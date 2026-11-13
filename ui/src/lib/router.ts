@@ -113,8 +113,10 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
  * advertise it; a local board keeps it. The route still explains itself if
  * reached by a deep link.
  */
-export function navItems(noWiki: boolean): typeof NAV {
-  return noWiki ? NAV.filter((item) => item.screen !== "wiki") : NAV;
+export function navItems(noWiki: boolean, hiddenScreens?: readonly Screen[]): typeof NAV {
+  const hidden = new Set<Screen>(hiddenScreens);
+  if (noWiki) hidden.add("wiki");
+  return hidden.size === 0 ? NAV : NAV.filter((item) => !hidden.has(item.screen));
 }
 
 /**

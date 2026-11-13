@@ -28,7 +28,15 @@ import "./explorer.css";
  * non-operators and the daemon's `operator_connection` gate is the
  * second layer.
  */
-export default function ManageApp({ installId, viewer }: { installId: string; viewer: Viewer }) {
+export default function ManageApp({
+  installId,
+  viewer,
+  automaticUpdatesEnabled = true,
+}: {
+  installId: string;
+  viewer: Viewer;
+  automaticUpdatesEnabled?: boolean;
+}) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
   const [home, setHome] = useState<HomeInstallation | null>(null);
@@ -94,7 +102,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   }, [installId, reread, isOp]);
 
   useEffect(() => {
-    if (!isOp) return;
+    if (!automaticUpdatesEnabled || !isOp) return;
     const controller = new AbortController();
     setAutomatic(false);
     automaticRef.current = false;
@@ -113,7 +121,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => { if (!controller.signal.aborted) setAutomaticReady(false); });
     return () => controller.abort();
-  }, [installId, isOp]);
+  }, [automaticUpdatesEnabled, installId, isOp]);
 
   useEffect(() => {
     // The saved preference is armed only after the server confirms it.

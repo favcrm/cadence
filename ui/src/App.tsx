@@ -63,9 +63,11 @@ import MobileNavigation from "./ui/MobileNavigation";
 import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
+import Button from "./ui/Button";
 import ProjectFilter from "./ui/ProjectFilter";
 import PageState from "./ui/PageState";
 import { wikiAvailable } from "./lib/wikiAvailable";
+import { boardSupports } from "./lib/capabilities";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
@@ -279,11 +281,22 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // screen showing it. An explicit open records its own origin.
   const effectiveOrigin: WorkItemOrigin = workOrigin ??
     (screen === "home" ? "home" : screen === "myWork" ? "myWork" : screen === "threads" ? "threads" : "issue");
-  const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
+  const myWorkOn = boardSupports(meta, "my_work");
+  const milestonesOn = boardSupports(meta, "milestones");
+  const workflowsOn = boardSupports(meta, "workflows");
+  const workConversationsOn = boardSupports(meta, "work_conversations");
+  const humanThreadsOn = boardSupports(meta, "human_threads");
+  const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  const hiddenScreens: Screen[] = [
+    ...(!myWorkOn ? ["myWork" as const] : []),
+    ...(!workConversationsOn && !humanThreadsOn ? ["threads" as const] : []),
+  ];
+
+  const personalState = useMaybeResource(screen === "myWork" && myWorkOn ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
-  const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
-  const personalWanted = useRef(screen === "myWork");
-  personalWanted.current = screen === "myWork";
+  const membershipState = useMaybeResource(screen === "myWork" && myWorkOn && openId ? resources.myWorkIssue(openId) : null);
+  const personalWanted = useRef(screen === "myWork" && myWorkOn);
+  personalWanted.current = screen === "myWork" && myWorkOn;
   const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
   const [, notifyPersonalDrafts] = useState(0);
   useEffect(() => onPrivateSessionReset(() => personalDrafts.clear()), [personalDrafts]);
@@ -1035,6 +1048,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         collapsed={sidebarCollapsed}
         onExpand={() => setSidebarCollapsed(false)}
         noWiki={!wikiAvailable(meta)}
+        hiddenScreens={hiddenScreens}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
         appMenu={appMenu}
@@ -1141,6 +1155,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <MobileNavigation onClose={closeMenu}>
             <NavList
               noWiki={!wikiAvailable(meta)}
+              hiddenScreens={hiddenScreens}
               screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
               navHref={hrefFor}
               appMenu={appMenu}
@@ -1189,12 +1204,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           </div>
         )}
         {route.screen === "myWork" && (
-          <MyWork
-            view={route.view ?? {}}
-            onView={(view) => update((c) => ({ ...c, route: { screen: "myWork", view } }), { replace: true })}
-            onOpen={openPersonal}
-            onDetails={rememberPersonal}
-          />
+          myWorkOn ? (
+            <MyWork
+              view={route.view ?? {}}
+              onView={(view) => update((c) => ({ ...c, route: { screen: "myWork", view } }), { replace: true })}
+              onOpen={openPersonal}
+              onDetails={rememberPersonal}
+            />
+          ) : (
+            <PageState title={t("My work is not available here")} actions={<Button href="/">{t("Home")}</Button>}>
+              {t("This hosted workspace does not serve a personal work queue.")}
+            </PageState>
+          )
         )}
 
         {screen === "home" && (
@@ -1272,7 +1293,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && route.section === "epics",
               },
-              {
+              ...(!milestonesOn ? [] : [{
                 label: "Milestones",
                 href: hrefFor({
                   screen: "projects",
@@ -1280,8 +1301,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   section: "milestones",
                 }),
                 on: route.screen === "projects" && route.section === "milestones",
-              },
-              {
+              }]),
+              ...(!workflowsOn ? [] : [{
                 label: "Workflows",
                 href: hrefFor({
                   screen: "projects",
@@ -1289,7 +1310,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   section: "workflows",
                 }),
                 on: route.screen === "projects" && route.section === "workflows",
-              },
+              }]),
               ...(!wikiAvailable(meta) ? [] : [{
                 label: "Context",
                 href: hrefFor({
@@ -1314,7 +1335,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "projects" && route.section === "overview" && (
-          <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+          <ProjectsOverview
+            project={project}
+            projects={projects}
+            issues={issuesState}
+            onOpenIssue={openIssue}
+            onRetry={() => void resources.issues.refresh()}
+            milestonesEnabled={milestonesOn}
+            workflowsEnabled={workflowsOn}
+          />
         )}
         {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
           <Timeline
@@ -1397,15 +1426,27 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
-          <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+          milestonesOn ? (
+            <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+          ) : (
+            <PageState title={t("Milestones are not available here")} actions={<Button href={hrefFor({ screen: "projects", slug: route.slug, section: "overview" })}>{t("Project overview")}</Button>}>
+              {t("This hosted workspace does not serve project milestones.")}
+            </PageState>
+          )
         )}
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
-          <Workflows
-            project={route.slug}
-            viewer={viewer}
-            onOpenIssue={openIssue}
-            onHome={() => goRoute({ screen: "home" })}
-          />
+          workflowsOn ? (
+            <Workflows
+              project={route.slug}
+              viewer={viewer}
+              onOpenIssue={openIssue}
+              onHome={() => goRoute({ screen: "home" })}
+            />
+          ) : (
+            <PageState title={t("Workflows live in Apps")} actions={<Button href="/apps">{t("Apps")}</Button>}>
+              {t("Hosted workspaces run workflows through installed apps.")}
+            </PageState>
+          )
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context
@@ -1430,7 +1471,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CatalogDetail id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} />
         )}
         {(route.screen === "workspaceApp" || route.screen === "workspaceAppKey") && (
           <WorkspaceAppEntry
@@ -1445,6 +1486,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
+            automaticUpdatesEnabled={automaticUpdatesOn}
           />
         )}
         {route.screen === "apps" && route.project && route.name && (
@@ -1509,11 +1551,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           )
         )}
         {route.screen === "threads" && (
-          <ThreadsPage
-            key={meta.session?.id ?? ""}
-            operator={meta.operator === true}
-            onOpenWorkItem={(id) => openWorkItem(id, "threads")}
-          />
+          workConversationsOn || humanThreadsOn ? (
+            <ThreadsPage
+              key={meta.session?.id ?? ""}
+              operator={meta.operator === true}
+              onOpenWorkItem={(id) => openWorkItem(id, "threads")}
+              workConversationsEnabled={workConversationsOn}
+              humanThreadsEnabled={humanThreadsOn}
+            />
+          ) : (
+            <PageState title={t("Threads are not available here")} actions={<Button href="/">{t("Home")}</Button>}>
+              {t("This hosted workspace does not serve agent or human thread rooms.")}
+            </PageState>
+          )
         )}
         {route.screen === "credentialEntry" && (
           <CredentialEntry key={route.requestId} requestId={route.requestId} />
@@ -1656,6 +1706,7 @@ function WorkspaceAppEntry({
   onRetryWorkspace,
   onInstallation,
   onBack,
+  automaticUpdatesEnabled,
 }: {
   route: Extract<Route, { screen: "workspaceApp" | "workspaceAppKey" }>;
   /** The current query — the `install` pin is read from it. */
@@ -1669,6 +1720,7 @@ function WorkspaceAppEntry({
   onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
+  automaticUpdatesEnabled: boolean;
 }) {
   const { t } = useLocale();
   if (viewer.operator === null) {
@@ -1793,7 +1845,7 @@ function WorkspaceAppEntry({
       viewer={viewer}
       onInstallation={onInstallation}
     >
-      {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} restoreDrawer={screen.restoreDrawer} onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed} />}
+      {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} restoreDrawer={screen.restoreDrawer} onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed} automaticUpdatesEnabled={automaticUpdatesEnabled} />}
     </AppShell>
   );
 }

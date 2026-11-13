@@ -252,6 +252,7 @@ export default function WorkspaceApp({
   drawerTarget,
   restoreDrawer,
   onRestoreDrawerConsumed,
+  automaticUpdatesEnabled = true,
 }: {
   installId: string;
   viewer: Viewer;
@@ -278,6 +279,8 @@ export default function WorkspaceApp({
   onRestoreDrawerConsumed?: () => void;
   /** The screen went away (a refused push, a retired mount): close with it. */
   onScreenClosed?: () => void;
+  /** Whether the board serves per-install automatic-update preferences. */
+  automaticUpdatesEnabled?: boolean;
 }) {
   const t = useTranslate();
   // CAD-1137: a revisit mounts with the last session's snapshot already
@@ -493,7 +496,7 @@ export default function WorkspaceApp({
   }, [refresh]);
   useEffect(() => {
     // A read-only session may open the app. It must not arm a release.
-    if (viewer.operator !== true || viewer.readOnly) {
+    if (!automaticUpdatesEnabled || viewer.operator !== true || viewer.readOnly) {
       setArmed(false);
       automaticRef.current = false;
       return;
@@ -516,7 +519,7 @@ export default function WorkspaceApp({
       })
       .catch(() => { if (!controller.signal.aborted) setAutomaticReady(false); });
     return () => controller.abort();
-  }, [installId, viewer.operator, viewer.readOnly]);
+  }, [automaticUpdatesEnabled, installId, viewer.operator, viewer.readOnly]);
   useEffect(() => {
     const visitKey = destinationVisitKey;
     if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;

@@ -38,9 +38,11 @@ interface Props {
   homeCount?: number;
   /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
   noWiki?: boolean;
+  /** Additional nav screens unsupported on this board (see boardSupports). */
+  hiddenScreens?: readonly Screen[];
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, collapsed, onExpand }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, hiddenScreens, collapsed, onExpand }: Props) {
   const { t } = useLocale();
   const [tip, setTip] = useState<{ text: string; top: number; left: number } | null>(null);
   const showTip = (target: EventTarget | null) => {
@@ -70,7 +72,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
               </span>
           )}
         </div>
-        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} noWiki={noWiki} rail={collapsed} />
+        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} noWiki={noWiki} hiddenScreens={hiddenScreens} rail={collapsed} />
         <div hidden={collapsed}><ProjectsSection project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} /></div>
       </div>
       <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">

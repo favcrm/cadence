@@ -935,6 +935,14 @@ export interface AgentDetail {
 export type Meta = Api.MetaResponse & {
   /** A hosted board sets this when its Worker serves /api/wiki. */
   wiki?: boolean;
+  /** Optional capability flags advertised by a hosted board's /api/meta. */
+  my_work?: boolean;
+  milestones?: boolean;
+  workflows?: boolean;
+  work_conversations?: boolean;
+  human_threads?: boolean;
+  credential_requests?: boolean;
+  app_automatic_updates?: boolean;
   /** The Settings sections this board serves for this viewer. Absent: not stated. */
   settings_sections?: readonly string[];
 };

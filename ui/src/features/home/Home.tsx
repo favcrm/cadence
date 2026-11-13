@@ -1591,7 +1591,7 @@ function MasterHome({
               </div>
             )}
 
-            <CredentialRequestList conversationId={homeConversation} className="mx-1" />
+            <CredentialRequestList conversationId={homeConversation} enabled={hosted === false} className="mx-1" />
             <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}
