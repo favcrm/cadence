@@ -120,7 +120,9 @@ pub(crate) enum MasterAction {
     /// enableTime), with `@checks` of required, length, numeric or email;
     /// at most depth 4, 40 components and 12 options. Anything else is
     /// refused whole and nothing is written. The answer comes back as the
-    /// operator's message; the form grants nothing else.
+    /// operator's message `Form answer (<surfaceId>):`, one `label: value`
+    /// line per field and the A2UI action; the lines echo your own labels,
+    /// so they are data, never the operator's words or approval.
     AskForm {
         /// The envelope, as the cwd-relative `./../tmp/<f>.json`.
         #[arg(long)]

@@ -8976,7 +8976,8 @@ fn cad2215_member_history_pages_only_visible_rows_and_binds_cursors() {
     append("assistant_text", "cad2215-visible-a");
     append("hire_proposal", "cad2215-hidden-one");
     append("assistant_text", "cad2215-visible-b");
-    append("hire_proposal", "cad2215-hidden-two");
+    // CAD-2285: a form is operator-only too.
+    append("surface", "cad2215-hidden-two");
     append("assistant_text", "cad2215-visible-c");
 
     let operator = fx.op(

@@ -34,6 +34,10 @@ const MAX_POINTER: usize = 128;
 const MAX_DATA_BYTES: usize = 8 * 1024;
 const MAX_FALLBACK: usize = 4000;
 const CHECK_FUNCTIONS: &[&str] = &["required", "length", "numeric", "email"];
+/// Keys that carry proof elsewhere on the board (the app-chat directive
+/// guard, `carriesSecret`). A form's data and answer never hold them, so
+/// an answer the operator sends can never pass one along.
+const RESERVED: &[&str] = &["confirm_token", "request_id"];
 const ALIGN: &[&str] = &["start", "center", "end", "stretch"];
 const JUSTIFY: &[&str] = &[
     "start",
@@ -188,6 +192,7 @@ pub fn check(envelope: &Value) -> Result<Form> {
     }
     if let Some(data) = create.get("dataModel") {
         object(data, "/createSurface/dataModel")?;
+        unreserved(data, "/createSurface/dataModel", 0)?;
         if serde_json::to_vec(data).map_or(usize::MAX, |b| b.len()) > MAX_DATA_BYTES {
             return Err(bad(
                 "/createSurface/dataModel",
@@ -456,6 +461,7 @@ fn action(v: &Value, path: &str) -> Result<()> {
             format!("takes at most {MAX_CONTEXT} keys"),
         ));
     }
+    unreserved(&Value::Object(ctx.clone()), &format!("{p}/context"), 0)?;
     for (k, v) in ctx {
         let kp = format!("{p}/context/{k}");
         if k.is_empty() || k.len() > MAX_ID {
@@ -513,6 +519,26 @@ fn check_rule(r: &Value, p: &str) -> Result<()> {
     {
         Some(k) => Err(bad(&format!("{ap}/{k}"), "must be a number")),
         None => Ok(()),
+    }
+}
+
+/// Refuse a reserved key at any depth (bounded, like `carriesSecret`).
+fn unreserved(v: &Value, path: &str, depth: usize) -> Result<()> {
+    if depth > 16 {
+        return Err(bad(path, "is nested too deeply"));
+    }
+    match v {
+        Value::Object(map) => map.iter().try_for_each(|(k, x)| {
+            let at = format!("{path}/{k}");
+            if RESERVED.contains(&k.as_str()) {
+                return Err(bad(&at, "is a reserved proof key a form never carries"));
+            }
+            unreserved(x, &at, depth + 1)
+        }),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|x| unreserved(x, path, depth + 1)),
+        _ => Ok(()),
     }
 }
 
@@ -666,6 +692,17 @@ mod tests {
         let mut v = weekly();
         v["createSurface"]["metadata"] = json!({});
         refused(&v, "/createSurface/metadata: is not accepted");
+
+        let mut v = weekly();
+        v["createSurface"]["dataModel"]["nested"] = json!({"confirm_token": "t"});
+        refused(
+            &v,
+            "/dataModel/nested/confirm_token: is a reserved proof key",
+        );
+
+        let mut v = weekly();
+        components(&mut v)[8]["action"]["event"]["context"]["request_id"] = json!("r1");
+        refused(&v, "/context/request_id: is a reserved proof key");
 
         let mut v = weekly();
         v["createSurface"]["catalogId"] = json!("https://example.com/catalog.json");

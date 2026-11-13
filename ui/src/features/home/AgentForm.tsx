@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { useWriteBlock } from "../auth/WriteGate";
+import { carriesSecret } from "../app-shell/chat/directive";
 import { sendToMaster } from "./send";
 import { newMessageId, type FormStatus, type ThreadEntry } from "./thread";
 
@@ -207,12 +208,18 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
       for (const [k, v] of Object.entries(event.context as Data)) context[k] = resolve(v, data) ?? null;
     }
     const lines = order.filter((c) => INPUTS.has(c.component)).map((c) => `${label(c) || c.id}: ${shown(c)}`);
-    const head = title ? asText(title.text) : "";
     const action = {
       version: "1.0",
       action: { name: event.name, surfaceId: surface.id, sourceComponentId: button.id, timestamp: new Date().toISOString(), context },
     };
-    const text = [head, ...lines].filter(Boolean).join("\n") + ACTION_MARK + JSON.stringify(action);
+    const json = JSON.stringify(action);
+    // The daemon already refuses reserved keys; never send one regardless.
+    if (carriesSecret(json)) {
+      setErrors({ [button.id]: "Check this field." });
+      return;
+    }
+    // Host wording, not the agent's title: the lines echo the form's own labels.
+    const text = [`Form answer (${surface.id}):`, ...lines].join("\n") + ACTION_MARK + json;
     writeDraft(entry.seq, null);
     void sendToMaster(text, message.current, [{ kind: "surface", id: String(entry.seq) }]);
   };
@@ -265,6 +272,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
               <>
                 <button type="button" className={cls} onClick={() => submit(c)} disabled={disabled}>{words}</button>
                 <span className="text-micro text-ink-500">{block ?? t("Goes to the assistant as your message.")}</span>
+                {errors[c.id] && <span className="text-micro text-fail" role="alert">{t(errors[c.id])}</span>}
               </>
             )}
           </div>
