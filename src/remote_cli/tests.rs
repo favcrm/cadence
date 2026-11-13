@@ -355,7 +355,7 @@ fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
     ] {
         let error = wiki_copy_refusal(verb, status, Some(code), &with(op)).unwrap();
         // The copy client trusts exactly these codes as definite refusals.
-        assert!(super::WIKI_COPY_REFUSAL_CODES.contains(&code), "{code}");
+        assert!(super::is_wiki_copy_refusal(code), "{code}");
         let text = error.to_string();
         assert_eq!(error.code(), Some(code), "{text}");
         assert_eq!(error.kind(), "rejected", "{text}");

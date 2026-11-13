@@ -542,12 +542,12 @@ fn import_local(
 /// local daemon can publish a page and then answer `busy` or `rejected` when
 /// it fails to record the outcome, and a lost local reply is `internal`. So
 /// only two things count: a hosted board's own transfer refusal (its code is
-/// in [`crate::remote_cli::WIKI_COPY_REFUSAL_CODES`]), and this client's own
+/// is one [`crate::remote_cli::is_wiki_copy_refusal`] knows), and this client's own
 /// stop before it sends (`timeout` at the command deadline, `waking` at the
 /// wake budget). Everything else is reconciled, never called refused.
 fn definite(error: &Error) -> bool {
     match (error.kind(), error.code()) {
-        ("rejected", Some(code)) => crate::remote_cli::WIKI_COPY_REFUSAL_CODES.contains(&code),
+        ("rejected", Some(code)) => crate::remote_cli::is_wiki_copy_refusal(code),
         ("busy", Some(code)) => matches!(code, "timeout" | "waking"),
         _ => false,
     }
