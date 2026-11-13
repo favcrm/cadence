@@ -217,11 +217,10 @@ in every case.
 
 A local source problem found while sending a chunk, such as a file that changed
 or shrank after the manifest was pinned or could not be read, exits 3: that run
-did not apply the file and did not finish the job. Resume with `--resume <job>`
-once the source matches what was pinned, or copy again without `--resume`. If
-the board's job holds more bytes for a file than its pinned size, resuming
-cannot help: copy again without `--resume` (exit 3). A chunk answer the client
-cannot read exits 1.
+did not apply the file and did not finish the job; copy again without
+`--resume`. The same holds when the board's job holds more bytes for a file than
+its pinned size, which resuming cannot fix. A chunk answer the client cannot
+read exits 1.
 
 `--wait-index` polls that job's own status until the index is covered, the job
 fails, or the command deadline

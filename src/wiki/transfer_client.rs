@@ -248,9 +248,10 @@ impl Channel for RemoteChannel<'_> {
 /// CAD-2271: a hosted transfer error that proves the request changed
 /// nothing. Either the board refused it with one of its own transfer codes
 /// (only [`crate::remote_cli::is_wiki_copy_refusal`] codes, which on the
-/// hosted path come only from the board's refusal table), or this client
-/// stopped before sending: `timeout` at the command deadline or during
-/// session renewal, `waking` when the gateway answered before forwarding.
+/// hosted path come only from the board's refusal table), or the board never
+/// ran the request: `timeout` at the command deadline or during session
+/// renewal, `waking` when the gateway answered that the board was still
+/// waking or this copy's wake budget ran out before sending.
 fn hosted_stop_is_unchanged(error: &Error) -> bool {
     match (error.kind(), error.code()) {
         ("rejected", Some(code)) => crate::remote_cli::is_wiki_copy_refusal(code),
@@ -413,6 +414,7 @@ fn import_local(
         if !entry_progress.decided {
             // The board's record of this entry disagrees with the manifest it
             // admitted. A resume reads the same record, so only a new job helps.
+            // The `dir` and empty-file cases match `send_entry`'s early returns.
             if item.kind != "dir" && item.size != 0 && entry_progress.received > item.size {
                 return Err(Error::rejected(format!(
                     "wiki cp job {job_id}: the board holds {} staged bytes for '{}', more than \
@@ -642,7 +644,6 @@ fn chunk_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
         Stop::Client(error) if error.kind() == "unknown" => hedged(&error),
         Stop::Client(error) => Error::rejected(format!(
             "{what}: {error} — this run did not apply this file and did not finish the job; \
-             resume with `--resume {job_id}` once the local source matches what was pinned, or \
              copy again without `--resume`"
         )),
     }
@@ -699,7 +700,7 @@ fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
             format!("{what}: {error} — that job is gone, so copy again without `--resume`")
         }
         Some("waking") => format!(
-            "{what}: the request was not sent — the board was still waking, or this copy's \
+            "{what}: the board did not run the request — it was still waking, or this copy's \
              `--wake-timeout` ran out first; resume with `--resume {job_id}`, with a larger \
              `--wake-timeout`; this attempt was not retried"
         ),
@@ -2973,7 +2974,8 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("copy again without `--resume`"), "{text}");
-        assert!(!text.contains("once the local source matches"), "{text}");
+        assert!(text.contains("resuming this job cannot fix that"), "{text}");
+        assert!(!text.contains("this run did not apply"), "{text}");
     }
 
     /// CAD-2275: a `waking` stop names one next step. The wake budget's own
@@ -2995,7 +2997,7 @@ mod tests {
             ("busy", Some("waking"), 75),
             "{text}"
         );
-        assert!(text.contains("the request was not sent"), "{text}");
+        assert!(text.contains("the board did not run the request"), "{text}");
         assert!(text.contains("resume with `--resume J`"), "{text}");
         assert!(text.contains("a larger `--wake-timeout`"), "{text}");
         assert!(!text.contains("retry"), "{text}");
@@ -3125,11 +3127,11 @@ mod tests {
             chunk.to_string().contains("resume with `--resume J`"),
             "{chunk}"
         );
-        // CAD-2275: a local source problem stopped before the file was
-        // applied. It is a refusal (exit 3) with one claim about the board:
-        // nothing of this file was applied. It never also says the chunk may
-        // or may not have been staged, so "nothing was sent" from a refused
-        // path cannot contradict the wrapper.
+        // CAD-2275: a local source problem stopped before this run applied
+        // the file. It is a refusal (exit 3) that speaks only for this run
+        // and names one next step that always works: a new copy. It never
+        // also says the chunk may or may not have been staged, so "nothing
+        // was sent" from a refused path cannot contradict the wrapper.
         for source in [
             Error::rejected("source 'a.bin' changed after the manifest was pinned"),
             Error::rejected("source 'a.bin' shrank during copy"),
@@ -3148,7 +3150,8 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("may or may not have been staged"), "{text}");
-            assert!(text.contains("--resume J"), "{text}");
+            assert!(text.contains("copy again without `--resume`"), "{text}");
+            assert!(!text.contains("--resume J"), "{text}");
         }
         // A chunk answer this client could not read may have staged it.
         let unread = chunk_stopped(
