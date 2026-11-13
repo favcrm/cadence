@@ -91,6 +91,19 @@
 .issue-output-links {
   list-style: none;
 }
+.issue-deliverable-preview {
+  margin: 0 0.75rem 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  background: var(--color-ink-900);
+}
+.issue-deliverable-preview .cv-body {
+  max-height: 70vh;
+}
+.issue-deliverable-preview .canvas-frame {
+  min-height: 28rem;
+}
 @media (max-width: 640px) {
   .issue-workspace .btn,
   .issue-workspace .field,

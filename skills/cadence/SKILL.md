@@ -44,6 +44,8 @@ branch, review or release path. A profile supplies context, not an authenticated
 reviewer identity or approval:
 
 ```bash
+cadence --org <org> project ls
+cadence --org <org> issue ls --project <key> --open --limit 20
 cadence --org <org> agent profiles
 cadence --org <org> agent context <profile-id>
 cadence --org <org> agent profile get <profile-id>   # owner-only writes: create, edit, archive
@@ -219,6 +221,42 @@ Stdin feeds one body per call. `issue new --file -` and
 `issue comment --file -` read stdin too (not for the Pi master, which must
 use a file in its tmp dir). The single-purpose verbs stay for one-part
 updates.
+
+## Deliverables and review handoff
+
+Across business, design, marketing and engineering tickets, keep internal
+deliverables inside the workspace rather than uploading confidential drafts or
+incident reports to external preview hosts:
+
+- **Ticket attachments (`issue attach <ID> <file>` / `issue edit --attach`, up to 1 MiB):**
+  best for self-contained `.md`, `.html`, `.csv`, `.pdf` and screenshot evidence
+  bound to one ticket. Hosted and native boards render `.md`, `.html` (sandboxed
+  frame + source toggle), `.csv`, `.pdf` and raster images on the ticket's
+  `Evidence` tab alongside direct download.
+- **Versioned workspace artifacts (`artifact put --issue <ID> --kind <md|html|csv|pdf|image> --title "<title>" --file <path>`, up to 10 MiB):**
+  best for larger or multi-version deliverables — commercial decks, quotations,
+  proposals, print-ready PDFs, campaign mockups and full postmortems. Linking
+  `--issue <ID>` increments the ticket's artifact count and surfaces the latest
+  version directly on the ticket's `Evidence` tab while keeping full version
+  history discoverable via `artifact find`.
+- **Workspace wiki (`wiki write` / `wiki upload`, up to 15 MiB):**
+  best for durable shared knowledge — project guardrails (`projects/<key>/index.md`),
+  SOPs, brand guidelines and runbooks, not one-off ticket review drafts.
+- **Reusable standards (`company-outputs`):**
+  when a deliverable should follow or become a reusable company template, keep
+  client/incident-specific facts out of the template and treat unapproved drafts
+  as `SAMPLE`.
+
+Choose the ticket handoff state deliberately:
+
+- **`status=review`:** use whenever a human owner or reviewer must inspect a
+  deliverable, approve pricing/copy/brand direction, authorize an external send
+  or spend, or review/merge/deploy a change. Attach the deliverable(s) first,
+  then transition to `review` with a comment stating what was verified and what
+  decision is needed.
+- **`status=done`:** use only when the work is complete within already-granted
+  authority and requires no pending human sign-off, external release or merge
+  gate.
 
 ## Errors and exit codes
 

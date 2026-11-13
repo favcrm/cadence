@@ -35,13 +35,12 @@ struct HostedIssueLsOptions {
     blocked: bool,
     at: bool,
     sort: bool,
-    limit: bool,
     fields: bool,
     summary: bool,
 }
 
 impl HostedIssueLsOptions {
-    fn restrictions(self) -> [(&'static str, bool); 11] {
+    fn restrictions(self) -> [(&'static str, bool); 10] {
         [
             ("--stage", self.stage),
             ("--health", self.health),
@@ -51,14 +50,13 @@ impl HostedIssueLsOptions {
             ("--blocked", self.blocked),
             ("--at", self.at),
             ("--sort", self.sort),
-            ("--limit", self.limit),
             ("--fields", self.fields),
             ("--summary", self.summary),
         ]
     }
 }
 
-pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 11] {
+pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 10] {
     HostedIssueLsOptions::default()
         .restrictions()
         .map(|(flag, _)| flag)
@@ -258,7 +256,6 @@ fn verb_for(
                 blocked: *blocked,
                 at: at.is_some(),
                 sort: sort.is_some(),
-                limit: limit.is_some(),
                 fields: !fields.is_empty(),
                 summary: *summary,
             };
@@ -266,6 +263,14 @@ fn verb_for(
                 if present {
                     return Err(unsupported("issue ls", flag, HOSTED_ISSUE_LS_REFUSAL));
                 }
+            }
+            if let Some(n) = limit {
+                if !(1..=5000).contains(n) {
+                    return Err(Error::rejected(
+                        "remote `issue ls` --limit must be 1 to 5000 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
             }
             if project.len() > 1 {
                 return Err(Error::rejected(
@@ -804,6 +809,31 @@ fn verb_for(
                 args.insert("prefix".into(), json!(prefix));
             }
             "project_new"
+        }
+        Commands::Project {
+            action:
+                ProjectCmd::Ls {
+                    sort,
+                    limit,
+                    fields,
+                    json: _,
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
         }
         // CAD-1999: `issue project ls` reads the hosted registry, which
         // includes projects that exist only as their tickets' key. The
@@ -3376,6 +3406,14 @@ where
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let issue_ls_fallback = (verb == "issue_ls")
+        .then(|| {
+            let n = args.get("limit").and_then(Value::as_u64)? as usize;
+            let mut without_limit = args.clone();
+            without_limit.remove("limit");
+            Some((n, without_limit))
+        })
+        .flatten();
     let out = match cadence_agent::remote_cli::call_verb(
         &target,
         verb,
@@ -3386,26 +3424,56 @@ where
     ) {
         Ok(out) => out,
         Err(error) => {
-            if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
-                eprint_line(&format!(
-                    "remote send `{id}` was not confirmed — it may or may not have \
-                     been recorded. Reconcile before resubmitting: `cadence message \
-                     read {id} --org {}` returns your durable message and its state. \
-                     If nothing is recorded, retry `send` with the same --message {id} \
-                     — the same id and content does not enqueue another message.",
-                    target.org
-                ));
+            // Hosted wire compatibility: if an older board predates `limit` on
+            // `issue_ls` and answers `400 invalid_request`, retry once without
+            // `limit`, slice locally, and state on stderr what was not applied
+            // server-side. If the retry also refuses (for instance another bad
+            // filter value), surface that refusal unchanged.
+            if let Some((n, without_limit)) =
+                issue_ls_fallback.filter(|_| error.code() == Some("invalid_request"))
+            {
+                match cadence_agent::remote_cli::call_verb(
+                    &target,
+                    verb,
+                    without_limit,
+                    deadline,
+                    wake_timeout,
+                    eprint_line,
+                ) {
+                    Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(mut body)) => {
+                        truncate_issue_ls_body(&mut body, n);
+                        eprint_line(&format!(
+                            "remote board on `{}` predates server-side `issue_ls` limit; \
+                             truncated to {n} locally.",
+                            target.org
+                        ));
+                        cadence_agent::remote_cli::RemoteAnswer::Ok(body)
+                    }
+                    Ok(other) => other,
+                    Err(retry_err) => return remote_failure(retry_err),
+                }
+            } else {
+                if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote send `{id}` was not confirmed — it may or may not have \
+                         been recorded. Reconcile before resubmitting: `cadence message \
+                         read {id} --org {}` returns your durable message and its state. \
+                         If nothing is recorded, retry `send` with the same --message {id} \
+                         — the same id and content does not enqueue another message.",
+                        target.org
+                    ));
+                }
+                if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote platform call `{key}` on org `{}` was not confirmed — \
+                         reconcile read-only with `cadence --org {} platform status --request {key}` \
+                         before repeating; replaying `platform call` returns a recorded outcome, \
+                         or starts and charges a new call if `{key}` was not recorded.",
+                        target.org, target.org
+                    ));
+                }
+                return remote_failure(error);
             }
-            if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
-                eprint_line(&format!(
-                    "remote platform call `{key}` on org `{}` was not confirmed — \
-                     reconcile read-only with `cadence --org {} platform status --request {key}` \
-                     before repeating; replaying `platform call` returns a recorded outcome, \
-                     or starts and charges a new call if `{key}` was not recorded.",
-                    target.org, target.org
-                ));
-            }
-            return remote_failure(error);
         }
     };
     match out {
@@ -4085,6 +4153,12 @@ fn migration_outcome_exit_code(receipt: &Value) -> i32 {
         Some("failed") => cadence_agent::error::exit_code_for_kind("rejected"),
         Some("unknown") => cadence_agent::error::exit_code_for_kind("unknown"),
         _ => cadence_agent::error::exit_code_for_kind("busy"),
+    }
+}
+
+fn truncate_issue_ls_body(body: &mut Value, limit: usize) {
+    if let Some(issues) = body.get_mut("issues").and_then(Value::as_array_mut) {
+        issues.truncate(limit);
     }
 }
 
@@ -5129,6 +5203,7 @@ mod read_contract_tests {
             l.owner = vec!["me".into()];
             l.plan = vec!["approved".into()];
             l.open = true;
+            l.limit = Some(10);
         }))
         .unwrap();
         assert_eq!(verb, "issue_ls");
@@ -5137,8 +5212,22 @@ mod read_contract_tests {
             json!({
                 "project": "ops",
                 "status": ["doing"], "tag": ["t"], "owner": ["me"],
-                "plan": ["approved"], "open": true,
+                "plan": ["approved"], "open": true, "limit": 10,
             })
+        );
+
+        for bad_limit in [0usize, 5001usize] {
+            let err = outcome(&issue_ls(|l| l.limit = Some(bad_limit))).unwrap_err();
+            assert!(err.contains("--limit"), "{bad_limit}: {err}");
+        }
+
+        let mut legacy_body = json!({
+            "issues": [{"id": "OPS-1"}, {"id": "OPS-2"}, {"id": "OPS-3"}]
+        });
+        truncate_issue_ls_body(&mut legacy_body, 2);
+        assert_eq!(
+            legacy_body,
+            json!({"issues": [{"id": "OPS-1"}, {"id": "OPS-2"}]})
         );
     }
 
@@ -5162,7 +5251,6 @@ mod read_contract_tests {
             ("--blocked", |l| l.blocked = true),
             ("--at", |l| l.at = Some("HEAD~1".into())),
             ("--sort", |l| l.sort = Some("id".into())),
-            ("--limit", |l| l.limit = Some(5)),
             ("--fields", |l| l.fields = vec!["id".into()]),
             ("--summary", |l| l.summary = true),
         ];
@@ -5702,6 +5790,29 @@ mod read_contract_tests {
             .unwrap_err();
             assert!(err.contains("issue project policy"), "{err}");
         }
+
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: None,
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: Some(5),
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
 
         let (verb, args) = outcome(&Commands::Issue {
             action: IssueAction::Project {
