@@ -208,7 +208,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     if (c.component === "CheckBox") return v === true ? t("Yes") : t("No");
     if (c.component === "ChoicePicker") {
       const opts = Array.isArray(c.options) ? (c.options as { label?: unknown; value?: unknown }[]) : [];
-      const names = asList(v).map((x) => asText(resolve(opts.find((o) => o.value === x)?.label, data)) || x);
+      const names = (displayed(c, data) as string[]).map((x) => asText(resolve(opts.find((o) => o.value === x)?.label, data)) || x);
       return names.join(", ") || "—";
     }
     return asText(v) || "—";
@@ -240,7 +240,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
       }
     }
     // One line per field, whatever the values hold.
-    const lines = inputs.map((c) => `${label(c) || c.id}: ${shown(c)}`.replace(/\s*[\r\n]+\s*/g, " "));
+    const lines = inputs.map((c) => `${label(c) || c.id}: ${shown(c)}`.replace(/\s*[\r\n\u2028\u2029]+\s*/g, " "));
     const action = {
       version: "1.0",
       action: { name: event.name, surfaceId: surface.id, sourceComponentId: button.id, timestamp: new Date().toISOString(), context },
