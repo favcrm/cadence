@@ -66,9 +66,9 @@ into reviewable workspace artifacts and concrete prevention.
 1. **Prepare the postmortem deliverable (internal to the workspace).**
    - Keep facts blameless and specific: executive summary, quantified customer /
      commercial / brand / operational impact, timestamped timeline, primary cause
-      plus detection gap, what worked well, and corrective/preventive actions
-     (CAPA). Mark any unconfirmed figure `[TBC: evidence needed]` rather than
-     guessing.
+     plus detection gap, what worked well, and corrective/preventive actions
+     (CAPA). Mark any unconfirmed figure `UNRESOLVED` or `[TBC: evidence needed]`
+     rather than guessing.
    - Format according to stakes and audience:
      - Always keep clean Markdown (`.md`) and, when stakeholders review a
        formatted report or print/PDF pack, render self-contained `.html` (and
@@ -97,8 +97,7 @@ into reviewable workspace artifacts and concrete prevention.
    one-off transient state. When a new multi-step team procedure is needed,
    shape it with `skills/sop-workshop/SKILL.md`.
 4. **Hand off in `status=review` (not `done`).**
-   Transition the incident ticket to `status=review` (`issue set <ID> status=review`
-   or `issue edit`) with a closeout comment listing:
+   Transition the incident ticket to `status=review` (`cadence [--org <org>] issue set <ID> status=review --if-rev <rev>`, or `issue edit` locally) with a closeout comment listing:
    - attached postmortem deliverable name(s) (viewable inline on the `Evidence` tab);
    - linked CAPA ticket IDs (`P1`/`P2`) and their owners;
    - updated wiki guardrail path(s);

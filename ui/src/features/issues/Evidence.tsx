@@ -52,9 +52,53 @@ export function deliverablePreviewKind(name: string): DeliverablePreviewKind | n
 
 export function deliverableDisplayName(name: string): string {
   const clean = name.replace(/^hosted:/, "");
-  const linked = /^(.*?)--art-[0-9a-f]{32}-v(\d+)(\.[a-z0-9]+)$/i.exec(clean);
+  const linked = /^(.*?)--art-[a-z0-9]{1,40}-v(\d+)(\.[a-z0-9]+)$/i.exec(clean);
   if (!linked) return clean;
   return `${linked[1]} (v${linked[2]})${linked[3]}`;
+}
+
+export function rasterMimeFromBytes(bytes: Uint8Array): string | null {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return "image/gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
 }
 
 interface LoadedArtifact {
@@ -125,15 +169,31 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
         const blob = await response.blob();
         session.assertCurrent();
         if (!current()) return;
-        // Only raster images may open inline. Other blobs lose the server's
-        // sandbox header, so they must download rather than navigate.
-        const raster = /^image\/(?:png|jpeg|gif|webp)$/i.test(blob.type);
+        // Only raster images may open inline. Hosted boards serve all ticket
+        // artifacts as application/octet-stream, so verify raster magic bytes
+        // before typing an untyped/octet-stream image blob for data: preview.
+        let typedBlob = blob;
+        let raster = /^image\/(?:png|jpeg|gif|webp)$/i.test(blob.type);
+        if (image && !raster && (!blob.type || blob.type === "application/octet-stream")) {
+          const headSlice = blob.slice(0, 12);
+          const headBuf =
+            typeof headSlice.arrayBuffer === "function"
+              ? await headSlice.arrayBuffer()
+              : await new Response(headSlice).arrayBuffer();
+          session.assertCurrent();
+          if (!current()) return;
+          const sniffed = rasterMimeFromBytes(new Uint8Array(headBuf));
+          if (sniffed) {
+            typedBlob = blob.slice(0, blob.size, sniffed);
+            raster = true;
+          }
+        }
         url = URL.createObjectURL(
-          raster ? blob : blob.slice(0, blob.size, "application/octet-stream"),
+          raster ? typedBlob : blob.slice(0, blob.size, "application/octet-stream"),
         );
         const ready = (preview: string | null) => {
           if (current() && url) {
-            setLoaded({ id, name, key, generation, attempt, url, preview, blob });
+            setLoaded({ id, name, key, generation, attempt, url, preview, blob: typedBlob });
           }
         };
         if (image && raster) {
@@ -145,7 +205,7 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
           reader.onerror = () => {
             if (current()) setFailed(true);
           };
-          reader.readAsDataURL(blob);
+          reader.readAsDataURL(typedBlob);
         } else {
           ready(null);
         }
@@ -181,13 +241,14 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
 
 function ImageArtifact({ id, name }: { id: string; name: string }) {
   const t = useTranslate();
+  const displayName = deliverableDisplayName(name);
   const { ready, failed, setFailed, retry } = useLoadedArtifact(id, name, true);
   if (ready && !failed) {
     return (
       <a
-        className="block"
+        className="block min-w-0 truncate"
         href={ready.url}
-        download={ready.preview ? undefined : name}
+        download={ready.preview ? undefined : displayName}
         target={ready.preview ? "_blank" : undefined}
         rel={ready.preview ? "noreferrer" : undefined}
         title={name}
@@ -195,27 +256,27 @@ function ImageArtifact({ id, name }: { id: string; name: string }) {
         {ready.preview ? (
           <img
             src={ready.preview}
-            alt={name}
+            alt={displayName}
             className="w-full h-28 object-cover bg-ink-900"
             onError={() => setFailed(true)}
           />
         ) : (
-          name
+          displayName
         )}
       </a>
     );
   }
   return (
-    <div className="grid min-h-28 gap-2 p-2.5 text-label">
+    <div className="grid min-w-0 min-h-28 gap-2 p-2.5 text-label">
       {failed ? (
         <div role="alert">
           <span>
-            {t("Could not load")} {name}.{" "}
+            {t("Could not load")} {displayName}.{" "}
           </span>
           <button
             type="button"
             className="lnk"
-            aria-label={`${t("Retry")} ${name}`}
+            aria-label={`${t("Retry")} ${displayName}`}
             onClick={retry}
           >
             {t("Retry")}
@@ -223,7 +284,7 @@ function ImageArtifact({ id, name }: { id: string; name: string }) {
         </div>
       ) : (
         <span role="status">
-          {t("Loading")} {name}…
+          {t("Loading")} {displayName}…
         </span>
       )}
     </div>
@@ -281,17 +342,17 @@ function FileArtifactRow({
   const showPreview = Boolean(previewOpen && ready && !failed && previewKind);
 
   return (
-    <li className="border-t border-ink-800">
-      <div className="flex items-center gap-3 px-3 py-2">
+    <li className="min-w-0 border-t border-ink-800">
+      <div className="flex min-w-0 items-center gap-3 px-3 py-2">
         {ready && !failed ? (
           <>
             <a
-              className="lnk num text-label truncate"
+              className="lnk num text-label truncate min-w-0"
               href={ready.url}
-              download={name}
+              download={displayName}
               title={name}
             >
-              {name}
+              {displayName}
             </a>
             {previewKind && (
               <button
@@ -306,19 +367,19 @@ function FileArtifactRow({
             )}
           </>
         ) : (
-          <div className="min-w-0 text-label">
+          <div className="min-w-0 truncate text-label">
             <span className="num truncate" title={name}>
-              {name}
+              {displayName}
             </span>{" "}
             {failed ? (
               <div role="alert">
                 <span>
-                  {t("Could not load")} {name}.{" "}
+                  {t("Could not load")} {displayName}.{" "}
                 </span>
                 <button
                   type="button"
                   className="lnk"
-                  aria-label={`${t("Retry")} ${name}`}
+                  aria-label={`${t("Retry")} ${displayName}`}
                   onClick={retry}
                 >
                   {t("Retry")}
@@ -326,7 +387,7 @@ function FileArtifactRow({
               </div>
             ) : (
               <span role="status">
-                {t("Loading")} {name}…
+                {t("Loading")} {displayName}…
               </span>
             )}
           </div>
@@ -441,9 +502,9 @@ export function Evidence({
   const t = useTranslate();
   const empty = images.length === 0 && files.length === 0;
   return (
-    <section className="grid gap-4">
+    <section className="grid min-w-0 gap-4">
       {empty && (
-        <div className="card px-4 py-8 text-center">
+        <div className="card min-w-0 px-4 py-8 text-center">
           <div className="text-cardtitle font-semibold text-ink-100">
             {t("No evidence yet")}
           </div>
@@ -453,31 +514,34 @@ export function Evidence({
         </div>
       )}
       {images.length > 0 && (
-        <div className="grid gap-2">
+        <div className="grid min-w-0 gap-2">
           <h2 className="text-cardtitle font-semibold text-ink-100 m-0">
             {t("Screenshots")}
           </h2>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {images.map((f) => (
-              <figure key={f.name} className="card overflow-hidden m-0">
-                <ImageArtifact key={`${id}:${f.name}`} id={id} name={f.name} />
-                <figcaption className="flex justify-between gap-2 px-2.5 py-2 text-label">
-                  <span className="num truncate" title={f.name}>
-                    {f.name}
-                  </span>
-                  <span className="text-ink-500 shrink-0">
-                    {fmtBytes(f.size)}
-                  </span>
-                </figcaption>
-              </figure>
-            ))}
+          <div className="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {images.map((f) => {
+              const displayName = deliverableDisplayName(f.name);
+              return (
+                <figure key={f.name} className="card min-w-0 overflow-hidden m-0">
+                  <ImageArtifact key={`${id}:${f.name}`} id={id} name={f.name} />
+                  <figcaption className="flex min-w-0 justify-between gap-2 px-2.5 py-2 text-label">
+                    <span className="num truncate min-w-0" title={f.name}>
+                      {displayName}
+                    </span>
+                    <span className="text-ink-500 shrink-0">
+                      {fmtBytes(f.size)}
+                    </span>
+                  </figcaption>
+                </figure>
+              );
+            })}
           </div>
         </div>
       )}
       {files.length > 0 && (
-        <div className="card">
+        <div className="card min-w-0 overflow-hidden">
           <div className="slabel px-3 pt-2.5">{t("Artifacts")}</div>
-          <ul className="list-none m-0 p-0">
+          <ul className="list-none m-0 p-0 min-w-0">
             {files.map((f) => (
               <FileArtifactRow
                 key={`${id}:${f.name}`}

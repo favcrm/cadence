@@ -2166,4 +2166,5 @@ Object.assign(zhTW, {
   "board Markdown renderer · no raw HTML": "看板 Markdown 檢視器 · 不載入原始 HTML",
   "table · first 2,000 rows · 50 columns": "表格 · 首 2,000 列 · 首 50 欄",
   "browser PDF tab or download": "瀏覽器 PDF 分頁開啟或下載",
+  "Contain and close out incidents across teams": "跨團隊遏止事件並完成復盤結案",
 });

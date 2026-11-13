@@ -72,6 +72,7 @@ async function run() {
     Evidence,
     deliverablePreviewKind,
     deliverableDisplayName,
+    rasterMimeFromBytes,
   } = require("../src/features/issues/Evidence") as typeof EvidenceModule;
   const { setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
   const {
@@ -106,6 +107,25 @@ async function run() {
     ) === "Customer-Recovery-Deck (v2).pdf",
     "Linked workspace deliverables format a readable versioned label",
   );
+  assert(
+    deliverableDisplayName("hosted:Deck--art-short123-v1.pdf") === "Deck (v1).pdf",
+    "Shorter valid art- IDs also format cleanly",
+  );
+
+  const pngBytes: Uint8Array<ArrayBuffer> = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+  ]);
+  const svgPolyglotBytes: Uint8Array<ArrayBuffer> = new Uint8Array(
+    new TextEncoder().encode("<svg onload=alert(1)></svg>"),
+  );
+  assert(
+    rasterMimeFromBytes(pngBytes) === "image/png",
+    "PNG magic bytes resolve to image/png",
+  );
+  assert(
+    rasterMimeFromBytes(svgPolyglotBytes) === null,
+    "SVG polyglot bytes never sniff as raster image",
+  );
 
   const originalFetch = globalThis.fetch;
   const originalCreate = URL.createObjectURL;
@@ -114,7 +134,10 @@ async function run() {
   URL.createObjectURL = () => `blob:http://localhost/cad2277-${++counter}`;
   URL.revokeObjectURL = () => {};
 
-  const payloads: Record<string, string> = {
+  const payloads: Record<string, string | Uint8Array<ArrayBuffer>> = {
+    "/api/issues/CAD-2277/artifacts/hosted%3Ascreenshot--art-7460ce3f47a4471391033ccad49faacd-v1.png":
+      pngBytes,
+    "/api/issues/CAD-2277/artifacts/hosted%3Apolyglot.png": svgPolyglotBytes,
     "/api/issues/CAD-2277/artifacts/hosted%3Apostmortem.html":
       "<h1>Incident Postmortem</h1><p>Containment verified.</p>",
     "/api/issues/CAD-2277/artifacts/hosted%3ACustomer-Recovery-Deck--art-7460ce3f47a4471391033ccad49faacd-v2.pdf":
@@ -131,6 +154,7 @@ async function run() {
       status: 200,
       headers: { "Content-Type": "application/octet-stream" },
     });
+    // happy-dom's FileReader consumes its own Blob implementation.
     response.blob = async () =>
       new win.Blob([body], { type: "application/octet-stream" }) as Blob;
     return response;
@@ -144,7 +168,13 @@ async function run() {
       root.render(
         React.createElement(Evidence, {
           id: "CAD-2277",
-          images: [],
+          images: [
+            {
+              name: "hosted:screenshot--art-7460ce3f47a4471391033ccad49faacd-v1.png",
+              size: pngBytes.length,
+            },
+            { name: "hosted:polyglot.png", size: svgPolyglotBytes.length },
+          ],
           files: [
             { name: "hosted:postmortem.html", size: 58 },
             {
@@ -159,6 +189,24 @@ async function run() {
       );
     });
     await flush();
+
+    // Hosted raster PNG served as application/octet-stream renders inline img, while SVG polyglot renamed .png stays inert download.
+    const renderedImg = host.querySelector('img[alt="screenshot (v1).png"]');
+    assert(
+      renderedImg instanceof HTMLElement &&
+        renderedImg.getAttribute("src")?.startsWith("data:image/png;"),
+      "Hosted octet-stream PNG renders inline data:image/png preview",
+    );
+    assert(
+      host.querySelector('img[alt="polyglot.png"]') === null &&
+        host.querySelector('a[download="polyglot.png"]') !== null,
+      "Non-raster bytes served as octet-stream .png stay download-only",
+    );
+    assert(
+      host.querySelector('a[download="Customer-Recovery-Deck (v2).pdf"]')?.textContent ===
+        "Customer-Recovery-Deck (v2).pdf",
+      "Linked deliverable row displays and downloads formatted displayName",
+    );
 
     // Non-previewable files keep download without Preview button.
     assert(

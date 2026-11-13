@@ -3429,9 +3429,9 @@ where
             // `limit`, slice locally, and state on stderr what was not applied
             // server-side. If the retry also refuses (for instance another bad
             // filter value), surface that refusal unchanged.
-            if let Some((n, without_limit)) =
-                issue_ls_fallback.filter(|_| error.code() == Some("invalid_request"))
-            {
+            if let Some((n, without_limit)) = issue_ls_fallback.filter(|_| {
+                error.code() == Some(cadence_agent::remote_cli::ISSUE_LS_LIMIT_UNSUPPORTED)
+            }) {
                 match cadence_agent::remote_cli::call_verb(
                     &target,
                     verb,

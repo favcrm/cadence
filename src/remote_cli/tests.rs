@@ -3521,6 +3521,25 @@ fn cad2150_board_without_review_text_gets_a_typed_refusal_only_when_asked() {
     assert!(result.unwrap_err().to_string().contains("Release order"));
 }
 
+/// CAD-2277: a board that predates `limit` on `issue_ls` answers `400
+/// invalid_request`; only a call carrying `limit` gets the typed code so
+/// `src/cli/remote.rs` can retry once without `limit` and slice locally.
+#[test]
+fn cad2277_board_without_issue_ls_limit_gets_typed_refusal_only_when_limit_sent() {
+    let refused = json!({"ok": false, "error": {"code": "invalid_request"}});
+    let mut with_limit = json!({"project": "ops"}).as_object().unwrap().clone();
+    with_limit.insert("limit".to_string(), json!(5));
+    let (result, _) = run(vec![(400, "", refused.clone())], "issue_ls", with_limit, 10);
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), Some(super::ISSUE_LS_LIMIT_UNSUPPORTED));
+
+    let without_limit = json!({"project": "ops"}).as_object().unwrap().clone();
+    let (plain_result, _) = run(vec![(400, "", refused)], "issue_ls", without_limit, 10);
+    let plain_err = plain_result.unwrap_err();
+    assert_eq!(plain_err.code(), None);
+    assert_eq!(plain_err.kind(), "rejected");
+}
+
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
 /// capability_unavailable) is a release-order refusal — never "no evidence"
 /// and never a fallback to the older repo-scoped verb. The matching write
