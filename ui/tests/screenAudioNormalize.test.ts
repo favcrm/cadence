@@ -9,6 +9,7 @@ import {
   normalizeChannelDataToWavChunks,
   resampleMonoFallback,
   sniffAudioContainer,
+  startLiveMicrophoneCapture,
   trySliceCanonicalWav16k,
 } from "../src/features/workspace-apps/screen/audioNormalize";
 
@@ -164,12 +165,135 @@ void (async () => {
   (globalThis as { AudioContext?: unknown }).AudioContext = FakeAudioContext;
   try {
     const m4aHeader = new Uint8Array([0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20, 0, 0, 0, 0]);
-    const m4aBlob = Object.assign(new Blob([m4aHeader], { type: "" }), { lastModified: fileTime });
-    const decodedM4a = await normalizeAudioFile(m4aBlob);
+    const m4aFile = new File([m4aHeader], "voice-memo.m4a", { type: "", lastModified: fileTime });
+    const decodedM4a = await normalizeAudioFile(m4aFile);
     check(decodedM4a.container === "mp4" && decodedM4a.durationSeconds === 2 && decodedM4a.heldAt === "2026-11-12T10:15:00.000Z",
       "iPhone .m4a with empty MIME type decodes via AudioContext and preserves lastModified held_at");
   } finally {
     (globalThis as { AudioContext?: unknown }).AudioContext = prevAudioContext;
+  }
+
+  // 7. Live microphone capture: Firefox sample-rate mismatch fallback + hardware track cleanup on setup throw.
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  try {
+    // 7a. Firefox NotSupportedError on 16kHz AudioContext.createMediaStreamSource falls back to default 48kHz context cleanly.
+    let trackStopped = 0;
+    const closedContexts: number[] = [];
+    let scriptProcessorHandler: ((ev: { inputBuffer: { getChannelData: (ch: number) => Float32Array } }) => void) | null = null;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          async getUserMedia() {
+            return {
+              getTracks: () => [{ stop: () => { trackStopped++; } }],
+            };
+          },
+        },
+      },
+    });
+    class FirefoxAudioContext {
+      sampleRate: number;
+      state = "running";
+      destination = {};
+      constructor(opts?: { sampleRate?: number }) {
+        this.sampleRate = opts?.sampleRate ?? 48_000;
+      }
+      createMediaStreamSource() {
+        if (this.sampleRate === AUDIO_SAMPLE_RATE) {
+          throw new DOMException(
+            "Connecting AudioNodes from AudioContexts with different sample-rate is currently not supported",
+            "NotSupportedError",
+          );
+        }
+        return { connect() {}, disconnect() {} };
+      }
+      createGain() {
+        return { gain: { value: 1 }, connect() {}, disconnect() {} };
+      }
+      createScriptProcessor() {
+        const node = {
+          onaudioprocess: null as typeof scriptProcessorHandler,
+          connect() {},
+          disconnect() {},
+        };
+        Object.defineProperty(node, "onaudioprocess", {
+          get: () => scriptProcessorHandler,
+          set: (fn) => { scriptProcessorHandler = fn; },
+        });
+        return node;
+      }
+      async close() {
+        closedContexts.push(this.sampleRate);
+      }
+    }
+    (globalThis as { AudioContext?: unknown }).AudioContext = FirefoxAudioContext;
+
+    const liveChunks: Array<{ frames: number }> = [];
+    const live = await startLiveMicrophoneCapture({
+      segmentSeconds: 1,
+      onSegment: (chunk) => liveChunks.push({ frames: chunk.frames }),
+    });
+    check(closedContexts.length === 1 && closedContexts[0] === 16_000, "mismatched 16kHz AudioContext closed immediately on Firefox fallback");
+    check(trackStopped === 0, "mic track stays live after Firefox fallback");
+    const block48k = new Float32Array(48_000).fill(0.2);
+    const invokeProcessor = scriptProcessorHandler as ((ev: {
+      inputBuffer: { getChannelData: (ch: number) => Float32Array };
+    }) => void) | null;
+    invokeProcessor?.({ inputBuffer: { getChannelData: () => block48k } });
+    const fin = await live.finish();
+    check(liveChunks.length === 1 && liveChunks[0]!.frames === 16_000 && fin.durationSeconds === 1,
+      "48kHz fallback resamples into canonical 16kHz WAV segment");
+    check(trackStopped === 1 && closedContexts.includes(48_000), "finish() stops mic track and closes fallback AudioContext");
+
+    // 7b. Post-getUserMedia setup throw stops all MediaStream tracks and closes AudioContext (zero hardware mic leak).
+    let leakedTrackStops = 0;
+    let leakedCtxCloses = 0;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          async getUserMedia() {
+            return {
+              getTracks: () => [{ stop: () => { leakedTrackStops++; } }],
+            };
+          },
+        },
+      },
+    });
+    class ThrowingSetupAudioContext {
+      sampleRate = 48_000;
+      state = "running";
+      destination = {};
+      createMediaStreamSource() {
+        return { connect() {}, disconnect() {} };
+      }
+      createGain() {
+        return { gain: { value: 1 }, connect() {}, disconnect() {} };
+      }
+      createScriptProcessor(): never {
+        throw new Error("script_processor_unavailable");
+      }
+      async close() {
+        leakedCtxCloses++;
+      }
+    }
+    (globalThis as { AudioContext?: unknown }).AudioContext = ThrowingSetupAudioContext;
+    let threwSetup = false;
+    try {
+      await startLiveMicrophoneCapture({ onSegment: () => {} });
+    } catch {
+      threwSetup = true;
+    }
+    check(threwSetup && leakedTrackStops === 1 && leakedCtxCloses === 1,
+      "post-getUserMedia throw stops MediaStream tracks and closes AudioContext");
+  } finally {
+    (globalThis as { AudioContext?: unknown }).AudioContext = prevAudioContext;
+    if (prevNavigator) {
+      Object.defineProperty(globalThis, "navigator", prevNavigator);
+    } else {
+      delete (globalThis as { navigator?: unknown }).navigator;
+    }
   }
 
   console.log("screenAudioNormalize checks pass");

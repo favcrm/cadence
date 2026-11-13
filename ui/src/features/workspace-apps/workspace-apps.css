@@ -669,7 +669,7 @@ textarea.wa-prompt-input {
   cursor: pointer;
 }
 .wa-audio-tab.is-active {
-  background: var(--color-ink-750, var(--color-ink-700));
+  background: var(--color-ink-700);
   color: var(--color-ink-100);
 }
 .wa-audio-tab:disabled {
@@ -711,10 +711,10 @@ textarea.wa-prompt-input {
   flex: none;
 }
 .wa-audio-dot.is-recording {
-  background: var(--color-danger, #ef4444);
+  background: var(--color-fail, #ef4444);
 }
 .wa-audio-dot.is-paused {
-  background: var(--color-warning, #f59e0b);
+  background: var(--color-warn, #f59e0b);
 }
 .wa-audio-clock {
   font-size: 1.25rem;
@@ -784,9 +784,9 @@ textarea.wa-prompt-input {
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.65rem 0.75rem;
-  border: 1px solid color-mix(in srgb, var(--color-danger, #ef4444) 45%, var(--color-ink-700));
+  border: 1px solid color-mix(in srgb, var(--color-fail, #ef4444) 45%, var(--color-ink-700));
   border-radius: 0.5rem;
-  background: color-mix(in srgb, var(--color-danger, #ef4444) 10%, var(--color-ink-850));
+  background: color-mix(in srgb, var(--color-fail, #ef4444) 10%, var(--color-ink-850));
   font-size: var(--text-label);
 }
 .wa-audio-alert p {

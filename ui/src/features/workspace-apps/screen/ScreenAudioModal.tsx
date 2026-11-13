@@ -6,7 +6,6 @@ import { sessionHeaders } from "../../../lib/sessionKey";
 import { WorkspaceDialog } from "../WorkspaceDialog";
 import {
   AudioNormalizeError,
-  MAX_AUDIO_UPLOAD_BYTES,
   normalizeAudioFile,
   SCREEN_AUDIO_ACCEPT,
   startLiveMicrophoneCapture,
@@ -340,7 +339,15 @@ export default function ScreenAudioModal({
           const text = (body as TranscribeReply).text.trim();
           setSegments((prev) =>
             prev.map((item) =>
-              item.requestId === next.requestId ? { ...item, status: "done", text, errorCode: null } : item,
+              item.requestId === next.requestId
+                ? {
+                    ...item,
+                    status: "done",
+                    text,
+                    errorCode: null,
+                    chunk: { ...item.chunk, wavBytes: new Uint8Array(0), base64: "" },
+                  }
+                : item,
             ),
           );
         }
@@ -545,8 +552,23 @@ export default function ScreenAudioModal({
       capturedDurationSec > 0
         ? capturedDurationSec
         : Math.max(1, Math.round(totalChunkMs / 1000));
+    let boundedTranscript = effectiveTranscript.slice(0, AUDIO_TRANSCRIPT_CHARS_MAX);
+    const maxUtf8Bytes = 240 * 1024;
+    if (new TextEncoder().encode(boundedTranscript).length > maxUtf8Bytes) {
+      let lo = 0;
+      let hi = boundedTranscript.length;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (new TextEncoder().encode(boundedTranscript.slice(0, mid)).length <= maxUtf8Bytes) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      boundedTranscript = boundedTranscript.slice(0, lo);
+    }
     const payload: ScreenAudioCapture = {
-      transcript: effectiveTranscript.slice(0, AUDIO_TRANSCRIPT_CHARS_MAX),
+      transcript: boundedTranscript,
       duration_seconds: durationSeconds,
       held_at: heldAt,
       source: activeMode === "record" ? "recording" : "upload",
@@ -564,11 +586,10 @@ export default function ScreenAudioModal({
       onClose={requestClose}
     >
       <div className="wa-stack wa-audio-body" data-screen-audio-modal={activeMode}>
-        <div className="wa-audio-tabs" role="tablist" aria-label={t("Audio capture mode")}>
+        <div className="wa-audio-tabs" role="group" aria-label={t("Audio capture mode")}>
           <button
             type="button"
-            role="tab"
-            aria-selected={activeMode === "record"}
+            aria-pressed={activeMode === "record"}
             className={activeMode === "record" ? "wa-audio-tab is-active" : "wa-audio-tab"}
             disabled={isBusy}
             onClick={() => {
@@ -579,8 +600,7 @@ export default function ScreenAudioModal({
           </button>
           <button
             type="button"
-            role="tab"
-            aria-selected={activeMode === "upload"}
+            aria-pressed={activeMode === "upload"}
             className={activeMode === "upload" ? "wa-audio-tab is-active" : "wa-audio-tab"}
             disabled={isBusy}
             onClick={() => {
@@ -753,9 +773,6 @@ export default function ScreenAudioModal({
                     {selectedFileName ? t("Choose another file") : t("Select audio file")}
                   </span>
                 </label>
-                <span className="sr-only">
-                  {Math.round(MAX_AUDIO_UPLOAD_BYTES / (1024 * 1024))} MB
-                </span>
               </div>
             )}
 

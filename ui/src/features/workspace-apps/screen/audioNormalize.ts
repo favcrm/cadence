@@ -517,7 +517,7 @@ export async function normalizeAudioFile(
     } catch {
       audioCtx = new AudioCtx();
     }
-    const decoded = await audioCtx.decodeAudioData(fullBuffer.slice(0));
+    const decoded = await audioCtx.decodeAudioData(fullBuffer);
     const channels: Float32Array[] = [];
     for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
       channels.push(decoded.getChannelData(ch));
@@ -605,142 +605,208 @@ export async function startLiveMicrophoneCapture(options: {
     throw new Error("webaudio_unsupported");
   }
 
-  let audioCtx: AudioContext;
-  try {
-    audioCtx = new AudioCtx({ sampleRate: AUDIO_SAMPLE_RATE });
-  } catch {
-    audioCtx = new AudioCtx();
-  }
-  if (audioCtx.state === "suspended") {
-    await audioCtx.resume().catch(() => {});
-  }
-
-  const inputRate = audioCtx.sampleRate;
-  const segmentFrames = Math.max(
-    AUDIO_SAMPLE_RATE,
-    Math.floor((options.segmentSeconds ?? RECORD_SEGMENT_SECONDS) * AUDIO_SAMPLE_RATE),
-  );
-
-  let paused = false;
-  let closed = false;
-  let segmentIndex = 0;
-  let totalFrames16k = 0;
-  let buffered = new Int16Array(segmentFrames);
-  let bufferedOffset = 0;
-
-  // Fractional resampler state across blocks when inputRate !== 16000.
-  const step = inputRate / AUDIO_SAMPLE_RATE;
-  let sourceCursor = 0;
-
-  const emitBuffer = (count: number) => {
-    if (count <= 0) return;
-    const samples = buffered.subarray(0, count);
-    const wavBytes = encodeWav16kMonoPcm16(samples);
-    const chunk: WavAudioChunk = {
-      index: segmentIndex++,
-      frames: count,
-      durationMs: Math.max(1, Math.round((count / AUDIO_SAMPLE_RATE) * 1000)),
-      wavBytes,
-      base64: bytesToBase64(wavBytes),
-    };
-    buffered = new Int16Array(segmentFrames);
-    bufferedOffset = 0;
-    options.onSegment(chunk);
-  };
-
-  const pushMonoSamples = (mono: Float32Array) => {
-    if (closed || mono.length === 0) return;
-    if (paused) {
-      options.onLevel?.(0);
-      return;
-    }
-
-    let sumSq = 0;
-    for (let i = 0; i < mono.length; i++) {
-      const s = mono[i]!;
-      sumSq += s * s;
-    }
-    const rms = Math.sqrt(sumSq / mono.length);
-    options.onLevel?.(Math.min(1, rms * 3.2));
-
-    if (inputRate === AUDIO_SAMPLE_RATE) {
-      for (let i = 0; i < mono.length; i++) {
-        buffered[bufferedOffset++] = floatToPcm16Sample(mono[i]!);
-        totalFrames16k++;
-        if (bufferedOffset >= segmentFrames) {
-          emitBuffer(bufferedOffset);
-        }
-      }
-    } else {
-      while (sourceCursor < mono.length) {
-        const idx = Math.floor(sourceCursor);
-        const end = Math.min(mono.length, Math.max(idx + 1, Math.ceil(sourceCursor + step)));
-        let acc = 0;
-        let cnt = 0;
-        for (let j = idx; j < end; j++) {
-          acc += mono[j]!;
-          cnt++;
-        }
-        const sample = cnt > 0 ? acc / cnt : mono[idx]!;
-        buffered[bufferedOffset++] = floatToPcm16Sample(sample);
-        totalFrames16k++;
-        if (bufferedOffset >= segmentFrames) {
-          emitBuffer(bufferedOffset);
-        }
-        sourceCursor += step;
-      }
-      sourceCursor -= mono.length;
-      if (sourceCursor < 0) sourceCursor = 0;
-    }
-
-    options.onElapsedMs?.(Math.round((totalFrames16k / AUDIO_SAMPLE_RATE) * 1000));
-  };
-
-  const sourceNode = audioCtx.createMediaStreamSource(stream);
-  const silentGain = audioCtx.createGain();
-  silentGain.gain.value = 0;
-  silentGain.connect(audioCtx.destination);
-
+  let audioCtx: AudioContext | null = null;
+  let sourceNode: MediaStreamAudioSourceNode | null = null;
+  let silentGain: GainNode | null = null;
   let workletNode: AudioWorkletNode | null = null;
   let fallbackNode: ScriptProcessorNode | null = null;
 
   try {
-    if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
-      const blob = new Blob([WORKLET_PROCESSOR_SOURCE], { type: "application/javascript" });
-      const url = URL.createObjectURL(blob);
-      try {
-        await audioCtx.audioWorklet.addModule(url);
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-      workletNode = new AudioWorkletNode(audioCtx, "screen-audio-capture");
-      workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
-        if (event.data instanceof Float32Array) {
-          pushMonoSamples(event.data);
-        }
-      };
-      sourceNode.connect(workletNode);
-      workletNode.connect(silentGain);
+    try {
+      audioCtx = new AudioCtx({ sampleRate: AUDIO_SAMPLE_RATE });
+    } catch {
+      audioCtx = new AudioCtx();
     }
-  } catch {
-    workletNode = null;
-  }
+    if (audioCtx.state === "suspended") {
+      await audioCtx.resume().catch(() => {});
+    }
+    try {
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+    } catch {
+      // Firefox allows new AudioContext({ sampleRate: 16000 }) and then throws
+      // NotSupportedError in createMediaStreamSource when the mic track runs at 48/44.1 kHz.
+      await audioCtx.close().catch(() => {});
+      audioCtx = new AudioCtx();
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume().catch(() => {});
+      }
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+    }
 
-  if (!workletNode) {
-    // Fallback for restricted WebViews where Blob AudioWorklet modules are blocked.
-    fallbackNode = audioCtx.createScriptProcessor(4096, 1, 1);
-    fallbackNode.onaudioprocess = (event: AudioProcessingEvent) => {
-      const input = event.inputBuffer.getChannelData(0);
-      pushMonoSamples(new Float32Array(input));
+    const activeCtx = audioCtx;
+    const activeSource = sourceNode;
+    const inputRate = activeCtx.sampleRate;
+    const segmentFrames = Math.max(
+      AUDIO_SAMPLE_RATE,
+      Math.floor((options.segmentSeconds ?? RECORD_SEGMENT_SECONDS) * AUDIO_SAMPLE_RATE),
+    );
+
+    let paused = false;
+    let closed = false;
+    let segmentIndex = 0;
+    let totalFrames16k = 0;
+    let buffered = new Int16Array(segmentFrames);
+    let bufferedOffset = 0;
+
+    // Fractional resampler state across blocks when inputRate !== 16000.
+    const step = inputRate / AUDIO_SAMPLE_RATE;
+    let sourceCursor = 0;
+
+    const emitBuffer = (count: number) => {
+      if (count <= 0) return;
+      const samples = buffered.subarray(0, count);
+      const wavBytes = encodeWav16kMonoPcm16(samples);
+      const chunk: WavAudioChunk = {
+        index: segmentIndex++,
+        frames: count,
+        durationMs: Math.max(1, Math.round((count / AUDIO_SAMPLE_RATE) * 1000)),
+        wavBytes,
+        base64: bytesToBase64(wavBytes),
+      };
+      buffered = new Int16Array(segmentFrames);
+      bufferedOffset = 0;
+      options.onSegment(chunk);
     };
-    sourceNode.connect(fallbackNode);
-    fallbackNode.connect(silentGain);
-  }
 
-  const teardown = async () => {
-    if (closed) return;
-    closed = true;
-    options.onLevel?.(0);
+    const pushMonoSamples = (mono: Float32Array) => {
+      if (closed || mono.length === 0) return;
+      if (paused) {
+        options.onLevel?.(0);
+        return;
+      }
+
+      let sumSq = 0;
+      for (let i = 0; i < mono.length; i++) {
+        const s = mono[i]!;
+        sumSq += s * s;
+      }
+      const rms = Math.sqrt(sumSq / mono.length);
+      options.onLevel?.(Math.min(1, rms * 3.2));
+
+      if (inputRate === AUDIO_SAMPLE_RATE) {
+        for (let i = 0; i < mono.length; i++) {
+          buffered[bufferedOffset++] = floatToPcm16Sample(mono[i]!);
+          totalFrames16k++;
+          if (bufferedOffset >= segmentFrames) {
+            emitBuffer(bufferedOffset);
+          }
+        }
+      } else {
+        while (sourceCursor < mono.length) {
+          const idx = Math.floor(sourceCursor);
+          const end = Math.min(mono.length, Math.max(idx + 1, Math.ceil(sourceCursor + step)));
+          let acc = 0;
+          let cnt = 0;
+          for (let j = idx; j < end; j++) {
+            acc += mono[j]!;
+            cnt++;
+          }
+          const sample = cnt > 0 ? acc / cnt : mono[idx]!;
+          buffered[bufferedOffset++] = floatToPcm16Sample(sample);
+          totalFrames16k++;
+          if (bufferedOffset >= segmentFrames) {
+            emitBuffer(bufferedOffset);
+          }
+          sourceCursor += step;
+        }
+        sourceCursor -= mono.length;
+        if (sourceCursor < 0) sourceCursor = 0;
+      }
+
+      options.onElapsedMs?.(Math.round((totalFrames16k / AUDIO_SAMPLE_RATE) * 1000));
+    };
+
+    silentGain = activeCtx.createGain();
+    silentGain.gain.value = 0;
+    silentGain.connect(activeCtx.destination);
+
+    try {
+      if (activeCtx.audioWorklet && typeof AudioWorkletNode === "function") {
+        const blob = new Blob([WORKLET_PROCESSOR_SOURCE], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        try {
+          await activeCtx.audioWorklet.addModule(url);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+        workletNode = new AudioWorkletNode(activeCtx, "screen-audio-capture");
+        workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
+          if (event.data instanceof Float32Array) {
+            pushMonoSamples(event.data);
+          }
+        };
+        activeSource.connect(workletNode);
+        workletNode.connect(silentGain);
+      }
+    } catch {
+      workletNode = null;
+    }
+
+    if (!workletNode) {
+      // Fallback for restricted WebViews where Blob AudioWorklet modules are blocked.
+      fallbackNode = activeCtx.createScriptProcessor(4096, 1, 1);
+      fallbackNode.onaudioprocess = (event: AudioProcessingEvent) => {
+        const input = event.inputBuffer.getChannelData(0);
+        pushMonoSamples(new Float32Array(input));
+      };
+      activeSource.connect(fallbackNode);
+      fallbackNode.connect(silentGain);
+    }
+
+    const activeSilentGain = silentGain;
+    const teardown = async () => {
+      if (closed) return;
+      closed = true;
+      options.onLevel?.(0);
+      try {
+        workletNode?.port.close();
+        workletNode?.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        fallbackNode?.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        activeSource.disconnect();
+        activeSilentGain.disconnect();
+      } catch {
+        // ignore
+      }
+      stream.getTracks().forEach((track) => track.stop());
+      await activeCtx.close().catch(() => {});
+    };
+
+    return {
+      startedAtIso,
+      pause() {
+        paused = true;
+        options.onLevel?.(0);
+      },
+      resume() {
+        paused = false;
+      },
+      async finish() {
+        if (!closed) {
+          const minTailFrames = segmentIndex === 0 ? 1 : Math.floor(0.15 * AUDIO_SAMPLE_RATE);
+          if (bufferedOffset >= minTailFrames) {
+            emitBuffer(bufferedOffset);
+          }
+        }
+        await teardown();
+        return {
+          totalFrames: totalFrames16k,
+          durationSeconds: Math.max(0, Math.round(totalFrames16k / AUDIO_SAMPLE_RATE)),
+        };
+      },
+      async abort() {
+        bufferedOffset = 0;
+        await teardown();
+      },
+    };
+  } catch (setupError) {
     try {
       workletNode?.port.close();
       workletNode?.disconnect();
@@ -753,40 +819,21 @@ export async function startLiveMicrophoneCapture(options: {
       // ignore
     }
     try {
-      sourceNode.disconnect();
-      silentGain.disconnect();
+      sourceNode?.disconnect();
+      silentGain?.disconnect();
     } catch {
       // ignore
     }
-    stream.getTracks().forEach((track) => track.stop());
-    await audioCtx.close().catch(() => {});
-  };
-
-  return {
-    startedAtIso,
-    pause() {
-      paused = true;
-      options.onLevel?.(0);
-    },
-    resume() {
-      paused = false;
-    },
-    async finish() {
-      if (!closed) {
-        const minTailFrames = segmentIndex === 0 ? 1 : Math.floor(0.15 * AUDIO_SAMPLE_RATE);
-        if (bufferedOffset >= minTailFrames) {
-          emitBuffer(bufferedOffset);
-        }
+    for (const track of stream.getTracks()) {
+      try {
+        track.stop();
+      } catch {
+        // ignore
       }
-      await teardown();
-      return {
-        totalFrames: totalFrames16k,
-        durationSeconds: Math.max(0, Math.round(totalFrames16k / AUDIO_SAMPLE_RATE)),
-      };
-    },
-    async abort() {
-      bufferedOffset = 0;
-      await teardown();
-    },
-  };
+    }
+    if (audioCtx) {
+      await audioCtx.close().catch(() => {});
+    }
+    throw setupError;
+  }
 }
