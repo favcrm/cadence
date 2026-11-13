@@ -2791,8 +2791,8 @@ with the ui tests' compiler options and runs every payload through the UI's
 own client code (`parseBrowserRead`, `readBrowser`, `viewBrowser`,
 `stopBrowser`, `readPersonalIdentity`, `mutatePersonalProfile`, the member
 thread store, `sendToAssistant`, `screenTag`, `screenProjection`, `shapeFor`
-and `parseMount`). A refused payload is named and `up` stops;
-`tests/qaBoardFixtures.test.ts` runs the same check. `/api/meta` and
+and `parseMount`). A refused payload is named and `up` stops: the board is
+proved by running it, so there is no separate unit test. `/api/meta` and
 `/api/locale` have no exported parser: meta is checked by `writeBlock` and
 `kickoffBlock`, and both by the live render.
 
