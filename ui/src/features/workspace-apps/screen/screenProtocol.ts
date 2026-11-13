@@ -54,6 +54,7 @@ export type ChildToHost =
   | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
   | AudioRequest
+  | AudioSessionRequest
   | CallRequest
   | SlotRequest
   | ToolRequest;
@@ -217,16 +218,153 @@ export const SCREEN_RECORDS_V1 = "screen-records.v1";
 export const SCREEN_LOCALE_V1 = "screen-locale.v1";
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
+/** Headless inline host-mediated audio capture/upload session streaming (`screen-audio.v2`). */
+export const SCREEN_AUDIO_V2 = "screen-audio.v2";
 export type ScreenAudioMode = "record" | "upload";
 export type ScreenAudioSource = "recording" | "upload";
+export type ScreenAudioLanguage = "" | "en" | "zh";
+export type ScreenAudioSessionPhase =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "paused"
+  | "stopping"
+  | "transcribing"
+  | "ready"
+  | "error";
 export interface AudioRequest { v: 2; op: "audio"; id: string; mode: ScreenAudioMode }
+export type AudioSessionRequest =
+  | { v: 2; op: "audio-session"; id: string; action: "start"; language?: ScreenAudioLanguage }
+  | { v: 2; op: "audio-session"; id: string; action: "pause" | "resume" | "stop" | "retry" | "cancel" }
+  | {
+      v: 2;
+      op: "audio-session";
+      id: string;
+      action: "upload";
+      bytes: ArrayBuffer;
+      mime_type: string;
+      file_name?: string;
+      last_modified?: number;
+      language?: ScreenAudioLanguage;
+    };
 export interface ScreenAudioCapture {
   transcript: string;
   duration_seconds: number;
   held_at: string;
   source: ScreenAudioSource;
 }
+export interface ScreenAudioSessionSnapshot {
+  session_id: string;
+  mode: ScreenAudioMode;
+  phase: ScreenAudioSessionPhase;
+  held_at: string;
+  elapsed_seconds: number;
+  level: number;
+  peak: number;
+  segments_total: number;
+  segments_done: number;
+  segments_in_flight: number;
+  segments_failed: number;
+  no_speech_segments: number;
+  transcript: string;
+  error: ActionRefusal | null;
+}
+export interface AudioSessionEvent {
+  v: 2;
+  op: "audio-session-event";
+  state: ScreenAudioSessionSnapshot;
+}
 export const AUDIO_TRANSCRIPT_CHARS_MAX = 200_000;
+export const AUDIO_UPLOAD_BYTES_MAX = 50 * 1024 * 1024;
+const AUDIO_SESSION_PHASES: readonly ScreenAudioSessionPhase[] = [
+  "idle",
+  "starting",
+  "recording",
+  "paused",
+  "stopping",
+  "transcribing",
+  "ready",
+  "error",
+];
+const AUDIO_SESSION_KEYS =
+  "elapsed_seconds,error,held_at,level,mode,no_speech_segments,peak,phase,segments_done,segments_failed,segments_in_flight,segments_total,session_id,transcript";
+const REFUSAL_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+
+function isBoundedSafeInt(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+function readArrayBufferByteLength(value: unknown): number | null {
+  if (typeof value !== "object" || value === null || typeof ARRAY_BUFFER_BYTE_LENGTH !== "function") {
+    return null;
+  }
+  try {
+    const len = ARRAY_BUFFER_BYTE_LENGTH.call(value);
+    return typeof len === "number" && Number.isSafeInteger(len) && len >= 0 ? len : null;
+  } catch {
+    return null;
+  }
+}
+export function parseActionRefusal(value: unknown): ActionRefusal | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const errRec = value as Record<string, unknown>;
+  if (
+    Object.keys(errRec).sort().join() !== "code,text" ||
+    typeof errRec.code !== "string" ||
+    !REFUSAL_CODE.test(errRec.code) ||
+    typeof errRec.text !== "string" ||
+    errRec.text.length === 0 ||
+    errRec.text.length > 512
+  ) {
+    return null;
+  }
+  return { code: errRec.code, text: errRec.text };
+}
+export function parseScreenAudioSessionSnapshot(value: unknown): ScreenAudioSessionSnapshot | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).sort().join() !== AUDIO_SESSION_KEYS) return null;
+  if (typeof r.session_id !== "string" || !/^[A-Za-z0-9_-]{0,64}$/.test(r.session_id)) return null;
+  if (r.mode !== "record" && r.mode !== "upload") return null;
+  if (typeof r.phase !== "string" || !(AUDIO_SESSION_PHASES as readonly string[]).includes(r.phase)) return null;
+  if (typeof r.held_at !== "string" || r.held_at.length > 64 || (r.phase !== "idle" && r.held_at.length === 0)) return null;
+  if (!isBoundedSafeInt(r.elapsed_seconds, 0, 86_400)) return null;
+  if (!isBoundedSafeInt(r.level, 0, 100) || !isBoundedSafeInt(r.peak, 0, 100)) return null;
+  if (
+    !isBoundedSafeInt(r.segments_total, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_done, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_in_flight, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_failed, 0, 10_000) ||
+    !isBoundedSafeInt(r.no_speech_segments, 0, 10_000)
+  ) {
+    return null;
+  }
+  if (typeof r.transcript !== "string" || r.transcript.length > AUDIO_TRANSCRIPT_CHARS_MAX) return null;
+  let error: ActionRefusal | null = null;
+  if (r.error !== null) {
+    error = parseActionRefusal(r.error);
+    if (!error) return null;
+  }
+  return {
+    session_id: r.session_id,
+    mode: r.mode,
+    phase: r.phase as ScreenAudioSessionPhase,
+    held_at: r.held_at,
+    elapsed_seconds: r.elapsed_seconds,
+    level: r.level,
+    peak: r.peak,
+    segments_total: r.segments_total,
+    segments_done: r.segments_done,
+    segments_in_flight: r.segments_in_flight,
+    segments_failed: r.segments_failed,
+    no_speech_segments: r.no_speech_segments,
+    transcript: r.transcript,
+    error,
+  };
+}
 export function parseScreenAudioCapture(value: unknown): ScreenAudioCapture | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const r = value as Record<string, unknown>;
@@ -308,6 +446,8 @@ export type ReplyMessage =
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "audio-reply"; id: string; ok: true; data: ScreenAudioCapture }
   | { v: 2; op: "audio-reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "audio-session-reply"; id: string; ok: true; data: ScreenAudioSessionSnapshot }
+  | { v: 2; op: "audio-session-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt; data?: never }
   | { v: 2; op: "slot-state"; id: string; state: "done"; data: unknown; receipt?: never }
   | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
@@ -336,7 +476,7 @@ export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -670,7 +810,7 @@ export interface ScreenPush {
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -746,7 +886,8 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
+    !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -759,6 +900,60 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     (d.mode === "record" || d.mode === "upload")
   ) {
     return { v: 2, op: "audio", id: d.id, mode: d.mode };
+  }
+  if (d.v === 2 && d.op === "audio-session" && typeof d.id === "string" && ACTION_ID.test(d.id)) {
+    const keys = Object.keys(d).sort().join();
+    const validLanguage = (lang: unknown): lang is ScreenAudioLanguage =>
+      lang === "" || lang === "en" || lang === "zh";
+    if (d.action === "start" && (keys === "action,id,op,v" || (keys === "action,id,language,op,v" && validLanguage(d.language)))) {
+      return d.language !== undefined
+        ? { v: 2, op: "audio-session", id: d.id, action: "start", language: d.language as ScreenAudioLanguage }
+        : { v: 2, op: "audio-session", id: d.id, action: "start" };
+    }
+    if (
+      (d.action === "pause" || d.action === "resume" || d.action === "stop" || d.action === "retry" || d.action === "cancel") &&
+      keys === "action,id,op,v"
+    ) {
+      return { v: 2, op: "audio-session", id: d.id, action: d.action };
+    }
+    if (d.action === "upload") {
+      const allowedUploadKeys = new Set([
+        "v",
+        "op",
+        "id",
+        "action",
+        "bytes",
+        "mime_type",
+        "file_name",
+        "last_modified",
+        "language",
+      ]);
+      const byteLen = readArrayBufferByteLength(d.bytes);
+      if (
+        !Object.keys(d).every(k => allowedUploadKeys.has(k)) ||
+        byteLen === null ||
+        !isBoundedSafeInt(byteLen, 1, AUDIO_UPLOAD_BYTES_MAX) ||
+        typeof d.mime_type !== "string" ||
+        d.mime_type.length > 128 ||
+        (d.file_name !== undefined && (typeof d.file_name !== "string" || d.file_name.length > 255)) ||
+        (d.last_modified !== undefined && !isBoundedSafeInt(d.last_modified, 0, 8_640_000_000_000_000)) ||
+        (d.language !== undefined && !validLanguage(d.language))
+      ) {
+        return null;
+      }
+      return {
+        v: 2,
+        op: "audio-session",
+        id: d.id,
+        action: "upload",
+        bytes: d.bytes as ArrayBuffer,
+        mime_type: d.mime_type,
+        ...(d.file_name !== undefined ? { file_name: d.file_name } : {}),
+        ...(d.last_modified !== undefined ? { last_modified: d.last_modified } : {}),
+        ...(d.language !== undefined ? { language: d.language } : {}),
+      };
+    }
+    return null;
   }
   if (Object.keys(d).sort().join() === "op,unsaved,v" && d.v === 2 && d.op === "leave" &&
       typeof d.unsaved === "boolean") {

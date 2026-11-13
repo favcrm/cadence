@@ -127,15 +127,21 @@ call `ownLeaveState()` after an accepted `screen.v2` PUSH to publish
 
 Any `screen.v2` screen may opt into `screen-audio.v1` (`audio: true` on
 `createScreenBridge`, or `accepts: ["screen.v2", "screen-audio.v1"]` on
-`createScreenReceiver`). When the host projects `audio_capture: 1` for the live
-mount (`bridge.canAudioCapture()`), calling
-`bridge.audioCapture(scope, { mode: "record" | "upload" })` asks the top-level
-host shell to run microphone recording or audio file upload outside the
-sandboxed iframe and resolves `{ transcript, duration_seconds, held_at, source }`.
-Unlike `call`/`tool`, interactive audio capture waits without a wall-clock RPC
-timeout unless `timeoutMs` is passed explicitly, and cancelling or refusing the
-modal (`cancelled`, `owner_required`, `conflict`, `unavailable`) leaves the
-open screen bridge intact.
+`createScreenReceiver`) for host-modal audio capture (`bridge.audioCapture`), or
+into `screen-audio.v2` (`audio: "v2"` on `createScreenBridge`, or
+`accepts: ["screen.v2", "screen-audio.v2"]` on `createScreenReceiver`) for
+headless inline audio sessions (`bridge.audioSession` + `bridge.onAudioSession`).
+When the host projects `audio_capture: 1` for the live mount
+(`bridge.canAudioCapture()`), `screen-audio.v1` opens the host modal and resolves
+`{ transcript, duration_seconds, held_at, source }`, while `screen-audio.v2`
+keeps the UI inside the app's own screen and streams bounded
+`ScreenAudioSessionSnapshot` events (`phase`, `elapsed_seconds`, `level` 0..100,
+`peak` 0..100, segment counts, `transcript`, `error`) for `start`, `pause`,
+`resume`, `stop`, `upload` (bounded `ArrayBuffer` <= 50 MiB), `retry`, and
+`cancel` without opening any host modal. Interactive audio commands wait without
+a wall-clock RPC timeout unless `timeoutMs` is passed explicitly, and refusals
+(`cancelled`, `owner_required`, `conflict`, `unavailable`, `mic_unavailable`)
+leave the open screen bridge intact.
 
 A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
 host then sends the records projection, which the app validates in `onPush` (or

@@ -269,6 +269,7 @@ var RECORD_SLOT_VERBS = [
 	"works.export"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
+Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
 var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",

@@ -8,7 +8,8 @@ import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import ScreenAudioModal from "./ScreenAudioModal";
-import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import { createScreenAudioSession, type ScreenAudioSessionController } from "./screenAudioSession";
+import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type AudioSessionRequest, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
 import { DrawerRestorer } from "./drawerRestore";
 import { SourcesInvalidator } from "./sourcesInvalidation";
 import { workspaceApps } from "../workspaceApps";
@@ -252,6 +253,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     // The live mount's action token, held host-side for invoke relay and
     // revoked on teardown so a stale mount's handle cannot be reused.
     let actionToken: string | null = null;
+    let inlineAudio: ScreenAudioSessionController | null = null;
     let services: ReturnType<typeof recordServices> | null = null;
     const isCurrent = () => !retired && !controller.signal.aborted && !session.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && JSON.stringify([latest.current.install_id, latest.current.digest, latest.current.tag, latest.current.context_id]) === scope;
     let releaseLeaveGuard: (() => void) | null = null;
@@ -291,7 +293,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
-    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
+    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); inlineAudio?.dispose(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -362,6 +364,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
         actionTokenRef.current = actionToken;
+        if (actionToken) {
+          inlineAudio = createScreenAudioSession({
+            actionToken,
+            signal: session.signal,
+            getLocale: () => presentationLocale.current,
+            onEvent: nextState => {
+              if (isCurrent()) owned?.sendAudioSessionEvent(nextState);
+            },
+          });
+        }
         owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
           () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
@@ -434,7 +446,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                     resolve(result);
                   },
                 });
-              }) } : {}),
+              }),
+              audioSession: (req: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }) =>
+                !isCurrent() || !inlineAudio || ui.signal.aborted
+                  ? Promise.resolve({ ok: false as const, refusal: { code: "cancelled", text: "Audio capture was cancelled." } })
+                  : inlineAudio.dispatch(req, ui.signal),
+              disposeAudioSession: () => inlineAudio?.dispose(),
+            } : {}),
           } : undefined, undefined, unsaved => {
             if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
             clearLeaveGuard();
@@ -467,6 +485,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       unsubscribe();
       session.dispose();
       clearLeaveGuard();
+      inlineAudio?.dispose();
       services?.retire();
       mounted.current = null;
       navigationCallbacks.current.onNavigation?.(null);

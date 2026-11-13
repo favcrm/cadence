@@ -1,4 +1,4 @@
-import { parseChild, parseDraftImageRef, parseInit, parseScreenAudioCapture, SCREEN_AUDIO_V1, SCREEN_LOCALE_V1, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { AUDIO_UPLOAD_BYTES_MAX, parseChild, parseDraftImageRef, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_LOCALE_V1, type AudioSessionRequest, type ScreenAudioSessionSnapshot, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -365,6 +365,153 @@ void (async () => {
   check(activeSignals.length === 1 && !activeSignals[0]!.aborted, "in-flight signal starts active");
   audioChannel.close();
   check(activeSignals[0]!.aborted, "closing channel aborts in-flight captureAudio signal");
+
+  // CAD-2281: screen-audio.v2 headless inline audio session negotiation & fencing.
+  check(SCREEN_AUDIO_V2 === "screen-audio.v2", "screen-audio.v2 token exported");
+  check(parseChild({ v: 2, op: "audio-session", id: "as-1", action: "start", language: "zh" })?.op === "audio-session",
+    "audio-session start parses");
+  check(parseChild({ v: 2, op: "audio-session", id: "as-2", action: "stop" })?.op === "audio-session",
+    "audio-session stop parses");
+  check(
+    parseChild({
+      v: 2,
+      op: "audio-session",
+      id: "as-3",
+      action: "upload",
+      bytes: new Uint8Array([1, 2, 3]).buffer,
+      mime_type: "audio/wav",
+      file_name: "clip.wav",
+      last_modified: 1_763_000_000_000,
+    })?.op === "audio-session",
+    "audio-session upload with ArrayBuffer parses",
+  );
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-bad", action: "upload", bytes: new Uint8Array([1]), mime_type: "audio/wav" }),
+    "audio-session upload rejects non-ArrayBuffer typed array");
+  const vmMod = await (Function('return import("node:vm")')() as Promise<{ runInNewContext(code: string): unknown }>);
+  const crossRealmBuffer = vmMod.runInNewContext("new ArrayBuffer(16)");
+  check(
+    parseChild({
+      v: 2,
+      op: "audio-session",
+      id: "as-cross-realm",
+      action: "upload",
+      bytes: crossRealmBuffer,
+      mime_type: "audio/wav",
+    })?.op === "audio-session",
+    "audio-session upload accepts genuine cross-realm ArrayBuffer",
+  );
+  const spoofedBuffer = Object.create(ArrayBuffer.prototype);
+  Object.defineProperty(spoofedBuffer, "byteLength", { value: 16 });
+  Object.defineProperty(spoofedBuffer, Symbol.toStringTag, { value: "ArrayBuffer" });
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-spoof", action: "upload", bytes: spoofedBuffer, mime_type: "audio/wav" }),
+    "audio-session upload rejects Symbol.toStringTag spoof without [[ArrayBufferData]]");
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-nan", action: "upload", bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: Number.NaN }, mime_type: "audio/wav" }),
+    "audio-session upload rejects NaN byteLength spoof");
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-huge", action: "upload", bytes: new ArrayBuffer(AUDIO_UPLOAD_BYTES_MAX + 1), mime_type: "audio/wav" }),
+    "audio-session upload rejects genuine ArrayBuffer over 50 MiB");
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-extra", action: "start", action_token: "forged" }),
+    "audio-session start rejects extra authority fields");
+
+  const validSessionSnap: ScreenAudioSessionSnapshot = {
+    session_id: "sess_v2",
+    mode: "record",
+    phase: "recording",
+    held_at: "2026-11-13T05:00:00.000Z",
+    elapsed_seconds: 8,
+    level: 50,
+    peak: 75,
+    segments_total: 1,
+    segments_done: 1,
+    segments_in_flight: 0,
+    segments_failed: 0,
+    no_speech_segments: 0,
+    transcript: "Hello team",
+    error: null,
+  };
+  check(parseScreenAudioSessionSnapshot(validSessionSnap)?.session_id === "sess_v2", "valid session snapshot parses");
+  check(!parseScreenAudioSessionSnapshot({ ...validSessionSnap, level: 101 }), "out-of-range level rejected");
+  check(
+    !parseScreenAudioSessionSnapshot({
+      ...validSessionSnap,
+      error: { code: "BAD-CODE", text: "Invalid code" },
+    }),
+    "non-canonical error.code rejected by parseScreenAudioSessionSnapshot",
+  );
+
+  // Combining screen-audio.v1 and screen-audio.v2 in ready.accepts closes the mount.
+  const combinedSource = {} as Window;
+  const combinedPort = new Port();
+  const combinedChannel = new ScreenChannel(combinedSource, toolReceipt, actingPush, () => {}, () => {}, () => {}, undefined, audioHost);
+  combinedChannel.receive({ source: combinedSource, origin: "null", data: init, ports: [combinedPort as unknown as MessagePort] });
+  combinedPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1", "screen-audio.v2"] });
+  check(combinedPort.closed, "combining screen-audio.v1 and screen-audio.v2 closes mount");
+
+  // Unopted or v1-audio-only frame sending op:"audio-session" closes immediately.
+  const v1OnlySource = {} as Window;
+  const v1OnlyPort = new Port();
+  const v1OnlyChannel = new ScreenChannel(v1OnlySource, toolReceipt, actingPush, () => {}, () => {}, () => {}, undefined, audioHost);
+  v1OnlyChannel.receive({ source: v1OnlySource, origin: "null", data: init, ports: [v1OnlyPort as unknown as MessagePort] });
+  v1OnlyPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1"] });
+  v1OnlyChannel.sendAudioSessionEvent(validSessionSnap);
+  check(!v1OnlyPort.sent.some(m => (m as { op?: string }).op === "audio-session-event"),
+    "audio-session-event is never pushed to screen-audio.v1 mounts");
+  v1OnlyPort.receive({ v: 2, op: "audio-session", id: "forged-v2", action: "start" });
+  check(v1OnlyPort.closed, "op:audio-session closes a frame that did not negotiate screen-audio.v2");
+
+  let disposedCount = 0;
+  const sessionSignals: AbortSignal[] = [];
+  let releaseSessionStart: ((res: { ok: true; data: unknown }) => void) | null = null;
+  const v2Host = {
+    ...toolHost,
+    audioSession: (_req: AudioSessionRequest, opts: { actionToken: string; signal: AbortSignal }) => {
+      check(opts.actionToken === tokenA, "audioSession receives host-held actionToken");
+      sessionSignals.push(opts.signal);
+      return new Promise<{ ok: true; data: unknown }>(resolve => {
+        releaseSessionStart = resolve;
+      });
+    },
+    disposeAudioSession: () => { disposedCount += 1; },
+  } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+
+  const v2Source = {} as Window;
+  const v2Port = new Port();
+  const v2Channel = new ScreenChannel(v2Source, toolReceipt, actingPush, () => {}, () => {}, () => {}, undefined, v2Host);
+  v2Channel.receive({ source: v2Source, origin: "null", data: init, ports: [v2Port as unknown as MessagePort] });
+  v2Port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v2"] });
+  check((v2Port.sent[0] as ScreenPush).audio_capture === 1, "screen-audio.v2 projects audio_capture: 1");
+
+  v2Channel.sendAudioSessionEvent(validSessionSnap);
+  const pushedEvt = v2Port.sent.find(m => (m as { op?: string }).op === "audio-session-event") as { state?: ScreenAudioSessionSnapshot } | undefined;
+  check(pushedEvt?.state?.transcript === "Hello team", "sendAudioSessionEvent forwards validated snapshot");
+
+  v2Port.receive({ v: 2, op: "audio-session", id: "as-run-1", action: "start" });
+  releaseSessionStart!({ ok: true, data: validSessionSnap });
+  await Promise.resolve();
+  await Promise.resolve();
+  const v2Reply = v2Port.sent.find(m => (m as { id?: string }).id === "as-run-1") as { op?: string; ok?: boolean } | undefined;
+  check(v2Reply?.op === "audio-session-reply" && v2Reply.ok === true, "audio-session-reply delivers validated snapshot");
+
+  v2Port.receive({ v: 2, op: "audio-session", id: "as-run-2", action: "stop" });
+  check(sessionSignals.length === 2 && !sessionSignals[1]!.aborted, "in-flight audioSession signal starts active");
+  v2Channel.close();
+  check(sessionSignals[1]!.aborted && disposedCount === 1, "closing channel aborts in-flight audioSession and calls disposeAudioSession");
+
+  // Malformed refusal from audioSession dispatcher is sanitized to canonical CODE instead of crashing child bridge.
+  const badRefusalHost = {
+    ...toolHost,
+    audioSession: async () => ({ ok: false as const, refusal: { code: "BAD-UPSTREAM", text: "Upstream error" } }),
+  } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+  const sanitizeSource = {} as Window;
+  const sanitizePort = new Port();
+  const sanitizeChannel = new ScreenChannel(sanitizeSource, toolReceipt, actingPush, () => {}, () => {}, () => {}, undefined, badRefusalHost);
+  sanitizeChannel.receive({ source: sanitizeSource, origin: "null", data: init, ports: [sanitizePort as unknown as MessagePort] });
+  sanitizePort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v2"] });
+  sanitizePort.receive({ v: 2, op: "audio-session", id: "as-bad-ref", action: "start" });
+  await Promise.resolve();
+  await Promise.resolve();
+  const sanitizedReply = sanitizePort.sent.find(m => (m as { id?: string }).id === "as-bad-ref") as { ok?: boolean; refusal?: { code?: string; text?: string } } | undefined;
+  check(sanitizedReply?.ok === false && sanitizedReply.refusal?.code === "failed" && !sanitizePort.closed,
+    "malformed host audioSession refusal is sanitized to canonical code");
 
   console.log("screen lifecycle adversarial checks pass");
 })();
