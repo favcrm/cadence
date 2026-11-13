@@ -542,6 +542,23 @@ fn a_board_code_off_its_row_is_not_a_trusted_refusal() {
     assert!(checked > 0);
 }
 
+/// CAD-2275: the copy client trusts a table row as "nothing changed", and
+/// the row is matched before the after-forward 5xx classification. A 5xx
+/// row would therefore call a write that may have landed refused, so every
+/// row must be a 4xx.
+#[test]
+fn every_wiki_copy_refusal_row_is_a_4xx() {
+    assert!(!super::WIKI_COPY_REFUSALS.is_empty());
+    for row in super::WIKI_COPY_REFUSALS {
+        assert!(
+            (400..500).contains(&row.status),
+            "{} {} is not a 4xx",
+            row.status,
+            row.code
+        );
+    }
+}
+
 #[test]
 fn a_missing_wiki_page_on_a_hosted_board_is_named_by_code() {
     let error = message_family_refusal("read", 404, Some("not_found"), reject("generic"));

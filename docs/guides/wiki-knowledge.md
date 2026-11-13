@@ -209,15 +209,19 @@ in every case.
 - **75** — the command deadline passed before the request was sent, or the
   board's gateway answered that the board was still waking and did not forward
   it. That request changed nothing. Run the same copy again with
-  `--resume <job>`; a plain rerun starts a new job instead.
+  `--resume <job>`, with a larger `--wake-timeout` if the board was still
+  waking; a plain rerun starts a new job instead.
 - **1** — the outcome is not confirmed: a reply was lost, a local daemon refused
   (its refusal can follow a publish), or the client cannot prove the request
   was never sent. It may have landed. Run the same copy with `--resume <job>`
   before repeating anything; the job shows what was recorded.
 
 A local source problem found while sending a chunk, such as a file that changed
-or shrank after the manifest was pinned or could not be read, exits 3; a chunk
-answer the client cannot read exits 1.
+or shrank after the manifest was pinned or could not be read, exits 3: that run
+did not apply the file and did not finish the job; copy again without
+`--resume`. The same holds when the board's job holds more bytes for a file than
+its pinned size, which resuming cannot fix. A chunk answer the client cannot
+read exits 1.
 
 `--wait-index` polls that job's own status until the index is covered, the job
 fails, or the command deadline

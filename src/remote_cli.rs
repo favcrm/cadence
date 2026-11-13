@@ -5402,6 +5402,11 @@ struct WikiCopyRefusal {
 /// CAD-2261/CAD-2271: the one list of a hosted board's own transfer
 /// refusals. [`wiki_copy_refusal`] prints from it and
 /// [`is_wiki_copy_refusal`] trusts only its codes, so the two cannot drift.
+///
+/// CAD-2275: every row is a 4xx, a refusal the board gives before it acts.
+/// [`wiki_copy_refusal`] runs before the after-forward 5xx classification,
+/// so a 5xx row would be trusted as "nothing changed" when the write may
+/// have landed. A test holds this.
 const WIKI_COPY_REFUSALS: &[WikiCopyRefusal] = &[
     WikiCopyRefusal {
         status: 409,
