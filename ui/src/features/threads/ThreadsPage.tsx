@@ -149,7 +149,17 @@ function clearScopedDraft(scope: string): void {
   setComposerContent(scope, "", []);
   for (const item of attachItems(scope)) removeAttach(scope, item.key);
 }
-export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: boolean; onOpenWorkItem?: (id: string) => void }) {
+export default function ThreadsPage({
+  operator,
+  onOpenWorkItem,
+  workConversationsEnabled = true,
+  humanThreadsEnabled = true,
+}: {
+  operator: boolean;
+  onOpenWorkItem?: (id: string) => void;
+  workConversationsEnabled?: boolean;
+  humanThreadsEnabled?: boolean;
+}) {
   const href = useHref();
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   const url = useMemo(() => readThreadsUrl(search), [search]);
@@ -174,7 +184,7 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
   const threadsTick = useSyncExternalStore(subscribeThreadsChanged, threadsRevisionNow);
   // Human discovery is the server's `me`, independent of the operator flag:
   // a verified member sees human rooms; agent conversations stay operator-only.
-  const human = useHumanMe(true);
+  const human = useHumanMe(humanThreadsEnabled);
   const humanRooms = useHumanRooms(human.me !== null);
   const people = useHumanPeople(human.me !== null && humanId !== null);
   const agents = useHumanAgents(human.me !== null);
@@ -220,10 +230,11 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
   // earlier request, or one started under a scope the page has since left,
   // is dropped and resolves to null.
   const listRequest = useRef(0);
+  const listLegacyRef = useRef(false);
   const listScope = `${operator}|${url.project ?? ""}|${url.agent ?? ""}|${url.includeSystem}`;
   const listScopeNow = useRef(listScope);
   const loadList = useCallback(async (): Promise<ConversationRow[] | null> => {
-    if (!operator) return [];
+    if (!operator || !workConversationsEnabled || listLegacyRef.current) return [];
     const n = ++listRequest.current;
     // Publish only the newest request; a rows result is still returned to a
     // caller in the same scope (the send that opened a draft needs it).
@@ -238,13 +249,14 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
       if (latest()) setList({ rows: out.conversations, error: null, legacy: false });
       return sameScope() ? out.conversations : null;
     } catch (e) {
+      if (predatesThreads(e)) listLegacyRef.current = true;
       if (latest()) {
         if (predatesThreads(e)) setList({ rows: [], error: null, legacy: true });
         else setList((s) => ({ ...s, error: e instanceof Error ? e.message : String(e) }));
       }
       return sameScope() ? [] : null;
     }
-  }, [operator, url.project, url.agent, url.includeSystem, listScope]);
+  }, [operator, workConversationsEnabled, url.project, url.agent, url.includeSystem, listScope]);
 
   // (1) Live: the existing SSE feed invalidates `agents` on every agent,
   // job and message change, and the `threads` frame names every topic and

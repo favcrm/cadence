@@ -522,12 +522,14 @@ function AppCard({
             )}
             <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
           </div>
-          <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>
+          {row.project && (
+            <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>
+          )}
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
             {row.error ? (
               row.error
-            ) : appName ? (
+            ) : row.project && appName ? (
               <AppActivity project={row.project} name={appName} needs={needs} />
             ) : (
               t("activity unavailable")
