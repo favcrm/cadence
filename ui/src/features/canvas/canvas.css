@@ -272,6 +272,8 @@
 .bz-ask { color: var(--color-ink-300); font-size: var(--text-label); }
 .bz-head[data-confirm] .bz-actions { order: 9; flex: 1 0 100%; flex-wrap: wrap; }
 .bz-head[data-confirm] .bz-ask { margin-right: auto; }
+/* The two answers stay together and at the right edge, beside the question or under it. */
+.bz-answers { display: inline-flex; flex: none; gap: 6px; margin-left: auto; }
 
 /* The live view fills the panel: a frame to the provider's own page, scoped by frame-src. */
 .bz-viewer { flex: 1; min-height: 0; display: flex; }

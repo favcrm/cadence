@@ -390,8 +390,11 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     dock = (
       <>
         <span className="bz-ask" role="alert">{t("Stop the session?")}{b.session?.signedIn ? ` ${t("Anything signed in to this session is lost.")}` : ""}</span>
-        <button key="go" type="button" className="btn btn-sm btn-danger" data-bz-act="go" onClick={stop}>{t("Stop session")}</button>
-        <button key="keep" type="button" className="btn btn-sm" data-bz-act="keep" onClick={keep}>{t("Keep it running")}</button>
+        {/* One group: a long question never leaves either answer alone on a row. */}
+        <span key="answers" className="bz-answers">
+          <button key="go" type="button" className="btn btn-sm btn-danger" data-bz-act="go" onClick={stop}>{t("Stop session")}</button>
+          <button key="keep" type="button" className="btn btn-sm" data-bz-act="keep" onClick={keep}>{t("Keep it running")}</button>
+        </span>
       </>
     );
   } else if (stopping) {
