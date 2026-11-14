@@ -269,8 +269,24 @@ async function down(opts, quiet = false) {
     return;
   }
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid()) die(`${root} is not this user's QA board directory`);
-  let state = { procs: [], ports: {}, cadence: "cadence" };
-  try { state = readJson(path.join(root, "state.json")); } catch { /* a partial up: nothing recorded */ }
+  // `up` writes state.json before it starts anything, so an unreadable one is
+  // never a partial start: something may still run that this cannot see. Fail
+  // closed: stop nothing, delete nothing, and say so.
+  let state;
+  try {
+    state = readJson(path.join(root, "state.json"));
+  } catch (error) {
+    const report = {
+      qa_board: name,
+      state: "unreadable",
+      state_dir: root,
+      error: String(error?.message ?? error),
+      next: "inspect the processes and the directory by hand; nothing was stopped or removed",
+    };
+    if (!quiet) console.log(JSON.stringify(report, null, 2));
+    process.exitCode = 1;
+    return;
+  }
   const left = await stop(state.procs);
   const reset = fs.existsSync(path.join(root, SANDBOX)) ? cadence(state.cadence, root, "reset", SANDBOX) : null;
   if (left.length === 0) fs.rmSync(root, { recursive: true, force: true });

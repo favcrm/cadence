@@ -2801,7 +2801,9 @@ the sandbox build from `/api/version`, the fixtures' revision, the ports and
 the URLs. Open the UI at the printed `http://localhost:<port>/`: the app frame
 accepts an http parent only on a `localhost` name. `down` stops exactly the
 recorded processes, runs `cadence dev reset`, removes the state directory and
-reports any process, port or file left.
+reports any process, port or file left. If its record (`state.json`) cannot be
+read, `down` stops and removes nothing, reports `unreadable` and exits 1:
+inspect by hand.
 
 The control endpoint is on the fixture proxy's port:
 
