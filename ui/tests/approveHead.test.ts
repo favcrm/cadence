@@ -29,6 +29,17 @@ async function main() {
     await React.act(async () => { root.render(React.createElement(Probe, { head: "b".repeat(40) })); });
     if (String(host.textContent) !== "owner") throw new Error("successful owner read must clear the stale member restriction");
 
+    // CAD-2311: 403 owner_required / approver_not_allowed on approvalState set member === true on initial read.
+    for (const code of ["owner_required", "approver_not_allowed"] as const) {
+      api.approvalState = async () => {
+        throw new ApiError("owner required", 403, { code });
+      };
+      await React.act(async () => { root.render(React.createElement(Probe, { head: `${code[0].repeat(39)}1` })); });
+      if (host.textContent !== "member") {
+        throw new Error(`expected 403 ${code} read refusal to set member === true, got ${host.textContent}`);
+      }
+    }
+
     // CAD-2303: head changes clear stale in-force state immediately, optional context passes cleanly,
     // 400 from predating boards/daemons degrades to strict { repo, pr, head }, and 403/409 do not retry.
     const stateCalls: Array<{ repo: string; pr: number; head: string; context?: { issue?: string; project?: string } }> = [];
@@ -116,6 +127,31 @@ async function main() {
       if (approveCalls.length !== before + 1) {
         throw new Error(`HTTP ${code} must not retry approveHead (${approveCalls.length - before} calls)`);
       }
+    }
+
+    // CAD-2311: changing head/targetKey while a context-carrying approve is in-flight prevents the 400 fallback POST on the old key.
+    let rejectInFlight400!: (err: unknown) => void;
+    const baseApproveHead = api.approveHead;
+    const beforeRace: number = approveCalls.length;
+    api.approveHead = (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) => {
+      approveCalls.push({ repo, pr, head, context });
+      return new Promise((_resolve, reject) => { rejectInFlight400 = reject; });
+    };
+    await React.act(async () => {
+      latest.approve();
+      await Promise.resolve();
+    });
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "f".repeat(40), issue: "CAD-2311", project: "cadence" }));
+    });
+    api.approveHead = baseApproveHead;
+    await React.act(async () => {
+      rejectInFlight400(new ApiError("unsupported field", 400, { code: "validation_failed" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    if (approveCalls.length !== beforeRace + 1) {
+      throw new Error(`target change during 400 fallback must suppress retry (${approveCalls.length - beforeRace} calls)`);
     }
     console.log("approval member-to-owner recovery passed");
   } finally {
