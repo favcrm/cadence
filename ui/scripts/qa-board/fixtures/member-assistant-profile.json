@@ -1,0 +1,18 @@
+{
+  "action": "update",
+  "applies": "next_turn",
+  "conversation_id": "cm_qa_board",
+  "assistant": {
+    "org": "org_qa_board",
+    "sub": "usr_qa_member",
+    "assistant_id": "asst_qa_board",
+    "alias": "assistant",
+    "conversation_id": "cm_qa_board",
+    "state": "ready",
+    "bootstrap_state": "complete",
+    "authority_rev": 2,
+    "created": 1794600000,
+    "updated": 1794600000,
+    "identity": { "name": "Poppy", "tone": null, "look": "designer", "revision": 2 }
+  }
+}

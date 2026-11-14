@@ -2754,6 +2754,72 @@ canonical navigation and a representative old contextual deep link; verify
 that the installation/context is retained and missing access fails safely.
 This procedure grants no permission to refresh staging or production.
 
+### QA board for hosted surfaces (CAD-2291)
+
+Member chat, the Browser panel and member app screens exist only on a hosted
+board, and an agent session cannot sign in to one. The QA board serves a
+checkout's UI with those routes answered from fixtures as a synthetic hosted
+member, so a Browser QA run needs no hand-written stub:
+
+```bash
+node ui/scripts/qa-board.mjs up --checkout <path> [--name <n>] [--cadence <bin>]
+node ui/scripts/qa-board.mjs status [--name <n>]
+node ui/scripts/qa-board.mjs down [--name <n>]
+```
+
+`up` needs `<checkout>/ui/node_modules` (hard-link the shared one when
+`ui/bun.lock` matches; never `bun install` there) and `openssl`. It starts,
+on free ports in 3110-3199:
+
+- a `cadence dev` sandbox board for native routes, under
+  `/tmp/qa-board-<name>` (mode 700, short for the socket path limit);
+- Vite from `<checkout>/ui`, with `/api` sent to the fixture proxy;
+- the fixture proxy. It answers `/api/meta` (a signed-in hosted member with the
+  sandbox's build identity), `/api/locale`, `member-assistant/*`,
+  `/api/browser` with `/view` and `/stop`, and one member app screen: the
+  repo's starter app (`app-toolchain/template/app`) through the binary's own
+  frame (`cadence app frame-kit`), with an installation, context and run shaped
+  like `ui/scripts/app-fixtures/producer.ts`. Every other route goes to the
+  sandbox; a sandbox 401 is answered as a 404, so it cannot sign the member
+  out, and is counted;
+- a stand-in HTTPS live view with a self-signed certificate made at start
+  (browse with `--ignore-https-errors`). Its Done button ends a takeover.
+
+The fixtures are in `ui/scripts/qa-board/fixtures/`. Before serving them, `up`
+compiles `ui/scripts/qa-board/validate.ts` against the checkout's `ui/src`
+with the ui tests' compiler options and runs every payload through the UI's
+own client code (`parseBrowserRead`, `readBrowser`, `viewBrowser`,
+`stopBrowser`, `readPersonalIdentity`, `mutatePersonalProfile`, the member
+thread store, `sendToAssistant`, `screenTag`, `screenProjection`, `shapeFor`
+and `parseMount`). A refused payload is named and `up` stops: the board is
+proved by running it, so there is no separate unit test. `/api/meta` and
+`/api/locale` have no exported parser: meta is checked by `writeBlock` and
+`kickoffBlock`, and both by the live render.
+
+`up` prints its provenance as JSON: the checkout's sha and whether it is clean,
+the sandbox build from `/api/version`, the fixtures' revision, the ports and
+the URLs. Open the UI at the printed `http://localhost:<port>/`: the app frame
+accepts an http parent only on a `localhost` name. `down` stops exactly the
+recorded processes, runs `cadence dev reset`, removes the state directory and
+reports any process, port or file left. If its record (`state.json`) cannot be
+read, `down` stops and removes nothing, reports `unreadable` and exits 1:
+inspect by hand.
+
+The control endpoint is on the fixture proxy's port:
+
+- `POST /__qa/state` takes `{"browser": "handoff" | "handoff-signed-in" |
+  "active" | "ended", "state", "signedIn", "url", "instructions", "locale":
+  "en" | "zh-TW" | null}`, every field optional: a preset, then overrides. A
+  browser state `parseBrowserRead` refuses is answered 400. The UI polls the
+  session while it is live; a locale change shows after a reload.
+- `GET /__qa/state` returns the current state. `GET /__qa/counts` returns the
+  requests per fixture route, the live-view requests and the sandbox routes
+  whose 401 was masked.
+
+Every result from the QA board is **fixture evidence**, not a real hosted
+board run, and the report says so. A check on a real hosted board stays an
+operator canary.
+
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
 hover), the issue page edits fields/body/links/refs, comments and attaches
