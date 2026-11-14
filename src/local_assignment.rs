@@ -35,6 +35,10 @@ pub mod notifications;
 pub mod reporting;
 mod wire;
 
+// Independently authored CAD-2290 acceptance; implementers must not weaken it.
+#[cfg(test)]
+mod cad2290_hosted_finish_acceptance;
+
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
 const MAX_BODY: u64 = 1024 * 1024;
 

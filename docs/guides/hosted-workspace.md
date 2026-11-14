@@ -724,10 +724,17 @@ equal to the tip, a merge time, and the default branch as its base (GitHub keeps
 that head after a squash). A branch pushed but not merged does not release, and
 neither does a lane merged without a PR, a non-GitHub `origin`, or a case where
 `gh` is missing, not signed in or times out. The release also refuses
-when the worktree holds gitignored files other than top-level `target/` and
-`node_modules/` (for example `.env`, `docs/*`, `docs/target/`), naming a sample,
-because removal deletes them; git reports an ignored directory as one entry, so a
-file kept inside `target/` or `node_modules/` is deleted with it. When the
+when the worktree holds gitignored files it may not delete, naming a sample,
+because removal deletes them. It may delete top-level `target/`, any
+`node_modules/` or `__pycache__/` directory (or a symlink to one) at any depth,
+and the lane's `.env` while it is exactly what lane setup last wrote: when every
+line setup writes is its own (the cargo-shim `PATH`, the slot env), it records
+the file's sha256 in the worktree's own git dir, and one changed or extra line
+keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept
+(CAD-2290). Anything else ignored (for example `docs/*`, `claudedocs/`,
+`docs/target/`, or a lane's `.env` from before CAD-2290, which has no record)
+refuses. Git reports an ignored directory as one entry, so a file kept inside
+one of those directories is deleted with it. When the
 refusal will not change (the ledger cannot identify the lane, or no PR or
 ancestry evidence can exist), take the manual path: verify the merge, that
 nothing is using the lane and that you do not need its ignored files, then
