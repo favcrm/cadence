@@ -7,7 +7,8 @@ import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
-import { useTranslate } from "../../lib/locale";
+import { useLocale } from "../../lib/locale";
+import { localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, pickLocaleEntry } from "../workspace-apps/appLocale";
 import "./explorer.css";
 import { PublicAppDetail } from "./publicDirectory";
 
@@ -17,7 +18,7 @@ import { PublicAppDetail } from "./publicDirectory";
  * state, with no marketplace hand-off and no Install for that source.
  */
 export default function CatalogDetail({ id, viewer }: { id: string; viewer: Viewer }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const isOp = viewer.operator === true && !viewer.readOnly;
   const [card, setCard] = useState<CatalogCard | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -82,25 +83,29 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   }
 
   const access = card.access ?? [];
-  const can = card.can ?? card.listing?.can ?? [];
+  const cardI18n = parseAppDisplayI18n(card.i18n);
+  const locListing = pickLocaleEntry(card.i18n, locale) ?? pickLocaleEntry(card.listing?.i18n, locale);
+  const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: card.listing }, locale, t);
+  const tagline = localizedAppTagline({ tagline: card.tagline, i18n: cardI18n, listing: card.listing }, locale, t);
+  const can = locListing?.can ?? card.can ?? card.listing?.can ?? [];
   const shots = card.screenshots ?? card.listing?.screenshots ?? [];
-  const about = card.about ?? card.listing?.about;
+  const about = locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
 
   return (
-    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={card.title}>
+    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={title}>
       <Link href="/apps/explore" className="text-label text-ink-400 hover:text-ink-100">{t("← Explore")}</Link>
 
       <div className="hero mt-3">
         <AppGlyph name={card.name} icon={card.listing?.icon} size="lg" />
         <div className="min-w-0">
-          <h1>{card.title}</h1>
-          <p className="tag">{card.listing?.tagline}</p>
+          <h1>{title}</h1>
+          <p className="tag">{tagline}</p>
           <div className="by">
             <TrustChip trust={card.trust} />
             <span>·</span>
-            <span>{card.listing?.category ?? "App"}</span>
+            <span>{card.listing?.category ? t(card.listing.category) : t("App")}</span>
             {installed && <span className="chip ok">{t("Installed")}</span>}
             {card.state === "off" && <span className="chip">{t("Access off")}</span>}
             {removed && <span className="chip">{t("Removed")}</span>}
@@ -121,11 +126,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       )}
       {removed && (
         <div className="alert warn mt-4" role="status">
-          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => card.title)}
+          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => title)}
         </div>
       )}
       {card.state === "off" && (
-        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => card.title)}</div>
+        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => title)}</div>
       )}
 
       <div className="dgrid">
@@ -206,7 +211,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
                 return href === null ? (
                   <span className="text-micro text-ink-500">{t("This install has no unique app page — see Manage.")}</span>
                 ) : (
-                  <Link className="btn btn-primary btn-lg" href={href}>Open {card.title}</Link>
+                  <Link className="btn btn-primary btn-lg" href={href}>Open {title}</Link>
                 );
               })()}
               {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
@@ -216,7 +221,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             isOp && card.restorable ? (
               <>
                 <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? "Restoring…" : "Restore"}</Button>
-                <span className="text-micro text-ink-500">Brings back {card.title} with its data.</span>
+                <span className="text-micro text-ink-500">Brings back {title} with its data.</span>
               </>
             ) : (
               <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>

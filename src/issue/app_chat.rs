@@ -187,6 +187,88 @@ fn unique(seen: &mut HashSet<String>, key: String, path: &str, what: &str) -> Re
     Ok(())
 }
 
+fn i18n_locales(
+    value: &Value,
+    path: &str,
+    allowed: &[&str],
+    mut check: impl FnMut(&serde_json::Map<String, Value>, &str) -> Result<()>,
+) -> Result<()> {
+    let Some(map) = value.as_object() else {
+        return fail(path, "expected an object");
+    };
+    if map.is_empty() || map.len() > cadence_core::app_screen_decl::MAX_I18N_LOCALES {
+        return fail(
+            path,
+            format!(
+                "expected 1 to {} locales",
+                cadence_core::app_screen_decl::MAX_I18N_LOCALES
+            ),
+        );
+    }
+    for (locale, entry) in map {
+        if !cadence_core::app_screen_decl::valid_locale_tag(locale) {
+            return fail(path, format!("invalid locale tag: {locale:?}"));
+        }
+        let lp = format!("{path}.{locale}");
+        let entry_map = object(entry, &lp, allowed)?;
+        if entry_map.is_empty() {
+            return fail(&lp, "expected at least one localized field");
+        }
+        check(entry_map, &lp)?;
+    }
+    Ok(())
+}
+
+fn label_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<()> {
+    let Some(val) = parent.get("i18n") else {
+        return Ok(());
+    };
+    i18n_locales(val, &format!("{path}.i18n"), &["label"], |entry, lp| {
+        text(entry.get("label"), &format!("{lp}.label"), 40)?;
+        Ok(())
+    })
+}
+
+fn context_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<()> {
+    let Some(val) = parent.get("i18n") else {
+        return Ok(());
+    };
+    i18n_locales(
+        val,
+        &format!("{path}.i18n"),
+        &["label", "prompts"],
+        |entry, lp| {
+            if entry.contains_key("label") {
+                text(entry.get("label"), &format!("{lp}.label"), 40)?;
+            }
+            if entry.contains_key("prompts") {
+                prompts(entry.get("prompts"), &format!("{lp}.prompts"))?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn card_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<()> {
+    let Some(val) = parent.get("i18n") else {
+        return Ok(());
+    };
+    i18n_locales(
+        val,
+        &format!("{path}.i18n"),
+        &["title", "text"],
+        |entry, lp| {
+            if entry.contains_key("title") {
+                text(entry.get("title"), &format!("{lp}.title"), 80)?;
+            }
+            if entry.contains_key("text") {
+                text(entry.get("text"), &format!("{lp}.text"), 240)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Refuse the descriptor text unless it is a valid `app-chat/v1` for
 /// `installed_app` (the manifest's `app`). Returns the parsed value.
 pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
@@ -224,7 +306,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("contexts.{i}");
-        let c = object(c, &p, &["id", "label", "prompts", "record"])?;
+        let c = object(c, &p, &["id", "label", "prompts", "record", "i18n"])?;
         unique(
             &mut seen,
             ident(c.get("id"), &format!("{p}.id"))?,
@@ -233,11 +315,13 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         )?;
         text(c.get("label"), &format!("{p}.label"), 40)?;
         prompts(c.get("prompts"), &format!("{p}.prompts"))?;
+        context_i18n(c, &p)?;
         if let Some(r) = c.get("record") {
             let rp = format!("{p}.record");
-            let r = object(r, &rp, &["label", "prompts"])?;
+            let r = object(r, &rp, &["label", "prompts", "i18n"])?;
             text(r.get("label"), &format!("{rp}.label"), 40)?;
             prompts(r.get("prompts"), &format!("{rp}.prompts"))?;
+            context_i18n(r, &rp)?;
         }
     }
     let mut seen = HashSet::new();
@@ -246,7 +330,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("attachments.{i}");
-        let a = object(a, &p, &["id", "label"])?;
+        let a = object(a, &p, &["id", "label", "i18n"])?;
         let id = ident(a.get("id"), &format!("{p}.id"))?;
         if !grammar().attachments.contains(&id) {
             return fail(&format!("{p}.id"), format!("not a host capability: {id}"));
@@ -255,6 +339,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         if a.contains_key("label") {
             text(a.get("label"), &format!("{p}.label"), 40)?;
         }
+        label_i18n(a, &p)?;
     }
     let mut seen = HashSet::new();
     for (i, d) in array(root.get("directives"), "directives", 8)?
@@ -295,7 +380,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("subjects.{i}");
-        let s = object(s, &p, &["kind", "label"])?;
+        let s = object(s, &p, &["kind", "label", "i18n"])?;
         unique(
             &mut seen,
             ident(s.get("kind"), &format!("{p}.kind"))?,
@@ -303,6 +388,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
             "subject kind",
         )?;
         text(s.get("label"), &format!("{p}.label"), 40)?;
+        label_i18n(s, &p)?;
     }
     if let Some(pres) = root.get("presentation") {
         let pres = object(pres, "presentation", &["showContext"])?;
@@ -314,26 +400,28 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
 }
 
 fn card_shape(card: &Value, p: &str) -> Result<()> {
-    let c = object(card, p, &["title", "text", "fields", "buttons"])?;
+    let c = object(card, p, &["title", "text", "fields", "buttons", "i18n"])?;
     text(c.get("title"), &format!("{p}.title"), 80)?;
     if c.contains_key("text") {
         text(c.get("text"), &format!("{p}.text"), 240)?;
     }
+    card_i18n(c, p)?;
     for (i, f) in array(c.get("fields"), &format!("{p}.fields"), 4)?
         .iter()
         .enumerate()
     {
         let fp = format!("{p}.fields.{i}");
-        let f = object(f, &fp, &["label", "from"])?;
+        let f = object(f, &fp, &["label", "from", "i18n"])?;
         text(f.get("label"), &format!("{fp}.label"), 40)?;
         ident(f.get("from"), &format!("{fp}.from"))?;
+        label_i18n(f, &fp)?;
     }
     for (i, b) in array(c.get("buttons"), &format!("{p}.buttons"), 2)?
         .iter()
         .enumerate()
     {
         let bp = format!("{p}.buttons.{i}");
-        let b = object(b, &bp, &["label", "run", "view"])?;
+        let b = object(b, &bp, &["label", "run", "view", "i18n"])?;
         text(b.get("label"), &format!("{bp}.label"), 40)?;
         let run = ident(b.get("run"), &format!("{bp}.run"))?;
         if !grammar().actions.contains(&run) {
@@ -341,6 +429,7 @@ fn card_shape(card: &Value, p: &str) -> Result<()> {
         }
         // open-view is the one v1 action and takes exactly a view id.
         ident(b.get("view"), &format!("{bp}.view"))?;
+        label_i18n(b, &bp)?;
     }
     Ok(())
 }
@@ -426,5 +515,86 @@ mod tests {
         assert_eq!(g.attachments, ["csv-import"]);
         assert_eq!(g.actions, ["open-view"]);
         assert!(g.forbidden.contains("install_id") && g.forbidden.contains("action"));
+    }
+
+    #[test]
+    fn validates_i18n_at_each_display_surface_and_refuses_violations() {
+        let check = |v: &Value| validate(&v.to_string(), "demo");
+
+        let mut ok = good();
+        ok["contexts"][0]["i18n"] = json!({
+            "zh-TW": { "label": "客戶", "prompts": ["列出上週新增的客戶"] }
+        });
+        ok["contexts"][0]["record"] = json!({
+            "label": "Customer",
+            "i18n": { "zh-TW": { "label": "客戶", "prompts": ["摘要最近互動"] } }
+        });
+        ok["attachments"] = json!([{
+            "id": "csv-import",
+            "label": "Import a customer list",
+            "i18n": { "zh-TW": { "label": "匯入客戶名單" } }
+        }]);
+        ok["subjects"] = json!([{
+            "kind": "customer",
+            "label": "Customer",
+            "i18n": { "zh-TW": { "label": "客戶" } }
+        }]);
+        ok["directives"] = json!([{
+            "match": "cadence_crm_import",
+            "card": {
+                "title": "Customer import",
+                "text": "You confirmed the reviewed rows. The assistant applies them.",
+                "i18n": {
+                    "zh-TW": {
+                        "title": "客戶匯入",
+                        "text": "您已確認檢視過的資料列，助理正在套用。"
+                    }
+                },
+                "fields": [{
+                    "label": "Rows",
+                    "from": "rows",
+                    "i18n": { "zh-TW": { "label": "筆數" } }
+                }],
+                "buttons": [{
+                    "label": "Open Customers",
+                    "run": "open-view",
+                    "view": "customers",
+                    "i18n": { "zh-TW": { "label": "開啟客戶列表" } }
+                }]
+            }
+        }]);
+        check(&ok).unwrap();
+
+        let mut bad = ok.clone();
+        bad["contexts"][0]["i18n"] = json!({});
+        assert!(check(&bad).is_err(), "empty i18n map");
+
+        let mut bad = ok.clone();
+        bad["contexts"][0]["i18n"] = json!({ "zh_TW": { "label": "客戶" } });
+        assert!(check(&bad).is_err(), "invalid locale tag");
+
+        let mut bad = ok.clone();
+        bad["contexts"][0]["i18n"] = json!({ "zh-TW": {} });
+        assert!(check(&bad).is_err(), "empty locale entry");
+
+        let mut bad = ok.clone();
+        bad["attachments"][0]["i18n"] = json!({ "zh-TW": { "title": "x" } });
+        assert!(check(&bad).is_err(), "unknown key on label i18n");
+
+        let mut bad = ok.clone();
+        bad["directives"][0]["card"]["i18n"] = json!({ "zh-TW": { "label": "x" } });
+        assert!(check(&bad).is_err(), "unknown key on card i18n");
+
+        let mut bad = ok.clone();
+        bad["subjects"][0]["i18n"] = json!({ "zh-TW": { "label": "客戶\n" } });
+        assert!(check(&bad).is_err(), "control char in i18n label");
+
+        let mut bad = ok.clone();
+        let mut too_many = serde_json::Map::new();
+        for i in 0..9 {
+            too_many.insert(format!("en-x{i}"), json!({ "label": "X" }));
+        }
+        bad["subjects"][0]["i18n"] = Value::Object(too_many);
+        assert!(check(&bad).is_err(), "more than 8 locales");
     }
 }

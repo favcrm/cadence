@@ -1230,7 +1230,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       : active.state === "failed"
         ? "The conversations could not be read — retry above"
         : "No conversation yet — start one with + New";
-  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
+  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
   // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;

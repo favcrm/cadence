@@ -15,6 +15,7 @@ import { readReturnDrawer, withoutReturnDrawer } from "../workspace-apps/socialC
 import { sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
+import { localizeAppChat } from "./chat/contract";
 import { useAppChatProjection } from "./chat/descriptorClient";
 import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
@@ -26,7 +27,8 @@ import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
-import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
+import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
+import { localizedAppTitle, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -135,6 +137,7 @@ export interface ActiveInstallation {
   kind: string;
   title: string;
   navigation?: ScreenNavigation | null;
+  i18n?: AppDisplayI18n | null;
 }
 
 export default function AppShell({
@@ -171,7 +174,7 @@ export default function AppShell({
    *  installId to its route and compares values before storing. */
   onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
-  const { t } = useLocale();
+  const { locale, t } = useLocale();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
   // A connect that left the board comes back with the drawer surface it was
@@ -747,6 +750,11 @@ export default function AppShell({
     return () => { current = false; };
   }, [contexts, generalSetupAttempt, installation, installId, receiptKey, receiptReady, setupScopeKey, viewer.operator, viewer.readOnly]);
 
+  const effectiveNavigation = useMemo(
+    () => screenNavigation ?? parseNavigation(installation?.navigation),
+    [installation?.navigation, screenNavigation],
+  );
+
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
   // so the shared sidebar/phone menu can nest this installation's
@@ -759,13 +767,14 @@ export default function AppShell({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
-        navigation: screenNavigation,
+        navigation: effectiveNavigation,
+        i18n: parseAppDisplayI18n(installation.i18n) ?? parseAppDisplayI18n(installation.listing?.i18n),
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation, receiptReady, screenNavigation]);
+  }, [effectiveNavigation, installId, installation, onInstallation, receiptReady]);
   // In-workspace scope changes (Social's picker, a screen's saved-context
   // verb) persist and emit through contextSelection. The shell applies the
   // emission to its own selection — the one scope chat, screen and the run
@@ -1029,7 +1038,17 @@ export default function AppShell({
       setPanel("chat");
     }
   };
-  const title = installation?.title || installation?.name || "App";
+  const title = installation
+    ? localizedAppTitle(
+        {
+          title: installation.title || installation.name,
+          i18n: parseAppDisplayI18n(installation.i18n),
+          listing: installation.listing,
+        },
+        locale,
+        t,
+      ) || t("App")
+    : t("App");
   const isSocial = isSocialContent(installation);
   // An app whose approved, executable package declares one screen mounts
   // that screen (presentation only; authorization stays in the
@@ -1060,24 +1079,28 @@ export default function AppShell({
     verified ? installation.digest : null,
     verified ? installation.name : null,
   );
-  const chatDescriptor = chatProjection.projection?.chat ?? null;
+  const rawChatDescriptor = chatProjection.projection?.chat ?? null;
+  const chatDescriptor = useMemo(
+    () => (rawChatDescriptor ? localizeAppChat(rawChatDescriptor, locale, t) : null),
+    [rawChatDescriptor, locale, t],
+  );
   // The chat descriptor's screen id (D5): the mounted screen's declared
   // section when it declares navigation, else its screen tag.
-  const section = screenNavigation ? sectionFromSearch(href.split("?")[1] ?? "", screenNavigation) : null;
+  const section = effectiveNavigation ? sectionFromSearch(href.split("?")[1] ?? "", effectiveNavigation) : null;
   const chatScreen = chatScreenFor(installation, verified, section, view);
   // `open-view` card action: a declared section of the mounted screen, or
   // the generic list/new view, within this installation and context.
   const openView = useCallback(
     (target: string) => {
-      if (screenNavigation) {
-        if (screenNavigation.sections.some((s) => s.id === target)) {
-          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: screenNavigation } });
+      if (effectiveNavigation) {
+        if (effectiveNavigation.sections.some((s) => s.id === target)) {
+          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: effectiveNavigation } });
         }
       } else if (target === "list" || target === "new") {
         writeQuery({ appview: target === "list" ? null : target, record: null });
       }
     },
-    [screenNavigation, writeQuery],
+    [effectiveNavigation, writeQuery],
   );
 
   // Capability-free local-text workflows reuse the guarded start lifecycle.

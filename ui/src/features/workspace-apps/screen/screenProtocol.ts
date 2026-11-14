@@ -210,7 +210,9 @@ export type RecordCallVerb = (typeof RECORD_CALL_VERBS)[number];
 export type RecordSlotVerb = (typeof RECORD_SLOT_VERBS)[number];
 export type CallVerb = (typeof CALL_VERBS)[number] | RecordCallVerb;
 export type SlotVerb = (typeof SLOT_VERBS)[number] | RecordSlotVerb;
-export interface ScreenNavigation { section_query: string; default_section: string; sections: { id: string; label: string }[] }
+export interface ScreenSectionI18n { label: string }
+export interface ScreenSection { id: string; label: string; i18n?: Record<string, ScreenSectionI18n> }
+export interface ScreenNavigation { section_query: string; default_section: string; sections: ScreenSection[] }
 export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
 export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
 export const SCREEN_RECORDS_V1 = "screen-records.v1";

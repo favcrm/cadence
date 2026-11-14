@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { useTranslate } from "../../lib/locale";
+import { useLocale, useTranslate } from "../../lib/locale";
+import { localizedAppTitle, parseAppDisplayI18n } from "../workspace-apps/appLocale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
@@ -115,15 +116,20 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
 /** Retired listings stay discoverable; Open and Restore live on the detail page. */
 function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
+  const title = localizedAppTitle(
+    { title: card.title, i18n: parseAppDisplayI18n(card.i18n), listing: card.listing },
+    locale,
+    t,
+  );
   return (
     <article className="pub-card">
       <Link className="pub-card-link" href={`/apps/catalog/${encodeURIComponent(card.id)}`}
         aria-labelledby={`retired-name-${card.id}`} aria-describedby={`retired-state-${card.id}`}>
-        <AppCover name={card.name} title={card.title} category={card.listing?.category} />
+        <AppCover name={card.name} title={title} category={card.listing?.category} />
         <span className="pub-card-copy">
           <span className="pub-card-category">{t("Retired source")}</span>
-          <span className="pub-card-title" id={`retired-name-${card.id}`}>{card.title}</span>
+          <span className="pub-card-title" id={`retired-name-${card.id}`}>{title}</span>
           <span className="pub-card-summary">{card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}</span>
           <span className="pub-card-footer" id={`retired-state-${card.id}`}>
             <InstallStateChip state={card.removed ? "removed" : card.state} />
@@ -144,12 +150,19 @@ function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
  * sends that digest. Never a catalog row: it ships nothing to the
  * catalog list. */
 function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const [url, setUrl] = useState("");
   const [checking, setChecking] = useState(false);
   const [found, setFound] = useState<CatalogCard | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEscape(true, onClose);
+  const foundTitle = found
+    ? localizedAppTitle(
+        { title: found.title, i18n: parseAppDisplayI18n(found.i18n), listing: found.listing },
+        locale,
+        t,
+      )
+    : "";
   const check = () => {
     setChecking(true); setErr(null); setFound(null);
     void appExplorer.gitCheck(url)
@@ -174,7 +187,7 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
           <div className="flex items-center gap-3 mb-2">
             <AppGlyph name={found.name} icon={found.listing?.icon} />
             <div className="min-w-0">
-              <div className="font-medium text-ink-100">{found.title}</div>
+              <div className="font-medium text-ink-100">{foundTitle}</div>
               <div className="text-micro text-ink-500"><TrustChip trust="unreviewed" /> · {found.version}</div>
             </div>
           </div>
@@ -182,7 +195,7 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
           <InstallCheckPanel
             key={`${url}@${found.commit}`}
             source={url}
-            label={found.title}
+            label={foundTitle}
             install={(digest) => appExplorer.installSource(url, digest)}
             onInstalled={onDone}
             onClose={() => setFound(null)}

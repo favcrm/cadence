@@ -2,9 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
-import { useTranslate } from "../../lib/locale";
+import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
+import {
+  MAX_I18N_LOCALES,
+  isPlainTextValue,
+  localizedAppSummary,
+  localizedAppTagline,
+  localizedAppTitle,
+  parseAppDisplayI18n,
+  pickLocaleEntry,
+  validLocaleTag,
+  type AppDisplayI18n,
+  type ListingDisplayLocale,
+} from "../workspace-apps/appLocale";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -31,6 +43,7 @@ export type PublicListing = {
   stores?: string[];
   personalData?: boolean;
   accessNotes?: string[];
+  i18n?: Record<string, ListingDisplayLocale>;
 };
 
 export type PublicApp = {
@@ -40,6 +53,7 @@ export type PublicApp = {
   summary: string;
   version: string;
   listing: PublicListing;
+  i18n?: AppDisplayI18n | null;
   digest: string | null;
   installable: boolean;
 };
@@ -81,6 +95,35 @@ const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
 const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
+function listingI18nOf(value: unknown): Record<string, ListingDisplayLocale> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return undefined;
+  const out: Record<string, ListingDisplayLocale> = {};
+  for (const [tag, raw] of entries) {
+    if (!validLocaleTag(tag) || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const obj = raw as Record<string, unknown>;
+    const loc: ListingDisplayLocale = {};
+    if (isPlainTextValue(obj.title, 80)) loc.title = obj.title.trim();
+    if (isPlainTextValue(obj.summary, 160)) loc.summary = obj.summary.trim();
+    if (isPlainTextValue(obj.tagline, 80)) loc.tagline = obj.tagline.trim();
+    if (isPlainTextValue(obj.about, 2000)) loc.about = obj.about.trim();
+    if (Array.isArray(obj.can)) {
+      const can = obj.can.filter((item): item is string => isPlainTextValue(item, 240)).map((item) => item.trim());
+      if (can.length > 0) loc.can = can;
+    }
+    if (obj.access_notes && typeof obj.access_notes === "object" && !Array.isArray(obj.access_notes)) {
+      const notes: Record<string, string> = {};
+      for (const [k, v] of Object.entries(obj.access_notes as Record<string, unknown>)) {
+        if (isPlainTextValue(v, 240)) notes[k] = v.trim();
+      }
+      if (Object.keys(notes).length > 0) loc.access_notes = notes;
+    }
+    if (Object.keys(loc).length > 0) out[tag] = loc;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function listingOf(value: unknown): PublicListing {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const row = value as Record<string, unknown>;
@@ -120,6 +163,7 @@ function listingOf(value: unknown): PublicListing {
   const accessNotes = accessObj
     ? Object.values(accessObj).filter((item): item is string => typeof item === "string" && !!item)
     : undefined;
+  const i18n = listingI18nOf(row.i18n);
   return {
     tagline,
     category: typeof row.category === "string" ? row.category : undefined,
@@ -131,6 +175,7 @@ function listingOf(value: unknown): PublicListing {
     stores,
     personalData,
     accessNotes,
+    ...(i18n ? { i18n } : {}),
   };
 }
 
@@ -143,6 +188,7 @@ export function parsePublicApp(value: unknown): PublicApp | null {
   if (row.digest !== null && (typeof row.digest !== "string" || !DIGEST.test(row.digest))) return null;
   if (row.installable && row.digest === null) return null;
   if ("price" in row || "artifact" in row || "path" in row) return null;
+  const parsedI18n = parseAppDisplayI18n(row.i18n);
   return {
     id: row.id,
     app: row.app,
@@ -150,6 +196,7 @@ export function parsePublicApp(value: unknown): PublicApp | null {
     summary: row.summary,
     version: row.version,
     listing: listingOf(row.listing),
+    ...(parsedI18n ? { i18n: parsedI18n } : {}),
     digest: row.digest as string | null,
     installable: row.installable,
   };
@@ -386,7 +433,7 @@ function catalogDetailHref(appId: string, installId: string | null): string {
 }
 
 export function PublicDirectory({ viewer }: { viewer: Viewer }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const { apps, error, retry } = usePublicList();
   const installs = useBoardInstalls(viewer);
   const [query, setQuery] = useState("");
@@ -404,10 +451,27 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
     }
     return map;
   }, [installs.rows]);
+  const publicTitle = (app: PublicApp) => localizedAppTitle(
+    { title: app.title, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  );
+  const publicTagline = (app: PublicApp) =>
+    localizedAppTagline(
+      { tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing },
+      locale,
+      t,
+    ) || localizedAppSummary(
+      { summary: app.summary, i18n: app.i18n, listing: app.listing },
+      locale,
+      t,
+    );
   const shown = (apps ?? []).filter((app) => {
     const hay = [
       app.title,
+      publicTitle(app),
       app.summary,
+      publicTagline(app),
       app.app,
       app.listing.tagline,
       app.listing.publisher,
@@ -464,14 +528,16 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
           const rows = installsByName.get(app.app) ?? [];
           const only = rows.length === 1 ? rows[0] : null;
           const known = installs.rows !== null && !installs.loading && !installs.error;
+          const displayTitle = publicTitle(app);
+          const displaySummary = publicTagline(app);
           return (
             <article className="pub-card" key={app.id}>
               <Link href={catalogDetailHref(app.id, only?.install_id ?? null)} className="pub-card-link" aria-labelledby={`pub-name-${app.id}`} aria-describedby={`pub-state-${app.id}`}>
-                <AppCover name={app.app} title={app.title} category={app.listing.category} />
+                <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
                 <span className="pub-card-copy">
-                  <span className="pub-card-category">{app.listing.category ?? ""}</span>
-                  <span className="pub-card-title" id={`pub-name-${app.id}`}>{app.title}</span>
-                  <span className="pub-card-summary">{app.listing.tagline ?? app.summary}</span>
+                  <span className="pub-card-category">{app.listing.category ? t(app.listing.category) : ""}</span>
+                  <span className="pub-card-title" id={`pub-name-${app.id}`}>{displayTitle}</span>
+                  <span className="pub-card-summary">{displaySummary}</span>
                   {app.listing.publisher && <span className="pub-card-publisher">{app.listing.publisher}</span>}
                   <span className="pub-card-footer">
                     <span>v{app.version}</span>
@@ -529,7 +595,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   installationParam: string | null;
   operator: boolean;
 }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const catalogued = (rows ?? []).filter((row) => {
     const claim = rowCatalogue(row);
     return claim.kind === "id" && claim.id === id;
@@ -548,7 +614,8 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
   const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
-  const title = install?.title ?? catalogued[0]?.title ?? id;
+  const rawTitle = install?.title ?? catalogued[0]?.title;
+  const title = rawTitle ? localizedAppTitle({ title: rawTitle }, locale, t) : id;
   return (
     <article className="pub-detail" aria-label={title}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
@@ -622,7 +689,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
 }
 
 export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer: Viewer; onResolved?: (found: boolean) => void }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const [app, setApp] = useState<PublicApp | null | undefined>(undefined);
   const [appError, setAppError] = useState<string | null>(null);
   const [appTick, setAppTick] = useState(0);
@@ -750,14 +817,34 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
     navigate(`/apps/catalog/${encodeURIComponent(app.id)}?${next}`, { replace: true });
   };
 
-  const highlights = app.listing.highlights ?? [];
+  const locListing = pickLocaleEntry(app.listing.i18n, locale);
+  const displayTitle = localizedAppTitle(
+    { title: app.title, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  );
+  const displaySummary = localizedAppSummary(
+    { summary: app.summary, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  );
+  const displayIntro = localizedAppTagline(
+    { tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  ) || displaySummary;
+  const displayDescription = locListing?.about ?? app.listing.description ?? displaySummary;
+  const highlights = locListing?.can ?? app.listing.highlights ?? [];
+  const accessNotes = locListing?.access_notes
+    ? Object.values(locListing.access_notes).filter(Boolean)
+    : app.listing.accessNotes;
   return (
-    <article className="pub-detail" aria-label={app.title}>
+    <article className="pub-detail" aria-label={displayTitle}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
       <header className="pub-heading">
-        {app.listing.category && <p className="pub-category">{app.listing.category}</p>}
-        <h1 id="pub-title" tabIndex={-1}>{app.title}</h1>
-        <p className="pub-intro">{app.listing.tagline ?? app.summary}</p>
+        {app.listing.category && <p className="pub-category">{t(app.listing.category)}</p>}
+        <h1 id="pub-title" tabIndex={-1}>{displayTitle}</h1>
+        <p className="pub-intro">{displayIntro}</p>
         <p className="pub-publisher">
           {app.listing.publisher ? t("By {publisher}").replace("{publisher}", app.listing.publisher) : app.app}
           <span className="pub-unverified">{t("Publisher not verified")}</span>
@@ -766,12 +853,12 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
       <div className="pub-layout">
         <div className="pub-story">
           <figure className="pub-cover">
-            <AppCover name={app.app} title={app.title} category={app.listing.category} />
+            <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
             <figcaption>{t("Illustrative app cover")}</figcaption>
           </figure>
           <section className="pub-section">
             <h2>{t("About this app")}</h2>
-            <p>{app.listing.description ?? app.summary}</p>
+            <p>{displayDescription}</p>
           </section>
           {highlights.length > 0 && (
             <section className="pub-section">
@@ -807,10 +894,10 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
               </ul>
             </section>
           )}
-          {app.listing.accessNotes && app.listing.accessNotes.length > 0 && (
+          {accessNotes && accessNotes.length > 0 && (
             <section className="pub-section">
               <h2>{t("Access notes")}</h2>
-              <ul className="pub-plain">{app.listing.accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
+              <ul className="pub-plain">{accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
             </section>
           )}
         </div>

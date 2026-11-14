@@ -48,6 +48,7 @@ const mk = (id: string, name: string, title: string) => ({
   approval: { state: "approved" }, guide: "", files: [], capabilities: null, connection_slots: [],
 });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
+let installationsFixture: Record<string, unknown>[] = [mk("install-crm", "crm", "CRM"), mk("install-soc", "social-content", "Social Content")];
 let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
@@ -60,8 +61,8 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
-  if (path === "/api/app-installations") { listCalls++; return json([mk("install-crm", "crm", "CRM"), mk("install-soc", "social-content", "Social Content")]); }
-  if (path === "/api/app-installations/install-crm") return json(mk("install-crm", "crm", "CRM"));
+  if (path === "/api/app-installations") { listCalls++; return json(installationsFixture); }
+  if (path === "/api/app-installations/install-crm") return json(installationsFixture.find((row) => row.install_id === "install-crm") ?? mk("install-crm", "crm", "CRM"));
   if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [] });
   if (path.startsWith("/api/app-installations/install-forged")) return json({ error: "unknown installation" }, 404);
   if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
@@ -131,6 +132,62 @@ await settle(() => assert(host.textContent?.includes("App link retired"), "forge
 assert(!appLink("install-forged") && appLinks().length === 2, "forged id adds no app entry");
 assert(sections().length === 0, "forged id shows no sections");
 await React.act(async () => { root2.unmount(); });
+
+// (d) Declared navigation & i18n from /api/app-installations populate
+// persistent sidebar sections on Home, active app, Settings, and reload
+// without waiting for an iframe screen mount.
+installationsFixture = [
+  {
+    ...mk("install-crm", "crm", "CRM"),
+    i18n: { "zh-TW": { title: "客戶關係" } },
+    navigation: {
+      section_query: "section",
+      default_section: "customers",
+      sections: [
+        { id: "customers", label: "Customers", i18n: { "zh-TW": { label: "客戶名單" } } },
+        { id: "segments", label: "Segments", i18n: { "zh-TW": { label: "分眾" } } },
+      ],
+    },
+  },
+  mk("install-soc", "social-content", "Social Content"),
+];
+win.localStorage.clear();
+const root3 = createRoot(host);
+history.pushState(null, "", "/");
+await React.act(async () => { root3.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
+await settle(() => equal(sections().map((s) => s.textContent?.trim()), ["Customers", "Segments"], "declared sections render on Home without mounting an iframe"));
+
+await go("/apps/crm?section=segments");
+await settle(() => {
+  const seg = sections().find((s) => s.textContent?.trim() === "Segments");
+  assert(seg?.getAttribute("aria-current") === "page", "active declared section is highlighted");
+});
+
+await go("/settings/email-sending");
+await settle(() => assert(location.pathname.startsWith("/settings"), "navigated to Settings"));
+equal(sections().map((s) => s.textContent?.trim()), ["Customers", "Segments"], "declared sections remain persistent on Settings");
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?section=segments", "remembered app link preserves last section on Settings");
+
+await React.act(async () => { root3.unmount(); });
+const root4 = createRoot(host);
+history.pushState(null, "", "/");
+await React.act(async () => { root4.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
+await settle(() => equal(sections().map((s) => s.textContent?.trim()), ["Customers", "Segments"], "declared sections survive reload"));
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?section=segments", "remembered section link survives reload");
+await React.act(async () => { root4.unmount(); });
+
+// (e) zh-TW locale localizes declared titles/sections and falls back via zhTW dictionary.
+win.localStorage.setItem("cadence-locale", "zh-TW");
+const root5 = createRoot(host);
+history.pushState(null, "", "/");
+await React.act(async () => { root5.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
+await settle(() => {
+  const sidebarLinks = Array.from(host.querySelectorAll("aside a.navlink-sub")).map((a) => a.textContent?.trim());
+  assert(sidebarLinks.includes("客戶關係"), "descriptor i18n localizes CRM title in sidebar");
+  assert(sidebarLinks.includes("社群內容"), "zhTW fallback localizes Social Content title in sidebar");
+  assert(sidebarLinks.includes("客戶名單") && sidebarLinks.includes("分眾"), "descriptor sections[].i18n localizes section labels in sidebar");
+});
+await React.act(async () => { root5.unmount(); });
 
 console.log("app nav persistence checks passed");
 }

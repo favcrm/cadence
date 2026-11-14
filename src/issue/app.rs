@@ -67,7 +67,9 @@ pub const LOCAL_CONNECTION: &str = "local";
 
 /// `app.md` frontmatter keys v0 knows. Anything else refuses — the same
 /// fail-loud rule the workflow and plan parsers apply.
-const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary", "listing"];
+const MANIFEST_KEYS: &[&str] = &[
+    "app", "title", "version", "needs", "summary", "listing", "i18n",
+];
 
 /// Frontmatter keys the later stages reserve — refused with their own
 /// message so a bundle carrying one names the stage, not "unknown key".
@@ -1228,6 +1230,8 @@ pub struct Manifest {
     /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
+    /// Optional top-level display translations (`{ <locale>: { title?, summary?, tagline? } }`).
+    pub i18n: Option<serde_json::Value>,
     pub guide: String,
 }
 
@@ -1241,6 +1245,52 @@ impl Manifest {
         self.capabilities
             .values()
             .find(|need| need.is_file_upload())
+    }
+
+    /// Merged display translations `{ <locale>: { title?, summary?, tagline? } }`
+    /// from `listing.i18n` overlaid with top-level `i18n` (top-level wins per field).
+    pub fn display_i18n(&self) -> serde_json::Value {
+        use serde_json::{Map, Value};
+
+        fn overlay_source(src: Option<&Value>, out: &mut Map<String, Value>) {
+            let Some(Value::Object(locales)) = src else {
+                return;
+            };
+            for (locale, entry) in locales {
+                let Some(Value::Object(fields)) = Some(entry) else {
+                    continue;
+                };
+                if !out.contains_key(locale)
+                    && out.len() >= cadence_core::app_screen_decl::MAX_I18N_LOCALES
+                {
+                    continue;
+                }
+                let mut merged = match out.get(locale) {
+                    Some(Value::Object(prev)) => prev.clone(),
+                    _ => Map::new(),
+                };
+                for key in ["title", "summary", "tagline"] {
+                    if let Some(val @ Value::String(_)) = fields.get(key) {
+                        merged.insert(key.to_string(), val.clone());
+                    }
+                }
+                if !merged.is_empty() {
+                    out.insert(locale.clone(), Value::Object(merged));
+                }
+            }
+        }
+
+        let mut merged = Map::new();
+        overlay_source(
+            self.listing.as_ref().and_then(|l| l.value.get("i18n")),
+            &mut merged,
+        );
+        overlay_source(self.i18n.as_ref(), &mut merged);
+        if merged.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(merged)
+        }
     }
 }
 
@@ -1702,6 +1752,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
+    let i18n = match get("i18n") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(value) => Some(crate::issue::app_listing::parse_manifest_i18n(value)?),
+    };
     let requires =
         app_compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
@@ -1714,6 +1768,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         view_contract,
         requires,
         listing,
+        i18n,
         guide: body.to_string(),
     })
 }
@@ -2332,6 +2387,7 @@ fn validate_contents(
                     view_contract: None,
                     requires: Compat::legacy(),
                     listing: None,
+                    i18n: None,
                     guide: String::new(),
                 }
             }
@@ -2346,6 +2402,7 @@ fn validate_contents(
             view_contract: None,
             requires: Compat::legacy(),
             listing: None,
+            i18n: None,
             guide: String::new(),
         },
     };
@@ -4833,6 +4890,25 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         // No declaration → None.
         let none = parse_manifest(APP_MD).unwrap();
         assert_eq!(none.view_contract, None);
+    }
+
+    #[test]
+    fn manifest_display_i18n_merges_listing_and_top_level() {
+        let none = parse_manifest(APP_MD).unwrap();
+        assert_eq!(none.i18n, None);
+        assert!(none.display_i18n().is_null());
+
+        let md = "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\n\
+needs:\n  connections: []\n\
+listing:\n  tagline: Track customers cleanly.\n  i18n:\n    zh-TW:\n      title: CRM 舊標題\n      tagline: 輕鬆管理客戶關係與商機\n      about: 詳細介紹\n    zh-HK:\n      title: 客戶管理\n\
+i18n:\n  zh-TW:\n    title: 客戶管理\n    summary: 管理客戶與分眾名單\n---\n\nGuide\n";
+        let m = parse_manifest(md).unwrap();
+        let disp = m.display_i18n();
+        assert_eq!(disp["zh-TW"]["title"], "客戶管理");
+        assert_eq!(disp["zh-TW"]["summary"], "管理客戶與分眾名單");
+        assert_eq!(disp["zh-TW"]["tagline"], "輕鬆管理客戶關係與商機");
+        assert!(disp["zh-TW"].get("about").is_none());
+        assert_eq!(disp["zh-HK"]["title"], "客戶管理");
     }
 
     /// CAD-864: declaration and descriptor file pair up in the

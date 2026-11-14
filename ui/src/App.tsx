@@ -14,6 +14,8 @@ import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
+import { parseAppDisplayI18n } from "./features/workspace-apps/appLocale";
+import { parseNavigation } from "./features/workspace-apps/screen/screenLifecycle";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -218,7 +220,7 @@ export default function App() {
 
 /** All private routes, subscriptions and effects live below read admission. */
 function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boolean> }) {
-  const { t } = useLocale();
+  const { locale, t } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
@@ -899,7 +901,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       if (
         prev !== null && info !== null &&
         prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title &&
-        JSON.stringify(prev.navigation) === JSON.stringify(info.navigation)
+        JSON.stringify(prev.navigation) === JSON.stringify(info.navigation) &&
+        JSON.stringify(prev.i18n) === JSON.stringify(info.i18n)
       ) {
         return prev;
       }
@@ -929,7 +932,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? [])
       .filter((i) => i.removed == null && (i.state ?? "active") === "active")
-      .map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
+      .map((i) => ({
+        installId: i.install_id,
+        kind: i.name,
+        title: i.title || i.name,
+        navigation: parseNavigation(i.navigation),
+        i18n: parseAppDisplayI18n(i.i18n),
+        listing: i.listing ?? null,
+      })),
     [installations.list],
   );
   const keyInstallations = route.screen === "workspaceAppKey"
@@ -955,7 +965,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps = receipt === null ? installed
     : installed.some((a) => a.installId === receipt.installId)
-      ? installed.map((app) => app.installId === receipt.installId ? { ...app, navigation: receipt.navigation } : app)
+      ? installed.map((app) => app.installId === receipt.installId
+          ? {
+              ...app,
+              navigation: receipt.navigation ?? app.navigation,
+              i18n: receipt.i18n ?? app.i18n,
+            }
+          : app)
       : [...installed, receipt];
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
@@ -994,6 +1010,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       activeId,
       activeHref: href,
       last,
+      locale,
+      t,
       installHref: (installId) => {
         // CAD-1438: app menu entries emit only the canonical key route.
         // A receipt-only app (in the menu but not the list) or a shared

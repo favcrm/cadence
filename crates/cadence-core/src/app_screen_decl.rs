@@ -109,6 +109,34 @@ const MAX_OPERATION_BYTES: usize = 64;
 /// check both read this one number, so a package set is bounded identically on
 /// both hosts.
 pub const MAX_SCREENS: usize = 8;
+/// Most locale entries one app display/nav i18n map may declare.
+pub const MAX_I18N_LOCALES: usize = 8;
+
+/// Validates a BCP-47 locale tag (`2..=20` ASCII bytes, `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$`).
+pub fn valid_locale_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    if !(2..=20).contains(&bytes.len()) || !bytes.is_ascii() {
+        return false;
+    }
+    let mut parts = tag.split('-');
+    let Some(lang) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut subtags = 0usize;
+    for sub in parts {
+        subtags += 1;
+        if subtags > 2
+            || !(2..=8).contains(&sub.len())
+            || !sub.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+    }
+    true
+}
 /// The whole-app aggregate content budget, bytes. A screen's supplied assets
 /// share it, and the native installer keeps the same number: the limit is
 /// stated here once and re-exported as the native app budget, so the two
@@ -510,9 +538,21 @@ pub struct ScreenNavigation {
 
 #[derive(Clone, Debug, serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ScreenSectionI18n {
+    pub label: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenSection {
     pub id: String,
     pub label: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "unique_opt_section_i18n"
+    )]
+    pub i18n: Option<BTreeMap<String, ScreenSectionI18n>>,
 }
 
 impl ScreenNavigation {
@@ -574,6 +614,24 @@ impl ScreenNavigation {
                 || section.label.chars().any(char::is_control)
             {
                 return Err(Error::rejected("invalid or duplicate navigation section"));
+            }
+            if let Some(i18n) = &section.i18n {
+                if i18n.is_empty() || i18n.len() > MAX_I18N_LOCALES {
+                    return Err(Error::rejected(
+                        "navigation section i18n requires 1..=8 locales",
+                    ));
+                }
+                for (locale, entry) in i18n {
+                    if !valid_locale_tag(locale)
+                        || entry.label.trim().is_empty()
+                        || entry.label.encode_utf16().count() > 40
+                        || entry.label.chars().any(char::is_control)
+                    {
+                        return Err(Error::rejected(
+                            "invalid navigation section i18n locale or label",
+                        ));
+                    }
+                }
             }
         }
         if !seen.contains(&self.default_section) {
@@ -1654,6 +1712,56 @@ where
     deserializer.deserialize_map(UniqueMap)
 }
 
+fn unique_opt_section_i18n<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, ScreenSectionI18n>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueOptMap;
+    impl<'de> Visitor<'de> for UniqueOptMap {
+        type Value = Option<BTreeMap<String, ScreenSectionI18n>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional locale map without repeated keys")
+        }
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, deserializer: D2) -> std::result::Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            struct UniqueLocaleMap;
+            impl<'de> Visitor<'de> for UniqueLocaleMap {
+                type Value = BTreeMap<String, ScreenSectionI18n>;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a map of locale tags without repeated keys")
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut out = BTreeMap::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if out.contains_key(&key) {
+                            return Err(serde::de::Error::custom(format!(
+                                "i18n locale {key:?} is declared twice"
+                            )));
+                        }
+                        out.insert(key, map.next_value::<ScreenSectionI18n>()?);
+                    }
+                    Ok(out)
+                }
+            }
+            deserializer.deserialize_map(UniqueLocaleMap).map(Some)
+        }
+    }
+    deserializer.deserialize_option(UniqueOptMap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1983,5 +2091,86 @@ mod tests {
         let bad_digest = manifest.replacen(&digest(BODY), "sha256:short", 1);
         assert!(validate_facts_asset_integrity(&bad_digest, &facts(BODY)).is_err());
         assert!(validate_facts_asset_integrity("{", &facts(BODY)).is_err());
+    }
+
+    #[test]
+    fn navigation_section_i18n_validates_bounds_and_rejects_bad_inputs() {
+        let base_manifest = |sections: Value| {
+            serde_json::json!({
+                "contract": "app-screens/v2",
+                "app": "crm",
+                "entry": "client.js",
+                "assets": [{
+                    "name": "client.js",
+                    "media_type": "text/javascript",
+                    "size": BODY.len(),
+                    "sha256": digest(BODY),
+                }],
+                "provenance": {
+                    "source_digest": digest("source"),
+                    "sdk_digest": digest("sdk"),
+                    "toolchain_digest": digest("toolchain"),
+                },
+                "host_contract": "screen-records.v1",
+                "may": [],
+                "navigation": {
+                    "section_query": "section",
+                    "default_section": "customers",
+                    "sections": sections,
+                }
+            })
+            .to_string()
+        };
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+
+        let valid = base_manifest(serde_json::json!([{
+            "id": "customers",
+            "label": "Customers",
+            "i18n": {
+                "zh-TW": { "label": "客戶" },
+                "zh-HK": { "label": "客戶" }
+            }
+        }]));
+        let parsed = validate_map(&valid, &bodies).expect("valid section i18n must pass");
+        let nav = parsed.navigation().expect("navigation must be present");
+        let i18n = nav.sections[0].i18n.as_ref().expect("i18n map");
+        assert_eq!(i18n["zh-TW"].label, "客戶");
+
+        // Empty map, invalid locale tag, blank label, control char, unknown inner field all refuse.
+        for bad_section in [
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": {} }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh_TW": { "label": "客戶" } } }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "   " } } }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶\n" } } }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶", "extra": "x" } } }),
+        ] {
+            let manifest = base_manifest(serde_json::json!([bad_section]));
+            assert!(validate_map(&manifest, &bodies).is_err());
+        }
+
+        // More than MAX_I18N_LOCALES refuses.
+        let mut too_many = serde_json::Map::new();
+        for i in 0..=MAX_I18N_LOCALES {
+            too_many.insert(format!("en-x{i}"), serde_json::json!({ "label": "S" }));
+        }
+        let manifest = base_manifest(serde_json::json!([{
+            "id": "customers",
+            "label": "Customers",
+            "i18n": too_many,
+        }]));
+        assert!(validate_map(&manifest, &bodies).is_err());
+
+        // Duplicate locale key in raw JSON refuses.
+        let dup_json = valid.replace(
+            r#""zh-TW":{"label":"客戶"},"zh-HK":{"label":"客戶"}"#,
+            r#""zh-TW":{"label":"客戶"},"zh-TW":{"label":"客戶"}"#,
+        );
+        // Handle pretty/compact spacing from serde_json::Value::to_string()
+        let dup_json = if dup_json == valid {
+            valid.replace("\"zh-HK\"", "\"zh-TW\"")
+        } else {
+            dup_json
+        };
+        assert!(validate_map(&dup_json, &bodies).is_err());
     }
 }

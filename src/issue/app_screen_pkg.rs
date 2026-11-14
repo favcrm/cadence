@@ -140,6 +140,27 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
     })
 }
 
+/// Extract declared `navigation` when the bundle carries a single valid screen
+/// package whose `app` matches `app`. Returns `Value::Null` otherwise.
+pub fn single_screen_navigation(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
+    let Ok(tags) = tags_in(files) else {
+        return serde_json::Value::Null;
+    };
+    let [tag] = tags.as_slice() else {
+        return serde_json::Value::Null;
+    };
+    let Ok(pkg) = extract(files, tag) else {
+        return serde_json::Value::Null;
+    };
+    if pkg.app != app {
+        return serde_json::Value::Null;
+    }
+    match pkg.navigation {
+        Some(nav) => serde_json::to_value(nav).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// CAD-1827: how one installed bundle relates to the campaign-work contract.
 ///
 /// Discovery must never read a failed inspection as "not a source": a
@@ -621,5 +642,37 @@ mod tests {
             campaign_work_source(&no_manifest),
             CampaignWorkSource::Unavailable("installation manifest is unreadable")
         );
+    }
+
+    #[test]
+    fn single_screen_navigation_projects_i18n_and_ignores_multi_or_mismatch() {
+        let js = "console.log(1);";
+        let mut with_nav: serde_json::Value =
+            serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
+        with_nav["navigation"] = json!({
+            "section_query": "section",
+            "default_section": "customers",
+            "sections": [{
+                "id": "customers",
+                "label": "Customers",
+                "i18n": { "zh-TW": { "label": "客戶" } }
+            }]
+        });
+        let files = bundle_with("main", &with_nav.to_string(), &[("client.js", js)]);
+        let projected = single_screen_navigation(&files, "crm");
+        assert_eq!(projected["default_section"], "customers");
+        assert_eq!(projected["sections"][0]["i18n"]["zh-TW"]["label"], "客戶");
+        assert!(single_screen_navigation(&files, "other").is_null());
+
+        let no_nav = bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]);
+        assert!(single_screen_navigation(&no_nav, "crm").is_null());
+
+        let mut two = files.clone();
+        two.insert(
+            "screens/second/screens.json".to_string(),
+            with_nav.to_string(),
+        );
+        two.insert("screens/second/client.js".to_string(), js.to_string());
+        assert!(single_screen_navigation(&two, "crm").is_null());
     }
 }
