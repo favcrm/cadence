@@ -1139,11 +1139,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         </header>
 
         <AssistantUnreadProbes apps={installed} />
-        {partialUpdates && (
-          <p role="status" className="px-4 lg:px-8 py-2 text-label text-warn">
-            {t("Some board updates are not live. This tab checks for changes periodically.")}
-          </p>
-        )}
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
@@ -1612,7 +1607,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {route.section === "general" && <General />}
             {route.section === "account" && <PlatformAccount />}
             {route.section === "update" && (meta?.settings_sections
-              ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} />
+              ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} partialUpdates={partialUpdates} />
               : <Update viewer={viewer} health={health} />)}
             {route.section === "custody" && <AdvancedCustody viewer={viewer} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
