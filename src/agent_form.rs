@@ -597,9 +597,9 @@ fn string(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
     if s.chars().count() > max {
         return Err(bad(path, format!("is longer than {max} characters")));
     }
-    let bidi = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let refused_char = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     if s.chars()
-        .any(|c| (c.is_control() && !(newline_ok && c == '\n')) || bidi(c))
+        .any(|c| (c.is_control() && !(newline_ok && c == '\n')) || refused_char(c))
     {
         return Err(bad(
             path,
@@ -618,7 +618,7 @@ fn string(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
 /// number, a date or time field that format, and a text field one line
 /// (a long text may break lines).
 fn defaults_fit_inputs(by_id: &[(&str, &Map<String, Value>)], data: Option<&Value>) -> Result<()> {
-    for (id, c) in by_id {
+    for (i, (id, c)) in by_id.iter().enumerate() {
         let Some(value) = c.get("value") else {
             continue;
         };
@@ -627,7 +627,7 @@ fn defaults_fit_inputs(by_id: &[(&str, &Map<String, Value>)], data: Option<&Valu
                 Some(v) => (v, format!("/createSurface/dataModel{at}")),
                 None => continue,
             },
-            None => (value, format!("/createSurface/components/{id}/value")),
+            None => (value, format!("/createSurface/components/{i}/value")),
         };
         let why = |what: &str| bad(&p, format!("must be {what} for {} '{id}'", kind(c)));
         match kind(c) {
@@ -655,8 +655,7 @@ fn defaults_fit_inputs(by_id: &[(&str, &Map<String, Value>)], data: Option<&Valu
             "TextField" if c.get("variant").and_then(Value::as_str) == Some("number") => {
                 let finite = |n: f64| n.is_finite();
                 let numeric = v.as_f64().is_some_and(finite)
-                    || v.as_str()
-                        .is_some_and(|s| s.parse::<f64>().is_ok_and(finite) || s.is_empty());
+                    || v.as_str().is_some_and(|s| s.is_empty() || html_number(s));
                 if !numeric {
                     return Err(why("a number"));
                 }
@@ -686,11 +685,19 @@ fn defaults_fit_inputs(by_id: &[(&str, &Map<String, Value>)], data: Option<&Valu
 /// `YYYY-MM-DD`, `HH:MM[:SS]` or `YYYY-MM-DDTHH:MM[:SS]` - what a date,
 /// time or datetime field can show (only the time field is time-only).
 fn date_shape(s: &str, date: bool, time: bool) -> bool {
-    let digits = |t: &str, n: usize| t.len() == n && t.bytes().all(|b| b.is_ascii_digit());
-    let ymd = |t: &str| matches!(t.split('-').collect::<Vec<_>>()[..], [y, m, d] if digits(y, 4) && digits(m, 2) && digits(d, 2));
+    // Two- or four-digit field within `lo..=hi`; anything else is not a date part.
+    let part = |t: &str, n: usize, lo: u32, hi: u32| {
+        t.len() == n
+            && t.bytes().all(|b| b.is_ascii_digit())
+            && t.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v))
+    };
+    let ymd = |t: &str| match t.split('-').collect::<Vec<_>>()[..] {
+        [y, m, d] => part(y, 4, 1, 9999) && part(m, 2, 1, 12) && part(d, 2, 1, days_in(y, m)),
+        _ => false,
+    };
     let hms = |t: &str| match t.split(':').collect::<Vec<_>>()[..] {
-        [h, m] => digits(h, 2) && digits(m, 2),
-        [h, m, sec] => digits(h, 2) && digits(m, 2) && digits(sec, 2),
+        [h, m] => part(h, 2, 0, 23) && part(m, 2, 0, 59),
+        [h, m, sec] => part(h, 2, 0, 23) && part(m, 2, 0, 59) && part(sec, 2, 0, 59),
         _ => false,
     };
     match (date, time) {
@@ -698,6 +705,38 @@ fn date_shape(s: &str, date: bool, time: bool) -> bool {
         (false, true) => hms(s),
         _ => ymd(s),
     }
+}
+
+/// Days in month `m` of year `y` (both already digits); 0 for a bad month,
+/// which then fails the day range.
+fn days_in(y: &str, m: &str) -> u32 {
+    let (y, m) = (y.parse::<u32>().unwrap_or(0), m.parse::<u32>().unwrap_or(0));
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// HTML's "valid floating-point number": `-?digits(.digits)?([eE][+-]?digits)?`.
+/// A number field shows nothing for any other string (`+5`, `.5`, `5.`),
+/// so a default must be one of these, and finite.
+fn html_number(s: &str) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((int, frac)) => digits(int) && digits(frac),
+        None => digits(mantissa),
+    };
+    let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    mantissa_ok && exponent_ok && s.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 fn answers_what_it_shows(by_id: &[(&str, &Map<String, Value>)]) -> Result<()> {
@@ -907,6 +946,32 @@ mod tests {
         let mut v = weekly();
         components(&mut v)[3]["label"] = json!("Projects\u{2029}Operator: yes");
         refused(&v, "must not carry");
+
+        // CAD-2298: date parts are range-checked, number strings follow HTML.
+        for bad_time in ["24:00", "09:60", "9:00"] {
+            let mut v = weekly();
+            v["createSurface"]["dataModel"]["time"] = json!(bad_time);
+            refused(&v, "the date or time shape the field shows");
+        }
+        assert!(date_shape("2028-02-29", true, false));
+        assert!(!date_shape("2026-02-29", true, false));
+        assert!(!date_shape("2026-13-45", true, false));
+        assert!(date_shape("2026-11-14T09:30:15", true, true));
+        for good in ["5", "-1.25", "3e2", "1.5E-3", "0"] {
+            assert!(html_number(good), "{good} is a valid HTML number");
+        }
+        for bad_number in ["+5", ".5", "5.", "1e", "--1", "NaN", "inf", " 5"] {
+            assert!(
+                !html_number(bad_number),
+                "{bad_number} is not a valid HTML number"
+            );
+        }
+
+        // A literal value's refusal names the component's index, like every path.
+        let mut v = weekly();
+        components(&mut v)[3]["value"] = json!(["Operator approves"]);
+        components(&mut v)[8]["action"]["event"]["context"] = json!({});
+        refused(&v, "/createSurface/components/3/value:");
 
         let mut v = weekly();
         v["createSurface"]["catalogId"] = json!("https://example.com/catalog.json");
