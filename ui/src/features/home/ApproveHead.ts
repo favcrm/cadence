@@ -16,6 +16,7 @@ const refusal = (e: unknown) =>
 
 export type ApprovalState = "unknown" | "missing" | "in-force" | "revoked";
 export type ApproveHeadContext = { issue?: string | null; project?: string | null };
+const ROLE_RESTRICTED = new Set(["member_role", "owner_required", "approver_not_allowed"]);
 export type ApprovalVerdict = {
   name: string;
   agent: string | null;
@@ -120,8 +121,10 @@ export function useApproveHead(pr: string | null, head: string | null, context?:
       if (seq !== seqRef.current || targetKeyRef.current !== key) return;
       setState("unknown");
       setVerdicts([]);
-      // A hosted member may not decide: the read says so before any click.
-      if (e instanceof ApiError && (e.check ?? e.code) === "member_role") setMember(true);
+      // A hosted member or non-owner session may not decide: the read says so before any click.
+      if (e instanceof ApiError && e.status === 403 && ROLE_RESTRICTED.has(e.check ?? e.code ?? "")) {
+        setMember(true);
+      }
     }
   }, [repo, number, head, hasContext, issue, project]);
   useEffect(() => {
@@ -145,12 +148,14 @@ export function useApproveHead(pr: string | null, head: string | null, context?:
   };
   const approve = () => {
     if (!repo || !number || !head) return;
+    const key = targetKey;
     run("approve", async () => {
       try {
         return await api.approveHead(repo, number, head, hasContext ? { issue, project } : undefined);
       } catch (e) {
         // Degrade safely on 400 from boards/daemons that reject fields beyond { repo, pr, head }.
         if (e instanceof ApiError && e.status === 400 && hasContext) {
+          if (targetKeyRef.current !== key) return undefined;
           return await api.approveHead(repo, number, head);
         }
         throw e;

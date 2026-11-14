@@ -599,6 +599,71 @@ for (const row of [
   await rw.done();
 }
 
+// ---- 7. CAD-2311: hosted vs non-hosted copy, stale verdict badge, and exact 40/64 hex safeHead guard ----
+{
+  const noIssueRow = {
+    kind: "merge_decision", audience: "operator", title: "D-22 ready", age: 210, project: "demo", command: "cadence x",
+    subject: { kind: "issue", id: "D-22" },
+    merge: { issue: "D-22", pr: "acme/app#11", sha: SHA, reviewer: "r1", verdict_summary: "PASS" },
+  };
+  const localView = await render([noIssueRow], false, { hosted: false });
+  await click(labelled(localView.card("merge_decision"), "Review"));
+  await settle(() => assert(localView.host.querySelector('[data-review-verb="Publish change"]'), "non-hosted merge uses Publish change verb"));
+  assert(
+    (localView.host.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Publish a change"),
+    "non-hosted merge falls back to Publish a change title",
+  );
+  await localView.done();
+
+  const hostedFallback = await render([noIssueRow], false, { hosted: true });
+  await click(labelled(hostedFallback.card("merge_decision"), "Review"));
+  await settle(() => assert(hostedFallback.host.querySelector('[data-review-verb="Approve change"]'), "hosted merge uses Approve change verb"));
+  assert(
+    (hostedFallback.host.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Approve a change"),
+    "hosted merge falls back to Approve a change title",
+  );
+  await hostedFallback.done();
+
+  const oldSha = "b".repeat(40);
+  approval = {
+    state: "in-force",
+    approval_id: "a-stale",
+    board_revocable: true,
+    verdicts: [
+      { name: "standards", agent: "svc_review_standards", verdict: "PASS", sha: oldSha },
+      { name: "spec", agent: "svc_review_spec", verdict: "PASS", sha: SHA },
+    ],
+  };
+  const staleView = await render([rows.merge], false, { hosted: true });
+  await click(labelled(staleView.card("merge_decision"), "Review"));
+  const staleDrawer = () => staleView.host.querySelector('[data-drawer="review"]')!;
+  await settle(() => assert(labelled(staleDrawer(), "Local enqueue command"), "40-hex head exposes Local enqueue command"));
+  const verdictText = staleDrawer().querySelector(".rv-verdicts")?.textContent ?? "";
+  assert(verdictText.includes(`${oldSha.slice(0, 12)} · older version`), `mismatched verdict SHA renders older version badge (${verdictText})`);
+  assert(verdictText.includes(`${SHA.slice(0, 12)} · matches this version`), `matching verdict SHA renders matches this version badge (${verdictText})`);
+  await staleView.done();
+
+  const sha64 = "d".repeat(64);
+  const sha64Row = { ...rows.merge, merge: { ...rows.merge.merge, sha: sha64 } };
+  approval = { state: "in-force", approval_id: "a-64", board_revocable: false, verdicts: [] };
+  const view64 = await render([sha64Row], false, { hosted: true });
+  await click(labelled(view64.card("merge_decision"), "Review"));
+  await settle(() => assert(labelled(view64.host.querySelector('[data-drawer="review"]')!, "Local enqueue command"), "64-hex head exposes Local enqueue command"));
+  await view64.done();
+
+  const midLenRow = { ...rows.merge, merge: { ...rows.merge.merge, sha: "a".repeat(45) } };
+  approval = { state: "in-force", approval_id: "a-mid", board_revocable: false, verdicts: [] };
+  const midView = await render([midLenRow], false, { hosted: true });
+  await click(labelled(midView.card("merge_decision"), "Review"));
+  await settle(() => assert(labelled(midView.host.querySelector('[data-drawer="review"]')!, "Done"), "approved hosted drawer renders with 45-char head"));
+  assert(
+    !labelled(midView.host.querySelector('[data-drawer="review"]')!, "Local enqueue command"),
+    "45-char non-SHA hex head must not expose Local enqueue command",
+  );
+  approval = { state: "missing" };
+  await midView.done();
+}
+
 console.log("todo guard checks passed");
 }
 void main();

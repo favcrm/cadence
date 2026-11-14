@@ -297,17 +297,17 @@ function OverviewPanel({
   return (
     <div className="wi-panel">
       {home && (
-          <DecisionPanel
-            key={home.open.need.key}
-            need={home.open.need}
-            readOnly={readOnly}
-            hosted={hosted}
-            index={home.open.index}
-            total={home.open.total}
-            onDone={(key, text) => home.onDone(home.open, key, text)}
-            onClose={onClose}
-            onAsk={home.onAsk}
-          />
+        <DecisionPanel
+          key={home.open.need.key}
+          need={home.open.need}
+          readOnly={readOnly}
+          hosted={hosted}
+          index={home.open.index}
+          total={home.open.total}
+          onDone={(key, text) => home.onDone(home.open, key, text)}
+          onClose={onClose}
+          onAsk={home.onAsk}
+        />
       )}
 
       <ReadState readState={readState} onRetry={onRetry} />
@@ -571,11 +571,12 @@ function ApprovalsPanel({
             {stagedMatches.map((item) => {
               const who = askedBy(item, t);
               const ts = item.decidedAt ?? item.createdAt;
+              const tsIso = ts && Number.isFinite(ts) && Math.abs(ts) <= 8.64e15 ? new Date(ts).toISOString() : null;
               return (
                 <li key={item.id} className="issue-peek-act">
                   <div>
                     <bdi className="who">{isolate(item.title)}</bdi>
-                    {ts ? <span className="when"> · {fmtTime(new Date(ts).toISOString())}</span> : null}
+                    {tsIso ? <span className="when"> · {fmtTime(tsIso)}</span> : null}
                   </div>
                   <div>
                     <span className="num">{t(outcomeOf(item))}</span>

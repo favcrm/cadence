@@ -432,7 +432,16 @@ async function main() {
             readOnly: false,
             onOpen: (id) => drawerOpened.push(id),
             projectRepos: [],
-            stagedActions: stagedRows,
+            stagedActions: [
+              ...stagedRows,
+              {
+                ...stagedRows[0],
+                id: "act-bad-ts",
+                title: "Out-of-range timestamp staged write",
+                createdAt: 9e15,
+                decidedAt: 9e15,
+              },
+            ],
           }),
         ),
       );
@@ -455,6 +464,7 @@ async function main() {
     assert(approvalsTab, "Approvals tab exists");
     await React.act(() => approvalsTab.click());
     assert(host.textContent?.includes("Approve Q3 enterprise pricing"), "Approvals tab lists matching staged/decided action");
+    assert(host.textContent?.includes("Out-of-range timestamp staged write"), "Approvals tab renders staged action with out-of-range timestamp safely");
     assert(host.textContent?.includes("Atlas (agent)"), "Approvals tab shows staged action origin");
 
     await React.act(async () => root.unmount());

@@ -383,7 +383,7 @@ function MergeReview({ need, readOnly, hosted, index, total, onDone, onClose, on
     .map((r) => ({ name: r.name, agent: r.agent ?? null, verdict: r.verdict ?? null, sha: r.sha ?? null }));
   const verdicts = a.verdicts.length > 0 ? a.verdicts : issueVerdicts;
   const parsedPr = prTarget(action.pr);
-  const safeHead = m.head && /^[0-9a-f]{40,64}$/i.test(m.head) ? m.head.toLowerCase() : null;
+  const safeHead = m.head && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(m.head) ? m.head.toLowerCase() : null;
   const lead = firstSentence(issue?.body);
   const off = !!block || !m.head || a.member;
   // One line per distinct error: a repeat of the same text shows once.
@@ -393,8 +393,8 @@ function MergeReview({ need, readOnly, hosted, index, total, onDone, onClose, on
   return (
     <Shell
       need={need}
-      verb="Approve change"
-      title={issue?.title ?? need.shortTitle ?? t("Publish a change")}
+      verb={hosted ? "Approve change" : "Publish change"}
+      title={issue?.title ?? need.shortTitle ?? t(hosted ? "Approve a change" : "Publish a change")}
       subtitle={`${t("Ready")} ${waiting(need, t)}`}
       body={
         <>
@@ -417,10 +417,16 @@ function MergeReview({ need, readOnly, hosted, index, total, onDone, onClose, on
                     </span>
                     <small>
                       {v.sha ? (
-                        m.head && v.sha.toLowerCase() === m.head.toLowerCase() ? (
-                          <>
-                            <bdi>{isolate(v.sha.slice(0, 12))}</bdi> · {t("matches this version")}
-                          </>
+                        m.head ? (
+                          v.sha.toLowerCase() === m.head.toLowerCase() ? (
+                            <>
+                              <bdi>{isolate(v.sha.slice(0, 12))}</bdi> · {t("matches this version")}
+                            </>
+                          ) : (
+                            <>
+                              <bdi>{isolate(v.sha.slice(0, 12))}</bdi> · {t("older version")}
+                            </>
+                          )
                         ) : (
                           <bdi>{isolate(v.sha.slice(0, 12))}</bdi>
                         )
