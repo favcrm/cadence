@@ -127,6 +127,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1752: propose hiring a catalogue role on the master's own live
     // turn; the handler binds to that turn and writes one inert entry.
     "hire_propose",
+    // CAD-2285: ask the operator with a form on the master's own live
+    // turn; the handler binds to that turn and writes one inert entry.
+    "master_ask_form",
     // Retained Library image bytes, still exact-turn and source/receiver scoped.
     "app_media_inspect",
 ];
@@ -370,20 +373,25 @@ impl Shared {
         // narrowed to `MASTER_APP_ALLOWED`.
         let scope = self.master_turn_scope();
         if scope != MasterScope::Home {
-            // CAD-1767: say what is actually missing for a hire proposal -
-            // a live Home turn - instead of the app-conversation rule.
-            if method == "hire_propose" {
+            // CAD-1767 / CAD-2285: say what is actually missing for a verb
+            // bound to a live Home turn instead of the app-conversation rule.
+            let home_verb = match method {
+                "hire_propose" => Some("hire propose"),
+                "master_ask_form" => Some("master ask-form"),
+                _ => None,
+            };
+            if let Some(verb) = home_verb {
                 return Err(Error::invalid(
                     "master_refused",
                     match scope {
-                        MasterScope::App(_) => {
-                            "hire propose is made in the master's Home conversation, \
+                        MasterScope::App(_) => format!(
+                            "{verb} is made in the master's Home conversation, \
                              not in an app conversation"
-                        }
-                        _ => {
-                            "hire propose needs the master's live assigned turn in its \
+                        ),
+                        _ => format!(
+                            "{verb} needs the master's live assigned turn in its \
                              Home conversation - none is running"
-                        }
+                        ),
                     },
                 ));
             }

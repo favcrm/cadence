@@ -238,6 +238,12 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "hire_propose",
         Rule::Handler("the master's live assigned turn, in its Home conversation; refuses every other caller; records one inert thread entry (CAD-1752)"),
     ),
+    // CAD-2285: the master's form for the operator - the same live-turn,
+    // Home-only binding as `hire_propose`; the answer is a chat message.
+    (
+        "master_ask_form",
+        Rule::Handler("the master's live assigned turn, in its Home conversation; refuses every other caller; records one inert form entry (CAD-2285)"),
+    ),
     (
         "artifact_read",
         Rule::Handler("operator only on proof; stored scope re-proved against the conversation in view (CAD-1726)"),

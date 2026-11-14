@@ -26,6 +26,7 @@ use crate::output as console_output;
 mod console_macros;
 
 pub mod adapter;
+pub mod agent_form;
 pub mod agent_roles;
 pub mod agent_settings;
 pub mod agent_uid;

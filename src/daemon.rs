@@ -188,6 +188,7 @@ pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInp
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+mod form_rpc;
 mod hire_rpc;
 mod idea_rpc;
 mod identity;
@@ -4517,6 +4518,7 @@ impl Shared {
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
             "artifact_put" => self.rpc_artifact_put(params, peer_pid),
             "hire_propose" => self.rpc_hire_propose(params, peer_pid),
+            "master_ask_form" => self.rpc_master_ask_form(params, peer_pid),
             "artifact_read" => self.rpc_artifact_read(params, peer_pid),
             "artifact_versions" => self.rpc_artifact_versions(params, peer_pid),
             "conversation_list" => self.rpc_conversation_list(params, peer_pid),
