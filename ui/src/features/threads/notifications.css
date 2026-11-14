@@ -84,6 +84,12 @@ dialog.notification-popover::backdrop { background: var(--color-scrim); }
   color: var(--color-ink-100);
 }
 .notification-popover .lnk { font-size: var(--text-micro); }
+.notification-popover .lnk:disabled {
+  color: var(--color-ink-500);
+  opacity: .6;
+  text-decoration: none;
+  cursor: default;
+}
 .notification-list {
   display: grid;
   gap: .25rem;

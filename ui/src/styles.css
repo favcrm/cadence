@@ -171,6 +171,19 @@
   padding-left: 6px;
   border-left: 1px solid var(--color-ink-700);
 }
+:where(.navtree > .navrow) > .navlink-sub {
+  font-weight: 500;
+  color: var(--color-ink-300);
+}
+.navtree .navtree {
+  margin: 1px 0 4px 8px;
+  padding-left: 8px;
+}
+:where(.navtree .navtree) .navlink-sub {
+  min-height: 26px;
+  font-size: 12px;
+  color: var(--color-ink-500);
+}
 @media (prefers-reduced-motion: reduce) {
   .navfold,
   .navdisc svg,
@@ -347,6 +360,12 @@
    keeps it, in the accent. */
 .projrow {
   position: relative;
+}
+.projrow > .proj {
+  grid-template-columns: minmax(0, 1fr) minmax(22px, auto) 2.4em;
+}
+#mobile-navigation .projrow > .proj {
+  grid-template-columns: minmax(0, 1fr) minmax(32px, auto) 2.4em;
 }
 .projpin {
   position: absolute;

@@ -1,6 +1,7 @@
 import { NO_FILTERS } from "../src/lib/filters";
 import { readThreadsUrl } from "../src/features/threads/threadsView";
 import {
+  appNavigationSearch,
   goTo,
   legacyRedirect,
   locationHref,
@@ -11,6 +12,7 @@ import {
   routePath,
   scopeRedirect,
   showProjectChoices,
+  stripAppRouteParams,
   withProject,
   type Route,
 } from "../src/lib/router";
@@ -327,4 +329,52 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
   const settings = goTo(app, { screen: "settings", section: "memory" });
   equal(locationHref(settings, crm), "/settings/memory?keep=1", "settings drops CRM params, keeps unrelated ones");
   equal(locationHref(goTo(app, { screen: "home" }), crm), "/?keep=1", "home drops CRM params");
+}
+
+// Leaving a mounted app or switching apps strips section_query + app-owned params while keeping unrelated ones.
+{
+  const hrSearch = "?hr=leave&record=rec-1&conversation=conv-1&drawer=connect&drawer_size=md&foo=1";
+  const hrLoc = readLocation("/apps/hr", hrSearch);
+  equal(
+    locationHref(goTo(hrLoc, { screen: "home" }), hrSearch, hrLoc.route),
+    "/?foo=1",
+    "leaving /apps/hr for home strips hr, record, conversation, drawer, drawer_size",
+  );
+  equal(
+    locationHref(goTo(hrLoc, { screen: "threads" }), hrSearch, hrLoc.route),
+    "/threads?foo=1",
+    "leaving /apps/hr for threads strips app query params",
+  );
+  equal(
+    locationHref(goTo(hrLoc, { screen: "workspaceAppKey", appKey: "accounting" }), hrSearch, hrLoc.route),
+    "/apps/accounting?foo=1",
+    "switching from /apps/hr to /apps/accounting strips previous app query params",
+  );
+  const customSearch = "?people_tab=directory&record=r9&unknown=stay";
+  const hrLegacy: Route = { screen: "workspaceApp", installId: "inst-hr" };
+  equal(
+    appNavigationSearch(hrLegacy, hrLegacy, customSearch, "people_tab"),
+    customSearch,
+    "staying on the same app keeps declared section_query",
+  );
+  equal(
+    appNavigationSearch(hrLegacy, { screen: "home" }, customSearch, "people_tab"),
+    "unknown=stay",
+    "leaving an app strips its declared activeSectionQuery",
+  );
+  equal(
+    appNavigationSearch(hrLegacy, { screen: "workspaceAppKey", appKey: "accounting" }, customSearch, "people_tab"),
+    "unknown=stay",
+    "switching apps strips activeSectionQuery",
+  );
+  equal(
+    stripAppRouteParams("?crm=leads&record=r2&hr_tab=leave&project=cadence&keep=1", "hr_tab"),
+    "project=cadence&keep=1",
+    "stripAppRouteParams drops declared target section_query and keeps unrelated params",
+  );
+  equal(
+    stripAppRouteParams("?project=cadence&record=r2&keep=1", "project"),
+    "project=cadence&keep=1",
+    "stripAppRouteParams preserves host query keys even if declared as extraSectionQuery",
+  );
 }

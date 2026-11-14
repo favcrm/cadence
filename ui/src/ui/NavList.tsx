@@ -244,7 +244,7 @@ export function ProjectsSection(props: ProjectListProps) {
           <IconCaret size={10} />
           {t("Projects")}
         </button>
-        <span className="num text-[10px] text-ink-500">{projectsOpen ? "~/pm" : props.projects.length}</span>
+        <span className="num text-[10px] text-ink-500">{projectsOpen && !props.hosted ? "~/pm" : props.projects.length}</span>
       </div>
       <Fold id={listId} open={projectsOpen}>
         <ProjectList {...props} />
@@ -261,6 +261,8 @@ interface ProjectListProps {
   /** Counts derive from the cards (counts.ts), not `/api/projects`. */
   issues: ResourceState<IssueCard[]>;
   projectsError?: string | null;
+  /** Hosted workspaces hide the local `~/pm` filesystem path hint. */
+  hosted?: boolean;
   onNavigate?: () => void;
 }
 
@@ -306,6 +308,7 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
           onClick={onNavigate}
           className={`proj ${project === p.key ? "on" : ""}`}
           aria-current={project === p.key ? "page" : undefined}
+          title={p.key}
         >
           <span className="truncate">{p.key}</span>
           <span className="proj-prefix num">{p.prefix}</span>

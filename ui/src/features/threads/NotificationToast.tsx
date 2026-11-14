@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import Button from "../../ui/Button";
 import { IconClose } from "../../ui/icons";
 import { navigate } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed } from "../../lib/privateSession";
 
 /** One in-app alert. `href` is fixed when the alert is created: Open always goes to this thread. */
@@ -25,6 +26,7 @@ const ToastContext = createContext<ToastApi>({ show: () => undefined, clear: () 
 const TOAST_MS = 7000;
 
 export function NotificationToastProvider({ children }: { children: ReactNode }) {
+  const t = useTranslate();
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const seq = useRef(0);
   // Per-room announce guard: one alert per room while it is pending, so a burst
@@ -107,10 +109,10 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
           <div key={a.id} className="notification-toast" role="status">
             <div>
               <strong>{a.title}</strong>
-              <p>{a.note}</p>
-              <button type="button" className="lnk" onClick={() => { dismiss(a.id); navigate(a.href); }}>Open</button>
+              <p>{t(a.note)}</p>
+              <button type="button" className="lnk" onClick={() => { dismiss(a.id); navigate(a.href); }}>{t("Open")}</button>
             </div>
-            <Button variant="ghost" size="sm" aria-label="Dismiss notification" icon={<IconClose />} onClick={() => dismiss(a.id)} />
+            <Button variant="ghost" size="sm" aria-label={t("Dismiss notification")} icon={<IconClose />} onClick={() => dismiss(a.id)} />
           </div>
         ))}
       </div>
