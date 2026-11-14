@@ -43,7 +43,7 @@ const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import(".
 const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
+const { parseStagedRow, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
 
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
@@ -948,6 +948,134 @@ listStatus = 200;
   await React.act(async () => { root.unmount(); });
   host.remove();
   scopedActions.clear();
+}
+
+// ---- 18. CAD-2303: 4-tab drawer, cross-domain chip, optional deny note, and multi-tab bidi isolation ----
+{
+  const RLO = "\u202E";
+  const PDI = "\u2069";
+  const crossRows = {
+    marketing: customer("m1", { title: "Send Q4 campaign newsletter", app: "Mailchimp", target: { kind: "campaign", label: "Q4 Launch", id: "cmp_1" } }),
+    design: customer("d1", { title: "Publish Figma brand token set", app: "Figma", target: { kind: "brand", label: "Core Palette", id: "des_1" } }),
+    business: customer("b1", { title: "Update Marlow Books", app: "CRM" }),
+    operations: customer("o1", { title: "Approve vendor invoice schedule", app: "Ops", target: { kind: "vendor", label: "Acme Freight", id: "vnd_1" } }),
+    engineering: {
+      id: "e1", tool: "board_create_issue", status: "pending", createdAt: Date.now() - AGO, decidedAt: null,
+      input: { title: "Deploy GitHub repo worker release", project: "ENG", priority: "high", body: "Ready for release." },
+    },
+  };
+  assert(stagedDomain(parseStagedRow(crossRows.marketing)!) === "marketing", "marketing domain");
+  assert(stagedDomain(parseStagedRow(crossRows.design)!) === "design", "design domain");
+  assert(stagedDomain(parseStagedRow(crossRows.business)!) === "business", "business domain");
+  assert(stagedDomain(parseStagedRow(crossRows.operations)!) === "operations", "operations domain");
+  assert(stagedDomain(parseStagedRow(crossRows.engineering)!) === "engineering", "engineering domain");
+
+  const parsedWithReason = parseStagedRow(customer("r1", { status: "denied", decidedAt: Date.now(), decision_reason: "Budget freeze until Q2" }));
+  assert(parsedWithReason?.decisionReason === "Budget freeze until Q2", "decision_reason is parsed onto StagedWrite");
+
+  const evil = (s: string) => `${RLO}${s}${PDI}x`;
+  actions = [customer("a1", {
+    title: evil("Launch promo campaign"),
+    app: "Mailchimp",
+    target: { kind: "campaign", label: evil("VIP List"), id: evil("cmp_77") },
+    origin: { via: "cli", kind: "agent", label: evil("Atlas") },
+    reason: evil("Ready for send"),
+    consent: { channel: evil("email") },
+    effects: [evil("Sends once")],
+  })];
+  onDecide = (id, verb) => {
+    actions = actions.map((a: any) =>
+      a.id === id ? { ...a, status: verb === "approve" ? "approved" : "denied", decidedAt: Date.now(), decision_reason: "Hold until pricing sign-off" } : a,
+    );
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "one card"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "drawer opens"));
+  const d = drawerEl()!;
+  assert(text(d.querySelector(".dx-domain-chip")) === "Marketing", "domain chip renders Marketing");
+  const tabLabels = Array.from(d.querySelectorAll('[role="tab"]')).map((el) => text(el));
+  assert(tabLabels.join("|") === "Approvals|Overview|Evidence|Audit", `4 tabs render (${tabLabels.join("|")})`);
+
+  const bare = (root: Element) => Array.from(root.querySelectorAll("*")).filter((e) => Array.from(e.childNodes).some((n) => n.nodeType === 3 && (n.textContent ?? "").includes(RLO)) && !e.closest("bdi"));
+  const inBdi = (root: Element) => Array.from(root.querySelectorAll("bdi")).map((b) => b.textContent ?? "").join("");
+
+  // Check all 4 tabs before any Show raw is opened: "revision" must not appear anywhere.
+  assert(!/revision/i.test(text(d)), "Approvals hides 'revision' outside Show raw");
+  // Approvals Show raw must also isolate RLO text inside bdi.
+  await click(labelled(d, "Show raw"));
+  assert(d.querySelector("pre")?.textContent?.includes('"expected_revision": 7'), "Approvals Show raw renders payload");
+  assert(bare(d).length === 0, "Approvals Show raw isolates RLO text inside bdi");
+  assert(!/[\u2066-\u2069]/.test(inBdi(d)), "Approvals Show raw strips PDI inside bdi");
+  await click(labelled(d, "Hide raw"));
+
+  // Switch tabs within the same drawer node and check content, no-'revision' guard, and bidi isolation on every tab.
+  for (const name of ["Overview", "Evidence", "Audit"] as const) {
+    await click(labelled(d, name));
+    assert(drawerEl() === d, `${name} tab reuses the same drawer node`);
+    assert(bare(d).length === 0, `${name} isolates RLO text inside bdi`);
+    assert(!/[\u2066-\u2069]/.test(inBdi(d)), `${name} strips PDI inside bdi`);
+    assert(!/revision/i.test(text(d)), `${name} hides 'revision' outside Show raw`);
+    if (name === "Overview") assert(text(d).includes("What this request does") && text(d).includes("Marketing"), "Overview shows domain facts");
+    if (name === "Evidence") {
+      assert(d.querySelector("pre") === null, "Evidence hides raw payload behind Show raw by default");
+      await click(labelled(d, "Show raw"));
+      assert(d.querySelector("pre")?.textContent?.includes('"expected_revision": 7'), "Evidence Show raw renders payload");
+      assert(bare(d).length === 0, "Evidence Show raw isolates RLO text inside bdi");
+      assert(!/[\u2066-\u2069]/.test(inBdi(d)), "Evidence Show raw strips PDI inside bdi");
+      await click(labelled(d, "Hide raw"));
+      assert(d.querySelector("pre") === null, "Evidence Hide raw collapses payload");
+    }
+    if (name === "Audit") assert(text(d).includes("Workspace owner only") && text(d).includes("a1"), "Audit shows gate and id");
+  }
+
+  await click(labelled(d, "Approvals"));
+  await click(labelled(d, "Add deny note (optional)"));
+  const draftBox = d.querySelector(".dx-deny-box textarea") as HTMLTextAreaElement | null;
+  assert(draftBox !== null, "deny note textarea expands");
+  const setTextarea = async (el: HTMLTextAreaElement, val: string) => {
+    await React.act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(el, val);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  };
+  await setTextarea(draftBox, "Draft note");
+  await click(labelled(d, "Overview"));
+  await click(labelled(d, "Approvals"));
+  const keptBox = d.querySelector(".dx-deny-box textarea") as HTMLTextAreaElement | null;
+  assert(keptBox?.value === "Draft note", "deny note disclosure & text survive tab switch");
+  await click(labelled(d, "Hide deny note"));
+  assert(d.querySelector(".dx-deny-box") === null, "Hide deny note collapses textarea");
+  await click(labelled(d, "Add deny note (optional)"));
+  const box = d.querySelector(".dx-deny-box textarea") as HTMLTextAreaElement | null;
+  assert(box !== null && box.value === "", "Hide deny note cleared draft text before re-opening");
+  await setTextarea(box, "  Hold until pricing sign-off  ");
+  await click(labelled(d, "Deny"));
+  await settle(() => assert(!drawerEl(), "drawer closes after deny"));
+  const denyPost = posts.find((p) => p.path === "/api/assist/actions/a1/deny");
+  assert(denyPost && posts.length === 1 && denyPost.body.reason === "Hold until pricing sign-off", `deny sends optional trimmed reason (${JSON.stringify(denyPost?.body)})`);
+  onDecide = null;
+  await v.done();
+
+  // Audit tab also hides raw failure code ("revision_conflict") behind Show raw.
+  actions = [customer("a1")];
+  const f = await render();
+  await settle(() => assert(f.cards().length === 1, "one card for Audit receipt check"));
+  await click(labelled(f.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "drawer opens for Audit receipt check"));
+  decideStatus.a1 = 409;
+  actions = [customer("a1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code: "revision_conflict" } })];
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(text(drawerEl()!).includes("already decided elsewhere"), "decided elsewhere keeps drawer open"));
+  await click(labelled(drawerEl()!, "Audit"));
+  assert(text(drawerEl()!).includes("Execution receipt") && text(drawerEl()!).includes("Did not apply: the record changed after it was staged"), "Audit renders plain failure reason");
+  assert(!/revision/i.test(text(drawerEl()!)), "Audit hides raw failure code containing 'revision' outside Show raw");
+  await click(labelled(drawerEl()!, "Show raw"));
+  assert(drawerEl()!.querySelector("pre")?.textContent?.includes("revision_conflict"), "Audit Show raw discloses failure code");
+  decideStatus.a1 = 200;
+  await f.done();
 }
 
 console.log("staged decision checks passed");

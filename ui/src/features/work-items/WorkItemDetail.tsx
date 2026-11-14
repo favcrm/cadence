@@ -119,6 +119,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
           myWork={myWork}
           readOnly={readOnly}
           home={home}
+          hosted={hosted}
           stagedActions={stagedActions}
         />
       ) : tabId === "code" ? (
@@ -243,6 +244,7 @@ function OverviewPanel({
   myWork,
   readOnly,
   home,
+  hosted,
   stagedActions,
 }: {
   id: string;
@@ -255,6 +257,7 @@ function OverviewPanel({
   myWork?: MyWorkWorkItemProps;
   readOnly: boolean;
   home?: WorkItemDetailProps["home"];
+  hosted?: boolean;
   stagedActions?: readonly StagedWrite[];
 }) {
   const { t, formatNumber } = useLocale();
@@ -294,16 +297,17 @@ function OverviewPanel({
   return (
     <div className="wi-panel">
       {home && (
-        <DecisionPanel
-          key={home.open.need.key}
-          need={home.open.need}
-          readOnly={readOnly}
-          index={home.open.index}
-          total={home.open.total}
-          onDone={(key, text) => home.onDone(home.open, key, text)}
-          onClose={onClose}
-          onAsk={home.onAsk}
-        />
+          <DecisionPanel
+            key={home.open.need.key}
+            need={home.open.need}
+            readOnly={readOnly}
+            hosted={hosted}
+            index={home.open.index}
+            total={home.open.total}
+            onDone={(key, text) => home.onDone(home.open, key, text)}
+            onClose={onClose}
+            onAsk={home.onAsk}
+          />
       )}
 
       <ReadState readState={readState} onRetry={onRetry} />
@@ -582,6 +586,11 @@ function ApprovalsPanel({
                       </>
                     ) : null}
                   </div>
+                  {item.decisionReason ? (
+                    <div className="text-secondary text-ink-300">
+                      {t("Decision note")}: <bdi>{isolate(item.decisionReason)}</bdi>
+                    </div>
+                  ) : null}
                 </li>
               );
             })}

@@ -1550,13 +1550,25 @@ export const api = {
   /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
    *  merge approval for the exact head the drawer showed. A moved head
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
-  approveHead: (repo: string, pr: number, head: string) =>
-    post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  approveHead: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    post<{ approval_id: string }>("/api/approvals/approve", {
+      repo,
+      pr,
+      head,
+      ...(context?.issue ? { issue: context.issue } : {}),
+      ...(context?.project ? { project: context.project } : {}),
+    }),
   /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
    *  approval in force, revoked, or none. */
-  approvalState: (repo: string, pr: number, head: string) =>
-    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
-      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+  approvalState: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    get<{
+      state: "in-force" | "revoked" | "missing";
+      approval_id?: string;
+      board_revocable?: boolean;
+      verdicts?: unknown[];
+      precheck?: { verdicts?: unknown[] };
+    }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}${context?.issue ? `&issue=${encodeURIComponent(context.issue)}` : ""}${context?.project ? `&project=${encodeURIComponent(context.project)}` : ""}`,
     ),
   /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
   revokeApproval: (id: string, reason: string) =>

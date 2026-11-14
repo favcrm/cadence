@@ -60,23 +60,36 @@ const issues: Record<string, unknown> = {
   "D-2": issue("D-2", { title: "Light the fuselage", body: "Visitors see a calm message." }),
 };
 const posts: { path: string; body: any }[] = [];
+const approvalStateUrls: string[] = [];
 let replies: Record<string, { status: number; body: unknown }> = {};
 // A request that waits to be released, to hold a send in flight.
 let holds: Record<string, Promise<void>> = {};
 let approval: unknown = { state: "missing" };
+let strictThreeTupleApprove = false;
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if ((init?.method ?? "GET") === "POST") {
-    posts.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
+    const parsedBody = JSON.parse(String(init?.body ?? "{}"));
+    posts.push({ path: url.pathname, body: parsedBody });
     await (holds[url.pathname] as Promise<void> | undefined);
+    if (
+      url.pathname === "/api/approvals/approve" &&
+      strictThreeTupleApprove &&
+      Object.keys(parsedBody).some((k) => k !== "repo" && k !== "pr" && k !== "head")
+    ) {
+      return json({ error: "Request body contains an unsupported field.", code: "validation_failed" }, 400);
+    }
     const r = replies[url.pathname];
     return r ? json(r.body, r.status) : json({ state: "ok" });
   }
   const m = /^\/api\/issues\/([\w-]+)$/.exec(url.pathname);
   if (m && issues[m[1]]) return json(issues[m[1]]);
-  if (url.pathname === "/api/approvals/state") return json(approval);
+  if (url.pathname === "/api/approvals/state") {
+    approvalStateUrls.push(url.pathname + url.search);
+    return json(approval);
+  }
   if (url.pathname === "/api/agents") return json({ agents: [], by_issue: {} });
   return json({});
 }) as typeof fetch;
@@ -156,7 +169,7 @@ function Badge({ needs }: { needs: unknown[] }) {
   return React.createElement("span", { "data-badge": true }, String(useHomeCount(needs as never)));
 }
 
-async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: boolean; noBadge?: boolean } = {}) {
+async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: boolean; noBadge?: boolean; hosted?: boolean } = {}) {
   if (!opts.keepLocal) {
     resetTodoLocal();
     posts.length = 0;
@@ -174,7 +187,7 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
           // Without the badge nothing reconciles: the marks alone must not hide a changed need.
           opts.noBadge ? null : React.createElement(Badge, { needs: rows }),
           React.createElement(RailWithDetail, {
-            overview, readOnly: ro, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
+            overview, readOnly: ro, hosted: opts.hosted, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
             onAsk: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
           }),
         ),
@@ -511,6 +524,79 @@ for (const row of [
   assert(c.querySelector(".todo-title")?.textContent === "Something needs your attention", "the generic title");
   assert(labelled(c, "Fix it"), 'the generic card offers "Fix it"');
   await done();
+}
+
+// ---- 6. hosted merge review promotes Approve this version, sends optional issue/project context with 3-tuple 400 fallback, renders board pre-check verdicts, and shows CLI enqueue handoff ----
+{
+  issues["D-2"] = issue("D-2", {
+    title: "Light the fuselage",
+    body: "Visitors see a calm message.",
+    reports: [],
+  });
+  approvalStateUrls.length = 0;
+  strictThreeTupleApprove = true;
+  const boardVerdicts = [{ name: "standards", agent: "svc_review_standards", verdict: "PASS", sha: SHA }];
+  approval = { state: "missing", verdicts: boardVerdicts };
+  const ro = await render([rows.merge], true, { hosted: true });
+  await click(labelled(ro.card("merge_decision"), "Review"));
+  const drawer = () => ro.host.querySelector('[data-drawer="review"]')!;
+  await settle(() => assert(labelled(drawer(), "Approve this version"), "hosted merge renders primary Approve this version"));
+  assert(!labelled(drawer(), "Publish"), "hosted merge hides local Publish button");
+  assert(labelled(drawer(), "Ask for changes…"), "hosted merge renders Ask for changes…");
+  assert(isDisabled(labelled(drawer(), "Approve this version")!), "read-only disables Approve this version");
+  assert(isDisabled(labelled(drawer(), "Ask for changes…")!), "read-only disables Ask for changes…");
+  await ro.done();
+
+  const rw = await render([rows.merge], false, { hosted: true });
+  approvalStateUrls.length = 0;
+  await click(labelled(rw.card("merge_decision"), "Review"));
+  const d = () => rw.host.querySelector('[data-drawer="review"]')!;
+  await settle(() => assert(!isDisabled(labelled(d(), "Approve this version")!), "writable hosted approval enabled"));
+  assert(
+    approvalStateUrls.some((u) => u.includes("issue=D-2") && u.includes("project=demo")),
+    `approvalState carries optional issue/project context (${JSON.stringify(approvalStateUrls)})`,
+  );
+  assert(
+    (d().textContent ?? "").includes("Recorded review verdicts") &&
+      (d().textContent ?? "").includes("svc_review_standards") &&
+      (d().textContent ?? "").includes("matches this version"),
+    "board pre-check verdicts render even when issue.reports is empty",
+  );
+  approval = { state: "in-force", approval_id: "a-hosted", board_revocable: true, verdicts: boardVerdicts };
+  await click(labelled(d(), "Approve this version"));
+  await settle(() => assert(labelled(d(), "Done"), "approved hosted merge switches primary to Done"));
+  const approvePosts = posts.filter((p) => p.path === "/api/approvals/approve");
+  assert(
+    approvePosts.length === 2 &&
+      approvePosts[0].body.issue === "D-2" &&
+      approvePosts[0].body.project === "demo" &&
+      approvePosts[1].body.repo === "acme/app" &&
+      approvePosts[1].body.pr === 9 &&
+      approvePosts[1].body.head === SHA &&
+      Object.keys(approvePosts[1].body).length === 3,
+    `approve sends optional context first and degrades cleanly to strict 3-tuple on 400 (${JSON.stringify(approvePosts)})`,
+  );
+  assert((d().textContent ?? "").includes("Approved on this board for this exact version."), "hosted approval status text");
+  assert(labelled(d(), "Take my approval back"), "revocable take-back stays available");
+  await click(labelled(d(), "Local enqueue command"));
+  assert((d().textContent ?? "").includes(`scripts/enqueue-reviewed 9 --head ${SHA}`), "CLI enqueue handoff discloses exact command");
+  await click(labelled(d(), "Take my approval back"));
+  const revokeBox = d().querySelector(".rv-sendback textarea") as HTMLTextAreaElement | null;
+  assert(revokeBox !== null, "take-back reason textarea expands");
+  await React.act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(revokeBox, "Need one more check");
+    revokeBox.dispatchEvent(new Event("input", { bubbles: true }));
+    revokeBox.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  approval = { state: "revoked", approval_id: "a-hosted", board_revocable: false };
+  await click(labelled(d(), "Take it back"));
+  await settle(() => assert((d().textContent ?? "").includes("Your approval was taken back. A new version needs a fresh approval."), "revoked copy shown after take-back"));
+  const revokePost = posts.find((p) => p.path === "/api/approvals/a-hosted/revoke");
+  assert(revokePost && revokePost.body.reason === "Need one more check", `revoke payload sends trimmed reason (${JSON.stringify(revokePost?.body)})`);
+  strictThreeTupleApprove = false;
+  approval = { state: "missing" };
+  await rw.done();
 }
 
 console.log("todo guard checks passed");

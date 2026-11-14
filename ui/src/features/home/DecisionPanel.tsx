@@ -5,7 +5,8 @@ import { useMaybeResource } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import { useTranslate } from "../../lib/locale";
-import { useApproveHead } from "./ApproveHead";
+import { useApproveHead, prTarget } from "./ApproveHead";
+import { isolate } from "../decisions/stagedWrite";
 import { useIdeaDecision } from "./IdeaCard";
 import { useMergeDecision } from "./MergeForm";
 import { usePlanDecision } from "./PlanCard";
@@ -25,6 +26,8 @@ import { ageWords, changeSize, firstSentence, type HomeNeed } from "./needs";
 export interface DecisionPanelProps {
   need: HomeNeed;
   readOnly: boolean;
+  /** True on hosted workspaces where delivery runs through local enqueue after board approval. */
+  hosted?: boolean;
   /** 1-based position among the reading items, and how many there are. */
   index: number;
   total: number;
@@ -61,15 +64,15 @@ function Details({ text }: { text: string }) {
   );
 }
 
-function Ticks({ items }: { items: string[] }) {
+function Ticks({ items }: { items: { key: string; node: ReactNode }[] }) {
   const t = useTranslate();
   if (items.length === 0) return null;
   return (
     <>
       <h4 className="rv-h">{t("Checked")}</h4>
       <ul className="rv-ticks">
-        {items.map((t) => (
-          <li key={t}>{t}</li>
+        {items.map((item) => (
+          <li key={item.key}>{item.node}</li>
         ))}
       </ul>
     </>
@@ -345,32 +348,53 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: DecisionP
   );
 }
 
-function MergeReview({ need, readOnly, index, total, onDone, onClose }: DecisionPanelProps) {
+function MergeReview({ need, readOnly, hosted, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
   const action = need.action as HomeNeed["action"] & { type: "merge" };
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
   const [sendBack, setSendBack] = useState(false);
   const [takeBack, setTakeBack] = useState(false);
+  const [showCmd, setShowCmd] = useState(false);
   const issue = useIssue(action.issue);
-  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null);
-  const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (t) =>
-    onDone(need.key, t.startsWith("declined") ? "Sent back" : "Published"),
+  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null, {
+    issue: action.issue,
+    project: need.project,
+  });
+  const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (res) =>
+    onDone(need.key, res.startsWith("declined") ? "Sent back" : "Published"),
   );
   const size = changeSize(need.title);
-  const ticks = [
-    action.reviewer ? "Reviewed and passed by a second agent" : null,
-    action.verdict ? action.verdict : null,
-    m.head ? "Checked at the exact version you are about to publish" : null,
-  ].filter((t): t is string => !!t);
+  const ticks: { key: string; node: ReactNode }[] = (
+    [
+      action.reviewer ? { key: "reviewer", node: t("Reviewed and passed by a second agent") } : null,
+      action.verdict ? { key: "verdict", node: <bdi>{isolate(action.verdict)}</bdi> } : null,
+      m.head
+        ? {
+            key: "head",
+            node: hosted
+              ? t("Checked at the exact version you are about to approve")
+              : t("Checked at the exact version you are about to publish"),
+          }
+        : null,
+    ] as ({ key: string; node: ReactNode } | null)[]
+  ).filter((item): item is { key: string; node: ReactNode } => item !== null);
+  const issueVerdicts = (issue?.reports ?? [])
+    .filter((r) => r.kind === "verdict")
+    .map((r) => ({ name: r.name, agent: r.agent ?? null, verdict: r.verdict ?? null, sha: r.sha ?? null }));
+  const verdicts = a.verdicts.length > 0 ? a.verdicts : issueVerdicts;
+  const parsedPr = prTarget(action.pr);
+  const safeHead = m.head && /^[0-9a-f]{40,64}$/i.test(m.head) ? m.head.toLowerCase() : null;
   const lead = firstSentence(issue?.body);
   const off = !!block || !m.head || a.member;
   // One line per distinct error: a repeat of the same text shows once.
-  const errors = [...new Set([a.error, m.error].filter((t): t is string => !!t))];
+  const errors = hosted
+    ? (a.error ? [a.error] : [])
+    : [...new Set([a.error, m.error].filter((msg): msg is string => !!msg))];
   return (
     <Shell
       need={need}
       verb="Approve change"
-      title={issue?.title ?? need.shortTitle ?? "Publish a change"}
+      title={issue?.title ?? need.shortTitle ?? t("Publish a change")}
       subtitle={`${t("Ready")} ${waiting(need, t)}`}
       body={
         <>
@@ -382,8 +406,35 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
             </>
           )}
           <Ticks items={ticks} />
+          {hosted && verdicts.length > 0 && (
+            <>
+              <h4 className="rv-h">{t("Recorded review verdicts")}</h4>
+              <ul className="rv-verdicts">
+                {verdicts.map((v, i) => (
+                  <li key={`${v.name}:${i}`}>
+                    <span>
+                      <bdi>{isolate(v.agent ?? v.name)}</bdi> · <bdi>{isolate(v.verdict ?? t("verdict not recorded"))}</bdi>
+                    </span>
+                    <small>
+                      {v.sha ? (
+                        m.head && v.sha.toLowerCase() === m.head.toLowerCase() ? (
+                          <>
+                            <bdi>{isolate(v.sha.slice(0, 12))}</bdi> · {t("matches this version")}
+                          </>
+                        ) : (
+                          <bdi>{isolate(v.sha.slice(0, 12))}</bdi>
+                        )
+                      ) : (
+                        t("no head recorded")
+                      )}
+                    </small>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
           {!m.head && <p className="rv-error">{t("This has no checked version to approve. It needs a fresh review.")}</p>}
-          {sendBack && (
+          {!hosted && sendBack && (
             <SendBack
               label="Send back"
               placeholder="What should change before this goes out?"
@@ -393,9 +444,17 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
           )}
           {a.approved && (
             <>
-              <p className="rv-note">{a.revocable ? t("Approved.") : t("Approved from your terminal.")}</p>
+              <p className="rv-note">
+                {hosted
+                  ? a.revocable
+                    ? t("Approved on this board for this exact version.")
+                    : t("Approved from your terminal.")
+                  : a.revocable
+                    ? t("Approved.")
+                    : t("Approved from your terminal.")}
+              </p>
               {a.revocable && !block && (
-                <button type="button" className="rv-dlnk" disabled={a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
+                <button type="button" className="rv-dlnk" disabled={a.busy !== null} onClick={() => setTakeBack((open) => !open)}>
                   {t("Take my approval back")}
                 </button>
               )}
@@ -406,6 +465,19 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
                   busy={a.busy === "revoke"}
                   onSend={a.revoke}
                 />
+              )}
+              {hosted && parsedPr && safeHead && (
+                <>
+                  <button type="button" className="rv-dlnk" aria-expanded={showCmd} onClick={() => setShowCmd((s) => !s)}>
+                    {t("Local enqueue command")}
+                  </button>
+                  {showCmd && (
+                    <div className="rv-cmd">
+                      <p className="rv-note m-0">{t("Board approval is on record. Run from an operator checkout once Browser QA is ready:")}</p>
+                      <pre className="rv-tech">{`scripts/enqueue-reviewed ${parsedPr.number} --head ${safeHead}`}</pre>
+                    </div>
+                  )}
+                </>
               )}
             </>
           )}
@@ -429,34 +501,75 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
         </>
       }
       foot={
-        <Foot
-          block={block}
-          index={index}
-          total={total}
-          onClose={onClose}
-          primary={
-            <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={() => { a.clearError(); m.merge(); }}>
-              {m.busy === "merge" ? t("Publishing…") : t("Publish")}
-            </Button>
-          }
-          secondary={
-            <>
-              {a.available && !a.approved && !a.revoked && (
+        hosted ? (
+          <Foot
+            block={block}
+            index={index}
+            total={total}
+            onClose={onClose}
+            primary={
+              a.approved ? (
+                <Button variant="primary" onClick={() => onDone(need.key, "Approved")}>
+                  {t("Done")}
+                </Button>
+              ) : (
                 <Button
-                  disabled={!!block || a.member || a.busy !== null || m.busy !== null}
+                  variant="primary"
+                  disabled={!!block || !a.available || a.revoked || a.member || a.busy !== null}
                   loading={a.busy === "approve"}
                   title={block ? t(READ_ONLY_COPY) : undefined}
-                  onClick={() => { m.clearError(); a.approve(); }}
+                  onClick={() => {
+                    a.clearError();
+                    a.approve();
+                  }}
                 >
                   {t("Approve this version")}
                 </Button>
-              )}
-              <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>
-                Send back…
+              )
+            }
+            secondary={
+              <Button
+                disabled={!!block}
+                title={block ? t(READ_ONLY_COPY) : undefined}
+                onClick={() => {
+                  onAsk(need, `Please update ${action.issue} (${action.pr ?? action.issue}): `);
+                  onClose();
+                }}
+              >
+                {t("Ask for changes…")}
               </Button>
-            </>
-          }
-        />
+            }
+          />
+        ) : (
+          <Foot
+            block={block}
+            index={index}
+            total={total}
+            onClose={onClose}
+            primary={
+              <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={() => { a.clearError(); m.merge(); }}>
+                {m.busy === "merge" ? t("Publishing…") : t("Publish")}
+              </Button>
+            }
+            secondary={
+              <>
+                {a.available && !a.approved && !a.revoked && (
+                  <Button
+                    disabled={!!block || a.member || a.busy !== null || m.busy !== null}
+                    loading={a.busy === "approve"}
+                    title={block ? t(READ_ONLY_COPY) : undefined}
+                    onClick={() => { m.clearError(); a.approve(); }}
+                  >
+                    {t("Approve this version")}
+                  </Button>
+                )}
+                <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>
+                  {t("Send back…")}
+                </Button>
+              </>
+            }
+          />
+        )
       }
     />
   );
