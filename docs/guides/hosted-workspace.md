@@ -310,10 +310,11 @@ preview before the new header is sent.
 
 The browser clears a preview as soon as its connection closes, even if the
 status probe cannot answer. The browser opts in to partial board feeds with
-`accept_degraded=1`; when one declares degraded coverage, the board says some
-updates are not live and the recovery refresh stays enabled while local
-invalidations continue. Older browsers remain on polling rather than treating
-the partial feed as complete.
+`accept_degraded=1`; when one declares degraded coverage, recovery refresh
+stays enabled while local invalidations continue, and Hosted Status
+(`/settings/status`) notes the background refresh without showing a
+workspace-wide warning banner. Older browsers remain on polling rather than
+treating the partial feed as complete.
 
 A slow thread reader reconnects from its last received durable `id` after the
 queued data crosses 256 KiB; already queued entries drain before closure. One

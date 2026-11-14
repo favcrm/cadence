@@ -41,8 +41,12 @@ export class LiveUpdates {
     // Coverage is per connection: a previous feed's claim never carries into
     // a new one, so a native `hello` without liveness keeps today's behaviour.
     this.coverage = "unstipulated";
+    this.opts.onDegraded?.(false);
   };
-  failed = () => { this.live = false; };
+  failed = () => {
+    this.live = false;
+    this.opts.onDegraded?.(false);
+  };
   healthy = () => this.live && this.coverage !== "degraded" && this.now() - this.last < 45_000;
   event = (event: SseEvent) => {
     if (this.live && this.now() - this.last >= 45_000) this.opts.resync();
@@ -119,6 +123,7 @@ export class LiveUpdates {
     this.timer = null;
     this.pending.clear();
     this.live = false;
+    this.opts.onDegraded?.(false);
   };
 }
 
