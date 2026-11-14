@@ -1582,6 +1582,10 @@ V2 records retain:
 - bounded latest usage-report receipts and report counts. Full audit history
   stays in the canonical record, not the default agent context.
 
+For a Wiki citation, refusal or an unreadable revision is a skipped check, not
+proof that the page is absent. Absence requires an admitted, successfully read
+pinned commit. Neither result is a pass.
+
 Existing v1 records are neither rewritten nor silently adopted. Their native
 two-reviewer/PM lifecycle remains in `memory::submit_review`,
 `memory::finalize_native` and the legacy retrieval evaluator. Incomplete
