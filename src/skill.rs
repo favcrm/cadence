@@ -144,17 +144,45 @@ const DELIVERABLE_QA: BundledSkill = BundledSkill {
     )],
 };
 
-pub const SKILL_NAMES: [&str; 6] = [
+const CADENCE_APP_DEV: BundledSkill = BundledSkill {
+    name: "cadence-app-dev",
+    files: &[
+        (
+            "references/contracts-and-storage.md",
+            include_str!("../skills/cadence-app-dev/references/contracts-and-storage.md"),
+        ),
+        (
+            "references/bridge-and-ui.md",
+            include_str!("../skills/cadence-app-dev/references/bridge-and-ui.md"),
+        ),
+        (
+            "references/release-and-catalog.md",
+            include_str!("../skills/cadence-app-dev/references/release-and-catalog.md"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/cadence-app-dev/SKILL.md"),
+        ),
+    ],
+};
+
+pub const SKILL_NAMES: [&str; 7] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
     COMPANY_OUTPUTS.name,
     WEBSITE_BUILDER.name,
     INCIDENT_RESPONSE.name,
     DELIVERABLE_QA.name,
+    CADENCE_APP_DEV.name,
 ];
 
 /// Provider skill directories that receive links to each selected bundle.
-const LINK_PARENTS: [&str; 3] = [".claude/skills", ".cursor/skills", ".copilot/skills"];
+const LINK_PARENTS: [&str; 4] = [
+    ".claude/skills",
+    ".cursor/skills",
+    ".copilot/skills",
+    ".gemini/skills",
+];
 
 fn canonical_root(home: &Path) -> PathBuf {
     home.join(".agents").join("skills")
@@ -182,6 +210,7 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             WEBSITE_BUILDER,
             INCIDENT_RESPONSE,
             DELIVERABLE_QA,
+            CADENCE_APP_DEV,
         ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
@@ -189,6 +218,7 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
         Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
         Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
         Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
+        Some("cadence-app-dev") => Ok(&[CADENCE_APP_DEV]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -872,6 +902,56 @@ mod tests {
                 // The exact two lines the merge gate counts (scripts/enqueue-reviewed).
                 assert!(text.contains("Browser QA: pass\n   Head: <full 40-hex sha>"));
                 assert!(text.contains("never approves on a person's behalf"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn cadence_app_dev_bundle_installs_skill_references_and_gemini_provider_link() {
+        assert!(SKILL_NAMES.contains(&"cadence-app-dev"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("cadence-app-dev")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("cadence-app-dev");
+        for relative in [
+            "SKILL.md",
+            "references/contracts-and-storage.md",
+            "references/bridge-and-ui.md",
+            "references/release-and-catalog.md",
+        ] {
+            assert!(root.join(relative).is_file(), "missing {relative}");
+        }
+        for parent in [
+            ".claude/skills",
+            ".cursor/skills",
+            ".copilot/skills",
+            ".gemini/skills",
+        ] {
+            let link = dir.path().join(parent).join("cadence-app-dev");
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "expected symlink at {}",
+                link.display()
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), root);
+        }
+        let second = sync(dir.path(), false, Some("cadence-app-dev")).unwrap();
+        assert_eq!(second["wrote"], false);
+        let report = status(dir.path());
+        let entry = report["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "cadence-app-dev")
+            .expect("cadence-app-dev status entry");
+        assert_eq!(entry["installed"], true);
+        assert_eq!(entry["content_match"], true);
+        assert_eq!(entry["links"]["gemini"], "ok");
+        match show("cadence-app-dev", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                assert!(text.contains("createScreenBridge"));
+                assert!(text.contains("installSandboxFormActions"));
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }
