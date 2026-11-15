@@ -955,5 +955,17 @@ mod tests {
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }
+        match show(
+            "cadence-app-dev",
+            Some("references/contracts-and-storage.md"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(text) => {
+                assert!(text.contains("app-storage/v1"));
+                assert!(text.contains("capability_slots"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
     }
 }

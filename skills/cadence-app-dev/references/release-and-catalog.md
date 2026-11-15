@@ -16,13 +16,13 @@ Detached app repos pin the versioned toolchain release asset:
 
 | Command | Purpose | Key Rules / Caveats |
 | :--- | :--- | :--- |
-| `cadence app dev --package .` | Serve app locally via `package.json.cadence` | Scrubbed `CADENCE_APP_*` env; ports `3110..=3199`; `cadence.dev` is a single command rejecting newlines, unquoted `(`, `)`, and shell metacharacters (`cadence.check` runs via `sh -c`). |
-| `cadence app check <local-dir> --json` | Offline install check (grammar, caps, manifests, descriptors, workflows, `requires`) | Takes a local directory path; exit `0` pass, `3` refusal. Does not check duplicate installs or pending catalog journals. **Never ship solely on `inspect` or `--integrity-only` preview/fixture modes.** |
+| `cadence app dev --package .` | Serve app locally via root `package.json.cadence` | Scrubbed `CADENCE_APP_*` env; ports `3110..=3199`; `cadence.dev` is a single command rejecting newlines, unquoted `(`, `)`, and shell metacharacters (`;`, `&`, `&&`, `||`, `|`, `<`, `>`, backticks, `$()`), while `cadence.check` runs via `sh -c`. |
+| `cadence app check <bundle-dir> --json` | Offline install check (grammar, caps, manifests, workflows, `requires`) | Takes the bundle root directory containing `app.md` (for example `./app` in a detached app repo); exit `0` pass, `3` refusal. Checks `app-storage.json` / `storage/` path-presence pairing rather than hosted `app-storage/v1` internals (`agenticos-v2` `packages/contracts/src/app-storage.ts`), and does not check duplicate installs or pending catalog journals. **Never ship solely on `inspect` or `--integrity-only` preview/fixture modes.** |
 | `cadence app inspect <source> --json` | Inspect bundle integrity & observed Native requirements | Read-only; does not claim target compatibility and installs/approves nothing. |
-| `cadence app frame-kit --out <dir> --bundle <dir> --parent-origin <origin>` | Export exact host screen frame + kit CSS for offline preview | Refuses existing `--out`; runtime `@cadence/app-kit` `validateBoot()` validates `https:` or `http://localhost:<port>` / `http://<name>.localhost:<port>` (explicit port `>= 1` required; override default `http://127.0.0.1` when testing live boot). `--integrity-only` skips target compatibility check (static preview only). |
-| `cadence app fixtures --bundle <dir> --json` | Emit canonical screen `PUSH` fixtures from validated bundle | Synthetic fixtures only; `--integrity-only` skips target runtime compatibility. |
+| `cadence app frame-kit --out <dir> --bundle <bundle-dir> --parent-origin <origin>` | Export exact host screen frame + kit CSS for offline preview | Refuses existing `--out`; runtime `@cadence/app-kit` `validateBoot()` validates `https:` or `http://localhost:<port>` / `http://<name>.localhost:<port>` (explicit port `>= 1` required; override default `http://127.0.0.1` when testing live boot). `--integrity-only` skips target compatibility check (static preview only). |
+| `cadence app fixtures --bundle <bundle-dir> --json` | Emit canonical screen `PUSH` fixtures from validated bundle | Synthetic fixtures only; `--integrity-only` skips target runtime compatibility. |
 
-Note: `builtin:<id>` package sources are retired (`CAD-1422`) and refused by the CLI and daemon. `cadence app check` validates a local directory path, whereas `cadence app catalog install` accepts a local directory or canonical Git repository URL.
+Note: `builtin:<id>` package sources are retired (`CAD-1422`) and refused by the CLI and daemon. `cadence app check` validates a local bundle directory path (`./app`), whereas `cadence app catalog install` accepts a local directory or canonical Git repository URL.
 
 ## 3. Local Workspace Catalog vs. Hosted (`--org`) Catalog
 
@@ -47,7 +47,7 @@ Selected remote orgs never accept local bundle uploads or fall back to local cat
 
 ## 4. Artifact Slots, Bindings & Release Effects
 
-Apps publishing content or requiring host asset storage declare slot names in `app/app.md` `needs.capabilities` (for example `publication` and `image`), reference those declared slot names from workflow frontmatter (`publication_slot: <slot>`, `required_asset_slot: <slot>`), and go through explicit operator bindings + two-step effect approval:
+Apps publishing content or requiring host asset storage declare publication slots in `./app/app.md` `needs.capabilities` (referenced by workflow frontmatter `publication_slot: <slot>`) and workflow-scoped `capability_slots: [...]` in frontmatter (referenced by `required_asset_slot: <slot>`), and go through explicit operator bindings + two-step effect approval:
 
 - **Bindings:** `cadence app binding create|ls|show|set|publish|revoke <install-id> ...` (revision-pinned connection/destination configuration).
 - **Effects:** `cadence app effect stage <run-id> --artifact-id <id> --slot <slot> --request-id <req> --title <title>` -> `show <effect-id>` -> `accept <effect-id> --digest <digest>` (or `decline --digest <digest>` / `resolve <effect-id> --resolution close|acknowledge --digest <digest>`). HTTP transport caps effect request bodies at `48 KiB` and receipts at `4 MiB`.

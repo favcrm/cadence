@@ -4,7 +4,7 @@ Always read the target repo's pinned `@cadence/app-kit` (`package.json`, `README
 
 ## 1. Receiver Initialization (`createScreenBridge` vs `createScreenReceiver`)
 
-- **Modern `@cadence/app-kit` (`0.5.0`+):** Use `createScreenBridge` where available. Admits up to **6** declared `ready` capabilities (`0.3.0`–`0.4.x` introduced `createScreenBridge` with `5` `ready` capabilities) and supports `screen-locale.v1` (`"en" | "zh-TW"`), `screen-audio.v1`/`.v2`, `screen-records.v1`, `ownLeaveState()`, and `patchRoute()`.
+- **Modern `@cadence/app-kit` (`0.4.0`+ and `0.5.0`+):** Use `createScreenBridge` where available. Admits up to **6** declared `ready` capabilities (`0.4.0` added `screen-audio.v1`, `0.5.0`+ added `screen-audio.v2`; `0.3.0` introduced `createScreenBridge` with `5` `ready` capabilities) and supports `screen-locale.v1` (`"en" | "zh-TW"`), `screen-audio.v1`/`.v2`, `screen-records.v1`, `ownLeaveState()`, and `patchRoute()`.
 - **Legacy `@cadence/app-kit` (`0.2.0`, vendored from toolchain `v0.3.20`):** Only exposes `createScreenReceiver`, enforces a **4** `ready` capability limit (`readyAccepts <= 4`), and may use legacy locale tags such as `crm-locale.v1`.
 - Never silently assume `createScreenBridge` or a `6`-capability budget exists until verified in the target repo's installed `app-kit`.
 
@@ -32,7 +32,7 @@ Exported by `@cadence/app-kit` (`src/index.mjs`, `src/receiver.mjs`, `src/refusa
 
 - Declare drawer widths via `size: "narrow" | "wide"` and pass `<= 1024` bytes of `context`.
 - The host owns global chrome, sidebar/screen navigation, and `HOST_DRAWER_VERBS` drawers.
-- **No nested drawers/modals:** Never open an app-owned drawer, modal, or confirmation sheet inside an active host drawer. Check the current surface/drawer mode (`screen-surfaces.v1` or `DrawerShell` context) first.
+- **No nested drawers/modals:** Never open an app-owned drawer, modal, or confirmation sheet inside an active host drawer. Check the current surface/drawer mode first via `bridge.getState().surface` (`createScreenBridge`, `role: "primary" | "drawer"`) or `receiver.surfaceRole()` (`createScreenReceiver` / `onSurface(role, surface, modal)` on `screen-surfaces.v1`); note `DrawerShell` props (`modal`, `scrim`, `open`, `onClose`) configure local drawer presentation and do not expose host surface state.
 - Check host `screen-surfaces.v1` support before adopting newer surface controls over legacy `screen-presentation.v1`.
 
 ## 4. Routing, Unsaved Draft Guards & Sandboxed `<form>` Handling
@@ -53,7 +53,7 @@ Exported primitives (`ui/screen-ui/src/index.ts`):
 - Data fetching helpers: `ApiError`, `Resource`, `QueryCache`, `useQuery`, `useResource`, `useMaybeResource`
 
 Visual & UX requirements from `ui/screen-ui/DESIGN.md`:
-- Compact, calm SaaS density: `28px` desktop list/control heights, `36px` on narrow viewports.
+- Compact, calm SaaS density: in compact list compositions (search, filters, primary action, pager controls), use `28px` desktop and `36px` narrow control heights; preserve shipped global form defaults (`.field` `36px`, `.select-trigger` `32px`) unless a compact list layout explicitly calls for compact variants.
 - Support both dark and light theme semantic tokens (`@cadence/screen-ui/styles.css`, built from `theme.css`, `controls.css`, `base.css`, `primitives.css`, `drawer-base.css`, `drawer.css`, plus `foundation.css` in source)—never add a second CSS reset or custom color palette.
 - Honor reduced-motion preferences, full keyboard focus rings, and desktop + narrow responsive stacking.
 - Provide full `"en"` and `"zh-TW"` copy through `LocaleTextProvider` (or app translation dictionaries) for every heading, empty state, validation message, error state, and `section_query` tab label.
