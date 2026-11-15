@@ -68,8 +68,9 @@ jobs:
             --github-output "$GITHUB_OUTPUT" > "$RUNNER_TEMP/filter.txt"
           {
             echo "### changed-tests"
-            if [ -s "$RUNNER_TEMP/filter.txt" ]; then
-              echo "Selected filterset: \`$(cat "$RUNNER_TEMP/filter.txt")\`"
+            filter=$(cat "$RUNNER_TEMP/filter.txt")
+            if [ -n "$filter" ]; then
+              echo "Selected filterset: \`$filter\`"
             else
               echo "No daemon or suite test file changed; nothing to run."
             fi

@@ -29,7 +29,7 @@ file moved out of these trees still counts; type changes and deletions included)
                                changed line maps to its enclosing `#[test]`
                                fn; a changed helper selects its enclosing
                                `mod`. Names match by suffix at a `::`
-                               boundary, so a misread enclosing module can
+                               boundary, so a missed enclosing module can
                                only widen the selection, never drop a test.
                                A deletion selects the items on both
                                sides of it. A change outside any test fn or mod
