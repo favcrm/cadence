@@ -141,6 +141,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "artifact_find",
     "artifact_show",
     "artifact_read",
+    // CAD-2286: the workspace's document types and baseline. It is also the
+    // one probe that decides whether the document lifecycle is available
+    // ([`document_lifecycle_unavailable`]).
+    "document_types",
     "message_read",
     "message_inbox",
     "team_list",
@@ -160,6 +164,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_message_send",
     "issue_messages_read",
     "issue_set",
+    // CAD-2286: submit a file the caller saved into the document lifecycle.
+    // The board judges the creator from the subject, so it stays on the
+    // member's login (`agent_credential::stays_on_login`).
+    "document_submit",
     // AOS-528: one link added or removed. The board applies the delta to the
     // card it holds, so the client sends ids and a kind, never a whole card.
     "issue_link",
@@ -249,7 +257,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_show"
         | "agent_roles"
         | "project_ls"
-        | "project_timeline" => &["cli.read"],
+        | "project_timeline"
+        | "document_types" => &["cli.read"],
+        // CAD-2286: the tenant admits `document_submit` with cli.write alone.
+        "document_submit" => &["cli.write"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" | "audit_verdict_project" => &["cli.write"],
@@ -351,6 +362,7 @@ const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have bee
 const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
 const RECONCILE_AUDIT_IDENTITIES: &str = "the identity attestations may or may not have been recorded — read `audit identities` before repeating it";
 const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
+const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — read `artifact types`, then repeat `artifact submit` for the same id, which answers the document's current stage";
 const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
@@ -385,6 +397,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "artifact_find"
         | "artifact_show"
         | "artifact_read"
+        | "document_types"
         | "message_read"
         | "message_inbox"
         | "team_list"
@@ -409,6 +422,7 @@ fn cli_effect(verb: &str) -> Effect {
         "issue_review" => mutation(RECONCILE_ISSUE_REVIEW),
         "issue_message_send" => mutation(RECONCILE_ISSUE_MESSAGE_SEND),
         "issue_messages_read" => mutation(RECONCILE_ISSUE_MESSAGES_READ),
+        "document_submit" => mutation(RECONCILE_DOCUMENT_SUBMIT),
         "project_policy" => mutation(RECONCILE_PROJECT_POLICY),
         "project_new" => mutation(RECONCILE_PROJECT_NEW),
         "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
@@ -2074,6 +2088,82 @@ pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
 
 /// Stable code for a board that predates `limit` on `issue_ls`.
 pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
+
+/// CAD-2286: stable code for a workspace whose document lifecycle cannot be
+/// used — the tenant predates it, the flag is off, or an older relay refuses
+/// the verb. Only `document_types` decides it ([`document_lifecycle_unavailable`]).
+pub const DOCUMENT_LIFECYCLE_UNAVAILABLE: &str = "document_lifecycle_unavailable";
+
+/// CAD-2286: the `document_types` answers that mean "this workspace has no
+/// document lifecycle", never "remote unavailable, retry later":
+///
+/// - `501` — a tenant without the verb (`not_implemented`);
+/// - `404 not_found` — the tenant's flag is off; it answers that before it
+///   reads any argument;
+/// - `400 invalid_request`/`unknown_verb` — a relay older than the verb.
+///   `document_types` takes no arguments, so the refusal can only be the
+///   name, as [`tenant_cannot_serve`] reasons.
+///
+/// Every other verb, `document_submit` included, keeps its own answer: a 404
+/// on submit is a missing file, not a missing lifecycle.
+fn document_lifecycle_unavailable(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_types" {
+        return None;
+    }
+    let state = body.and_then(|b| b["state"].as_str()).unwrap_or_default();
+    if matches!(state, "waking" | "wake_failed") {
+        return None;
+    }
+    let code = refusal_fields(body).0;
+    let unavailable = match status {
+        501 => true,
+        404 => code == Some("not_found"),
+        400 => matches!(code, Some("invalid_request" | "unknown_verb")),
+        _ => false,
+    };
+    unavailable.then(|| {
+        Error::invalid(
+            DOCUMENT_LIFECYCLE_UNAVAILABLE,
+            format!(
+                "document lifecycle is not available on this workspace (HTTP {status}{}): its \
+                 server does not serve it, or it is not turned on here. Nothing was read",
+                code.map_or(String::new(), |c| format!(", {c}"))
+            ),
+        )
+    })
+}
+
+/// CAD-2286: the tenant's `document_submit` refusals
+/// (`DOCUMENT_SUBMIT_STATUS` in `apps/api/src/tenant-board/cli.ts`), each a
+/// typed error carrying its code. Without this, the generic decoder drops a
+/// 403 code as an access denial. A 5xx is never mapped: an unmapped store
+/// code answers 500 `internal`, after a possible write, so it stays unknown.
+fn document_submit_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_submit" {
+        return None;
+    }
+    let (code, why): (&'static str, &str) = match (status, refusal_fields(body).0?) {
+        (404, "not_found") => (
+            "not_found",
+            "no such file that you can see on this workspace",
+        ),
+        (403, "not_creator") => ("not_creator", "only the file's creator can submit it"),
+        (400, "unlabelled") => (
+            "unlabelled",
+            "give the file a document type label before submitting it",
+        ),
+        (409, "already_shared") => (
+            "already_shared",
+            "this version is already shared; save a new version to submit it for review",
+        ),
+        (409, "document_archived") => ("document_archived", "this document is archived"),
+        _ => return None,
+    };
+    Some(Error::invalid(
+        code,
+        format!("{why} ({code}, HTTP {status}). Nothing was submitted"),
+    ))
+}
 
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
 /// explicit `project` — plus `issue` for the two approvals — so the answer is
@@ -6184,6 +6274,13 @@ fn call_verb_until_retry(
         if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
             let verb = verb.replacen('_', " ", 1);
             return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
+        }
+        // CAD-2286: availability is decided by the type list alone, and a
+        // submit refusal keeps the store's code.
+        if let Some(error) = document_lifecycle_unavailable(verb, status, body.as_ref())
+            .or_else(|| document_submit_refusal(verb, status, body.as_ref()))
+        {
+            return Err(error);
         }
         // CAD-2150: a board that predates `include_body` refuses the field as an
         // invalid request. That is not "the tenant cannot serve the verb": the

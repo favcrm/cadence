@@ -1931,6 +1931,35 @@ fn artifact(
             print_json(&out);
             Ok(0)
         }
+        // CAD-2286: the type list is also the probe that decides whether the
+        // document lifecycle is available here.
+        ArtifactAction::Types => {
+            print_json(&read("document_types", serde_json::Map::new())?);
+            Ok(0)
+        }
+        ArtifactAction::Submit { id } => {
+            // Probe first, so an unavailable lifecycle is named as such and a
+            // 404 from the submit itself can only mean the file.
+            read("document_types", serde_json::Map::new())?;
+            let mut args = serde_json::Map::new();
+            args.insert("id".into(), json!(id));
+            match call_verb(
+                target,
+                "document_submit",
+                args,
+                deadline,
+                wake_timeout,
+                eprint_line,
+            )? {
+                RemoteAnswer::Ok(body) => {
+                    print_json(&body);
+                    Ok(0)
+                }
+                RemoteAnswer::Conflict(_) => Err(Error::rejected(
+                    "remote submit answered a conflict; nothing was submitted",
+                )),
+            }
+        }
         ArtifactAction::Show { id, version, out } => {
             let Some(path) = out else {
                 if version.is_some() {

@@ -5753,6 +5753,185 @@ fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
     assert!(!old.contains("unavailable"));
 }
 
+// CAD-2286: `artifact types` and `artifact submit`. The statuses and codes are
+// the tenant's (`apps/api/src/tenant-board/cli.ts`, `readDocumentTypes`,
+// `writeDocumentSubmit`, `DOCUMENT_SUBMIT_STATUS`).
+mod cad2286_document {
+    use super::*;
+
+    fn refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn submit_args() -> Map<String, Value> {
+        json!({"id": "art-x"}).as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn document_verbs_are_registered_with_one_scope_each() {
+        use super::super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb};
+        assert!(REMOTE_VERBS.contains(&"document_types"));
+        assert!(REMOTE_VERBS.contains(&"document_submit"));
+        assert_eq!(cli_requested_scopes("document_types"), &["cli.read"]);
+        assert_eq!(cli_requested_scopes("document_submit"), &["cli.write"]);
+        assert!(!mutating_cli_verb("document_types"));
+        assert!(mutating_cli_verb("document_submit"));
+        // No correlated receipt: a repeated submit answers the current stage,
+        // so a lost answer sends the caller to the read and the repeat.
+        let note = lost_mutation_note("document_submit");
+        assert!(note.contains("artifact types"), "{note}");
+        assert!(note.contains("artifact submit"), "{note}");
+        assert!(note.contains("current stage"), "{note}");
+    }
+
+    #[test]
+    fn document_submit_stays_on_the_login_and_document_types_does_not() {
+        // Operator decision 2026-11-15: the creator check needs the subject
+        // that saved the file, which is the member's login.
+        use super::super::agent_credential::stays_on_login;
+        assert!(stays_on_login(Surface::Cli, "document_submit"));
+        assert!(!stays_on_login(Surface::Cli, "document_types"));
+    }
+
+    #[test]
+    fn document_types_answers_the_body_and_sends_no_arguments() {
+        let types = json!({
+            "capability": "document_lifecycle",
+            "baseline": {"stages": ["draft", "submitted"], "requireApproval": false,
+                "approver": null, "archiveAfterDays": 30, "recipientNote": ""},
+            "types": [],
+        });
+        let (out, requests) = run(
+            vec![(200, "", types.clone())],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_eq!(out.unwrap(), types);
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["body"]["verb"], json!("document_types"));
+        assert!(calls[0]["body"].get("arguments").is_none());
+    }
+
+    #[test]
+    fn document_types_unavailable_answers_are_typed_and_never_an_outage() {
+        for (status, code) in [
+            // A tenant without the verb.
+            (501u16, "not_implemented"),
+            // The lifecycle flag is off.
+            (404, "not_found"),
+            // A relay older than the verb: `document_types` takes no
+            // arguments, so the refusal can only be the name.
+            (400, "invalid_request"),
+            (400, "unknown_verb"),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_types",
+                Map::new(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(
+                err.code(),
+                Some("document_lifecycle_unavailable"),
+                "{status} {code}: {err}"
+            );
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            let shown = err.to_string();
+            assert!(
+                shown.contains("document lifecycle is not available on this workspace"),
+                "{shown}"
+            );
+            assert!(!shown.contains("retry"), "{status} {code}: {shown}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+        // An access refusal is not an unavailable lifecycle.
+        let (out, _) = run(
+            vec![(403, "", refusal("forbidden"))],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_ne!(
+            out.unwrap_err().code(),
+            Some("document_lifecycle_unavailable")
+        );
+    }
+
+    #[test]
+    fn document_submit_refusals_carry_the_store_code() {
+        for (status, code) in [
+            (403u16, "not_creator"),
+            (400, "unlabelled"),
+            (409, "already_shared"),
+            (409, "document_archived"),
+            // After a successful probe, a 404 is the file, not the lifecycle.
+            (404, "not_found"),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some(code), "{status} {code}: {err}");
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
+    fn document_submit_answers_the_stage_and_a_lost_answer_is_unknown() {
+        let stage = json!({"stage": "submitted", "type": "quotation", "typeConfirmed": true});
+        let (out, requests) = run(
+            vec![(200, "", stage.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), stage);
+        let call = requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!({"id": "art-x"}));
+        assert_eq!(
+            minted_scopes(&requests),
+            ["cli.write"],
+            "submit asks for cli.write only"
+        );
+        // An unmapped store code answers 500 `internal`: the write may have
+        // landed, so it is unknown and names the read, never a refusal.
+        let (out, _) = run(
+            vec![(500, "", refusal("internal"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(err.to_string().contains("artifact types"), "{err}");
+    }
+
+    fn minted_scopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/authorize"))
+            .unwrap()["body"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
 // CAD-2083 acceptance, written from the ticket by the reviewer rather than the
 // implementer. It drives the real client path (`call_verb_in`, or the real local
 // dispatch) with the statuses and bodies the tenant's `tenantCliCall` answers.
@@ -8111,6 +8290,28 @@ mod agent_credential_acceptance {
             ]
         );
         assert!(s.lines().is_empty());
+    }
+
+    // CAD-2286, operator decision 2026-11-15: the creator check compares the
+    // caller with the subject that saved the file, so a managed submit keeps
+    // the member's login. The type list is an ordinary read on the credential.
+    #[test]
+    fn a_managed_document_submit_stays_on_the_login_and_document_types_rides_the_credential() {
+        let s = session(board(), 5);
+        s.send(true, "document_submit", json!({"id": "art-x"}))
+            .unwrap();
+        s.send(true, "document_types", json!({})).unwrap();
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("authorize", "login"),
+                step("call", "login"),
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        assert!(s.lines().is_empty(), "{:?}", s.lines());
     }
 
     // The board's own `issued_at` bounds the lifetime; a slow mint (the client
