@@ -96,7 +96,7 @@ test("@cadence/app-kit/react hooks subscribe, memoize status/selectors, and driv
     surfaces: true,
     locale: true,
     calls: { "screen.route.patch": ["section", "view", "record_id", "segment_id"] },
-    route: { sections: ["all", "open"], defaultSection: "all" },
+    route: { sections: ["all", "open"], defaultSection: "all", views: ["list", "new", "board"] },
   });
   const { host, inbox } = startBridge(bridge);
   await tick();
@@ -214,6 +214,14 @@ test("@cadence/app-kit/react hooks subscribe, memoize status/selectors, and driv
       "replace patch",
     );
     assert.deepEqual(replacePatchMsg.args, { section: "all", replace: true });
+
+    // Custom declared route views pass through instead of being hardcoded to "list" | "new".
+    nav.navigate("?view=board");
+    const customViewMsg = await waitFor(
+      () => inbox.filter((m) => m.op === "call" && m.verb === "screen.route.patch")[3],
+      "custom view patch",
+    );
+    assert.deepEqual(customViewMsg.args, { view: "board" });
   } finally {
     await React.act(async () => {
       root.unmount();

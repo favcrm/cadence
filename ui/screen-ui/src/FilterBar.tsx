@@ -67,7 +67,7 @@ export function FilterBar<ChipId extends string = string>({
         <div
           className="s-filter-bar-chips"
           role="group"
-          aria-label={chipsLabel ?? `${resolvedLabel} ${t("options")}`}
+          aria-label={chipsLabel ?? t("{label} options").replace("{label}", () => resolvedLabel)}
         >
           {chips.map((chip) => (
             <Button

@@ -73,7 +73,7 @@ export function createFrameNavigationAdapter(bridge, options = {}) {
     const section = url.searchParams.get(sectionQuery);
     if (section !== null && section !== "") patch.section = section;
     const view = url.searchParams.get("view");
-    if (view === "list" || view === "new") patch.view = view;
+    if (view !== null && view !== "") patch.view = view;
     for (const key of ["record_id", "segment_id"]) {
       const val = url.searchParams.get(key);
       if (val !== null) patch[key] = val || null;

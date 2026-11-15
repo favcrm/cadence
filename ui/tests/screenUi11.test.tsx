@@ -63,7 +63,7 @@ async function main() {
     return React.createElement(
       "div",
       null,
-      React.createElement("span", { "data-testid": "locale-probe" }, `${screenLocale.locale}:${t("Save")}`),
+      React.createElement("span", { "data-testid": "locale-probe" }, `${screenLocale.locale}:${t("Save")}:${t("Confirm")}:${t("OnlyZh")}:${t("constructor")}`),
       React.createElement(StatusPill, { tone: "ok", children: t("Save") }),
       React.createElement(StatusPill, { tone: "fail", children: "Blocked" }),
       React.createElement(FilterBar, {
@@ -115,10 +115,14 @@ async function main() {
         root.render(
       React.createElement(LocaleBridgeProvider, {
         bridge: fakeBridge,
+        fallbackLocale: "en-US",
         messages: {
-          en: { Save: "Save", Clear: "Clear", Confirm: "Confirm", Discard: "Discard" },
-          zh: { Save: "儲存", Clear: "清除", Confirm: "確認", Discard: "放棄" },
-          "zh-Hant": { Save: "儲存(繁)" },
+          en: { Save: "Save", Clear: "Clear", Confirm: "Confirm", Discard: "Discard", OnlyZh: "EnFallback" },
+          zh: { Save: "保存", OnlyZh: "简" },
+          "zh-Hans": { Save: "保存(简)" },
+          "zh-Hant": { Save: "儲存(繁)", Clear: "清除", Confirm: "確認", Discard: "放棄" },
+          "zh-TW": { Confirm: "確認(台)" },
+          fr: { Save: "Enregistrer" },
         },
         children: React.createElement(Probe),
       }),
@@ -128,8 +132,8 @@ async function main() {
 
     await renderApp();
 
-    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-TW:儲存", "zh-TW falls back to zh catalog");
-    assert(host.querySelector('.s-status-pill[data-tone="ok"]')?.textContent === "儲存", "StatusPill ok renders translated children");
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-TW:儲存(繁):確認(台):EnFallback:constructor", "zh-TW isolates Traditional Chinese via zh-Hant, uses zh-TW override, and falls back to en instead of zh");
+    assert(host.querySelector('.s-status-pill[data-tone="ok"]')?.textContent === "儲存(繁)", "StatusPill ok renders translated children");
     assert(host.querySelector('.s-status-pill[data-tone="fail"]')?.textContent === "Blocked", "StatusPill fail renders tone");
     assert(host.querySelector(".s-confirm-wrap.crm-confirm-wrap"), "ConfirmDialog emits canonical .s-confirm-wrap alias");
     assert(host.querySelector(".s-confirm-scrim.crm-confirm-scrim"), "ConfirmDialog emits canonical .s-confirm-scrim alias");
@@ -140,7 +144,7 @@ async function main() {
     const region = host.querySelector('.s-staged-banner[role="region"]');
     assert(region, "StagedApprovalBanner warn renders region");
     const buttons = Array.from(region.querySelectorAll("button")) as HTMLButtonElement[];
-    assert(buttons.map((b) => b.textContent).join("|") === "放棄|確認", "StagedApprovalBanner uses LocaleBridgeProvider translations");
+    assert(buttons.map((b) => b.textContent).join("|") === "放棄|確認(台)", "StagedApprovalBanner uses LocaleBridgeProvider translations");
     buttons[0].click();
     buttons[1].click();
     assert(events.includes("discard") && events.includes("approve"), "StagedApprovalBanner fires callbacks");
@@ -167,20 +171,38 @@ async function main() {
       localeValue = "zh-Hant-TW";
       for (const fn of listeners) fn();
     });
-    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-Hant-TW:儲存(繁)", "LocaleBridgeProvider walks progressive BCP-47 subtag prefixes");
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-Hant-TW:儲存(繁):確認:EnFallback:constructor", "LocaleBridgeProvider walks progressive BCP-47 Traditional subtag prefixes");
+
+    await React.act(async () => {
+      localeValue = "zh-CN";
+      for (const fn of listeners) fn();
+    });
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-CN:保存(简):Confirm:EnFallback:constructor", "LocaleBridgeProvider isolates Simplified Chinese via zh-Hans without touching zh-Hant or bare zh");
+
+    await React.act(async () => {
+      localeValue = "fr_CA";
+      for (const fn of listeners) fn();
+    });
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "fr_CA:Enregistrer:Confirm:EnFallback:constructor", "LocaleBridgeProvider normalizes underscore tags and strips non-zh prefixes");
 
     await React.act(async () => {
       localeValue = "en";
       for (const fn of listeners) fn();
     });
-    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "en:Save", "LocaleBridgeProvider updates reactively on bridge push");
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "en:Save:Confirm:EnFallback:constructor", "LocaleBridgeProvider updates reactively on bridge push");
 
     await React.act(async () => {
       useContextFallback = true;
       localeValue = "zh-HK";
       for (const fn of listeners) fn();
     });
-    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-HK:儲存", "LocaleBridgeProvider supports context.locale fallback");
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-HK:儲存(繁):確認:EnFallback:constructor", "LocaleBridgeProvider supports context.locale fallback and Traditional isolation");
+
+    await React.act(async () => {
+      localeValue = "de-DE";
+      for (const fn of listeners) fn();
+    });
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "de-DE:Save:Confirm:EnFallback:constructor", "LocaleBridgeProvider normalizes fallbackLocale prefixes cleanly");
 
     const fs = require("fs");
     const path = require("path");
