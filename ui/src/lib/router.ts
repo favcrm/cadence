@@ -522,6 +522,9 @@ function scopedRoute(route: Route, project: string): Route {
   return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
+/** Query parameters the Documents screen owns (CAD-2286). */
+const DOCUMENTS_PARAMS = ["archived", "stage"] as const;
+
 /** Query parameters only the mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
  *  the ctx/conversation/record selectors were minted for. `drawer` and
@@ -544,11 +547,14 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // must carry it across the delete below. Only a Threads → Threads move
   // keeps it: another screen's `?project=` is that screen's filter.
   const threadsProject = from?.screen === "threads" && loc.route.screen === "threads" ? q.get("project") : null;
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "archived", "stage"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  // CAD-2286: Documents owns `archived` and `stage` and drops them elsewhere,
+  // except on a mounted app route, whose own query may use either name.
+  if (route.screen !== "workspaceApp" && route.screen !== "workspaceAppKey") for (const key of DOCUMENTS_PARAMS) q.delete(key);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
   // `workspaceApp` compat route) own these; they stay on the app's own
   // route and never follow the user to /settings and the like.

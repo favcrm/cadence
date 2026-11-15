@@ -12,10 +12,16 @@ import { probe, type DocumentsProbe } from "./documentsClient";
  * store without a request. The cache resets the store when the private session
  * changes, which clears the latch, so a new session asks again. An `error` or
  * an `available` answer is never latched: the next revalidation asks again.
+ *
+ * An `error` never replaces an earlier `available` answer: a failed re-read
+ * says nothing new about the capability, so the store keeps its last good
+ * answer and the nav item does not flicker away on one bad request.
  */
 export const documentsProbe: Resource<DocumentsProbe> = cache.resource<DocumentsProbe>("documentsProbe", async () => {
   const seen = documentsProbe.get().data;
-  return seen?.kind === "unavailable" ? seen : probe();
+  if (seen?.kind === "unavailable") return seen;
+  const next = await probe();
+  return next.kind === "error" && seen?.kind === "available" ? seen : next;
 });
 
 /**

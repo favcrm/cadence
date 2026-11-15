@@ -367,4 +367,12 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
   equal(locationHref(goTo(archived, { screen: "home" }), "?archived=1"), "/", "the tab stays on Documents");
   equal(locationHref(goTo(loc, { screen: "documents", archived: true }), both), "/documents?keep=1&archived=1", "switching tabs drops the Active tab's stage");
   equal(projectScope(loc.route), "none", "Documents has no project scope");
+
+  // A mounted app's own query may use the same names; its route keeps them.
+  const appQuery = "?stage=lead&archived=1&keep=1";
+  const app = readLocation("/apps/crm", appQuery);
+  equal(locationHref(app, appQuery), "/apps/crm?stage=lead&archived=1&keep=1", "an app route keeps its own stage and archived params");
+  const legacyApp = readLocation("/app-installations/install-a", appQuery);
+  equal(locationHref(legacyApp, appQuery), "/app-installations/install-a?stage=lead&archived=1&keep=1", "the compat app route keeps them too");
+  equal(locationHref(goTo(app, { screen: "home" }), appQuery), "/?keep=1", "leaving the app drops them");
 }

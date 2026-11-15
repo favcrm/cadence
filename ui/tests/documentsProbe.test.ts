@@ -7,7 +7,7 @@
  */
 import { DOCUMENT_CAPABILITY, type DocumentsProbe } from "../src/features/documents/documentsClient";
 import { documentsNavHidden, documentsProbe } from "../src/features/documents/documentsProbe";
-import { allowPrivateReads, resetPrivateSession } from "../src/lib/privateSession";
+import { allowPrivateReads, pausePrivateReads, resetPrivateSession } from "../src/lib/privateSession";
 
 function equal(actual: unknown, expected: unknown, why: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected))
@@ -26,7 +26,7 @@ Object.defineProperty(globalThis, "localStorage", {
 });
 
 let requests: string[] = [];
-let answer: () => Response = () => new Response("{}", { status: 200 });
+let answer: () => Response | Promise<Response> = () => new Response("{}", { status: 200 });
 globalThis.fetch = (async (input: unknown) => {
   requests.push(String(input));
   return answer();
@@ -48,7 +48,7 @@ const AVAILABLE = {
 };
 
 /** A new private session: the store forgets what it saw. */
-function newSession(next: () => Response): void {
+function newSession(next: () => Response | Promise<Response>): void {
   resetPrivateSession();
   allowPrivateReads();
   requests = [];
@@ -88,7 +88,15 @@ async function main(): Promise<void> {
   equal(requests, ["/api/document-types"], "a new session probes again");
   equal(kind(), "available", "the new session's answer is read");
   await documentsProbe.revalidate();
-  equal(requests.length, 2, "an available answer is re-read, so a flag turned off is noticed");
+  equal(requests.length, 2, "an available answer is not latched: the next revalidate asks again");
+
+  // A failed re-read keeps the last good answer, so the nav item stays.
+  answer = reply(500, { ok: false, error: { code: "internal", message: "boom" } });
+  await documentsProbe.revalidate();
+  equal([kind(), requests.length], ["available", 3], "an error does not replace an earlier available answer");
+  answer = reply(404, { ok: false, error: { code: "not_found", message: "no route" } });
+  await documentsProbe.revalidate();
+  equal([kind(), requests.length], ["unavailable", 4], "a later unavailable answer does replace it");
 
   // A 501 `not_implemented` latches as a 404 does.
   newSession(reply(501, { ok: false, error: { code: "not_implemented", message: "off" } }));
@@ -109,6 +117,30 @@ async function main(): Promise<void> {
   answer = reply(200, AVAILABLE);
   await documentsProbe.revalidate();
   equal([kind(), requests.length], ["available", 2], "an error is retried on the next revalidate");
+
+  // Paused reads (an unanswered verification) keep the session: the latch
+  // stands, and the next revalidate after reads resume makes no request.
+  newSession(reply(404, { ok: false, error: { code: "not_found", message: "no route" } }));
+  await documentsProbe.revalidate();
+  equal([kind(), requests.length], ["unavailable", 1], "the latch is set");
+  pausePrivateReads();
+  allowPrivateReads();
+  await documentsProbe.revalidate();
+  equal([kind(), requests.length], ["unavailable", 1], "a pause keeps the latch and asks nothing");
+
+  // A reset while the probe is in flight drops its answer: it belongs to the old session.
+  let land: (response: Response) => void = () => {};
+  newSession(() => new Promise<Response>((resolve) => { land = resolve; }));
+  const inFlight = documentsProbe.revalidate();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  equal(requests.length, 1, "the probe is in flight");
+  resetPrivateSession();
+  allowPrivateReads();
+  land(reply(200, AVAILABLE)());
+  await inFlight;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  equal(documentsProbe.get().data, null, "an answer from before the reset is dropped");
+  equal(documentsProbe.get().status, "loading", "the store waits for the new session's probe");
 
   console.log("documents probe checks passed");
 }

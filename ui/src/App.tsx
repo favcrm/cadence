@@ -350,9 +350,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
-  // The probe store latches an `unavailable` answer for the private session,
-  // so this asks the board again only after an error, an `available` answer
-  // or a new session.
+  // Probe on a hosted board when it mounts and when the session identity
+  // changes; the routine `refresh` below asks again too. A latched
+  // `unavailable` answer makes no request for the rest of the session.
   useEffect(() => {
     if (documentsHosted) void documentsProbe.revalidate();
   }, [documentsHosted, personalIdentity]);
@@ -526,9 +526,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.agents.refresh();
       if (overviewWantedRef.current) void resources.overview.refresh();
       if (personalWanted.current) void resources.myWork.refresh();
+      // CAD-2286: a probe that failed recovers on the routine recheck; a
+      // latched `unavailable` answers from the store without a request.
+      if (documentsHosted) void documentsProbe.revalidate();
       loadDetail();
     });
-  }, [loadDetail, recheck]);
+  }, [loadDetail, recheck, documentsHosted]);
   const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
