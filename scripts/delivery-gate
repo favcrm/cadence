@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""CAD-1925 / CAD-1946: the merge queue's proof that the delivery gate passed.
+"""CAD-1946: the merge queue's proof that the delivery gate passed.
 
     scripts/delivery-gate verify --repo R --pr N --head SHA --signers FILE --comments FILE
     scripts/delivery-gate queue-pr REF
-    scripts/delivery-gate sign --repo R --pr N --head SHA --key KEY   # bootstrap v1 only
     scripts/delivery-gate --self-test
 
 v2 (CAD-1946): the hosted Cadence board signs (repo, pr, head, evidence, verify)
@@ -15,8 +14,8 @@ exact `https://<slug>.cadencecloud.app/__platform/delivery-gate/verify` shape,
 mints a GitHub Actions OIDC token whose audience equals that URL, and confirms
 the live hosted attestation before returning 0.
 
-Bootstrap note (PR 2A): `v1` and `exception v1` (`cadence-delivery-gate`) stay
-temporarily accepted alongside `v2` until PR 2B retires the legacy local key.
+Legacy local `v1` and `exception v1` comments and `delivery-gate sign` are retired
+and refused unconditionally.
 Exit: 0 ok / 1 refused / 2 usage.
 """
 
@@ -33,12 +32,9 @@ import urllib.parse
 import urllib.request
 
 ME = "delivery-gate"
-MARKER = "<!-- cadence-delivery-gate v1 -->"
 MARKER_V2 = "<!-- cadence-delivery-gate v2 -->"
-EXCEPTION_MARKER = "<!-- cadence-delivery-gate exception v1 -->"
 EXCEPTION_ENDS = "2026-12-31T00:00:00Z"
 NAMESPACE = "cadence-delivery-gate"
-PRINCIPAL = "cadence-delivery-gate"
 PRINCIPAL_V2 = "cadence-hosted-delivery-gate"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
@@ -51,10 +47,6 @@ VERIFY_URL = re.compile(
 )
 
 
-def payload(repo, pr, head):
-    return f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode()
-
-
 def payload_v2(repo, pr, head, evidence_id, verify_url):
     return (
         f"cadence-delivery-gate v2\n"
@@ -64,11 +56,6 @@ def payload_v2(repo, pr, head, evidence_id, verify_url):
         f"evidence {evidence_id}\n"
         f"verify {verify_url}\n"
     ).encode("utf-8")
-
-
-def exception_payload(repo, pr, head):
-    return (f"cadence-delivery-gate exception v1\nrepo {repo}\npr {pr}\nhead {head}\n"
-            f"ends {EXCEPTION_ENDS}\n").encode()
 
 
 def exception_open():
@@ -224,27 +211,9 @@ def parse_v2_comments(comments):
 
 
 def sign(args):
-    if not (os.path.isfile(args.key) and os.access(args.key, os.R_OK)):
-        print(f"{ME}: refused: no readable signing key at {args.key}", file=sys.stderr)
-        return 1
-    exception = getattr(args, "exception", False)
-    if exception and not exception_open():
-        print(f"{ME}: refused: the review exception ended at {EXCEPTION_ENDS}", file=sys.stderr)
-        return 1
-    data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
-    p = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", args.key],
-                       input=data, capture_output=True)
-    sig = p.stdout.decode(errors="replace").strip()
-    if p.returncode != 0 or not ARMOR.fullmatch(sig):
-        print(f"{ME}: refused: signing failed: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
-        return 1
-    if exception:
-        print(f"{EXCEPTION_MARKER}\nDelivery gate EXCEPTION, not a pass: {args.repo}#{args.pr} at "
-              f"{args.head}\nReviewer attestation waived by the operator's approval of this head, "
-              f"until {EXCEPTION_ENDS}.\n\n```\n{sig}\n```")
-        return 0
-    print(f"{MARKER}\nDelivery gate passed: {args.repo}#{args.pr} at {args.head}\n\n```\n{sig}\n```")
-    return 0
+    return refuse([
+        "legacy local v1 delivery-gate signing is retired; approve and merge from the hosted Cadence board"
+    ])
 
 
 def _verify_ssh_block(signers, principal, data, block, sig_path):
@@ -279,13 +248,7 @@ def verify(args, *, _oidc_verifier=verify_oidc_live):
         return refuse(reasons)
 
     v2_candidates = parse_v2_comments(comments)
-    v1_blocks = [
-        (c.get("id"), m.group(0), EXCEPTION_MARKER in c["body"])
-        for c in comments
-        if MARKER in c["body"] or EXCEPTION_MARKER in c["body"]
-        for m in ARMOR.finditer(c["body"].replace("\r\n", "\n"))
-    ]
-    if not v2_candidates and not v1_blocks:
+    if not v2_candidates:
         return refuse([f"no signed delivery-gate comment on PR #{args.pr}: "
                        "approve and merge from the hosted Cadence board"])
 
@@ -316,17 +279,7 @@ def verify(args, *, _oidc_verifier=verify_oidc_live):
                 return 0
             v2_errors.append(f"comment {cid}: OIDC verify refused ({detail})")
 
-        opened = exception_open()
-        for cid, block, exception in v1_blocks:
-            if exception and not opened:
-                continue
-            data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
-            if _verify_ssh_block(args.signers, PRINCIPAL, data, block, sig):
-                kind = "as an EXCEPTION, not a pass" if exception else "as a pass"
-                print(f"{ME}: accepted {kind}: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
-                return 0
-
-    tried = len(v2_candidates) + len(v1_blocks)
+    tried = len(v2_candidates)
     if v2_errors:
         return refuse(v2_errors + [
             f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} ({tried} tried)"
@@ -504,6 +457,50 @@ def self_test():
                 os.environ.pop("ACTIONS_ID_TOKEN_REQUEST_TOKEN", None)
             else:
                 os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = old_tok
+
+        # 6. Retired v1 and exception v1 comments refused with 0 OIDC calls even when legacy signer key is present
+        key_v1 = os.path.join(tmp, "v1_key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key_v1], check=True)
+        with open(key_v1 + ".pub", encoding="utf-8") as f:
+            pub_v1 = f.read().strip()
+        signers_v1 = os.path.join(tmp, "allowed_signers_with_v1")
+        with open(signers_v1, "w", encoding="utf-8") as f:
+            f.write(f'{PRINCIPAL_V2} namespaces="{NAMESPACE}" {pub_v2}\n')
+            f.write(f'cadence-delivery-gate namespaces="{NAMESPACE}" {pub_v1}\n')
+
+        def sign_v1(raw_payload, marker, body_line):
+            res = subprocess.run(
+                ["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", key_v1],
+                input=raw_payload,
+                capture_output=True,
+                check=True,
+            )
+            sig = res.stdout.decode("utf-8").strip()
+            return f"{marker}\n{body_line}\n\n```\n{sig}\n```"
+
+        v1_data = f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode("utf-8")
+        v1_exc_data = (
+            f"cadence-delivery-gate exception v1\nrepo {repo}\npr {pr}\nhead {head}\nends {EXCEPTION_ENDS}\n"
+        ).encode("utf-8")
+        for cid, body in (
+            (107, sign_v1(v1_data, "<!-- cadence-delivery-gate v1 -->", f"Delivery gate passed: {repo}#{pr} at {head}")),
+            (
+                108,
+                sign_v1(
+                    v1_exc_data,
+                    "<!-- cadence-delivery-gate exception v1 -->",
+                    f"Delivery gate EXCEPTION, not a pass: {repo}#{pr} at {head}",
+                ),
+            ),
+        ):
+            v1_calls = []
+            write_comments([{"id": cid, "body": body}])
+            args_v1 = argparse.Namespace(repo=repo, pr=pr, head=head, signers=signers_v1, comments=comments_file)
+            rc = verify(args_v1, _oidc_verifier=lambda *a: (v1_calls.append(a) or True, "ok"))
+            assert rc == 1 and not v1_calls, f"retired v1 comment {cid} unexpectedly passed or called OIDC: {v1_calls}"
+
+        assert sign(argparse.Namespace(repo=repo, pr=pr, head=head, key=key_v1, exception=False)) == 1
+        assert sign(argparse.Namespace(repo=repo, pr=pr, head=head, key=key_v1, exception=True)) == 1
 
     print(f"{ME}: self-test ok")
     return 0
