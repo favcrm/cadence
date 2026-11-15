@@ -53,7 +53,8 @@ async function main() {
   const { DOCUMENT_CAPABILITY } = require("../src/features/documents/documentsClient") as typeof import("../src/features/documents/documentsClient");
   const { documentsViewer } = require("../src/features/documents/documentsAccess") as typeof import("../src/features/documents/documentsAccess");
   const { documentsProbe } = require("../src/features/documents/documentsProbe") as typeof import("../src/features/documents/documentsProbe");
-  const { canvasSnapshot, resetCanvas } = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
+  const { canvasSnapshot, resetCanvas, selectVersion } = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
+  const CanvasDrawer = (require("../src/features/canvas/CanvasDrawer") as typeof import("../src/features/canvas/CanvasDrawer")).default;
   const { allowPrivateReads, pausePrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
   const { goTo, locationHref, readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
   const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
@@ -372,6 +373,26 @@ async function main() {
   equal([latest.selected, latest.bytes, latest.versions[1]], [1, 121, { bytes: 121, digest: "digest-art-approved" }], "the listed version keeps its own size and digest");
   ok(!buttonIn(row("art-draft"), "Early draft"), "a file the canvas cannot show is not a button");
   ok(row("art-draft")!.textContent?.includes("Early draft"), "it still shows its title");
+
+  // A non-approver opens the newest version (v3, whose size the list carries)
+  // and picks v1 in the drawer: v1's size is unknown, so the footer shows no
+  // size at all, never v3's.
+  await fresh({ viewer: MEMBER });
+  await listed();
+  const drawerHost = document.createElement("div");
+  document.body.append(drawerHost);
+  const drawerRoot = createRoot(drawerHost);
+  await React.act(async () => {
+    drawerRoot.render(React.createElement(LocaleProvider, null, React.createElement(CanvasDrawer)));
+  });
+  await click(buttonIn(row("art-review"), "Quarterly proposal"));
+  equal(canvasSnapshot().tabs.find((tab) => tab.id === "art-review")?.selected, 3, "a non-approver opens the newest version");
+  const foot = () => drawerHost.querySelector(".cv-foot span")?.textContent ?? null;
+  await settle(() => ok(foot()?.startsWith("v3 · "), `v3 shows its own size (${foot()})`), "v3 size");
+  await React.act(async () => { selectVersion("art-review", 1); });
+  await settle(() => equal(foot(), "v1", "a picked version with no known size shows none"), "v1 size");
+  await React.act(async () => { drawerRoot.unmount(); });
+  drawerHost.remove();
   await React.act(async () => { root.unmount(); });
   root = createRoot(host);
   equal(canvasSnapshot().conversation, null, "leaving the screen closes its canvas");

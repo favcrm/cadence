@@ -151,7 +151,7 @@ export default function DocumentsScreen({
     // its return of focus to a trigger that may be about to go.
     if (focusHeading > 0) headingRef.current?.focus();
   }, [focusHeading]);
-  /** The screen asks the shared probe again once per session after a 404 list. */
+  /** The screen asks the shared probe again once per mount after a 404 list. */
   const probeAsked = useRef(false);
   const goneRef = useRef(false);
   goneRef.current = gone;
@@ -204,7 +204,7 @@ export default function DocumentsScreen({
         else if (result.failure.status === 404 && refusalCode(result) === "not_found") {
           setGone(true);
           // Let the shared probe learn it too, so the nav item goes. Once per
-          // session: if the probe still says available, its answer lists once
+          // mount: if the probe still says available, its answer lists once
           // more, and a lasting 404 stops there instead of looping.
           if (!probeAsked.current) {
             probeAsked.current = true;

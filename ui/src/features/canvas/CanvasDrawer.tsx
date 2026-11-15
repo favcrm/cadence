@@ -86,7 +86,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
   // A version whose size is unknown shows none, never another version's.
-  const size = info ? info.bytes : tab.bytes;
+  const size = info?.bytes;
   // "updating v1 → v2" only while this turn has asked to add a version to
   // this artifact and it has not landed; once it has, "updated to v2".
   // A put still waiting for its result wins, so a second put of the same
