@@ -34,7 +34,9 @@ concurrency:
 permissions:
   contents: read
 
-# Same as ci.yml: rust-cache and sccache hash these into their keys.
+# rust-cache and sccache hash these into their keys; they match tests.yml and
+# ci.yml so the shared restore keys line up. (save-if is false: this job only
+# restores, as tests.yml does.)
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings

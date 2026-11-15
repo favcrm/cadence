@@ -27,6 +27,13 @@ Selection, from the merge-base diff of added, copied, modified and renamed files
                                (top-level helper, `use`) cannot be bounded, so
                                it selects the whole `suite` binary (about 224
                                tests, one binary) and says so on stderr.
+  tests/<anything else>        fixtures the suite reads (include_str! and
+                               friends) select the whole `suite` binary too.
+
+A path under src/daemon/tests/ whose components are not plain identifiers
+(non-ASCII, quotes, backslashes, spaces) selects all of daemon::tests; such a
+name is never written to an output or a regex. Paths are read NUL-separated
+and unquoted (`-z`, `core.quotePath=false`) and include type changes.
 
 Fail closed, bounded: nothing under those two paths is dropped. An unbounded
 change widens to one binary or one module tree, never to the full suite, and a
@@ -63,6 +70,8 @@ def daemon_prefix(path):
     return "daemon::tests::" + "".join(p + "::" for p in parts)
 
 
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+ATTRS = re.compile(r"^(?:#\[[^\]]*\]\s*)+")
 MOD_DECL = re.compile(r"(?:pub(?:\([\w:]+\))? )?mod (\w+);$")
 
 
@@ -79,12 +88,12 @@ def classify_mod_diff(diff, parent):
             continue
         if not body or line[:1] not in "+-":
             continue
-        text = line[1:].strip()
+        text = ATTRS.sub("", line[1:].strip())
         decl = MOD_DECL.match(text)
         if decl:
             if line[0] == "+":
                 added.append(f"{parent}{decl.group(1)}::")
-        elif text and not text.startswith("#["):
+        elif text:
             widen = True
     return ([parent] if widen else []) + added
 
@@ -241,24 +250,35 @@ def main():
     ap.add_argument("--head", default="HEAD")
     ap.add_argument("--github-output")
     args = ap.parse_args()
-    files = git("diff", "--name-only", "--diff-filter=ACMR",
-                f"{args.base}...{args.head}").splitlines()
+    # NUL-separated and unquoted: git's default quoting would hide a path with
+    # a non-ASCII, control, quote or backslash byte from the prefix checks.
+    files = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z",
+                            "--diff-filter=ACMRT",
+                            f"{args.base}...{args.head}").split("\0") if f]
     daemon, suite = [], []
+    whole_suite = False
     for p in files:
-        if not p.startswith(DAEMON_ROOT):
-            continue
-        if not p.endswith(".rs"):
-            daemon.append("daemon::tests::")
-        elif p.rsplit("/", 1)[-1] == "mod.rs":
-            daemon += mod_prefixes(args.base, args.head, p) or [daemon_prefix(p)]
-        else:
-            daemon.append(daemon_prefix(p))
+        if p.startswith(DAEMON_ROOT):
+            rel = p[len(DAEMON_ROOT):]
+            names = rel[:-3].split("/") if rel.endswith(".rs") else None
+            if names is None or not all(SAFE_NAME.match(n) for n in names):
+                # A non-Rust file, or a name that cannot be a module path: never
+                # put it in a regex or an output; select the whole module tree.
+                daemon.append("daemon::tests::")
+            elif names[-1] == "mod":
+                daemon += mod_prefixes(args.base, args.head, p) or [daemon_prefix(p)]
+            else:
+                daemon.append(daemon_prefix(p))
+        elif p.startswith("tests/") and p != SUITE:
+            whole_suite = True  # fixtures the suite target reads via include_str!
     if SUITE in files:
         suite, unbounded = suite_filters(args.base, args.head)
         if unbounded:
             print(f"changed-test-filter: {SUITE} lines {unbounded[:10]} are outside any "
                   "test fn or mod; selecting the whole suite binary", file=sys.stderr)
-            suite = ["test(/./)"]
+            whole_suite = True
+    if whole_suite:
+        suite = ["test(/./)"]
     cargo, clauses = [], []
     if daemon:
         cargo.append("--lib")
