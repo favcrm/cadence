@@ -5,3 +5,99 @@
 .documents-table {
   min-width: 640px;
 }
+
+/* CAD-2286 Settings → Documents. Rows reuse the shared `.settings-row`; only
+   the values list, the row actions and the form live here. */
+.document-types-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-block-end: 1rem;
+}
+
+.document-types-heading > div {
+  min-inline-size: 0;
+}
+
+.document-types-page > .snotice {
+  margin-block-end: 1rem;
+}
+
+.document-types-group + .document-types-group {
+  margin-block-start: 1.25rem;
+}
+
+.document-types-label {
+  margin: 0 0 0.375rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+
+.document-type-row {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.document-type-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-inline-size: 0;
+}
+
+.document-type-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.25rem 1rem;
+  margin: 0.25rem 0 0;
+  font-size: var(--text-label);
+}
+
+.document-type-values dt {
+  color: var(--color-ink-500);
+}
+
+.document-type-values dd {
+  margin: 0;
+  color: var(--color-ink-200);
+  overflow-wrap: anywhere;
+}
+
+.document-type-warn {
+  margin-block-start: 0.25rem;
+}
+
+.document-type-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 0.375rem;
+  margin-inline-start: auto;
+}
+
+.document-type-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.document-type-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: var(--color-ink-200);
+  font-size: var(--text-secondary);
+}
+
+.document-type-check input {
+  margin-block-start: 0.2rem;
+}
+
+.document-type-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  inline-size: 100%;
+}

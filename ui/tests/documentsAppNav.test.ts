@@ -8,7 +8,8 @@ export {};
  *   blank body or an error.
  * - A hosted board probes once when it mounts (App's effect and its routine
  *   refresh share the one answer), shows the nav item once the probe answers
- *   `available`, and mounts the screen on `/documents`.
+ *   `available`, and mounts the screen on `/documents` and the type
+ *   preferences on `/settings/documents` from that same answer.
  */
 declare function require(name: string): any;
 
@@ -57,10 +58,14 @@ async function main() {
     const url = new URL(path, "http://localhost");
     if (url.pathname.endsWith("/stream")) return streamFixture(path);
     if (path.startsWith("/api/meta"))
-      return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session, ...(hosted ? { hosted: true } : {}) });
+      return json({
+        read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session,
+        ...(hosted ? { hosted: true, settings_sections: ["preferences", "members", "documents", "general", "status"] } : {}),
+      });
     if (path === "/api/document-types")
       return json({ capability: DOCUMENT_CAPABILITY, baseline: { stages: [], requireApproval: true, approver: null, archiveAfterDays: 30, recipientNote: "" }, types: [] });
     if (path.startsWith("/api/documents?")) return json({ documents: [] });
+    if (path === "/api/team/members") return json({ members: [] });
     if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
     if (path === "/api/projects") return json({ projects: [] });
     if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
@@ -121,6 +126,12 @@ async function main() {
   await settle(() => assert(host.textContent?.includes("No documents to show"), "the screen mounts on /documents"), "hosted screen");
   assert(requests.includes("/api/documents?archived=0"), "the screen lists active documents");
   equal(probes(), 1, "opening the screen does not probe again");
+  // Settings → Documents mounts where the other sections are, from the same probe.
+  await go("/settings/documents");
+  await settle(() => assert(host.textContent?.includes("Default for new types"), "Settings → Documents mounts the type preferences"), "settings documents");
+  assert(host.querySelector('a[href="/settings/documents"]'), "the settings menu lists Documents");
+  assert(requests.includes("/api/team/members"), "the page reads the roster for approver names");
+  equal(probes(), 1, "the settings page reads the shared probe, not a second one");
   await React.act(async () => { root.unmount(); });
 
   console.log("documents app nav checks passed");
