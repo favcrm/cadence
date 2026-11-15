@@ -17329,22 +17329,28 @@ mod cad2286_document_acceptance {
     const RELAY_VERSION: &str = "hosted-cadence-cli.v1";
     const FILE_ID: &str = "art-x";
 
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentTypesView` with `DOCUMENT_CAPABILITY`.
     fn types() -> Value {
         json!({
-            "capability": "document_lifecycle",
-            "baseline": {"stages": ["draft", "submitted", "approved", "delivered"],
-                "requireApproval": true, "approver": null, "archiveAfterDays": 30,
-                "recipientNote": ""},
-            "types": [{"label": "quotation", "requireApproval": true, "approver": null,
-                "recipientNote": "", "archiveAfterDays": 30, "state": "confirmed", "rev": 2}]
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
+            "types": []
         })
     }
 
+    /// `documentSubmitView` for a first submission of an unconfirmed type.
     fn submitted() -> Value {
         json!({
-            "stage": "submitted", "type": "invoice", "typeConfirmed": false,
-            "baseline": {"stages": ["draft", "submitted"], "requireApproval": false,
-                "approver": null, "archiveAfterDays": 30, "recipientNote": ""}
+            "stage": "in_review", "type": "invoice", "typeConfirmed": false,
+            "baseline": baseline()
         })
     }
 
@@ -17736,6 +17742,26 @@ mod cad2286_document_acceptance {
             assert_refused(&output, code);
             assert_eq!(board.verbs(), vec![probe(), submit()], "{code}");
         }
+    }
+
+    #[test]
+    fn a_submit_success_without_a_receipt_is_unknown_and_prints_nothing() {
+        let board = Board::new(vec![(200, types()), (200, json!({"ok": false}))]);
+        let output = board.run(&["submit", FILE_ID]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "an unproved submit printed a receipt"
+        );
+        assert!(stderr.contains("\"kind\": \"unknown\""), "{stderr}");
+        assert!(stderr.contains("repeat `artifact submit <id>`"), "{stderr}");
+        assert_eq!(board.verbs(), vec![probe(), submit()]);
     }
 
     #[test]

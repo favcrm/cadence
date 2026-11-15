@@ -5767,6 +5767,21 @@ mod cad2286_document {
         json!({"id": "art-x"}).as_object().unwrap().clone()
     }
 
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`, through
+    /// `documentBaselineView`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentSubmitView`: an unconfirmed type carries the baseline.
+    fn submit_receipt() -> Value {
+        json!({"stage": "in_review", "type": "quotation", "typeConfirmed": false,
+            "baseline": baseline()})
+    }
+
     #[test]
     fn document_verbs_are_registered_with_one_scope_each() {
         use super::super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb};
@@ -5795,10 +5810,10 @@ mod cad2286_document {
 
     #[test]
     fn document_types_answers_the_body_and_sends_no_arguments() {
+        // `documentTypesView`, with `DOCUMENT_CAPABILITY`.
         let types = json!({
-            "capability": "document_lifecycle",
-            "baseline": {"stages": ["draft", "submitted"], "requireApproval": false,
-                "approver": null, "archiveAfterDays": 30, "recipientNote": ""},
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
             "types": [],
         });
         let (out, requests) = run(
@@ -5914,8 +5929,47 @@ mod cad2286_document {
     }
 
     #[test]
+    fn a_document_submit_success_without_a_submit_receipt_is_unknown() {
+        // A 2xx proves the submit only as `documentSubmitView`: a known stage, a
+        // type string, a boolean `typeConfirmed` and an object baseline if
+        // any. Anything else may follow a recorded submit, so it is unknown and
+        // sends the caller back to the repeat, never a success.
+        let mut bad_baseline = submit_receipt();
+        bad_baseline["baseline"] = json!("baseline");
+        let mut unknown_stage = submit_receipt();
+        unknown_stage["stage"] = json!("submitted");
+        let mut no_type = submit_receipt();
+        no_type.as_object_mut().unwrap().remove("type");
+        let mut string_confirmed = submit_receipt();
+        string_confirmed["typeConfirmed"] = json!("false");
+        for reply in [
+            json!({}),
+            json!({"ok": false}),
+            json!({"stage": 7}),
+            unknown_stage,
+            no_type,
+            string_confirmed,
+            bad_baseline,
+        ] {
+            let (out, requests) = run(
+                vec![(200, "", reply.clone())],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.expect_err(&format!("{reply} is not a submit receipt"));
+            assert_eq!(err.kind(), "unknown", "{reply}: {err}");
+            assert!(
+                err.to_string().contains("repeat `artifact submit <id>`"),
+                "{reply}: {err}"
+            );
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
     fn document_submit_answers_the_stage_and_a_lost_answer_is_unknown() {
-        let stage = json!({"stage": "submitted", "type": "quotation", "typeConfirmed": true});
+        let stage = submit_receipt();
         let (out, requests) = run(
             vec![(200, "", stage.clone())],
             "document_submit",
@@ -5923,6 +5977,15 @@ mod cad2286_document {
             10,
         );
         assert_eq!(out.unwrap(), stage);
+        // A confirmed type answers without the baseline.
+        let confirmed = json!({"stage": "approved", "type": "quotation", "typeConfirmed": true});
+        let (out, _) = run(
+            vec![(200, "", confirmed.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), confirmed);
         let call = requests
             .iter()
             .find(|r| r["path"] == json!("/__platform/cli/call"))
@@ -8354,7 +8417,13 @@ mod agent_credential_acceptance {
     // guard. Both the probe and the submit ride the agent credential.
     #[test]
     fn a_managed_artifact_submit_probes_and_submits_on_the_agent_credential() {
-        let s = session(board(), 5);
+        // The probe's body is not read; the submit's answer must be a receipt.
+        let mut b = board();
+        b.agent_call = (
+            200,
+            json!({"stage": "in_review", "type": "quotation", "typeConfirmed": true}),
+        );
+        let s = session(b, 5);
         s.submit_document().unwrap();
         assert_eq!(
             s.trail(),

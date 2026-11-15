@@ -2133,6 +2133,21 @@ fn document_lifecycle_unavailable(verb: &str, status: u16, body: Option<&Value>)
     ))
 }
 
+/// CAD-2286: a `document_submit` 2xx is a receipt only in the shape of the
+/// tenant's `documentSubmitView` (`apps/api/src/tenant-board/document-store.ts`):
+/// a lifecycle stage (`DOCUMENT_STAGES` in `document-lifecycle.ts`), the type,
+/// whether that type is confirmed, and the baseline object for an unconfirmed
+/// one. The answer carries no id to correlate, so the shape is the proof; any
+/// other body may follow a recorded submit and is an unknown outcome.
+fn document_submit_receipt(reply: &Value) -> bool {
+    matches!(
+        reply.get("stage").and_then(Value::as_str),
+        Some("draft" | "in_review" | "approved" | "delivered" | "archived")
+    ) && reply.get("type").is_some_and(Value::is_string)
+        && reply.get("typeConfirmed").is_some_and(Value::is_boolean)
+        && reply.get("baseline").is_none_or(Value::is_object)
+}
+
 /// CAD-2286: the tenant's `document_submit` refusals
 /// (`DOCUMENT_SUBMIT_STATUS` in `apps/api/src/tenant-board/cli.ts`), each a
 /// typed error carrying its code. Without this, the generic decoder drops a
@@ -5321,6 +5336,8 @@ fn submit_document_in(
             &sleep,
         )
     };
+    // The probe decides availability only; its body is not read. What proves
+    // the submit is the submit's own receipt (`document_submit_receipt`).
     if let RemoteAnswer::Conflict(_) = call("document_types", Map::new())? {
         return Err(reject(
             "remote read answered a conflict; nothing was submitted",
@@ -6253,6 +6270,7 @@ fn call_verb_until_retry(
                 "agent_profile_create" | "agent_profile_update" => {
                     !profile_receipt_correlates(verb, reply, &arguments)
                 }
+                "document_submit" => !document_submit_receipt(reply),
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)
                 }
