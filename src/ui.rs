@@ -50,6 +50,8 @@ mod board_api_golden;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad2018_wiki_http_acceptance;
+#[cfg(test)]
+mod cad2321_actor_kind_http_acceptance;
 mod cli_route;
 mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
