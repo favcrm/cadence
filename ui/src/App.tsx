@@ -1314,6 +1314,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
               footer={versionLine}
             /></div>}
+            {meta?.signed_in !== true && <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-ink-700 pt-2">
+              <LocalLanguage />
+              <ThemeToggle />
+            </div>}
           </MobileNavigation>
         )}
 

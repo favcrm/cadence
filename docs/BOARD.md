@@ -2793,7 +2793,7 @@ parameters while clearing record and segment selection. The aligned
 conversation or app frame. A collapsed chat leaves no rail; on narrow screens
 the workspace and assistant share one pane. Workflow launchers and developer
 tools live in the header's **More actions** menu. Narrow layouts keep account,
-board status and update controls in the existing mobile navigation.
+board status, update, language and theme controls in the existing mobile navigation.
 
 Every setup or Browser QA handover states these separately:
 
