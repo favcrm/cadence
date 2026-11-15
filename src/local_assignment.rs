@@ -39,6 +39,10 @@ mod wire;
 #[cfg(test)]
 mod cad2290_hosted_finish_acceptance;
 
+// Independently authored CAD-2337 refusal acceptance; implementers must not weaken it.
+#[cfg(test)]
+mod cad2337_stale_socket_finish_refusal;
+
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
 const MAX_BODY: u64 = 1024 * 1024;
 
