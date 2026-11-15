@@ -113,14 +113,15 @@ async function main() {
     const renderApp = async () => {
       await React.act(async () => {
         root.render(
-          React.createElement(LocaleBridgeProvider, {
-            bridge: fakeBridge,
-            messages: {
-              en: { Save: "Save", Clear: "Clear", Confirm: "Confirm", Discard: "Discard" },
-              zh: { Save: "儲存", Clear: "清除", Confirm: "確認", Discard: "放棄" },
-            },
-            children: React.createElement(Probe),
-          }),
+      React.createElement(LocaleBridgeProvider, {
+        bridge: fakeBridge,
+        messages: {
+          en: { Save: "Save", Clear: "Clear", Confirm: "Confirm", Discard: "Discard" },
+          zh: { Save: "儲存", Clear: "清除", Confirm: "確認", Discard: "放棄" },
+          "zh-Hant": { Save: "儲存(繁)" },
+        },
+        children: React.createElement(Probe),
+      }),
         );
       });
     };
@@ -144,6 +145,14 @@ async function main() {
     buttons[1].click();
     assert(events.includes("discard") && events.includes("approve"), "StagedApprovalBanner fires callbacks");
 
+    const searchLandmark = host.querySelector('.s-filter-bar[role="search"]');
+    const chipGroup = host.querySelector('.s-filter-bar-chips[role="group"]');
+    assert(searchLandmark && chipGroup, "FilterBar exposes distinct search landmark and chip group");
+    assert(
+      chipGroup.getAttribute("aria-label") !== searchLandmark.getAttribute("aria-label"),
+      "FilterBar chip group aria-label differs from search landmark aria-label",
+    );
+
     const search = host.querySelector('.s-filter-bar input[type="search"]') as HTMLInputElement;
     assert(search && search.value === "ada", "FilterBar binds search query");
     const chipBtn = host.querySelector('.s-filter-bar-chips button[aria-pressed="true"]') as HTMLButtonElement;
@@ -153,6 +162,12 @@ async function main() {
     assert(clearBtn && clearBtn.textContent === "清除", "FilterBar Clear button localized");
     clearBtn.click();
     assert(events.includes("chip:vip") && events.includes("clear"), "FilterBar chip and clear callbacks fire");
+
+    await React.act(async () => {
+      localeValue = "zh-Hant-TW";
+      for (const fn of listeners) fn();
+    });
+    assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-Hant-TW:儲存(繁)", "LocaleBridgeProvider walks progressive BCP-47 subtag prefixes");
 
     await React.act(async () => {
       localeValue = "en";
@@ -166,6 +181,22 @@ async function main() {
       for (const fn of listeners) fn();
     });
     assert(host.querySelector('[data-testid="locale-probe"]')?.textContent === "zh-HK:儲存", "LocaleBridgeProvider supports context.locale fallback");
+
+    const fs = require("fs");
+    const path = require("path");
+    const cwd = require("process").cwd();
+    const screenUiSrcDir = fs.existsSync(path.resolve(cwd, "screen-ui/src"))
+      ? path.resolve(cwd, "screen-ui/src")
+      : path.resolve(cwd, "ui/screen-ui/src");
+    for (const file of fs.readdirSync(screenUiSrcDir) as string[]) {
+      const content = fs.readFileSync(path.join(screenUiSrcDir, file), "utf8") as string;
+      assert(!content.includes("--color-ink)") && !content.includes("--color-ink-2)"), `${file} must not reference undefined --color-ink/--color-ink-2`);
+    }
+    const stylesCss = fs.readFileSync(path.join(screenUiSrcDir, "styles.css"), "utf8") as string;
+    const primitivesCss = fs.readFileSync(path.join(screenUiSrcDir, "primitives.css"), "utf8") as string;
+    assert(stylesCss.includes('@source "./*.tsx";'), "styles.css must scan screen-ui/src/*.tsx");
+    assert(primitivesCss.includes(".s-staged-banner-body p"), "primitives.css must reset margin on .s-staged-banner-body p");
+
     console.log("screen-ui 1.1 checks passed");
   } finally {
     await React.act(async () => {

@@ -43,7 +43,7 @@ export const CALL_FIELDS = {
   "records.show": ["record_id"],
   "records.create": ["record_id", "profile"],
   "records.update": ["record_id", "expected_revision", "profile"],
-  "screen.route.patch": ["section", "view", "record_id"],
+  "screen.route.patch": ["section", "view", "record_id", "replace"],
 };
 
 export const bridge = createScreenBridge({
@@ -238,11 +238,12 @@ protocol violation calls `onError` and closes the port.
 ## Non-Fatal Host 403 Refusals
 
 Only mount revocation refusals (`"This app's access is no longer available."`
-or non-slot/non-`owner_required` permission errors on the initial mount push)
-transition the bridge to `"error"`. Host `403` refusals for write actions,
-slot limits, or `owner_required` gates reject the returned promise
-(`ScreenRefusalError` with `.status === 403`) while keeping the bridge mounted
-and interactive.
+or post-mount `403` refusals that are not a `slot` call, declared `writeVerbs`
+operation, `code === "owner_required"`, or opted-in `keepAliveOnForbidden`)
+transition the bridge to `"error"`. Host `403` refusals for declared
+`writeVerbs`, confirmation `slot` actions, `owner_required` gates, or
+`keepAliveOnForbidden` calls reject the returned promise (`ScreenRefusalError`
+with `.status === 403`) while keeping the bridge mounted and interactive.
 
 ## Tests
 

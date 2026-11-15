@@ -198,9 +198,56 @@ test("@cadence/app-kit/react hooks subscribe, memoize status/selectors, and driv
     assert.equal(container.textContent, "ready:open");
     assert.equal(seenSections.at(-1), "open");
     assert.equal(seenStatuses.at(-1), statusBeforeRoute);
+
+    // Empty section/view params are omitted rather than emitted as null, while record_id/segment_id clear to null.
+    nav.navigate("?section=&view=&record_id=");
+    const clearPatchMsg = await waitFor(
+      () => inbox.filter((m) => m.op === "call" && m.verb === "screen.route.patch")[1],
+      "empty query patch",
+    );
+    assert.deepEqual(clearPatchMsg.args, { record_id: null });
+
+    // navOptions.replace forwards replace boolean even if app's declared calls["screen.route.patch"] omitted "replace".
+    nav.navigate("?section=all", { replace: true });
+    const replacePatchMsg = await waitFor(
+      () => inbox.filter((m) => m.op === "call" && m.verb === "screen.route.patch")[2],
+      "replace patch",
+    );
+    assert.deepEqual(replacePatchMsg.args, { section: "all", replace: true });
   } finally {
     await React.act(async () => {
       root.unmount();
     });
+  }
+});
+
+test("useScreenSelector resets cache cleanly when bridge prop changes", async () => {
+  const { doc } = setupDom();
+  const makeFakeBridge = (value) => {
+    const subs = new Set();
+    let cur = value;
+    return {
+      subscribe: (fn) => { subs.add(fn); return () => subs.delete(fn); },
+      getState: () => ({ status: "ready", snapshot: { tag: cur } }),
+      set(next) { cur = next; for (const fn of subs) fn(); },
+    };
+  };
+  const b1 = makeFakeBridge("one");
+  const b2 = makeFakeBridge("two");
+  const sel = (s) => s.snapshot?.tag;
+  function Probe({ bridge }) {
+    const tagVal = useScreenSelector(bridge, sel);
+    return createElement("span", null, tagVal);
+  }
+  const container = doc.createElement("div");
+  doc.body.append(container);
+  const root = createRoot(container);
+  try {
+    await React.act(async () => { root.render(createElement(Probe, { bridge: b1 })); });
+    assert.equal(container.textContent, "one");
+    await React.act(async () => { root.render(createElement(Probe, { bridge: b2 })); });
+    assert.equal(container.textContent, "two");
+  } finally {
+    await React.act(async () => { root.unmount(); });
   }
 });

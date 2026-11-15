@@ -1263,9 +1263,10 @@ export function createScreenBridge(options = {}) {
     }
   };
 
-  const cleanArgs = (verb, rawArgs, fieldsMap) => {
-    const allowed = fieldsMap[verb];
-    if (!allowed) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+  const cleanArgs = (verb, rawArgs, fieldsMap, extraFields) => {
+    const baseAllowed = fieldsMap[verb];
+    if (!baseAllowed) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+    const allowed = Array.isArray(extraFields) && extraFields.length > 0 ? [...baseAllowed, ...extraFields] : baseAllowed;
     const source = rawArgs === undefined ? {} : rawArgs;
     if (!isPlain(source)) throw makeError(`Invalid arguments for ${verb}`, 400, { code: "invalid" });
     const cleaned = {};
@@ -1306,7 +1307,7 @@ export function createScreenBridge(options = {}) {
       assertScope(scope);
       const fieldsMap = kind === "call" ? calls : slots;
       if (!(verb in fieldsMap) || !can(verb)) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
-      const args = cleanArgs(verb, rawArgs, fieldsMap);
+      const args = cleanArgs(verb, rawArgs, fieldsMap, extra.extraFields);
       if (inFlight >= maxInFlight) return Promise.reject(makeError("Screen bridge is busy; wait for the current request", 429, { code: "conflict" }));
       const lockKey = matchSingleFlight(verb);
       if (lockKey && activeSingleFlight.has(lockKey)) {
@@ -1478,9 +1479,12 @@ export function createScreenBridge(options = {}) {
     patchRoute(patch = {}) {
       const snap = currentState.snapshot;
       if (!parsedRouteConfig || !snap || !("screen.route.patch" in calls) || !can("screen.route.patch", snap.actions) || !isPlain(patch)) return;
+      if (patch.section !== undefined && (typeof patch.section !== "string" || !parsedRouteConfig.sections.includes(patch.section))) return;
+      if (patch.view !== undefined && (typeof patch.view !== "string" || !parsedRouteConfig.views.includes(patch.view))) return;
       if (patch.record_id !== undefined && patch.record_id !== null && (typeof patch.record_id !== "string" || !ROUTABLE_ID.test(patch.record_id))) return;
       if (patch.segment_id !== undefined && patch.segment_id !== null && (typeof patch.segment_id !== "string" || !ROUTABLE_ID.test(patch.segment_id))) return;
-      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true }).catch(() => undefined);
+      if (patch.replace !== undefined && typeof patch.replace !== "boolean") return;
+      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true, extraFields: ["replace"] }).catch(() => undefined);
     },
     ownLeaveState() {
       const snap = currentState.snapshot;

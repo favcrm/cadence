@@ -247,3 +247,47 @@ test("installSandboxFormActions is ref-counted and idempotent per Document", () 
 
   awaitableTeardown(win);
 });
+
+test("installSandboxFormActions respects ancestor <fieldset disabled> wrapping <form>", () => {
+  const { win, doc } = setupDoc();
+  const cleanup = installSandboxFormActions(doc);
+
+  const outerFieldset = doc.createElement("fieldset");
+  outerFieldset.disabled = true;
+  const form = doc.createElement("form");
+  const input = doc.createElement("input");
+  input.type = "text";
+  const btn = doc.createElement("button");
+  btn.type = "submit";
+  form.append(input, btn);
+  outerFieldset.append(form);
+  doc.body.append(outerFieldset);
+
+  let submits = 0;
+  form.addEventListener("submit", () => { submits += 1; });
+
+  const disabledKey = new win.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  input.dispatchEvent(disabledKey);
+  assert.equal(disabledKey.defaultPrevented, false);
+  assert.equal(submits, 0, "input inside outer disabled fieldset must not synthesize submit");
+
+  const disabledClick = new win.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  btn.dispatchEvent(disabledClick);
+  assert.equal(disabledClick.defaultPrevented, false, "click inside outer disabled fieldset is not intercepted by sandbox handler");
+
+  const beforeEnableSubmits = submits;
+  outerFieldset.disabled = false;
+
+  const enabledKey = new win.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  input.dispatchEvent(enabledKey);
+  assert.equal(enabledKey.defaultPrevented, true);
+  assert.equal(submits, beforeEnableSubmits + 1, "input submits once outer fieldset is re-enabled");
+
+  const enabledClick = new win.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  btn.dispatchEvent(enabledClick);
+  assert.equal(enabledClick.defaultPrevented, true);
+  assert.equal(submits, beforeEnableSubmits + 2, "button submits via click handler once outer fieldset is re-enabled");
+
+  cleanup();
+  awaitableTeardown(win);
+});

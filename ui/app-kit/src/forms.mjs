@@ -72,13 +72,13 @@ function isInFirstLegend(control, fieldset) {
   return false;
 }
 
-function isDisabledInForm(control, form) {
+function isDisabledInForm(control, _form) {
   if (!control) return true;
   if (control.disabled === true || (typeof control.hasAttribute === "function" && control.hasAttribute("disabled"))) {
     return true;
   }
   let cur = control.parentElement ?? null;
-  while (cur && cur !== form) {
+  while (cur) {
     if (tagOf(cur) === "FIELDSET" && isDisabledFieldset(cur) && !isInFirstLegend(control, cur)) {
       return true;
     }

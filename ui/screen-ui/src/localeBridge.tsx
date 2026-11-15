@@ -38,11 +38,16 @@ function lookupCatalog(
   if (!messages) return text;
   const direct = messages[locale]?.[text];
   if (direct !== undefined) return direct;
-  const sepIndex = Math.max(locale.indexOf("-"), locale.indexOf("_"));
-  if (sepIndex > 0) {
-    const base = locale.slice(0, sepIndex);
-    const baseMatch = messages[base]?.[text];
-    if (baseMatch !== undefined) return baseMatch;
+  const normalized = locale.replace(/_/g, "-");
+  if (normalized !== locale) {
+    const normalizedDirect = messages[normalized]?.[text];
+    if (normalizedDirect !== undefined) return normalizedDirect;
+  }
+  const parts = normalized.split("-").filter(Boolean);
+  for (let len = parts.length - 1; len >= 1; len -= 1) {
+    const prefix = parts.slice(0, len).join("-");
+    const match = messages[prefix]?.[text];
+    if (match !== undefined) return match;
   }
   const fallback = messages[fallbackLocale]?.[text];
   return fallback !== undefined ? fallback : text;

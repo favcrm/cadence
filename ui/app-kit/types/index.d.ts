@@ -177,6 +177,7 @@ export interface ScreenRoutePatch<Section extends string = string, View extends 
   view?: View;
   record_id?: string | null;
   segment_id?: string | null;
+  replace?: boolean;
 }
 
 export interface ScreenReadObservation {

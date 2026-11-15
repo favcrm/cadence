@@ -16,6 +16,7 @@ export interface FilterBarProps<ChipId extends string = string> {
   searchPlaceholder?: string;
   searchLabel?: string;
   chips?: ReadonlyArray<FilterChipOption<ChipId>>;
+  chipsLabel?: string;
   onChipToggle?: (id: ChipId) => void;
   actions?: ReactNode;
   onClear?: () => void;
@@ -30,6 +31,7 @@ export function FilterBar<ChipId extends string = string>({
   searchPlaceholder,
   searchLabel,
   chips,
+  chipsLabel,
   onChipToggle,
   actions,
   onClear,
@@ -62,7 +64,11 @@ export function FilterBar<ChipId extends string = string>({
         </div>
       ) : null}
       {chips && chips.length > 0 ? (
-        <div className="s-filter-bar-chips" role="group" aria-label={resolvedLabel}>
+        <div
+          className="s-filter-bar-chips"
+          role="group"
+          aria-label={chipsLabel ?? `${resolvedLabel} ${t("options")}`}
+        >
           {chips.map((chip) => (
             <Button
               key={chip.id}

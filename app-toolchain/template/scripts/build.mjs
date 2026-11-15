@@ -47,6 +47,8 @@ const provenance = {
     path.join(appKit, "src/index.mjs"),
     path.join(appKit, "src/receiver.mjs"),
     path.join(appKit, "src/refusal.mjs"),
+    path.join(appKit, "src/forms.mjs"),
+    path.join(appKit, "src/react.mjs"),
   ]),
   toolchain_digest: digest([path.join(root, "package.json"), path.join(root, "scripts/build.mjs")]),
 };
@@ -67,6 +69,9 @@ const result = await Bun.build({
       setup(build) {
         build.onResolve({ filter: /^@cadence\/app-kit$/ }, () => ({
           path: path.join(appKit, "src/index.mjs"),
+        }));
+        build.onResolve({ filter: /^@cadence\/app-kit\/react$/ }, () => ({
+          path: path.join(appKit, "src/react.mjs"),
         }));
       },
     },

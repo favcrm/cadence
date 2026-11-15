@@ -7,6 +7,7 @@ export function useScreenBridge(bridge) {
 export function useScreenSelector(bridge, selector, isEqual = Object.is) {
   const cacheRef = useRef({
     initialized: false,
+    bridge: undefined,
     state: undefined,
     selector: undefined,
     selected: undefined,
@@ -14,16 +15,17 @@ export function useScreenSelector(bridge, selector, isEqual = Object.is) {
   const getSelected = () => {
     const state = bridge.getState();
     const cache = cacheRef.current;
-    if (cache.initialized && cache.state === state && cache.selector === selector) {
+    if (cache.initialized && cache.bridge === bridge && cache.state === state && cache.selector === selector) {
       return cache.selected;
     }
     const nextSelected = selector(state);
-    if (cache.initialized && isEqual(cache.selected, nextSelected)) {
+    if (cache.initialized && cache.bridge === bridge && isEqual(cache.selected, nextSelected)) {
       cache.state = state;
       cache.selector = selector;
       return cache.selected;
     }
     cache.initialized = true;
+    cache.bridge = bridge;
     cache.state = state;
     cache.selector = selector;
     cache.selected = nextSelected;
@@ -69,8 +71,10 @@ export function createFrameNavigationAdapter(bridge, options = {}) {
     }
     const patch = {};
     const section = url.searchParams.get(sectionQuery);
-    if (section !== null) patch.section = section || null;
-    for (const key of ["view", "record_id", "segment_id"]) {
+    if (section !== null && section !== "") patch.section = section;
+    const view = url.searchParams.get("view");
+    if (view === "list" || view === "new") patch.view = view;
+    for (const key of ["record_id", "segment_id"]) {
       const val = url.searchParams.get(key);
       if (val !== null) patch[key] = val || null;
     }
@@ -78,10 +82,10 @@ export function createFrameNavigationAdapter(bridge, options = {}) {
   };
 
   return Object.freeze({
-    navigate(to, _navOptions) {
+    navigate(to, navOptions) {
       const patch = resolvePatch(to);
       if (patch && typeof bridge?.patchRoute === "function") {
-        bridge.patchRoute(patch);
+        bridge.patchRoute(typeof navOptions?.replace === "boolean" ? { ...patch, replace: navOptions.replace } : patch);
       }
     },
     href(to) {

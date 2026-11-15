@@ -45,12 +45,12 @@ export function StagedApprovalBanner({
       className={className ? `s-staged-banner ${className}` : "s-staged-banner"}
     >
       <div className="s-staged-banner-body">
-        <div className="text-body font-medium text-[var(--color-ink)]">{title}</div>
+        <div className="text-body font-medium text-ink-100">{title}</div>
         {description ? (
-          <p className="text-label text-[var(--color-ink-2)]">{description}</p>
+          <p className="text-label text-ink-300">{description}</p>
         ) : null}
         {summary ? (
-          <div className="text-label text-[var(--color-ink-2)]">{summary}</div>
+          <div className="text-label text-ink-300">{summary}</div>
         ) : null}
       </div>
       {onDiscard || onApprove || actions ? (
