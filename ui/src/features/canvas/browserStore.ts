@@ -57,6 +57,7 @@ let state: BrowserTabState = empty(null);
 /** Bumped on every conversation change and on a confirmed stop, so a stale answer is dropped. */
 let epoch = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
+let timerDueAt: number | null = null;
 let reading = false;
 /** A read was asked for while one was in flight: it runs once that one ends. */
 let again = false;
@@ -119,6 +120,16 @@ export function tabVisible(s: BrowserTabState): boolean {
   return s.availability === "available" && !s.hidden;
 }
 
+/** Whether the Browser panel is currently visible in the front of the canvas drawer. */
+export function isBrowserPanelShown(
+  canvas: { open: boolean; tabs: readonly unknown[] },
+  s: BrowserTabState,
+): boolean {
+  const has = tabVisible(s);
+  const drawerOpen = (canvas.open && canvas.tabs.length > 0) || (s.open && has);
+  return drawerOpen && has && (s.focused || canvas.tabs.length === 0);
+}
+
 /** Poll while a session is live or being stopped, or a turn is running. */
 export function pollDelay(s: BrowserTabState, turnRunning = false, retry = false): number | null {
   if (s.conversation === null) return null;
@@ -132,16 +143,27 @@ export function pollDelay(s: BrowserTabState, turnRunning = false, retry = false
   return turnRunning ? POLL.turn : retry ? POLL.probe : null;
 }
 
+function clearTimer(): void {
+  if (timer !== null) clearTimeout(timer);
+  timer = null;
+  timerDueAt = null;
+}
+
 function schedule(): void {
   const delay = pollDelay(state, watching, retrying);
   if (delay === null) {
-    if (timer !== null) clearTimeout(timer);
-    timer = null;
+    clearTimer();
     return;
   }
-  if (timer !== null) return;
+  const nextDueAt = Date.now() + delay;
+  // Keep an earlier timer, but replace any slower timer (e.g. a 30s retry) when
+  // faster polling is now needed.
+  if (timer !== null && timerDueAt !== null && timerDueAt <= nextDueAt) return;
+  clearTimer();
+  timerDueAt = nextDueAt;
   timer = setTimeout(() => {
     timer = null;
+    timerDueAt = null;
     // A hidden tab does not poll; the next tick catches up.
     if (typeof document !== "undefined" && document.hidden) schedule();
     else void refreshBrowser();
@@ -210,6 +232,7 @@ export async function refreshBrowser(): Promise<void> {
     return;
   }
   reading = true;
+  clearTimer();
   const mine = epoch;
   try {
     const read = await readBrowser(conversation); // bounded: a hung read fails
@@ -244,8 +267,7 @@ export function feedBrowser(conversation: string | null): void {
   failedReads = 0;
   retrying = false;
   if (conversation === null) watching = false;
-  if (timer !== null) clearTimeout(timer);
-  timer = null;
+  clearTimer();
   set(empty(conversation));
   if (conversation !== null) void refreshBrowser();
 }
@@ -291,6 +313,18 @@ export function useBrowserFeed(conversation: string | null, running: boolean, re
   useEffect(() => {
     if (conversation !== null) void refreshBrowser();
   }, [conversation, revision]);
+  useEffect(() => {
+    if (conversation === null || typeof document === "undefined") return;
+    // Returning from another tab (e.g. an OTP/SSO window during handoff) wakes
+    // polling at once instead of waiting for the next timer tick.
+    const onVisibilityChange = () => {
+      if (!document.hidden && pollDelay(state, watching, retrying) !== null) {
+        void refreshBrowser();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [conversation]);
   const was = useRef({ running: false, on: false });
   useEffect(() => {
     const on = running && !expired;
