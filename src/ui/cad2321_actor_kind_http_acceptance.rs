@@ -237,6 +237,19 @@ impl Rig {
     /// One call with a fresh envelope whose `sub` and `actor` are chosen
     /// independently of each other and of the principal kind.
     fn call(&self, kind: &str, actor: &str, sub: &str, verb: &str, args: Value) -> (u16, Value) {
+        self.call_as(kind, actor, sub, "member", verb, args)
+    }
+
+    /// [`Rig::call`] with the role the envelope was minted with.
+    fn call_as(
+        &self,
+        kind: &str,
+        actor: &str,
+        sub: &str,
+        role: &str,
+        verb: &str,
+        args: Value,
+    ) -> (u16, Value) {
         let now = crate::issue::time::now_epoch();
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
@@ -251,7 +264,7 @@ impl Rig {
                 "sub": sub,
                 "actor": actor,
                 "principal_kind": kind,
-                "role_at_issue": "member",
+                "role_at_issue": role,
                 "organization_id": ORG,
                 "scope": ["cli.read"],
                 "credential_id": format!("cad2321-{sub}"),
@@ -417,5 +430,69 @@ fn matching_kind_and_actor_pairs_are_admitted_where_policy_grants() {
         vec![rig.open_issue.clone()],
         "matching agent listing"
     );
+    assert_eq!(tracker_state(&rig.pm_dir), before, "an admitted read wrote");
+}
+
+/// A cross pair between the two reserved kinds is refused the same way.
+#[test]
+fn an_agent_principal_with_a_service_actor_is_refused() {
+    let rig = start();
+    assert_refused(&rig, "agent", "service/mia", "human_session_required");
+}
+
+/// Positive control for the remaining exact pairs: a service with its own
+/// prefix reads the open project (the private one refuses every service by
+/// policy), and the Owner's `operator` reads both.
+#[test]
+fn service_and_operator_pairs_are_admitted_where_policy_grants() {
+    let rig = start();
+    let before = tracker_state(&rig.pm_dir);
+
+    let (status, body) = rig.call(
+        "service",
+        "service/svc",
+        "svc",
+        "issue_show",
+        json!({ "id": rig.open_issue }),
+    );
+    assert_eq!(
+        status, 200,
+        "matching service refused the open project: {body}"
+    );
+    assert_eq!(body["issue"]["id"], json!(rig.open_issue), "{body}");
+    let (status, body) = rig.call(
+        "service",
+        "service/svc",
+        "svc",
+        "issue_show",
+        json!({ "id": rig.secret_issue }),
+    );
+    assert_eq!(status, 404, "a service read the private project: {body}");
+    assert_eq!(body["error"]["message"], "unknown project", "{body}");
+    let (status, body) = rig.call("service", "service/svc", "svc", "issue_ls", json!({}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        listed(&body),
+        vec![rig.open_issue.clone()],
+        "matching service listing"
+    );
+
+    for id in [&rig.secret_issue, &rig.open_issue] {
+        let (status, body) = rig.call_as(
+            "user",
+            "operator",
+            "owner",
+            "owner",
+            "issue_show",
+            json!({ "id": id }),
+        );
+        assert_eq!(status, 200, "the operator was refused {id}: {body}");
+        assert_eq!(body["issue"]["id"], json!(id), "{body}");
+    }
+    let (status, body) = rig.call_as("user", "operator", "owner", "owner", "issue_ls", json!({}));
+    assert_eq!(status, 200, "{body}");
+    let mut want = vec![rig.secret_issue.clone(), rig.open_issue.clone()];
+    want.sort();
+    assert_eq!(listed(&body), want, "the operator's listing");
     assert_eq!(tracker_state(&rig.pm_dir), before, "an admitted read wrote");
 }
