@@ -4009,6 +4009,30 @@ impl Shared {
                         crate::peer::AgentMutation::SelfService,
                     )?;
                 }
+                // CAD-2310: the briefing read (`briefing::briefing_read`) by
+                // the agent itself or its group root keeps what the briefing
+                // is built from past the scoped filter below. Allowed only
+                // when the caller rule admits an AGENT connection: every
+                // relayed read rides an operator-proven connection, so its
+                // reader is never the caller the rule judged.
+                let owner_read = scope.is_some()
+                    && (include_profile_instructions || include_catalogue_instructions)
+                    && match self.authorize_agent_mutation(
+                        params,
+                        peer_pid,
+                        "agent show",
+                        &agent,
+                        crate::peer::AgentMutation::SelfService,
+                    ) {
+                        Ok(crate::peer::AgentCaller::Agent(_)) => true,
+                        Ok(crate::peer::AgentCaller::Operator) | Err(Error::Rejected(_)) => false,
+                        Err(error) => {
+                            eprintln!(
+                                "agent show: briefing fields withheld for '{alias}': {error}"
+                            );
+                            false
+                        }
+                    };
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.
@@ -4105,9 +4129,6 @@ impl Shared {
                     std::collections::BTreeSet::new()
                 };
                 let mut agent_json = agent.to_json();
-                if profile_snapshot || catalogue_snapshot {
-                    agent_json["instructions"] = json!(agent.instructions);
-                }
                 // CAD-1752: the project of the task this agent is running
                 // (else its cwd's); the briefing's memory section reads it.
                 // CAD-2215: that derivation reads raw running/queued work, so a
@@ -4230,6 +4251,16 @@ impl Shared {
                 }
                 if scope.is_some() {
                     identity::retain_scoped_agent_fields(&mut agent_json, Some(&visible_running));
+                    if owner_read {
+                        agent_json["params"] = json!(agent.params);
+                        agent_json["cwd"] = json!(agent.cwd);
+                    }
+                }
+                // After the scoped filter, so a job the caller rule admitted
+                // is not stripped (CAD-2310); a relayed reader still never
+                // gets it.
+                if (profile_snapshot || catalogue_snapshot) && (scope.is_none() || owner_read) {
+                    agent_json["instructions"] = json!(agent.instructions);
                 }
                 let projected_messages = messages
                     .iter()

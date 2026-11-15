@@ -18,6 +18,10 @@ mod cad2239_reviewer_pane_refusal;
 mod cad2285_master_ask_form_refusal;
 #[cfg(feature = "test-seam")]
 mod cad2298_master_ask_form_refusal;
+#[cfg(feature = "test-seam")]
+mod cad2310_member_briefing_read;
+#[cfg(feature = "test-seam")]
+mod cad2310_relayed_briefing_read_refusal;
 mod pty_retry_tests;
 mod unit;
 mod unknown_fence_guidance;
