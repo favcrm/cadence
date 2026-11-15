@@ -7,12 +7,12 @@ Always inspect the target repository's existing manifests and pinned contract ve
 Detached app repositories expose a `cadence` object in root `package.json` for local dev and verification (`cadence app dev --package .`):
 
 - Required/standard fields: `cadence.app` (app identifier), `cadence.dev` (local dev command), `cadence.check` (verification command).
-- **Command grammar rule:** Commands in `cadence.dev` must be a single command and must **not** contain shell metacharacters (`;`, `&&`, `||`, `|`, `<`, `>`, backticks, or `$()`); put multiple steps in a script file. `cadence.check` runs via `sh -c`.
+- **Command grammar rule:** Commands in `cadence.dev` must be a single command and must **not** contain newlines, unquoted parentheses `(`, `)`, or shell metacharacters (`;`, `&&`, `||`, `|`, `<`, `>`, backticks, or `$()`); put multiple steps in a script file. `cadence.check` runs via `sh -c`.
 - `cadence app dev --package .` injects a scrubbed environment (`CADENCE_APP_ROOT`, `CADENCE_APP_NAME`, `CADENCE_APP_PORT`, `CADENCE_APP_HOST`, `CADENCE_APP_CONTRACT`) bound to `127.0.0.1` ports `3110..=3199`.
 
 ## 2. `app/app.md` & Explorer `listing:` Metadata
 
-`app/app.md` carries YAML frontmatter identifying the package (`app`, `title`, `version`, `needs.connections` / `needs.capabilities` slots such as `publication_slot` / `required_asset_slot`, `needs.requires.contracts`).
+`app/app.md` carries YAML frontmatter identifying the package (`app`, `title`, `version`, `needs.connections` / `needs.capabilities` slots such as `publication` or `image`, `needs.requires.contracts`). Workflow definitions (`workflows/*.md`) reference those declared `needs.capabilities` slot names via workflow frontmatter keys `publication_slot: <slot>` and `required_asset_slot: <slot>`—never declare `publication_slot` or `required_asset_slot` itself as a slot name inside `needs.capabilities`.
 
 - `needs.requires.contracts` pins exact host contract majors, for example `{ app-views: [1], app-chat: [1], app-storage: [1] }`.
 - Optional `listing:` block provides plain-text Explorer metadata (covered by the bundle digest; cannot grant capabilities or declare workflow verbs):
@@ -25,7 +25,7 @@ Each mounted screen declares a manifest under `app/screens/<tag>/screens.json`:
 
 - Bundle bounds: `MAX_SCREENS = 8`, `MAX_ASSETS = 32`, `MAX_MANIFEST_BYTES = 32_768` (`32 KiB`), aggregate bundle size cap `2 MiB`.
 - `navigation` block (validated strictly by host):
-  - `section_query`: app-owned URL query parameter (`1..=32` chars matching `^[a-z][a-z0-9_-]{0,31}$`). Cannot reuse host-reserved keys (`app`, `install`, `install_id`, `context`, `context_id`, `ctx`, `actor`, `identity`, `auth`, `token`, `key`, `session`, `session_key`, `origin`, `project`, `workspace`, `conversation`, `thread`, `message`, `view`, `appview`, `record`, `record_id`, `segment`, `segment_id`, `screen`, `contract-preview`, `nonce`, `proof`, `generation`, `digest`).
+  - `section_query`: app-owned URL query parameter (`1..=32` chars matching `^[a-z][a-z0-9_-]{0,31}$`). Cannot reuse host-reserved keys (`app`, `install`, `install_id`, `context`, `context_id`, `ctx` [TS], `actor`, `identity`, `auth`, `token`, `key`, `session`, `session_key`, `origin`, `project`, `workspace`, `conversation`, `thread`, `message`, `view`, `appview`, `record`, `record_id`, `segment`, `segment_id`, `screen`, `contract-preview`, `nonce`, `proof` [Rust], `generation` [TS], `digest` [TS] — avoid all 31 keys across Rust/UI layers).
   - `sections`: `1..=8` `{ id, label }` objects (unique valid tags for `id`; non-empty `label` <= 40 UTF-16 code units with no control characters).
   - `default_section`: must match one of the declared `sections[].id`.
 
@@ -40,7 +40,8 @@ Apps that persist structured relational records declare `app/app-storage.json`, 
   - `default_table` (identifier or `null`), `record_kind` (`^[a-z][a-z0-9_-]{0,31}$`), optional `record_write_schema` (JSON Schema), optional `record_search_columns` (distinct `text` or `json` columns on `default_table`).
   - `migrations`: contiguous `1..=schema_version` entries `{ version, path: "storage/<tag>.json", sha256: "sha256:<64-hex>" }`.
 - **Host-owned base columns (forbidden in column declarations):** `id`, `context_id`, `revision`, `created_at`, `updated_at`.
-- **Allowed column types:** `text` (supports `max_length`, `format`, `enum`, `default`), `integer`, `real`, `boolean`, `json` (no `enum`).
+- **Allowed column types:** `text` (`max_length`, `format`, `enum`, `default`, `json_schema`), `integer` (`enum`, `default`, `json_schema`), `real` (`enum`, `default`, `json_schema`), `boolean` (`enum`, `default`, `json_schema`), `json` (`json_schema`, no `enum`).
+- **Table & row-policy options (`tables` descriptor):** `append_only`, `read_role`, `balanced`, `lock`, `row_owner`.
 - **Allowed migration operations (`op`):**
   - `create_table` (`table`, `columns`, optional `record_bytes`)
   - `add_column` (`table`, `column`; **non-null additive columns require a `default`**)

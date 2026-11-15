@@ -4,8 +4,8 @@ Always read the target repo's pinned `@cadence/app-kit` (`package.json`, `README
 
 ## 1. Receiver Initialization (`createScreenBridge` vs `createScreenReceiver`)
 
-- **Modern `@cadence/app-kit` (`0.5.0`):** Use `createScreenBridge` where available. Admits up to **6** declared `ready` capabilities and supports `screen-locale.v1` (`"en" | "zh-TW"`), `screen-audio.v1`/`.v2`, `screen-records.v1`, `ownLeaveState()`, and `patchRoute()`.
-- **Legacy `@cadence/app-kit` (`0.3.x`, still vendored in some apps):** Only exposes `createScreenReceiver`, enforces a **4** `ready` capability limit (`readyAccepts <= 4`), and may use legacy locale tags such as `crm-locale.v1`.
+- **Modern `@cadence/app-kit` (`0.5.0`+):** Use `createScreenBridge` where available. Admits up to **6** declared `ready` capabilities (`0.3.0`–`0.4.x` introduced `createScreenBridge` with `5` `ready` capabilities) and supports `screen-locale.v1` (`"en" | "zh-TW"`), `screen-audio.v1`/`.v2`, `screen-records.v1`, `ownLeaveState()`, and `patchRoute()`.
+- **Legacy `@cadence/app-kit` (`0.2.0`, vendored from toolchain `v0.3.20`):** Only exposes `createScreenReceiver`, enforces a **4** `ready` capability limit (`readyAccepts <= 4`), and may use legacy locale tags such as `crm-locale.v1`.
 - Never silently assume `createScreenBridge` or a `6`-capability budget exists until verified in the target repo's installed `app-kit`.
 
 ## 2. Wire Limits, Exported Constants & Error Classes
@@ -14,7 +14,7 @@ Exported by `@cadence/app-kit` (`src/index.mjs`, `src/receiver.mjs`, `src/refusa
 
 | Constant / Surface | Limit / Behavior | Design Implication |
 | :--- | :--- | :--- |
-| `action_args` tiers (default `argBytes: 16 KiB`) | `16 KiB` (`16 * 1024`) default; `48 KiB` (`49,152` B) for `records.create\|update\|batch`, `content.save`, `screen.preview.show`, `whatsapp.*`; `320 KiB` (`327,680` B) for `records.csv.*` | Keep interactive action payloads compact (override `argBytes` per verb only within host-permitted caps) and use CSV/artifact/media flows for bulk data. |
+| `action_args` tiers (default `argBytes: 16 KiB`) | `16 KiB` (`16 * 1024`) default (including other `whatsapp.*` actions such as `whatsapp.status`, `whatsapp.messages`, `whatsapp.broadcast.prepare`, `whatsapp.broadcast.send`); `48 KiB` (`49,152` B) for `records.create\|update\|batch`, `content.save`, `screen.preview.show`, `whatsapp.reply.prepare\|send`, `whatsapp.template.prepare\|send`; `80 KiB` (`81,920` B) for `works.create\|patch`; `192 KiB` (`196,608` B) for `whatsapp.broadcast.draft`; `320 KiB` (`327,680` B) for `records.csv.preview\|import\|confirm` | Keep interactive action payloads compact (override `argBytes` per verb only within host-permitted caps) and use CSV/artifact/media flows for bulk data. |
 | `MAX_STATE_BYTES` | `32 KiB` | Persist large domain datasets in backend storage/records, not ephemeral bridge state. |
 | `MAX_PUSH_BYTES` | `128 KiB` | Paginate list snapshots pushed from host to iframe. |
 | `MAX_REPLY_DATA_BYTES` | `1 MiB` | Bound RPC response payloads. |
@@ -24,7 +24,7 @@ Exported by `@cadence/app-kit` (`src/index.mjs`, `src/receiver.mjs`, `src/refusa
 | `DRAWER_CONTEXT_BYTES` | `1,024` bytes | Pass IDs and minimal cursor keys in drawer context, never whole records. |
 | `DEFAULT_TIMEOUT_MS` / `timeoutMs` | `createScreenBridge` defaults `timeoutMs` to `65,000` ms; low-level `createScreenReceiver` defaults to `DEFAULT_TIMEOUT_MS` (`15,000` ms) | Ensure interactive actions fail/reply promptly and pick a timeout appropriate to the host operation. |
 
-**Origin & boot validation:** At runtime, `@cadence/app-kit`'s `validateBoot()` validates `#cadence-screen-boot` (`parent_origin` must be `https:` or `http://localhost[:port]` / `http://<name>.localhost[:port]`).
+**Origin & boot validation:** At runtime, `@cadence/app-kit`'s `validateBoot()` validates `#cadence-screen-boot` (`parent_origin` must be `https:` or `http://localhost:<port>` / `http://<name>.localhost:<port>` with an explicit port `>= 1`).
 
 **Strict error/refusal handling:** Catch `ScreenBridgeError`, `ScreenClosedError`, `ScreenRefusalError`, and `ScreenTimeoutError` (or inspect `REFUSAL_STATUS` via `readRefusal`). Render an explicit blocked/unavailable/retryable UI state—never coerce a refusal or timeout into optimistic local success.
 
@@ -54,7 +54,7 @@ Exported primitives (`ui/screen-ui/src/index.ts`):
 
 Visual & UX requirements from `ui/screen-ui/DESIGN.md`:
 - Compact, calm SaaS density: `28px` desktop list/control heights, `36px` on narrow viewports.
-- Support both dark and light theme semantic tokens (`theme.css`, `foundation.css`, `controls.css`, `drawer.css`)—never add a second CSS reset or custom color palette.
+- Support both dark and light theme semantic tokens (`@cadence/screen-ui/styles.css`, built from `theme.css`, `controls.css`, `base.css`, `primitives.css`, `drawer-base.css`, `drawer.css`, plus `foundation.css` in source)—never add a second CSS reset or custom color palette.
 - Honor reduced-motion preferences, full keyboard focus rings, and desktop + narrow responsive stacking.
 - Provide full `"en"` and `"zh-TW"` copy through `LocaleTextProvider` (or app translation dictionaries) for every heading, empty state, validation message, error state, and `section_query` tab label.
 - **Do not use legacy `.crm-*` selectors** in greenfield apps; only retain existing `.crm-*` references when maintaining unmigrated legacy components.
