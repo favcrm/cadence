@@ -87,6 +87,21 @@ fn mia_rig() -> Rig {
         "key: secret\nprefix: SEC\npolicy:\n  version: 1\n  visibility: private\n  members:\n  - users/mia\n",
     )
     .unwrap();
+    // Settle the daemon's own tracker writes before any snapshot. Its
+    // periodic checkup grooms dormant backlog work (stamping
+    // `last_groomed_at`), and the fixture issues are dormant. One pass here
+    // stamps every candidate under the same per-issue lock, and the groom's
+    // cooldown then makes every later daemon pass skip them. So a later
+    // tracker change can only come from the call under test.
+    let pm = crate::issue::Pm::at(&rig.pm).unwrap();
+    crate::issue::groom::groom(
+        &pm,
+        None,
+        crate::issue::groom::GROOM_GRACE_SECS,
+        false,
+        "cad2321-fixture",
+    )
+    .unwrap();
     rig
 }
 
