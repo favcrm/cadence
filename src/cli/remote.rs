@@ -3996,12 +3996,17 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 Some(AuditAction::Revoke {
                     id,
                     project,
+                    source,
                     reason,
-                    ..
                 }),
             ..
         } => {
             refuse_managed(target, "audit revoke")?;
+            if source.is_some() {
+                return Err(cadence_agent::Error::rejected(
+                    "`--source` is not supported on a hosted org; the authenticated owner session is recorded automatically.",
+                ));
+            }
             let receipt =
                 hosted_gate::revoke_project(target, wake_timeout, project.as_deref(), id, reason)
                     .map_err(|error| {

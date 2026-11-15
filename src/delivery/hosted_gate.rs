@@ -1682,11 +1682,13 @@ pub fn delivery_check(
         call_args.insert("browser_qa".into(), json!(true));
     }
     let body = call(target, wake_timeout, "delivery_check", call_args)?;
-    delivery_check_answer(&body, repo, pr, head)
+    delivery_check_answer(&body, project, issue, repo, pr, head)
 }
 
 pub(crate) fn delivery_check_answer(
     body: &Value,
+    project: Option<&str>,
+    issue: Option<&str>,
     repo: &str,
     pr: u64,
     requested_head: Option<&str>,
@@ -1701,6 +1703,23 @@ pub(crate) fn delivery_check_answer(
             "`{verb}` answer has inconsistent state/ok: {}",
             short(body)
         )));
+    }
+    if let Some(p) = project {
+        if body["project"].as_str() != Some(p) {
+            return Err(refuse(format!(
+                "`{verb}` answer names another project than {p}"
+            )));
+        }
+    }
+    if let Some(i) = issue {
+        if !body["issue"]
+            .as_str()
+            .is_some_and(|got| got.eq_ignore_ascii_case(i))
+        {
+            return Err(refuse(format!(
+                "`{verb}` answer names another issue than {i}"
+            )));
+        }
     }
     if !body["repo"]
         .as_str()
@@ -1756,11 +1775,13 @@ pub fn delivery_enqueue(
         call_args.insert("browser_qa".into(), json!(true));
     }
     let body = call(target, wake_timeout, "delivery_enqueue", call_args)?;
-    delivery_enqueue_answer(&body, repo, pr, head)
+    delivery_enqueue_answer(&body, project, issue, repo, pr, head)
 }
 
 pub(crate) fn delivery_enqueue_answer(
     body: &Value,
+    project: Option<&str>,
+    issue: Option<&str>,
     repo: &str,
     pr: u64,
     head: &str,
@@ -1772,6 +1793,23 @@ pub(crate) fn delivery_enqueue_answer(
                 "`{verb}` did not enqueue the PR: {}",
                 short(body)
             )));
+        }
+        if let Some(p) = project {
+            if body["project"].as_str() != Some(p) {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names another project than {p}"
+                )));
+            }
+        }
+        if let Some(i) = issue {
+            if !body["issue"]
+                .as_str()
+                .is_some_and(|got| got.eq_ignore_ascii_case(i))
+            {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names another issue than {i}"
+                )));
+            }
         }
         if !body["repo"]
             .as_str()
@@ -1938,6 +1976,23 @@ pub(crate) fn scope_project_answer(
     let verb = "audit_scope_project";
     let state = text(body, "state", verb)?;
     if state != "ok" {
+        if let Some(p) = body.get("project").filter(|v| !v.is_null()) {
+            if p.as_str() != Some(project) {
+                return Err(refuse(format!(
+                    "`{verb}` answered for another project than {project}"
+                )));
+            }
+        }
+        if let Some(i) = body.get("issue").filter(|v| !v.is_null()) {
+            if !i
+                .as_str()
+                .is_some_and(|got| got.eq_ignore_ascii_case(issue))
+            {
+                return Err(refuse(format!(
+                    "`{verb}` answered for another issue than {issue}"
+                )));
+            }
+        }
         let reason = body["reason"].as_str().unwrap_or(state);
         return Ok((json!({"state": state, "reason": reason}), 1));
     }
@@ -1959,9 +2014,21 @@ pub(crate) fn scope_project_answer(
         let scope_digest = text(row, "scope_digest", verb)?;
         text(row, "source", verb)?;
         text(row, "recorded_via", verb)?;
-        let revoked = row["revoked"]
-            .as_bool()
-            .unwrap_or_else(|| !row["revoked_at"].is_null());
+        let revoked = match row.get("revoked") {
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(refuse(format!("`{verb}` row has non-boolean revoked flag")));
+            }
+            None => match row.get("revoked_at") {
+                Some(Value::Null) => false,
+                Some(Value::String(s)) if !s.trim().is_empty() => true,
+                _ => {
+                    return Err(refuse(format!(
+                        "`{verb}` row has missing or invalid revoked_at field"
+                    )));
+                }
+            },
+        };
         let mut obj = row
             .as_object()
             .cloned()
@@ -3302,36 +3369,95 @@ mod tests {
     #[test]
     fn cad1946_hosted_gate_validators_enforce_bindings() {
         let head = HEAD;
-        // delivery_check: pass -> 0, refused -> 1, repo/pr/head mismatch -> err
+        // delivery_check: pass -> 0, refused -> 1, repo/pr/head/project/issue mismatch -> err
         let pass = json!({
-            "state": "pass", "ok": true, "repo": "favcrm/cadence", "pr": 7, "head": head,
-            "reasons": []
+            "state": "pass", "ok": true, "project": "cadence", "issue": "CAD-1946",
+            "repo": "favcrm/cadence", "pr": 7, "head": head, "reasons": []
         });
         assert_eq!(
-            delivery_check_answer(&pass, "favcrm/cadence", 7, Some(head))
-                .unwrap()
-                .1,
+            delivery_check_answer(
+                &pass,
+                Some("cadence"),
+                Some("CAD-1946"),
+                "favcrm/cadence",
+                7,
+                Some(head)
+            )
+            .unwrap()
+            .1,
             0
         );
         let refused = json!({
-            "state": "refused", "ok": false, "repo": "favcrm/cadence", "pr": 7, "head": head,
-            "reasons": ["need review"]
+            "state": "refused", "ok": false, "project": "cadence", "issue": "CAD-1946",
+            "repo": "favcrm/cadence", "pr": 7, "head": head, "reasons": ["need review"]
         });
         assert_eq!(
-            delivery_check_answer(&refused, "favcrm/cadence", 7, None)
-                .unwrap()
-                .1,
+            delivery_check_answer(
+                &refused,
+                Some("cadence"),
+                Some("CAD-1946"),
+                "favcrm/cadence",
+                7,
+                None
+            )
+            .unwrap()
+            .1,
             1
         );
-        assert!(delivery_check_answer(&pass, "favcrm/other", 7, None).is_err());
+        assert!(delivery_check_answer(
+            &pass,
+            Some("other"),
+            Some("CAD-1946"),
+            "favcrm/cadence",
+            7,
+            None
+        )
+        .is_err());
+        assert!(delivery_check_answer(
+            &pass,
+            Some("cadence"),
+            Some("CAD-99"),
+            "favcrm/cadence",
+            7,
+            None
+        )
+        .is_err());
+        assert!(delivery_check_answer(&pass, None, None, "favcrm/other", 7, None).is_err());
 
-        // delivery_enqueue: valid receipt passes; missing evidence_id or wrong head fails as unknown
+        // delivery_enqueue: valid receipt passes; missing evidence_id or wrong head/project/issue fails as unknown
         let enq = json!({
-            "state": "enqueued", "ok": true, "repo": "favcrm/cadence", "pr": 7, "head": head,
+            "state": "enqueued", "ok": true, "project": "cadence", "issue": "CAD-1946",
+            "repo": "favcrm/cadence", "pr": 7, "head": head,
             "evidence_id": "ev_1", "queued": true, "auto_merge_enabled": true
         });
-        assert!(delivery_enqueue_answer(&enq, "favcrm/cadence", 7, head).is_ok());
-        assert!(delivery_enqueue_answer(&enq, "favcrm/cadence", 8, head).is_err());
+        assert!(delivery_enqueue_answer(
+            &enq,
+            Some("cadence"),
+            Some("CAD-1946"),
+            "favcrm/cadence",
+            7,
+            head
+        )
+        .is_ok());
+        assert!(delivery_enqueue_answer(
+            &enq,
+            Some("other"),
+            Some("CAD-1946"),
+            "favcrm/cadence",
+            7,
+            head
+        )
+        .is_err());
+        assert!(delivery_enqueue_answer(
+            &enq,
+            Some("cadence"),
+            Some("CAD-99"),
+            "favcrm/cadence",
+            7,
+            head
+        )
+        .is_err());
+        assert!(delivery_enqueue_answer(&enq, None, None, "favcrm/cadence", 8, head).is_err());
 
         // revoke_project
         let rev = json!({"state": "revoked", "approval_id": "ap-1", "project": "cadence", "revoked_at": "2026-11-15T00:00:00Z"});
@@ -3357,6 +3483,24 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(norm["approvals"][0]["digest"], "deadbeef");
         assert_eq!(norm["approvals"][0]["revoked"], false);
+        assert!(scope_project_answer(
+            &json!({
+                "state": "ok", "project": "cadence", "issue": "CAD-1946",
+                "approvals": [{
+                    "approval_id": "sc-1", "scope_digest": "deadbeef",
+                    "source": "op", "recorded_via": "hosted-owner-login"
+                }]
+            }),
+            "cadence",
+            "CAD-1946"
+        )
+        .is_err());
+        assert!(scope_project_answer(
+            &json!({"state": "not_found", "project": "other", "issue": "CAD-1946"}),
+            "cadence",
+            "CAD-1946"
+        )
+        .is_err());
 
         // designate, designations, digest
         let des = json!({"state": "recorded", "project": "cadence", "designation": {"alias": "bot-1", "project": "cadence"}});

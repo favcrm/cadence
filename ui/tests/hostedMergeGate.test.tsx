@@ -305,8 +305,9 @@ async function main() {
     });
     await flush();
   }
-  const btn = (root: ParentNode, text: string) =>
-    Array.from(root.querySelectorAll("button")).find((b) => b.textContent?.trim() === text) as HTMLButtonElement | undefined;
+  const btnAll = (root: ParentNode, text: string) =>
+    Array.from(root.querySelectorAll("button")).filter((b) => b.textContent?.trim() === text) as HTMLButtonElement[];
+  const btn = (root: ParentNode, text: string) => btnAll(root, text)[0];
 
   async function mountDecisionPanel(hosted = true, readOnly = false) {
     const doneCalls: { key: string; text: string }[] = [];
@@ -395,6 +396,8 @@ async function main() {
   {
     const view = await mountDecisionPanel(true, false);
     await settle(() => assert(btn(view.host, "Send 6-digit code"), "proactive OTP shows Send 6-digit code"));
+    assert(btnAll(view.host, "Send 6-digit code").length === 1, "does not duplicate Send 6-digit code button");
+    assert(!btn(view.host, "Approve & merge"), "does not show conflicting Approve & merge before code is sent");
     await click(btn(view.host, "Send 6-digit code"));
     await settle(() => assert((view.host.textContent ?? "").includes("o***@fav.hk"), "shows email hint after send"));
     const otpInput = view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null;
@@ -535,15 +538,65 @@ async function main() {
     host.remove();
   }
 
-  // 6. Clean fallback to LegacyMergeReview on HTTP 501, generic 404, and mock `{}`.
+  // 6. Clean fallback to LegacyMergeReview on HTTP 501, generic/route-missing 404, and mock `{}`.
   for (const fallback of [
     () => ({ status: 501, body: { error: { code: "not_implemented", message: "Local daemon" } } }),
     () => ({ status: 404, body: { error: { message: "Not found" } } }),
+    () => ({ status: 404, body: { error: { code: "unknown_route", message: "Unknown route" } } }),
     () => ({ status: 200, body: {} }),
   ]) {
     nextGateResponse = fallback;
     const view = await mountDecisionPanel(true, false);
     await settle(() => assert(view.host.querySelector('[data-review-verb="Approve change"]'), "falls back to LegacyMergeReview when /api/approvals/gate is unsupported"));
+    await view.unmount();
+  }
+
+  // 7. Domain 404s stay in HostedMergeGate; 403 non-role error mentioning "owner" does not trigger memberRestricted;
+  //    403 invalid_code + 409 gate_refused map to clear user copy; Enter key submits OTP.
+  for (const domain404 of [
+    { code: "pr_not_found", expected: "Pull request was not found in the bound repository." },
+    { code: "repo_not_bound", expected: "Repository is not bound to this hosted workspace." },
+  ]) {
+    nextGateResponse = () => ({ status: 404, body: { error: { code: domain404.code, message: domain404.code } } });
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert((view.host.textContent ?? "").includes(domain404.expected), `stays on hosted gate for ${domain404.code}`));
+    assert(!view.host.querySelector('[data-review-verb="Approve change"]'), `does not fall back for domain 404 ${domain404.code}`);
+    assert(Boolean(btn(view.host, "Refresh gate")), `offers Refresh gate on domain 404 ${domain404.code}`);
+    await view.unmount();
+  }
+
+  nextGateResponse = () => ({ status: 403, body: { error: { code: "email_not_configured", message: "Owner email not configured." } } });
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert((view.host.textContent ?? "").includes("Owner verification email is not configured for this workspace."), "renders email_not_configured refusal"));
+    assert(!(view.host.textContent ?? "").includes("Only the board's owner can approve or publish."), "does not misclassify non-role 403 mentioning 'owner' as member_role");
+    await view.unmount();
+  }
+
+  stepUpVerifyStatus = 403;
+  nextGateResponse = () => ({ status: 200, body: makeCard("ready", { step_up_fresh: false }) });
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Send 6-digit code"), "renders Send 6-digit code"));
+    await click(btn(view.host, "Send 6-digit code"));
+    await settle(() => assert(view.host.querySelector('input[inputmode="numeric"]'), "renders OTP input"));
+    const otpInput = view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null;
+    await setInput(otpInput, "000000");
+    await React.act(async () => {
+      otpInput?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settle(() => assert((view.host.textContent ?? "").includes("That 6-digit code did not match. Check the email and try again."), "Enter key submits OTP and invalid_code maps clearly"));
+    await view.unmount();
+  }
+
+  stepUpVerifyStatus = 200;
+  nextGateResponse = () => ({ status: 200, body: makeCard("ready", { step_up_fresh: true }) });
+  nextMergeResponse = () => ({ status: 409, body: { error: { code: "gate_refused", message: "checks failing" } } });
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Approve & merge"), "renders Approve & merge for 409 test"));
+    await click(btn(view.host, "Approve & merge"));
+    await settle(() => assert((view.host.textContent ?? "").includes("Merge gate refused this pull request. Review the checks above and refresh the gate."), "maps 409 gate_refused cleanly"));
     await view.unmount();
   }
 

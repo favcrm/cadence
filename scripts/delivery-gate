@@ -3,6 +3,7 @@
 
     scripts/delivery-gate verify --repo R --pr N --head SHA --signers FILE --comments FILE
     scripts/delivery-gate queue-pr REF
+    scripts/delivery-gate sign --repo R --pr N --head SHA --key KEY   # bootstrap v1 only
     scripts/delivery-gate --self-test
 
 v2 (CAD-1946): the hosted Cadence board signs (repo, pr, head, evidence, verify)

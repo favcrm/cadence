@@ -504,6 +504,8 @@ fn valid_stub_reply(verb: &str) -> HttpReply {
             json!({
                 "state": "pass",
                 "ok": true,
+                "project": TEST_PROJECT,
+                "issue": TEST_ISSUE,
                 "repo": TEST_REPO,
                 "pr": TEST_PR,
                 "head": HEAD_A,
@@ -775,6 +777,8 @@ fn forged_http_200_receipts_for_delivery_enqueue_are_rejected_as_unknown() {
     let valid = json!({
         "state": "enqueued",
         "ok": true,
+        "project": TEST_PROJECT,
+        "issue": TEST_ISSUE,
         "repo": TEST_REPO,
         "pr": TEST_PR,
         "head": HEAD_A,
@@ -809,6 +813,26 @@ fn forged_http_200_receipts_for_delivery_enqueue_are_rejected_as_unknown() {
         ("ok=false", {
             let mut v = valid.clone();
             v["ok"] = json!(false);
+            v
+        }),
+        ("wrong project", {
+            let mut v = valid.clone();
+            v["project"] = json!("other-proj");
+            v
+        }),
+        ("missing project", {
+            let mut v = valid.clone();
+            v.as_object_mut().unwrap().remove("project");
+            v
+        }),
+        ("wrong issue", {
+            let mut v = valid.clone();
+            v["issue"] = json!("CAD-999");
+            v
+        }),
+        ("missing issue", {
+            let mut v = valid.clone();
+            v.as_object_mut().unwrap().remove("issue");
             v
         }),
         ("wrong repo", {
@@ -1057,23 +1081,71 @@ fn forged_http_200_receipts_for_scope_delegated_and_revoke_are_rejected_as_unkno
 
 #[test]
 fn forged_http_200_receipt_for_delivery_check_mismatch_is_rejected() {
+    let valid = json!({
+        "state": "pass",
+        "ok": true,
+        "project": TEST_PROJECT,
+        "issue": TEST_ISSUE,
+        "repo": TEST_REPO,
+        "pr": TEST_PR,
+        "head": HEAD_A,
+        "reasons": [],
+    });
+    call_with_single_reply(valid.clone(), |t| {
+        delivery_check(
+            t,
+            5,
+            Some(TEST_PROJECT),
+            Some(TEST_ISSUE),
+            TEST_REPO,
+            TEST_PR,
+            Some(HEAD_A),
+            false,
+        )
+        .map(|_| ())
+    })
+    .expect("baseline valid delivery_check receipt must succeed");
     for (label, payload) in [
-        (
-            "wrong repo",
-            json!({"state": "pass", "ok": true, "repo": "other/repo", "pr": TEST_PR, "head": HEAD_A, "reasons": []}),
-        ),
-        (
-            "wrong pr",
-            json!({"state": "pass", "ok": true, "repo": TEST_REPO, "pr": 999, "head": HEAD_A, "reasons": []}),
-        ),
-        (
-            "wrong head",
-            json!({"state": "pass", "ok": true, "repo": TEST_REPO, "pr": TEST_PR, "head": HEAD_B, "reasons": []}),
-        ),
-        (
-            "inconsistent state/ok",
-            json!({"state": "pass", "ok": false, "repo": TEST_REPO, "pr": TEST_PR, "head": HEAD_A, "reasons": []}),
-        ),
+        ("wrong project", {
+            let mut v = valid.clone();
+            v["project"] = json!("other-proj");
+            v
+        }),
+        ("missing project", {
+            let mut v = valid.clone();
+            v.as_object_mut().unwrap().remove("project");
+            v
+        }),
+        ("wrong issue", {
+            let mut v = valid.clone();
+            v["issue"] = json!("CAD-999");
+            v
+        }),
+        ("missing issue", {
+            let mut v = valid.clone();
+            v.as_object_mut().unwrap().remove("issue");
+            v
+        }),
+        ("wrong repo", {
+            let mut v = valid.clone();
+            v["repo"] = json!("other/repo");
+            v
+        }),
+        ("wrong pr", {
+            let mut v = valid.clone();
+            v["pr"] = json!(999);
+            v
+        }),
+        ("wrong head", {
+            let mut v = valid.clone();
+            v["head"] = json!(HEAD_B);
+            v
+        }),
+        ("inconsistent state/ok", {
+            let mut v = valid.clone();
+            v["ok"] = json!(false);
+            v
+        }),
     ] {
         let err = call_with_single_reply(payload, |t| {
             delivery_check(
@@ -1109,6 +1181,8 @@ fn delivery_check_refused_returns_nonzero_or_err() {
                 json!({
                     "state": "refused",
                     "ok": false,
+                    "project": TEST_PROJECT,
+                    "issue": TEST_ISSUE,
                     "repo": TEST_REPO,
                     "pr": TEST_PR,
                     "head": HEAD_A,
@@ -1121,6 +1195,8 @@ fn delivery_check_refused_returns_nonzero_or_err() {
                 json!({
                     "status": "refused",
                     "ok": false,
+                    "project": TEST_PROJECT,
+                    "issue": TEST_ISSUE,
                     "repo": TEST_REPO,
                     "pr": TEST_PR,
                     "head": HEAD_A,
@@ -1133,6 +1209,8 @@ fn delivery_check_refused_returns_nonzero_or_err() {
                 json!({
                     "state": "refused",
                     "ok": true,
+                    "project": TEST_PROJECT,
+                    "issue": TEST_ISSUE,
                     "repo": TEST_REPO,
                     "pr": TEST_PR,
                     "head": HEAD_A,

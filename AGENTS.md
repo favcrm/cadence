@@ -509,8 +509,10 @@ hosted workspace can run it. If the gate cannot run, stop and report the
 limitation; only an authorized operator can decide an exception.
 
 - Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>` (or pass
-  `--org <hosted-org> --project <key> --issue <ID>` on a hosted org so it acts as a
-  thin client delegating to `cadence delivery check` and `cadence delivery enqueue`). It
+  `--org <hosted-org>` or `CADENCE_ORG` with optional `--project <key>`,
+  `--issue <ID>`, and `--browser-qa <url> | --require-browser-qa` on a hosted
+  org so it delegates to `cadence delivery check` and `cadence delivery enqueue`;
+  `--exception` is refused on hosted orgs). It
   refuses unless the PR is open at that head, every required check is
   present and green, the required verdicts are pinned to the head, a ticket
   comment lists them and, for a `human` diff, an operator approval is

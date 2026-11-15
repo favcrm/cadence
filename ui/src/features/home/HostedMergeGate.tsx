@@ -14,10 +14,79 @@ import SafeLink from "../../ui/SafeLink";
 import { isolate } from "../decisions/stagedWrite";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import { prTarget } from "./ApproveHead";
-import { plainRefusal } from "./MergeForm";
 import { changeSize, type HomeNeed } from "./needs";
 
 const ROLE_RESTRICTED_CODES = new Set(["member_role", "owner_required", "approver_not_allowed"]);
+const UNSUPPORTED_404_CODES = new Set(["", "not_implemented", "unknown_route", "route_not_found"]);
+
+type TranslateFn = (key: string) => string;
+
+const GATE_REFUSAL_MESSAGES: Record<string, string> = {
+  invalid_code: "That 6-digit code did not match. Check the email and try again.",
+  expired_code: "That verification code has expired. Send a new code and try again.",
+  challenge_not_found: "Verification challenge expired or missing. Send a new 6-digit code.",
+  challenge_consumed: "That verification code was already used. Send a new code and try again.",
+  too_many_attempts: "Too many verification attempts. Wait a few minutes or send a new code.",
+  rate_limited: "Too many verification emails requested. Wait a moment before resending.",
+  step_up_required: "Email verification is required before approving and queuing this merge.",
+  email_delivery_unavailable: "Could not send the verification email right now. Try again shortly.",
+  email_not_configured: "Owner verification email is not configured for this workspace.",
+  no_verified_email: "Owner verification email is not configured for this workspace.",
+  member_role: "Only the board's owner can approve or publish.",
+  owner_required: "Only the board's owner can approve or publish.",
+  approver_not_allowed: "Only the board's owner can approve or publish.",
+  membership_changed: "Workspace membership changed. Refresh the gate and sign in again.",
+  board_session_required: "Sign in to the hosted board again to continue.",
+  origin_refused: "Request origin was refused. Reload this hosted board page and try again.",
+  project_not_authorized: "This project is not authorized on the hosted merge gate.",
+  project_policy_unavailable: "Project merge policy is unavailable. Check workspace policy setup and try again.",
+  head_moved: "Pull request updated — a new commit was pushed.",
+  request_conflict: "An approval request is already in flight or conflicted. Refresh the gate and retry.",
+  gate_refused: "Merge gate refused this pull request. Review the checks above and refresh the gate.",
+  already_approved: "This commit already has an approval recorded. Refresh the gate for current status.",
+  approval_revoked: "This approval was already revoked.",
+  already_revoked: "This approval was already revoked.",
+  scope_approval_required: "This pull request needs an active ticket scope approval before delegated merge.",
+  not_delegable: "This pull request touches paths that require direct owner approval.",
+  project_archived: "This project is archived and no longer accepts merge approvals.",
+  not_board_revocable: "This approval was not issued from the hosted board and cannot be revoked here.",
+  repo_not_bound: "Repository is not bound to this hosted workspace.",
+  issue_not_found: "Issue was not found on this hosted board.",
+  pr_not_found: "Pull request was not found in the bound repository.",
+  project_not_found: "Project was not found on this hosted workspace.",
+  not_found: "The requested approval or pull request record was not found.",
+  capability_unavailable: "Hosted merge service is temporarily unavailable. Try again shortly.",
+  unavailable: "Hosted merge service is temporarily unavailable. Try again shortly.",
+};
+
+function apiErrorCodes(err: ApiError): string[] {
+  return [err.check, err.code].filter((value): value is string => Boolean(value && value.trim()));
+}
+
+function hostedGateRefusal(err: unknown, t: TranslateFn): string {
+  if (err instanceof ApiError) {
+    for (const code of apiErrorCodes(err)) {
+      const mapped = GATE_REFUSAL_MESSAGES[code];
+      if (mapped) return t(mapped);
+    }
+    if (err.status === 401) return t("Sign in to the hosted board again to continue.");
+    if (err.status === 429) return t("Too many requests right now. Wait a moment and try again.");
+    if (err.status === 503) return t("Hosted merge service is temporarily unavailable. Try again shortly.");
+    const msg = err.message.trim();
+    if (msg && !/^\s*</.test(msg)) return msg;
+    return t("Hosted merge request was refused.");
+  }
+  if (err instanceof Error) {
+    const msg = err.message.trim();
+    if (msg && !/^\s*</.test(msg)) return msg;
+  }
+  return t("Hosted merge request failed.");
+}
+
+function primaryMergeLabel(otpPromptOpen: boolean, hasChallenge: boolean, t: TranslateFn): string {
+  if (!otpPromptOpen) return t("Approve & merge");
+  return hasChallenge ? t("Verify & merge") : t("Send 6-digit code");
+}
 
 const STAGE_STEPS = [
   { key: "checks", label: "Checks" },
@@ -86,6 +155,7 @@ export function useHostedMergeGate(params: {
   issue?: string | null;
   project?: string | null;
 }): HostedMergeGateState {
+  const t = useTranslate();
   const target = params.enabled ? prTarget(params.pr) : null;
   const repo = target?.repo ?? null;
   const prNumber = target?.number ?? null;
@@ -146,9 +216,12 @@ export function useHostedMergeGate(params: {
       } catch (err) {
         if (!mountedRef.current || seq !== seqRef.current) return null;
         if (err instanceof ApiError) {
+          const codes = apiErrorCodes(err);
           const isUnsupported =
             err.status === 501 ||
-            (err.status === 404 && err.code !== "repo_not_bound" && err.code !== "issue_not_found");
+            (err.status === 404 &&
+              !(err.check ?? "").trim() &&
+              UNSUPPORTED_404_CODES.has((err.code ?? "").trim()));
           if (isUnsupported) {
             setSupported(false);
             setLoading(false);
@@ -157,7 +230,7 @@ export function useHostedMergeGate(params: {
             setLoadError(null);
             return null;
           }
-          if (err.status === 403 && (ROLE_RESTRICTED_CODES.has(err.code ?? "") || /owner/i.test(err.message))) {
+          if (err.status === 403 && codes.some((code) => ROLE_RESTRICTED_CODES.has(code))) {
             setSupported(true);
             setLoading(false);
             setCard(null);
@@ -169,11 +242,11 @@ export function useHostedMergeGate(params: {
         setSupported(true);
         setLoading(false);
         setMemberRestricted(false);
-        setLoadError(plainRefusal(err));
+        setLoadError(hostedGateRefusal(err, t));
         return null;
       }
     },
-    [params.enabled, repo, prNumber, issue, project, head],
+    [params.enabled, repo, prNumber, issue, project, head, t],
   );
 
   useEffect(() => {
@@ -377,11 +450,11 @@ export function useHostedGateActions(params: {
       setReactiveOtpOpen(true);
       setOtpCodeState("");
     } catch (err) {
-      setError(plainRefusal(err));
+      setError(hostedGateRefusal(err, t));
     } finally {
       setBusy(null);
     }
-  }, [block, busy]);
+  }, [block, busy, t]);
 
   const performMerge = useCallback(async () => {
     if (!card || block) return;
@@ -411,7 +484,7 @@ export function useHostedGateActions(params: {
           setChallenge(next);
           setOtpCodeState("");
         } catch (sendErr) {
-          setError(plainRefusal(sendErr));
+          setError(hostedGateRefusal(sendErr, t));
         }
         return;
       }
@@ -420,11 +493,11 @@ export function useHostedGateActions(params: {
         setChallenge(null);
         setReactiveOtpOpen(false);
         setOtpCodeState("");
-        setError(t("Pull request updated — a new commit was pushed."));
+        setError(hostedGateRefusal(err, t));
         await gate.refresh();
         return;
       }
-      setError(plainRefusal(err));
+      setError(hostedGateRefusal(err, t));
     }
   }, [card, block, getRequestId, gate, t]);
 
@@ -458,7 +531,7 @@ export function useHostedGateActions(params: {
       await api.verifyApprovalStepUp(challenge.challenge_id, clean);
       await performMerge();
     } catch (err) {
-      setError(plainRefusal(err));
+      setError(hostedGateRefusal(err, t));
     } finally {
       setBusy(null);
     }
@@ -483,7 +556,7 @@ export function useHostedGateActions(params: {
         if (card.issue) void resources.issue(card.issue).refresh();
         await gate.refresh();
       } catch (err) {
-        setError(plainRefusal(err));
+        setError(hostedGateRefusal(err, t));
       } finally {
         setBusy(null);
       }
@@ -516,7 +589,7 @@ export function useHostedGateActions(params: {
         );
         await gate.refresh();
       } catch (err) {
-        setError(plainRefusal(err));
+        setError(hostedGateRefusal(err, t));
       } finally {
         setBusy(null);
       }
@@ -613,7 +686,7 @@ export function HostedGateBody({
         )}
       </div>
 
-      <p className="rv-gate-headline">{card.headline}</p>
+      <p className="rv-gate-headline"><bdi>{isolate(card.headline)}</bdi></p>
 
       <ol className="rv-gate-stepper" aria-label={t("Merge gate progress")}>
         {STAGE_STEPS.map((step, idx) => {
@@ -655,8 +728,8 @@ export function HostedGateBody({
                   {CHECKLIST_GLYPH[item.status]}
                 </span>
                 <div className="rv-gate-check-body">
-                  <div className="rv-gate-check-label">{item.label}</div>
-                  {item.summary && <div className="rv-gate-check-summary">{item.summary}</div>}
+                  <div className="rv-gate-check-label"><bdi>{isolate(item.label)}</bdi></div>
+                  {item.summary && <div className="rv-gate-check-summary"><bdi>{isolate(item.summary)}</bdi></div>}
                 </div>
               </li>
             ))}
@@ -681,21 +754,9 @@ export function HostedGateBody({
         <div className="rv-gate-otp" aria-label={t("Email verification")}>
           <h4 className="rv-h mt-0">{t("Email verification")}</h4>
           {!actions.challenge ? (
-            <>
-              <p className="rv-note m-0">
-                {t("Verify with a 6-digit email code before approving and queuing this merge.")}
-              </p>
-              <div className="rv-gate-otp-actions">
-                <Button
-                  size="sm"
-                  loading={actions.busy === "send_code"}
-                  disabled={actions.busy !== null || readOnly}
-                  onClick={() => void actions.sendCode()}
-                >
-                  {t("Send 6-digit code")}
-                </Button>
-              </div>
-            </>
+            <p className="rv-note m-0">
+              {t("Verify with a 6-digit email code before approving and queuing this merge.")}
+            </p>
           ) : (
             <>
               <p className="rv-note m-0">
@@ -713,8 +774,20 @@ export function HostedGateBody({
                   className="field rv-gate-otp-input num"
                   aria-label={t("6-digit verification code")}
                   placeholder="000000"
+                  disabled={actions.busy !== null || readOnly}
                   value={actions.otpCode}
                   onChange={(e) => actions.setOtpCode(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (
+                      e.key === "Enter" &&
+                      actions.otpCode.length === 6 &&
+                      actions.busy === null &&
+                      !readOnly
+                    ) {
+                      e.preventDefault();
+                      void actions.verifyAndMerge();
+                    }
+                  }}
                 />
                 <Button
                   size="sm"
@@ -756,7 +829,7 @@ export function HostedGateBody({
             <Button
               variant="primary"
               size="sm"
-              loading={actions.busy === "merge" || actions.busy === "verify_merge"}
+              loading={actions.busy === "merge" || actions.busy === "verify_merge" || actions.busy === "send_code"}
               disabled={
                 actions.busy !== null ||
                 (actions.otpPromptOpen && Boolean(actions.challenge) && actions.otpCode.length !== 6)
@@ -767,11 +840,7 @@ export function HostedGateBody({
                   : actions.mergeWithFreshSession())
               }
             >
-              {actions.otpPromptOpen
-                ? actions.challenge
-                  ? t("Verify & merge")
-                  : t("Approve & merge")
-                : t("Approve & merge")}
+              {primaryMergeLabel(actions.otpPromptOpen, Boolean(actions.challenge), t)}
             </Button>
           )}
           {card.can_send_back && !readOnly && (
@@ -918,7 +987,7 @@ export function HostedMergeGate({
               : actions.mergeWithFreshSession())
           }
         >
-          {needsCodeEntry ? t("Verify & merge") : t("Approve & merge")}
+          {primaryMergeLabel(actions.otpPromptOpen, Boolean(actions.challenge), t)}
         </Button>
       );
     }

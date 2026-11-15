@@ -2465,26 +2465,43 @@ def self_test():
         os.chmod(fake_cadence, os.stat(fake_cadence).st_mode | stat.S_IXUSR)
         old_cwd = os.getcwd()
         old_bin = os.environ.get("CADENCE_BIN")
+        old_org = os.environ.get("CADENCE_ORG")
         old_mode = os.environ.get("TEST_ORG_MODE")
         old_gate = os.environ.get("TEST_GATE")
         old_enq = os.environ.get("TEST_ENQUEUE")
         try:
             os.chdir(tmp)
             os.environ["CADENCE_BIN"] = fake_cadence
+            os.environ.pop("CADENCE_ORG", None)
             os.environ["TEST_ORG_MODE"] = "remote"
             os.environ["TEST_GATE"] = "pass"
             os.environ["TEST_ENQUEUE"] = "ok"
             rc_dry = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
             rc_enq = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--head", "a" * 40])
+            rc_exc = main([
+                "7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--head", "a" * 40,
+                "--exception", "--advisory", "standards=https://example/1",
+                "--advisory", "spec-security=https://example/2", "--dry-run",
+            ])
+            os.environ["CADENCE_ORG"] = "fav-limited"
+            open(calls_log, "w", encoding="utf-8").close()
+            rc_env_qa = main(["7", "--repo", "favcrm/cadence", "--require-browser-qa", "--dry-run"])
+            env_calls = [json.loads(line) for line in open(calls_log, encoding="utf-8") if line.strip()]
+            saw_env_qa = any("--org" in c and "fav-limited" in c and "--browser-qa" in c for c in env_calls)
+            os.environ.pop("CADENCE_ORG", None)
             os.environ["TEST_GATE"] = "refused"
             rc_ref = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
             os.environ["TEST_ORG_MODE"] = "broken"
             rc_brk = main(["7", "--org", "bad-org", "--repo", "favcrm/cadence", "--dry-run"])
-            ok_hosted = rc_dry == 0 and rc_enq == 0 and rc_ref == 1 and rc_brk == 1
+            ok_hosted = (
+                rc_dry == 0 and rc_enq == 0 and rc_exc == 1
+                and rc_env_qa == 0 and saw_env_qa and rc_ref == 1 and rc_brk == 1
+            )
         finally:
             os.chdir(old_cwd)
-            for k, v in [("CADENCE_BIN", old_bin), ("TEST_ORG_MODE", old_mode),
-                         ("TEST_GATE", old_gate), ("TEST_ENQUEUE", old_enq)]:
+            for k, v in [("CADENCE_BIN", old_bin), ("CADENCE_ORG", old_org),
+                         ("TEST_ORG_MODE", old_mode), ("TEST_GATE", old_gate),
+                         ("TEST_ENQUEUE", old_enq)]:
                 if v is None:
                     os.environ.pop(k, None)
                 else:
@@ -2565,39 +2582,33 @@ def check_gate_copy(dry_run):
 
 
 def hosted_org_mode(org_arg):
-    """Detect whether the target Cadence org is remote via `cadence org inspect`."""
+    """Detect whether an explicitly selected Cadence org (`--org` or `CADENCE_ORG`)
+    is remote via `cadence --org <org> org inspect`, failing closed on any error."""
     explicit_org = (org_arg or os.environ.get("CADENCE_ORG") or "").strip() or None
-    cmd = ["cadence"]
-    if explicit_org:
-        cmd += ["--org", explicit_org]
-    cmd += ["org", "inspect"]
-    rc, out, err = run(cmd)
-    if rc != 0:
-        if explicit_org:
-            detail = err.strip() or out.strip() or f"exit {rc}"
-            return "error", None, f"cannot inspect hosted org {explicit_org}: {detail}"
+    if not explicit_org:
         return "local", None, None
+    rc, out, err = run(["cadence", "--org", explicit_org, "org", "inspect"])
+    if rc != 0:
+        detail = err.strip() or out.strip() or f"exit {rc}"
+        return "error", None, f"cannot inspect hosted org {explicit_org}: {detail}"
     try:
         doc = json.loads(out)
     except ValueError as e:
-        if explicit_org:
-            return "error", None, f"cadence org inspect returned invalid JSON: {e}"
-        return "local", None, None
-    dest = doc.get("destination") if isinstance(doc, dict) else None
-    mode = dest.get("mode") if isinstance(dest, dict) else (doc.get("mode") if isinstance(doc, dict) else None)
-    if mode == "remote":
-        return "remote", doc, None
-    if mode == "local":
-        return "local", doc, None
-    if explicit_org:
-        return "error", None, f"cadence org inspect reported unknown mode {mode!r}"
-    return "local", doc, None
+        return "error", None, f"cadence org inspect returned invalid JSON: {e}"
+    if not isinstance(doc, dict):
+        return "error", None, "cadence org inspect returned non-object JSON"
+    dest = doc.get("destination")
+    mode = dest.get("mode") if isinstance(dest, dict) else doc.get("mode")
+    if mode in ("remote", "local"):
+        return mode, doc, None
+    return "error", None, f"cadence org inspect reported unknown mode {mode!r}"
 
 
 def _run_hosted_check(args, repo):
+    explicit_org = (args.org or os.environ.get("CADENCE_ORG") or "").strip() or None
     cmd = ["cadence"]
-    if args.org:
-        cmd += ["--org", args.org]
+    if explicit_org:
+        cmd += ["--org", explicit_org]
     cmd += ["delivery", "check", "--repo", repo, "--pr", str(args.pr)]
     if args.head:
         cmd += ["--head", args.head]
@@ -2605,7 +2616,7 @@ def _run_hosted_check(args, repo):
         cmd += ["--issue", args.issue]
     if args.project:
         cmd += ["--project", args.project]
-    if args.browser_qa:
+    if args.browser_qa or args.require_browser_qa:
         cmd.append("--browser-qa")
     rc, out, err = run(cmd)
     try:
@@ -2618,18 +2629,24 @@ def _run_hosted_check(args, repo):
 def run_hosted_gate(args, repo):
     """Thin hosted client: evaluate or approve+enqueue on the remote Cadence board."""
     head = args.head
+    explicit_org = (args.org or os.environ.get("CADENCE_ORG") or "").strip() or None
     if args.dry_run or not head:
         rc, out, err, doc = _run_hosted_check(args, repo)
         if args.dry_run:
             if isinstance(doc, dict):
-                checked_head = doc.get("head") or head or "?"
+                checked_head = str(doc.get("head") or head or "").lower()
                 cls = doc.get("delivery_class")
                 kind = doc.get("approval_kind")
-                if rc == 0 and doc.get("ok") is True:
+                reasons = list(doc.get("reasons")) if isinstance(doc.get("reasons"), list) else []
+                if args.browser_qa:
+                    if not FULL_SHA.match(checked_head):
+                        reasons.append("cannot verify --browser-qa without a resolved 40-hex PR head")
+                    else:
+                        reasons.extend(browser_qa_comment_reasons(args.browser_qa, repo, args.pr, checked_head))
+                if rc == 0 and doc.get("ok") is True and not reasons:
                     print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {checked_head}"
                           f" (class={cls}, approval={kind}); nothing enqueued")
                     return 0
-                reasons = doc.get("reasons") if isinstance(doc.get("reasons"), list) else []
                 for r in reasons:
                     print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
                 if not reasons:
@@ -2649,15 +2666,22 @@ def run_hosted_gate(args, repo):
             return 1
         head = doc["head"].lower()
 
+    if args.browser_qa:
+        qa_reasons = browser_qa_comment_reasons(args.browser_qa, repo, args.pr, head)
+        if qa_reasons:
+            for r in qa_reasons:
+                print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+            return 1
+
     cmd = ["cadence"]
-    if args.org:
-        cmd += ["--org", args.org]
+    if explicit_org:
+        cmd += ["--org", explicit_org]
     cmd += ["delivery", "enqueue", "--repo", repo, "--pr", str(args.pr), "--head", head]
     if args.issue:
         cmd += ["--issue", args.issue]
     if args.project:
         cmd += ["--project", args.project]
-    if args.browser_qa:
+    if args.browser_qa or args.require_browser_qa:
         cmd.append("--browser-qa")
     rc, out, err = run(cmd)
     if rc == 0:
@@ -2696,8 +2720,10 @@ def main(argv):
                     help="CAD-1946: waive only the missing reviewer attestation; needs --advisory")
     ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
                     help="a separate advisory review: standards, spec-security or browser-qa")
-    ap.add_argument("--browser-qa", nargs="?", const="required", metavar="URL",
+    ap.add_argument("--browser-qa", metavar="URL",
                     help="a ui/ change on a hosted org: the PR comment recording its Browser QA")
+    ap.add_argument("--require-browser-qa", action="store_true",
+                    help="force hosted delivery check/enqueue to require Browser QA")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
@@ -2708,7 +2734,7 @@ def main(argv):
     if len(args.advisory) != len(pairs) or (pairs and not args.exception):
         print(f"{ME}: --advisory takes one KIND=URL per kind, with --exception", file=sys.stderr)
         return 2
-    if args.browser_qa and args.exception:
+    if (args.browser_qa or args.require_browser_qa) and args.exception:
         print(f"{ME}: --browser-qa and --exception are separate routes", file=sys.stderr)
         return 2
     if args.pr < 1 or (args.head is not None and not FULL_SHA.match(args.head)):
@@ -2725,7 +2751,10 @@ def main(argv):
     if org_err:
         print(f"{ME}: refused: {shown(org_err)}", file=sys.stderr)
         return 1
-    if org_mode == "remote" and not args.exception:
+    if org_mode == "remote":
+        if args.exception:
+            print(f"{ME}: refused: --exception is not supported on hosted orgs", file=sys.stderr)
+            return 1
         repo = args.repo
         try:
             if not repo:
@@ -2738,8 +2767,11 @@ def main(argv):
             print(f"{ME}: refused: cannot read the PR: {shown(str(e))}", file=sys.stderr)
             return 1
 
+    if args.require_browser_qa:
+        print(f"{ME}: --require-browser-qa applies only on a hosted org", file=sys.stderr)
+        return 2
     if not args.head:
-        print(f"{ME}: --head is required", file=sys.stderr)
+        print(f"{ME}: --head is required (unless --org <hosted-org> or CADENCE_ORG selects a remote org)", file=sys.stderr)
         return 2
     repo = args.repo
     try:
