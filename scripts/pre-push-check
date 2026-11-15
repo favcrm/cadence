@@ -2,9 +2,10 @@
 # CAD-2307: run this worktree's pre-push hook for the current HEAD before
 # `git push`, so the long compile happens in your shell instead of inside the
 # push. GitHub drops an SSH push whose hook runs for minutes (rc=141). The hook
-# records an rc=0 receipt for this head; the push's own hook run sees it on a
-# clean tree and returns at once. Any other result (failure, edited tree, a new
-# commit) leaves the plan to run again.
+# records an rc=0 `tree=clean` receipt for this head; the push's own hook run
+# sees it on a clean tree and returns at once. Any other result (failure, edited
+# tree, a new commit) leaves the plan to run again. A dirty tree is refused
+# here: a pass over uncommitted edits says nothing about the commit.
 #
 #   scripts/pre-push-check [<remote-ref>]    # default refs/heads/<current branch>
 #
@@ -19,8 +20,20 @@ hook="${hooks:-$(git rev-parse --git-path hooks)}/pre-push"
     echo "pre-push-check: no pre-push hook at $hook; run scripts/boat-build --receipt -- scripts/pre-push --base origin/main" >&2
     exit 1
 }
+[ -z "$(git status --porcelain)" ] || {
+    echo "pre-push-check: the working tree has uncommitted or untracked files; commit or remove them so the pass describes the commit" >&2
+    exit 1
+}
 head=$(git rev-parse HEAD)
-ref=${1:-refs/heads/$(git symbolic-ref --short HEAD)}
+if [ -n "${1:-}" ]; then
+    ref=$1
+else
+    branch=$(git symbolic-ref --short -q HEAD) || {
+        echo "pre-push-check: detached HEAD; pass the remote ref, e.g. scripts/pre-push-check refs/heads/<branch>" >&2
+        exit 1
+    }
+    ref=refs/heads/$branch
+fi
 exec "$hook" origin "" <<IN
 $ref $head $ref 0000000000000000000000000000000000000000
 IN

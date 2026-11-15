@@ -56,25 +56,87 @@ def root_mod_prefixes(base, head):
     return [f"daemon::tests::{m}::" for m in re.findall(r"^\+\s*mod (\w+);", diff, re.M)]
 
 
+def mask(text):
+    """`text` with string, char and comment contents blanked (newlines kept).
+
+    Braces, `;` and item keywords inside a raw string, a string, a char literal
+    or a comment must not move the scanner. Handles r"..", r#".."#, any `#`
+    count, b/c prefixes, escapes, lifetimes (not char literals) and nested
+    block comments.
+    """
+    out, i, n = [], 0, len(text)
+
+    def blank(chunk):
+        return "".join(c if c == "\n" else " " for c in chunk)
+
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(blank(text[i:j]))
+            i = j
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(blank(text[i:j]))
+            i = j
+        else:
+            m = re.compile(r'(?:b|c)?r(#*)"').match(text, i) if c in "rbc" else None
+            prev_ident = i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+            if m and not prev_ident:
+                close = '"' + m.group(1)
+                j = text.find(close, m.end())
+                j = n if j < 0 else j + len(close)
+                out.append(blank(text[i:j]))
+                i = j
+            elif c == '"' or (c in "bc" and text.startswith('"', i + 1) and not prev_ident):
+                j = i + (2 if c != '"' else 1)
+                while j < n and text[j] != '"':
+                    j += 2 if text[j] == "\\" else 1
+                j = min(j + 1, n)
+                out.append(blank(text[i:j]))
+                i = j
+            elif c == "'":
+                m = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^\\'])'").match(text, i)
+                if m:
+                    out.append(blank(m.group(0)))
+                    i = m.end()
+                else:  # a lifetime or label
+                    out.append(c)
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+    return "".join(out)
+
+
 def suite_spans(text):
     """[(start, end, kind, qualified name, is_test)] for fns and mods, 1-based.
 
-    CI runs rustfmt, so an item's closing brace sits at its own indentation;
-    that delimits a span without parsing Rust. A span starts at the first
-    attribute or comment line directly above the item.
+    Items are delimited by brace depth over the masked text, so braces in
+    strings and comments cannot desync it. An item ends at the `}` that closes
+    its first `{`, or at a `;` reached before any `{` (a bodyless fn). A span
+    starts at the first attribute or comment line directly above the item.
     """
     lines = text.splitlines()
-    spans, stack = [], []
-    above = None
-    for i, line in enumerate(lines, 1):
-        s = line.strip()
-        indent = len(line) - len(line.lstrip())
+    masked = mask(text).splitlines()
+    spans, stack, depth, above = [], [], 0, None
+    item_re = re.compile(
+        r"(?:pub(?:\([\w:]+\))? )?(?:(mod) (\w+)\b|(?:const )?(?:async )?(?:unsafe )?(fn) (\w+))"
+    )
+    for i, (orig, line) in enumerate(zip(lines, masked), 1):
+        s = orig.strip()
         if s.startswith(("#[", "//")):
             above = above or i
             continue
-        item = re.match(
-            r"(?:pub(?:\([\w:]+\))? )?(?:(mod) (\w+) \{$|(?:async )?(?:unsafe )?(fn) (\w+))", s
-        )
+        item = item_re.match(line.strip())
         if item:
             kind = item.group(1) or item.group(3)
             name = item.group(2) or item.group(4)
@@ -82,12 +144,23 @@ def suite_spans(text):
             is_test = any(
                 re.match(r"#\[(?:\w+::)?test\b", lines[j - 1].strip()) for j in range(start, i)
             )
-            mods = [x[3].rsplit("::", 1)[-1] for x in stack if x[1] == "mod"]
-            stack.append((start, kind, indent, "::".join(mods + [name]), is_test))
-        elif s == "}" and stack and stack[-1][2] == indent:
-            start, kind, _, qual, is_test = stack.pop()
-            spans.append((start, i, kind, qual, is_test))
+            mods = [x["name"].rsplit("::", 1)[-1] for x in stack if x["kind"] == "mod"]
+            stack.append(dict(start=start, kind=kind, name="::".join(mods + [name]),
+                              is_test=is_test, base=depth, opened=False))
         above = None
+        for ch in line:
+            if ch == "{":
+                depth += 1
+                if stack and not stack[-1]["opened"] and depth == stack[-1]["base"] + 1:
+                    stack[-1]["opened"] = True
+            elif ch == "}":
+                depth -= 1
+                if stack and stack[-1]["opened"] and depth == stack[-1]["base"]:
+                    it = stack.pop()
+                    spans.append((it["start"], i, it["kind"], it["name"], it["is_test"]))
+            elif ch == ";" and stack and not stack[-1]["opened"] and depth == stack[-1]["base"]:
+                it = stack.pop()
+                spans.append((it["start"], i, it["kind"], it["name"], it["is_test"]))
     return spans
 
 

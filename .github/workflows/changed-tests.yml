@@ -7,16 +7,22 @@
 #
 # Selection is scripts/changed-test-filter (a nextest filterset from the diff).
 # A PR that touches no such file reports success after the cheap select step;
-# the build and run steps are skipped, so the check name always reports and is
-# safe to mark required. Marking it required is an operator ruleset action.
+# the build and run steps are skipped. On merge_group (the queue ci.yml also
+# runs on) every step is skipped and the job reports success at once: the PR
+# already ran this on its own head, and the queue's integration proof is ci.yml.
+# The job always reports a conclusion on both events, so a required check on it
+# would not hang a PR or the queue. Marking it required is an operator ruleset
+# action.
 name: changed-tests
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
-  group: changed-tests-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: changed-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -32,12 +38,14 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ github.event_name == 'pull_request' }}
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Select the changed tests
         id: select
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
