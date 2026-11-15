@@ -889,12 +889,12 @@ kickoff's `.bind` file, for at most 15 minutes; there is no refresh token, so
 renewal is another mint, and the file goes when the assignment ends.
 
 Stays on the member's login: claim, daemon reports and `agent report`; every
-wiki action; `artifact put`; the audit verdicts (`audit_verdict`,
-`audit_verdict_project`); and `artifact submit` (`document_submit`, CAD-2286).
-Submit is an exception to the agent-credential default, by operator decision
-on 2026-11-15: the board lets only a file's creator submit it, judged by the
-subject that saved the file, and `artifact put` saves on the member's login.
-`artifact types` rides the agent credential like any other read. Not available to a managed agent session at all:
+wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
+`audit_verdict_project`). `artifact types` and `artifact submit` (CAD-2286)
+ride the agent credential like the other verbs. The credential carries the
+member's own subject, so the board's creator check still admits the member's
+files, and a reader or reviewer assignment's submit is refused by the board's
+read-only guard. Not available to a managed agent session at all:
 `settings agents`, `master status` and `master resume`. They always refuse —
 owner-class settings authority is never delegated — and the refusal names the
 operator's plain shell and the grant-bound local path.

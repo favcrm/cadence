@@ -8,8 +8,7 @@
 //!
 //! What moves and what does not:
 //! - Every hosted CLI verb the managed session sends rides the credential,
-//!   except [`stays_on_login`] (wiki, the audit verdicts and, by operator
-//!   decision 2026-11-15, `document_submit`, CAD-2286). `issue review`
+//!   except [`stays_on_login`] (wiki and the audit verdicts). `issue review`
 //!   rides the credential: its author check compares the reviewer with an
 //!   artifact's author, and `issue attach` is recorded as the agent. That is an allowlist of what
 //!   keeps the login, so a verb added later defaults to the restricted bearer.
@@ -133,17 +132,9 @@ pub fn bound_session() -> Option<Arc<AgentSlot>> {
 }
 
 /// Wiki traffic and verdicts keep the member's login (operator decision,
-/// AOS-502). So does `document_submit` (CAD-2286, operator decision
-/// 2026-11-15): the board admits only the file's creator, judged by the
-/// subject that saved it, and `artifact put` saves on the login. An exception
-/// to the restricted-credential default. An allowlist: anything not named
-/// here uses the agent credential.
+/// AOS-502). An allowlist: anything not named here uses the agent credential.
 pub(super) fn stays_on_login(surface: Surface, verb: &str) -> bool {
-    matches!(surface, Surface::Wiki)
-        || matches!(
-            verb,
-            "audit_verdict" | "audit_verdict_project" | "document_submit"
-        )
+    matches!(surface, Surface::Wiki) || matches!(verb, "audit_verdict" | "audit_verdict_project")
 }
 
 /// Whether this call is sent on the agent credential at all.

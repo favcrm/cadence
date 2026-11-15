@@ -17728,6 +17728,8 @@ mod cad2286_document_acceptance {
             (409, "document_archived"),
             // A 404 after a successful probe is the file, never the lifecycle.
             (404, "not_found"),
+            // A server that answers the probe but predates the submit.
+            (501, "not_implemented"),
         ] {
             let board = Board::new(vec![(200, types()), (status, refusal(code))]);
             let output = board.run(&["submit", FILE_ID]);

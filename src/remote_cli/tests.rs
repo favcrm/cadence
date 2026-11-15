@@ -5777,19 +5777,19 @@ mod cad2286_document {
         assert!(!mutating_cli_verb("document_types"));
         assert!(mutating_cli_verb("document_submit"));
         // No correlated receipt: a repeated submit answers the current stage,
-        // so a lost answer sends the caller to the read and the repeat.
+        // so a lost answer sends the caller back to the same command.
         let note = lost_mutation_note("document_submit");
-        assert!(note.contains("artifact types"), "{note}");
-        assert!(note.contains("artifact submit"), "{note}");
+        assert!(note.contains("repeat `artifact submit <id>`"), "{note}");
         assert!(note.contains("current stage"), "{note}");
+        assert!(note.contains("does not submit it twice"), "{note}");
     }
 
     #[test]
-    fn document_submit_stays_on_the_login_and_document_types_does_not() {
-        // Operator decision 2026-11-15: the creator check needs the subject
-        // that saved the file, which is the member's login.
+    fn document_verbs_ride_the_agent_credential() {
+        // Operator decision 2026-11-15: the credential carries the member's
+        // subject, so neither verb is an exception to the default.
         use super::super::agent_credential::stays_on_login;
-        assert!(stays_on_login(Surface::Cli, "document_submit"));
+        assert!(!stays_on_login(Surface::Cli, "document_submit"));
         assert!(!stays_on_login(Surface::Cli, "document_types"));
     }
 
@@ -5819,15 +5819,17 @@ mod cad2286_document {
 
     #[test]
     fn document_types_unavailable_answers_are_typed_and_never_an_outage() {
-        for (status, code) in [
+        const OLDER: &str = "the workspace's server is older than this command";
+        const OFF: &str = "document review is turned off on this workspace";
+        for (status, code, cause) in [
             // A tenant without the verb.
-            (501u16, "not_implemented"),
+            (501u16, "not_implemented", OLDER),
             // The lifecycle flag is off.
-            (404, "not_found"),
+            (404, "not_found", OFF),
             // A relay older than the verb: `document_types` takes no
             // arguments, so the refusal can only be the name.
-            (400, "invalid_request"),
-            (400, "unknown_verb"),
+            (400, "invalid_request", OLDER),
+            (400, "unknown_verb", OLDER),
         ] {
             let (out, requests) = run(
                 vec![(status, "", refusal(code))],
@@ -5847,6 +5849,7 @@ mod cad2286_document {
                 shown.contains("document lifecycle is not available on this workspace"),
                 "{shown}"
             );
+            assert!(shown.contains(cause), "{status} {code}: {shown}");
             assert!(!shown.contains("retry"), "{status} {code}: {shown}");
             assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
         }
@@ -5887,6 +5890,30 @@ mod cad2286_document {
     }
 
     #[test]
+    fn a_tenant_without_document_submit_is_named_and_is_not_an_outage() {
+        // After a successful probe a 501 can only be a server that serves the
+        // type list but not the submit: name the release order, as the
+        // ticket-message verbs do.
+        let (out, requests) = run(
+            vec![(501, "", refusal("not_implemented"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some("not_implemented"), "{err}");
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("`artifact submit`"), "{shown}");
+        assert!(shown.contains("update the tenant server first"), "{shown}");
+        assert!(shown.contains("Nothing was submitted"), "{shown}");
+        for outage in ["unavailable", "retry"] {
+            assert!(!shown.contains(outage), "reads as an outage: {shown}");
+        }
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+    }
+
+    #[test]
     fn document_submit_answers_the_stage_and_a_lost_answer_is_unknown() {
         let stage = json!({"stage": "submitted", "type": "quotation", "typeConfirmed": true});
         let (out, requests) = run(
@@ -5916,7 +5943,10 @@ mod cad2286_document {
         );
         let err = out.unwrap_err();
         assert_eq!(err.kind(), "unknown", "{err}");
-        assert!(err.to_string().contains("artifact types"), "{err}");
+        assert!(
+            err.to_string().contains("repeat `artifact submit <id>`"),
+            "{err}"
+        );
     }
 
     fn minted_scopes(requests: &[Value]) -> Vec<String> {
@@ -8292,26 +8322,67 @@ mod agent_credential_acceptance {
         assert!(s.lines().is_empty());
     }
 
-    // CAD-2286, operator decision 2026-11-15: the creator check compares the
-    // caller with the subject that saved the file, so a managed submit keeps
-    // the member's login. The type list is an ordinary read on the credential.
+    impl Session {
+        /// The real `artifact submit` order: the type-list probe, then the submit.
+        fn submit_document(&self) -> Result<Value> {
+            super::super::submit_document_in(
+                &self.target,
+                "art-x",
+                Instant::now() + Duration::from_secs(10),
+                10,
+                &self.dir,
+                Some(&self.slot),
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+        }
+
+        fn verbs(&self) -> Vec<Value> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|req| req.path.ends_with("/cli/call"))
+                .map(|req| req.body["verb"].clone())
+                .collect()
+        }
+    }
+
+    // CAD-2286, operator decision 2026-11-15: the credential carries the
+    // member's subject, so the creator check admits the member's files on it,
+    // and a reader or reviewer session's submit meets the board's read-only
+    // guard. Both the probe and the submit ride the agent credential.
     #[test]
-    fn a_managed_document_submit_stays_on_the_login_and_document_types_rides_the_credential() {
+    fn a_managed_artifact_submit_probes_and_submits_on_the_agent_credential() {
         let s = session(board(), 5);
-        s.send(true, "document_submit", json!({"id": "art-x"}))
-            .unwrap();
-        s.send(true, "document_types", json!({})).unwrap();
+        s.submit_document().unwrap();
         assert_eq!(
             s.trail(),
             vec![
-                step("authorize", "login"),
-                step("call", "login"),
                 step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
                 step("authorize", "agent"),
                 step("call", "agent"),
             ]
         );
+        assert_eq!(
+            s.verbs(),
+            vec![json!("document_types"), json!("document_submit")]
+        );
         assert!(s.lines().is_empty(), "{:?}", s.lines());
+    }
+
+    // A failed mint never falls back to the member's wider login: the probe is
+    // refused, so no submit is ever sent.
+    #[test]
+    fn a_failed_mint_refuses_artifact_submit_before_anything_is_submitted() {
+        let mut b = board();
+        b.mint = (403, json!({"ok": false, "code": "forbidden"}));
+        let s = session(b, 1);
+        s.submit_document().unwrap_err();
+        assert_eq!(s.trail(), vec![step("agent-credential", "login")]);
+        assert!(s.verbs().is_empty());
     }
 
     // The board's own `issued_at` bounds the lifetime; a slow mint (the client

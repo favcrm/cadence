@@ -1937,28 +1937,17 @@ fn artifact(
             print_json(&read("document_types", serde_json::Map::new())?);
             Ok(0)
         }
+        // The probe, the submit and the probe-then-submit race are in
+        // `remote_cli::submit_document`.
         ArtifactAction::Submit { id } => {
-            // Probe first, so an unavailable lifecycle is named as such and a
-            // 404 from the submit itself can only mean the file.
-            read("document_types", serde_json::Map::new())?;
-            let mut args = serde_json::Map::new();
-            args.insert("id".into(), json!(id));
-            match call_verb(
+            print_json(&cadence_agent::remote_cli::submit_document(
                 target,
-                "document_submit",
-                args,
+                id,
                 deadline,
                 wake_timeout,
                 eprint_line,
-            )? {
-                RemoteAnswer::Ok(body) => {
-                    print_json(&body);
-                    Ok(0)
-                }
-                RemoteAnswer::Conflict(_) => Err(Error::rejected(
-                    "remote submit answered a conflict; nothing was submitted",
-                )),
-            }
+            )?);
+            Ok(0)
         }
         ArtifactAction::Show { id, version, out } => {
             let Some(path) = out else {

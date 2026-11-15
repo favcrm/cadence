@@ -165,8 +165,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_messages_read",
     "issue_set",
     // CAD-2286: submit a file the caller saved into the document lifecycle.
-    // The board judges the creator from the subject, so it stays on the
-    // member's login (`agent_credential::stays_on_login`).
+    // It rides a managed session's agent credential like any other verb: that
+    // credential carries the member's subject, which the creator check reads,
+    // and the board's read-only guard refuses a reader or reviewer session.
     "document_submit",
     // AOS-528: one link added or removed. The board applies the delta to the
     // card it holds, so the client sends ids and a kind, never a whole card.
@@ -362,7 +363,7 @@ const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have bee
 const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
 const RECONCILE_AUDIT_IDENTITIES: &str = "the identity attestations may or may not have been recorded — read `audit identities` before repeating it";
 const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
-const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — read `artifact types`, then repeat `artifact submit` for the same id, which answers the document's current stage";
+const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — repeat `artifact submit <id>`, which answers the document's current stage and does not submit it twice";
 const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
@@ -2115,32 +2116,39 @@ fn document_lifecycle_unavailable(verb: &str, status: u16, body: Option<&Value>)
         return None;
     }
     let code = refusal_fields(body).0;
-    let unavailable = match status {
-        501 => true,
-        404 => code == Some("not_found"),
-        400 => matches!(code, Some("invalid_request" | "unknown_verb")),
-        _ => false,
+    let cause = match (status, code) {
+        (501, _) | (400, Some("invalid_request" | "unknown_verb")) => {
+            "the workspace's server is older than this command"
+        }
+        (404, Some("not_found")) => "document review is turned off on this workspace",
+        _ => return None,
     };
-    unavailable.then(|| {
-        Error::invalid(
-            DOCUMENT_LIFECYCLE_UNAVAILABLE,
-            format!(
-                "document lifecycle is not available on this workspace (HTTP {status}{}): its \
-                 server does not serve it, or it is not turned on here. Nothing was read",
-                code.map_or(String::new(), |c| format!(", {c}"))
-            ),
-        )
-    })
+    Some(Error::invalid(
+        DOCUMENT_LIFECYCLE_UNAVAILABLE,
+        format!(
+            "document lifecycle is not available on this workspace (HTTP {status}{}): \
+             {cause}. Nothing was read",
+            code.map_or(String::new(), |c| format!(", {c}"))
+        ),
+    ))
 }
 
 /// CAD-2286: the tenant's `document_submit` refusals
 /// (`DOCUMENT_SUBMIT_STATUS` in `apps/api/src/tenant-board/cli.ts`), each a
 /// typed error carrying its code. Without this, the generic decoder drops a
-/// 403 code as an access denial. A 5xx is never mapped: an unmapped store
-/// code answers 500 `internal`, after a possible write, so it stays unknown.
+/// 403 code as an access denial. A 501 is a server that predates the submit
+/// (the release order is named, as for the ticket-message verbs); no other
+/// 5xx is mapped: an unmapped store code answers 500 `internal`, after a
+/// possible write, so it stays unknown.
 fn document_submit_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
     if verb != "document_submit" {
         return None;
+    }
+    if status == 501 {
+        return Some(Error::invalid(
+            "not_implemented",
+            artifact_tenant_too_old("artifact submit", status, "submitted"),
+        ));
     }
     let (code, why): (&'static str, &str) = match (status, refusal_fields(body).0?) {
         (404, "not_found") => (
@@ -5251,6 +5259,81 @@ pub fn cli_material_until(
         subject_id: cred.subject_id,
         issuer: cred.issuer,
     })
+}
+
+/// CAD-2286: `artifact submit <id>` on a hosted org. It asks `document_types`
+/// first, so an unavailable lifecycle is named as such
+/// ([`document_lifecycle_unavailable`]) and a 404 from the submit itself can
+/// only mean the file. Both calls ride a managed session's agent credential.
+///
+/// The probe and the submit are two calls, so the lifecycle can be turned off
+/// between them. The submit then answers 404 `not_found` and is reported as no
+/// such file; nothing was submitted, and running the command again names the
+/// unavailable lifecycle. The window is one round trip, so it is accepted
+/// rather than closed.
+pub fn submit_document(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let session = agent_credential::bound_session();
+    submit_document_in(
+        target,
+        id,
+        deadline,
+        wake_timeout,
+        &dir,
+        session.as_deref(),
+        note,
+        std::thread::sleep,
+    )
+}
+
+/// [`submit_document`] with the credential dir, the managed session and the
+/// sleep injectable, so a test drives the real order.
+#[allow(clippy::too_many_arguments)]
+fn submit_document_in(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    dir: &Path,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+    sleep: impl Fn(Duration),
+) -> Result<Value> {
+    let call = |verb: &str, arguments: Map<String, Value>| {
+        call_verb_until_retry(
+            target,
+            verb,
+            arguments,
+            deadline,
+            wake_timeout,
+            dir,
+            true,
+            agent,
+            &note,
+            &sleep,
+        )
+    };
+    if let RemoteAnswer::Conflict(_) = call("document_types", Map::new())? {
+        return Err(reject(
+            "remote read answered a conflict; nothing was submitted",
+        ));
+    }
+    let mut arguments = Map::new();
+    arguments.insert("id".into(), json!(id));
+    match call("document_submit", arguments)? {
+        RemoteAnswer::Ok(body) => Ok(body),
+        RemoteAnswer::Conflict(_) => Err(reject(
+            "remote submit answered a conflict; nothing was submitted",
+        )),
+    }
 }
 
 /// Execute within the command-owned deadline. Continuations reuse it rather
