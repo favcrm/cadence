@@ -47,7 +47,7 @@ Before writing code or diagnosing a bridge bug, inspect the target repository's 
   - Keep translation key completeness tests covering both locales when tests exist.
   - Configure `navigation.section_query` in `screens.json` intentionally so host tabs/sidebar links synchronize with `@cadence/screen-ui`'s `useNavigation()` and `@cadence/app-kit`'s `bridge.patchRoute()`.
 - **Visual Consistency & No Legacy Class Leakage:** Follow `@cadence/screen-ui` `DESIGN.md` compact SaaS density (`28px` desktop / `36px` narrow controls in compact list compositions while keeping shipped `.field` `36px` / `.select-trigger` `32px` form defaults, calm neutral chrome, dark & light token parity, reduced-motion support). Do not introduce new `.crm-*` legacy classes in greenfield apps.
-- **No Shell Metacharacters in `package.json` `cadence.dev`:** `cadence.dev` enforces a single command and rejects newlines, unquoted parentheses (`(` and `)`), and shell metacharacters (`;`, `&`, `&&`, `||`, `|`, `<`, `>`, backticks, and `$()`), whereas `cadence.check` runs via `sh -c`. Put multi-step dev orchestration in a script file.
+- **No Shell Metacharacters in `package.json` `cadence.dev`:** `cadence.dev` enforces a single command—rejecting newlines (`\n`/`\r`), unescaped backticks, and `$()` command substitution everywhere (even inside quotes) plus unquoted `;`, `&`, `|`, `<`, `>`, `(`, and `)`—whereas `cadence.check` runs via `sh -c`. Put multi-step dev orchestration in a script file.
 - **Synthetic Data Only:** All test fixtures, `cadence app fixtures` seeds, docs, and examples must use synthetic, non-sensitive data—never real customer records, credentials, host paths, or commercial secrets.
 
 ## Standard Engineering Loop
@@ -55,7 +55,7 @@ Before writing code or diagnosing a bridge bug, inspect the target repository's 
 1. **Inspect pinned contracts & existing manifests** before planning changes (`@cadence/app-kit`, `@cadence/screen-ui`, hosted `app-storage/v1` if used, and `./app/*` manifests).
 2. **Author or update manifests & code** (under bundle root `./app`: `app.md`, `workflows/*.md`, `screens/<tag>/screens.json`, `app-storage.json`, `storage/<tag>.json`, optional `app-chat.json` and `skills/<tag>/`, plus TypeScript/UI code using `@cadence/app-kit` + `@cadence/screen-ui`).
 3. **Run local dev & isolation harnesses:**
-   - Start isolated local serving from repo root `.` via `cadence app dev --package .` (binds `127.0.0.1` ports `3110..=3199` with scrubbed `CADENCE_APP_*` env vars).
+   - Start isolated local serving from repo root `.` via `cadence app dev --package .` (binds `127.0.0.1` ports `3110..=3199` in a cleared environment retaining allowlisted host vars plus injected `CADENCE_APP_*` vars).
    - Exercise iframe bridge behavior locally with `cadence app frame-kit` (strict `https:` or `http://localhost:<port>` / `http://<name>.localhost:<port>` parent-origin validation is enforced at runtime by `@cadence/app-kit`'s `validateBoot()`) and deterministic seed scenarios with `cadence app fixtures`.
 4. **Verify static & build gates:**
    - Run the app's typecheck/unit/translation tests plus `package.json` `cadence.check`.

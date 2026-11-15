@@ -947,7 +947,9 @@ mod tests {
             .expect("cadence-app-dev status entry");
         assert_eq!(entry["installed"], true);
         assert_eq!(entry["content_match"], true);
-        assert_eq!(entry["links"]["gemini"], "ok");
+        for provider in ["claude", "cursor", "copilot", "gemini"] {
+            assert_eq!(entry["links"][provider], "ok", "provider {provider}");
+        }
         match show("cadence-app-dev", Some("SKILL.md")).unwrap() {
             ShowOutput::File(text) => {
                 assert!(text.contains("createScreenBridge"));
@@ -964,6 +966,7 @@ mod tests {
             ShowOutput::File(text) => {
                 assert!(text.contains("app-storage/v1"));
                 assert!(text.contains("capability_slots"));
+                assert!(text.contains("agent-side and unattested"));
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }

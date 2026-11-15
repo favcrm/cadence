@@ -57,4 +57,4 @@ Visual & UX requirements from `ui/screen-ui/DESIGN.md`:
 - Support both dark and light theme semantic tokens (`@cadence/screen-ui/styles.css`, built from `theme.css`, `controls.css`, `base.css`, `primitives.css`, `drawer-base.css`, `drawer.css`, plus `foundation.css` in source)—never add a second CSS reset or custom color palette.
 - Honor reduced-motion preferences, full keyboard focus rings, and desktop + narrow responsive stacking.
 - Provide full `"en"` and `"zh-TW"` copy through `LocaleTextProvider` (or app translation dictionaries) for every heading, empty state, validation message, error state, and `section_query` tab label.
-- **Do not use legacy `.crm-*` selectors** in greenfield apps; only retain existing `.crm-*` references when maintaining unmigrated legacy components.
+- **Do not introduce new legacy `.crm-*` classes** in greenfield apps (shared `@cadence/screen-ui` primitives like `DrawerShell` and `ConfirmDialog` own their internal class names); only retain existing app-authored `.crm-*` references when maintaining unmigrated legacy components.
