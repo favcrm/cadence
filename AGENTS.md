@@ -361,10 +361,14 @@ runs, on a PR, only the daemon tests (`src/daemon/tests/**`) and suite tests
 (`tests/suite.rs`) that PR adds or changes, under `--features test-seam`, in
 one build with no shards. `scripts/changed-test-filter` derives the nextest
 filter from the diff. A PR that touches none of those files skips the build and
-run. It fails closed but bounded: an edit to a suite helper, `use` line or
-other code outside any test selects the whole `suite` binary (about 224 tests),
-and a `mod.rs` edit that adds no module, or a non-Rust file under
-`src/daemon/tests/`, selects all of `daemon::tests` (about 190 tests); a
+run. It fails closed but bounded: a top-level helper, `use` line or other
+code outside any test or `mod` selects the whole `suite` binary (about 224
+tests; a helper inside a `mod` selects that mod). A `mod.rs` selects the
+modules whose `mod x;` line it adds, plus its own directory when any other line
+changes (a shared helper, `use`; `mod` lines, attributes and blank lines do not
+widen) or when it adds no module. Only the root `mod.rs` widens to all of
+`daemon::tests` (about 190 tests); a nested one selects its own directory. A
+non-Rust file under `src/daemon/tests/` also selects all of `daemon::tests`. A
 selection that matches no test fails the run. Compile coverage of every
 test-seam target is `ci.yml`'s required clippy job
 (`--all-targets --features test-seam`); this job adds running the changed

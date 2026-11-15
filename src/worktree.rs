@@ -327,7 +327,7 @@ fi
 # CAD-2307: GitHub drops an SSH push whose hook runs for minutes (rc=141).
 # `scripts/pre-push-check` runs this hook before the push and records the
 # receipt. A pass is recorded as `tree=clean` only when the working tree had no
-# edits, staged, unstaged or untracked, before the plan ran, so it describes the
+# edits, staged, unstaged or untracked, before and after the plan ran, so it describes the
 # commit and not the files beside it. The skip needs all of: no PRE_PUSH_TESTS
 # at this push, the pushed commit is HEAD, a clean tree now, and a receipt for
 # this head that says rc=0 and tree=clean. Any other receipt (failure, skipped,

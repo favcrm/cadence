@@ -11,10 +11,13 @@ build to the targets holding the selected tests).
 Selection, from the merge-base diff of added, copied, modified and renamed files:
 
   src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
-                               A `mod.rs` that adds `mod x;` lines selects
-                               those modules; a `mod.rs` that adds none selects
-                               its whole directory (the root one is all of
-                               daemon::tests, about 190 tests). Any other file
+                               A `mod.rs` selects the modules whose
+                               `mod x;` line it adds; any other changed line
+                               besides `mod` declarations, attributes and blank
+                               lines (a shared helper, `use`) also selects its
+                               whole directory, as does a mod.rs diff that adds
+                               no module (the root one is all of daemon::tests,
+                               about 190 tests). Any other file
                                under src/daemon/tests/ (not .rs) also selects
                                all of daemon::tests.
   tests/suite.rs               the single integration target (CAD-1727). Each
@@ -60,11 +63,36 @@ def daemon_prefix(path):
     return "daemon::tests::" + "".join(p + "::" for p in parts)
 
 
+MOD_DECL = re.compile(r"(?:pub(?:\([\w:]+\))? )?mod (\w+);$")
+
+
+def classify_mod_diff(diff, parent):
+    """Prefixes a mod.rs diff selects: each added `mod x;`, plus the whole
+    directory when any other line changed. A `mod` declaration (added or
+    removed), an attribute line and a blank line do not widen; anything else
+    (a shared helper, `use`, an inline module) can change every test below."""
+    added, widen = [], False
+    body = False
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            body = True
+            continue
+        if not body or line[:1] not in "+-":
+            continue
+        text = line[1:].strip()
+        decl = MOD_DECL.match(text)
+        if decl:
+            if line[0] == "+":
+                added.append(f"{parent}{decl.group(1)}::")
+        elif text and not text.startswith("#["):
+            widen = True
+    return ([parent] if widen else []) + added
+
+
 def mod_prefixes(base, head, path):
-    """Modules newly declared in a mod.rs under src/daemon/tests/."""
+    """Test prefixes selected by a mod.rs under src/daemon/tests/."""
     diff = git("diff", "-U0", f"{base}...{head}", "--", path)
-    parent = daemon_prefix(path)
-    return [f"{parent}{m}::" for m in re.findall(r"^\+\s*mod (\w+);", diff, re.M)]
+    return classify_mod_diff(diff, daemon_prefix(path))
 
 
 def mask(text):
@@ -222,8 +250,7 @@ def main():
         if not p.endswith(".rs"):
             daemon.append("daemon::tests::")
         elif p.rsplit("/", 1)[-1] == "mod.rs":
-            added = mod_prefixes(args.base, args.head, p)
-            daemon += added or [daemon_prefix(p)]
+            daemon += mod_prefixes(args.base, args.head, p) or [daemon_prefix(p)]
         else:
             daemon.append(daemon_prefix(p))
     if SUITE in files:
