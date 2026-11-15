@@ -713,9 +713,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const operationPending = operationState?.scope === operationScope && operationState.pending;
   const stagedPending = hosted && viewer.operator === true && !viewer.readOnly && convId !== null &&
     stagedState?.conversation === convId && stagedState.pending;
-  useEffect(() => {
-    onPendingDecision?.(operationPending || stagedPending);
-  }, [onPendingDecision, operationPending, stagedPending]);
   const streamDown = streamLink !== "live" || !operationsCurrent;
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
@@ -1245,6 +1242,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
   const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
   const permissionPending = pendingPermission !== null;
+  useEffect(() => {
+    onPendingDecision?.(operationPending || stagedPending || permissionPending);
+  }, [onPendingDecision, operationPending, stagedPending, permissionPending]);
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -1957,6 +1957,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const canReplyDraft = canSend && binding.error === null;
   const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const revealComposer = useCallback(() => onCollapsed(false), [onCollapsed]);
   const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
   const rejectAndReplyDraft = useCallback(
     (command: string) => {
@@ -2471,6 +2472,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         stop={canStop ? { onStop: () => { if (runningMessage) turnCommand("stop", runningMessage); } } : null}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
+        onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
         onCommand={(name, arg) => {

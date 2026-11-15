@@ -4,6 +4,7 @@ import {
   hostActions,
 } from "../src/features/app-shell/hostActions";
 import { ApiError } from "../src/lib/api";
+import { isDev } from "../src/env";
 
 export {};
 /** CAD-802 corrections: grammar + single-pane shell + scoped links. */
@@ -324,6 +325,34 @@ await click(toggle);
 assert(host.querySelector("[data-chat-pane]") === mountedPane, "the same conversation stays mounted");
 assert(host.querySelector("#app-shell-chat-box") === mountedBox, "the same composer stays mounted");
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "the header switch preserves the unsent draft");
+
+// Run with NODE_ENV=development to exercise the development-only action.
+// A retained installation is not a fresh receipt while access is checking
+// or after the next metadata read fails.
+if (isDev) {
+  const originalFetch = globalThis.fetch;
+  const show = async (operator: boolean | null) => {
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-shell", viewer: { operator, readOnly: false } })));
+    });
+  };
+  assert(host.querySelector("[data-contract-preview-toggle]"), "a verified development app offers its preview");
+  try {
+    await show(null);
+    assert(!host.querySelector("[data-contract-preview-toggle]"), "checking access withholds a stale preview");
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input) === "/api/app-installations/install-shell") throw new Error("Simulated metadata outage");
+      return originalFetch(input as RequestInfo, init);
+    }) as typeof fetch;
+    await show(true);
+    assert(text().includes("Simulated metadata outage"), "the metadata error is visible");
+    assert(!host.querySelector("[data-contract-preview-toggle]"), "a failed current receipt cannot expose the retained app's preview");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await show(null);
+    await show(true);
+  }
+}
 
 // Chat sends carry the verified-scope request; refusal would surface.
 // Context is adopted from the URL — no selector needed.

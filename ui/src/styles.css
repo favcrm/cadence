@@ -2479,15 +2479,18 @@ button.refchip:hover {
 .app-header-assistant-unread { width: .4rem; height: .4rem; flex: none; border-radius: 50%; background: var(--color-warn); }
 .app-header[data-installed-app] .header-breadcrumb > a { flex: none; }
 .app-header[data-installed-app] .header-breadcrumb { font-size: var(--text-label); }
+@media (width < 1024px) {
+  .app-header[data-installed-app] { min-height: 2.75rem; }
+  .app-header-assistant, .app-header-more { height: 2.25rem; }
+  .app-header-more { width: 2.25rem; }
+  .app-header-action-menu { top: 3rem; }
+}
 @media (width < 640px) {
-  .app-header[data-installed-app] { min-height: 2.75rem; flex-wrap: nowrap; }
+  .app-header[data-installed-app] { flex-wrap: nowrap; }
   .app-header[data-installed-app] .header-breadcrumb { order: 0; flex: 1 1 0%; gap: .375rem; }
   .app-header[data-installed-app] .app-header-utilities { display: none; }
   .app-header-location-target, .app-header-location { gap: .375rem; }
   .app-header-version { display: none; }
-  .app-header-assistant, .app-header-more { height: 2.25rem; }
-  .app-header-more { width: 2.25rem; }
-  .app-header-action-menu { top: 3rem; }
 }
 @media (width < 640px) {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }

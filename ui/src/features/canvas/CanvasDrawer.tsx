@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
-import { setComposerRefs } from "../app-shell/chat/composerStore";
+import { requestComposerFocus, setComposerRefs } from "../app-shell/chat/composerStore";
 import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
@@ -65,11 +65,6 @@ function selectedPassage(root: HTMLElement | null): string {
   return sel.toString().trim().slice(0, 1200);
 }
 
-function focusComposer(): void {
-  const box = document.querySelector<HTMLElement>("#app-shell-chat-box, [data-composer] textarea");
-  box?.focus();
-}
-
 function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
@@ -115,8 +110,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
     if (!composerKey) return;
     const passage = selectedPassage(contentRef.current);
     setComposerRefs(composerKey, [makeAskRef({ artifact: tab.id, version: tab.selected, title: tab.title, passage })]);
+    requestComposerFocus(composerKey);
     if (sheet) onClose();
-    requestAnimationFrame(focusComposer);
   };
 
   const first = Math.max(1, tab.latest - KEPT_VERSIONS + 1);
@@ -274,11 +269,16 @@ export default function CanvasDrawer() {
     const mine = at === document.body || !!rootRef.current?.contains(at);
     requestAnimationFrame(() => {
       if (!mine) return;
+      const current = document.activeElement;
+      if (current !== at && current !== document.body && !rootRef.current?.contains(current)) return;
       const root = rootRef.current;
-      if (!root) return focusComposer();
+      if (!root) {
+        if (canvas.composerKey !== null) requestComposerFocus(canvas.composerKey);
+        return;
+      }
       (root.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? root).focus();
     });
-  }, []);
+  }, [canvas.composerKey]);
   const closeAll = useCallback(() => {
     handFocusOn();
     closeDrawer();

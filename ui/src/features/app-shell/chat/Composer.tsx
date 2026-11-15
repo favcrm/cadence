@@ -2,6 +2,7 @@ import { askBody, askLabel, citesArtifact } from "../../canvas/askRefs";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -21,6 +22,7 @@ import {
   captureReady,
   composerDraftState,
   consumeSeed,
+  onComposerFocusRequest,
   removeAttach,
   reserveDraft,
   retryAttach,
@@ -101,6 +103,8 @@ export interface ComposerProps {
   onSubmitted?: () => void;
   /** Focus the box after a send (the Home dock does). */
   refocusAfterSend?: boolean;
+  /** Reveal an owning pane before an external request focuses this composer. */
+  onReveal?: () => void;
   textareaId?: string;
   ariaLabel?: string;
   placeholder?: string;
@@ -390,6 +394,7 @@ export default function Composer({
   onSend,
   onSubmitted,
   refocusAfterSend,
+  onReveal,
   textareaId,
   ariaLabel,
   placeholder,
@@ -450,6 +455,24 @@ export default function Composer({
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const revealRef = useRef(onReveal);
+  revealRef.current = onReveal;
+  useLayoutEffect(() => {
+    let frame: number | null = null;
+    const off = onComposerFocusRequest((requestedKey) => {
+      if (requestedKey !== key) return;
+      revealRef.current?.();
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        box.current?.focus();
+      });
+    });
+    return () => {
+      off();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [key]);
   useEffect(() => {
     if (seed && seed.n > 0 && consumeSeed(key, seed)) {
       setComposerContent(key, seed.text, seed.refs ?? []);

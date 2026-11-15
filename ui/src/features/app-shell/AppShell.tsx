@@ -1170,7 +1170,7 @@ export default function AppShell({
       )}
       {header?.actions && createPortal(
       <div className="app-header-app-actions" inert={drawerOpen || independentOpen}>
-        {(launchableWorkflows.length > 0 || (isDev && installation !== null)) && <>
+        {verified && (launchableWorkflows.length > 0 || isDev) && <>
           <button type="button" className="header-icon app-header-more" popoverTarget={appActionsId} aria-label={t("More actions")} title={t("More actions")}>
             <IconMore size={16} />
           </button>
@@ -1197,7 +1197,7 @@ export default function AppShell({
           </Button>
         ))}
 
-        {isDev && installation !== null && (
+        {isDev && verified && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
             className="lnk text-label app-shell-preview-toggle"

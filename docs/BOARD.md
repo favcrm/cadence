@@ -2794,6 +2794,10 @@ conversation or app frame. A collapsed chat leaves no rail; on narrow screens
 the workspace and assistant share one pane. Workflow launchers and developer
 tools live in the header's **More actions** menu. Narrow layouts keep account,
 board status, update, language and theme controls in the existing mobile navigation.
+App actions remain unavailable until the current installation receipt is verified.
+Pending approvals override the untouched collapsed default; an explicit choice
+still wins. Canvas edit requests reveal the current composer; editable inputs
+receive focus without sending or replacing the draft.
 
 Every setup or Browser QA handover states these separately:
 

@@ -51,6 +51,7 @@ let timerSeq = 0;
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
+const SharedComposer = require("../src/features/app-shell/chat/Composer").default;
 const { BrowserCard } = require("../src/features/canvas/BrowserPanel") as typeof import("../src/features/canvas/BrowserPanel");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
@@ -1340,9 +1341,15 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
 // ===== closing the last artifact with no session hands focus to the composer =====
 {
   const m = await start({ state: "none" });
-  const composer = document.createElement("textarea");
-  composer.id = "app-shell-chat-box";
-  document.body.append(composer);
+  const composerHost = document.createElement("div");
+  document.body.append(composerHost);
+  const composerRoot = createRoot(composerHost);
+  await React.act(async () => {
+    composerRoot.render(React.createElement(LocaleProvider, null, React.createElement(SharedComposer, {
+      density: "full", block: null, storeKey: "home", onSend: () => { throw new Error("Focus must not send"); },
+    })));
+  });
+  const composer = composerHost.querySelector("textarea")!;
   await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
   await settle();
   const closeBtn = el(m.host, ".cv-tab-close")!;
@@ -1358,7 +1365,8 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await click(el(m.host, '[aria-label="Close canvas"]')!);
   await raf();
   assert(document.activeElement === composer, "the header close too");
-  composer.remove();
+  await React.act(async () => { composerRoot.unmount(); });
+  composerHost.remove();
   await m.unmount();
 }
 
