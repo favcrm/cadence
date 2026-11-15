@@ -125,10 +125,20 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const [noMatchBeforeExplore, noMatchAfterExplore] = noMatchCopy.split(/Explore|「探索」/);
   const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
 
+  const localizedById = useMemo(() => new Map(
+    live.map((h) => [h.install_id, { title: homeAppTitle(h, locale, t), tagline: homeAppTagline(h, locale, t) }]),
+  ), [live, locale, t]);
+
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    let list = live.filter((h) => !needle || [h.name, h.title, homeAppTitle(h, locale, t), h.tagline, homeAppTagline(h, locale, t)].filter(Boolean).join(" ").toLowerCase().includes(needle));
-    if (sort === "name") list = [...list].sort((a, b) => homeAppTitle(a, locale, t).localeCompare(homeAppTitle(b, locale, t)));
+    let list = live.filter((h) => {
+      if (!needle) return true;
+      const loc = localizedById.get(h.install_id);
+      return [h.name, h.title, loc?.title, h.tagline, loc?.tagline].filter(Boolean).join(" ").toLowerCase().includes(needle);
+    });
+    if (sort === "name") {
+      list = [...list].sort((a, b) => (localizedById.get(a.install_id)?.title ?? a.title).localeCompare(localizedById.get(b.install_id)?.title ?? b.title));
+    }
     if (sort === "attention") {
       const rank: Record<string, number> = { attention: 0, setup: 1, update: 2, off: 3, ok: 4 };
       list = [...list].sort((a, b) => (rank[a.attention.state] ?? 4) - (rank[b.attention.state] ?? 4));
@@ -138,7 +148,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
       list = [...list].sort((a, b) => (order.get(a.install_id) ?? 999) - (order.get(b.install_id) ?? 999));
     }
     return list;
-  }, [live, q, sort, favs, locale, t]);
+  }, [live, q, sort, favs, localizedById]);
 
   const pin = (id: string) => {
     const cur = favs?.favorites ?? [];

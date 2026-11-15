@@ -228,6 +228,30 @@ async function main() {
   assert(validI18n?.listing.i18n?.["zh-TW"]?.can?.length === 2 && validI18n.i18n?.["zh-TW"]?.summary === maxSummary, "280-char summary");
   const emptyParsed = directory.parsePublicList({ ok: true, data: { apps: [{ ...app, i18n: {}, listing: { i18n: {} } }] } });
   assert(emptyParsed.length === 1 && !emptyParsed[0].i18n && !emptyParsed[0].listing.i18n, "{} i18n");
+  const wireTolerated = directory.parsePublicList({
+    ok: true,
+    data: {
+      apps: [{
+        ...app,
+        i18n: { "zh-TW": {}, ja: { title: null } },
+        listing: {
+          i18n: {
+            "zh-TW": { title: "範例", summary: null, tagline: null, about: null, can: [], access_notes: {} },
+            "zh-HK": { access_notes: { "CRM Read / Write": "唯讀" } },
+            ja: {},
+          },
+        },
+      }],
+    },
+  });
+  assert(
+    wireTolerated.length === 1
+      && !wireTolerated[0].i18n
+      && wireTolerated[0].listing.i18n?.["zh-TW"]?.title === "範例"
+      && wireTolerated[0].listing.i18n?.["zh-HK"]?.access_notes?.["CRM Read / Write"] === "唯讀"
+      && !wireTolerated[0].listing.i18n?.ja,
+    "agenticos-v2 wire-compatible nullish/empty i18n",
+  );
   let deep: Record<string, unknown> = { ok: true };
   for (let i = 0; i < 35; i++) deep = { child: deep };
   const badPatches: [string, Record<string, unknown>][] = [
@@ -243,6 +267,10 @@ async function main() {
     ["extra", { listing: { i18n: { "zh-TW": { extra: "bad" } } } }],
     ["can>5", { listing: { i18n: { "zh-TW": { can: ["1", "2", "3", "4", "5", "6"] } } } }],
     ["list>280", { listing: { i18n: { "zh-TW": { summary: "x".repeat(281) } } } }],
+    ["bad-note-empty", { listing: { i18n: { "zh-TW": { access_notes: { "": "x" } } } } }],
+    ["bad-note-65", { listing: { i18n: { "zh-TW": { access_notes: { ["k".repeat(65)]: "x" } } } } }],
+    ["bad-note-ctrl", { listing: { i18n: { "zh-TW": { access_notes: { "bad\nkey": "x" } } } } }],
+    ["bad-title-num", { i18n: { "zh-TW": { title: 123 } } }],
   ];
   for (const [why, patch] of badPatches) assert(directory.parsePublicApp({ ...app, ...patch }) === null, why);
 

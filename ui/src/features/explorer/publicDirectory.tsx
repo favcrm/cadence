@@ -71,7 +71,7 @@ import { canOpenInstall, type InstallLifecycleState } from "./installAccess";
 export type InstallRef = Pick<
   Installation,
   "install_id" | "name" | "title" | "removed" | "catalogue"
-> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link">> & {
+> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link" | "i18n" | "listing">> & {
   project?: string;
   /** The tenant's lifecycle word; only an active row can open its app route. */
   state?: InstallLifecycleState;
@@ -133,13 +133,9 @@ function listingOf(value: unknown): PublicListing | null {
     : undefined;
   let i18n: Record<string, ListingDisplayLocale> | undefined;
   if (row.i18n !== undefined && row.i18n !== null) {
-    if (isPlainJsonObject(row.i18n) && Object.keys(row.i18n).length === 0) {
-      // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
-    } else {
-      const parsedListingI18n = parseListingDisplayI18n(row.i18n);
-      if (!parsedListingI18n) return null;
-      i18n = parsedListingI18n;
-    }
+    const parsedListingI18n = parseListingDisplayI18n(row.i18n, { wire: true });
+    if (!parsedListingI18n) return null;
+    if (Object.keys(parsedListingI18n).length > 0) i18n = parsedListingI18n;
   }
   return {
     tagline,
@@ -167,13 +163,9 @@ export function parsePublicApp(value: unknown): PublicApp | null {
   if (hasUnsafePublicStructure(row)) return null;
   let parsedI18n: AppDisplayI18n | undefined;
   if (row.i18n !== undefined && row.i18n !== null) {
-    if (isPlainJsonObject(row.i18n) && Object.keys(row.i18n).length === 0) {
-      // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
-    } else {
-      const parsed = parseAppDisplayI18n(row.i18n);
-      if (!parsed) return null;
-      parsedI18n = parsed;
-    }
+    const parsed = parseAppDisplayI18n(row.i18n, { wire: true });
+    if (!parsed) return null;
+    if (Object.keys(parsed).length > 0) parsedI18n = parsed;
   }
   const listing = listingOf(row.listing);
   if (!listing) return null;
@@ -338,12 +330,14 @@ function useBoardInstalls(viewer: Viewer): {
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
         removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+        i18n: row.i18n, listing: row.listing,
       }));
     const fromHome = (home: HomeInstallation[]): InstallRef[] => home
       .filter((row) => row.attention?.state !== "removed")
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         project_link: row.project ?? "", removed: null, catalogue: row.catalogue ?? null, project: row.project,
+        i18n: row.i18n, listing: row.listing,
       }));
     const once = () => operator
       ? workspaceApps.installations(signal).then(fromOperator)
@@ -388,6 +382,7 @@ function useBoardInstalls(viewer: Viewer): {
       install_id: row.install_id, name: row.name, title: row.title, version: row.version,
       digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
       removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+      i18n: row.i18n, listing: row.listing,
     };
     setRows((current) => [...(current ?? []).filter((item) => item.install_id !== row.install_id), confirmed]);
     setError(null);
@@ -602,8 +597,8 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
   const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
-  const rawTitle = install?.title ?? catalogued[0]?.title;
-  const title = rawTitle ? localizedAppTitle({ title: rawTitle }, locale, t) : id;
+  const titleSource = install ?? catalogued[0];
+  const title = titleSource ? localizedAppTitle(titleSource, locale, t) : id;
   return (
     <article className="pub-detail" aria-label={title}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
@@ -634,7 +629,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
                       replace
                       href={`/apps/catalog/${encodeURIComponent(id)}?${new URLSearchParams({ installation: row.install_id })}`}
                     >
-                      {row.title} · {row.version ?? "—"}
+                      {localizedAppTitle(row, locale, t)} · {row.version ?? "—"}
                       {row.project ? ` · ${row.project}` : ""}
                     </Link>
                   </li>

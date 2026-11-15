@@ -238,6 +238,16 @@ Object.assign(zhTW, {
   "Fetch my saved source's posts": "擷取已儲存來源的貼文",
   "Draft a post from the newest": "根據最新內容草擬貼文",
   "What's ready to publish?": "有哪些內容已可發佈？",
+  "Open {title}": "開啟 {title}",
+  "Ask an admin to manage access.": "請聯絡管理員管理存取權限。",
+  "Brings back {title} with its data.": "連同原有資料還原 {title}。",
+  "This app was removed. Ask an admin.": "此應用程式已移除。請聯絡管理員。",
+  "Your admin will see the request.": "管理員將會看到此申請。",
+  "Made by": "提供者",
+  "Retired source": "已退役來源",
+  "Retired built-in catalog": "已退役內建目錄",
+  "Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.": "其內建目錄項目已退役。請從應用程式本身的儲存庫更新或重新安裝。",
+  "The built-in app catalog was retired. Update from each app's repository or reinstall it from the store.": "內建應用程式目錄已退役。請從各應用程式的儲存庫更新，或從商店重新安裝。",
 });
 
 Object.assign(zhTW, {

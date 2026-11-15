@@ -130,7 +130,7 @@ function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
         <span className="pub-card-copy">
           <span className="pub-card-category">{t("Retired source")}</span>
           <span className="pub-card-title" id={`retired-name-${card.id}`}>{title}</span>
-          <span className="pub-card-summary">{card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}</span>
+          <span className="pub-card-summary">{card.retired_reason ? t(card.retired_reason) : t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}</span>
           <span className="pub-card-footer" id={`retired-state-${card.id}`}>
             <InstallStateChip state={card.removed ? "removed" : card.state} />
             <span>{t("Retired")}</span>

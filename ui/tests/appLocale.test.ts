@@ -39,6 +39,12 @@ function main() {
   eq(L.parseListingDisplayI18n(tw({ about: "x".repeat(600) })), tw({ about: "x".repeat(600) }), "600");
   eq([L.parseListingDisplayI18n(tw({ about: "x".repeat(601) })), L.parseListingDisplayI18n(tw({ summary: "x".repeat(281) })), L.displayI18nFromListing(tw({ about: "x" }))], [null, null, null], "max");
   eq(L.displayI18nFromListing(tw({ title: "客", about: "x" })), tw({ title: "客" }), "fromL");
+  eq(L.parseAppDisplayI18n({ "zh-TW": {}, ja: { title: null } }, { wire: true }), {}, "wireApp0");
+  eq(L.parseListingDisplayI18n({ "zh-TW": { title: " 客 ", about: null, can: [], access_notes: {}, tagline: null }, ja: {} }, { wire: true }), tw({ title: "客" }), "wireListNull");
+  eq(L.parseListingDisplayI18n(tw({ access_notes: { "CRM Read / Write": " 唯讀 " } }), { wire: true }), tw({ access_notes: { "CRM Read / Write": "唯讀" } }), "wireNotes");
+  for (const b of [tw({ title: "x", extra: "y" }), tw({ can: ["1", "2", "3", "4", "5", "6"] }), tw({ access_notes: { "bad\nkey": "x" } }), tw({ access_notes: JSON.parse('{"__proto__":"x"}') }), tw({ about: "x".repeat(601) })]) {
+    eq(L.parseListingDisplayI18n(b, { wire: true }), null, "badWire");
+  }
 
   const d = (k: string) => ({ CRM: "D-C", Sum: "D-S", Tag: "D-T", Sec: "D-N" })[k] ?? k;
   const src = { title: "CRM", summary: "Sum", tagline: "Tag", i18n: tw({ title: "T-C", summary: "T-S", tagline: "T-T" }), listing: { tagline: "L", i18n: tw({ title: "L-C", summary: "L-S", tagline: "L-T" }) } };

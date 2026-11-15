@@ -90,8 +90,8 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   }
 
   const access = card.access ?? [];
-  const cardI18n = parseAppDisplayI18n(card.i18n);
-  const listingI18n = parseListingDisplayI18n(card.listing?.i18n);
+  const cardI18n = parseAppDisplayI18n(card.i18n, { wire: true });
+  const listingI18n = parseListingDisplayI18n(card.listing?.i18n, { wire: true });
   const locListing = pickLocaleEntry(listingI18n, locale);
   const localizedListing = card.listing ? { ...card.listing, i18n: listingI18n ?? undefined } : card.listing;
   const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: localizedListing }, locale, t);
@@ -101,6 +101,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const about = locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
+  const accessNotes = Object.values(locListing?.access_notes ?? card.access_notes ?? card.listing?.access_notes ?? {}).filter(Boolean);
 
   return (
     <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={title}>
@@ -185,6 +186,15 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </div>
           </div>
 
+          {accessNotes.length > 0 && (Boolean(locListing?.access_notes) || !access.some((r) => Boolean(r.note))) && (
+            <div className="blk">
+              <h2>{t("Access notes")}</h2>
+              <ul className="can">
+                {accessNotes.map((n, i) => <li key={i}><span aria-hidden>◦</span><span>{n}</span></li>)}
+              </ul>
+            </div>
+          )}
+
           {setup && setup.length > 0 && (
             <div className="blk">
               <h2>{t("Setup")}</h2>
@@ -220,20 +230,20 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
                 return href === null ? (
                   <span className="text-micro text-ink-500">{t("This install has no unique app page — see Manage.")}</span>
                 ) : (
-                  <Link className="btn btn-primary btn-lg" href={href}>Open {title}</Link>
+                  <Link className="btn btn-primary btn-lg" href={href}>{t("Open {title}").replace("{title}", () => title)}</Link>
                 );
               })()}
-              {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
-              {!isOp && <span className="text-micro text-ink-500">Ask an admin to manage access.</span>}
+              {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>{t("Manage")}</Link>}
+              {!isOp && <span className="text-micro text-ink-500">{t("Ask an admin to manage access.")}</span>}
             </>
           ) : removed ? (
             isOp && card.restorable ? (
               <>
-                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? "Restoring…" : "Restore"}</Button>
-                <span className="text-micro text-ink-500">Brings back {title} with its data.</span>
+                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? t("Restoring…") : t("Restore")}</Button>
+                <span className="text-micro text-ink-500">{t("Brings back {title} with its data.").replace("{title}", () => title)}</span>
               </>
             ) : (
-              <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
+              <span className="text-micro text-ink-500">{isOp ? t("The restore window has closed.") : t("This app was removed. Ask an admin.")}</span>
             )
           ) : retired ? (
             <span className="text-micro text-ink-500">
@@ -241,8 +251,8 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </span>
           ) : card.requested_by_me || card.state === "requested" ? (
             <>
-              <Button className="btn-lg" disabled>Asked</Button>
-              <span className="text-micro text-ink-500">Your admin will see the request.</span>
+              <Button className="btn-lg" disabled>{t("Asked")}</Button>
+              <span className="text-micro text-ink-500">{t("Your admin will see the request.")}</span>
             </>
           ) : (
             <>
@@ -251,11 +261,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </>
           )}
           <dl className="dl mt-3">
-            <dt>Made by</dt><dd><TrustChip trust={card.trust} /></dd>
+            <dt>{t("Made by")}</dt><dd><TrustChip trust={card.trust} /></dd>
             {card.version && <><dt>{t("Version")}</dt><dd>{card.version}</dd></>}
             {card.listing?.category && <><dt>{t("Category")}</dt><dd>{localizedAppCategory(card.listing.category, locale)}</dd></>}
-            {retired && <><dt>Source</dt><dd>{t("Retired built-in catalog")}</dd></>}
-            {isOp && card.digest && <><dt>Digest</dt><dd className="num break-all">{card.digest}</dd></>}
+            {retired && <><dt>{t("Source")}</dt><dd>{t("Retired built-in catalog")}</dd></>}
+            {isOp && card.digest && <><dt>{t("Digest")}</dt><dd className="num break-all">{card.digest}</dd></>}
           </dl>
         </aside>
       </div>

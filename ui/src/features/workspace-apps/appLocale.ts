@@ -81,10 +81,11 @@ function parseLocaleEntries<T extends object>(
   value: unknown,
   allowedKeys: Set<string>,
   parseEntry: (raw: Record<string, unknown>) => T | null,
+  wire = false,
 ): Record<string, T> | null {
   if (!isPlainJsonObject(value)) return null;
   const entries = Object.entries(value);
-  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return null;
+  if ((!wire && entries.length === 0) || entries.length > MAX_I18N_LOCALES) return null;
   const out: Record<string, T> = {}, seen = new Set<string>();
   for (const [tag, raw] of entries) {
     if (!validLocaleTag(tag)) return null;
@@ -93,9 +94,13 @@ function parseLocaleEntries<T extends object>(
     seen.add(lower);
     if (!isPlainJsonObject(raw)) return null;
     const keys = Object.keys(raw);
-    if (keys.length === 0 || keys.some((k) => !allowedKeys.has(k))) return null;
+    if ((!wire && keys.length === 0) || keys.some((k) => !allowedKeys.has(k))) return null;
     const parsed = parseEntry(raw);
-    if (!parsed || Object.keys(parsed).length === 0) return null;
+    if (!parsed) return null;
+    if (Object.keys(parsed).length === 0) {
+      if (!wire) return null;
+      continue;
+    }
     setOwn(out, tag, parsed);
   }
   return out;
@@ -104,7 +109,7 @@ function parseLocaleEntries<T extends object>(
 function parseBaseDisplay(raw: Record<string, unknown>): AppDisplayLocale | null {
   const out: AppDisplayLocale = {};
   for (const [k, max, multi] of [["title", 80, false], ["summary", 280, true], ["tagline", 80, false]] as const) {
-    if (raw[k] !== undefined) {
+    if (raw[k] !== undefined && raw[k] !== null) {
       if (!isPlainTextValue(raw[k], max, multi)) return null;
       out[k] = raw[k].trim();
     }
@@ -112,41 +117,47 @@ function parseBaseDisplay(raw: Record<string, unknown>): AppDisplayLocale | null
   return out;
 }
 
-export function parseAppDisplayI18n(value: unknown): AppDisplayI18n | null {
-  return parseLocaleEntries(value, DISPLAY_KEYS, parseBaseDisplay);
+export function parseAppDisplayI18n(value: unknown, opts?: { wire?: boolean }): AppDisplayI18n | null {
+  return parseLocaleEntries(value, DISPLAY_KEYS, parseBaseDisplay, Boolean(opts?.wire));
 }
 
-export function parseListingDisplayI18n(value: unknown): AppListingI18n | null {
+export function parseListingDisplayI18n(value: unknown, opts?: { wire?: boolean }): AppListingI18n | null {
+  const wire = Boolean(opts?.wire);
   return parseLocaleEntries(value, LISTING_KEYS, (raw) => {
     const base = parseBaseDisplay(raw);
     if (!base) return null;
     const loc: AppListingLocale = { ...base };
-    if (raw.about !== undefined) {
+    if (raw.about !== undefined && raw.about !== null) {
       if (!isPlainTextValue(raw.about, 600, true)) return null;
       loc.about = raw.about.trim();
     }
-    if (raw.can !== undefined) {
-      if (!Array.isArray(raw.can) || raw.can.length === 0 || raw.can.length > 5) return null;
-      const can: string[] = [];
-      for (const item of raw.can) {
-        if (!isPlainTextValue(item, 100)) return null;
-        can.push(item.trim());
+    if (raw.can !== undefined && raw.can !== null) {
+      if (!Array.isArray(raw.can) || raw.can.length > 5) return null;
+      if (raw.can.length === 0) {
+        if (!wire) return null;
+      } else {
+        const can: string[] = [];
+        for (const item of raw.can) {
+          if (!isPlainTextValue(item, 100)) return null;
+          can.push(item.trim());
+        }
+        loc.can = can;
       }
-      loc.can = can;
     }
-    if (raw.access_notes !== undefined) {
+    if (raw.access_notes !== undefined && raw.access_notes !== null) {
       if (!isPlainJsonObject(raw.access_notes)) return null;
       const noteEntries = Object.entries(raw.access_notes);
-      if (noteEntries.length === 0 || noteEntries.length > 16) return null;
+      if ((!wire && noteEntries.length === 0) || noteEntries.length > (wire ? 64 : 16)) return null;
       const notes: Record<string, string> = {};
       for (const [k, v] of noteEntries) {
-        if (FORBIDDEN_PLAIN_OBJECT_KEYS.has(k) || !SLOT_KEY_RE.test(k) || !isPlainTextValue(v, 140)) return null;
+        const validKey = wire ? (k.length >= 1 && k.length <= 64 && !CTRL_SINGLE_LINE_RE.test(k)) : SLOT_KEY_RE.test(k);
+        if (FORBIDDEN_PLAIN_OBJECT_KEYS.has(k) || !validKey || !isPlainTextValue(v, 140)) return null;
         setOwn(notes, k, v.trim());
       }
-      loc.access_notes = notes;
+      if (noteEntries.length > 0) loc.access_notes = notes;
     }
     return loc;
-  });
+  }, wire);
 }
 
 export function displayI18nFromListing(value: unknown): AppDisplayI18n | null {
@@ -170,9 +181,9 @@ interface LocalizedAppSource {
 }
 
 function pickField(src: LocalizedAppSource, field: keyof AppDisplayLocale, fallback: string, locale: string, t?: TranslateFn): string {
-  const top = pickLocaleEntry(parseAppDisplayI18n(src.i18n), locale)?.[field];
+  const top = pickLocaleEntry(parseAppDisplayI18n(src.i18n, { wire: true }), locale)?.[field];
   if (typeof top === "string" && top.trim().length > 0) return top;
-  const listed = pickLocaleEntry(parseListingDisplayI18n(src.listing?.i18n), locale)?.[field];
+  const listed = pickLocaleEntry(parseListingDisplayI18n(src.listing?.i18n, { wire: true }), locale)?.[field];
   if (typeof listed === "string" && listed.trim().length > 0) return listed;
   return !fallback || isEnglishLocale(locale) ? fallback : (t ? t(fallback) : fallback);
 }
