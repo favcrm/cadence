@@ -6,14 +6,14 @@ import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
 import {
-  MAX_I18N_LOCALES,
-  isPlainTextValue,
+  isPlainJsonObject,
+  localizedAppCategory,
   localizedAppSummary,
   localizedAppTagline,
   localizedAppTitle,
   parseAppDisplayI18n,
+  parseListingDisplayI18n,
   pickLocaleEntry,
-  validLocaleTag,
   type AppDisplayI18n,
   type ListingDisplayLocale,
 } from "../workspace-apps/appLocale";
@@ -95,84 +95,42 @@ const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
 const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
-const FORBIDDEN_PRICE_KEYS = new Set(["cost", "price", "pricing"]);
-const LISTING_I18N_KEYS = new Set(["title", "summary", "tagline", "about", "can", "access_notes"]);
+const FORBIDDEN_PUBLIC_KEYS = new Set([
+  "cost",
+  "price",
+  "pricing",
+  "artifact",
+  "path",
+  "__proto__",
+  "prototype",
+  "constructor",
+]);
+const MAX_PUBLIC_SCAN_DEPTH = 32;
+const MAX_PUBLIC_SCAN_NODES = 4096;
 
-function hasForbiddenPriceKey(value: unknown, depth = 0): boolean {
-  if (depth > 32 || !value || typeof value !== "object") return false;
+function hasUnsafePublicStructure(
+  value: unknown,
+  depth = 0,
+  state = { nodes: 0 },
+): boolean {
+  if (depth > MAX_PUBLIC_SCAN_DEPTH) return true;
+  if (value === null || typeof value !== "object") return false;
+  if (++state.nodes > MAX_PUBLIC_SCAN_NODES) return true;
   if (Array.isArray(value)) {
-    return value.some((item) => hasForbiddenPriceKey(item, depth + 1));
+    return value.some((item) => hasUnsafePublicStructure(item, depth + 1, state));
   }
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (FORBIDDEN_PRICE_KEYS.has(k) || hasForbiddenPriceKey(v, depth + 1)) return true;
+  if (!isPlainJsonObject(value)) return true;
+  for (const k of Object.keys(value)) {
+    if (FORBIDDEN_PUBLIC_KEYS.has(k)) return true;
+    if (hasUnsafePublicStructure(value[k], depth + 1, state)) return true;
   }
   return false;
 }
 
-function listingI18nOf(value: unknown): Record<string, ListingDisplayLocale> | undefined | null {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "object" || Array.isArray(value)) return null;
-  const entries = Object.entries(value as Record<string, unknown>);
-  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return null;
-  const out: Record<string, ListingDisplayLocale> = {};
-  const seenLocales = new Set<string>();
-  for (const [tag, raw] of entries) {
-    if (!validLocaleTag(tag)) return null;
-    const lowerTag = tag.toLowerCase();
-    if (seenLocales.has(lowerTag)) return null;
-    seenLocales.add(lowerTag);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-    const obj = raw as Record<string, unknown>;
-    const objKeys = Object.keys(obj);
-    if (objKeys.length === 0 || objKeys.some((k) => !LISTING_I18N_KEYS.has(k))) return null;
-    const loc: ListingDisplayLocale = {};
-    if (obj.title !== undefined) {
-      if (!isPlainTextValue(obj.title, 80)) return null;
-      loc.title = obj.title.trim();
-    }
-    if (obj.summary !== undefined) {
-      if (!isPlainTextValue(obj.summary, 280, true)) return null;
-      loc.summary = obj.summary.trim();
-    }
-    if (obj.tagline !== undefined) {
-      if (!isPlainTextValue(obj.tagline, 80)) return null;
-      loc.tagline = obj.tagline.trim();
-    }
-    if (obj.about !== undefined) {
-      if (!isPlainTextValue(obj.about, 600, true)) return null;
-      loc.about = obj.about.trim();
-    }
-    if (obj.can !== undefined) {
-      if (!Array.isArray(obj.can) || obj.can.length === 0 || obj.can.length > 5) return null;
-      const can: string[] = [];
-      for (const item of obj.can) {
-        if (!isPlainTextValue(item, 100)) return null;
-        can.push(item.trim());
-      }
-      loc.can = can;
-    }
-    if (obj.access_notes !== undefined) {
-      if (!obj.access_notes || typeof obj.access_notes !== "object" || Array.isArray(obj.access_notes)) {
-        return null;
-      }
-      const noteEntries = Object.entries(obj.access_notes as Record<string, unknown>);
-      if (noteEntries.length === 0 || noteEntries.length > 16) return null;
-      const notes: Record<string, string> = {};
-      for (const [k, v] of noteEntries) {
-        if (k.length === 0 || k.length > 64 || !isPlainTextValue(v, 140)) return null;
-        notes[k] = v.trim();
-      }
-      loc.access_notes = notes;
-    }
-    if (Object.keys(loc).length === 0) return null;
-    out[tag] = loc;
-  }
-  return out;
-}
-
 function listingOf(value: unknown): PublicListing | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const row = value as Record<string, unknown>;
+  if (value === undefined || value === null) return {};
+  if (!isPlainJsonObject(value)) return null;
+  const row = value;
   const rawList = Array.isArray(row.can) ? row.can : Array.isArray(row.highlights) ? row.highlights : undefined;
   const highlights = rawList
     ? rawList.filter((item): item is string => typeof item === "string")
@@ -180,9 +138,7 @@ function listingOf(value: unknown): PublicListing | null {
   const tags = Array.isArray(row.tags)
     ? row.tags.filter((item): item is string => typeof item === "string")
     : undefined;
-  const pubObj = row.publisher && typeof row.publisher === "object" && !Array.isArray(row.publisher)
-    ? (row.publisher as Record<string, unknown>).name
-    : row.publisher;
+  const pubObj = isPlainJsonObject(row.publisher) ? row.publisher.name : row.publisher;
   const publisher = typeof pubObj === "string" && pubObj ? pubObj : undefined;
   const description = typeof row.about === "string" && row.about
     ? row.about
@@ -192,25 +148,25 @@ function listingOf(value: unknown): PublicListing | null {
   const tagline = typeof row.tagline === "string" && row.tagline ? row.tagline : undefined;
   const setup = Array.isArray(row.setup)
     ? row.setup
-        .filter((s): s is Record<string, unknown> => !!s && typeof s === "object" && !Array.isArray(s))
+        .filter((s): s is Record<string, unknown> => isPlainJsonObject(s))
         .filter((s) => typeof s.label === "string" && typeof s.help === "string")
         .map((s) => ({ slot: typeof s.slot === "string" ? s.slot : s.label as string, label: s.label as string, help: s.help as string }))
     : undefined;
-  const dataObj = row.data && typeof row.data === "object" && !Array.isArray(row.data)
-    ? (row.data as Record<string, unknown>)
-    : null;
+  const dataObj = isPlainJsonObject(row.data) ? row.data : null;
   const stores = dataObj && Array.isArray(dataObj.stores)
     ? dataObj.stores.filter((item): item is string => typeof item === "string")
     : undefined;
   const personalData = dataObj && typeof dataObj.personal === "boolean" ? dataObj.personal : undefined;
-  const accessObj = row.access_notes && typeof row.access_notes === "object" && !Array.isArray(row.access_notes)
-    ? (row.access_notes as Record<string, unknown>)
-    : null;
+  const accessObj = isPlainJsonObject(row.access_notes) ? row.access_notes : null;
   const accessNotes = accessObj
     ? Object.values(accessObj).filter((item): item is string => typeof item === "string" && !!item)
     : undefined;
-  const i18n = listingI18nOf(row.i18n);
-  if (i18n === null) return null;
+  let i18n: Record<string, ListingDisplayLocale> | undefined;
+  if (row.i18n !== undefined && row.i18n !== null) {
+    const parsedListingI18n = parseListingDisplayI18n(row.i18n);
+    if (!parsedListingI18n) return null;
+    i18n = parsedListingI18n;
+  }
   return {
     tagline,
     category: typeof row.category === "string" ? row.category : undefined,
@@ -227,14 +183,14 @@ function listingOf(value: unknown): PublicListing | null {
 }
 
 export function parsePublicApp(value: unknown): PublicApp | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const row = value as Record<string, unknown>;
+  if (!isPlainJsonObject(value)) return null;
+  const row = value;
   if (typeof row.installable !== "boolean") return null;
   if (typeof row.id !== "string" || !CATALOG_ID.test(row.id) || row.id.startsWith(".") || row.id.includes("..") || typeof row.app !== "string" || typeof row.title !== "string") return null;
   if (typeof row.summary !== "string" || typeof row.version !== "string") return null;
   if (row.digest !== null && (typeof row.digest !== "string" || !DIGEST.test(row.digest))) return null;
   if (row.installable && row.digest === null) return null;
-  if (hasForbiddenPriceKey(row) || "artifact" in row || "path" in row) return null;
+  if (hasUnsafePublicStructure(row)) return null;
   let parsedI18n: AppDisplayI18n | undefined;
   if (row.i18n !== undefined && row.i18n !== null) {
     const parsed = parseAppDisplayI18n(row.i18n);
@@ -560,7 +516,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
             aria-label={t("Category")}
             options={[
               { value: "all", label: t("All categories") },
-              ...categories.map((item) => ({ value: item, label: item })),
+              ...categories.map((item) => ({ value: item, label: localizedAppCategory(item, locale) })),
             ]}
           />
         </div>
@@ -589,7 +545,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
               <Link href={catalogDetailHref(app.id, only?.install_id ?? null)} className="pub-card-link" aria-labelledby={`pub-name-${app.id}`} aria-describedby={`pub-state-${app.id}`}>
                 <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
                 <span className="pub-card-copy">
-                  <span className="pub-card-category">{app.listing.category ? t(app.listing.category) : ""}</span>
+                  <span className="pub-card-category">{app.listing.category ? localizedAppCategory(app.listing.category, locale) : ""}</span>
                   <span className="pub-card-title" id={`pub-name-${app.id}`}>{displayTitle}</span>
                   <span className="pub-card-summary">{displaySummary}</span>
                   {app.listing.publisher && <span className="pub-card-publisher">{app.listing.publisher}</span>}
@@ -896,11 +852,11 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
     <article className="pub-detail" aria-label={displayTitle}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
       <header className="pub-heading">
-        {app.listing.category && <p className="pub-category">{t(app.listing.category)}</p>}
+        {app.listing.category && <p className="pub-category">{localizedAppCategory(app.listing.category, locale)}</p>}
         <h1 id="pub-title" tabIndex={-1}>{displayTitle}</h1>
         <p className="pub-intro">{displayIntro}</p>
         <p className="pub-publisher">
-          {app.listing.publisher ? t("By {publisher}").replace("{publisher}", app.listing.publisher) : app.app}
+          {app.listing.publisher ? t("By {publisher}").replace("{publisher}", () => app.listing.publisher!) : app.app}
           <span className="pub-unverified">{t("Publisher not verified")}</span>
         </p>
       </header>

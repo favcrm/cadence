@@ -1264,10 +1264,7 @@ impl Manifest {
                 let Some(Value::Object(fields)) = Some(entry) else {
                     continue;
                 };
-                let existing_key = out
-                    .keys()
-                    .find(|k| k.eq_ignore_ascii_case(locale))
-                    .cloned();
+                let existing_key = out.keys().find(|k| k.eq_ignore_ascii_case(locale)).cloned();
                 if existing_key.is_none()
                     && out.len() >= cadence_core::app_screen_decl::MAX_I18N_LOCALES
                 {
@@ -1635,7 +1632,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let title = need_str("title", "one line naming the app")?;
     let version = need_str("version", "a version string like 0.1.0")?;
     for (k, v, cap) in [("title", &title, 120), ("version", &version, 40)] {
-        if v.chars().count() > cap || v.chars().any(char::is_control) {
+        if v.encode_utf16().count() > cap
+            || v.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return Err(Error::rejected(format!(
                 "app.md `{k}:` — ≤{cap} chars, no control characters"
             )));
@@ -1648,7 +1648,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             let s = s.trim();
             if s.is_empty() {
                 None
-            } else if s.chars().count() > 160 || s.chars().any(char::is_control) {
+            } else if s.encode_utf16().count() > 160
+                || s.chars()
+                    .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            {
                 return Err(Error::rejected(
                     "app.md `summary:` — ≤160 chars, no control characters",
                 ));

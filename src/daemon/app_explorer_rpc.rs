@@ -903,6 +903,7 @@ impl Shared {
             "digest": digest,
             "check_digest": digest,
             "trust": "unreviewed",
+            "i18n": manifest.display_i18n(),
             "listing": manifest.listing.as_ref().map(|l| l.value.clone()),
             "access": access["access"],
             "never": access["never"],

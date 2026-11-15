@@ -126,7 +126,7 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   display_session_key?: string;
   install_id?: string; context_id?: string | null; digest?: string;
   remote_images?: string[] };
-const SECTION_CTRL_RE = /[\u0000-\u001f\u007f\u2028\u2029]/;
+const SECTION_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
   if (raw === undefined || raw === null) return undefined;

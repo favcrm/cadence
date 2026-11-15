@@ -1,11 +1,15 @@
 import {
+  displayI18nFromListing,
+  isPlainJsonObject,
   isPlainTextValue,
   localeCandidates,
+  localizedAppCategory,
   localizedAppSummary,
   localizedAppTagline,
   localizedAppTitle,
   localizedSectionLabel,
   parseAppDisplayI18n,
+  parseListingDisplayI18n,
   pickLocaleEntry,
   validLocaleTag,
 } from "../src/features/workspace-apps/appLocale";
@@ -74,18 +78,34 @@ function main() {
   // 2. Tag/text helpers, parseAppDisplayI18n bounds, and display resolution precedence.
   assert(validLocaleTag("zh-TW"), "validLocaleTag accepts zh-TW");
   assert(!validLocaleTag("zh_TW"), "validLocaleTag rejects underscore");
+  assert(isPlainJsonObject({ title: "ok" }), "isPlainJsonObject accepts plain object");
+  assert(!isPlainJsonObject(null), "isPlainJsonObject rejects null");
+  assert(!isPlainJsonObject([]), "isPlainJsonObject rejects arrays");
+  assert(!isPlainJsonObject(new Date()), "isPlainJsonObject rejects non-plain instances");
+  assert(!isPlainJsonObject(Object.create({ inherited: 1 })), "isPlainJsonObject rejects custom prototypes");
+  assert(
+    !isPlainJsonObject({
+      get title() {
+        return "x";
+      },
+    }),
+    "isPlainJsonObject rejects accessor descriptors",
+  );
+  assert(!isPlainJsonObject(JSON.parse('{"__proto__":{"title":"x"}}')), "isPlainJsonObject rejects own __proto__ key");
   assert(isPlainTextValue("Hello", 10), "isPlainTextValue accepts trimmed text");
   assert(!isPlainTextValue("bad\nline", 20), "isPlainTextValue rejects newline in single-line mode");
   assert(isPlainTextValue("good\nline", 20, true), "isPlainTextValue allows newline in multiline mode");
   assert(!isPlainTextValue("bad\u2028line", 20, true), "isPlainTextValue rejects Unicode line separator even in multiline mode");
+  assert(!isPlainTextValue("bad\u0085line", 20), "isPlainTextValue rejects C1 NEL in single-line mode");
+  assert(!isPlainTextValue("bad\u0085line", 20, true), "isPlainTextValue rejects C1 NEL in multiline mode");
 
   const parsedI18n = parseAppDisplayI18n({
-    "zh-TW": { title: " 客戶管理 ", summary: "第一行\n第二行", tagline: "客戶關係與分群" },
+    "zh-TW": { title: " 客戶管理 ", summary: "整合客戶資料與互動紀錄", tagline: "客戶關係與分群" },
   });
   equal(
     parsedI18n,
-    { "zh-TW": { title: "客戶管理", summary: "第一行\n第二行", tagline: "客戶關係與分群" } },
-    "parseAppDisplayI18n trims valid entries and allows multiline summary",
+    { "zh-TW": { title: "客戶管理", summary: "整合客戶資料與互動紀錄", tagline: "客戶關係與分群" } },
+    "parseAppDisplayI18n trims valid entries",
   );
   equal(parseAppDisplayI18n({}), null, "parseAppDisplayI18n rejects empty map");
   equal(parseAppDisplayI18n({ zh_TW: { title: "壞" } }), null, "parseAppDisplayI18n rejects bad tag");
@@ -102,12 +122,58 @@ function main() {
   equal(
     parseAppDisplayI18n({ "zh-TW": { title: "客戶管理", about: "說明" } }),
     null,
-    "parseAppDisplayI18n rejects listing-only fields by default",
+    "parseAppDisplayI18n rejects listing-only fields",
   );
   equal(
-    parseAppDisplayI18n({ "zh-TW": { title: "客戶管理", about: "說明" } }, { allowListingFields: true }),
+    parseAppDisplayI18n({ "zh-TW": { summary: "bad\nline" } }),
+    null,
+    "parseAppDisplayI18n rejects newline in summary",
+  );
+  equal(
+    parseListingDisplayI18n({
+      "zh-TW": {
+        title: " 客戶管理 ",
+        summary: "單行簡介",
+        about: "第一行\n第二行",
+        can: [" 建立聯絡人 "],
+        access_notes: { crm_api: " 需要 API 權限 " },
+      },
+    }),
+    {
+      "zh-TW": {
+        title: "客戶管理",
+        summary: "單行簡介",
+        about: "第一行\n第二行",
+        can: ["建立聯絡人"],
+        access_notes: { crm_api: "需要 API 權限" },
+      },
+    },
+    "parseListingDisplayI18n parses trimmed listing fields including multiline about",
+  );
+  equal(
+    parseListingDisplayI18n({ "zh-TW": { summary: "bad\nline" } }),
+    null,
+    "parseListingDisplayI18n rejects newline in summary",
+  );
+  equal(
+    parseListingDisplayI18n({ "zh-TW": { about: "x".repeat(600) } }),
+    { "zh-TW": { about: "x".repeat(600) } },
+    "parseListingDisplayI18n accepts about <= 600 chars",
+  );
+  equal(
+    parseListingDisplayI18n({ "zh-TW": { about: "x".repeat(601) } }),
+    null,
+    "parseListingDisplayI18n rejects about > 600 chars",
+  );
+  equal(
+    displayI18nFromListing({ "zh-TW": { title: "客戶管理", about: "說明" } }),
     { "zh-TW": { title: "客戶管理" } },
-    "parseAppDisplayI18n accepts listing-derived display fields when allowListingFields is set",
+    "displayI18nFromListing extracts valid display fields from listing i18n",
+  );
+  equal(
+    displayI18nFromListing({ "zh-TW": { about: "只有說明" } }),
+    null,
+    "displayI18nFromListing returns null when only non-display fields are present",
   );
   equal(
     parseAppDisplayI18n({ "zh-TW": {}, ja: { title: "Valid" } }),
@@ -150,14 +216,14 @@ function main() {
     "parseAppDisplayI18n rejects title > 80 chars",
   );
   equal(
-    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(280) } }),
-    { "zh-TW": { summary: "x".repeat(280) } },
-    "parseAppDisplayI18n accepts summary <= 280 chars",
+    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(160) } }),
+    { "zh-TW": { summary: "x".repeat(160) } },
+    "parseAppDisplayI18n accepts summary <= 160 chars",
   );
   equal(
-    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(281) } }),
+    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(161) } }),
     null,
-    "parseAppDisplayI18n rejects summary > 280 chars",
+    "parseAppDisplayI18n rejects summary > 160 chars",
   );
   equal(
     parseAppDisplayI18n({ "zh-TW": { tagline: "x".repeat(81) } }),
@@ -506,6 +572,44 @@ function main() {
   const twT = (key: string) => translateUiText(key, "zh-TW");
   const openCtx = chatContext(localizedTw, "contacts", true, twT);
   equal(openCtx?.label, "聯絡人（已開啟）", "chatContext formats localized open record label");
+
+  // 6. C1 control rejection, listing display parsing, fail-closed listing.i18n, and category/dict parity.
+  equal(
+    parseNavigation({
+      section_query: "tab",
+      default_section: "contacts",
+      sections: [{ id: "contacts", label: "bad\u0085label" }],
+    }),
+    null,
+    "parseNavigation rejects C1 NEL in base section label",
+  );
+  equal(
+    parseNavigation({
+      section_query: "tab",
+      default_section: "contacts",
+      sections: [{ id: "contacts", label: "Contacts", i18n: { "zh-TW": { label: "bad\u0085label" } } }],
+    }),
+    null,
+    "parseNavigation rejects C1 NEL in sections[].i18n label",
+  );
+  equal(
+    localizedAppTitle(
+      {
+        title: "CRM",
+        listing: {
+          i18n: {
+            "zh-TW": { title: "不應採用", unknown_field: "bad" } as unknown as Record<string, string>,
+          },
+        },
+      },
+      "zh-TW",
+    ),
+    "CRM",
+    "localizedAppTitle ignores unvalidated listing.i18n",
+  );
+  equal(localizedAppCategory("customers", "zh-TW"), "客戶", "localizedAppCategory translates customers category");
+  equal(localizedAppCategory("marketing", "zh-TW"), "行銷", "localizedAppCategory translates marketing category");
+  equal(translateUiText("customers", "zh-TW"), "位客戶", "translateUiText preserves plural customers word");
 
   console.log("app locale checks passed");
 }

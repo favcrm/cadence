@@ -28,7 +28,7 @@ import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
 import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
-import { localizedAppTitle, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
+import { displayI18nFromListing, localizedAppTitle, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -768,7 +768,7 @@ export default function AppShell({
         kind: installation.name,
         title: installation.title || installation.name,
         navigation: effectiveNavigation,
-        i18n: parseAppDisplayI18n(installation.i18n) ?? parseAppDisplayI18n(installation.listing?.i18n, { allowListingFields: true }),
+        i18n: parseAppDisplayI18n(installation.i18n) ?? displayI18nFromListing(installation.listing?.i18n),
       });
     } else {
       onInstallation(null);

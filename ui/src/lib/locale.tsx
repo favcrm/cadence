@@ -137,10 +137,6 @@ Object.assign(zhTW, {
   "Meeting Minutes": "會議紀錄",
   "Social Content": "社群內容",
   "Works": "作品",
-  "marketing": "行銷",
-  "content": "內容",
-  "operations": "營運",
-  "finance": "財務",
   // App section, record, subject, and card copy
   "Sales": "銷售",
   "Purchases": "採購",

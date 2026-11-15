@@ -8,7 +8,14 @@ import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { useLocale } from "../../lib/locale";
-import { localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, pickLocaleEntry } from "../workspace-apps/appLocale";
+import {
+  localizedAppCategory,
+  localizedAppTagline,
+  localizedAppTitle,
+  parseAppDisplayI18n,
+  parseListingDisplayI18n,
+  pickLocaleEntry,
+} from "../workspace-apps/appLocale";
 import "./explorer.css";
 import { PublicAppDetail } from "./publicDirectory";
 
@@ -84,13 +91,14 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
 
   const access = card.access ?? [];
   const cardI18n = parseAppDisplayI18n(card.i18n);
-  const locTop = pickLocaleEntry(card.i18n as Record<string, { about?: string; can?: string[] }> | null | undefined, locale);
-  const locListing = pickLocaleEntry(card.listing?.i18n, locale);
-  const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: card.listing }, locale, t);
-  const tagline = localizedAppTagline({ tagline: card.tagline, i18n: cardI18n, listing: card.listing }, locale, t);
-  const can = locTop?.can ?? locListing?.can ?? card.can ?? card.listing?.can ?? [];
+  const listingI18n = parseListingDisplayI18n(card.listing?.i18n);
+  const locListing = pickLocaleEntry(listingI18n, locale);
+  const localizedListing = card.listing ? { ...card.listing, i18n: listingI18n ?? undefined } : card.listing;
+  const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: localizedListing }, locale, t);
+  const tagline = localizedAppTagline({ tagline: card.tagline, i18n: cardI18n, listing: localizedListing }, locale, t);
+  const can = locListing?.can ?? card.can ?? card.listing?.can ?? [];
   const shots = card.screenshots ?? card.listing?.screenshots ?? [];
-  const about = locTop?.about ?? locListing?.about ?? card.about ?? card.listing?.about;
+  const about = locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
 
@@ -106,7 +114,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
           <div className="by">
             <TrustChip trust={card.trust} />
             <span>·</span>
-            <span>{card.listing?.category ? t(card.listing.category) : t("App")}</span>
+            <span>{card.listing?.category ? localizedAppCategory(card.listing.category, locale) : t("App")}</span>
             {installed && <span className="chip ok">{t("Installed")}</span>}
             {card.state === "off" && <span className="chip">{t("Access off")}</span>}
             {removed && <span className="chip">{t("Removed")}</span>}
@@ -244,8 +252,8 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
           )}
           <dl className="dl mt-3">
             <dt>Made by</dt><dd><TrustChip trust={card.trust} /></dd>
-            {card.version && <><dt>Version</dt><dd>{card.version}</dd></>}
-            {card.listing?.category && <><dt>Category</dt><dd>{card.listing.category}</dd></>}
+            {card.version && <><dt>{t("Version")}</dt><dd>{card.version}</dd></>}
+            {card.listing?.category && <><dt>{t("Category")}</dt><dd>{localizedAppCategory(card.listing.category, locale)}</dd></>}
             {retired && <><dt>Source</dt><dd>{t("Retired built-in catalog")}</dd></>}
             {isOp && card.digest && <><dt>Digest</dt><dd className="num break-all">{card.digest}</dd></>}
           </dl>

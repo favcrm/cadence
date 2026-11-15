@@ -2,7 +2,7 @@ import { canOpenInstall } from "../explorer/installAccess";
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { useLocale, useTranslate } from "../../lib/locale";
-import { localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
+import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
@@ -460,7 +460,7 @@ function InstalledCard({ h, href, settingsHref, onOpen }: {
     <>
       <AppCover name={h.name} title={title} category={category ?? ""} />
       <div className="app-card-copy">
-        {category && <span className="card-category">{t(category)}</span>}
+        {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
         <h3 className="app-card-name" id={nameId}>{title}</h3>
         {summary && <p className="app-card-summary">{summary}</p>}
         {publisher && <span className="card-publisher">{publisher}</span>}

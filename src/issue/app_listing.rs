@@ -46,14 +46,22 @@ pub struct Listing {
     pub assets: Vec<String>,
 }
 
-fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+fn check_plain_text(
+    value: &serde_yaml::Value,
+    what: &str,
+    max: usize,
+    allow_newlines: bool,
+) -> Result<String> {
     let Some(text) = value.as_str() else {
         return Err(Error::rejected(format!("listing {what} is a plain string")));
     };
     let text = text.trim();
     if text.is_empty()
-        || text.chars().count() > max
-        || text.chars().any(|c| c.is_control() && c != '\n')
+        || text.encode_utf16().count() > max
+        || text.chars().any(|c| {
+            (c.is_control() && (!allow_newlines || c != '\n'))
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
         || text.contains('<')
         || text.contains('>')
         || text.contains("](")
@@ -66,6 +74,14 @@ fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<Strin
         )));
     }
     Ok(text.to_string())
+}
+
+fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+    check_plain_text(value, what, max, false)
+}
+
+fn plain_multiline_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+    check_plain_text(value, what, max, true)
 }
 
 /// `assets/<leaf>.svg` — flat, tag-shaped stem, real file under the
@@ -295,7 +311,7 @@ pub(crate) fn parse(
             )),
         };
     let about = match yget(map, "about") {
-        Some(v) => Some(plain_text(v, "about", 600)?),
+        Some(v) => Some(plain_multiline_text(v, "about", 600)?),
         None => None,
     };
     let mut can = Vec::new();
@@ -515,13 +531,18 @@ fn parse_i18n_locales(
 
 fn parse_optional_text_fields(
     entry: &serde_yaml::Mapping,
-    fields: &[(&str, &str, usize)],
+    fields: &[(&str, &str, usize, bool)],
     out: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
-    for &(key, label, max) in fields {
+    for &(key, label, max, multiline) in fields {
         if let Some(v) = yget(entry, key) {
             if !v.is_null() {
-                out.insert(key.to_string(), json!(plain_text(v, label, max)?));
+                let text = if multiline {
+                    plain_multiline_text(v, label, max)?
+                } else {
+                    plain_text(v, label, max)?
+                };
+                out.insert(key.to_string(), json!(text));
             }
         }
     }
@@ -542,10 +563,10 @@ fn parse_listing_i18n(value: &serde_yaml::Value, slots: &[String]) -> Result<Val
         parse_optional_text_fields(
             entry,
             &[
-                ("title", "i18n.title", 80),
-                ("tagline", "i18n.tagline", 80),
-                ("summary", "i18n.summary", 160),
-                ("about", "i18n.about", 600),
+                ("title", "i18n.title", 80, false),
+                ("tagline", "i18n.tagline", 80, false),
+                ("summary", "i18n.summary", 160, false),
+                ("about", "i18n.about", 600, true),
             ],
             &mut obj,
         )?;
@@ -604,9 +625,9 @@ pub(crate) fn parse_manifest_i18n(value: &serde_yaml::Value) -> Result<Value> {
             parse_optional_text_fields(
                 entry,
                 &[
-                    ("title", "i18n.title", 80),
-                    ("summary", "i18n.summary", 160),
-                    ("tagline", "i18n.tagline", 80),
+                    ("title", "i18n.title", 80, false),
+                    ("summary", "i18n.summary", 160, false),
+                    ("tagline", "i18n.tagline", 80, false),
                 ],
                 &mut obj,
             )?;
@@ -655,10 +676,37 @@ i18n:
             "i18n:\n  zh-TW: {}",
             "i18n:\n  zh-TW:\n    unknown: 1",
             "i18n:\n  zh-TW:\n    access_notes:\n      missing.slot: x",
+            "i18n:\n  zh-TW:\n    title: \"line1\\nline2\"",
+            "i18n:\n  zh-TW:\n    summary: \"line1\\nline2\"",
+            "i18n:\n  zh-TW:\n    title: \"bad\\u2028line\"",
         ] {
             let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
             assert!(parse(&v, 256, &slots).is_err(), "{bad}");
         }
+
+        let long_summary = format!("i18n:\n  zh-TW:\n    summary: {}", "x".repeat(161));
+        let v: serde_yaml::Value = serde_yaml::from_str(&long_summary).unwrap();
+        assert!(parse(&v, 512, &slots).is_err(), "summary > 160");
+
+        let ok_multiline_about = "i18n:\n  zh-TW:\n    about: \"第一段\\n第二段\"";
+        let v: serde_yaml::Value = serde_yaml::from_str(ok_multiline_about).unwrap();
+        assert_eq!(
+            parse(&v, 512, &slots).unwrap().value["i18n"]["zh-TW"]["about"],
+            "第一段\n第二段"
+        );
+
+        let emoji_ok = format!("i18n:\n  zh-TW:\n    title: {}", "😀".repeat(40));
+        let v: serde_yaml::Value = serde_yaml::from_str(&emoji_ok).unwrap();
+        assert!(
+            parse(&v, 512, &slots).is_ok(),
+            "40 astral emoji = 80 UTF-16 units"
+        );
+        let emoji_over = format!("i18n:\n  zh-TW:\n    title: {}", "😀".repeat(41));
+        let v: serde_yaml::Value = serde_yaml::from_str(&emoji_over).unwrap();
+        assert!(
+            parse(&v, 512, &slots).is_err(),
+            "41 astral emoji = 82 UTF-16 units > 80"
+        );
 
         let mut too_many = String::from("i18n:\n");
         for i in 0..9 {

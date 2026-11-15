@@ -598,7 +598,10 @@ mod tests {
             "zh-tw": { "label": "客戶" },
             "zh-TW": { "label": "客戶" }
         });
-        assert!(check(&bad).is_err(), "case-insensitive duplicate locale tag");
+        assert!(
+            check(&bad).is_err(),
+            "case-insensitive duplicate locale tag"
+        );
 
         let mut bad = ok.clone();
         let mut too_many = serde_json::Map::new();

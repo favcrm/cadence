@@ -220,15 +220,15 @@ async function main() {
   try { await directory.loadPublicApp(app.id, new AbortController().signal); } catch { refused = true; }
   assert(refused, "a detail response for another identity is not the requested app");
 
-  // CAD-2314: parsePublicApp rejects nested price/cost/pricing keys and invalid i18n fail-closed.
+  // CAD-2314: parsePublicApp rejects nested price/cost/pricing/artifact/path/deep/non-plain inputs and invalid i18n fail-closed.
   const validI18nApp = {
     ...app,
-    i18n: { "zh-TW": { title: "範例筆記", summary: "第一行\n第二行", tagline: "輕量筆記" } },
+    i18n: { "zh-TW": { title: "範例筆記", summary: "一行摘要", tagline: "輕量筆記" } },
     listing: {
       i18n: {
         "zh-TW": {
           title: "範例筆記",
-          summary: "第一行\n第二行",
+          summary: "一行摘要",
           about: "說明第一段\n說明第二段",
           can: ["建立筆記", "整理摘要"],
           access_notes: { "notes.read": "讀取筆記內容" },
@@ -239,15 +239,26 @@ async function main() {
   const parsedValidI18nApp = directory.parsePublicApp(validI18nApp);
   assert(
     parsedValidI18nApp !== null && parsedValidI18nApp.listing.i18n?.["zh-TW"]?.can?.length === 2,
-    "parsePublicApp accepts bounded multiline listing i18n",
+    "parsePublicApp accepts valid single-line summary and bounded multiline about",
   );
+  let deeplyNested: Record<string, unknown> = { ok: true };
+  for (let i = 0; i < 35; i++) deeplyNested = { child: deeplyNested };
+  const protoInjectedListing = JSON.parse('{"__proto__":{"polluted":true}}');
+  const getterObj = Object.defineProperty({}, "safe", { enumerable: true, get: () => "x" });
   for (const [why, badRow] of [
     ["nested pricing key in listing", { ...app, listing: { details: { pricing: { monthly: 10 } } } }],
     ["nested cost key in array", { ...app, listing: { items: [{ cost: 5 }] } }],
+    ["nested artifact key in listing", { ...app, listing: { nested: { artifact: "foo.tar.zst" } } }],
+    ["nested path key in listing", { ...app, listing: { nested: { path: "/etc/passwd" } } }],
+    ["depth > 32 fails closed", { ...app, listing: deeplyNested }],
+    ["non-object listing", { ...app, listing: "bad" }],
+    ["__proto__ own key in listing", { ...app, listing: protoInjectedListing }],
+    ["getter descriptor object", { ...app, listing: getterObj }],
     ["invalid row.i18n duplicate locale", { ...app, i18n: { "zh-tw": { title: "A" }, "zh-TW": { title: "B" } } }],
+    ["newline in listing.i18n summary", { ...app, listing: { i18n: { "zh-TW": { summary: "line1\nline2" } } } }],
     ["invalid listing.i18n unknown key", { ...app, listing: { i18n: { "zh-TW": { extra: "bad" } } } }],
     ["listing.i18n can > 5 items", { ...app, listing: { i18n: { "zh-TW": { can: ["1", "2", "3", "4", "5", "6"] } } } }],
-    ["listing.i18n summary > 280 chars", { ...app, listing: { i18n: { "zh-TW": { summary: "x".repeat(281) } } } }],
+    ["listing.i18n summary > 160 chars", { ...app, listing: { i18n: { "zh-TW": { summary: "x".repeat(161) } } } }],
   ] as const) {
     assert(directory.parsePublicApp(badRow) === null, `parsePublicApp rejects ${why}`);
   }
