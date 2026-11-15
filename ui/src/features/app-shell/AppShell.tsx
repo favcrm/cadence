@@ -768,7 +768,7 @@ export default function AppShell({
         kind: installation.name,
         title: installation.title || installation.name,
         navigation: effectiveNavigation,
-        i18n: parseAppDisplayI18n(installation.i18n) ?? displayI18nFromListing(installation.listing?.i18n),
+        i18n: parseAppDisplayI18n(installation.i18n, { wire: true }) ?? displayI18nFromListing(installation.listing?.i18n, { wire: true }),
       });
     } else {
       onInstallation(null);
@@ -1042,7 +1042,7 @@ export default function AppShell({
     ? localizedAppTitle(
         {
           title: installation.title || installation.name,
-          i18n: parseAppDisplayI18n(installation.i18n),
+          i18n: parseAppDisplayI18n(installation.i18n, { wire: true }),
           listing: installation.listing,
         },
         locale,

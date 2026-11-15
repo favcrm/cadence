@@ -6,7 +6,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
-import { isPlainJsonObject, MAX_I18N_LOCALES, validLocaleTag } from "../appLocale";
+import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
  *  when it cannot be loaded now. Supplied by the board; never by the frame. */
@@ -128,41 +128,32 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   install_id?: string; context_id?: string | null; digest?: string;
   remote_images?: string[] };
 const SECTION_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const SECTION_I18N_KEYS = new Set(["label"]);
+const RESERVED_SECTION_QUERIES = new Set([
+  "app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity",
+  "auth", "token", "key", "session", "session_key", "origin", "project", "workspace",
+  "conversation", "thread", "message", "view", "appview", "record", "record_id",
+  "segment", "segment_id", "screen", "contract-preview", "nonce", "proof",
+  "generation", "digest",
+]);
 
 function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
   if (raw === undefined || raw === null) return undefined;
   if (!isPlainJsonObject(raw)) return null;
-  const entries = Object.entries(raw);
   // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
-  if (entries.length === 0) return undefined;
-  if (entries.length > MAX_I18N_LOCALES) return null;
-  const out: Record<string, ScreenSectionI18n> = {};
-  const seenLocales = new Set<string>();
-  for (const [locale, entry] of entries) {
-    if (!validLocaleTag(locale)) return null;
-    const lowerLocale = locale.toLowerCase();
-    if (seenLocales.has(lowerLocale)) return null;
-    seenLocales.add(lowerLocale);
-    if (!isPlainJsonObject(entry)) return null;
-    const keys = Object.keys(entry);
-    if (keys.length !== 1 || keys[0] !== "label") return null;
+  if (Object.keys(raw).length === 0) return undefined;
+  return parseLocaleEntries(raw, SECTION_I18N_KEYS, (entry) => {
     const label = entry.label;
-    if (typeof label !== "string" || label.trim().length === 0 || label.length > 40 || SECTION_CTRL_RE.test(label)) return null;
-    Object.defineProperty(out, locale, {
-      value: { label },
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    });
-  }
-  return out;
+    return typeof label === "string" && label.trim().length > 0 && label.length <= 40 && !SECTION_CTRL_RE.test(label)
+      ? { label }
+      : null;
+  });
 }
 
 export function parseNavigation(value: unknown): ScreenNavigation | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const nav = value as Record<string, unknown>;
-  const reserved = new Set(["app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity", "auth", "token", "key", "session", "session_key", "origin", "project", "workspace", "conversation", "thread", "message", "view", "appview", "record", "record_id", "segment", "segment_id", "screen", "contract-preview", "nonce", "generation", "digest"]);
-  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || reserved.has(nav.section_query) || typeof nav.default_section !== "string" || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8) return null;
+  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || RESERVED_SECTION_QUERIES.has(nav.section_query) || typeof nav.default_section !== "string" || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8) return null;
   const seen = new Set<string>();
   const sections: ScreenSection[] = [];
   for (const rawSection of nav.sections) {

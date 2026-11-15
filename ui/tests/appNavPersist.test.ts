@@ -89,9 +89,9 @@ async function settle(check: () => void) {
 }
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const go = (path: string) => React.act(async () => { navigate(path); });
-const appLinks = () => Array.from(host.querySelectorAll('aside nav[aria-label="Primary"] > div a.navlink-sub')) as HTMLAnchorElement[];
-const appLink = (title: string) => appLinks().find((a) => a.textContent?.trim() === title);
-const sections = () => Array.from(host.querySelectorAll('aside nav[aria-label="CRM sections"] a')) as HTMLAnchorElement[];
+const appLinks = (navLabel = "Primary") => Array.from(host.querySelectorAll(`aside nav[aria-label="${navLabel}"] > div a.navlink-sub`)) as HTMLAnchorElement[];
+const appLink = (title: string, navLabel = "Primary") => appLinks(navLabel).find((a) => a.textContent?.trim() === title);
+const sections = (navLabel = "CRM sections") => Array.from(host.querySelectorAll(`aside nav[aria-label="${navLabel}"] a`)) as HTMLAnchorElement[];
 
 win.localStorage.clear();
 history.pushState(null, "", "/");
@@ -150,6 +150,7 @@ await remount(async () => {
   await settle(() => equal(labels(), ["Customers", "Segments"], "home"));
   await go("/apps/crm?section=segments");
   await settle(() => assert(sections().find((s) => s.textContent?.trim() === "Segments")?.getAttribute("aria-current") === "page", "active"));
+  equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content", "cross-app link strips active app section_query");
   await go("/settings/email-sending");
   await settle(() => assert(location.pathname.startsWith("/settings"), "settings"));
   equal(labels(), ["Customers", "Segments"], "persist");
@@ -165,6 +166,20 @@ await remount(async () => {
     const ls = Array.from(host.querySelectorAll("aside a.navlink-sub")).map((a) => a.textContent?.trim());
     assert(["客戶關係", "社群內容", "客戶名單", "分眾"].every((x) => ls.includes(x)), "zh-TW");
   });
+});
+
+installationsFixture = [
+  installationsFixture[0],
+  {
+    ...mk("install-soc", "social-content", "Social Content"),
+    navigation: { section_query: "tab", default_section: "posts", sections: [secDef("posts", "Posts", "貼文")] },
+  },
+];
+await remount(async () => {
+  await settle(() => assert(appLink("社群內容", "主要導覽"), "social listed in zh-TW"));
+  await go("/apps/crm?section=segments&tab=drafts&keep=1");
+  await settle(() => assert(sections("客戶關係 區段").find((s) => s.textContent?.trim() === "分眾")?.getAttribute("aria-current") === "page", "crm active"));
+  equal(appLink("社群內容", "主要導覽")!.getAttribute("href"), "/apps/social-content?keep=1", "cross-app link strips source and target section_query while preserving unrelated params");
 });
 
 console.log("app nav persistence checks passed");

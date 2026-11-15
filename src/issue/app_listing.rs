@@ -590,6 +590,11 @@ fn parse_listing_i18n(value: &serde_yaml::Value, slots: &[String]) -> Result<Val
                         "listing i18n.{locale}.access_notes is a {{slot: note}} mapping"
                     )));
                 };
+                if notes.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "listing i18n.{locale}.access_notes must not be empty"
+                    )));
+                }
                 let mut note_map = serde_json::Map::new();
                 for (k, nv) in notes {
                     let slot = k.as_str().ok_or_else(|| {
@@ -661,6 +666,7 @@ mod tests {
             "{zh-TW: {}}",
             "{zh-TW: {unknown: 1}}",
             "{zh-TW: {access_notes: {missing.slot: x}}}",
+            "{zh-TW: {title: \"客\", access_notes: {}}}",
             "{zh-TW: {title: \"a\\nb\"}}",
             "{zh-TW: {title: \"a\\u2028b\"}}",
         ] {

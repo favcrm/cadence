@@ -9,6 +9,7 @@ import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { useLocale } from "../../lib/locale";
 import {
+  extractAccessNoteEntries,
   localizedAppCategory,
   localizedAppTagline,
   localizedAppTitle,
@@ -101,7 +102,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const about = locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
-  const accessNotes = Object.values(locListing?.access_notes ?? card.access_notes ?? card.listing?.access_notes ?? {}).filter(Boolean);
+  const accessNotes = extractAccessNoteEntries(locListing?.access_notes, card.access_notes ?? card.listing?.access_notes);
 
   return (
     <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={title}>
@@ -190,7 +191,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             <div className="blk">
               <h2>{t("Access notes")}</h2>
               <ul className="can">
-                {accessNotes.map((n, i) => <li key={i}><span aria-hidden>◦</span><span>{n}</span></li>)}
+                {accessNotes.map(([slotKey, text]) => <li key={slotKey}><span aria-hidden>◦</span><span>{text}</span></li>)}
               </ul>
             </div>
           )}

@@ -565,6 +565,7 @@ impl ScreenNavigation {
             "install_id",
             "context",
             "context_id",
+            "ctx",
             "actor",
             "identity",
             "auth",
@@ -588,6 +589,8 @@ impl ScreenNavigation {
             "contract-preview",
             "nonce",
             "proof",
+            "generation",
+            "digest",
         ];
         let key = self.section_query.as_bytes();
         if key.is_empty()
@@ -2121,6 +2124,18 @@ mod tests {
                 &bodies
             )
             .is_err());
+        }
+
+        for reserved in ["ctx", "generation", "digest", "proof"] {
+            let m = format!(
+                r#"{{"contract":"app-screens/v2","app":"crm","entry":"client.js","assets":[{{"name":"client.js","media_type":"text/javascript","size":{},"sha256":"{}"}}],"provenance":{{"source_digest":"{}","sdk_digest":"{}","toolchain_digest":"{}"}},"host_contract":"screen-records.v1","may":[],"navigation":{{"section_query":"{reserved}","default_section":"customers","sections":[{{"id":"customers","label":"Customers"}}]}}}}"#,
+                BODY.len(),
+                digest(BODY),
+                digest("source"),
+                digest("sdk"),
+                digest("toolchain"),
+            );
+            assert!(validate_map(&m, &bodies).is_err(), "{reserved}");
         }
 
         let many = (0..=MAX_I18N_LOCALES)

@@ -67,9 +67,9 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
       {check && (
         <>
           <dl className="ic-facts text-label mt-2">
-            <dt>App</dt><dd>{check.name}</dd>
-            <dt>Version</dt><dd>{check.version}</dd>
-            <dt>Digest</dt><dd><code className="ic-digest" title={check.digest}>{check.digest}</code></dd>
+            <dt>{t("App")}</dt><dd>{check.name}</dd>
+            <dt>{t("Version")}</dt><dd>{check.version}</dd>
+            <dt>{t("Digest")}</dt><dd><code className="ic-digest" title={check.digest}>{check.digest}</code></dd>
             <dt>{t("Files")}</dt><dd>{check.files.length}</dd>
           </dl>
           <details className="mt-2">

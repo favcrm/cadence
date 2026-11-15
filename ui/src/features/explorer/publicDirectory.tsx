@@ -5,7 +5,7 @@ import Select from "../../ui/Select";
 import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
-import { isPlainJsonObject, localizedAppCategory, localizedAppSummary, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, parseListingDisplayI18n, pickLocaleEntry, type AppDisplayI18n, type ListingDisplayLocale } from "../workspace-apps/appLocale";
+import { extractAccessNoteEntries, isPlainJsonObject, localizedAppCategory, localizedAppSummary, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, parseListingDisplayI18n, pickLocaleEntry, type AppDisplayI18n, type ListingDisplayLocale } from "../workspace-apps/appLocale";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -434,27 +434,24 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
     }
     return map;
   }, [installs.rows]);
-  const publicTitle = (app: PublicApp) => localizedAppTitle(
-    { title: app.title, i18n: app.i18n, listing: app.listing },
-    locale,
-    t,
-  );
-  const publicTagline = (app: PublicApp) =>
-    localizedAppTagline(
-      { tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing },
-      locale,
-      t,
-    ) || localizedAppSummary(
-      { summary: app.summary, i18n: app.i18n, listing: app.listing },
-      locale,
-      t,
-    );
+  const localizedById = useMemo(() => new Map(
+    (apps ?? []).map((app) => [
+      app.id,
+      {
+        title: localizedAppTitle({ title: app.title, i18n: app.i18n, listing: app.listing }, locale, t),
+        tagline:
+          localizedAppTagline({ tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing }, locale, t) ||
+          localizedAppSummary({ summary: app.summary, i18n: app.i18n, listing: app.listing }, locale, t),
+      },
+    ]),
+  ), [apps, locale, t]);
   const shown = (apps ?? []).filter((app) => {
+    const localized = localizedById.get(app.id);
     const hay = [
       app.title,
-      publicTitle(app),
+      localized?.title,
       app.summary,
-      publicTagline(app),
+      localized?.tagline,
       app.app,
       app.listing.tagline,
       app.listing.publisher,
@@ -511,8 +508,9 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
           const rows = installsByName.get(app.app) ?? [];
           const only = rows.length === 1 ? rows[0] : null;
           const known = installs.rows !== null && !installs.loading && !installs.error;
-          const displayTitle = publicTitle(app);
-          const displaySummary = publicTagline(app);
+          const localized = localizedById.get(app.id);
+          const displayTitle = localized?.title ?? app.title;
+          const displaySummary = localized?.tagline ?? app.listing.tagline ?? app.summary;
           return (
             <article className="pub-card" key={app.id}>
               <Link href={catalogDetailHref(app.id, only?.install_id ?? null)} className="pub-card-link" aria-labelledby={`pub-name-${app.id}`} aria-describedby={`pub-state-${app.id}`}>
@@ -818,9 +816,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   ) || displaySummary;
   const displayDescription = locListing?.about ?? app.listing.description ?? displaySummary;
   const highlights = locListing?.can ?? app.listing.highlights ?? [];
-  const accessNotes = locListing?.access_notes
-    ? Object.values(locListing.access_notes).filter(Boolean)
-    : app.listing.accessNotes;
+  const accessNotes = extractAccessNoteEntries(locListing?.access_notes, app.listing.accessNotes);
   return (
     <article className="pub-detail" aria-label={displayTitle}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
@@ -847,8 +843,8 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
             <section className="pub-section">
               <h2>{t("What you can do")}</h2>
               <ul className="pub-features">
-                {highlights.map((item) => (
-                  <li key={item}>
+                {highlights.map((item, idx) => (
+                  <li key={`${idx}:${item}`}>
                     <svg aria-hidden="true" viewBox="0 0 20 20"><path d="m4 10 4 4 8-9" /></svg>
                     <span>{item}</span>
                   </li>
@@ -880,7 +876,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
           {accessNotes && accessNotes.length > 0 && (
             <section className="pub-section">
               <h2>{t("Access notes")}</h2>
-              <ul className="pub-plain">{accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
+              <ul className="pub-plain">{accessNotes.map(([slotKey, item]) => <li key={slotKey}>{item}</li>)}</ul>
             </section>
           )}
         </div>

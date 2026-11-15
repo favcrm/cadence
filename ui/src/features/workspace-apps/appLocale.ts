@@ -11,12 +11,20 @@ const SLOT_KEY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const CTRL_SINGLE_LINE_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const CTRL_MULTILINE_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]/;
 const TRADITIONAL_CHINESE_TAGS = new Set(["zh-tw", "zh-hk", "zh-mo", "zh-hant"]);
-const FORBIDDEN_PLAIN_OBJECT_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const FORBIDDEN_PLAIN_OBJECT_KEYS = new Set([
+  "__proto__", "prototype", "constructor",
+  "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
+]);
+export function isForbiddenPlainKey(key: string): boolean {
+  return FORBIDDEN_PLAIN_OBJECT_KEYS.has(key) || key in Object.prototype;
+}
 const ZH_TW_APP_CATEGORIES: Record<string, string> = {
   marketing: "行銷", customers: "客戶", operations: "營運", finance: "財務", content: "內容", other: "其他",
 };
 const DISPLAY_KEYS = new Set(["title", "summary", "tagline"]);
 const LISTING_KEYS = new Set(["title", "summary", "tagline", "about", "can", "access_notes"]);
+const wireAppDisplayCache = new WeakMap<object, AppDisplayI18n | null>();
+const wireListingDisplayCache = new WeakMap<object, AppListingI18n | null>();
 
 export function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -26,7 +34,7 @@ export function isPlainJsonObject(value: unknown): value is Record<string, unkno
   const descs = Object.getOwnPropertyDescriptors(value);
   return Object.keys(descs).every((k) => {
     const d = descs[k];
-    return !FORBIDDEN_PLAIN_OBJECT_KEYS.has(k) && !!d && typeof d.get !== "function" && typeof d.set !== "function";
+    return !isForbiddenPlainKey(k) && !!d && typeof d.get !== "function" && typeof d.set !== "function";
   });
 }
 
@@ -77,10 +85,10 @@ export function pickLocaleEntry<T>(map: Record<string, T> | null | undefined, lo
   return undefined;
 }
 
-function parseLocaleEntries<T extends object>(
+export function parseLocaleEntries<T extends object>(
   value: unknown,
   allowedKeys: Set<string>,
-  parseEntry: (raw: Record<string, unknown>) => T | null,
+  parseEntry: (raw: Record<string, unknown>, wire: boolean) => T | null,
   wire = false,
 ): Record<string, T> | null {
   if (!isPlainJsonObject(value)) return null;
@@ -95,7 +103,7 @@ function parseLocaleEntries<T extends object>(
     if (!isPlainJsonObject(raw)) return null;
     const keys = Object.keys(raw);
     if ((!wire && keys.length === 0) || keys.some((k) => !allowedKeys.has(k))) return null;
-    const parsed = parseEntry(raw);
+    const parsed = parseEntry(raw, wire);
     if (!parsed) return null;
     if (Object.keys(parsed).length === 0) {
       if (!wire) return null;
@@ -106,35 +114,45 @@ function parseLocaleEntries<T extends object>(
   return out;
 }
 
-function parseBaseDisplay(raw: Record<string, unknown>): AppDisplayLocale | null {
+function parseBaseDisplay(raw: Record<string, unknown>, wire = false): AppDisplayLocale | null {
   const out: AppDisplayLocale = {};
   for (const [k, max, multi] of [["title", 80, false], ["summary", 280, true], ["tagline", 80, false]] as const) {
-    if (raw[k] !== undefined && raw[k] !== null) {
-      if (!isPlainTextValue(raw[k], max, multi)) return null;
-      out[k] = raw[k].trim();
-    }
+    const val = raw[k];
+    if (val === undefined || (wire && val === null)) continue;
+    if (!isPlainTextValue(val, max, multi)) return null;
+    out[k] = val.trim();
   }
   return out;
 }
 
 export function parseAppDisplayI18n(value: unknown, opts?: { wire?: boolean }): AppDisplayI18n | null {
-  return parseLocaleEntries(value, DISPLAY_KEYS, parseBaseDisplay, Boolean(opts?.wire));
+  const wire = Boolean(opts?.wire);
+  if (wire && typeof value === "object" && value !== null) {
+    if (wireAppDisplayCache.has(value)) return wireAppDisplayCache.get(value) ?? null;
+    const parsed = parseLocaleEntries(value, DISPLAY_KEYS, parseBaseDisplay, true);
+    wireAppDisplayCache.set(value, parsed);
+    return parsed;
+  }
+  return parseLocaleEntries(value, DISPLAY_KEYS, parseBaseDisplay, wire);
 }
 
 export function parseListingDisplayI18n(value: unknown, opts?: { wire?: boolean }): AppListingI18n | null {
   const wire = Boolean(opts?.wire);
-  return parseLocaleEntries(value, LISTING_KEYS, (raw) => {
-    const base = parseBaseDisplay(raw);
+  if (wire && typeof value === "object" && value !== null && wireListingDisplayCache.has(value)) {
+    return wireListingDisplayCache.get(value) ?? null;
+  }
+  const result = parseLocaleEntries(value, LISTING_KEYS, (raw, isWire) => {
+    const base = parseBaseDisplay(raw, isWire);
     if (!base) return null;
     const loc: AppListingLocale = { ...base };
-    if (raw.about !== undefined && raw.about !== null) {
+    if (raw.about !== undefined && !(isWire && raw.about === null)) {
       if (!isPlainTextValue(raw.about, 600, true)) return null;
       loc.about = raw.about.trim();
     }
-    if (raw.can !== undefined && raw.can !== null) {
+    if (raw.can !== undefined && !(isWire && raw.can === null)) {
       if (!Array.isArray(raw.can) || raw.can.length > 5) return null;
       if (raw.can.length === 0) {
-        if (!wire) return null;
+        if (!isWire) return null;
       } else {
         const can: string[] = [];
         for (const item of raw.can) {
@@ -144,24 +162,50 @@ export function parseListingDisplayI18n(value: unknown, opts?: { wire?: boolean 
         loc.can = can;
       }
     }
-    if (raw.access_notes !== undefined && raw.access_notes !== null) {
+    if (raw.access_notes !== undefined && !(isWire && raw.access_notes === null)) {
       if (!isPlainJsonObject(raw.access_notes)) return null;
       const noteEntries = Object.entries(raw.access_notes);
-      if ((!wire && noteEntries.length === 0) || noteEntries.length > (wire ? 64 : 16)) return null;
+      if ((!isWire && noteEntries.length === 0) || noteEntries.length > (isWire ? 64 : 16)) return null;
       const notes: Record<string, string> = {};
       for (const [k, v] of noteEntries) {
-        const validKey = wire ? (k.length >= 1 && k.length <= 64 && !CTRL_SINGLE_LINE_RE.test(k)) : SLOT_KEY_RE.test(k);
-        if (FORBIDDEN_PLAIN_OBJECT_KEYS.has(k) || !validKey || !isPlainTextValue(v, 140)) return null;
+        const validKey = isWire
+          ? (k.trim().length >= 1 && k.length <= 64 && !CTRL_SINGLE_LINE_RE.test(k))
+          : SLOT_KEY_RE.test(k);
+        if (isForbiddenPlainKey(k) || !validKey || !isPlainTextValue(v, 140)) return null;
         setOwn(notes, k, v.trim());
       }
       if (noteEntries.length > 0) loc.access_notes = notes;
     }
     return loc;
   }, wire);
+  if (wire && typeof value === "object" && value !== null) {
+    wireListingDisplayCache.set(value, result);
+  }
+  return result;
 }
 
-export function displayI18nFromListing(value: unknown): AppDisplayI18n | null {
-  const listingI18n = parseListingDisplayI18n(value);
+export function extractAccessNoteEntries(
+  localizedNotes: Record<string, string> | null | undefined,
+  fallbackNotes?: Record<string, string> | readonly string[] | null,
+): [string, string][] {
+  const rawEntries: [string, unknown][] = localizedNotes && Object.keys(localizedNotes).length > 0
+    ? Object.entries(localizedNotes)
+    : Array.isArray(fallbackNotes)
+      ? fallbackNotes.map((text, index): [string, unknown] => [String(index), text])
+      : fallbackNotes
+        ? Object.entries(fallbackNotes)
+        : [];
+  const out: [string, string][] = [];
+  for (const [key, value] of rawEntries) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed.length > 0) out.push([key, trimmed]);
+  }
+  return out;
+}
+
+export function displayI18nFromListing(value: unknown, opts?: { wire?: boolean }): AppDisplayI18n | null {
+  const listingI18n = parseListingDisplayI18n(value, opts);
   if (!listingI18n) return null;
   const out: AppDisplayI18n = {};
   for (const [tag, e] of Object.entries(listingI18n)) {

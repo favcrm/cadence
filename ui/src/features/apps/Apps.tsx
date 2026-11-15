@@ -24,7 +24,7 @@ import "../explorer/explorer.css";
 
 function homeAppTitle(h: HomeInstallation, locale: string, t: TranslateFn): string {
   return localizedAppTitle(
-    { title: h.title, i18n: parseAppDisplayI18n(h.i18n), listing: h.listing },
+    { title: h.title, i18n: parseAppDisplayI18n(h.i18n, { wire: true }), listing: h.listing },
     locale,
     t,
   );
@@ -32,7 +32,7 @@ function homeAppTitle(h: HomeInstallation, locale: string, t: TranslateFn): stri
 
 function homeAppTagline(h: HomeInstallation, locale: string, t: TranslateFn): string {
   return localizedAppTagline(
-    { tagline: h.tagline, i18n: parseAppDisplayI18n(h.i18n), listing: h.listing },
+    { tagline: h.tagline, i18n: parseAppDisplayI18n(h.i18n, { wire: true }), listing: h.listing },
     locale,
     t,
   );
@@ -126,8 +126,8 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
 
   const localizedById = useMemo(() => new Map(
-    live.map((h) => [h.install_id, { title: homeAppTitle(h, locale, t), tagline: homeAppTagline(h, locale, t) }]),
-  ), [live, locale, t]);
+    (home ?? []).map((h) => [h.install_id, { title: homeAppTitle(h, locale, t), tagline: homeAppTagline(h, locale, t) }]),
+  ), [home, locale, t]);
 
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -193,7 +193,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
     return (
       <div key={h.install_id} className="attn-row">
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
-        <span className="txt"><b>{homeAppTitle(h, locale, t)}</b> · {h.attention.message ?? label}</span>
+        <span className="txt"><b>{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</b> · {h.attention.message ? t(h.attention.message) : label}</span>
         {isOp ? (
           <Button className="btn-sm" href={(s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`}>
             {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
@@ -299,7 +299,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                             checked={favs?.favorites.includes(h.install_id) ?? false}
                             disabled={favs === null}
                             onChange={() => pin(h.install_id)} />
-                          <span className="favpick-name">{homeAppTitle(h, locale, t)}</span>
+                          <span className="favpick-name">{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</span>
                         </label>
                       ))}
                     </div>
@@ -310,8 +310,9 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
             {favorites.length > 0 ? (
               <div className="favs">
                 {favorites.map((h) => {
-                  const title = homeAppTitle(h, locale, t);
-                  const tagline = homeAppTagline(h, locale, t);
+                  const localized = localizedById.get(h.install_id);
+                  const title = localized?.title ?? homeAppTitle(h, locale, t);
+                  const tagline = localized?.tagline ?? homeAppTagline(h, locale, t);
                   return (
                   <div key={h.install_id} className="card fav">
                     {(() => {
@@ -371,6 +372,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 <div className="apps-grid">
                   {items.map((h) => (
                     <InstalledCard key={h.install_id} h={h}
+                      localized={localizedById.get(h.install_id)}
                       href={openHref(h)}
                       settingsHref={settingsHref(h)}
                       onOpen={() => opened(h.install_id)} />
@@ -393,7 +395,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 {removedList.map((h) => (
                   <div key={h.install_id} className="rrow flex items-center gap-3 p-3">
                     <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                    <div className="grow"><b>{homeAppTitle(h, locale, t)}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
+                    <div className="grow"><b>{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
                     {h.attention.action === "restore" && (
                       <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
                         {t(busy === h.install_id ? "Restoring…" : "Restore")}
@@ -444,8 +446,9 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
  * listing fields come from the real `app_home` row — absent fields
  * leave clean slots, never fixture text.
  */
-function InstalledCard({ h, href, settingsHref, onOpen }: {
+function InstalledCard({ h, localized, href, settingsHref, onOpen }: {
   h: HomeInstallation;
+  localized?: { title: string; tagline: string };
   href: string | null;
   settingsHref: string | null;
   onOpen: () => void;
@@ -463,8 +466,8 @@ function InstalledCard({ h, href, settingsHref, onOpen }: {
   const statusId = `app-card-status-${h.install_id}`;
   const listing = h.listing;
   const category = listing?.category;
-  const title = homeAppTitle(h, locale, t);
-  const summary = homeAppTagline(h, locale, t);
+  const title = localized?.title ?? homeAppTitle(h, locale, t);
+  const summary = localized?.tagline ?? homeAppTagline(h, locale, t);
   const publisher = listing?.publisher?.name;
   const body = (
     <>

@@ -223,12 +223,34 @@ fn i18n_locales(
     Ok(())
 }
 
+fn i18n_text(value: Option<&Value>, path: &str, max: usize) -> Result<String> {
+    let s = text(value, path, max)?;
+    if s.trim().is_empty() {
+        return fail(path, "expected a non-blank string");
+    }
+    if s.chars().any(|c| matches!(c, '\u{80}'..='\u{9f}')) {
+        return fail(path, "control characters are not allowed");
+    }
+    Ok(s)
+}
+
+fn i18n_prompts(value: Option<&Value>, path: &str) -> Result<()> {
+    let items = array(value, path, 3)?;
+    if items.is_empty() {
+        return fail(path, "expected at least 1 entry");
+    }
+    for (i, p) in items.iter().enumerate() {
+        i18n_text(Some(p), &format!("{path}.{i}"), 80)?;
+    }
+    Ok(())
+}
+
 fn label_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<()> {
     let Some(val) = parent.get("i18n") else {
         return Ok(());
     };
     i18n_locales(val, &format!("{path}.i18n"), &["label"], |entry, lp| {
-        text(entry.get("label"), &format!("{lp}.label"), 40)?;
+        i18n_text(entry.get("label"), &format!("{lp}.label"), 40)?;
         Ok(())
     })
 }
@@ -243,10 +265,10 @@ fn context_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<(
         &["label", "prompts"],
         |entry, lp| {
             if entry.contains_key("label") {
-                text(entry.get("label"), &format!("{lp}.label"), 40)?;
+                i18n_text(entry.get("label"), &format!("{lp}.label"), 40)?;
             }
             if entry.contains_key("prompts") {
-                prompts(entry.get("prompts"), &format!("{lp}.prompts"))?;
+                i18n_prompts(entry.get("prompts"), &format!("{lp}.prompts"))?;
             }
             Ok(())
         },
@@ -263,10 +285,10 @@ fn card_i18n(parent: &serde_json::Map<String, Value>, path: &str) -> Result<()> 
         &["title", "text"],
         |entry, lp| {
             if entry.contains_key("title") {
-                text(entry.get("title"), &format!("{lp}.title"), 80)?;
+                i18n_text(entry.get("title"), &format!("{lp}.title"), 80)?;
             }
             if entry.contains_key("text") {
-                text(entry.get("text"), &format!("{lp}.text"), 240)?;
+                i18n_text(entry.get("text"), &format!("{lp}.text"), 240)?;
             }
             Ok(())
         },
@@ -537,9 +559,16 @@ mod tests {
             ("ctx", json!({})),
             ("ctx", json!({"zh_TW":{"label":"客"}})),
             ("ctx", json!({"zh-TW":{}})),
+            ("ctx", json!({"zh-TW":{"prompts":[]}})),
+            ("ctx", json!({"zh-TW":{"label":"   "}})),
+            ("ctx", json!({"zh-TW":{"prompts":["\u{0085}"]}})),
             ("att", json!({"zh-TW":{"title":"x"}})),
+            ("att", json!({"zh-TW":{"label":"   "}})),
             ("card", json!({"zh-TW":{"label":"x"}})),
+            ("card", json!({"zh-TW":{"text":"x\u{0085}y"}})),
             ("sub", json!({"zh-TW":{"label":"客\n"}})),
+            ("sub", json!({"zh-TW":{"label":"\u{0085}"}})),
+            ("sub", json!({"zh-TW":{"label":"   "}})),
             (
                 "sub",
                 json!({"zh-tw":{"label":"客"},"zh-TW":{"label":"客"}}),

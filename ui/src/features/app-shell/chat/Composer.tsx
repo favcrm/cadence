@@ -716,7 +716,7 @@ export default function Composer({
     <button
       type="button"
       className="app-chat-attach"
-      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
+      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : t("unavailable")}`}
       title={attachEnabled
         ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}

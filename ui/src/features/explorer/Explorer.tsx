@@ -41,24 +41,24 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
   if (viewer.operator === null && viewer.access === "unavailable") {
     return (
-      <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
+      <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={t("explore apps")}>
         <h1 className="text-section font-semibold text-ink-100 mb-4">{t("Explore apps")}</h1>
         <PublicDirectory viewer={viewer} />
-        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-          Access could not be confirmed. Retry the access check before acting.
+        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel={t("Retry access check")}>
+          {t("Access could not be confirmed. Retry the access check before acting.")}
         </Notice>
       </main>
     );
   }
 
   return (
-    <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
+    <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={t("explore apps")}>
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
         <h1 className="text-section font-semibold text-ink-100">{t("Explore apps")}</h1>
         <span className="grow" />
         <div className="popwrap relative">
           <Button className="btn-sm" onClick={() => setGitOpen((v) => !v)} aria-expanded={gitOpen}>
-            More ▾
+            {t("More ▾")}
           </Button>
           {gitOpen && (
             <div className="pmenu" role="menu">
@@ -68,10 +68,10 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
                 </button>
               ) : (
                 <button className="w-full text-left opacity-50" disabled>
-                  Add from Git URL<small className="block text-ink-500">Admins only</small>
+                  {t("Add from Git URL")}<small className="block text-ink-500">{t("Admins only")}</small>
                 </button>
               )}
-              <Link href="/apps" className="block">Your installed apps</Link>
+              <Link href="/apps" className="block">{t("Your installed apps")}</Link>
             </div>
           )}
         </div>
@@ -118,7 +118,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
   const { locale, t } = useLocale();
   const title = localizedAppTitle(
-    { title: card.title, i18n: parseAppDisplayI18n(card.i18n), listing: card.listing },
+    { title: card.title, i18n: parseAppDisplayI18n(card.i18n, { wire: true }), listing: card.listing },
     locale,
     t,
   );
@@ -158,7 +158,7 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
   useEscape(true, onClose);
   const foundTitle = found
     ? localizedAppTitle(
-        { title: found.title, i18n: parseAppDisplayI18n(found.i18n), listing: found.listing },
+        { title: found.title, i18n: parseAppDisplayI18n(found.i18n, { wire: true }), listing: found.listing },
         locale,
         t,
       )

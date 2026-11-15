@@ -937,7 +937,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         kind: i.name,
         title: i.title || i.name,
         navigation: parseNavigation(i.navigation),
-        i18n: parseAppDisplayI18n(i.i18n),
+        i18n: parseAppDisplayI18n(i.i18n, { wire: true }),
         listing: i.listing ?? null,
       })),
     [installations.list],
@@ -1025,6 +1025,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         const targetSearch = new URLSearchParams(search);
         if (installId !== activeId) {
           for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation", "install"]) targetSearch.delete(key);
+          const currentSectionQuery = selectedMenuApp?.navigation?.section_query;
+          if (currentSectionQuery) targetSearch.delete(currentSectionQuery);
+          const targetSectionQuery = menuApps.find((app) => app.installId === installId)?.navigation?.section_query;
+          if (targetSectionQuery) targetSearch.delete(targetSectionQuery);
         }
         const nextSearch = targetSearch.toString();
         return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));

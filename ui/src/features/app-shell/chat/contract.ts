@@ -193,17 +193,31 @@ function parseI18nMap<T>(
   return out;
 }
 
+function i18nText(v: unknown, path: string, max: number): string {
+  const s = text(v, path, max);
+  if (s.trim().length === 0) fail(path, "expected a non-blank string");
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x80 && c <= 0x9f) fail(path, "control characters are not allowed");
+  }
+  return s;
+}
+
 function parseLabelI18n(raw: unknown, path: string): ChatLabelI18n | undefined {
   return parseI18nMap(raw, path, ["label"], (entry, lp) => ({
-    label: text(entry.label, `${lp}.label`, 40),
+    label: i18nText(entry.label, `${lp}.label`, 40),
   }));
 }
 
 function parseContextI18n(raw: unknown, path: string): ChatContextI18n | undefined {
   return parseI18nMap(raw, path, ["label", "prompts"], (entry, lp) => {
     const out: { label?: string; prompts?: string[] } = {};
-    if (entry.label !== undefined) out.label = text(entry.label, `${lp}.label`, 40);
-    if (entry.prompts !== undefined) out.prompts = prompts(entry.prompts, `${lp}.prompts`);
+    if (entry.label !== undefined) out.label = i18nText(entry.label, `${lp}.label`, 40);
+    if (entry.prompts !== undefined) {
+      const items = list(entry.prompts, `${lp}.prompts`, 3);
+      if (items.length === 0) fail(`${lp}.prompts`, "expected at least 1 entry");
+      out.prompts = items.map((p, i) => i18nText(p, `${lp}.prompts.${i}`, 80));
+    }
     return out;
   });
 }
@@ -211,8 +225,8 @@ function parseContextI18n(raw: unknown, path: string): ChatContextI18n | undefin
 function parseCardI18n(raw: unknown, path: string): ChatCardI18n | undefined {
   return parseI18nMap(raw, path, ["title", "text"], (entry, lp) => {
     const out: { title?: string; text?: string } = {};
-    if (entry.title !== undefined) out.title = text(entry.title, `${lp}.title`, 80);
-    if (entry.text !== undefined) out.text = text(entry.text, `${lp}.text`, 240);
+    if (entry.title !== undefined) out.title = i18nText(entry.title, `${lp}.title`, 80);
+    if (entry.text !== undefined) out.text = i18nText(entry.text, `${lp}.text`, 240);
     return out;
   });
 }

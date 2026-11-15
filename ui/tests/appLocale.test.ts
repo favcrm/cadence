@@ -41,8 +41,12 @@ function main() {
   eq(L.displayI18nFromListing(tw({ title: "客", about: "x" })), tw({ title: "客" }), "fromL");
   eq(L.parseAppDisplayI18n({ "zh-TW": {}, ja: { title: null } }, { wire: true }), {}, "wireApp0");
   eq(L.parseListingDisplayI18n({ "zh-TW": { title: " 客 ", about: null, can: [], access_notes: {}, tagline: null }, ja: {} }, { wire: true }), tw({ title: "客" }), "wireListNull");
+  eq(L.displayI18nFromListing({ "zh-TW": { title: " 客 ", summary: null, about: null } }, { wire: true }), tw({ title: "客" }), "fromLWire");
+  eq([L.parseAppDisplayI18n(tw({ title: null })), L.parseListingDisplayI18n(tw({ title: "客", about: null }))], [null, null], "strictNull");
   eq(L.parseListingDisplayI18n(tw({ access_notes: { "CRM Read / Write": " 唯讀 " } }), { wire: true }), tw({ access_notes: { "CRM Read / Write": "唯讀" } }), "wireNotes");
-  for (const b of [tw({ title: "x", extra: "y" }), tw({ can: ["1", "2", "3", "4", "5", "6"] }), tw({ access_notes: { "bad\nkey": "x" } }), tw({ access_notes: JSON.parse('{"__proto__":"x"}') }), tw({ about: "x".repeat(601) })]) {
+  eq(L.extractAccessNoteEntries({ c: " 甲 ", b: "" }, ["乙"]), [["c", "甲"]], "notesObj");
+  eq(L.extractAccessNoteEntries(undefined, ["乙", "  "]), [["0", "乙"]], "notesArr");
+  for (const b of [tw({ title: "x", extra: "y" }), tw({ can: ["1", "2", "3", "4", "5", "6"] }), tw({ access_notes: { "bad\nkey": "x" } }), tw({ access_notes: { "   ": "x" } }), tw({ access_notes: { toString: "x" } }), tw({ access_notes: { constructor: "x" } }), tw({ access_notes: JSON.parse('{"__proto__":"x"}') }), tw({ about: "x".repeat(601) })]) {
     eq(L.parseListingDisplayI18n(b, { wire: true }), null, "badWire");
   }
 
@@ -55,7 +59,7 @@ function main() {
   eq(parseNavigation(nv(tw({ label: "聯" })))?.sections[0].i18n?.["zh-TW"]?.label, "聯", "nav");
   const nav0 = parseNavigation(nv({}));
   ok(nav0 !== null && nav0.sections[0].i18n === undefined, "nav{}");
-  for (const b of [nv({ zh_TW: { label: "x" } }), nv(n9({ label: "x" })), ...["x\ny", "  ", "x".repeat(41), "x\u0085y"].map((v) => nv(tw({ label: v }))), nv(tw({ label: "x", extra: "y" })), nv({ "zh-tw": { label: "A" }, ...tw({ label: "B" }) }), nv(Object.defineProperty({}, "zh-TW", { enumerable: true, get: () => ({ label: "x" }) })), nv(undefined, "x\u2028y"), nv(undefined, "x\u0085y", "tab")]) eq(parseNavigation(b), null, "badN");
+  for (const b of [nv({ zh_TW: { label: "x" } }), nv(n9({ label: "x" })), ...["x\ny", "  ", "x".repeat(41), "x\u0085y"].map((v) => nv(tw({ label: v }))), nv(tw({ label: "x", extra: "y" })), nv({ "zh-tw": { label: "A" }, ...tw({ label: "B" }) }), nv(Object.defineProperty({}, "zh-TW", { enumerable: true, get: () => ({ label: "x" }) })), nv(undefined, "x\u2028y"), nv(undefined, "x\u0085y", "tab"), ...["proof", "ctx", "generation", "digest"].map((q) => nv(undefined, "C", q))]) eq(parseNavigation(b), null, "badN");
 
   const fs = require("fs"), path = require("path");
   const s = JSON.parse(fs.readFileSync(path.join(require("process").cwd(), "..", "contracts", "app-chat", "v1", "app-chat.schema.json"), "utf8")).$defs;
@@ -76,7 +80,7 @@ function main() {
   const c0 = (i18n: unknown) => ({ contexts: [{ id: "c", label: "C", prompts: [], i18n }] });
   const a0 = (i18n: unknown) => ({ attachments: [{ id: "csv-import", label: "A", i18n }] });
   const s0 = (i18n: unknown) => ({ subjects: [{ kind: "k", label: "K", i18n }] });
-  for (const patch of [a0({}), a0({ zh_TW: { label: "x" } }), a0(n9({ label: "x" })), c0(tw({ prompts: ["a", "b", "c", "d"] })), c0(tw({ prompts: ["x".repeat(81)] })), s0(tw({ label: "a\nb" })), s0(tw({ label: "x", extra: "y" })), s0({ "zh-tw": { label: "A" }, ...tw({ label: "B" }) })]) {
+  for (const patch of [a0({}), a0({ zh_TW: { label: "x" } }), a0(n9({ label: "x" })), a0(tw({ label: "   " })), c0(tw({ prompts: [] })), c0(tw({ prompts: ["a", "b", "c", "d"] })), c0(tw({ prompts: ["x".repeat(81)] })), c0(tw({ label: "   " })), c0(tw({ label: "a\u0085b" })), s0(tw({ label: "   " })), s0(tw({ label: "a\u0085b" })), s0(tw({ label: "a\nb" })), s0(tw({ label: "x", extra: "y" })), s0({ "zh-tw": { label: "A" }, ...tw({ label: "B" }) })]) {
     let threw = false;
     try { C.parseAppChat({ ...chat, ...patch }); } catch (e) { threw = e instanceof C.AppChatContractError; }
     ok(threw, "badChat");
@@ -86,7 +90,7 @@ function main() {
   eq(chatContext(cTw, "c", true, twT)?.label, "C-TW（已開啟）", "ctx");
   const dChat = C.parseAppChat({ contract: C.APP_CHAT_CONTRACT, app: "crm", contexts: [{ id: "c", label: "C", prompts: [], record: { label: "A$&$$", prompts: [] } }] });
   eq(chatContext(dChat, "c", true, twT)?.label, "A$&$$（已開啟）", "$safe");
-  eq([twT("New conversation (unsaved)"), twT("New {label} conversation (unsaved)").replace("{label}", () => "聯絡人")], ["新對話（未儲存）", "新聯絡人對話（未儲存）"], "draft");
+  eq([twT("New conversation (unsaved)"), twT("New {label} conversation (unsaved)").replace("{label}", () => "聯絡人")], ["新增對話（未儲存）", "新增聯絡人對話（未儲存）"], "draft");
   eq([L.localizedAppCategory("customers", "zh-TW"), L.localizedAppCategory("marketing", "zh-TW"), translateUiText("customers", "zh-TW")], ["客戶", "行銷", "位客戶"], "cat");
   console.log("app locale checks passed");
 }
