@@ -1610,6 +1610,26 @@ impl Shared {
             crate::master_perm::clock(),
         )?;
         let owner = req.requested_by.clone();
+        if owner != ALIAS {
+            if let Ok(pm_dir) = self.pm_dir() {
+                if req.argv.iter().skip(1).any(|a| {
+                    crate::master_perm::touches_pm_agents_dir(
+                        a,
+                        std::path::Path::new(&req.cwd),
+                        &pm_dir,
+                    )
+                }) {
+                    let _ = crate::master_perm::reopen(
+                        &self.state_dir,
+                        id,
+                        crate::master_perm::clock(),
+                    );
+                    return Err(Error::rejected(
+                        "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
+                    ));
+                }
+            }
+        }
         let body = crate::master_perm::request_json(&req);
         self.audit_perm(
             "permission_decided",
@@ -1649,6 +1669,7 @@ impl Shared {
             }
         };
         let tail = optional_strs(params, "tail")?;
+        let pm = self.pm()?;
         let (checkouts, states) = self.perm_roots();
         let state_refs = Self::perm_states(&states);
         let (req, rule) = crate::master_perm::always_rule(
@@ -1661,7 +1682,20 @@ impl Shared {
             crate::master_perm::clock(),
         )?;
         let owner = req.requested_by.clone();
-        let pm = self.pm()?;
+        if owner != ALIAS
+            && req.argv.iter().skip(1).any(|a| {
+                crate::master_perm::touches_pm_agents_dir(
+                    a,
+                    std::path::Path::new(&req.cwd),
+                    &pm.dir,
+                )
+            })
+        {
+            let _ = crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
+            return Err(Error::rejected(
+                "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
+            ));
+        }
         if let Err(e) = self.persist_rule(&pm, &owner, rule.clone()) {
             let _ = crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
             return Err(e);
@@ -1701,12 +1735,15 @@ impl Shared {
         let id = required_str(params, "id")?;
         let dont = params["dont_ask_again"].as_bool().unwrap_or(false);
         let reason = optional_str(params, "reason").map(str::to_string);
+        let pm = dont.then(|| self.pm()).transpose()?;
         let (req, rule) =
             crate::master_perm::reject(&self.state_dir, id, dont, crate::master_perm::clock())?;
         let owner = req.requested_by.clone();
         if let Some(rule) = &rule {
-            let pm = self.pm()?;
-            if let Err(e) = self.persist_rule(&pm, &owner, rule.clone()) {
+            let pm = pm
+                .as_ref()
+                .ok_or_else(|| Error::internal("pm handle missing for dont_ask_again reject"))?;
+            if let Err(e) = self.persist_rule(pm, &owner, rule.clone()) {
                 let _ =
                     crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
                 return Err(e);
@@ -1758,15 +1795,19 @@ impl Shared {
         };
         let target_path = crate::master_perm::rules_file(&pm.dir, &owner)?;
         let lock = pm.lock_for_paths(std::slice::from_ref(&target_path))?;
+        let prev_rules = crate::master_perm::read_rules(&pm.dir, &owner)?;
         let rule = crate::master_perm::revoke_rule(&pm.dir, &owner, id)?;
-        crate::issue::write::commit_scoped(
+        if let Err(e) = crate::issue::write::commit_scoped(
             &pm,
             &lock,
             std::slice::from_ref(&target_path),
             &format!("agents/{owner}: revoke a permission rule"),
             &[],
             "operator",
-        )?;
+        ) {
+            let _ = crate::master_perm::write_rules(&pm.dir, &owner, &prev_rules);
+            return Err(e);
+        }
         let body = crate::master_perm::rule_json_for(&rule, &owner);
         self.audit_perm("permission_revoked", body.clone());
         self.wake();

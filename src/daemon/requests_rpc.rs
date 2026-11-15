@@ -306,17 +306,17 @@ impl Shared {
             return Ok(existing);
         }
         let pending_perm = if kind == "approval" && !crate::master::is_master(&alias) {
-            let pm_dir = self.pm().ok().map(|pm| pm.dir);
+            let pm_dir = self.pm_dir()?;
             let cwd_buf = optional_str(params, "cwd")
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from)
                 .or_else(|| (!agent.cwd.is_empty()).then(|| std::path::PathBuf::from(&agent.cwd)))
-                .unwrap_or_else(|| pm_dir.clone().unwrap_or_else(|| self.state_dir.clone()));
+                .unwrap_or_else(|| pm_dir.clone());
             let (_checkouts, states) = self.perm_roots();
             let state_refs = Self::perm_states(&states);
             match crate::master_perm::evaluate_worker(
                 &self.state_dir,
-                pm_dir.as_deref(),
+                Some(pm_dir.as_path()),
                 &alias,
                 &handle,
                 tool,

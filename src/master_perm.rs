@@ -11,9 +11,10 @@
 //! Callers are checked by the daemon, not here. This module is the
 //! record and the match.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -218,15 +219,29 @@ fn save_doc(state_dir: &Path, doc: &Doc) -> Result<()> {
     Ok(())
 }
 
+fn reject_rules_symlinks(pm_dir: &Path, alias: &str, path: &Path, action: &str) -> Result<()> {
+    let checks = [
+        pm_dir.join("agents"),
+        pm_dir.join("agents").join(alias),
+        path.to_path_buf(),
+        path.with_extension("yaml.tmp"),
+    ];
+    if checks
+        .iter()
+        .any(|p| p.symlink_metadata().is_ok_and(|m| m.is_symlink()))
+    {
+        return Err(Error::rejected(format!(
+            "agents/{alias}/permissions.yaml is or traverses a symlink — refusing to {action} it"
+        )));
+    }
+    Ok(())
+}
+
 fn load_rules(pm_dir: &Path, alias: &str) -> Result<Vec<Rule>> {
     let path = rules_file(pm_dir, alias)?;
+    reject_rules_symlinks(pm_dir, alias, &path, "read")?;
     if !path.exists() && path.symlink_metadata().is_err() {
         return Ok(vec![]);
-    }
-    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "agents/{alias}/permissions.yaml is a symlink — refusing to read it"
-        )));
     }
     let text = fs::read_to_string(&path)?;
     let file: RulesFile = serde_yaml::from_str(&text).map_err(|e| {
@@ -335,7 +350,10 @@ fn cadence_subcommand(argv: &[String]) -> Option<&str> {
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
-        if matches!(a, "--org" | "--state-dir" | "--project") {
+        if a == "--" {
+            return argv.get(i + 1).map(String::as_str);
+        }
+        if matches!(a, "--org" | "--state-dir" | "--project" | "--wake-timeout") {
             i += 2;
             continue;
         }
@@ -428,7 +446,7 @@ fn never_why_for(
             );
         }
     }
-    if argv.iter().any(|a| protected_file(a)) || edit_target_protected(argv) {
+    if argv.iter().any(|a| touches_protected_file(a, cwd)) || edit_target_protected(argv) {
         return Some("agent SOUL.md, AGENT.md and permissions.yaml files are never requestable");
     }
     if touches_state_for(argv, cwd, state_dirs, allow_master_scratch) {
@@ -478,47 +496,109 @@ fn state_root(dir: &Path) -> PathBuf {
     fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
+fn arg_path_candidates(arg: &str) -> [Option<&str>; 2] {
+    let rhs = arg
+        .split_once('=')
+        .map(|(_, v)| v)
+        .filter(|v| !v.is_empty());
+    [Some(arg), rhs]
+}
+
+fn expand_path_symlinks(path: &Path) -> std::result::Result<PathBuf, ()> {
+    const MAX_SYMLINK_HOPS: usize = 40;
+    let mut cur = PathBuf::new();
+    let mut queue: VecDeque<OsString> = VecDeque::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                queue.push_back(comp.as_os_str().to_os_string());
+            }
+        }
+    }
+    let mut hops = 0usize;
+    while let Some(part) = queue.pop_front() {
+        if part.as_os_str() == std::ffi::OsStr::new("..") {
+            if matches!(cur.components().next_back(), Some(Component::Normal(_))) {
+                cur.pop();
+            } else if !cur.has_root() {
+                cur.push("..");
+            }
+            continue;
+        }
+        let next = cur.join(&part);
+        if next
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return Err(());
+            }
+            let target = fs::read_link(&next).map_err(|_| ())?;
+            let mut suffix = Vec::new();
+            for comp in target.components() {
+                match comp {
+                    Component::Prefix(p) => {
+                        cur = PathBuf::new();
+                        cur.push(p.as_os_str());
+                    }
+                    Component::RootDir => {
+                        if !matches!(cur.components().next(), Some(Component::Prefix(_))) {
+                            cur = PathBuf::new();
+                        }
+                        cur.push(Path::new("/"));
+                    }
+                    Component::CurDir => {}
+                    Component::ParentDir | Component::Normal(_) => {
+                        suffix.push(comp.as_os_str().to_os_string());
+                    }
+                }
+            }
+            for item in suffix.into_iter().rev() {
+                queue.push_front(item);
+            }
+            continue;
+        }
+        cur = next;
+    }
+    Ok(cur)
+}
+
 fn resolve_canonical(path: &Path) -> PathBuf {
     if let Ok(canon) = fs::canonicalize(path) {
         return canon;
     }
-    let mut normalized = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
-            std::path::Component::RootDir => normalized.push(Path::new("/")),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                let popped = normalized.pop();
-                if !popped && !normalized.has_root() {
-                    normalized.push("..");
-                }
-            }
-            std::path::Component::Normal(s) => normalized.push(s),
+    expand_path_symlinks(path).unwrap_or_else(|()| path.to_path_buf())
+}
+
+fn touches_protected_file(arg: &str, cwd: &Path) -> bool {
+    arg_path_candidates(arg).into_iter().flatten().any(|cand| {
+        if protected_file(cand) {
+            return true;
         }
-    }
-    if let Ok(canon) = fs::canonicalize(&normalized) {
-        return canon;
-    }
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = normalized.as_path();
-    while let Some(name) = cur.file_name() {
-        tail.push(name.to_os_string());
-        let Some(parent) = cur.parent() else {
-            break;
-        };
-        if parent.as_os_str().is_empty() {
-            break;
+        let probed = probe_path(cand, cwd);
+        if protected_file(&probed.to_string_lossy()) {
+            return true;
         }
-        if let Ok(mut canon) = fs::canonicalize(parent) {
-            for part in tail.iter().rev() {
-                canon.push(part);
-            }
-            return canon;
+        match expand_path_symlinks(&probed) {
+            Ok(exp) => protected_file(&exp.to_string_lossy()),
+            Err(()) => true,
         }
-        cur = parent;
-    }
-    normalized
+    })
+}
+
+pub(crate) fn touches_pm_agents_dir(arg: &str, cwd: &Path, pm_dir: &Path) -> bool {
+    let agents_root = resolve_canonical(&pm_dir.join("agents"));
+    arg_path_candidates(arg).into_iter().flatten().any(|cand| {
+        let probed = probe_path(cand, cwd);
+        match expand_path_symlinks(&probed) {
+            Ok(exp) => exp == agents_root || exp.parent() == Some(agents_root.as_path()),
+            Err(()) => true,
+        }
+    })
 }
 
 fn is_state_root(arg: &str, cwd: &Path, state_dirs: &[&Path]) -> bool {
@@ -1185,11 +1265,11 @@ fn live_rules(pm_dir: &Path, alias: &str, state_dirs: &[&Path]) -> Result<Vec<Ru
     let rules = load_rules(pm_dir, alias)?;
     Ok(rules
         .into_iter()
-        .filter(|rule| rule_live_for(alias, rule, state_dirs))
+        .filter(|rule| rule_live_for(alias, rule, state_dirs, pm_dir))
         .collect())
 }
 
-fn rule_live_for(alias: &str, rule: &Rule, state_dirs: &[&Path]) -> bool {
+fn rule_live_for(alias: &str, rule: &Rule, state_dirs: &[&Path], pm_dir: &Path) -> bool {
     if check_rule_shape(&rule.argv, &rule.tail, &rule.scope).is_err() {
         return false;
     }
@@ -1204,23 +1284,21 @@ fn rule_live_for(alias: &str, rule: &Rule, state_dirs: &[&Path]) -> bool {
             probe.push(pat.clone());
         }
     }
+    let cwd = Path::new(&rule.cwd);
     if alias == crate::master::ALIAS {
-        !matches!(
-            classify(&probe, Path::new(&rule.cwd), &[], state_dirs),
-            Class::Never { .. }
-        )
+        !matches!(classify(&probe, cwd, &[], state_dirs), Class::Never { .. })
     } else {
-        never_why_for(&probe, Path::new(&rule.cwd), state_dirs, false).is_none()
+        never_why_for(&probe, cwd, state_dirs, false).is_none()
+            && !probe
+                .iter()
+                .skip(1)
+                .any(|a| touches_pm_agents_dir(a, cwd, pm_dir))
     }
 }
 
 pub fn write_rules(pm_dir: &Path, alias: &str, rules: &[Rule]) -> Result<PathBuf> {
     let path = rules_file(pm_dir, alias)?;
-    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "agents/{alias}/permissions.yaml is a symlink — refusing to write it"
-        )));
-    }
+    reject_rules_symlinks(pm_dir, alias, &path, "write")?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -1281,12 +1359,20 @@ pub fn list_all_rules(pm_dir: &Path) -> Vec<(String, Rule)> {
 
 /// Locate the agent alias whose `permissions.yaml` owns `rule_id`.
 pub fn find_rule_owner(pm_dir: &Path, rule_id: &str) -> Result<String> {
+    let mut first_err = None;
     for alias in known_rule_aliases(pm_dir) {
-        if let Ok(rules) = load_rules(pm_dir, &alias) {
-            if rules.iter().any(|r| r.id == rule_id) {
-                return Ok(alias);
+        match load_rules(pm_dir, &alias) {
+            Ok(rules) => {
+                if rules.iter().any(|r| r.id == rule_id) {
+                    return Ok(alias);
+                }
             }
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
         }
+    }
+    if let Some(err) = first_err {
+        return Err(err);
     }
     Err(Error::rejected(format!("no permission rule '{rule_id}'")))
 }
@@ -1606,11 +1692,23 @@ pub fn evaluate_worker(
             "{why} — it cannot be approved and no permission rule can cover it"
         )));
     }
+    if let Some(pm) = pm_dir {
+        if argv
+            .iter()
+            .skip(1)
+            .any(|a| touches_pm_agents_dir(a, &cwd, pm))
+        {
+            return Err(Error::rejected(
+                "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
+            ));
+        }
+    }
     let mut input_paths = Vec::new();
     collect_input_paths(input, 0, &mut input_paths);
     for path in input_paths {
-        let probed = probe_path(&path, &cwd).to_string_lossy().into_owned();
-        if protected_file(&path) || protected_file(&probed) {
+        if touches_protected_file(&path, &cwd)
+            || pm_dir.is_some_and(|pm| touches_pm_agents_dir(&path, &cwd, pm))
+        {
             return Err(Error::rejected(
                 "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
             ));
@@ -2823,6 +2921,178 @@ mod tests {
             .unwrap()
             .is_none(),
             "worker allow rule must not authorize Master"
+        );
+    }
+
+    #[test]
+    fn worker_symlink_and_dangling_symlink_to_protected_files_are_never() {
+        let dir = tmp();
+        let pm = dir.path().join("pm");
+        let w1_dir = pm.join("agents/w1");
+        let w2_dir = pm.join("agents/w2");
+        fs::create_dir_all(&w1_dir).unwrap();
+        fs::create_dir_all(&w2_dir).unwrap();
+        let w2_perm = w2_dir.join("permissions.yaml");
+        fs::write(&w2_perm, "rules: []\n").unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let cwd = fs::canonicalize(&repo).unwrap();
+
+        std::os::unix::fs::symlink(&w1_dir, cwd.join("cfg")).unwrap();
+        // Point dangling symlink into a not-yet-created subdirectory/file under pm/agents.
+        let uncreated_perm = pm.join("agents/w3/permissions.yaml");
+        std::os::unix::fs::symlink(&uncreated_perm, cwd.join("dangling.yaml")).unwrap();
+        std::os::unix::fs::symlink(&w2_perm, cwd.join("live.yaml")).unwrap();
+
+        // Plant a broad prefix rule for Write <cwd>/cfg/*.
+        let prefix_rule = Rule {
+            id: "mr-cfg-prefix".into(),
+            effect: Effect::Allow,
+            scope: Scope::Prefix,
+            argv: vec!["Write".into()],
+            tail: vec![format!("{}/cfg/*", cwd.display())],
+            cwd: cwd.to_string_lossy().into_owned(),
+            by: "operator".into(),
+            at: 1_000,
+        };
+        write_rules(&pm, "w1", &[prefix_rule]).unwrap();
+
+        for target in [
+            "cfg/permissions.yaml",
+            "cfg/SOUL.md",
+            "cfg/AGENT.md",
+            "cfg/../w2/permissions.yaml",
+            "dangling.yaml",
+            "live.yaml",
+        ] {
+            let err = evaluate_worker(
+                dir.path(),
+                Some(pm.as_path()),
+                "w1",
+                "h-sym-write",
+                "Write",
+                &serde_json::json!({"file_path": target, "content": "x"}),
+                target,
+                &cwd,
+                &[dir.path()],
+                1_001,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("never requestable"), "{target}: {err}");
+
+            let cls = classify(&["Write".into(), target.into()], &cwd, &[], &[dir.path()]);
+            assert!(matches!(cls, Class::Never { .. }), "{target}: {cls:?}");
+        }
+
+        // Bash hitting <cwd>/cfg (directory symlink to pm/agents/w1) or --file=<cwd>/dangling.yaml.
+        for cmd in [
+            "cp /tmp/x cfg".to_string(),
+            format!(
+                "cadence --file={} --help",
+                cwd.join("dangling.yaml").display()
+            ),
+        ] {
+            let err = evaluate_worker(
+                dir.path(),
+                Some(pm.as_path()),
+                "w1",
+                "h-sym-bash",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                &cmd,
+                &cwd,
+                &[dir.path()],
+                1_002,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("never requestable") || err.contains("cannot be approved"),
+                "{cmd}: {err}"
+            );
+        }
+
+        // Even if a pending request was somehow planted, allow_once and always_rule must refuse it.
+        let mut doc = Doc::default();
+        doc.requests.push(Request {
+            id: "mp-sym-dangling".into(),
+            argv: vec![
+                "cadence".into(),
+                format!("--file={}", cwd.join("dangling.yaml").display()),
+            ],
+            cwd: cwd.to_string_lossy().into_owned(),
+            reason: "planted".into(),
+            requested_by: "w1".into(),
+            created: 1_000,
+            expires_at: 1_000 + TTL_SECS,
+            status: "pending".into(),
+            risk: Risk::High,
+            decision: String::new(),
+            decision_label: String::new(),
+        });
+        save_doc(dir.path(), &doc).unwrap();
+        allow_once(dir.path(), "mp-sym-dangling", &[], &[dir.path()], 1_003)
+            .expect_err("allow_once must refuse dangling symlink to protected permissions.yaml");
+        always_rule(
+            dir.path(),
+            "mp-sym-dangling",
+            Scope::Exact,
+            &[],
+            &[],
+            &[dir.path()],
+            1_003,
+        )
+        .expect_err("always_rule must refuse dangling symlink to protected permissions.yaml");
+    }
+
+    #[test]
+    fn cadence_wake_timeout_and_global_flags_never_bypass_update() {
+        let dir = tmp();
+        let pm = dir.path().join("pm");
+        fs::create_dir_all(&pm).unwrap();
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+
+        for cmd in [
+            "cadence --wake-timeout 10 update",
+            "cadence --wake-timeout=10 --org fav-limited update",
+            "cadence -- update",
+        ] {
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                matches!(
+                    classify(&argv, &cwd, &[], &[dir.path()]),
+                    Class::Never { .. }
+                ),
+                "expected Class::Never for `{cmd}`"
+            );
+            let err = evaluate_worker(
+                dir.path(),
+                Some(pm.as_path()),
+                "w1",
+                "h-wake-update",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                cmd,
+                &cwd,
+                &[dir.path()],
+                1_005,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("never requestable"), "{cmd}: {err}");
+        }
+
+        let allowed_argv: Vec<String> = "cadence --wake-timeout 10 issue show CAD-616"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !matches!(
+                classify(&allowed_argv, &cwd, &[], &[dir.path()]),
+                Class::Never { .. }
+            ),
+            "issue show with --wake-timeout must not be Class::Never"
         );
     }
 }
