@@ -600,6 +600,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "input_json",
             "context_json",
             "created",
+            "has_unresolved_pricing",
         ],
     ),
     (
@@ -621,6 +622,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "approved_source",
             "approved_at",
             "source_sha256",
+            "source_format",
         ],
     ),
     (

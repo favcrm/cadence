@@ -16,13 +16,19 @@ export function proposalRequest(name: string, file: string, provenance: IntakePr
   const evidence = provenance.evidence;
   const found =
     evidence.format === "docx"
-      ? {
-          placeholders: evidence.structure.placeholders,
-          table_placeholders: evidence.structure.table_placeholders,
-          loops: evidence.structure.loops,
-          unrecognized_markers: evidence.structure.unrecognized_markers,
-          text: evidence.blocks.map((b) => `${b.locator}: ${b.text}`).join("\n"),
-        }
+      ? "structure" in evidence
+        ? {
+            placeholders: evidence.structure.placeholders,
+            table_placeholders: evidence.structure.table_placeholders,
+            loops: evidence.structure.loops,
+            unrecognized_markers: evidence.structure.unrecognized_markers,
+            text: evidence.blocks.map((b) => `${b.locator}: ${b.text}`).join("\n"),
+          }
+        : {
+            placeholders: evidence.placeholders,
+            tables: evidence.tables,
+            text: evidence.paragraphs.map((p, idx) => `p[${idx + 1}]: ${p}`).join("\n"),
+          }
       : { pdf_text: evidence.pages.map((p) => `page ${p.page}: ${p.text}`).join("\n") };
   let data = JSON.stringify({ file, source_sha256: provenance.source.sha256, found }, null, 2);
   if (data.length > PROPOSAL_TEXT_CAP) data = `${data.slice(0, PROPOSAL_TEXT_CAP)}\n...[truncated]`;

@@ -159,7 +159,11 @@ pub use migration::{
 /// `staged_routine_proposals`.
 ///
 /// v69 (CAD-2378) adds `workspace_settings`, the company time zone.
-pub const SCHEMA_VERSION: i64 = 69;
+///
+/// v70 (CAD-2019 / CAD-2316 / CAD-2022) adds
+/// `business_template_versions.source_format` (docx/html/authoring) and
+/// `business_documents.has_unresolved_pricing`.
+pub const SCHEMA_VERSION: i64 = 70;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

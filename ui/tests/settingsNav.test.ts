@@ -25,8 +25,13 @@ for (const absent of ["Agents", "Memory", "Master permissions", "Advanced custod
   if (flat(OWNER).includes(absent)) throw new Error(`${absent} must be hidden on a hosted board`);
 equal(
   flat(null),
-  ["Preferences", "Agents", "Connections", "Email sending", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
+  ["Preferences", "Agents", "Connections", "Email sending", "Templates", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
   "no list keeps every section a native board has, General (company time zone) included",
+);
+equal(
+  flat({ ...OWNER, settings_sections: [...OWNER.settings_sections, "templates"] }).includes("Templates"),
+  true,
+  "a hosted board that lists templates shows the sidebar entry",
 );
 equal(
   flat({ ...OWNER, platform_account_configured: true }).includes("Account"),
@@ -41,7 +46,11 @@ equal(settingsRedirect("models", null), null, "nothing moves before the board ha
 equal(settingsRedirect("permissions", {}), null, "a board that states nothing keeps every route");
 equal(settingsRedirect("members", {}), "models", "a native board does not expose hosted members");
 equal(settingsRedirect("members", { settings_sections: ["preferences"] }), "preferences", "a board without the capability refuses the direct link");
+equal(settingsRedirect("templates", OWNER), null, "direct templates links stay reachable");
+equal(settingsRedirect("templates", null), null, "templates waits cleanly before meta loads");
+equal(settingsRedirect("templates", {}), null, "templates stays open on native boards");
 equal(settingsLabel("update"), "Status", "the crumb names the section");
+equal(settingsLabel("templates"), "Templates", "the crumb names Templates");
 
 // CAD-2286: Settings → Documents is hosted only, offered when the board names it.
 const DOCUMENTS = { settings_sections: ["preferences", "general", "members", "documents", "connections", "email", "status"] };

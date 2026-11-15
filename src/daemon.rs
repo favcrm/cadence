@@ -5072,7 +5072,8 @@ impl Shared {
             | "app_social_sources_page"
             | "app_social_sources_get"
             | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),
-            "business_template_create"
+            "business_template_list"
+            | "business_template_create"
             | "business_template_revise"
             | "business_template_show"
             | "business_template_intake"

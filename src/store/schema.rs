@@ -1837,6 +1837,34 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=69", [])?;
                 tx.commit()?;
             }
+            if version < 70 {
+                // CAD-2019 / CAD-2316 / CAD-2022: additive template source format and
+                // partial-pricing indicator. Column-checked so a half-applied
+                // store converges on reopen without touching approved rows.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let tpl_cols = tx
+                    .prepare("PRAGMA table_info(business_template_versions)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !tpl_cols.iter().any(|name| name == "source_format") {
+                    tx.execute_batch(
+                        "ALTER TABLE business_template_versions \
+                           ADD COLUMN source_format TEXT NOT NULL DEFAULT 'docx';",
+                    )?;
+                }
+                let doc_cols = tx
+                    .prepare("PRAGMA table_info(business_documents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !doc_cols.iter().any(|name| name == "has_unresolved_pricing") {
+                    tx.execute_batch(
+                        "ALTER TABLE business_documents \
+                           ADD COLUMN has_unresolved_pricing INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=70", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

@@ -145,6 +145,17 @@ pub fn export_sample(template_docx: &[u8], context: &serde_json::Value) -> Resul
     render(template_docx, context, true)
 }
 
+/// Render a validated HTML5 template deterministically with `context`.
+pub fn export_html(
+    template_html: &[u8],
+    context: &serde_json::Value,
+    sample: bool,
+) -> Result<String> {
+    let raw = std::str::from_utf8(template_html)
+        .map_err(|_| Error::rejected("retained HTML template is not valid UTF-8"))?;
+    crate::business_templates::render_html_template(raw, context, sample)
+}
+
 fn render(template_docx: &[u8], context: &serde_json::Value, sample: bool) -> Result<Exported> {
     let runner = runner_dir()?;
     let root = tempfile::Builder::new()

@@ -8620,6 +8620,184 @@ mod agent_credential_acceptance {
         assert!(check(at + 60, at + 960, at).is_err());
         assert!(check(at, at + 100_000, at).is_err());
     }
+
+    #[test]
+    fn template_upload_rides_agent_credential_with_reissue_and_human_session_fallback() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::net::{TcpListener, TcpStream};
+
+        #[derive(Clone, Copy)]
+        enum UploadMode {
+            AgentOk,
+            StaleCached401Once,
+            HumanSessionRequired,
+        }
+
+        fn read_upload_req(socket: TcpStream) -> (TcpStream, String, String, Vec<u8>) {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let path = line.split(' ').nth(1).unwrap().to_string();
+            let (mut len, mut bearer) = (0_usize, String::new());
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap();
+                    } else if k.eq_ignore_ascii_case("authorization") {
+                        bearer = v.trim().strip_prefix("Bearer ").unwrap_or("").to_string();
+                    }
+                }
+            }
+            let mut raw = vec![0; len];
+            reader.read_exact(&mut raw).unwrap();
+            (socket, path, bearer, raw)
+        }
+
+        fn run_case(mode: UploadMode) -> (Vec<(String, &'static str)>, Vec<String>, Value) {
+            let payload = b"<!doctype html><html><body>{{ customer }}</body></html>";
+            let sha = crate::business_templates::sha256_hex(payload);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target_base = RemoteTarget {
+                identity: Some(CliIdentityPin {
+                    subject_id: SUBJECT.into(),
+                    issuer: ISSUER.into(),
+                }),
+                ..target(&listener)
+            };
+            let root = tempfile::tempdir().unwrap();
+            let (dir, assigns) = (
+                root.path().join("auth"),
+                root.path().join("hosted-assignments"),
+            );
+            for p in [&dir, &assigns] {
+                std::fs::create_dir(p).unwrap();
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let login = json!({"version":"hosted-cadence-auth.v1","organization_id":ORG_ID,"organization_slug":ORG,"audience":target_base.endpoint,"issuer":ISSUER,"subject_id":SUBJECT,"capabilities":["cli.read","cli.write","wiki.read"],"access_token":BRIDGE,"expires_at":now().unwrap()+300});
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(dir.join(format!("cli-{ORG}.json")))
+                .unwrap()
+                .write_all(login.to_string().as_bytes())
+                .unwrap();
+            let slot = AgentSlot::new(
+                assigns.join("msg_upload.agent"),
+                &target_base,
+                ASSIGNMENT.into(),
+                CLAIM.into(),
+                1,
+            );
+            let max_reqs = if matches!(mode, UploadMode::StaleCached401Once) {
+                8
+            } else {
+                5
+            };
+            let seen: std::sync::Arc<Mutex<Vec<(String, &'static str)>>> = Default::default();
+            let (seen_w, server) = (seen.clone(), listener.try_clone().unwrap());
+            let handle = std::thread::spawn(move || {
+                let (mut rej, mut seq) = (false, 0_usize);
+                for _ in 0..max_reqs {
+                    let (mut sock, path, bearer, raw) = read_upload_req(server.accept().unwrap().0);
+                    let route = path.rsplit('/').next().unwrap().to_string();
+                    let who = if bearer == AGENT {
+                        "agent"
+                    } else if bearer == BRIDGE {
+                        "login"
+                    } else {
+                        "other"
+                    };
+                    seen_w.lock().unwrap().push((route.clone(), who));
+                    let (st, ans) = if route == "agent-credential" {
+                        seq += 1;
+                        let (_, mut b) = minted();
+                        b["credential"]["credential_id"] = json!(format!("hca_{seq}"));
+                        (200, b)
+                    } else if route == "authorize" {
+                        (
+                            200,
+                            json!({"version": CLI_VERSION, "envelope": format!("h.u.{seq}")}),
+                        )
+                    } else {
+                        let req_id = String::from_utf8_lossy(&raw)
+                            .split_once("name=\"request_id\"\r\n\r\n")
+                            .unwrap()
+                            .1
+                            .split("\r\n")
+                            .next()
+                            .unwrap()
+                            .to_string();
+                        if matches!(mode, UploadMode::StaleCached401Once)
+                            && who == "agent"
+                            && !rej
+                            && seq >= 1
+                            && seen_w
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|(r, _)| r == "upload")
+                                .count()
+                                >= 2
+                        {
+                            rej = true;
+                            (401, json!({"ok": false, "code": CREDENTIAL_REJECTED}))
+                        } else if matches!(mode, UploadMode::HumanSessionRequired) && who == "agent"
+                        {
+                            (
+                                403,
+                                json!({"ok": false, "error": {"code": agent_credential::HUMAN_SESSION_REQUIRED, "message": "human login required"}}),
+                            )
+                        } else {
+                            (
+                                200,
+                                json!({"request_id": req_id, "blob": {"blob_key": "tpl_blob_ok", "byte_length": payload.len(), "sha256": sha}}),
+                            )
+                        }
+                    };
+                    write_answer(&mut sock, status_line(st), "", &ans);
+                }
+            });
+            let notes = Mutex::new(Vec::<String>::new());
+            let note_fn = |l: &str| notes.lock().unwrap().push(l.to_string());
+            let up = TemplateUpload {
+                media_type: "text/html",
+                file_name: "quote.html",
+                bytes: payload,
+            };
+            let first =
+                upload_template_in(&dir, &target_base, &up, 10, Some(&slot), note_fn).unwrap();
+            let res = if matches!(mode, UploadMode::HumanSessionRequired) {
+                first
+            } else {
+                upload_template_in(&dir, &target_base, &up, 10, Some(&slot), note_fn).unwrap()
+            };
+            handle.join().unwrap();
+            let s = seen.lock().unwrap().clone();
+            let n = notes.lock().unwrap().clone();
+            (s, n, res)
+        }
+
+        for (mode, exp, nlen) in [
+            (UploadMode::AgentOk, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent", 0),
+            (UploadMode::StaleCached401Once, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent agent-credential:login authorize:agent upload:agent", 0),
+            (UploadMode::HumanSessionRequired, "agent-credential:login authorize:agent upload:agent authorize:login upload:login", 1),
+        ] {
+            let (trail, notes, res) = run_case(mode);
+            let got: Vec<String> = trail.into_iter().map(|(r, w)| format!("{r}:{w}")).collect();
+            assert_eq!(res["blob"]["blob_key"], json!("tpl_blob_ok"));
+            assert_eq!(notes.len(), nlen, "{notes:?}");
+            assert_eq!(got, exp.split(' ').collect::<Vec<_>>());
+        }
+    }
 }
 
 // CAD-2149 / AOS-502: independent refusal acceptance for the managed session's

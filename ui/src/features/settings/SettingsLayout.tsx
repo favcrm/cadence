@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { BrainIcon, DocumentValidationIcon, GlobalIcon, Key01Icon, Mail01Icon, Shield01Icon, SlidersHorizontalIcon, UserIcon, UserMultiple02Icon } from "@hugeicons/core-free-icons";
+import { BrainIcon, DocumentValidationIcon, File01Icon, GlobalIcon, Key01Icon, Mail01Icon, Shield01Icon, SlidersHorizontalIcon, UserIcon, UserMultiple02Icon } from "@hugeicons/core-free-icons";
 import Link from "../../ui/Link";
 import { IconAgents, IconConnection, IconPulse } from "../../ui/icons";
 import { useTranslate } from "../../lib/locale";
@@ -16,6 +16,7 @@ const ICONS: Record<SettingsIcon, ReactNode> = {
   preferences: line(SlidersHorizontalIcon),
   connections: <IconConnection size={16} />,
   email: line(Mail01Icon),
+  templates: line(File01Icon),
   general: line(GlobalIcon),
   status: <IconPulse size={16} />,
   agents: <IconAgents size={16} />,

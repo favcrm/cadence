@@ -1,8 +1,19 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "../../lib/locale";
+import { onPrivateReadsPaused, privateReadsAllowed } from "../../lib/privateSession";
+import { navigate } from "../../lib/useLocation";
 import { IconClose } from "../../ui/icons";
+import { WriteGate } from "../auth/WriteGate";
 import { requestComposerFocus, setComposerRefs } from "../app-shell/chat/composerStore";
-import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
+import {
+  consumeSaveAsTemplateRequest,
+  extractHtmlPlaceholders,
+  onSaveAsTemplateRequested,
+  parameterizeHtmlForTemplate,
+  stageCanvasTemplatePrefill,
+} from "../templates/canvasTemplateDraft";
+import { templatesApi } from "../templates/templatesApi";
+import ArtifactView, { downloadName, htmlFrameDocument, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
@@ -65,6 +76,28 @@ function selectedPassage(root: HTMLElement | null): string {
   return sel.toString().trim().slice(0, 1200);
 }
 
+function cssEscape(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
+  return value.replace(/(["\\])/g, "\\$1");
+}
+
+function defaultTemplateSlug(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || "quotation-draft";
+}
+
+function focusFallback(fallbackArtifactId?: string | null): void {
+  const target = document.querySelector<HTMLElement>("#app-shell-chat-box, [data-composer] textarea")
+    ?? (fallbackArtifactId ? document.querySelector<HTMLElement>(`[data-artifact="${cssEscape(fallbackArtifactId)}"]`) : null)
+    ?? document.querySelector<HTMLElement>("main button, main a, main input, nav a, button");
+  target?.focus();
+}
+
 function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
@@ -79,11 +112,78 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
   onHtmlView: (view: HtmlView) => void;
 }) {
   const t = useTranslate();
+  const writeGate = useContext(WriteGate);
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
   // A version whose size is unknown shows none, never another version's.
   const size = info?.bytes;
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [tplForm, setTplForm] = useState({ name: "", kind: "quotation" as "quotation" | "invoice", currency: "HKD", taxBps: "0", discountBps: "0", customerLiteral: "", confirmed: false });
+  const [tplBusy, setTplBusy] = useState(false);
+  const [tplError, setTplError] = useState<string | null>(null);
+  const [tplSaved, setTplSaved] = useState<{ name: string; version: number; sha256: string; html: string; specJson: string; sampleHtml?: string } | null>(null);
+  const saveLifecycle = useRef(0);
+  const patchForm = (patch: Partial<typeof tplForm>) => setTplForm((f) => ({ ...f, ...patch }));
+
+  useEffect(() => {
+    const reset = () => { saveLifecycle.current += 1; setSaveOpen(false); setTplBusy(false); setTplError(null); setTplSaved(null); };
+    reset();
+    return onPrivateReadsPaused(reset);
+  }, [tab.id, tab.selected]);
+
+  useEffect(() => {
+    if (tab.kind !== "html") return;
+    const maybeOpen = () => {
+      if (!consumeSaveAsTemplateRequest(tab.id)) return;
+      setTplError(null);
+      setTplSaved(null);
+      setTplForm((f) => ({ ...f, name: f.name.trim() ? f.name : defaultTemplateSlug(tab.title) }));
+      setSaveOpen(true);
+    };
+    maybeOpen();
+    return onSaveAsTemplateRequested(maybeOpen);
+  }, [tab.id, tab.title, tab.kind]);
+
+  const htmlSourceText = tab.kind === "html" && state.status === "ready" ? new TextDecoder().decode(state.data.bytes) : "";
+  const detectedPlaceholders = tab.kind === "html" && saveOpen && htmlSourceText ? extractHtmlPlaceholders(htmlSourceText) : null;
+
+  const submitSaveTemplate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!privateReadsAllowed() || !htmlSourceText || writeGate !== null) return;
+    const cleanName = tplForm.name.trim().toLowerCase();
+    if (!cleanName) return setTplError(t("Template name is required."));
+    const taxRateBps = Number.parseInt(tplForm.taxBps.trim() || "0", 10);
+    const discountBps = Number.parseInt(tplForm.discountBps.trim() || "0", 10);
+    if (!Number.isFinite(taxRateBps) || taxRateBps < 0 || !Number.isFinite(discountBps) || discountBps < 0) {
+      return setTplError(t("Tax and discount bps must be non-negative integers."));
+    }
+    const prepared = parameterizeHtmlForTemplate(htmlSourceText, { customerLiteral: tplForm.customerLiteral });
+    const spec = {
+      kind: tplForm.kind,
+      fields: prepared.scalars.map((key) => ({ key, label: key, kind: "text", required: true })),
+      fixed_text: {},
+      calculation: { confirmed: tplForm.confirmed, currency: tplForm.currency.trim() || "HKD", tax_rate_bps: taxRateBps, discount_bps: discountBps },
+    };
+    const token = saveLifecycle.current;
+    setTplBusy(true);
+    setTplError(null);
+    try {
+      const created = await templatesApi.createHtml(cleanName, prepared.html, spec);
+      if (token !== saveLifecycle.current || !privateReadsAllowed()) return;
+      let sampleHtml: string | undefined;
+      try {
+        const s = await templatesApi.sample(created.template.name, created.template.version, "html");
+        if (token !== saveLifecycle.current || !privateReadsAllowed()) return;
+        sampleHtml = s.html ?? (s.html_base64 ? new TextDecoder().decode(Uint8Array.from(atob(s.html_base64), (c) => c.charCodeAt(0))) : undefined);
+      } catch {}
+      setTplSaved({ name: created.template.name, version: created.template.version, sha256: created.template.content_sha256, html: prepared.html, specJson: JSON.stringify(spec, null, 2), sampleHtml });
+    } catch (cause) {
+      if (token === saveLifecycle.current && privateReadsAllowed()) setTplError(cause instanceof Error ? cause.message : t("Couldn’t save template."));
+    } finally {
+      if (token === saveLifecycle.current) setTplBusy(false);
+    }
+  };
   // "updating v1 → v2" only while this turn has asked to add a version to
   // this artifact and it has not landed; once it has, "updated to v2".
   // A put still waiting for its result wins, so a second put of the same
@@ -123,6 +223,19 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
   // its version picker only a choice between versions.
   const image = tab.kind === "image";
   const showTools = !image || versions.length > 1;
+  const saveAsTemplateButton = tab.kind === "html" && state.status === "ready" ? (
+    <button
+      type="button"
+      className="btn btn-ghost"
+      disabled={changing || writeGate !== null}
+      onClick={() => {
+        setTplForm((f) => ({ ...f, name: f.name.trim() ? f.name : defaultTemplateSlug(tab.title) }));
+        setSaveOpen((open) => !open);
+      }}
+    >
+      {t("Save as Template")}
+    </button>
+  ) : null;
   return (
     <>
       <header className="cv-head">
@@ -193,6 +306,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
               <button type="button" className="btn btn-ghost" disabled={!composerKey || changing} onClick={askToChange}>
                 {t("Ask to change")}
               </button>
+              {saveAsTemplateButton}
               <button type="button" className="btn" disabled={changing} onClick={download}>
                 {t("Download")}
               </button>
@@ -205,6 +319,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
             <button type="button" className="btn btn-ghost" disabled={!composerKey || changing} onClick={askToChange}>
               {t("Ask to change")}
             </button>
+            {saveAsTemplateButton}
             <button type="button" className="btn" disabled={changing} onClick={download}>
               {t("Download")}
             </button>
@@ -216,6 +331,47 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
           </div>
         ) : null}
       </header>
+      {saveOpen && tab.kind === "html" && state.status === "ready" ? (
+        <form className="p-3 border-b border-ink-800 bg-ink-950/60 grid gap-2 text-label min-w-0 overflow-x-hidden" onSubmit={submitSaveTemplate} data-save-as-template>
+          <div className="flex items-center justify-between gap-2 min-w-0">
+            <strong>{t("Save as Template")}</strong>
+            <button type="button" className="btn btn-ghost" onClick={() => setSaveOpen(false)}>{t("Cancel")}</button>
+          </div>
+          {detectedPlaceholders && (detectedPlaceholders.scalars.length > 0 || detectedPlaceholders.itemFields.length > 0) ? (
+            <div className="flex flex-wrap gap-1 min-w-0">
+              {detectedPlaceholders.scalars.map((k) => <code key={`s-${k}`} className="artbadge">{`{{ ${k} }}`}</code>)}
+              {detectedPlaceholders.itemFields.map((k) => <code key={`i-${k}`} className="artbadge">{`{{ item.${k} }}`}</code>)}
+            </div>
+          ) : <p className="text-micro text-ink-400 m-0" data-auto-param-note>{t("No {{ field }} placeholders found — a {{ customer }} slot will be added automatically when saved.")}</p>}
+          <div className={`grid gap-2 min-w-0 ${sheet ? "grid-cols-1" : "grid-cols-2"}`}>
+            {([["Name", "name", "quotation-acme"], ["Currency", "currency", "HKD"]] as const).map(([lbl, key, ph]) => (
+              <label key={key} className="grid gap-1 min-w-0"><span>{t(lbl)}</span><input className="min-w-0 w-full" value={tplForm[key]} onChange={(e) => patchForm({ [key]: e.target.value })} placeholder={ph} /></label>
+            ))}
+            <label className="grid gap-1 min-w-0"><span>{t("Kind")}</span><select className="min-w-0 w-full" value={tplForm.kind} onChange={(e) => patchForm({ kind: e.target.value as "quotation" | "invoice" })}><option value="quotation">{t("Quotation")}</option><option value="invoice">{t("Invoice")}</option></select></label>
+            <div className="grid grid-cols-2 gap-1 min-w-0">
+              {([["Tax bps", "taxBps"], ["Discount bps", "discountBps"]] as const).map(([lbl, key]) => (
+                <label key={key} className="grid gap-1 min-w-0"><span>{t(lbl)}</span><input className="min-w-0 w-full" value={tplForm[key]} onChange={(e) => patchForm({ [key]: e.target.value })} /></label>
+              ))}
+            </div>
+          </div>
+          <label className="grid gap-1 min-w-0"><span>{t("Replace customer text (optional)")}</span><input className="min-w-0 w-full" value={tplForm.customerLiteral} onChange={(e) => patchForm({ customerLiteral: e.target.value })} placeholder="Northwind Ltd" /></label>
+          <label className="flex items-center gap-2 min-w-0"><input type="checkbox" checked={tplForm.confirmed} onChange={(e) => patchForm({ confirmed: e.target.checked })} /><span>{t("I confirm the calculation rules above")}</span></label>
+          {tplError && <p role="alert" className="text-fail break-words">{tplError}</p>}
+          {tplSaved && (
+            <div className="grid gap-2 min-w-0">
+              <p role="status" className="artbadge ok break-all">{t("Saved")} {tplSaved.name} v{tplSaved.version} ({t("draft")}) · sha256:{tplSaved.sha256}</p>
+              {tplSaved.sampleHtml && (
+                <div className="grid gap-1 min-w-0" data-canvas-sample-preview>
+                  <p className="text-micro text-ink-300 m-0">{t("SAMPLE: placeholder values only. This is not a document to send.")}</p>
+                  <iframe className="w-full h-44 rounded border border-ink-800 bg-white" sandbox="" referrerPolicy="no-referrer" srcDoc={htmlFrameDocument(tplSaved.sampleHtml)} title={`SAMPLE HTML of ${tplSaved.name} v${tplSaved.version}`} />
+                </div>
+              )}
+              <div className="flex justify-end"><button type="button" className="btn btn-ghost" data-open-in-templates onClick={() => { stageCanvasTemplatePrefill({ name: tplSaved.name, html: tplSaved.html, specJson: tplSaved.specJson }); onClose(); navigate("/settings/templates"); }}>{t("Open in Templates")}</button></div>
+            </div>
+          )}
+          <div className="flex justify-end gap-2"><button type="submit" className="btn" disabled={tplBusy || writeGate !== null || !tplForm.name.trim() || !tplForm.confirmed}>{tplBusy ? t("Saving…") : t("Save draft v1")}</button></div>
+        </form>
+      ) : null}
       <div className="cv-body" data-canvas-body>
         {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
         {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}
@@ -263,20 +419,27 @@ export default function CanvasDrawer() {
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
   const showBrowser = isBrowserPanelShown(canvas, browser);
   const rootRef = useRef<HTMLElement | null>(null);
+  const lastArtifactIdRef = useRef<string | null>(tab?.id ?? null);
+  lastArtifactIdRef.current = tab?.id ?? lastArtifactIdRef.current;
   // Where focus goes when a control inside the drawer goes away (a closed or
   // hidden tab, or the drawer itself): the next tab, else the drawer; if the
-  // drawer is gone, the composer. Only if focus was in the drawer or nowhere:
-  // a person who is somewhere else keeps it.
+  // drawer is gone, the composer (or the triggering artifact card). Only if
+  // focus was in the drawer or nowhere: a person who is somewhere else keeps it.
   const handFocusOn = useCallback(() => {
     const at = document.activeElement;
     const mine = at === document.body || !!rootRef.current?.contains(at);
+    const fallbackId = tab?.id ?? lastArtifactIdRef.current;
     requestAnimationFrame(() => {
       if (!mine) return;
       const current = document.activeElement;
       if (current !== at && current !== document.body && !rootRef.current?.contains(current)) return;
       const root = rootRef.current;
       if (!root) {
-        if (canvas.composerKey !== null) requestComposerFocus(canvas.composerKey);
+        if (canvas.composerKey !== null) {
+          requestComposerFocus(canvas.composerKey);
+          return;
+        }
+        focusFallback(fallbackId);
         return;
       }
       (root.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? root).focus();

@@ -2428,7 +2428,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         },
         "/api/platform-account" => send(request, platform_account::get(opts)),
         // CAD-1393: operator-only reads of company templates and drafts.
-        "/api/templates/show"
+        "/api/templates/list"
+        | "/api/templates/show"
         | "/api/documents/show"
         | "/api/documents/export"
         | "/api/templates/sample" => {
