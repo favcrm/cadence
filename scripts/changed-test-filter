@@ -12,18 +12,20 @@ Selection, from the merge-base diff of added, copied, modified and renamed files
 
   src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
                                A `mod.rs` selects the modules whose
-                               `mod x;` line it adds; any other changed line
-                               besides `mod` declarations, attributes and blank
-                               lines (a shared helper, `use`) also selects its
-                               whole directory, as does a mod.rs diff that adds
-                               no module (the root one is all of daemon::tests,
-                               about 190 tests). Any other file
+                               `mod x;` line it adds (with attributes added
+                               directly above it); any removed line (a `mod`
+                               line, a `#[cfg]` gate) or other edit (a shared
+                               helper, `use`) also selects its whole directory,
+                               as does a mod.rs diff that adds no module (the
+                               root one is all of daemon::tests, about 190
+                               tests). Any other file
                                under src/daemon/tests/ (not .rs) also selects
                                all of daemon::tests.
   tests/suite.rs               the single integration target (CAD-1727). Each
                                changed line maps to its enclosing `#[test]`
                                fn; a changed helper selects its enclosing
-                               `mod`. A change outside any test fn or mod
+                               `mod`. A deletion selects the items on both
+                               sides of it. A change outside any test fn or mod
                                (top-level helper, `use`) cannot be bounded, so
                                it selects the whole `suite` binary (about 224
                                tests, one binary) and says so on stderr.
@@ -77,24 +79,40 @@ MOD_DECL = re.compile(r"(?:pub(?:\([\w:]+\))? )?mod (\w+);$")
 
 def classify_mod_diff(diff, parent):
     """Prefixes a mod.rs diff selects: each added `mod x;`, plus the whole
-    directory when any other line changed. A `mod` declaration (added or
-    removed), an attribute line and a blank line do not widen; anything else
-    (a shared helper, `use`, an inline module) can change every test below."""
+    directory when anything else changed. Only a purely added `mod x;` line
+    (with attributes added directly above it or on the same line) and blank
+    lines stay narrow. Any removed line (a `mod` line, or a `#[cfg]` gate that
+    switches an existing module on), an attribute not attached to an added
+    `mod x;`, or any other edit (a shared helper, `use`, an inline module)
+    selects the whole directory."""
     added, widen = [], False
     body = False
+    pending_attr = False
     for line in diff.splitlines():
         if line.startswith("@@"):
             body = True
+            widen = widen or pending_attr
+            pending_attr = False
             continue
         if not body or line[:1] not in "+-":
             continue
-        text = ATTRS.sub("", line[1:].strip())
+        raw = line[1:].strip()
+        if not raw:
+            continue
+        if line[0] == "-":
+            widen = True
+            continue
+        text = ATTRS.sub("", raw)
+        if not text:
+            pending_attr = True
+            continue
         decl = MOD_DECL.match(text)
         if decl:
-            if line[0] == "+":
-                added.append(f"{parent}{decl.group(1)}::")
-        elif text:
+            added.append(f"{parent}{decl.group(1)}::")
+        else:
             widen = True
+        pending_attr = False
+    widen = widen or pending_attr
     return ([parent] if widen else []) + added
 
 
@@ -218,7 +236,13 @@ def changed_lines(base, head, path):
     for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff, re.M):
         start = int(m.group(1))
         count = 1 if m.group(2) is None else int(m.group(2))
-        out.update(range(start, start + max(count, 1)))
+        if count == 0:
+            # A deletion-only hunk sits after line `start`: select the items
+            # on both sides, so the item the deleted text belonged to (for
+            # example a removed `#[ignore]`) is never missed.
+            out.update(n for n in (start, start + 1) if n >= 1)
+        else:
+            out.update(range(start, start + count))
     return out
 
 
