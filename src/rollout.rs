@@ -154,7 +154,10 @@ pub use migration::{
 /// v67 (CAD-2215) gives each app-conversation grant an authorization epoch.
 /// Existing grants keep their authority; an explicit re-grant changes the
 /// epoch, fencing readers that selected data under the previous grant.
-pub const SCHEMA_VERSION: i64 = 67;
+///
+/// v68 (CAD-2317) adds `routines`, `routine_runs`, `connection_policies`, and
+/// `staged_routine_proposals`.
+pub const SCHEMA_VERSION: i64 = 68;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

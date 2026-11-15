@@ -1425,6 +1425,13 @@ fn verb_for(
             }
             "platform_call"
         }
+        Commands::Routine { action } if action.uses_local_script() => {
+            return Err(unsupported(
+                "routine",
+                "--script",
+                "local workspace shell scripts cannot run in hosted Cloudflare Workers; run against a local workspace daemon (`cadence routine ...` without `--org`) or wait for hosted routine Worker routes",
+            ));
+        }
         _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))

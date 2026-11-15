@@ -24,6 +24,7 @@ import {
   type HistoryFilter,
 } from "./agentTabModel";
 import { agentLocation } from "./agentView";
+import RoutinesTab from "./RoutinesTab";
 
 export interface TabContext {
   alias: string;
@@ -891,6 +892,8 @@ function Access({ c }: { c: TabContext }) {
 
 export default function AgentTabBody({ tab, c }: { tab: AgentTab; c: TabContext }) {
   switch (tab) {
+    case "routines":
+      return <RoutinesTab c={c} />;
     case "history":
       return <History c={c} />;
     case "skills":

@@ -864,6 +864,21 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "connection_policies",
+        &[
+            "connection_id",
+            "provider",
+            "visibility",
+            "owner_user_id",
+            "is_default",
+            "write_mode",
+            "allow_external_triggers",
+            "allowed_agents_json",
+            "policy_revision",
+            "updated",
+        ],
+    ),
+    (
         "connection_send_approvals",
         &[
             "approval_id",
@@ -933,6 +948,16 @@ const CATALOG: &[(&str, &[&str])] = &[
             "issued_at_ms",
             "expires_at_ms",
             "claimed_at_ms",
+        ],
+    ),
+    (
+        "credential_request_resolutions",
+        &[
+            "request_id",
+            "connection_id",
+            "message_id",
+            "conversation_id",
+            "resumed_at",
         ],
     ),
     (
@@ -1372,6 +1397,54 @@ const CATALOG: &[(&str, &[&str])] = &[
             "end_reason",
         ],
     ),
+    (
+        "routine_runs",
+        &[
+            "id",
+            "routine_id",
+            "due_instant",
+            "trigger_source",
+            "state",
+            "approved_rev",
+            "approved_sha256",
+            "checklist_state_json",
+            "script_output_json",
+            "message_id",
+            "error",
+            "started_at",
+            "finished_at",
+        ],
+    ),
+    (
+        "routines",
+        &[
+            "id",
+            "name",
+            "agent_alias",
+            "trigger_kind",
+            "cron",
+            "interval_mins",
+            "timezone",
+            "event_source",
+            "target_kind",
+            "markdown_path",
+            "approved_rev",
+            "script_path",
+            "approved_sha256",
+            "destination_thread",
+            "connection_account",
+            "checklist_json",
+            "inputs_json",
+            "status",
+            "pause_reason",
+            "consecutive_failures",
+            "next_due_at",
+            "last_run_at",
+            "last_run_state",
+            "created",
+            "updated",
+        ],
+    ),
     ("schema_version", &["version"]),
     (
         "settings_authority",
@@ -1401,6 +1474,19 @@ const CATALOG: &[(&str, &[&str])] = &[
             "frozen_digest",
             "receipt",
             "upstream",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "staged_routine_proposals",
+        &[
+            "id",
+            "kind",
+            "proposed_by",
+            "state",
+            "title",
+            "payload_json",
             "created",
             "updated",
         ],
@@ -3333,6 +3419,14 @@ fn classify_private_work(
         || count_where(&conn, "messages", "source='cloud_agent'")? > 0
     {
         found.push("cloud-agent state");
+    }
+    if count_where(
+        &conn,
+        "connection_policies",
+        "visibility='personal' OR owner_user_id IS NOT NULL",
+    )? > 0
+    {
+        found.push("personal connection policies");
     }
     drop(conn);
     classify_state_dir(state_dir, &mut found)?;

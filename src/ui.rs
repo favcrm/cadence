@@ -50,6 +50,8 @@ mod board_api_golden;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad2018_wiki_http_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2317_routine_connection_guard_acceptance;
 #[cfg(test)]
 mod cad2321_actor_kind_http_acceptance;
 mod cli_route;
@@ -77,6 +79,7 @@ mod platform_account;
 pub(crate) use crate::project_policy;
 pub(crate) mod public_directory;
 mod read_model;
+mod routines;
 mod serve;
 mod setup;
 mod social_publish;
