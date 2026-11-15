@@ -85,12 +85,22 @@ const refused = (route: string, status: number, code: string, message: string): 
   body: { ok: false, error: { code, message } },
 });
 
-/** `/api/meta` as the hosted board sends it for this probe preset: with the
- *  lifecycle off, `documents` leaves the settings sections. */
-export function documentsMeta(meta: unknown, probe: DocumentProbePreset): unknown {
-  const row = meta as { settings_sections?: string[] };
-  if (probe === "available" || !Array.isArray(row.settings_sections)) return meta;
-  return { ...row, settings_sections: row.settings_sections.filter((section) => section !== "documents") };
+/**
+ * The Settings list presets. `native` (the default) serves meta as the fixture
+ * has it, with no `settings_sections`, so Settings keeps the full native list
+ * every other QA run relies on. `hosted-member` adds the list the hosted board
+ * sends a member while the lifecycle is on (agenticos-v2 `tenantSettingsSections`).
+ */
+export const SETTINGS_PRESETS = ["native", "hosted-member"] as const;
+export type SettingsPreset = (typeof SETTINGS_PRESETS)[number];
+const HOSTED_MEMBER_SECTIONS = ["preferences", "members", "documents"] as const;
+
+/** `/api/meta` for these presets. With the lifecycle off, `documents` leaves a
+ *  hosted list, as it does on the hosted board. */
+export function boardMeta(meta: unknown, settings: SettingsPreset, probe: DocumentProbePreset): unknown {
+  if (settings === "native") return meta;
+  const sections = HOSTED_MEMBER_SECTIONS.filter((section) => probe === "available" || section !== "documents");
+  return { ...(meta as object), settings_sections: sections };
 }
 
 /** The paths the documents responder answers; every other path is not its own. */
@@ -329,11 +339,25 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
   const meta = fx.meta as Meta;
   if (writeBlock(meta) !== null) fail("meta", `writeBlock refused it: ${writeBlock(meta)}`);
   if (kickoffBlock(meta) === null) fail("meta", "kickoffBlock reads it as the operator, not a member");
-  // Settings → Documents is mounted only when the board lists the section, and
-  // a board without the lifecycle drops it (the not-served preset).
-  if (settingsRedirect("documents", meta) !== null) fail("meta", "settings_sections does not offer documents");
-  if (settingsRedirect("documents", documentsMeta(meta, "not-served") as Meta) === null) {
-    fail("meta", "the not-served preset still offers Settings → Documents");
+  // The default meta keeps the native Settings list that every other QA run
+  // relies on: a `settings_sections` here would redirect Connections, Email and
+  // Status away for everyone. The hosted list is the `hosted-member` preset.
+  if ("settings_sections" in (fx.meta as object)) fail("meta", "the default meta lists settings_sections: the native Settings pages would redirect for every QA run");
+  for (const settings of SETTINGS_PRESETS) {
+    for (const probe of DOCUMENT_PROBES) {
+      const served = boardMeta(meta, settings, probe) as Meta;
+      const offered = settingsRedirect("documents", served) === null;
+      // Settings → Documents is mounted only for a hosted list that names it,
+      // and a board without the lifecycle drops it.
+      if (offered !== (settings === "hosted-member" && probe === "available")) {
+        fail("meta", `settings ${settings}, documents ${probe}: Settings → Documents is ${offered ? "offered" : "not offered"}`);
+      }
+      if (settings === "native") {
+        for (const section of ["connections", "email", "update"] as const) {
+          if (settingsRedirect(section, served) !== null) fail("meta", `settings native, documents ${probe}: ${section} redirects away`);
+        }
+      }
+    }
   }
   const viewerSub = meta.session?.user?.sub ?? null;
   if (viewerSub === null) fail("meta", "no session subject: the member could never be a document's approver");

@@ -328,7 +328,7 @@ function serve(opts) {
   const state = readJson(path.join(root, "state.json"));
   const fx = Object.fromEntries(fs.readdirSync(path.join(root, "served")).map((f) => [f.slice(0, -5), readJson(path.join(root, "served", f))]));
   // The UI's own parser, compiled at `up`: a state set mid-run is checked too.
-  const { checkBrowser, BROWSER_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, documentsMeta, documentsResponder, isDocumentsRoute } = createRequire(SCRIPT)(state.validator);
+  const { checkBrowser, BROWSER_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, boardMeta, documentsResponder, isDocumentsRoute } = createRequire(SCRIPT)(state.validator);
   const { sandbox, viewer } = state.ports;
   let browser = { ...fx["browser-handoff"] };
   const locale = { ...fx.locale };
@@ -343,6 +343,9 @@ function serve(opts) {
   let documentsControl = { probe: "available", refusals: [] };
   const viewerSub = fx.meta.session.user.sub;
   let documents = documentsResponder(fx, viewerSub, () => documentsControl);
+  // The Settings list: native by default, which every other QA run relies on;
+  // `hosted-member` serves the member's hosted list, with Settings → Documents.
+  let settings = "native";
   const counts = { routes: {}, proxied: 0, masked_401: {}, views: 0, viewer_loads: 0, viewer_done: 0 };
   const count = (key) => (counts.routes[key] = (counts.routes[key] ?? 0) + 1);
 
@@ -378,7 +381,7 @@ function serve(opts) {
   }
 
   const fixtures = {
-    "GET /api/meta": () => documentsMeta(fx.meta, documentsControl.probe),
+    "GET /api/meta": () => boardMeta(fx.meta, settings, documentsControl.probe),
     "GET /api/team/members": () => fx["team-members"],
     "GET /api/locale": () => locale,
     "POST /api/locale": (b) => {
@@ -443,6 +446,7 @@ function serve(opts) {
       const why = checkBrowser(next);
       if (why) return send(res, 400, { error: `browser state refused: ${why}` });
       if ("locale" in b && b.locale !== null && b.locale !== "en" && b.locale !== "zh-TW") return send(res, 400, { error: "locale must be en, zh-TW or null" });
+      if (b.settings !== undefined && !SETTINGS_PRESETS.includes(b.settings)) return send(res, 400, { error: `settings preset must be one of ${SETTINGS_PRESETS.join(", ")}` });
       if (b.documents !== undefined && !DOCUMENT_PROBES.includes(b.documents)) return send(res, 400, { error: `documents preset must be one of ${DOCUMENT_PROBES.join(", ")}` });
       const refusals = b.document_refusals;
       if (refusals !== undefined && (!Array.isArray(refusals) || refusals.some((route) => !DOCUMENT_WRITES.includes(route)))) {
@@ -450,13 +454,14 @@ function serve(opts) {
       }
       browser = next;
       if ("locale" in b) locale.user_locale = b.locale;
+      if (b.settings !== undefined) settings = b.settings;
       if (b.documents !== undefined) {
         documentsControl = { ...documentsControl, probe: b.documents };
         documents = documentsResponder(fx, viewerSub, () => documentsControl);
       }
       if (refusals !== undefined) documentsControl = { ...documentsControl, refusals: [...new Set(refusals)] };
     } else if (req.method !== "GET") return send(res, 405, { error: "GET or POST" });
-    return send(res, 200, { browser, locale, views, documents: documentsControl });
+    return send(res, 200, { browser, locale, views, settings, documents: documentsControl });
   }
 
   http.createServer(async (req, res) => {
