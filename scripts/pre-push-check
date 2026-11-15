@@ -1,5 +1,5 @@
 #!/bin/sh
-# CAD-2307: run this worktree's pre-push hook for the current HEAD before
+# CAD-2341: run this worktree's pre-push hook for the current HEAD before
 # `git push`, so the long compile happens in your shell instead of inside the
 # push. GitHub drops an SSH push whose hook runs for minutes (rc=141). The hook
 # records an rc=0 `tree=clean` receipt for this head; the push's own hook run
@@ -13,14 +13,19 @@
 # own plan, Boat/local mode, head binding and receipt are the ones used. It
 # never reimplements the plan. `git push` still runs the hook.
 set -eu
-cd "$(git rev-parse --show-toplevel)"
+top=$(git rev-parse --show-toplevel) || {
+    echo "pre-push-check: not inside a git worktree" >&2
+    exit 1
+}
+cd "$top"
 hooks=$(git config --get core.hooksPath || true)
 hook="${hooks:-$(git rev-parse --git-path hooks)}/pre-push"
 [ -x "$hook" ] || {
     echo "pre-push-check: no pre-push hook at $hook; run scripts/boat-build --receipt -- scripts/pre-push --base origin/main" >&2
     exit 1
 }
-[ -z "$(git status --porcelain)" ] || {
+st=$(git status --porcelain --untracked-files=normal) || st=dirty
+[ -z "$st" ] || {
     echo "pre-push-check: the working tree has uncommitted or untracked files; commit or remove them so the pass describes the commit" >&2
     exit 1
 }
