@@ -593,9 +593,12 @@ limitation; only an authorized operator can decide an exception.
   the hook's own plan and receipt are used, and the long compile happens in
   your shell instead of inside the push. GitHub drops an SSH push whose hook
   runs for minutes (rc=141, "Connection to github.com closed by remote host").
-  Run it right before the push: it leaves the Boat sandbox warm (30 minutes),
-  so the push's own hook run reuses it and is short. The hook still runs on
-  every push; nothing here skips or caches it. If a push dies with rc=141,
+  The hook records an rc=0 receipt for the head; the push's own hook run sees
+  a recorded pass for that exact head on a clean tree and returns at once. A
+  failure, an edited tree, a new commit or `PRE_PUSH_TESTS` runs the plan
+  again, so nothing is skipped that was not just passed. A lane minted before
+  this hook change gets it when `issue start` re-heals the hook; until then
+  the push reruns the plan (several minutes). If a push dies with rc=141,
   retry it once.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`. Example: `scripts/boat-build -- cargo

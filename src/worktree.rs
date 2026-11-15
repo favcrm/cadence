@@ -324,6 +324,19 @@ if [ ! -x scripts/pre-push ]; then
         "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 0
 fi
+# CAD-2307: GitHub drops an SSH push whose hook runs for minutes (rc=141).
+# `scripts/pre-push-check` runs this hook before the push and records the
+# receipt. A recorded rc=0 pass for exactly this head, on a clean tree, is that
+# plan's result: report it instead of re-running the plan. A failed, skipped,
+# refused or `--tests` receipt never matches, so the plan still runs for them.
+if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -f "$out" ] &&
+    [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    prev=$(cat "$out" 2>/dev/null)
+    case "$prev" in
+        *steps=skipped*|*steps=refused*) ;;
+        "head=$head "*" rc=0 "*|"head=$head "*" rc=0") echo "pre-push: recorded pass for $head; not re-running the plan"; exit 0 ;;
+    esac
+fi
 if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     if [ "$pushed" != "$head" ]; then
         printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
