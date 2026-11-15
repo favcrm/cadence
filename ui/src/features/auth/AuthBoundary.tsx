@@ -127,10 +127,10 @@ export default function AuthBoundary({ children }: {
       }
       const admitted = meta.signed_in === true || (!hosted && meta.anonymous_reads === true);
       if (admitted) {
-        // SessionView.id is only a non-secret display prefix; stable creation
-        // and expiry plus verified subject/role distinguish its observations.
+        // Hosted sessions use a stable server-issued id; their expiry slides
+        // without changing identity. Local sessions retain the expiry fence.
         const nextIdentity = meta.signed_in === true && session
-          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
+          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;
@@ -294,10 +294,10 @@ export default function AuthBoundary({ children }: {
   const checking = state.status === "checking";
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
-    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Your work, behind a sign-in." : "Sign in to your local board.", text: hosted ? "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
+    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Sign in to Cadence." : "Sign in to your local board.", text: hosted ? "Use your AgenticOS account to open this workspace." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
-    expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
+    expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: hosted ? "Your session ended. Continue with AgenticOS to reopen your workspace." : "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
   };
   const gate = copy[state.status === "ready" ? "checking" : state.status];
   const showGate = state.status !== "ready" || loginRoute;

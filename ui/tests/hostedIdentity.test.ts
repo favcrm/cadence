@@ -155,6 +155,21 @@ async function boundaryChecks() {
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session recovery restores the in-memory draft");
     assert(effects > 1, "private effects resume after recovery");
 
+    // A hosted renewal changes its deadline, not the owner of an unsent draft.
+    const hostedSession = { ...signedIn, hosted: true, session: { ...signedIn.session, id: "hosted-session", origin: "public" } };
+    response = () => json(hostedSession);
+    await focus();
+    await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    const beforeRenewal = privateSessionGeneration();
+    response = () => json({ ...hostedSession, session: { ...hostedSession.session, expires_at: 4102473600, idle_expires_at: 4102473600 } });
+    await focus();
+    assert(privateSessionGeneration() === beforeRenewal, "hosted renewal keeps the same private session");
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "hosted renewal keeps the unsent draft");
+    response = () => json(signedIn);
+    await focus();
+    assert(host.querySelector("output")?.textContent === "", "changing identity clears the previous draft");
+    await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+
     // A newer authoritative refusal supersedes an already validated but delayed
     // metadata response. Neither envelope may restore the old private draft.
     for (const refusal of [
