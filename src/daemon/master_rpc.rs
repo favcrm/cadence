@@ -1611,23 +1611,27 @@ impl Shared {
         )?;
         let owner = req.requested_by.clone();
         if owner != ALIAS {
-            if let Ok(pm_dir) = self.pm_dir() {
-                if req.argv.iter().skip(1).any(|a| {
-                    crate::master_perm::touches_pm_agents_dir(
-                        a,
-                        std::path::Path::new(&req.cwd),
-                        &pm_dir,
-                    )
-                }) {
+            let pm_dir = match self.pm_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
                     let _ = crate::master_perm::reopen(
                         &self.state_dir,
                         id,
                         crate::master_perm::clock(),
                     );
-                    return Err(Error::rejected(
-                        "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
-                    ));
+                    return Err(e);
                 }
+            };
+            if crate::master_perm::argv_touches_pm_agents_dir(
+                &req.argv,
+                std::path::Path::new(&req.cwd),
+                &pm_dir,
+            ) {
+                let _ =
+                    crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
+                return Err(Error::rejected(
+                    "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
+                ));
             }
         }
         let body = crate::master_perm::request_json(&req);
@@ -1683,13 +1687,11 @@ impl Shared {
         )?;
         let owner = req.requested_by.clone();
         if owner != ALIAS
-            && req.argv.iter().skip(1).any(|a| {
-                crate::master_perm::touches_pm_agents_dir(
-                    a,
-                    std::path::Path::new(&req.cwd),
-                    &pm.dir,
-                )
-            })
+            && crate::master_perm::argv_touches_pm_agents_dir(
+                &req.argv,
+                std::path::Path::new(&req.cwd),
+                &pm.dir,
+            )
         {
             let _ = crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
             return Err(Error::rejected(

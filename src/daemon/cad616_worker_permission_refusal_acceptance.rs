@@ -293,11 +293,22 @@ fn request_open_write(alias: &str, handle: &str, file_path: &str, content: &str)
     })
 }
 
+fn request_open_tool(alias: &str, handle: &str, tool: &str, input: Value) -> Value {
+    json!({
+        "alias": alias,
+        "kind": "approval",
+        "tool": tool,
+        "request": handle,
+        "input_summary": tool,
+        "input": input,
+    })
+}
+
 #[test]
 fn operator_only_master_permission_rpcs_refuse_worker_caller() {
     let fx = Fixture::new("c616rpc");
     let w1 = fx.enroll_managed("w1", "worker", true);
-    let _master = fx.enroll_managed("master", "worker", false);
+    let master = fx.enroll_managed("master", "worker", false);
     let op_pid = fx.operator_pid();
 
     let ls_argv = vec!["ls".into(), fx.repo_dir.to_string_lossy().into_owned()];
@@ -357,34 +368,96 @@ fn operator_only_master_permission_rpcs_refuse_worker_caller() {
         ("master_permission_revoke", json!({"id": "rule-m-1"})),
     ];
 
-    for (method, params) in agent_calls {
-        let err = fx
-            .dispatch(method, params.clone(), w1.pid())
-            .expect_err(&format!("worker w1 must be refused {method} {params}"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("operator"),
-            "{method} refusal must name operator boundary, got: {msg}"
-        );
-    }
-
-    // Even when an agent supplies an explicit `alias` targeting worker rules, it must be refused
-    // (either as connection-bound on origin/main or as operator-only once worker alias routing exists).
-    for (method, params) in [
+    let explicit_or_forged_calls = [
         ("master_permission_list", json!({"alias": "w1"})),
+        ("master_permission_list", json!({"alias": "master"})),
+        ("master_permission_list", json!({"agent": "w1"})),
+        ("master_permission_list", json!({"agent": "master"})),
         (
             "master_permission_revoke",
             json!({"id": "rule-w1-1", "alias": "w1"}),
         ),
-    ] {
+        (
+            "master_permission_revoke",
+            json!({"id": "rule-m-1", "agent": "master"}),
+        ),
+        (
+            "master_permission_list",
+            json!({"alias": "w1", "operator": true}),
+        ),
+        (
+            "master_permission_list",
+            json!({"alias": "master", "from": "operator"}),
+        ),
+        (
+            "master_permission_revoke",
+            json!({"id": "rule-w1-1", "alias": "w1", "operator": true}),
+        ),
+        (
+            "master_permission_revoke",
+            json!({"id": "rule-m-1", "agent": "master", "from": "operator"}),
+        ),
+    ];
+
+    // First verify enrolled `master` without an active Home turn is also refused before
+    // reaching any permission verb (`master_policy` fails closed outside Home).
+    for (method, params) in agent_calls.iter().chain(explicit_or_forged_calls.iter()) {
         let err = fx
-            .dispatch(method, params.clone(), w1.pid())
-            .expect_err(&format!("worker w1 must be refused {method} {params}"));
+            .dispatch(method, params.clone(), master.pid())
+            .expect_err(&format!(
+                "agent master (no home turn) must be refused {method} {params}"
+            ));
         let msg = err.to_string();
         assert!(
-            msg.contains("operator") || msg.contains("connection-bound"),
-            "{method} {params} refusal must hit operator/connection-bound boundary, got: {msg}"
+            msg.contains("home thread") || msg.contains("operator") || msg.contains("connection-bound"),
+            "agent master (no home turn) {method} {params} refusal must hit policy/operator boundary, got: {msg}"
         );
+    }
+
+    // Activate a Home turn for `master` so calls pass the app-turn filter and hit
+    // the operator/master boundary directly (`MasterScope::Home`).
+    fx.shared
+        .store
+        .enqueue(
+            "master",
+            "home permission rpc boundary check",
+            None,
+            "msg-master-rpc-home-1",
+            "operator",
+        )
+        .unwrap();
+    assert!(matches!(
+        fx.shared.store.take_queued("master").unwrap(),
+        crate::store::Take::Message(_)
+    ));
+
+    for (caller_label, pid) in [
+        ("worker w1", w1.pid()),
+        ("agent master (home)", master.pid()),
+    ] {
+        for (method, params) in &agent_calls {
+            let err = fx
+                .dispatch(method, params.clone(), pid)
+                .expect_err(&format!("{caller_label} must be refused {method} {params}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("operator"),
+                "{caller_label} {method} refusal must name operator boundary, got: {msg}"
+            );
+        }
+
+        // Even when an agent supplies explicit `alias`/`agent` routing params or forged
+        // operator/identity fields, the daemon must refuse without touching any rules.
+        for (method, params) in &explicit_or_forged_calls {
+            let err = fx
+                .dispatch(method, params.clone(), pid)
+                .expect_err(&format!("{caller_label} must be refused {method} {params}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("operator") || msg.contains("connection-bound"),
+                "{caller_label} {method} {params} refusal must hit operator/connection-bound boundary, got: {msg}"
+            );
+        }
     }
 
     assert_eq!(fs::read(&doc_path).unwrap(), doc_before);
@@ -903,6 +976,25 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
     std::os::unix::fs::symlink("loop_b", fx.repo_dir.join("loop_a")).unwrap();
     std::os::unix::fs::symlink("loop_a", fx.repo_dir.join("loop_b")).unwrap();
 
+    // Vector 5c: deeper subtrees under <pm_dir>/agents/** and symlink into w1 profile.
+    let w1_profile_dir = fx.pm_dir.join("agents/w1/profile");
+    let w2_memory_dir = fx.pm_dir.join("agents/w2/memory");
+    fs::create_dir_all(&w1_profile_dir).unwrap();
+    fs::create_dir_all(&w2_memory_dir).unwrap();
+    std::os::unix::fs::symlink(&w1_profile_dir, fx.repo_dir.join("prof")).unwrap();
+    assert_eq!(
+        fs::canonicalize(fx.repo_dir.join("prof")).unwrap(),
+        fs::canonicalize(&w1_profile_dir).unwrap(),
+        "test fixture symlink prof must resolve to agents/w1/profile"
+    );
+    let w1_profile_secret = w1_profile_dir.join("secret.md");
+    let w2_memory_notes = w2_memory_dir.join("notes.md");
+    let agent_subtree_targets = [
+        w1_profile_secret.to_string_lossy().into_owned(),
+        w2_memory_notes.to_string_lossy().into_owned(),
+        "prof/secret.md".to_string(),
+    ];
+
     // Commands for Vector 2 (`=rhs` Bash arguments targeting fx.state_dir).
     let dd_cmd = format!("dd if={} of=/tmp/out", state_target.display());
     let dd_argv = vec![
@@ -948,7 +1040,50 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
             vec!["Write".into(), "loop_a".into()],
             &fx.repo_dir,
         ),
+        exact_allow_rule(
+            "allow-git-plus-main",
+            vec!["git".into(), "push".into(), "origin".into(), "+main".into()],
+            &fx.repo_dir,
+        ),
+        exact_allow_rule(
+            "allow-git-plus-head",
+            vec![
+                "git".into(),
+                "push".into(),
+                "origin".into(),
+                "+HEAD:main".into(),
+            ],
+            &fx.repo_dir,
+        ),
+        exact_allow_rule(
+            "allow-smuggled-git-force",
+            vec![
+                "git".into(),
+                "push".into(),
+                "--force".into(),
+                "origin".into(),
+                "main".into(),
+            ],
+            &fx.repo_dir,
+        ),
+        exact_allow_rule(
+            "allow-smuggled-write-note",
+            vec!["Write".into(), "note.md".into()],
+            &fx.repo_dir,
+        ),
     ];
+    for (idx, target) in agent_subtree_targets.iter().enumerate() {
+        rules.push(exact_allow_rule(
+            &format!("allow-subtree-cat-{idx}"),
+            vec!["cat".into(), target.clone()],
+            &fx.repo_dir,
+        ));
+        rules.push(exact_allow_rule(
+            &format!("allow-subtree-write-{idx}"),
+            vec!["Write".into(), target.clone()],
+            &fx.repo_dir,
+        ));
+    }
     if state_canon != fx.state_dir {
         rules.push(exact_allow_rule(
             "allow-cwd-state-dir-canon",
@@ -1039,6 +1174,82 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
         res_loop_write.is_err(),
         "symlink loop Write 'loop_a' must fail closed immediately, got: {res_loop_write:?}"
     );
+
+    // 5a. `+refspec` force-pushes via Bash.
+    for (idx, cmd) in ["git push origin +main", "git push origin +HEAD:main"]
+        .into_iter()
+        .enumerate()
+    {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-bypass-refspec-{idx}"), cmd),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "+refspec force-push '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+
+    // 5b. Non-`Bash` tool smuggling via `request_open`.
+    for (idx, (tool, input)) in [
+        ("bash", json!({"command": "git push --force origin main"})),
+        ("git", json!({"command": "push --force origin main"})),
+        (
+            "/usr/bin/git",
+            json!({"command": "push --force origin main"}),
+        ),
+        (
+            "Write",
+            json!({
+                "file_path": "note.md",
+                "content": "x",
+                "command": "git push --force origin main",
+            }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_tool("w1", &format!("perm-bypass-smuggle-{idx}"), tool, input),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "non-Bash tool smuggling with tool '{tool}' must be refused immediately, got: {res:?}"
+        );
+    }
+
+    // 5c. Deeper subtrees under `<pm_dir>/agents/**` (including symlinked prof/).
+    for (idx, target) in agent_subtree_targets.iter().enumerate() {
+        let cat_cmd = format!("cat {target}");
+        let res_cat = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-bypass-subtree-cat-{idx}"), &cat_cmd),
+            w1.pid(),
+        );
+        assert!(
+            res_cat.is_err(),
+            "subtree Bash target '{target}' must be refused immediately even with planted allow rule, got: {res_cat:?}"
+        );
+
+        let res_write = fx.dispatch(
+            "request_open",
+            request_open_write(
+                "w1",
+                &format!("perm-bypass-subtree-write-{idx}"),
+                target,
+                "tampered",
+            ),
+            w1.pid(),
+        );
+        assert!(
+            res_write.is_err(),
+            "subtree Write target '{target}' must be refused immediately even with planted allow rule, got: {res_write:?}"
+        );
+    }
 
     assert!(
         fx.pending_requests_for("w1").is_empty(),

@@ -376,6 +376,14 @@ fn never_why_for(
     state_dirs: &[&Path],
     allow_master_scratch: bool,
 ) -> Option<&'static str> {
+    if !allow_master_scratch
+        && !argv
+            .first()
+            .is_some_and(|t| worker_allowed_non_bash_tool(t))
+        && (argv.is_empty() || argv.len() > ARG_MAX || !argv.iter().all(|a| pattern_arg_ok(a)))
+    {
+        return Some("malformed shell command is never requestable");
+    }
     let tokens: Vec<&str> = argv.iter().map(|s| tool_name(s)).collect();
     let has = |w: &str| tokens.contains(&w);
     let cadence = is_cadence(argv.first().map(String::as_str).unwrap_or(""));
@@ -390,6 +398,7 @@ fn never_why_for(
                 || a.starts_with("--force=")
                 || a.starts_with("--force-with-lease")
                 || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+                || (a.starts_with('+') && a.len() > 1)
         })
     {
         return Some("git force-push is never requestable");
@@ -567,13 +576,6 @@ fn expand_path_symlinks(path: &Path) -> std::result::Result<PathBuf, ()> {
     Ok(cur)
 }
 
-fn resolve_canonical(path: &Path) -> PathBuf {
-    if let Ok(canon) = fs::canonicalize(path) {
-        return canon;
-    }
-    expand_path_symlinks(path).unwrap_or_else(|()| path.to_path_buf())
-}
-
 fn touches_protected_file(arg: &str, cwd: &Path) -> bool {
     arg_path_candidates(arg).into_iter().flatten().any(|cand| {
         if protected_file(cand) {
@@ -591,11 +593,57 @@ fn touches_protected_file(arg: &str, cwd: &Path) -> bool {
 }
 
 pub(crate) fn touches_pm_agents_dir(arg: &str, cwd: &Path, pm_dir: &Path) -> bool {
-    let agents_root = resolve_canonical(&pm_dir.join("agents"));
+    touches_pm_agents_dir_inner(arg, cwd, pm_dir, false)
+}
+
+pub(crate) fn argv_touches_pm_agents_dir(argv: &[String], cwd: &Path, pm_dir: &Path) -> bool {
+    let is_wiki = is_cadence(argv.first().map(String::as_str).unwrap_or(""))
+        && cadence_subcommand(argv) == Some("wiki");
+    if !is_wiki {
+        let Ok(agents_root) = expand_for_state(&pm_dir.join("agents")) else {
+            return true;
+        };
+        match expand_for_state(cwd) {
+            Ok(exp) if exp == agents_root || exp.starts_with(&agents_root) => return true,
+            Ok(_) => {}
+            Err(()) => return true,
+        }
+    }
+    argv.iter()
+        .skip(1)
+        .any(|a| touches_pm_agents_dir_inner(a, cwd, pm_dir, is_wiki))
+}
+
+fn touches_pm_agents_dir_inner(
+    arg: &str,
+    cwd: &Path,
+    pm_dir: &Path,
+    allow_wiki_knowledge: bool,
+) -> bool {
+    let Ok(agents_root) = expand_for_state(&pm_dir.join("agents")) else {
+        return true;
+    };
     arg_path_candidates(arg).into_iter().flatten().any(|cand| {
         let probed = probe_path(cand, cwd);
-        match expand_path_symlinks(&probed) {
-            Ok(exp) => exp == agents_root || exp.parent() == Some(agents_root.as_path()),
+        match expand_for_state(&probed) {
+            Ok(exp) => {
+                if exp == agents_root || exp.starts_with(&agents_root) {
+                    if allow_wiki_knowledge {
+                        if let Ok(rel) = exp.strip_prefix(&agents_root) {
+                            let mut comps = rel.components();
+                            if matches!(comps.next(), Some(Component::Normal(_)))
+                                && matches!(comps.next(), Some(Component::Normal(c)) if c == "knowledge")
+                                && comps.next().is_some()
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             Err(()) => true,
         }
     })
@@ -1317,10 +1365,7 @@ fn rule_live_for(alias: &str, rule: &Rule, state_dirs: &[&Path], pm_dir: &Path) 
         !matches!(classify(&probe, cwd, &[], state_dirs), Class::Never { .. })
     } else {
         never_why_for(&probe, cwd, state_dirs, false).is_none()
-            && !probe
-                .iter()
-                .skip(1)
-                .any(|a| touches_pm_agents_dir(a, cwd, pm_dir))
+            && !argv_touches_pm_agents_dir(&probe, cwd, pm_dir)
     }
 }
 
@@ -1574,6 +1619,53 @@ fn collect_input_paths(val: &Value, depth: usize, out: &mut Vec<String>) {
     }
 }
 
+const WORKER_NON_BASH_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "TodoWrite",
+    "Skill",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "AskUserQuestion",
+];
+
+fn worker_allowed_non_bash_tool(tool: &str) -> bool {
+    if WORKER_NON_BASH_TOOLS.contains(&tool) {
+        return true;
+    }
+    if let Some(rest) = tool.strip_prefix("mcp__") {
+        return rest.contains("__")
+            && !rest.starts_with('_')
+            && !rest.ends_with('_')
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+    }
+    false
+}
+
+fn has_command_field(val: &Value, depth: usize) -> bool {
+    if depth > 5 {
+        return true;
+    }
+    match val {
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k == "command" || has_command_field(v, depth + 1)),
+        Value::Array(arr) => arr.iter().any(|v| has_command_field(v, depth + 1)),
+        _ => false,
+    }
+}
+
 fn worker_argv_and_reason(
     tool: &str,
     input: &Value,
@@ -1647,28 +1739,32 @@ fn worker_argv_and_reason(
         return Ok((argv, reason));
     }
 
-    let target = [
-        "file_path",
-        "notebook_path",
-        "path",
-        "url",
-        "pattern",
-        "command",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        input
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    })
-    .or_else(|| {
-        let trimmed = input_summary.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    })
-    .unwrap_or("{}");
-    if target.len() > ARG_LEN || target.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+    if !worker_allowed_non_bash_tool(tool) {
+        return Err(Error::rejected(format!(
+            "tool '{tool}' is not an allowed non-Bash worker tool — run shell and CLI commands through Bash"
+        )));
+    }
+    if has_command_field(input, 0) {
+        return Err(Error::rejected(
+            "non-Bash tool request cannot carry a command field",
+        ));
+    }
+
+    let target = ["file_path", "notebook_path", "path", "url", "pattern"]
+        .into_iter()
+        .find_map(|key| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            let trimmed = input_summary.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or("{}");
+    if target.len() > ARG_LEN || target.chars().any(char::is_control) {
         return Err(Error::rejected(format!(
             "{tool} target exceeds {ARG_LEN} bytes or contains control characters"
         )));
@@ -1721,11 +1817,7 @@ pub fn evaluate_worker(
         )));
     }
     if let Some(pm) = pm_dir {
-        if argv
-            .iter()
-            .skip(1)
-            .any(|a| touches_pm_agents_dir(a, &cwd, pm))
-        {
+        if argv_touches_pm_agents_dir(&argv, &cwd, pm) {
             return Err(Error::rejected(
                 "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable — it cannot be approved and no permission rule can cover it",
             ));
@@ -3302,5 +3394,203 @@ mod tests {
             1_012,
         )
         .expect_err("always_rule must refuse worker request whose cwd is state_dir");
+    }
+
+    #[test]
+    fn worker_plus_refspec_tool_smuggling_and_nested_agents_dir_are_never() {
+        let dir = tmp();
+        let state = dir.path().join("state");
+        let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        let w1_profile = pm.join("agents/w1/profile");
+        let w1_knowledge = pm.join("agents/w1/knowledge");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&w1_profile).unwrap();
+        fs::create_dir_all(&w1_knowledge).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let state_canon = fs::canonicalize(&state).unwrap();
+        let pm_canon = fs::canonicalize(&pm).unwrap();
+        let repo_cwd = fs::canonicalize(&repo).unwrap();
+        std::os::unix::fs::symlink(pm_canon.join("agents/w1/profile"), repo_cwd.join("prof"))
+            .unwrap();
+
+        // 1. +refspec force-pushes are Class::Never and refused for workers.
+        for cmd in [
+            "git push origin +main",
+            "git push origin +HEAD:refs/heads/main",
+        ] {
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                never_why(&argv, &repo_cwd, &[state_canon.as_path()]).is_some(),
+                "expected never_why for `{cmd}`"
+            );
+            assert!(
+                !matches!(
+                    classify(&argv, &repo_cwd, &[], &[state_canon.as_path()]),
+                    Class::Requestable { .. } | Class::Allowlisted
+                ),
+                "expected `{cmd}` not to be requestable or allowlisted"
+            );
+            let err = evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-plus-push",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                cmd,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_020,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("force-push"), "{cmd}: {err}");
+        }
+
+        // 2. Non-Bash tool smuggling (bash/git/command fields) is refused.
+        for (tool, input) in [
+            (
+                "bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+            ),
+            (
+                "git",
+                serde_json::json!({"command": "push --force origin main"}),
+            ),
+            (
+                "/usr/bin/git",
+                serde_json::json!({"command": "push --force origin main"}),
+            ),
+            (
+                "Write",
+                serde_json::json!({"file_path": "a.txt", "command": "git push --force"}),
+            ),
+        ] {
+            evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-smuggle",
+                tool,
+                &input,
+                "smuggle",
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_021,
+            )
+            .expect_err(&format!("expected refusal for tool={tool} input={input}"));
+        }
+
+        // Even a planted multi-word argv shell rule or request fails closed.
+        let smuggled_rule = Rule {
+            id: "wr-smuggle".into(),
+            effect: Effect::Allow,
+            scope: Scope::Exact,
+            argv: vec!["git".into(), "push --force origin main".into()],
+            tail: vec![],
+            cwd: repo_cwd.to_string_lossy().into_owned(),
+            by: "operator".into(),
+            at: 1_021,
+        };
+        write_rules(&pm_canon, "w1", &[smuggled_rule]).unwrap();
+        assert!(live_rules(&pm_canon, "w1", &[state_canon.as_path()])
+            .unwrap()
+            .is_empty());
+        let mut doc = Doc::default();
+        doc.requests.push(Request {
+            id: "mp-smuggle".into(),
+            argv: vec!["git".into(), "push --force origin main".into()],
+            cwd: repo_cwd.to_string_lossy().into_owned(),
+            reason: "planted".into(),
+            requested_by: "w1".into(),
+            created: 1_000,
+            expires_at: 1_000 + TTL_SECS,
+            status: "pending".into(),
+            risk: Risk::High,
+            decision: String::new(),
+            decision_label: String::new(),
+        });
+        save_doc(&state_canon, &doc).unwrap();
+        allow_once(
+            &state_canon,
+            "mp-smuggle",
+            &[],
+            &[state_canon.as_path()],
+            1_022,
+        )
+        .expect_err("allow_once must refuse planted multi-word shell argv");
+        always_rule(
+            &state_canon,
+            "mp-smuggle",
+            Scope::Exact,
+            &[],
+            &[],
+            &[state_canon.as_path()],
+            1_022,
+        )
+        .expect_err("always_rule must refuse planted multi-word shell argv");
+
+        // 3. Deeper descendants under pm/agents/** are refused for Write and Bash, including via symlinks.
+        let nested_abs = pm_canon.join("agents/w1/profile/note.md");
+        for target in [
+            nested_abs.to_string_lossy().into_owned(),
+            "prof/note.md".into(),
+        ] {
+            let err_w = evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-nested-write",
+                "Write",
+                &serde_json::json!({"file_path": target, "content": "x"}),
+                &target,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_023,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_w.contains("never requestable"),
+                "Write {target}: {err_w}"
+            );
+
+            let cmd = format!("cat {target}");
+            let err_b = evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-nested-bash",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                &cmd,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_024,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_b.contains("never requestable"),
+                "Bash {target}: {err_b}"
+            );
+        }
+
+        // Legitimate `cadence wiki` knowledge paths under pm_dir stay requestable (gated by wiki ACLs).
+        let eval_wiki = evaluate_worker(
+            &state_canon,
+            Some(pm_canon.as_path()),
+            "w1",
+            "h-wiki-ok",
+            "Bash",
+            &serde_json::json!({"command": "cadence wiki write agents/w1/knowledge/note.md"}),
+            "cadence wiki write agents/w1/knowledge/note.md",
+            &pm_canon,
+            &[state_canon.as_path()],
+            1_025,
+        )
+        .unwrap();
+        assert!(matches!(eval_wiki, WorkerEval::Pending(_)));
     }
 }
