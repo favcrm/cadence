@@ -233,15 +233,24 @@ async function boundaryChecks() {
     await flush();
     const hostedLink = host.querySelector('a[href^="/__platform/login"]') as HTMLAnchorElement | null;
     assert(hostedLink, "hosted refusal offers the platform sign-in handoff");
-    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${intendedPath}`, "hosted handoff preserves the absolute board path, query and safe fragment");
+    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${pathWithoutFragment}`, "hosted handoff never sends fragments to the platform");
+    hostedLink.addEventListener("click", (event) => event.preventDefault());
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === intendedPath, "safe anchor stays in this tab for verified restoration");
     await React.act(async () => navigate(`${pathWithoutFragment}#access_token=secret`));
     await flush();
-    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${pathWithoutFragment}`, "credential-bearing fragments never enter the hosted handoff");
-    assert(sessionStorage.getItem("cadence.auth.returnTo") === pathWithoutFragment, "credential-bearing fragments are not remembered");
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === pathWithoutFragment, "credential-style fragments are not remembered");
     await React.act(async () => navigate(intendedPath));
     await flush();
     const rememberedPath = sessionStorage.getItem("cadence.auth.returnTo");
     assert(rememberedPath === intendedPath, "public deep link is remembered for the same-tab local handoff");
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    history.replaceState(null, "", pathWithoutFragment);
+    response = () => json(hostedSession);
+    await focus();
+    assert(location.pathname + location.search + location.hash === intendedPath, "only verified same-tab return restores the safe anchor");
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === null, "the hosted return marker is single-use");
 
     // Exercise the actual Login nonce exchange. A returned key is not admission:
     // the /login route cannot redirect or mount private content before metadata.

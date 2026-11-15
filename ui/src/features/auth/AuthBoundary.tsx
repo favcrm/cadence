@@ -21,8 +21,9 @@ type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null;
 const IDENTITY_STORE = "cadence.privateSessionIdentity";
 
 const RETURN_STORE = "cadence.auth.returnTo";
+const HOSTED_RETURN_STORE = "cadence.auth.hostedReturnTo";
 
-/** Only navigation anchors, never credential-bearing fragments, cross sign-in. */
+/** Retain only plain anchor-like fragments, never credential-style key/value fragments. */
 function safeReturnFragment(fragment: string): string {
   if (!fragment.startsWith("#")) return "";
   try {
@@ -304,6 +305,19 @@ export default function AuthBoundary({ children }: {
     if (loginRoute && loginExchanged && state.status === "ready") navigate(returnDestination(), { replace: true });
   }, [loginRoute, loginExchanged, state.status]);
   useEffect(() => {
+    if (state.status !== "ready" || loginRoute) return;
+    try {
+      const saved = sessionStorage.getItem(HOSTED_RETURN_STORE);
+      if (saved === null) return;
+      sessionStorage.removeItem(HOSTED_RETURN_STORE);
+      const destination = safeReturnPath(saved);
+      if (!destination) return;
+      const target = new URL(destination, location.origin);
+      if (target.pathname === location.pathname && target.search === location.search && target.hash && !location.hash)
+        navigate(`${target.pathname}${target.search}${target.hash}`, { replace: true });
+    } catch { /* Same-tab return is optional when storage is unavailable. */ }
+  }, [state.status, loginRoute]);
+  useEffect(() => {
     const freshLink = () => {
       if (location.pathname !== "/login" || !location.hash) return;
       captureLoginNonce();
@@ -314,7 +328,13 @@ export default function AuthBoundary({ children }: {
   }, []);
 
   const hosted = state.hosted;
-  const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(returnHref) ?? "/", location.origin).href)}`;
+  const hostedDestination = loginRoute ? returnDestination() : safeReturnPath(returnHref) ?? "/";
+  const hostedTarget = new URL(hostedDestination, location.origin);
+  hostedTarget.hash = "";
+  const hostedLogin = `/__platform/login?to=${encodeURIComponent(hostedTarget.href)}`;
+  const rememberHostedReturn = () => {
+    try { sessionStorage.setItem(HOSTED_RETURN_STORE, hostedDestination); } catch { /* Same-tab return is optional. */ }
+  };
   const checking = state.status === "checking";
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
@@ -341,14 +361,14 @@ export default function AuthBoundary({ children }: {
             {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
               {state.status === "unavailable" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
-                {hosted ? <a className="auth-back-link" href={hostedLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">
+                {hosted ? <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>
                   <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
                   <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
                   {state.meta?.device_login === true && <DeviceSignIn onSignedIn={onSignedIn} />}
                 </details>}
               </> : hosted ? <>
-                <a className="btn btn-primary btn-full" href={hostedLogin}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
+                <a className="btn btn-primary btn-full" href={hostedLogin} onClick={rememberHostedReturn}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
                 <p className="auth-quiet auth-centered">{t("No separate Cadence account needed.")}</p>
               </> : <>
                 <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
