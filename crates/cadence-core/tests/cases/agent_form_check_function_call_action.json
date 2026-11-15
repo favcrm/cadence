@@ -1,0 +1,93 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.check",
+    "input": {
+      "form": {
+        "version": "1.0",
+        "createSurface": {
+          "surfaceId": "s-intake",
+          "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+          "components": [
+            {
+              "id": "root",
+              "component": "Column",
+              "children": [
+                "title",
+                "name",
+                "day",
+                "send"
+              ]
+            },
+            {
+              "id": "title",
+              "component": "Text",
+              "text": "Quick intake"
+            },
+            {
+              "id": "name",
+              "component": "TextField",
+              "label": "Your name",
+              "variant": "shortText",
+              "value": {
+                "@path": "/name"
+              }
+            },
+            {
+              "id": "day",
+              "component": "ChoicePicker",
+              "label": "Day",
+              "variant": "mutuallyExclusive",
+              "options": [
+                {
+                  "label": "Monday",
+                  "value": "mon"
+                },
+                {
+                  "label": "Friday",
+                  "value": "fri"
+                }
+              ],
+              "value": {
+                "@path": "/day"
+              }
+            },
+            {
+              "id": "send",
+              "component": "Button",
+              "variant": "primary",
+              "child": "send_label",
+              "action": {
+                "functionCall": {
+                  "@call": "openUrl",
+                  "args": {
+                    "url": "https://example.com"
+                  }
+                }
+              }
+            },
+            {
+              "id": "send_label",
+              "component": "Text",
+              "text": "Send answer"
+            }
+          ],
+          "dataModel": {
+            "name": "",
+            "day": [
+              "mon"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.check",
+    "value": {
+      "valid": false,
+      "message": "form /createSurface/components/4/action/functionCall: a form button only sends an event; it runs no function"
+    }
+  }
+}
