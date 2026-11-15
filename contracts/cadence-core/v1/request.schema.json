@@ -130,6 +130,23 @@
         "op",
         "input"
       ]
+    },
+    {
+      "description": "Check one agent form (an A2UI `createSurface` envelope) against the\npilot catalog the native daemon enforces (CAD-2331). A form the pilot\nrefuses is a `valid: false` value, not an envelope refusal.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FormCheckInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "agent.form.check"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
     }
   ],
   "required": [
@@ -329,6 +346,19 @@
       "required": [
         "changes",
         "lines"
+      ]
+    },
+    "FormCheckInput": {
+      "description": "Input of `agent.form.check`.",
+      "type": "object",
+      "properties": {
+        "form": {
+          "description": "The `{\"version\":\"1.0\",\"createSurface\":{...}}` envelope."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "form"
       ]
     },
     "ManifestPreflightInput": {

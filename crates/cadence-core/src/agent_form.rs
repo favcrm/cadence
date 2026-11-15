@@ -13,8 +13,14 @@
 //! The form carries no authority: its one action kind is an `event` the
 //! board turns into the operator's own chat message. There are no URLs,
 //! no renderer functions beyond checks, and no secret fields.
+//!
+//! CAD-2331: this is the one validator. The native daemon calls [`check`]
+//! directly; a non-native host (the hosted runtime) reaches the same
+//! function through `evaluate`'s `agent.form.check`, so the two gates
+//! cannot drift.
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -231,7 +237,7 @@ pub fn check(envelope: &Value) -> Result<Form> {
     Ok(Form {
         envelope: envelope.clone(),
         fallback: fallback(&order),
-        digest: crate::delegation::sha256_hex(&bytes),
+        digest: format!("{:x}", Sha256::digest(&bytes)),
     })
 }
 

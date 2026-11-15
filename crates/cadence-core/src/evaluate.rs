@@ -36,6 +36,12 @@
 //! must apply its own operation set and its own grants before publishing,
 //! installing or re-validating a package. `app.screen.integrity` keeps
 //! refusing an operation this core does not serve.
+//!
+//! `agent.form.check` runs the one agent-form validator
+//! ([`crate::agent_form::check`]) the native `master ask-form` gate runs, so
+//! a non-native host refuses exactly what the daemon refuses and builds the
+//! same fallback text and digest. It is a shape check only: who may ask,
+//! in which conversation and on which turn stays the host's own decision.
 
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
 use crate::app_screen_decl::{
@@ -133,6 +139,53 @@ pub enum Operation {
     /// class.
     #[serde(rename = "delivery.requirements.evaluate")]
     DeliveryRequirementsEvaluate(DeliveryRequirementsInput),
+    /// Check one agent form (an A2UI `createSurface` envelope) against the
+    /// pilot catalog the native daemon enforces (CAD-2331). A form the pilot
+    /// refuses is a `valid: false` value, not an envelope refusal.
+    #[serde(rename = "agent.form.check")]
+    AgentFormCheck(FormCheckInput),
+}
+
+/// Input of `agent.form.check`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FormCheckInput {
+    /// The `{"version":"1.0","createSurface":{...}}` envelope.
+    pub form: Value,
+}
+
+/// Success value of `agent.form.check`. When `valid`, `fallback` and
+/// `digest` are set; otherwise `message` names the refused path and rule,
+/// exactly as the native daemon words it.
+#[derive(Serialize, JsonSchema)]
+pub struct FormCheckValue {
+    pub valid: bool,
+    /// The text every surface that does not render the form shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// Lowercase sha256 hex of the envelope's compact JSON; a replay of the
+    /// same form compares equal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn form_check(input: &FormCheckInput) -> FormCheckValue {
+    match crate::agent_form::check(&input.form) {
+        Ok(form) => FormCheckValue {
+            valid: true,
+            fallback: Some(form.fallback),
+            digest: Some(form.digest),
+            message: None,
+        },
+        Err(error) => FormCheckValue {
+            valid: false,
+            fallback: None,
+            digest: None,
+            message: Some(error.to_string()),
+        },
+    }
 }
 
 /// Input of `delivery.requirements.evaluate`.
@@ -422,6 +475,8 @@ pub enum OpValue {
     #[serde(rename = "delivery.requirements.evaluate")]
     #[schemars(with = "DeliveryRequirementsValue")]
     DeliveryRequirements(Value),
+    #[serde(rename = "agent.form.check")]
+    FormCheck(FormCheckValue),
 }
 
 /// Success response.
@@ -699,6 +754,7 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
         )),
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
+        Operation::AgentFormCheck(input) => Ok(OpValue::FormCheck(form_check(&input))),
     }
 }
 

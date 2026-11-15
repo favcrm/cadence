@@ -282,7 +282,7 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             let text = crate::cli::read_master_command_file(
                 state_dir,
                 Some(&file),
-                cadence_agent::agent_form::MAX_BYTES as u64,
+                cadence_core::agent_form::MAX_BYTES as u64,
             )?;
             let form: Value = serde_json::from_str(&text).map_err(|e| {
                 cadence_agent::error::Error::usage(format!(
