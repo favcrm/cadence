@@ -227,8 +227,8 @@ async function boundaryChecks() {
 
     const { navigate } = require("../src/lib/useLocation") as typeof LocationModule;
     const { captureLoginNonce } = require("../src/features/auth/session") as typeof AuthSessionModule;
-    const pathWithoutFragment = "/projects/cadence/issues?view=kanban";
-    const intendedPath = `${pathWithoutFragment}#overview`;
+    const pathWithoutFragment = "/wiki/releases?view=read";
+    const intendedPath = `${pathWithoutFragment}#release-v1.2`;
     await React.act(async () => navigate(intendedPath));
     await flush();
     const hostedLink = host.querySelector('a[href^="/__platform/login"]') as HTMLAnchorElement | null;
@@ -237,10 +237,12 @@ async function boundaryChecks() {
     hostedLink.addEventListener("click", (event) => event.preventDefault());
     await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
     assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === intendedPath, "safe anchor stays in this tab for verified restoration");
-    await React.act(async () => navigate(`${pathWithoutFragment}#access_token=secret`));
-    await flush();
-    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
-    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === pathWithoutFragment, "credential-style fragments are not remembered");
+    for (const fragment of ["#access_token=secret", "#access_token%3Dsecret", "#bad%"]) {
+      await React.act(async () => navigate(`${pathWithoutFragment}${fragment}`));
+      await flush();
+      await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+      assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === pathWithoutFragment, "credential-style or malformed fragments are not remembered");
+    }
     await React.act(async () => navigate(intendedPath));
     await flush();
     const rememberedPath = sessionStorage.getItem("cadence.auth.returnTo");
