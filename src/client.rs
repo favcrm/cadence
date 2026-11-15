@@ -675,6 +675,41 @@ pub(crate) fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixSt
     }
 }
 
+/// True when `socket` is provably a dead daemon's leftover: connect(2)
+/// answers ECONNREFUSED (the file exists, nothing listens) or ENOENT.
+/// Any other outcome — a connection, a full backlog, a permission or
+/// path error — is not proof, so a daemon that might be alive is never
+/// read as stopped. A nonblocking connect never waits.
+pub(crate) fn socket_has_no_listener(socket: &Path) -> bool {
+    let Ok((addr, len)) = unix_addr(socket) else {
+        return false;
+    };
+    // SAFETY: fixed, valid socket(2) arguments.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let refused = arm_socket(fd).is_ok() && {
+        // SAFETY: `addr` is a sockaddr_un valid for `len` bytes; `fd` is a
+        // live nonblocking unix stream socket.
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        rc != 0
+            && matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            )
+    };
+    // SAFETY: `fd` is a live descriptor we own.
+    unsafe { libc::close(fd) };
+    refused
+}
+
 /// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
 /// exists on every unix target; SOCK_NONBLOCK/SOCK_CLOEXEC socket(2)
 /// flags do not (Darwin lacks them, so `connect_bounded` creates a

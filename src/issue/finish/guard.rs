@@ -211,8 +211,8 @@ pub(crate) fn in_use_blocks_with_process_probe(
                 "daemon-unreachable",
                 format!(
                     "Daemon unreachable while enumerating agents/tasks ({e}) — \
-                     a task-bound kickoff could be missed; rerun when the \
-                     daemon is up or pass --force"
+                     a task-bound kickoff could be missed; rerun once the \
+                     daemon answers or pass --force"
                 ),
             );
         }
@@ -278,7 +278,7 @@ pub(crate) fn in_use_blocks_with_process_probe(
                                 format!(
                                     "Daemon unreachable while checking a message's \
                                      task binding on '{alias}' — refusing to guess; \
-                                     rerun when the daemon is up or pass --force"
+                                     rerun once the daemon answers or pass --force"
                                 ),
                             ),
                             Bound::Unknown(ProbeKind::Inconclusive) => push_once(
@@ -335,9 +335,10 @@ pub(crate) fn in_use_blocks_with_process_probe(
                     &mut unreachable,
                     "daemon-unreachable",
                     format!(
-                        "Daemon unreachable while checking '{alias}' ({e}) — \
-                         the agent checks cannot run; rerun when the daemon is \
-                         up or pass --force"
+                        "Daemon unreachable while checking '{alias}' ({}) — \
+                         the agent checks cannot run; rerun once the daemon \
+                         answers or pass --force",
+                        probe_text(&e)
                     ),
                 ),
                 AgentLookup::Inconclusive(e) => push_once(
