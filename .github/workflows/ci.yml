@@ -1220,8 +1220,9 @@ jobs:
           import hashlib, json, re, sys, tarfile
           from pathlib import Path
           archive, tag, source_sha, ui_manifest_path = sys.argv[1:]
-          app_kit_files = ("README.md", "package.json", "src/index.mjs", "src/receiver.mjs",
-                           "src/refusal.mjs", "types/index.d.ts")
+          app_kit_files = ("README.md", "package.json", "src/forms.mjs", "src/index.mjs",
+                           "src/react.mjs", "src/receiver.mjs", "src/refusal.mjs",
+                           "types/index.d.ts", "types/react.d.ts")
           expected = {
               "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
               "frame-kit/metadata.json", "package.json", "bun.lock", "toolchain.json",

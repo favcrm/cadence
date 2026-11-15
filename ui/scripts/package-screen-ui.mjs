@@ -50,14 +50,21 @@ const { default: tailwind } = await import(pathToFileURL(requireTool.resolve("@t
 
 // Closed source allowlist, including type-only edges. New imports require audit here.
 const allowed = new Set([
-  "screen-ui/src/index.ts", "screen-ui/src/navigation.tsx",
+  "screen-ui/src/index.ts",
+  "screen-ui/src/navigation.tsx",
+  "screen-ui/src/StatusPill.tsx",
+  "screen-ui/src/FilterBar.tsx",
+  "screen-ui/src/StagedApprovalBanner.tsx",
+  "screen-ui/src/localeBridge.tsx",
   ...["DataTable", "Field", "Detail", "DrawerShell", "States", "ConfirmDialog"].map((name) => `src/features/app-shell/shared/${name}.tsx`),
   "src/features/app-shell/shared/useDrawerClose.ts", "src/features/app-shell/shared/hostErrors.ts",
   ...["Button", "Link", "Select", "icons"].map((name) => `src/ui/${name}.tsx`),
   "src/ui/buttonActivate.ts", "src/ui/selectLogic.ts",
-  "src/lib/apiError.ts", "src/lib/types.ts", "src/lib/cacheCore.ts", "src/lib/useResource.ts",
+  "src/lib/apiError.ts", "src/lib/types.ts", "src/lib/generated/board-api.ts", "src/lib/cacheCore.ts", "src/lib/useResource.ts",
   "src/lib/localeText.tsx",
 ]);
+// Modules admitted solely as type-only definitions; AST-verified below to carry zero runtime code.
+const typeOnlyAllowed = new Set(["src/lib/generated/board-api.ts"]);
 const external = (id) => /^(react(?:\/.*)?|react-dom(?:\/.*)?|@hugeicons\/react|@hugeicons\/core-free-icons)$/.test(id);
 const options = {
   target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext,
@@ -82,6 +89,16 @@ function visit(file) {
   if (seen.has(path)) return;
   seen.add(path);
   const parsed = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  if (typeOnlyAllowed.has(path)) {
+    for (const stmt of parsed.statements) {
+      const pureType =
+        ts.isInterfaceDeclaration(stmt) ||
+        ts.isTypeAliasDeclaration(stmt) ||
+        (ts.isImportDeclaration(stmt) && Boolean(stmt.importClause?.isTypeOnly)) ||
+        (ts.isExportDeclaration(stmt) && stmt.isTypeOnly);
+      if (!pureType) throw new Error(`Type-only allowlist module carries runtime code: ${path}`);
+    }
+  }
   function walk(node) {
     if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) {
       const name = node.moduleSpecifier.text;
