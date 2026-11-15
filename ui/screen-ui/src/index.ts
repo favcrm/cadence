@@ -27,10 +27,23 @@ export type { LinkProps } from "../../src/ui/Link";
 export * from "../../src/ui/icons";
 export { Select } from "../../src/ui/Select";
 export type { SelectProps, SelectOption } from "../../src/ui/Select";
-export { LocaleTextProvider } from "../../src/lib/localeText";
+export { LocaleTextProvider, useTranslate } from "../../src/lib/localeText";
 export { ApiError } from "../../src/lib/apiError";
 export { Resource, QueryCache } from "../../src/lib/cacheCore";
 export type { ResourceState, ResourceStatus, ResourceOptions } from "../../src/lib/cacheCore";
 export { useQuery, useResource, useMaybeResource } from "../../src/lib/useResource";
 export { NavigationProvider, useNavigation } from "./navigation";
 export type { NavigationAdapter, NavigationOptions } from "./navigation";
+export { StatusPill } from "./StatusPill";
+export type { StatusPillProps, StatusTone } from "./StatusPill";
+export { FilterBar } from "./FilterBar";
+export type { FilterBarProps, FilterChipOption } from "./FilterBar";
+export { StagedApprovalBanner } from "./StagedApprovalBanner";
+export type { StagedApprovalBannerProps, StagedApprovalTone } from "./StagedApprovalBanner";
+export { LocaleBridgeProvider, useScreenLocale } from "./localeBridge";
+export type {
+  LocaleBridgeProviderProps,
+  LocaleCatalog,
+  ScreenLocaleBridgeSource,
+  ScreenLocaleContextValue,
+} from "./localeBridge";

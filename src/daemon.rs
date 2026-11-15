@@ -53,6 +53,7 @@ mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad811_installed_crm_qa_fixture;
+mod routines_rpc;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
     let raw = params
@@ -4009,6 +4010,30 @@ impl Shared {
                         crate::peer::AgentMutation::SelfService,
                     )?;
                 }
+                // CAD-2310: the briefing read (`briefing::briefing_read`) by
+                // the agent itself or its group root keeps what the briefing
+                // is built from past the scoped filter below. Allowed only
+                // when the caller rule admits an AGENT connection: every
+                // relayed read rides an operator-proven connection, so its
+                // reader is never the caller the rule judged.
+                let owner_read = scope.is_some()
+                    && (include_profile_instructions || include_catalogue_instructions)
+                    && match self.authorize_agent_mutation(
+                        params,
+                        peer_pid,
+                        "agent show",
+                        &agent,
+                        crate::peer::AgentMutation::SelfService,
+                    ) {
+                        Ok(crate::peer::AgentCaller::Agent(_)) => true,
+                        Ok(crate::peer::AgentCaller::Operator) | Err(Error::Rejected(_)) => false,
+                        Err(error) => {
+                            eprintln!(
+                                "agent show: briefing fields withheld for '{alias}': {error}"
+                            );
+                            false
+                        }
+                    };
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.
@@ -4105,9 +4130,6 @@ impl Shared {
                     std::collections::BTreeSet::new()
                 };
                 let mut agent_json = agent.to_json();
-                if profile_snapshot || catalogue_snapshot {
-                    agent_json["instructions"] = json!(agent.instructions);
-                }
                 // CAD-1752: the project of the task this agent is running
                 // (else its cwd's); the briefing's memory section reads it.
                 // CAD-2215: that derivation reads raw running/queued work, so a
@@ -4230,6 +4252,16 @@ impl Shared {
                 }
                 if scope.is_some() {
                     identity::retain_scoped_agent_fields(&mut agent_json, Some(&visible_running));
+                    if owner_read {
+                        agent_json["params"] = json!(agent.params);
+                        agent_json["cwd"] = json!(agent.cwd);
+                    }
+                }
+                // After the scoped filter, so a job the caller rule admitted
+                // is not stripped (CAD-2310); a relayed reader still never
+                // gets it.
+                if (profile_snapshot || catalogue_snapshot) && (scope.is_none() || owner_read) {
+                    agent_json["instructions"] = json!(agent.instructions);
                 }
                 let projected_messages = messages
                     .iter()
@@ -4687,6 +4719,22 @@ impl Shared {
             "endpoint_enable" => self.rpc_endpoint_set_enabled(params, true, peer_pid),
             "endpoint_disable" => self.rpc_endpoint_set_enabled(params, false, peer_pid),
             "endpoint_remove" => self.rpc_endpoint_remove(params, peer_pid),
+            "routine_list" => self.rpc_routine_list(params, peer_pid),
+            "routine_show" => self.rpc_routine_show(params, peer_pid),
+            "routine_create" => self.rpc_routine_create(params, peer_pid),
+            "routine_update" => self.rpc_routine_update(params, peer_pid),
+            "routine_approve" => self.rpc_routine_approve(params, peer_pid),
+            "routine_run" => self.rpc_routine_run(params, peer_pid),
+            "routine_run_decide" => self.rpc_routine_run_decide(params, peer_pid),
+            "routine_pause" => self.rpc_routine_pause(params, peer_pid),
+            "routine_resume" => self.rpc_routine_resume(params, peer_pid),
+            "routine_remove" => self.rpc_routine_remove(params, peer_pid),
+            "wiki_propose" => self.rpc_wiki_propose(params),
+            "routine_propose" => self.rpc_routine_propose(params),
+            "routine_proposal_decide" => self.rpc_routine_proposal_decide(params, peer_pid),
+            "connection_policy_get" => self.rpc_connection_policy_get(params, peer_pid),
+            "connection_policy_set" => self.rpc_connection_policy_set(params, peer_pid),
+            "credential_request_continue" => self.rpc_credential_request_continue(params, peer_pid),
             "agent_unfence" => self.rpc_unfence(params, peer_pid),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {

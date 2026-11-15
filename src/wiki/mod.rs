@@ -1212,9 +1212,6 @@ pub fn read_revision_for_evidence(
     at: &str,
     max_bytes: usize,
 ) -> Result<Option<Value>> {
-    if !admitted(pm, caller, path) {
-        return Ok(None);
-    }
     let Some(found) = revision::evidence_text(pm, caller, path, at, max_bytes)? else {
         return Ok(None);
     };
@@ -2925,6 +2922,53 @@ mod tests {
         let empty = Pm::at(&empty_dir).unwrap();
         assert!(!admitted(&empty, &Caller::Operator, page));
         assert!(admitted(&empty, &Caller::Operator, "global/x.md"));
+    }
+
+    #[test]
+    fn evidence_distinguishes_an_unreadable_project_from_a_proven_missing_page() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("private")).unwrap();
+        let project = pm.dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+
+        let page = "projects/secret/notes.md";
+        write(&pm, &Caller::Operator, page, "private original", None).unwrap();
+        let revision = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let member = Caller::User("mia".into());
+        let outsider = Caller::User("rob".into());
+
+        let original = read_revision_for_evidence(&pm, &member, page, &revision, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["text"], "private original");
+        assert!(read_revision_for_evidence(
+            &pm,
+            &member,
+            "projects/secret/missing.md",
+            &revision,
+            1024,
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_revision_for_evidence(&pm, &member, page, &"0".repeat(40), 1024).is_err());
+
+        let denied = read_revision_for_evidence(&pm, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        let empty = Pm::init(&root.path().join("empty")).unwrap();
+        let unknown = read_revision_for_evidence(&empty, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(denied, unknown, "refusal must not reveal project existence");
+        assert!(!denied.contains("private original"));
     }
 
     fn segs(path: &str) -> Vec<&str> {

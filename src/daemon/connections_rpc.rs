@@ -78,8 +78,13 @@ impl Shared {
             _ => (None, None),
         };
         let verification_support = self.connection_verification_support(provider, record);
+        let policy = self
+            .store
+            .connection_policy_resolve(&id, provider, account)
+            .map(|p| p.to_json())
+            .unwrap_or_else(|_| Value::Null);
         Ok(
-            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"verification_support":verification_support,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
+            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"verification_support":verification_support,"policy":policy,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
     pub(super) fn connection_record_metadata(&self, record: &CredentialRecord) -> Result<Value> {

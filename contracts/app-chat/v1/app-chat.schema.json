@@ -135,6 +135,124 @@
         }
       }
     },
+    "labelI18n": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 8,
+      "propertyNames": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$"
+      },
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/safeObject"
+          }
+        ],
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029][^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          }
+        }
+      }
+    },
+    "contextI18n": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 8,
+      "propertyNames": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$"
+      },
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/safeObject"
+          }
+        ],
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029][^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          },
+          "prompts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029][^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+            }
+          }
+        }
+      }
+    },
+    "cardI18n": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 8,
+      "propertyNames": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$"
+      },
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/safeObject"
+          }
+        ],
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029][^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029][^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          }
+        }
+      }
+    },
     "context": {
       "allOf": [
         {
@@ -195,8 +313,14 @@
                 "maxLength": 80,
                 "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
               }
+            },
+            "i18n": {
+              "$ref": "#/$defs/contextI18n"
             }
           }
+        },
+        "i18n": {
+          "$ref": "#/$defs/contextI18n"
         }
       }
     },
@@ -223,6 +347,9 @@
           "minLength": 1,
           "maxLength": 40,
           "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+        },
+        "i18n": {
+          "$ref": "#/$defs/labelI18n"
         }
       },
       "description": "Registry membership is enforced by this enum, by the TS validator and by the daemon's install validator; a test asserts the three agree."
@@ -249,6 +376,9 @@
           "minLength": 1,
           "maxLength": 40,
           "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+        },
+        "i18n": {
+          "$ref": "#/$defs/labelI18n"
         }
       }
     },
@@ -331,6 +461,9 @@
                   "from": {
                     "type": "string",
                     "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  },
+                  "i18n": {
+                    "$ref": "#/$defs/labelI18n"
                   }
                 }
               }
@@ -366,10 +499,16 @@
                   "view": {
                     "type": "string",
                     "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  },
+                  "i18n": {
+                    "$ref": "#/$defs/labelI18n"
                   }
                 },
                 "description": "view is required exactly when run is open-view (consumer-checked)."
               }
+            },
+            "i18n": {
+              "$ref": "#/$defs/cardI18n"
             }
           }
         },

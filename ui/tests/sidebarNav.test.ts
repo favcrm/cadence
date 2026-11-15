@@ -186,10 +186,13 @@ assert(!projectList(five).includes("projmore"), "every project pinned: no empty 
 const { ProjectsSection: ProjectsSectionView } = require("../src/ui/NavList") as typeof import("../src/ui/NavList");
 // Fixture projects carry only the fields the sidebar reads.
 const sectionProps = { project: null, projectHref: (k: string) => `/p/${k}`, projects: five, issues: state([]) } as unknown as React.ComponentProps<typeof ProjectsSectionView>;
-const section = () => renderToStaticMarkup(React.createElement(LocaleProvider, null, React.createElement(NavigationProvider, { adapter: hostNavigation, children:
-  React.createElement(ProjectsSectionView, sectionProps) })));
+const section = (extra: Record<string, unknown> = {}) =>
+  renderToStaticMarkup(React.createElement(LocaleProvider, null, React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+    React.createElement(ProjectsSectionView, { ...sectionProps, ...extra }) })));
 set({});
 assert(/<button[^>]*class="projhead-toggle slabel"[^>]*aria-expanded="true"/.test(section()) && section().includes("~/pm"), "open section: expanded heading, ~/pm hint");
+assert(/aria-expanded="true"/.test(section({ hosted: true })) && !section({ hosted: true }).includes("~/pm") && />5<\/span>/.test(section({ hosted: true })), "hosted workspace hides ~/pm hint and shows project count");
+assert(several.includes('title="alpha"') && several.includes('title="beta"'), "project rows expose full name via title tooltip");
 set({ projectsOpen: false });
 const closed = section();
 assert(/aria-expanded="false"/.test(closed) && />5<\/span>/.test(closed), "folded section: collapsed heading shows the project count");

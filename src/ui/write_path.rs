@@ -23,7 +23,7 @@ use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
     connections, credential_entry, crm_send, crm_smtp, endpoints, home, lane, operator, read_model,
-    social_publish, stages, threads, updates, whatsapp, wiki, workflows,
+    routines, social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1627,6 +1627,15 @@ pub(crate) fn write_route(
         }
         let relay = operator::public_relay(&request, opts);
         let response = app_content::handle(&mut request, state_dir, route, true, relay);
+        send(request, response);
+        return;
+    }
+    if let Some(route) = routines::route(path) {
+        if *method != Method::Post || !route.is_writable() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = routines::handle_write(&mut request, state_dir, route);
         send(request, response);
         return;
     }

@@ -1,6 +1,7 @@
 /** The agent page's sections; the active one rides the URL as `?tab=`. */
 export const AGENT_TABS = [
   { id: "instructions", label: "Instructions" },
+  { id: "routines", label: "Routines" },
   { id: "skills", label: "Skills" },
   { id: "tools", label: "Tools" },
   { id: "history", label: "History" },

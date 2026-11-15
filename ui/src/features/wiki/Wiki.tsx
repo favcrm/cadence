@@ -575,9 +575,6 @@ function BrowsePane({
         {readOnly && !locked && !missingRoot && (
           <Note warn>{readOnlyReason ?? t("Writes are disabled on this board.")}</Note>
         )}
-        {!readOnly && !locked && rootHere && !missingRoot && (
-          <Note>{t("The root lists folders — open a folder to add pages or uploads.")}</Note>
-        )}
         {newRow}
         {!missingRoot && isCollectionRoot(path) && <CollectionPane path={path} navHref={navHref} readOnly={readOnly} />}
         {!missingRoot && <FolderPane

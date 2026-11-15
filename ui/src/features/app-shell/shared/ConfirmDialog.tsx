@@ -95,12 +95,12 @@ export default function ConfirmDialog({
   };
 
   return (
-    <div className="crm-confirm-wrap" role="presentation">
-      <div className="crm-confirm-scrim" onClick={onCancel} />
+    <div className="s-confirm-wrap crm-confirm-wrap" role="presentation">
+      <div className="s-confirm-scrim crm-confirm-scrim" onClick={onCancel} />
       <section
         ref={dialogRef}
         tabIndex={-1}
-        className="card crm-confirm grid gap-3"
+        className="card s-confirm crm-confirm grid gap-3"
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -109,7 +109,7 @@ export default function ConfirmDialog({
         <h4 className="text-cardtitle font-medium text-ink-100">{title}</h4>
         <div className="text-label text-ink-300">{body}</div>
         {expect !== undefined && (
-          <div className="crm-field">
+          <div className="s-field crm-field">
             <label className="text-label text-ink-300" htmlFor={inputId}>
               {inputLabel ?? `${t("Type")} ${match} ${t("to confirm")}`}
             </label>
@@ -131,7 +131,7 @@ export default function ConfirmDialog({
             {error}
           </p>
         )}
-        <div className="crm-toolbar">
+        <div className="s-toolbar crm-toolbar">
           <Button size="sm" onClick={onCancel} disabled={pending}>
             {t("Cancel")}
           </Button>

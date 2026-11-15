@@ -80,7 +80,11 @@ equal(restingStatus("waiting_input"), null, "an unlisted state is not rounded up
   equal(names(true), ["help"], "a hosted board whose state is unread offers help alone");
   equal(names(true, ["stop", "new", "forged"]), ["help", "new", "stop"], "a hosted board offers known verbs it advertises");
   equal(names(false, []).length, SLASH_COMMANDS.length, "a native board keeps the full list whatever its provider advertises");
-  equal(names(null, []).length, SLASH_COMMANDS.length, "an unknown board keeps the full list");
+  equal(
+    names(null, []),
+    SLASH_COMMANDS.filter((c) => c.name !== "permissions").map((c) => c.name),
+    "an unknown board keeps non-native-only commands",
+  );
 }
 
 console.log("master models checks passed");

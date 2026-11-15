@@ -203,6 +203,22 @@ impl Shared {
         if let Some(agent) = agent.as_deref() {
             self.check_grant(agent, &platform, &account, &adapter, tool)?;
         }
+        let conn_id = match self.store.platform_credential(&platform, &account)? {
+            Some(rec) => rec.connection_id,
+            None => self.builtin_connection_id(&platform, &account)?,
+        };
+        let conn_policy = self
+            .store
+            .connection_policy_resolve(&conn_id, &platform, &account)?;
+        if let Some(agent) = agent.as_deref() {
+            if !conn_policy.allowed_agents.is_empty()
+                && !conn_policy.allowed_agents.iter().any(|a| a == agent)
+            {
+                return Err(Error::rejected(format!(
+                    "connection_agent_denied: '{agent}' is not permitted to use {platform}/{account} by connection policy"
+                )));
+            }
+        }
         {
             let _admission = self.custody_operation()?;
             self.refuse_encrypted_target(&platform, &account)?;
@@ -216,7 +232,13 @@ impl Shared {
         // CAD-1974: the connected-read rule lives in one function so the RPC and
         // its tests cannot disagree about it.
         let connected = connected_read_admission(table, reported.as_deref(), tool, params)?;
-        match classify_call(table, reported.as_deref(), tool) {
+        let call_effect = classify_call(table, reported.as_deref(), tool);
+        if conn_policy.write_mode == "read_only" && call_effect != Effect::Read {
+            return Err(Error::rejected(format!(
+                "connection_read_only: connection '{platform}/{account}' is set to read-only; external writes and drafts ('{tool}') are blocked"
+            )));
+        }
+        match call_effect {
             Effect::Read | Effect::Draft => {
                 let draft = table.effect_of(tool) == Effect::Draft;
                 // The actor label is the event/draft-log identity only; a
@@ -346,6 +368,22 @@ impl Shared {
     }
 
     fn default_account(&self, agent: &str, platform: &str, params: &Value) -> Result<String> {
+        if let Ok(enrolled) = self.store.platform_credentials() {
+            for rec in enrolled.into_iter().filter(|r| r.platform == platform) {
+                if let Ok(pol) =
+                    self.store
+                        .connection_policy_resolve(&rec.connection_id, platform, &rec.account)
+                {
+                    if pol.visibility == "personal"
+                        && pol.is_default
+                        && (pol.allowed_agents.is_empty()
+                            || pol.allowed_agents.iter().any(|a| a == agent))
+                    {
+                        return Ok(rec.account);
+                    }
+                }
+            }
+        }
         let project = match optional_str(params, "project") {
             Some(p) => identifier(p, "Project")?,
             None => {

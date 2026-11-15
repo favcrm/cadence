@@ -371,18 +371,7 @@ impl Shared {
                 } else {
                     json!({"state":"removed","message":"Removed — the restore window has closed.","action":null,"count":0})
                 };
-                let listing = desc["listing"].clone();
-                rows.push(json!({
-                    "install_id": install_id,
-                    "name": desc["name"],
-                    "title": desc["title"],
-                    "tagline": listing["tagline"],
-                    "icon": listing["icon"],
-                    "version": desc["version"],
-                    "listing": listing,
-                    "catalogue": desc["catalogue"],
-                    "attention": attention,
-                }));
+                rows.push(app_home_row(&install_id, &desc, attention, false));
                 continue;
             }
             // Consent state: revoked installs read "off".
@@ -423,22 +412,7 @@ impl Shared {
                     attention = json!({"state":"ok","message":null,"action":null,"count":0});
                 }
             }
-            let listing = desc["listing"].clone();
-            rows.push(json!({
-                "install_id": install_id,
-                "name": desc["name"],
-                "title": desc["title"],
-                // The legacy project association — two same-name
-                // installs keep it so a reader can tell them apart
-                // (the old `/apps` list's `Project:` chip).
-                "project": desc["project"],
-                "tagline": listing["tagline"],
-                "icon": listing["icon"],
-                "version": desc["version"],
-                "listing": listing,
-                "catalogue": desc["catalogue"],
-                "attention": attention,
-            }));
+            rows.push(app_home_row(&install_id, &desc, attention, true));
         }
         rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(json!({"installations": rows}))
@@ -929,6 +903,7 @@ impl Shared {
             "digest": digest,
             "check_digest": digest,
             "trust": "unreviewed",
+            "i18n": manifest.display_i18n(),
             "listing": manifest.listing.as_ref().map(|l| l.value.clone()),
             "access": access["access"],
             "never": access["never"],
@@ -1922,5 +1897,55 @@ mod data_access_rows {
             data_flags(&manifest("  data:\n    personal: true\n")),
             (false, true)
         );
+    }
+}
+
+/// Shared row projection for `rpc_app_home` across removed and active installs.
+fn app_home_row(install_id: &str, desc: &Value, attention: Value, include_project: bool) -> Value {
+    let listing = desc["listing"].clone();
+    let mut row = json!({
+        "install_id": install_id,
+        "name": desc["name"],
+        "title": desc["title"],
+        "tagline": listing["tagline"],
+        "icon": listing["icon"],
+        "version": desc["version"],
+        "listing": listing,
+        "i18n": desc["i18n"],
+        "navigation": desc["navigation"],
+        "catalogue": desc["catalogue"],
+        "attention": attention,
+    });
+    if include_project {
+        row["project"] = desc["project"].clone();
+    }
+    row
+}
+
+#[cfg(test)]
+mod app_home_projection_tests {
+    use super::*;
+
+    #[test]
+    fn app_home_row_forwards_i18n_and_navigation() {
+        let desc = json!({
+            "name": "crm", "title": "CRM", "project": "default", "version": "0.2.2",
+            "listing": {"tagline": "Track.", "icon": null},
+            "i18n": {"zh-TW": {"title": "客戶管理"}},
+            "navigation": {"section_query": "section", "default_section": "c", "sections": [{"id": "c", "label": "Customers", "i18n": {"zh-TW": {"label": "客戶"}}}]},
+            "catalogue": null
+        });
+        let att = json!({"state": "ok", "message": null, "action": null, "count": 0});
+        let active = app_home_row("inst_1", &desc, att.clone(), true);
+        assert_eq!(active["project"], "default");
+        assert_eq!(active["i18n"]["zh-TW"]["title"], "客戶管理");
+        assert_eq!(
+            active["navigation"]["sections"][0]["i18n"]["zh-TW"]["label"],
+            "客戶"
+        );
+        let removed = app_home_row("inst_1", &desc, att, false);
+        assert!(removed.get("project").is_none());
+        assert_eq!(removed["i18n"], desc["i18n"]);
+        assert_eq!(removed["navigation"], desc["navigation"]);
     }
 }

@@ -1313,6 +1313,12 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Recurring schedules and verified event triggers targeting Context
+    /// Markdown (`wiki:` / `workflows/`) or SHA-256-pinned scripts.
+    Routine {
+        #[command(subcommand)]
+        action: super::RoutineAction,
+    },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
     Issue {

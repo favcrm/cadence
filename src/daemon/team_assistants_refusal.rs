@@ -1994,9 +1994,22 @@ fn job_evidence_acl_owner_and_subscriber_only() {
         ),
         "bob reads alice's job evidence",
     );
+    // CAD-2215: a foreign job answers in the exact words of a job that does
+    // not exist, so bob cannot tell alice's job from a missing one.
+    let missing = err_text(
+        fx.op_err(
+            "member_job_evidence",
+            json!({"member_envelope": fx.member_envelope("sub-bob"), "job": "cad2321-absent-job"}),
+        ),
+        "bob reads a nonexistent job's evidence",
+    );
     assert!(
-        e.contains("owns") || e.contains("subscribe") || e.contains("refused"),
-        "bob's foreign evidence read refused for another reason: {e}"
+        missing.contains("Unknown member job"),
+        "a nonexistent job refused for another reason: {missing}"
+    );
+    assert_eq!(
+        e, missing,
+        "bob's foreign evidence read is distinguishable from an unknown job"
     );
     assert_eq!(fx.tree(), before);
 }
@@ -7164,6 +7177,13 @@ mod master_home_acceptance {
                 .recv_timeout(wait)
                 .expect("home worker emitted no promotion outcome");
             if id == request_id {
+                // "pending" is the sweep's retry signal: the tracker write
+                // lock was busy with another writer (the PM checkup's
+                // blocked sweep and backlog groom run at daemon start), so
+                // the next sweep retries. Any other non-created outcome is a failure.
+                if outcome == "pending" {
+                    continue;
+                }
                 assert_eq!(outcome, "created", "home job promotion failed");
                 break;
             }
@@ -7397,6 +7417,9 @@ mod cad1380_rereview_refusal {
         let _flag = AssistantFlagOn::arm();
         let fx = Fx::new();
         with_deferred_service(&fx);
+        // CAD-2215: a scoped (non-operator) tail pages through the opaque
+        // cursor codec, which answers only once the keyring is bound.
+        fx.init_cursor_keyring();
         let rt = fx.member_runtime("sub-tail");
         let req = fx.op(
             "member_job_request",
@@ -7413,9 +7436,42 @@ mod cad1380_rereview_refusal {
         );
         // Positive control on the SAME ordinary read: a public stream row is
         // visible, so the read genuinely succeeded (not a blanket denial).
+        // CAD-2215 shows a scoped reader only rows bound to work on an issue
+        // it may read, so the control row names an ordinary job on one.
+        let spec = fx.dir.path().join("public-control-spec.md");
+        std::fs::write(&spec, "# public control\n").unwrap();
+        let spec_sha = sha256_file(&spec).unwrap();
+        let (_, public_job) = fx
+            .shared
+            .store
+            .create_job(
+                "job-public-control",
+                Some("public control"),
+                spec.to_str().unwrap(),
+                &spec_sha,
+                "ordinary-worker",
+                Some(FIXTURE_ISSUE_2),
+                None,
+                None,
+                2,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         fx.shared
             .store
-            .event_public("daemon", "wal_checkpointed", json!({"n": 1}))
+            .event_public_scoped(
+                "daemon",
+                "wal_checkpointed",
+                json!({"n": 1}),
+                Some(&public_job.id),
+                None,
+            )
             .unwrap();
         let worker_tail = fx
             .call(

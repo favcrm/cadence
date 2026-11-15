@@ -490,14 +490,69 @@ fn audit_approval_readback_parses() {
 fn audit_scope_readback_parses() {
     let cli = Cli::try_parse_from(["cadence", "audit", "scope", "--issue", "CAD-9"]).unwrap();
     let Commands::Audit {
-        action: Some(AuditAction::Scope { issue }),
+        action: Some(AuditAction::Scope { issue, project }),
         ..
     } = cli.command
     else {
         panic!("audit scope must parse to AuditAction::Scope");
     };
-    assert_eq!(issue, "CAD-9");
+    assert_eq!((issue.as_str(), project.as_deref()), ("CAD-9", None));
     assert!(Cli::try_parse_from(["cadence", "audit", "scope"]).is_err());
+
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "delivery",
+        "check",
+        "--repo",
+        "favcrm/cadence",
+        "--pr",
+        "12",
+        "--head",
+        head,
+        "--issue",
+        "CAD-1",
+        "--project",
+        "cadence",
+        "--browser-qa"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "delivery",
+        "enqueue",
+        "--repo",
+        "favcrm/cadence",
+        "--pr",
+        "12",
+        "--head",
+        head
+    ])
+    .is_ok());
+    assert!(
+        Cli::try_parse_from(["cadence", "audit", "designations", "--project", "cadence"]).is_ok()
+    );
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "digest",
+        "--project",
+        "cadence",
+        "--since",
+        "7d"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "revoke",
+        "ap-1",
+        "--project",
+        "cadence",
+        "--reason",
+        "superseded"
+    ])
+    .is_ok());
 }
 
 #[test]

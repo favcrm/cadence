@@ -203,6 +203,89 @@ fn audit_reviewers_set_is_a_registered_owner_write() {
 }
 
 #[test]
+fn cad1946_hosted_merge_gate_verbs_preserve_domain_409_and_scopes() {
+    use super::{
+        cli_requested_scopes, mutating_cli_verb, tenant_cannot_serve, HOSTED_MERGE_GATE_VERBS,
+        PROJECT_SCOPED_GATE_VERBS, REMOTE_VERBS,
+    };
+
+    for verb in HOSTED_MERGE_GATE_VERBS {
+        assert!(REMOTE_VERBS.contains(verb), "{verb}");
+        assert!(
+            !PROJECT_SCOPED_GATE_VERBS.contains(verb),
+            "{verb} must not sit in PROJECT_SCOPED_GATE_VERBS where every 409 maps to tenant_cannot_serve"
+        );
+    }
+
+    assert_eq!(cli_requested_scopes("delivery_check"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("audit_scope_project"), &["cli.read"]);
+    assert_eq!(
+        cli_requested_scopes("audit_designations_project"),
+        &["cli.read"]
+    );
+    assert_eq!(cli_requested_scopes("audit_digest_project"), &["cli.read"]);
+    assert!(!mutating_cli_verb("delivery_check"));
+    assert!(!mutating_cli_verb("audit_scope_project"));
+
+    // Delegated approvals run as an agent (`cli.write`), not owner `audit.approve`.
+    assert_eq!(
+        cli_requested_scopes("audit_approve_delegated_project"),
+        &["cli.write"]
+    );
+    assert!(mutating_cli_verb("audit_approve_delegated_project"));
+
+    for owner_write in [
+        "delivery_enqueue",
+        "audit_revoke_project",
+        "audit_approve_scope_project",
+        "audit_designate_project",
+    ] {
+        assert_eq!(
+            cli_requested_scopes(owner_write),
+            &["cli.write", "audit.approve"],
+            "{owner_write}"
+        );
+        assert!(mutating_cli_verb(owner_write), "{owner_write}");
+    }
+
+    // Domain 409s (`gate_refused`, `head_moved`, etc.) must NOT be swallowed as release-order errors.
+    for code in [
+        "gate_refused",
+        "head_moved",
+        "already_revoked",
+        "approval_id_conflict",
+        "not_delegable",
+        "scope_approval_required",
+        "approval_revoked",
+        "project_archived",
+    ] {
+        assert_eq!(
+            tenant_cannot_serve(
+                "delivery_enqueue",
+                409,
+                Some(&json!({"ok": false, "error": {"code": code}}))
+            ),
+            None,
+            "{code} must surface as the real domain refusal"
+        );
+    }
+    // But `409 container_required`, `501`, and `400 invalid_request` DO report release order.
+    assert!(tenant_cannot_serve(
+        "delivery_enqueue",
+        409,
+        Some(&json!({"ok": false, "error": {"code": "container_required"}}))
+    )
+    .is_some());
+    assert!(tenant_cannot_serve("delivery_check", 501, None).is_some());
+    assert!(tenant_cannot_serve(
+        "audit_approve_delegated_project",
+        400,
+        Some(&json!({"ok": false, "error": {"code": "invalid_request"}}))
+    )
+    .is_some());
+}
+
+#[test]
 fn timeline_on_an_older_board_is_a_release_order_refusal() {
     use super::timeline_board_too_old;
     let args = |before: bool| {

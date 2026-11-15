@@ -1,5 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
+import { routinesApi } from "../agents/routinesApi";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { routePath, type ConnectionPage } from "../../lib/router";
@@ -409,23 +410,11 @@ function ConnectionsIndex({
                   <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>
                 </section>
               ) : (
-                <ul className="settings-rows" aria-label={t("connections")}>
-                  {rows.map((row) => {
-                    const flagged = connectionNeedsAttention(row);
-                    const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
-                    return (
-                      <li key={row.id}>
-                        <button type="button" className="settings-row" data-record-id={row.id} onClick={() => setOpenId(row.id)}>
-                          <span className="settings-row-text">
-                            <b>{service.charAt(0).toUpperCase() + service.slice(1)}</b>
-                            <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
-                          </span>
-                          {flagged && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
+                <ConnectionsGroupedList
+                  rows={rows}
+                  groups={groups}
+                  onOpen={(id) => setOpenId(id)}
+                />
               )}
             </div>
           )}
@@ -1547,7 +1536,326 @@ export function ConnectionDetail({
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in connections are always present — they carry no credential and cannot be edited or disconnected through credential management.")}</p>
       )}
+      {managed && !hostedBoard && (
+        <ConnectionPolicyPanel row={row} canWrite={canWrite} onChanged={onChanged} />
+      )}
     </section>
+  );
+}
+
+function ConnectionsGroupedList({
+  rows,
+  groups,
+  onOpen,
+}: {
+  rows: Connection[];
+  groups: { provider: string; label: string }[];
+  onOpen: (id: string) => void;
+}) {
+  const t = useTranslate();
+  const personal = rows.filter((r) => r.policy?.visibility === "personal");
+  const shared = rows.filter((r) => r.policy?.visibility !== "personal");
+
+  const renderItem = (row: Connection) => {
+    const flagged = connectionNeedsAttention(row);
+    const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
+    return (
+      <li key={row.id}>
+        <button
+          type="button"
+          className="settings-row"
+          data-record-id={row.id}
+          onClick={() => onOpen(row.id)}
+        >
+          <span className="settings-row-text">
+            <b>{service.charAt(0).toUpperCase() + service.slice(1)}</b>
+            <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
+          </span>
+          <span className="conn-row-chips">
+            {row.policy?.visibility === "personal" && row.policy?.is_default && (
+              <span className="chip bg-ink-800 text-ink-300">{t("Default")}</span>
+            )}
+            {row.policy?.write_mode === "read_only" && (
+              <span className="chip bg-ink-800 text-ink-300">{t("Read only")}</span>
+            )}
+            {flagged && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+          </span>
+        </button>
+      </li>
+    );
+  };
+
+  return (
+    <div className="space-y-4 min-w-0">
+      {personal.length > 0 && (
+        <div className="space-y-1.5 min-w-0" data-connections-group="personal">
+          <h2 className="slabel">{t("Your accounts")}</h2>
+          <ul className="settings-rows" aria-label={t("Your accounts")}>
+            {personal.map(renderItem)}
+          </ul>
+        </div>
+      )}
+      {shared.length > 0 && (
+        <div className="space-y-1.5 min-w-0" data-connections-group="shared">
+          <h2 className="slabel">{t("Shared workspace accounts")}</h2>
+          <ul className="settings-rows" aria-label={t("connections")}>
+            {shared.map(renderItem)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConnectionPolicyPanel({
+  row,
+  canWrite,
+  onChanged,
+}: {
+  row: Connection;
+  canWrite: boolean;
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const baseVis = row.policy?.visibility ?? "shared";
+  const baseMode = row.policy?.write_mode ?? "ask_approval";
+  const baseExt = row.policy?.allow_external_triggers ?? false;
+  const baseDef = row.policy?.is_default ?? false;
+  const baseAgents = row.policy?.allowed_agents ?? [];
+
+  const [visibility, setVisibility] = useState<"shared" | "personal">(baseVis);
+  const [writeMode, setWriteMode] = useState<"ask_approval" | "read_only">(baseMode);
+  const [allowExternal, setAllowExternal] = useState(baseExt);
+  const [isDefault, setIsDefault] = useState(baseDef);
+  const [allowedAgents, setAllowedAgents] = useState<string[]>(baseAgents);
+  const [saving, setSaving] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const agentsState = useMaybeResource(resources.agents);
+
+  useEffect(() => {
+    setVisibility(row.policy?.visibility ?? "shared");
+    setWriteMode(row.policy?.write_mode ?? "ask_approval");
+    setAllowExternal(row.policy?.allow_external_triggers ?? false);
+    setIsDefault(row.policy?.is_default ?? false);
+    setAllowedAgents(row.policy?.allowed_agents ?? []);
+    setStatusMsg(null);
+  }, [
+    row.id,
+    row.policy?.visibility,
+    row.policy?.write_mode,
+    row.policy?.allow_external_triggers,
+    row.policy?.is_default,
+    row.policy?.policy_revision,
+  ]);
+
+  useEffect(() => {
+    if (visibility === "personal") {
+      void resources.agents.revalidate();
+    }
+  }, [visibility]);
+
+  const effectiveExt = visibility === "shared" ? allowExternal : false;
+  const effectiveDef = visibility === "personal" ? isDefault : false;
+  const effectiveAgents = visibility === "personal" ? allowedAgents : [];
+  const baseAgentsKey = [...baseAgents].sort().join(",");
+  const currAgentsKey = [...effectiveAgents].sort().join(",");
+  const dirty =
+    visibility !== baseVis ||
+    writeMode !== baseMode ||
+    effectiveExt !== baseExt ||
+    effectiveDef !== baseDef ||
+    currAgentsKey !== baseAgentsKey;
+  const clearsShared = baseVis === "shared" && visibility === "personal";
+  const rosterAgents = agentsState?.data?.agents ?? [];
+
+  const toggleAllowedAgent = (alias: string) => {
+    setAllowedAgents((prev) =>
+      prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias],
+    );
+  };
+
+  const savePolicy = async () => {
+    if (saving || !canWrite) return;
+    setSaving(true);
+    setStatusMsg(null);
+    try {
+      const res = await routinesApi.connectionPolicySet(row.id, {
+        visibility,
+        write_mode: writeMode,
+        allow_external_triggers: effectiveExt,
+        is_default: effectiveDef,
+        allowed_agents: effectiveAgents,
+      });
+      setStatusMsg({
+        ok: true,
+        text: res.shared_credential_cleared
+          ? "Shared credential cleared and account switched to Personal."
+          : "Access settings saved.",
+      });
+      onChanged();
+    } catch {
+      setStatusMsg({
+        ok: false,
+        text: "Could not save access settings.",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="conn-policy" data-connection-policy>
+      <div className="conn-policy-group">
+        <span className="slabel">{t("Who can use this account")}</span>
+        <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this account")}>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={visibility === "shared"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setVisibility("shared")}
+          >
+            <b>{t("Shared with workspace")}</b>
+            <small>{t("Team members and assigned routines can use this connection.")}</small>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={visibility === "personal"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setVisibility("personal")}
+          >
+            <b>{t("Just me (Personal)")}</b>
+            <small>{t("Only your turns and routines pinned to this account can use it.")}</small>
+          </button>
+        </div>
+        {clearsShared && (
+          <p className="text-micro text-warn mt-1 break-words" role="status">
+            {t(
+              "Switching a shared workspace account to Personal clears the stored shared credential first so you can connect your own account.",
+            )}
+          </p>
+        )}
+        {visibility === "personal" && (
+          <>
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={isDefault}
+              disabled={!canWrite || saving}
+              className="conn-policy-toggle mt-1"
+              onClick={() => setIsDefault((v) => !v)}
+            >
+              <span className="conn-policy-box" aria-hidden>
+                {isDefault ? "✓" : ""}
+              </span>
+              <span className="min-w-0 break-words">
+                {t("Default personal account for this service")}
+              </span>
+            </button>
+            {rosterAgents.length > 0 && (
+              <div className="mt-2 space-y-1.5 min-w-0">
+                <span className="slabel">{t("Agent access")}</span>
+                <p className="text-micro text-ink-400 break-words">
+                  {allowedAgents.length === 0
+                    ? t("All workspace agents can use this personal account on your turns. Select specific agents to restrict access.")
+                    : t("Only checked agents may call this personal account.")}
+                </p>
+                <div className="space-y-1">
+                  {rosterAgents.map((agentRow) => {
+                    const checked = allowedAgents.includes(agentRow.alias);
+                    return (
+                      <button
+                        key={agentRow.alias}
+                        type="button"
+                        role="checkbox"
+                        aria-checked={checked}
+                        disabled={!canWrite || saving}
+                        className="conn-policy-toggle"
+                        onClick={() => toggleAllowedAgent(agentRow.alias)}
+                      >
+                        <span className="conn-policy-box" aria-hidden>
+                          {checked ? "✓" : ""}
+                        </span>
+                        <span className="min-w-0 break-words num">{agentRow.alias}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="conn-policy-group">
+        <span className="slabel">{t("Action safety")}</span>
+        <div className="conn-policy-grid" role="radiogroup" aria-label={t("Action safety")}>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={writeMode === "ask_approval"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setWriteMode("ask_approval")}
+          >
+            <b>{t("Ask for approval first")}</b>
+            <small>{t("Drafts and external writes wait for approval.")}</small>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={writeMode === "read_only"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setWriteMode("read_only")}
+          >
+            <b>{t("Read only")}</b>
+            <small>{t("Agents can read data; external writes are blocked.")}</small>
+          </button>
+        </div>
+      </div>
+
+      {visibility === "shared" && (
+        <div className="conn-policy-group">
+          <span className="slabel">{t("Incoming triggers")}</span>
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={allowExternal}
+            disabled={!canWrite || saving}
+            className="conn-policy-toggle"
+            onClick={() => setAllowExternal((v) => !v)}
+          >
+            <span className="conn-policy-box" aria-hidden>
+              {allowExternal ? "✓" : ""}
+            </span>
+            <span className="min-w-0 break-words">
+              {t("Allow incoming emails or webhooks to trigger actions")}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {statusMsg && (
+        <p
+          className={`text-label break-words ${statusMsg.ok ? "text-ink-300" : "text-fail"}`}
+          role={statusMsg.ok ? "status" : "alert"}
+        >
+          {t(statusMsg.text)}
+        </p>
+      )}
+
+      {canWrite && dirty && (
+        <div>
+          <Button size="sm" variant="primary" onClick={() => void savePolicy()} loading={saving}>
+            {t("Save access settings")}
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -526,6 +526,7 @@ impl Shared {
     pub(super) fn run_monitor_watch(self: &Arc<Self>) {
         while !self.closing.load(Ordering::SeqCst) {
             self.advance_app_runs();
+            self.run_due_routines_tick();
             let at = epoch_secs();
             if let Ok(monitors) = self.store.due_monitors(at) {
                 for monitor in monitors {

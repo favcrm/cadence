@@ -142,6 +142,52 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         reason: String,
     },
+    /// Hosted (CAD-1946): evaluate the server-side merge gate for a PR
+    /// without recording an approval or posting a signature. Exits 0 only
+    /// when every gate passes.
+    Check {
+        /// Project key (optional; server resolves or verifies when given).
+        #[arg(long)]
+        project: Option<String>,
+        /// Tracker issue id (optional; verified against the PR when given).
+        #[arg(long)]
+        issue: Option<String>,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA to pin (optional for read-only check).
+        #[arg(long)]
+        head: Option<String>,
+        /// Require fresh Browser QA attestation for UI changes.
+        #[arg(long)]
+        browser_qa: bool,
+    },
+    /// Hosted (CAD-1946): evaluate the merge gate server-side, record an
+    /// owner approval + immutable `tenant_delivery_evidence`, sign `v2`
+    /// SSHSIG, comment on the PR and enable auto-merge (operator only).
+    Enqueue {
+        /// Project key (optional; server resolves or verifies when given).
+        #[arg(long)]
+        project: Option<String>,
+        /// Tracker issue id (optional; verified against the PR when given).
+        #[arg(long)]
+        issue: Option<String>,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact full 40-hex head SHA being approved and enqueued.
+        #[arg(long)]
+        head: String,
+        /// Require fresh Browser QA attestation for UI changes.
+        #[arg(long)]
+        browser_qa: bool,
+    },
 }
 
 pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
@@ -290,6 +336,18 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             "delivery_decline",
             json!({"issue": issue, "reason": reason}),
         )?,
+        DeliveryAction::Check { .. } => {
+            return Err(Error::rejected(
+                "delivery check is hosted-only: select a hosted org with `--org <org>`, \
+                 or run `scripts/enqueue-reviewed --dry-run` in local mode",
+            ));
+        }
+        DeliveryAction::Enqueue { .. } => {
+            return Err(Error::rejected(
+                "delivery enqueue is hosted-only: select a hosted org with `--org <org>`, \
+                 or run `scripts/enqueue-reviewed` in local mode",
+            ));
+        }
     };
     print_json(&result);
     Ok(0)

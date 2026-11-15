@@ -67,7 +67,9 @@ pub const LOCAL_CONNECTION: &str = "local";
 
 /// `app.md` frontmatter keys v0 knows. Anything else refuses — the same
 /// fail-loud rule the workflow and plan parsers apply.
-const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary", "listing"];
+const MANIFEST_KEYS: &[&str] = &[
+    "app", "title", "version", "needs", "summary", "listing", "i18n",
+];
 
 /// Frontmatter keys the later stages reserve — refused with their own
 /// message so a bundle carrying one names the stage, not "unknown key".
@@ -1228,6 +1230,8 @@ pub struct Manifest {
     /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
+    /// Optional top-level display translations (`{ <locale>: { title?, summary?, tagline? } }`).
+    pub i18n: Option<serde_json::Value>,
     pub guide: String,
 }
 
@@ -1241,6 +1245,62 @@ impl Manifest {
         self.capabilities
             .values()
             .find(|need| need.is_file_upload())
+    }
+
+    /// Merged display translations `{ <locale>: { title?, summary?, tagline? } }`
+    /// from `listing.i18n` overlaid with top-level `i18n` (top-level wins per field).
+    pub fn display_i18n(&self) -> serde_json::Value {
+        use serde_json::{Map, Value};
+        fn overlay(src: Option<&Value>, out: &mut Map<String, Value>, top: bool) {
+            let Some(Value::Object(locales)) = src else {
+                return;
+            };
+            for (locale, entry) in locales {
+                let Value::Object(fields) = entry else {
+                    continue;
+                };
+                let prev_key = out.keys().find(|k| k.eq_ignore_ascii_case(locale)).cloned();
+                if prev_key.is_none()
+                    && out.len() >= cadence_core::app_screen_decl::MAX_I18N_LOCALES
+                {
+                    continue;
+                }
+                let mut merged = prev_key
+                    .as_deref()
+                    .and_then(|k| out.get(k))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for k in ["title", "summary", "tagline"] {
+                    if let Some(v @ Value::String(_)) = fields.get(k) {
+                        merged.insert(k.to_string(), v.clone());
+                    }
+                }
+                if !merged.is_empty() {
+                    let key = if top {
+                        if let Some(p) = prev_key.filter(|p| p != locale) {
+                            out.remove(&p);
+                        }
+                        locale.clone()
+                    } else {
+                        prev_key.unwrap_or_else(|| locale.clone())
+                    };
+                    out.insert(key, Value::Object(merged));
+                }
+            }
+        }
+        let mut merged = Map::new();
+        overlay(
+            self.listing.as_ref().and_then(|l| l.value.get("i18n")),
+            &mut merged,
+            false,
+        );
+        overlay(self.i18n.as_ref(), &mut merged, true);
+        if merged.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(merged)
+        }
     }
 }
 
@@ -1566,7 +1626,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let title = need_str("title", "one line naming the app")?;
     let version = need_str("version", "a version string like 0.1.0")?;
     for (k, v, cap) in [("title", &title, 120), ("version", &version, 40)] {
-        if v.chars().count() > cap || v.chars().any(char::is_control) {
+        if v.encode_utf16().count() > cap
+            || v.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return Err(Error::rejected(format!(
                 "app.md `{k}:` — ≤{cap} chars, no control characters"
             )));
@@ -1579,7 +1642,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             let s = s.trim();
             if s.is_empty() {
                 None
-            } else if s.chars().count() > 160 || s.chars().any(char::is_control) {
+            } else if s.encode_utf16().count() > 160
+                || s.chars()
+                    .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            {
                 return Err(Error::rejected(
                     "app.md `summary:` — ≤160 chars, no control characters",
                 ));
@@ -1702,6 +1768,27 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
+    let i18n = match get("i18n") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(value) => Some(crate::issue::app_listing::parse_manifest_i18n(value)?),
+    };
+    let mut combined_locales = HashSet::new();
+    for map in [
+        listing.as_ref().and_then(|l| l.value.get("i18n")),
+        i18n.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_object())
+    {
+        combined_locales.extend(map.keys().map(|k| k.to_ascii_lowercase()));
+    }
+    if combined_locales.len() > cadence_core::app_screen_decl::MAX_I18N_LOCALES {
+        return Err(Error::rejected(format!(
+            "app.md listing.i18n and i18n together cannot exceed {} distinct locales",
+            cadence_core::app_screen_decl::MAX_I18N_LOCALES
+        )));
+    }
     let requires =
         app_compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
@@ -1714,6 +1801,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         view_contract,
         requires,
         listing,
+        i18n,
         guide: body.to_string(),
     })
 }
@@ -2332,6 +2420,7 @@ fn validate_contents(
                     view_contract: None,
                     requires: Compat::legacy(),
                     listing: None,
+                    i18n: None,
                     guide: String::new(),
                 }
             }
@@ -2346,6 +2435,7 @@ fn validate_contents(
             view_contract: None,
             requires: Compat::legacy(),
             listing: None,
+            i18n: None,
             guide: String::new(),
         },
     };
@@ -4833,6 +4923,60 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         // No declaration → None.
         let none = parse_manifest(APP_MD).unwrap();
         assert_eq!(none.view_contract, None);
+    }
+
+    #[test]
+    fn manifest_display_i18n_merges_listing_and_top_level() {
+        let mk = |extra: &str| {
+            format!("---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\nneeds:\n  connections: []\n{extra}\n---\n\nGuide\n")
+        };
+        let none = parse_manifest(APP_MD).unwrap();
+        assert!(none.i18n.is_none() && none.display_i18n().is_null());
+
+        let d = parse_manifest(&mk(
+            "listing:\n  tagline: T\n  i18n: { zh-TW: { title: A, tagline: L, about: B }, zh-HK: { title: C } }\n\
+             i18n: { zh-TW: { title: 客戶管理, summary: 管理 } }",
+        ))
+        .unwrap()
+        .display_i18n();
+        let z = &d["zh-TW"];
+        assert_eq!(
+            (
+                z["title"].as_str(),
+                z["summary"].as_str(),
+                z["tagline"].as_str(),
+                d["zh-HK"]["title"].as_str()
+            ),
+            (Some("客戶管理"), Some("管理"), Some("L"), Some("C"))
+        );
+        assert!(z.get("about").is_none());
+        let locs = |a: u8, b: u8| {
+            (a..b)
+                .map(|i| format!("en-x{i}: {{ title: T }}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ci = parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ zh-tw: {{ title: A, tagline: K }}, {} }} }}\ni18n: {{ zh-TW: {{ title: 客戶 }} }}",
+            locs(0, 7)
+        )))
+        .unwrap()
+        .display_i18n();
+        let obj = ci.as_object().unwrap();
+        assert!(obj.len() == 8 && obj.contains_key("zh-TW") && !obj.contains_key("zh-tw"));
+        assert_eq!(
+            (
+                ci["zh-TW"]["title"].as_str(),
+                ci["zh-TW"]["tagline"].as_str()
+            ),
+            (Some("客戶"), Some("K"))
+        );
+        assert!(parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ {} }} }}\ni18n: {{ {} }}",
+            locs(0, 5),
+            locs(5, 9)
+        )))
+        .is_err());
     }
 
     /// CAD-864: declaration and descriptor file pair up in the

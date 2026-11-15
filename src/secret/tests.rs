@@ -592,6 +592,74 @@ const KNOWN_FIXTURES: &[(&str, &str, &str)] = &[
         "jwt",
         "19280393965df1b4",
     ),
+    // CAD-2215's HTTP acceptance fixtures carry synthetic `cad2215-*` ids
+    // (job request keys and database ids) next to a `key`-shaped field name.
+    // They name no credential; `.gitleaks.toml` admits the same ids in CI.
+    (
+        "src/ui/cad2215_privacy_http_acceptance.rs",
+        "generic-api-key",
+        "c141c30c4ea08b05",
+    ),
+    (
+        "src/ui/cad2215_assist_job_binding_http_acceptance.rs",
+        "cadence-argv-secret",
+        "30c98ec16bbfce60",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "a12d521a39fd585c",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "423825d88bb8e4cb",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "a21acb2982cf286f",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "f61e4a74e4022c8b",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "92baf37d8ee03216",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "e2bed96ccb43bcc6",
+    ),
+    (
+        "src/ui/cad2215_job_request_issue_http_acceptance.rs",
+        "generic-api-key",
+        "e21d3735808ee492",
+    ),
+    (
+        "src/ui/cad2215_assistant_privacy_http_acceptance.rs",
+        "generic-api-key",
+        "4906348e3923c29d",
+    ),
+    (
+        "src/ui/cad2215_job_legacy_http_acceptance.rs",
+        "generic-api-key",
+        "7bbdb2e4b856f13c",
+    ),
+    // Not a fixture: CAD-2215's v67 migration SQL assigns
+    // `lower(hex(randomblob(16)))` to `authorization_epoch`, which the argv
+    // heuristic reads as an `auth`-named assignment. The value is a SQL
+    // expression, not a credential. Pinned per finding, like the entries
+    // above, rather than editing shipped migration text.
+    (
+        "src/store/schema.rs",
+        "cadence-argv-secret",
+        "36613a2f317de6c9",
+    ),
 ];
 
 /// The repo's own source has no credential-shaped string beyond the known

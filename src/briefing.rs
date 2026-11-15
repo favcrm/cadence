@@ -64,6 +64,16 @@ pub fn role_instructions(briefing: &str) -> Option<&str> {
     (start <= end).then(|| briefing[start..end].trim_matches('\n'))
 }
 
+/// The `agent_show` request [`brief_agent`] reads the agent with: its stored
+/// job, and (for the agent itself or its group root) the `params` and `cwd`
+/// the briefing is built from (CAD-2310).
+pub(crate) fn briefing_read(alias: &str) -> Value {
+    json!({
+        "alias": alias, "limit": 0, "include_profile_instructions": true,
+        "include_catalogue_instructions": true,
+    })
+}
+
 /// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
 /// state dir — `<state>/briefings/<root>/`, where `<root>` is the
 /// upstream PM's alias when wired, else the agent's own. Split-mode
@@ -86,15 +96,7 @@ pub fn brief_agent(
     enqueue: bool,
     instructions: Option<&str>,
 ) -> Result<PathBuf> {
-    let agent = client::rpc(
-        state_dir,
-        "agent_show",
-        json!({
-            "alias": alias, "limit": 0, "include_profile_instructions": true,
-            "include_catalogue_instructions": true,
-        }),
-    )?["agent"]
-        .clone();
+    let agent = client::rpc(state_dir, "agent_show", briefing_read(alias))?["agent"].clone();
     // A mailbox consumes no briefing — nothing runs in it.
     if !registry::has_actor(
         agent["provider"].as_str().unwrap_or_default(),

@@ -93,6 +93,7 @@ const OPERATOR: &[&str] = &[
     "inspect-portable",
     "ui",
     "master",
+    "routine",
     "connection",
     "platform",
     "app",

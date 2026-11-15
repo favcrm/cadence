@@ -85,6 +85,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "wiki_search",
     "wiki_history",
     "wiki_write",
+    "routine_list",
+    "routine_show",
+    "wiki_propose",
+    "routine_propose",
     // CAD-615: file a permission request, peek a grant, and retry an
     // approved command. Deciding a request is not on this list.
     "master_ask_permission",

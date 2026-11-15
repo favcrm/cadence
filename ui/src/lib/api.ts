@@ -67,6 +67,103 @@ import type {
   AvatarLook,
 } from "./types";
 
+export interface HostedStepUpVerified {
+  ok: true;
+  authenticated_at: number;
+  fresh_until: number;
+}
+
+export type ApproveCardState =
+  | "ready"
+  | "needs_1"
+  | "needs_n"
+  | "merging"
+  | "merged"
+  | "head_moved"
+  | "ejected"
+  | "unavailable";
+
+export interface GateChecklistItem {
+  id: string;
+  label: string;
+  status: "pass" | "fail" | "pending" | "info";
+  summary: string;
+}
+
+export interface HostedCheckProof {
+  context: string;
+  workflow_path: string;
+  run_url: string;
+}
+
+export interface HostedCountedVerdict {
+  kind?: string;
+  outcome?: string;
+  principal?: string;
+  github_login?: string | null;
+  identity_source?: string;
+  head_sha?: string;
+  recorded_at?: string;
+}
+
+export interface ApproveCardView {
+  ok: true;
+  project: string;
+  issue: string;
+  repo: string;
+  pr: number;
+  title: string;
+  pr_url: string;
+  state: ApproveCardState;
+  headline: string;
+  progress_stage: "checks" | "approved" | "in_queue" | "merged" | null;
+  can_approve_and_merge: boolean;
+  can_revoke: boolean;
+  can_send_back: boolean;
+  step_up_fresh: boolean;
+  checklist: GateChecklistItem[];
+  details: {
+    head_sha: string;
+    base_ref: string;
+    base_sha: string;
+    merge_base_sha: string | null;
+    delivery_class: string;
+    policy_digest: string | null;
+    approval_kind: string | null;
+    approval_id: string | null;
+    evidence_id: string | null;
+    reasons: string[];
+    check_proofs: HostedCheckProof[];
+    counted_verdicts: HostedCountedVerdict[];
+  };
+}
+
+export interface HostedMergeReceipt {
+  ok: true;
+  state: "merging";
+  approval_id: string;
+  evidence_id: string;
+  recorded_via: string;
+  board_revocable: boolean;
+  queued: boolean;
+  auto_merge_enabled: boolean;
+  comment_url: string | null;
+}
+
+export interface HostedSendBackReceipt {
+  ok: true;
+  state: "sent_back";
+  issue: string;
+  ticket: unknown;
+  outcome?: "stopped" | "already_merged" | "dequeue_unavailable";
+}
+
+export interface HostedStepUpChallenge {
+  challenge_id: string;
+  expires_at: number;
+  email_hint: string;
+}
+
 /** The native daemon-minted retained-file row `POST /api/chat/upload` answers
  *  (CAD-1168): the id is the only handle; metadata is server-derived. A hosted
  *  board answers `HostedChatFileReceipt` instead. */
@@ -1547,6 +1644,33 @@ export const api = {
    *  reason (CAD-140); the worker loop stands down. */
   declineDelivery: (issue: string, reason: string) =>
     post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
+  /** Hosted tenant board's `GET /api/approvals/gate` (`CAD-1946`) — server-side merge gate card state. */
+  approvalGate: (repo: string, pr: number, context?: { issue?: string; project?: string; head?: string }) =>
+    get<ApproveCardView>(
+      `/api/approvals/gate?repo=${encodeURIComponent(repo)}&pr=${pr}${context?.project ? `&project=${encodeURIComponent(context.project)}` : ""}${context?.issue ? `&issue=${encodeURIComponent(context.issue)}` : ""}${context?.head ? `&head=${encodeURIComponent(context.head)}` : ""}`,
+    ),
+  /** Hosted tenant board's `POST /api/approvals/merge` (`CAD-1946`) — record approval + enqueue atomically (requires fresh OTP step-up). */
+  approveAndMerge: (body: {
+    repo: string;
+    pr: number;
+    head: string;
+    issue?: string;
+    project?: string;
+    request_id?: string;
+  }) => post<HostedMergeReceipt>("/api/approvals/merge", body),
+  /** Hosted tenant board's `POST /api/approvals/send-back` (`CAD-1946`) — send ticket back and dequeue PR if queued. */
+  sendBackApproval: (body: {
+    project: string;
+    issue: string;
+    reason: string;
+    repo?: string;
+    pr?: number;
+  }) => post<HostedSendBackReceipt>("/api/approvals/send-back", body),
+  /** Hosted tenant board's `POST /api/approvals/step-up/send` (`CAD-1946`) — start a 6-digit email OTP step-up challenge. */
+  sendApprovalStepUp: () => post<HostedStepUpChallenge>("/api/approvals/step-up/send", {}),
+  /** Hosted tenant board's `POST /api/approvals/step-up/verify` (`CAD-1946`) — complete 6-digit email OTP step-up for 15 minutes. */
+  verifyApprovalStepUp: (challenge_id: string, code: string) =>
+    post<HostedStepUpVerified>("/api/approvals/step-up/verify", { challenge_id, code }),
   /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
    *  merge approval for the exact head the drawer showed. A moved head
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */

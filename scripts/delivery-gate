@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
-"""CAD-1925: the merge queue's proof that scripts/enqueue-reviewed passed.
+"""CAD-1946: the merge queue's proof that the delivery gate passed.
 
-    scripts/delivery-gate sign   --repo R --pr N --head SHA --key PATH
     scripts/delivery-gate verify --repo R --pr N --head SHA --signers FILE --comments FILE
     scripts/delivery-gate queue-pr REF
+    scripts/delivery-gate --self-test
 
-The GitHub merge queue only checks CI, and every session holds the operator's
-gh login, so a direct `gh pr merge` skips the delivery gate. enqueue-reviewed
-therefore signs (repo, pr, head) with an SSH key once every rule holds and
-posts the signature as a PR comment; the `delivery-gate` job of each merge
-group verifies it against docs/roles/delivery-gate.allowed_signers read from
-the merge group's base, so a PR can never trust its own key.
+v2 (CAD-1946): the hosted Cadence board signs (repo, pr, head, evidence, verify)
+with its isolated `cadence-hosted-delivery-gate` SSH key after evaluating the
+gate server-side and recording immutable `tenant_delivery_evidence`. `verify`
+checks the Ed25519 SSHSIG first against `docs/roles/delivery-gate.allowed_signers`
+from the merge group's base, validates the embedded `Verify:` URL against the
+exact `https://<slug>.cadencecloud.app/__platform/delivery-gate/verify` shape,
+mints a GitHub Actions OIDC token whose audience equals that URL, and confirms
+the live hosted attestation before returning 0.
 
-`sign` prints the comment body. `verify` exits 0 only when a comment carrying
-the marker holds a valid signature over exactly this (repo, pr, head); the
-payload is rebuilt from the arguments, never read from the comment. `queue-pr`
-prints the PR number of a gh-readonly-queue/main/pr-N-<sha> ref.
+Legacy local `v1` and `exception v1` comments and `delivery-gate sign` are retired
+and refused unconditionally.
 Exit: 0 ok / 1 refused / 2 usage.
-
-CAD-1946 temporary exception: `sign --exception` signs a distinct payload under a
-distinct marker. `verify` accepts one only before EXCEPTION_ENDS, read from the
-merge group's base, and says it is an exception. It waives the missing
-authenticated reviewer attestation only: enqueue-reviewed still requires every
-other rule and the operator's approval of this exact head. Delete it when the
-trusted reviewer workflow ships.
-
-Known limit: the key sits on a host where every session runs as one uid, so
-a session that reads it can sign (CAD-280 separates the operator uid).
 """
 
 import argparse
@@ -37,26 +27,35 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 
 ME = "delivery-gate"
-MARKER = "<!-- cadence-delivery-gate v1 -->"
-EXCEPTION_MARKER = "<!-- cadence-delivery-gate exception v1 -->"
+MARKER_V2 = "<!-- cadence-delivery-gate v2 -->"
 EXCEPTION_ENDS = "2026-12-31T00:00:00Z"
 NAMESPACE = "cadence-delivery-gate"
-PRINCIPAL = "cadence-delivery-gate"
+PRINCIPAL_V2 = "cadence-hosted-delivery-gate"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 QUEUE_REF = re.compile(r"^(?:refs/heads/)?gh-readonly-queue/main/pr-([1-9][0-9]*)-[0-9a-f]{40}$")
 ARMOR = re.compile(r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+?-----END SSH SIGNATURE-----")
+EVIDENCE_LINE = re.compile(r"^Evidence:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\s*$", re.MULTILINE)
+VERIFY_LINE = re.compile(r"^Verify:\s*(\S+)\s*$", re.MULTILINE)
+VERIFY_URL = re.compile(
+    r"^https://([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.cadencecloud\.app/__platform/delivery-gate/verify$"
+)
 
 
-def payload(repo, pr, head):
-    return f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode()
-
-
-def exception_payload(repo, pr, head):
-    return (f"cadence-delivery-gate exception v1\nrepo {repo}\npr {pr}\nhead {head}\n"
-            f"ends {EXCEPTION_ENDS}\n").encode()
+def payload_v2(repo, pr, head, evidence_id, verify_url):
+    return (
+        f"cadence-delivery-gate v2\n"
+        f"repo {repo.lower()}\n"
+        f"pr {pr}\n"
+        f"head {head.lower()}\n"
+        f"evidence {evidence_id}\n"
+        f"verify {verify_url}\n"
+    ).encode("utf-8")
 
 
 def exception_open():
@@ -76,31 +75,159 @@ def usage(args):
     return None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"unexpected HTTP redirect ({code})", headers, fp)
+
+
+def _http_opener():
+    return urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _append_audience(request_url, audience):
+    parsed = urllib.parse.urlsplit(request_url)
+    sep = "&" if parsed.query else "?"
+    return f"{request_url}{sep}audience={urllib.parse.quote(audience, safe='')}"
+
+
+def fetch_oidc_token(audience, opener_factory=_http_opener):
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "").strip()
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "").strip()
+    if not request_url or not request_token:
+        raise RuntimeError(
+            "GitHub OIDC environment is unavailable (missing ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN)"
+        )
+    url = _append_audience(request_url, audience)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {request_token}",
+            "Accept": "application/json",
+            "User-Agent": "cadence-delivery-gate/2",
+        },
+        method="GET",
+    )
+    opener = opener_factory()
+    with opener.open(req, timeout=15) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"GitHub OIDC token request failed with HTTP {resp.status}")
+        body = json.loads(resp.read().decode("utf-8"))
+    value = body.get("value") if isinstance(body, dict) else None
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("GitHub OIDC token response missing value")
+    return value
+
+
+def verify_oidc_live(repo, pr, head, evidence_id, verify_url, *, opener_factory=_http_opener,
+                     validate_url=True):
+    if validate_url and not VERIFY_URL.fullmatch(verify_url):
+        return False, f"untrusted Verify URL {verify_url!r}"
+    try:
+        jwt_token = fetch_oidc_token(verify_url, opener_factory=opener_factory)
+    except (OSError, RuntimeError, ValueError, urllib.error.URLError) as e:
+        return False, f"OIDC token error: {e}"
+
+    expected_repo = repo.lower()
+    expected_head = head.lower()
+    req_body = json.dumps({
+        "repo": expected_repo,
+        "pr": pr,
+        "head_sha": expected_head,
+        "evidence_id": evidence_id,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        verify_url,
+        data=req_body,
+        headers={
+            "Authorization": f"Bearer {jwt_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "cadence-delivery-gate/2",
+        },
+        method="POST",
+    )
+    opener = opener_factory()
+    try:
+        with opener.open(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace").strip()
+            if err_body:
+                parsed = json.loads(err_body)
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict):
+                        detail = f" ({err.get('code') or ''}: {err.get('message') or ''})".strip()
+                    elif isinstance(parsed.get("reason"), str):
+                        detail = f" ({parsed['reason']})"
+        except Exception:
+            pass
+        return False, f"hosted verify returned HTTP {e.code}{detail}"
+    except (OSError, urllib.error.URLError) as e:
+        return False, f"hosted verify request failed: {e}"
+
+    if status != 200:
+        return False, f"hosted verify returned unexpected HTTP {status}"
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        return False, f"hosted verify returned invalid JSON: {e}"
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return False, "hosted verify response missing ok: true"
+    if (
+        data.get("repo") != expected_repo
+        or data.get("pr") != pr
+        or data.get("head_sha") != expected_head
+        or data.get("evidence_id") != evidence_id
+    ):
+        return False, (
+            "hosted verify binding mismatch "
+            f"(got repo={data.get('repo')!r} pr={data.get('pr')!r} "
+            f"head_sha={data.get('head_sha')!r} evidence_id={data.get('evidence_id')!r})"
+        )
+    return True, "verified"
+
+
+def parse_v2_comments(comments):
+    candidates = []
+    for c in comments:
+        body = c["body"].replace("\r\n", "\n")
+        if MARKER_V2 not in body:
+            continue
+        ev_m = EVIDENCE_LINE.search(body)
+        ver_m = VERIFY_LINE.search(body)
+        armors = [m.group(0) for m in ARMOR.finditer(body)]
+        for block in armors:
+            candidates.append({
+                "id": c.get("id"),
+                "evidence_id": ev_m.group(1) if ev_m else None,
+                "verify_url": ver_m.group(1) if ver_m else None,
+                "block": block,
+            })
+    return candidates
+
+
 def sign(args):
-    if not (os.path.isfile(args.key) and os.access(args.key, os.R_OK)):
-        print(f"{ME}: refused: no readable signing key at {args.key}", file=sys.stderr)
-        return 1
-    exception = getattr(args, "exception", False)
-    if exception and not exception_open():
-        print(f"{ME}: refused: the review exception ended at {EXCEPTION_ENDS}", file=sys.stderr)
-        return 1
-    data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
-    p = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", args.key],
-                       input=data, capture_output=True)
-    sig = p.stdout.decode(errors="replace").strip()
-    if p.returncode != 0 or not ARMOR.fullmatch(sig):
-        print(f"{ME}: refused: signing failed: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
-        return 1
-    if exception:
-        print(f"{EXCEPTION_MARKER}\nDelivery gate EXCEPTION, not a pass: {args.repo}#{args.pr} at "
-              f"{args.head}\nReviewer attestation waived by the operator's approval of this head, "
-              f"until {EXCEPTION_ENDS}.\n\n```\n{sig}\n```")
-        return 0
-    print(f"{MARKER}\nDelivery gate passed: {args.repo}#{args.pr} at {args.head}\n\n```\n{sig}\n```")
-    return 0
+    return refuse([
+        "legacy local v1 delivery-gate signing is retired; approve and merge from the hosted Cadence board"
+    ])
 
 
-def verify(args):
+def _verify_ssh_block(signers, principal, data, block, sig_path):
+    with open(sig_path, "w", encoding="utf-8") as f:
+        f.write(block + "\n")
+    p = subprocess.run(
+        ["ssh-keygen", "-Y", "verify", "-f", signers, "-I", principal, "-n", NAMESPACE, "-s", sig_path],
+        input=data,
+        capture_output=True,
+    )
+    return p.returncode == 0
+
+
+def verify(args, *, _oidc_verifier=verify_oidc_live):
     reasons = []
     try:
         with open(args.signers, encoding="utf-8") as f:
@@ -119,30 +246,45 @@ def verify(args):
         comments = []
     if reasons:
         return refuse(reasons)
-    # The marker picks the payload, so one kind of signature can't stand in for the other.
-    blocks = [(c.get("id"), m.group(0), EXCEPTION_MARKER in c["body"]) for c in comments
-              if MARKER in c["body"] or EXCEPTION_MARKER in c["body"]
-              for m in ARMOR.finditer(c["body"].replace("\r\n", "\n"))]
-    if not blocks:
+
+    v2_candidates = parse_v2_comments(comments)
+    if not v2_candidates:
         return refuse([f"no signed delivery-gate comment on PR #{args.pr}: "
-                       "enqueue with scripts/enqueue-reviewed"])
-    opened = exception_open()
+                       "approve and merge from the hosted Cadence board"])
+
+    v2_errors = []
     with tempfile.TemporaryDirectory(prefix="delivery-gate.") as tmp:
-        for cid, block, exception in blocks:
-            if exception and not opened:
+        sig = os.path.join(tmp, "sig")
+        for cand in v2_candidates:
+            cid = cand["id"]
+            ev_id = cand["evidence_id"]
+            vurl = cand["verify_url"]
+            if not ev_id or not vurl:
+                v2_errors.append(f"comment {cid}: missing Evidence or Verify header")
                 continue
-            data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
-            sig = os.path.join(tmp, "sig")
-            with open(sig, "w", encoding="utf-8") as f:
-                f.write(block + "\n")
-            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers, "-I", PRINCIPAL,
-                                "-n", NAMESPACE, "-s", sig], input=data, capture_output=True)
-            if p.returncode == 0:
-                kind = "as an EXCEPTION, not a pass" if exception else "as a pass"
-                print(f"{ME}: accepted {kind}: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
+            if not VERIFY_URL.fullmatch(vurl):
+                v2_errors.append(f"comment {cid}: disallowed Verify URL {vurl!r}")
+                continue
+            data = payload_v2(args.repo, args.pr, args.head, ev_id, vurl)
+            # Verify the isolated hosted SSHSIG first so untrusted comments never trigger an OIDC fetch.
+            if not _verify_ssh_block(args.signers, PRINCIPAL_V2, data, cand["block"], sig):
+                v2_errors.append(f"comment {cid}: v2 SSHSIG verification failed")
+                continue
+            ok, detail = _oidc_verifier(args.repo, args.pr, args.head, ev_id, vurl)
+            if ok:
+                print(
+                    f"{ME}: accepted v2+OIDC: comment {cid} evidence {ev_id} signs "
+                    f"{args.repo.lower()}#{args.pr} at {args.head.lower()}"
+                )
                 return 0
-    return refuse([f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} "
-                   f"({len(blocks)} tried)"])
+            v2_errors.append(f"comment {cid}: OIDC verify refused ({detail})")
+
+    tried = len(v2_candidates)
+    if v2_errors:
+        return refuse(v2_errors + [
+            f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} ({tried} tried)"
+        ])
+    return refuse([f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} ({tried} tried)"])
 
 
 def refuse(reasons):
@@ -151,7 +293,222 @@ def refuse(reasons):
     return 1
 
 
+def self_test():
+    import http.server
+    import threading
+
+    repo = "FavCRM/Cadence"
+    pr = 42
+    head = "a" * 40
+    other_head = "b" * 40
+    ev_id = "ev_1234567890"
+    verify_url = "https://fav-limited.cadencecloud.app/__platform/delivery-gate/verify"
+
+    with tempfile.TemporaryDirectory(prefix="delivery-gate-selftest.") as tmp:
+        key_v2 = os.path.join(tmp, "v2_key")
+        key_bad = os.path.join(tmp, "bad_key")
+        for path in (key_v2, key_bad):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path], check=True)
+        with open(key_v2 + ".pub", encoding="utf-8") as f:
+            pub_v2 = f.read().strip()
+        signers = os.path.join(tmp, "allowed_signers")
+        with open(signers, "w", encoding="utf-8") as f:
+            f.write(f'{PRINCIPAL_V2} namespaces="{NAMESPACE}" {pub_v2}\n')
+
+        def sign_v2(key_path, r, p_num, h, e_id, v_url):
+            data = payload_v2(r, p_num, h, e_id, v_url)
+            res = subprocess.run(
+                ["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", key_path],
+                input=data,
+                capture_output=True,
+                check=True,
+            )
+            sig = res.stdout.decode("utf-8").strip()
+            return (
+                f"{MARKER_V2}\n"
+                f"Delivery gate passed: {r.lower()}#{p_num} at {h.lower()}\n"
+                f"Evidence: {e_id}\n"
+                f"Verify: {v_url}\n\n"
+                f"```\n{sig}\n```"
+            )
+
+        comments_file = os.path.join(tmp, "comments.json")
+        def write_comments(items):
+            with open(comments_file, "w", encoding="utf-8") as f:
+                json.dump(items, f)
+
+        args = argparse.Namespace(repo=repo, pr=pr, head=head, signers=signers, comments=comments_file)
+
+        # 1. Valid v2 SSHSIG + matching live OIDC verify -> 0
+        oidc_calls = []
+        write_comments([{"id": 101, "body": sign_v2(key_v2, repo, pr, head, ev_id, verify_url)}])
+        rc = verify(args, _oidc_verifier=lambda r, p_n, h, e, u: (oidc_calls.append((r, p_n, h, e, u)) or True, "ok"))
+        assert rc == 0 and len(oidc_calls) == 1, f"expected v2 pass, got rc={rc} calls={oidc_calls}"
+
+        # 2. Untrusted Verify URL (evil domain, wrong path, query string, or http) refused BEFORE SSH or OIDC
+        for bad_url in (
+            "https://evil.example.com/__platform/delivery-gate/verify",
+            "http://fav-limited.cadencecloud.app/__platform/delivery-gate/verify",
+            "https://fav-limited.cadencecloud.app/__platform/delivery-gate/verify?x=1",
+            "https://fav-limited.cadencecloud.app:8443/__platform/delivery-gate/verify",
+            "https://fav-limited.cadencecloud.app/other",
+        ):
+            assert not VERIFY_URL.fullmatch(bad_url), bad_url
+            calls = []
+            write_comments([{"id": 102, "body": sign_v2(key_v2, repo, pr, head, ev_id, bad_url)}])
+            rc = verify(args, _oidc_verifier=lambda *a: (calls.append(a) or True, "ok"))
+            assert rc == 1 and not calls, f"disallowed URL {bad_url} triggered OIDC or passed"
+
+        # 3. Wrong signing key / wrong head / wrong evidence refused BEFORE OIDC
+        calls = []
+        write_comments([
+            {"id": 103, "body": sign_v2(key_bad, repo, pr, head, ev_id, verify_url)},
+            {"id": 104, "body": sign_v2(key_v2, repo, pr, head, ev_id, verify_url).replace(ev_id, "ev_other")},
+            {"id": 105, "body": sign_v2(key_v2, repo, pr + 1, head, ev_id, verify_url)},
+            {"id": 106, "body": sign_v2(key_v2, repo, pr, other_head, ev_id, verify_url)},
+        ])
+        rc = verify(args, _oidc_verifier=lambda *a: (calls.append(a) or True, "ok"))
+        assert rc == 1 and not calls, f"bad v2 SSHSIG triggered OIDC: {calls}"
+
+        # 4. Valid SSHSIG but OIDC returns refusal -> exit 1
+        write_comments([{"id": 106, "body": sign_v2(key_v2, repo, pr, head, ev_id, verify_url)}])
+        rc = verify(args, _oidc_verifier=lambda *a: (False, "hosted verify returned HTTP 409 (revoked)"))
+        assert rc == 1, "OIDC refusal must exit 1"
+
+        # 5. Live loopback HTTP test of verify_oidc_live (token fetch, Bearer header, exact JSON echo, mismatch rejection, no-redirect)
+        server_state = {"mode": "ok", "seen_auth": None, "seen_body": None, "seen_aud": None}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *a):
+                pass
+            def do_GET(self):
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                server_state["seen_aud"] = qs.get("audience", [None])[0]
+                if self.headers.get("Authorization") != "Bearer req_tok_1":
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                body = json.dumps({"value": "oidc_jwt_1"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            def do_POST(self):
+                if server_state["mode"] == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.1/")
+                    self.end_headers()
+                    return
+                server_state["seen_auth"] = self.headers.get("Authorization")
+                assert "Cookie" not in self.headers, "Cookie header must never be sent"
+                length = int(self.headers.get("Content-Length", "0"))
+                server_state["seen_body"] = json.loads(self.rfile.read(length).decode("utf-8"))
+                if server_state["mode"] == "409":
+                    self.send_response(409)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":{"code":"revoked","message":"approval revoked"}}')
+                    return
+                if server_state["mode"] == "mismatch":
+                    payload = {"ok": True, "repo": repo.lower(), "pr": pr, "head_sha": other_head, "evidence_id": ev_id}
+                else:
+                    payload = {"ok": True, "repo": repo.lower(), "pr": pr, "head_sha": head, "evidence_id": ev_id}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        old_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+        old_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        try:
+            port = srv.server_address[1]
+            os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] = f"http://127.0.0.1:{port}/token"
+            os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "req_tok_1"
+            loop_verify = f"http://127.0.0.1:{port}/__platform/delivery-gate/verify"
+            ok, detail = verify_oidc_live(repo, pr, head, ev_id, loop_verify, validate_url=False)
+            assert ok, detail
+            assert server_state["seen_aud"] == loop_verify
+            assert server_state["seen_auth"] == "Bearer oidc_jwt_1"
+            assert server_state["seen_body"] == {
+                "repo": repo.lower(), "pr": pr, "head_sha": head, "evidence_id": ev_id
+            }
+
+            server_state["mode"] = "mismatch"
+            ok, _ = verify_oidc_live(repo, pr, head, ev_id, loop_verify, validate_url=False)
+            assert not ok, "binding mismatch must fail"
+
+            server_state["mode"] = "redirect"
+            ok, _ = verify_oidc_live(repo, pr, head, ev_id, loop_verify, validate_url=False)
+            assert not ok, "redirect must fail"
+
+            server_state["mode"] = "409"
+            ok, _ = verify_oidc_live(repo, pr, head, ev_id, loop_verify, validate_url=False)
+            assert not ok, "HTTP 409 must fail"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            if old_url is None:
+                os.environ.pop("ACTIONS_ID_TOKEN_REQUEST_URL", None)
+            else:
+                os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] = old_url
+            if old_tok is None:
+                os.environ.pop("ACTIONS_ID_TOKEN_REQUEST_TOKEN", None)
+            else:
+                os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = old_tok
+
+        # 6. Retired v1 and exception v1 comments refused with 0 OIDC calls even when legacy signer key is present
+        key_v1 = os.path.join(tmp, "v1_key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key_v1], check=True)
+        with open(key_v1 + ".pub", encoding="utf-8") as f:
+            pub_v1 = f.read().strip()
+        signers_v1 = os.path.join(tmp, "allowed_signers_with_v1")
+        with open(signers_v1, "w", encoding="utf-8") as f:
+            f.write(f'{PRINCIPAL_V2} namespaces="{NAMESPACE}" {pub_v2}\n')
+            f.write(f'cadence-delivery-gate namespaces="{NAMESPACE}" {pub_v1}\n')
+
+        def sign_v1(raw_payload, marker, body_line):
+            res = subprocess.run(
+                ["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", key_v1],
+                input=raw_payload,
+                capture_output=True,
+                check=True,
+            )
+            sig = res.stdout.decode("utf-8").strip()
+            return f"{marker}\n{body_line}\n\n```\n{sig}\n```"
+
+        v1_data = f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode("utf-8")
+        v1_exc_data = (
+            f"cadence-delivery-gate exception v1\nrepo {repo}\npr {pr}\nhead {head}\nends {EXCEPTION_ENDS}\n"
+        ).encode("utf-8")
+        for cid, body in (
+            (107, sign_v1(v1_data, "<!-- cadence-delivery-gate v1 -->", f"Delivery gate passed: {repo}#{pr} at {head}")),
+            (
+                108,
+                sign_v1(
+                    v1_exc_data,
+                    "<!-- cadence-delivery-gate exception v1 -->",
+                    f"Delivery gate EXCEPTION, not a pass: {repo}#{pr} at {head}",
+                ),
+            ),
+        ):
+            v1_calls = []
+            write_comments([{"id": cid, "body": body}])
+            args_v1 = argparse.Namespace(repo=repo, pr=pr, head=head, signers=signers_v1, comments=comments_file)
+            rc = verify(args_v1, _oidc_verifier=lambda *a: (v1_calls.append(a) or True, "ok"))
+            assert rc == 1 and not v1_calls, f"retired v1 comment {cid} unexpectedly passed or called OIDC: {v1_calls}"
+
+        assert sign(argparse.Namespace(repo=repo, pr=pr, head=head, key=key_v1, exception=False)) == 1
+        assert sign(argparse.Namespace(repo=repo, pr=pr, head=head, key=key_v1, exception=True)) == 1
+
+    print(f"{ME}: self-test ok")
+    return 0
+
+
 def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
     ap = argparse.ArgumentParser(prog=ME)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("sign", "verify"):

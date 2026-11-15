@@ -73,6 +73,7 @@ mod resume;
 mod resume_helpers;
 mod review;
 mod rollout;
+mod routine;
 mod sandbox;
 mod secret;
 mod self_info;
@@ -153,6 +154,7 @@ use resume_helpers::{
     resume_sweep, stop_group,
 };
 use rollout::RolloutAction;
+use routine::RoutineAction;
 use secret::SecretAction;
 use serde_json::json;
 use serde_json::Value;
@@ -572,6 +574,7 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             issue: Some(issue),
             source,
             action,
+            delegated: false,
             ..
         } => {
             if action != "scope" {
@@ -666,13 +669,45 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             "approval_designate",
             json!({"alias": alias, "project": project, "source": source, "active": !revoke}),
         )?,
-        AuditAction::Designations => client::rpc(state_dir, "approval_designations", json!({}))?,
-        AuditAction::Digest { since } => cadence_agent::audit::digest(state_dir, since.as_deref())?,
-        AuditAction::Revoke { id, source, reason } => client::rpc(
-            state_dir,
-            "approval_revoke",
-            json!({"id": id, "source": source, "reason": reason}),
-        )?,
+        AuditAction::Designations { project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     designations store no project. Nothing was read"
+                )));
+            }
+            client::rpc(state_dir, "approval_designations", json!({}))?
+        }
+        AuditAction::Digest { since, project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     digest takes no --project. Nothing was read"
+                )));
+            }
+            cadence_agent::audit::digest(state_dir, since.as_deref())?
+        }
+        AuditAction::Revoke {
+            id,
+            project,
+            source,
+            reason,
+        } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped revoke: local \
+                     revocations take no --project. Nothing was recorded"
+                )));
+            }
+            let source = source.ok_or_else(|| {
+                Error::usage("--source is required in local mode. Nothing was recorded")
+            })?;
+            client::rpc(
+                state_dir,
+                "approval_revoke",
+                json!({"id": id, "source": source, "reason": reason}),
+            )?
+        }
     };
     print_json(&result);
     Ok(0)
