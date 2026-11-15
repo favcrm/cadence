@@ -61,6 +61,7 @@ function catalogLocaleCandidates(locale: string): string[] {
       push("zh-hans");
       push("zh-cn");
       push("zh-sg");
+      push("zh-my");
     }
     return out;
   }

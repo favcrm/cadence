@@ -48,8 +48,8 @@ export function FilterBar<ChipId extends string = string>({
   return (
     <div
       className={className ? `s-filter-bar ${className}` : "s-filter-bar"}
-      role="search"
-      aria-label={resolvedLabel}
+      role={onQueryChange ? "search" : undefined}
+      aria-label={onQueryChange ? resolvedLabel : undefined}
     >
       {onQueryChange ? (
         <div className="s-filter-bar-search">
