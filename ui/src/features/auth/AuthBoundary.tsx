@@ -4,7 +4,7 @@ import { useLocale } from "../../lib/locale";
 import { allowPrivateReads, pausePrivateReads, privateSessionGeneration, resetPrivateSession } from "../../lib/privateSession";
 import { applySharedSessionChange, sessionKey, setSessionKey } from "../../lib/sessionKey";
 import type { Meta } from "../../lib/types";
-import { navigate, useHref } from "../../lib/useLocation";
+import { NAVIGATED, navigate, useHref } from "../../lib/useLocation";
 import { Logo } from "../../ui/Logo";
 import Button from "../../ui/Button";
 import ThemeToggle from "../../ui/ThemeToggle";
@@ -22,13 +22,24 @@ const IDENTITY_STORE = "cadence.privateSessionIdentity";
 
 const RETURN_STORE = "cadence.auth.returnTo";
 
+/** Only navigation anchors, never credential-bearing fragments, cross sign-in. */
+function safeReturnFragment(fragment: string): string {
+  if (!fragment.startsWith("#")) return "";
+  try {
+    const anchor = decodeURIComponent(fragment.slice(1));
+    return /^[\p{L}\p{N}_ -]{1,200}$/u.test(anchor) ? fragment : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Only board-local navigation survives the sign-in handoff. */
 function safeReturnPath(candidate: string | null): string | null {
   if (!candidate?.startsWith("/") || candidate.startsWith("//")) return null;
   try {
     const url = new URL(candidate, location.origin);
     if (url.origin !== location.origin || url.pathname === "/login" || url.pathname.startsWith("/__platform/")) return null;
-    return `${url.pathname}${url.search}${url.hash}`;
+    return `${url.pathname}${url.search}${safeReturnFragment(url.hash)}`;
   } catch { return null; }
 }
 
@@ -47,13 +58,26 @@ export default function AuthBoundary({ children }: {
 }) {
   const { t, setSession } = useLocale();
   const href = useHref();
+  const [fragment, setFragment] = useState(() => location.hash);
+  useEffect(() => {
+    const changed = () => setFragment(location.hash);
+    window.addEventListener("hashchange", changed);
+    window.addEventListener("popstate", changed);
+    window.addEventListener(NAVIGATED, changed);
+    return () => {
+      window.removeEventListener("hashchange", changed);
+      window.removeEventListener("popstate", changed);
+      window.removeEventListener(NAVIGATED, changed);
+    };
+  }, []);
+  const returnHref = `${href}${fragment}`;
   const loginRoute = href.split(/[?#]/)[0] === "/login";
   useEffect(() => {
-    const destination = safeReturnPath(href);
+    const destination = safeReturnPath(returnHref);
     if (destination) {
       try { sessionStorage.setItem(RETURN_STORE, destination); } catch { /* Same-tab return is optional when storage is unavailable. */ }
     }
-  }, [href]);
+  }, [returnHref]);
   const [state, setState] = useState<BoundaryState>({ status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(), hosted: hostedOrigin(typeof window === "undefined" ? null : window.location.hostname) });
   const stateRef = useRef(state);
   const [loginExchanged, setLoginExchanged] = useState(false);
@@ -290,7 +314,7 @@ export default function AuthBoundary({ children }: {
   }, []);
 
   const hosted = state.hosted;
-  const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(href) ?? "/", location.origin).href)}`;
+  const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(returnHref) ?? "/", location.origin).href)}`;
   const checking = state.status === "checking";
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },

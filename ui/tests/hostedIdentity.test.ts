@@ -227,12 +227,19 @@ async function boundaryChecks() {
 
     const { navigate } = require("../src/lib/useLocation") as typeof LocationModule;
     const { captureLoginNonce } = require("../src/features/auth/session") as typeof AuthSessionModule;
-    const intendedPath = "/projects/cadence/issues?view=kanban";
+    const pathWithoutFragment = "/projects/cadence/issues?view=kanban";
+    const intendedPath = `${pathWithoutFragment}#overview`;
     await React.act(async () => navigate(intendedPath));
     await flush();
     const hostedLink = host.querySelector('a[href^="/__platform/login"]') as HTMLAnchorElement | null;
     assert(hostedLink, "hosted refusal offers the platform sign-in handoff");
-    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${intendedPath}`, "hosted handoff preserves the absolute original board path and query");
+    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${intendedPath}`, "hosted handoff preserves the absolute board path, query and safe fragment");
+    await React.act(async () => navigate(`${pathWithoutFragment}#access_token=secret`));
+    await flush();
+    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${pathWithoutFragment}`, "credential-bearing fragments never enter the hosted handoff");
+    assert(sessionStorage.getItem("cadence.auth.returnTo") === pathWithoutFragment, "credential-bearing fragments are not remembered");
+    await React.act(async () => navigate(intendedPath));
+    await flush();
     const rememberedPath = sessionStorage.getItem("cadence.auth.returnTo");
     assert(rememberedPath === intendedPath, "public deep link is remembered for the same-tab local handoff");
 
@@ -277,7 +284,7 @@ async function boundaryChecks() {
       assert(heldMeta.length > 0, "post-exchange verification is genuinely pending");
       await React.act(async () => heldMeta[heldMeta.length - 1](json(signedIn)));
       await flush();
-      assert(location.pathname + location.search === expectedPath, `verified login returns only to a safe board route (${String(storedReturn)})`);
+      assert(location.pathname + location.search + location.hash === expectedPath, `verified login returns only to a safe board route (${String(storedReturn)})`);
       assert(history.length === beforeHistory, "verified login replaces the handoff entry instead of pushing it");
       assert(host.querySelector("[data-private-workspace]"), "private content mounts only after verified navigation");
     }
