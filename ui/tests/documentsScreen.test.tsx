@@ -305,6 +305,33 @@ async function main() {
   ok(!row("art-approved")!.textContent?.includes("v1"), "a version under review shows only while in review");
   ok(host.querySelector("table.stable.documents-table"), "the table keeps a readable floor and scrolls in its wrapper at 390px");
   ok(host.querySelector(".stable-wrap table.documents-table"), "inside the shared scrolling wrapper");
+  // Browser QA: headers and stage chips break mid-word ("In revie/w") when the
+  // shared cells' `overflow-wrap: anywhere` reaches them. Only the title cell
+  // wraps, at word boundaries; the floor fits six columns.
+  ok(review.querySelector("td.documents-title-cell button"), "the title sits in the one cell that wraps");
+  equal(
+    Array.from(review.querySelectorAll("td")).filter((td) => td.classList.contains("documents-title-cell")).length,
+    1,
+    "only the title cell wraps",
+  );
+  {
+    const css: string = require("fs").readFileSync(
+      require("path").resolve("src/features/documents/documents.css"),
+      "utf8",
+    );
+    const rule = (selector: string) => {
+      const at = css.indexOf(`${selector} {`);
+      return at < 0 ? "" : css.slice(at, css.indexOf("}", at));
+    };
+    const floor = Number(/min-width:\s*(\d+)px/.exec(rule(".documents-table"))?.[1] ?? 0);
+    ok(floor >= 760, `the table's floor fits six columns (${floor}px)`);
+    for (const selector of [".documents-table th", ".documents-table .chip"]) {
+      ok(/white-space:\s*nowrap/.test(rule(selector)), `${selector} keeps its words whole`);
+      ok(/overflow-wrap:\s*normal/.test(rule(selector)), `${selector} never breaks inside a word`);
+    }
+    ok(/overflow-wrap:\s*normal/.test(rule(".documents-table td")), "cells wrap only at word boundaries");
+    ok(/overflow-wrap:\s*break-word/.test(rule(".documents-table td.documents-title-cell")), "a title breaks a word only when it alone overflows");
+  }
   equal([heading()?.tagName, heading()?.tabIndex, heading()?.className.includes("font-semibold")], ["H1", -1, true], "the heading can take focus");
   ok(Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Version under review"), "the column says what it counts");
   ok(review.querySelector(".chip")?.textContent?.includes("In review"), "the stage is a chip");

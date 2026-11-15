@@ -165,7 +165,9 @@ export default function DrawerShell(props: DrawerShellProps) {
   }, []);
   useEffect(() => {
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      // An Escape a control inside already handled (an open Select's list)
+      // is not the drawer's.
+      if (e.key !== "Escape" || e.defaultPrevented) return;
       if (menuOpen) setMenuOpen(false);
       else if (edit != null) edit.onCancel();
       else requestClose();

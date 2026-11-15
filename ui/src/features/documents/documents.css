@@ -1,9 +1,32 @@
 /* CAD-2286: the Documents table keeps a readable floor, as `.crm-table` and
-   `.av-table` do: at a 390px viewport the shared `.stable-wrap` scrolls it
-   internally instead of crushing the columns. At desktop widths the table's
-   100% width rules and this is a no-op. */
+   `.av-table` do: at a 390px viewport, or beside the open canvas, the shared
+   `.stable-wrap` scrolls it internally instead of crushing the columns. The
+   floor fits the six Active columns with whole headers and chips; wider, the
+   table's 100% width rules. */
 .documents-table {
-  min-width: 640px;
+  min-width: 760px;
+}
+
+/* The shared cells break anywhere (`.stable td { overflow-wrap: anywhere }`),
+   which split headers and stage chips mid-word ("In revie/w", "審查/中").
+   Here cells wrap only between words, headers and chips never wrap, and the
+   title alone may break a word that cannot fit on its own. */
+.documents-table td {
+  overflow-wrap: normal;
+}
+
+.documents-table th {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.documents-table .chip {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.documents-table td.documents-title-cell {
+  overflow-wrap: break-word;
 }
 
 /* CAD-2286 Settings → Documents. Rows reuse the shared `.settings-row`; only
@@ -47,6 +70,12 @@
   align-items: center;
   gap: 0.5rem;
   min-inline-size: 0;
+}
+
+/* A badge wraps to its own line as a whole, never mid-word. */
+.document-type-name .chip {
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
 
 .document-type-values {

@@ -358,6 +358,7 @@ export default function DocumentsScreen({
     {
       key: "title",
       header: t("Document"),
+      cellClassName: "documents-title-cell",
       cell: (row) =>
         isArtifactKind(row.file.kind) ? (
           <button

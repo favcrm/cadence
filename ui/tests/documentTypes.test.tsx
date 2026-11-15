@@ -598,11 +598,25 @@ async function main() {
   const choices = () => Array.from(document.querySelectorAll('[role="option"] .select-label')).map((node) => node.textContent);
   await click(approverTrigger());
   equal(choices(), ["Workspace owner", "Olivia Owner", "Ann Lee", "ben@example.com"], "the approver list is the workspace owner and every member");
+  // Escape on the open list closes the list only: the drawer and its draft stay
+  // (Browser QA). The drawer's own close waits out a transition, so wait it out.
   await React.act(async () => {
     approverTrigger()!.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
-  await flush();
+  await closed();
+  ok(!document.querySelector('[role="listbox"]'), "Escape closes the open list");
   ok(drawer(), "Escape on the open list leaves the form open");
+  equal(
+    [field("Type name")?.value, field("Recipient note")?.value, field("Archive after (days)")?.value, approverTrigger()?.textContent],
+    [" Proposal ", "Thanks for reading", "45", "Ann Lee"],
+    "Escape on the open list keeps the draft",
+  );
+  // An Escape something inside already handled (cancelled) never closes the drawer.
+  const handled = new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  handled.preventDefault();
+  await React.act(async () => { window.dispatchEvent(handled); });
+  await closed();
+  ok(drawer(), "a handled Escape leaves the form open");
   writeReply = (path, body) =>
     path === "/api/document-types/Proposal"
       ? json({ type: { label: "proposal", ...(body as object), state: "confirmed", rev: 1 } })
@@ -826,6 +840,21 @@ async function main() {
   const latched = gets("/api/document-types");
   await React.act(async () => { await documentsProbe.revalidate(); });
   equal(gets("/api/document-types"), latched, "the unavailable answer is latched");
+
+  // ---- badges stay whole (Browser QA) ----
+
+  // The stylesheet is stubbed in this runner, so the rule itself is checked:
+  // a pending badge never breaks mid-word ("審查/中").
+  const css: string = require("fs").readFileSync(
+    require("path").resolve("src/features/documents/documents.css"),
+    "utf8",
+  );
+  const rule = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    return at < 0 ? "" : css.slice(at, css.indexOf("}", at));
+  };
+  ok(/white-space:\s*nowrap/.test(rule(".document-type-name .chip")), "a type's badge keeps its words whole");
+  ok(/overflow-wrap:\s*normal/.test(rule(".document-type-name .chip")), "a type's badge never breaks inside a word");
 
   // ---- zh-TW, rendered ----
 

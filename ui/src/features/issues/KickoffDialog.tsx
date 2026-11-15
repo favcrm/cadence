@@ -40,7 +40,8 @@ export default function KickoffDialog({ id, title, body, groups, seats, blocked,
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      // An Escape an open Select inside already handled is not the dialog's.
+      if (e.key === "Escape" && !e.defaultPrevented) onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
