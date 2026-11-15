@@ -4,6 +4,7 @@ import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
 import { subscribeMasterChanged } from "../../lib/masterChanged";
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import { cleanPermissionInline, cleanPermissionReason } from "./permissionFormat";
 
 /**
  * Provides a composer prefill callback for `Reject & reply…` across nested
@@ -11,6 +12,9 @@ import { useWriteBlock, WriteGate } from "../auth/WriteGate";
  * without prop-drilling.
  */
 export const PermissionReplyContext = createContext<((argv: string) => void) | null>(null);
+
+/** Gates legacy in-thread `ThreadPermission` rule fetches on non-hosted boards. */
+export const PermissionEnabledContext = createContext<boolean>(true);
 
 /** Formats the steering prefix seeded into the chat composer on reject-and-reply. */
 export function rejectReplyPrompt(command: string): string {
@@ -50,34 +54,32 @@ export interface PermissionCardData {
 /** Past this many characters the reason waits behind "…more" (never cut silently). */
 const REASON_CAP = 2000;
 
-/** Invisible, bidi and control characters could reorder or hide the text. */
-const INVISIBLE = /[\p{Cf}\p{Default_Ignorable_Code_Point}\p{Cc}]/gu;
-
 /**
  * What Master said about the command: all of it, as text to read before
  * Allow (never refused, never clamped). Only characters that cannot be
  * seen are removed.
  */
 export function ReasonBlock({ reason, label = "Master says:" }: { reason: string; label?: string }) {
+  const t = useTranslate();
   const [more, setMore] = useState(false);
-  const text = reason.replace(INVISIBLE, (c) => (c === "\n" || c === "\t" ? c : ""));
+  const text = cleanPermissionReason(reason);
   const long = text.length > REASON_CAP;
   const shown = long && !more ? text.slice(0, REASON_CAP) : text;
   return (
     <div className="rounded border border-ink-700 bg-ink-900 px-2 py-1.5 min-w-0" data-permission-reason>
-      <p className="text-micro text-ink-400">{label}</p>
+      <p className="text-micro text-ink-400">{t(label)}</p>
       <p
         className={`text-label text-ink-300 whitespace-pre-wrap break-words ${more ? "max-h-[50vh] overflow-y-auto" : ""}`}
         tabIndex={more ? 0 : undefined}
         role={more ? "region" : undefined}
-        aria-label={more ? "Master's full reason" : undefined}
+        aria-label={more ? t("Master's full reason") : undefined}
       >
-        {shown}
+        <bdi>{shown}</bdi>
         {long && !more ? "…" : ""}
       </p>
       {long ? (
         <button type="button" className="lnk text-micro mt-1" aria-expanded={more} onClick={() => setMore((v) => !v)}>
-          {more ? "Show less" : "…more"}
+          {more ? t("Show less") : t("…more")}
         </button>
       ) : null}
     </div>
@@ -127,7 +129,17 @@ export default function PermissionCard({
         after?.();
         onDone(what);
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => {
+        const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          setAlwaysOpen(false);
+          setRejectOpen(false);
+          setError(msg);
+          publishPermission();
+          return;
+        }
+        setError(msg);
+      })
       .finally(() => setBusy(false));
   };
   return (
@@ -135,10 +147,14 @@ export default function PermissionCard({
       {compact ? null : (
         <>
           <p className="text-micro text-ink-300 break-all">
-            <span className="chip bg-ink-800 text-ink-300 mr-1">{card.risk}</span>
-            {card.argv}
+            <span className="chip bg-ink-800 text-ink-300 mr-1">{t(card.risk)}</span>
+            <bdi>{cleanPermissionInline(card.argv)}</bdi>
           </p>
-          {card.cwd ? <p className="text-micro text-ink-500 break-all">{card.cwd}</p> : null}
+          {card.cwd ? (
+            <p className="text-micro text-ink-500 break-all">
+              <bdi>{cleanPermissionInline(card.cwd)}</bdi>
+            </p>
+          ) : null}
         </>
       )}
       {compact && card.risk !== "low" ? (
@@ -149,7 +165,7 @@ export default function PermissionCard({
       {card.reason ? <ReasonBlock reason={card.reason} /> : null}
       {decided ? (
         <p className="text-micro text-ok" data-permission-decided>
-          {card.decisionLabel || card.status}
+          <bdi>{cleanPermissionInline(t(card.decisionLabel || card.status))}</bdi>
         </p>
       ) : (
         <div className="flex flex-wrap items-center gap-2">
@@ -206,7 +222,7 @@ export default function PermissionCard({
                 run(() => api.permissionAlways(card.id, "prefix", card.prefix ?? []), "Always: prefix")
               }
             >
-              {t("Prefix")} {card.prefix.join(" ")}
+              {t("Prefix")} <bdi>{cleanPermissionInline(card.prefix.join(" "))}</bdi>
             </button>
           ) : null}
         </div>
@@ -271,8 +287,20 @@ export function cardFromRequest(req: MasterPermissionRequest): PermissionCardDat
 }
 
 /** The same card, fed by the master thread's permission message. */
-export function ThreadPermission({ text, readOnly }: { text: string; readOnly: boolean }) {
+export function ThreadPermission({
+  text,
+  readOnly,
+  enabled,
+}: {
+  text: string;
+  readOnly: boolean;
+  enabled?: boolean;
+}) {
   const id = permissionIdFromText(text);
+  const ctxEnabled = useContext(PermissionEnabledContext);
+  const masterSnap = resources.masterState.get().data;
+  const masterHosted = masterSnap !== null && Object.hasOwn(masterSnap, "actor_identity");
+  const canRead = (enabled ?? ctxEnabled) && !masterHosted;
   const [card, setCard] = useState<PermissionCardData | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -280,8 +308,8 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
     let revision = 0;
     setCard(null);
     setError(null);
+    if (!id || !canRead) return;
     const load = () => {
-      if (!id) return;
       const current = ++revision;
       void api.permissionRules().then((out) => {
         if (!alive || current !== revision) return;
@@ -302,14 +330,23 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
       offLocal();
       offMaster();
     };
-  }, [id]);
-  if (!id) return <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>;
+  }, [id, canRead]);
+  const fallbackText = cleanPermissionReason(text);
+  if (!id || !canRead) {
+    return (
+      <p className="text-micro text-ink-400 whitespace-pre-wrap break-words" data-permission-thread={id ?? undefined}>
+        <bdi>{fallbackText}</bdi>
+      </p>
+    );
+  }
   return (
     <div className="card px-3 py-2 ml-8 min-w-0" data-permission-thread={id}>
       {card ? (
         <PermissionCard card={card} readOnly={readOnly} onDone={() => setError(null)} compact />
       ) : (
-        <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>
+        <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">
+          <bdi>{fallbackText}</bdi>
+        </p>
       )}
       {error ? (
         <p className="text-micro text-fail" role="alert">

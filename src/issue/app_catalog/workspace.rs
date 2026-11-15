@@ -1973,7 +1973,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"catalogue":record.catalogue,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"catalogue":record.catalogue,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"navigation":crate::issue::app_screen_pkg::single_screen_navigation(&files, &manifest.app),"i18n":manifest.display_i18n(),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 /// CAD-1189: catalog reads take no lock. Every writer journals first
@@ -3048,5 +3048,52 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         drop(held);
         // Odd with no live writer: a crash leftover, read under the lock.
         assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn describe_id_projects_navigation_and_i18n_without_changing_generation() {
+        let td = || tempfile::tempdir().unwrap();
+        let (pm_dir, state_dir, sources) = (td(), td(), td());
+        let (pm, src) = (Pm::init(pm_dir.path()).unwrap(), sources.path().join("crm"));
+        bundle(&src, "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage\nneeds: {connections: [], requires: {contracts: {app-screens: [1], screen-records: [1]}}}\nlisting: {tagline: Track., i18n: {zh-TW: {tagline: 輕鬆}}}\ni18n: {zh-TW: {title: 客戶管理}}\n---\n\nGuide.\n");
+        let js = "console.log(1);\n";
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("sha256:{:x}", Sha256::digest(js.as_bytes()))
+        };
+        let screen = serde_json::json!({
+            "contract": "app-screens/v2", "app": "crm", "entry": "client.js",
+            "assets": [{"name": "client.js", "media_type": "text/javascript", "sha256": sha, "size": js.len()}],
+            "provenance": {"source_digest": format!("sha256:{}", "a".repeat(64)), "sdk_digest": format!("sha256:{}", "b".repeat(64)), "toolchain_digest": format!("sha256:{}", "c".repeat(64))},
+            "host_contract": "screen-records.v1", "may": [],
+            "navigation": {"section_query": "section", "default_section": "c", "sections": [{"id": "c", "label": "Customers", "i18n": {"zh-TW": {"label": "客戶"}}}]}
+        });
+        std::fs::create_dir_all(src.join("screens/main")).unwrap();
+        std::fs::write(src.join("screens/main/client.js"), js).unwrap();
+        std::fs::write(src.join("screens/main/screens.json"), screen.to_string()).unwrap();
+        let out = install(
+            &pm,
+            state_dir.path(),
+            src.to_str().unwrap(),
+            None,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
+        let catalog = Catalog::load(&pm.dir).unwrap();
+        let desc = describe_id(
+            &pm,
+            &catalog,
+            &InstallationId::parse(out["install_id"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desc["catalog_generation"], hash(&yaml(&catalog).unwrap()));
+        assert_eq!(
+            (
+                &desc["i18n"]["zh-TW"]["title"],
+                &desc["i18n"]["zh-TW"]["tagline"],
+                &desc["navigation"]["sections"][0]["i18n"]["zh-TW"]["label"]
+            ),
+            (&json!("客戶管理"), &json!("輕鬆"), &json!("客戶"))
+        );
     }
 }

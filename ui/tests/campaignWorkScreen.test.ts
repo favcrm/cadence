@@ -216,16 +216,43 @@ async function run(): Promise<void> {
   assert.equal(refusedSave.ok, false, "a stale save is refused");
   assert.equal(refusalCode(refusedSave), "stale_revision", "the stale code survives the bridge");
 
-  // A member's save is refused by the host (403): the bridge reports
-  // `forbidden` and retires the owned mount, exactly like every other loss.
+  // A non-fatal host write refusal (403 explicit read-only screen refusal)
+  // returns `forbidden` while keeping the owned mount active for reads.
   const member = fixture();
   const memberSave = member.services.call(SAVE, { campaign_id: "welcome", expected_revision: 1, due_at: "2026-12-02" });
-  member.requests[0].reply({ status: 403, body: { code: "forbidden", text: "screen service requires operator-role public session" } });
+  member.requests[0].reply({ status: 403, body: { code: "forbidden", error: "a read-only screen admits only read operations" } });
   const denied = await memberSave;
   assert.equal(denied.ok, false, "a member save is refused");
   assert.equal(refusalCode(denied), "forbidden", "the member refusal is forbidden, not a generic failure");
-  assert.equal(member.refused(), 1, "a lost mount is reported to the host");
+  assert.equal(member.refused(), 0, "a non-fatal write 403 keeps the mount active");
   assert.equal(member.commands.length, 0, "no host command is fabricated");
+  const followUpShow = member.services.call(SHOW, { campaign_id: "welcome" });
+  member.requests[1].reply({
+    status: 200,
+    body: {
+      contract: "crm-campaign-work/v1",
+      source: { app: "crm", install_id: "inst-1", context_id: "ctx-1" },
+      campaign_id: "welcome",
+      work: null,
+      content: null,
+    },
+  });
+  assert.ok((await followUpShow).ok, "subsequent read still succeeds after non-fatal write 403");
+
+  // Mount/session-revoking 403 replies report `forbidden` and retire the mount.
+  for (const text of [
+    "screen service requires operator-role public session",
+    "screen service access unavailable",
+  ]) {
+    const revoked = fixture();
+    const revokedSave = revoked.services.call(SAVE, { campaign_id: "welcome", expected_revision: 1, due_at: "2026-12-02" });
+    revoked.requests[0].reply({ status: 403, body: { code: "forbidden", text } });
+    const revokedDenied = await revokedSave;
+    assert.equal(revokedDenied.ok, false, `a revoked mount save is refused (${text})`);
+    assert.equal(refusalCode(revokedDenied), "forbidden", `the revoked refusal keeps forbidden (${text})`);
+    assert.equal(revoked.refused(), 1, `a lost mount is reported to the host (${text})`);
+    assert.equal(revoked.commands.length, 0, "no host command is fabricated");
+  }
 
   // Save is a direct CALL, never a SLOT: a planner request is refused
   // without reaching the wire. The cast asks the planner to treat a CALL

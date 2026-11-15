@@ -1,9 +1,12 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
   wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
+  type ScreenSection,
+  type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
+import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
  *  when it cannot be loaded now. Supplied by the board; never by the frame. */
@@ -124,12 +127,49 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   display_session_key?: string;
   install_id?: string; context_id?: string | null; digest?: string;
   remote_images?: string[] };
+const SECTION_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const SECTION_I18N_KEYS = new Set(["label"]);
+const RESERVED_SECTION_QUERIES = new Set([
+  "app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity",
+  "auth", "token", "key", "session", "session_key", "origin", "project", "workspace",
+  "conversation", "thread", "message", "view", "appview", "record", "record_id",
+  "segment", "segment_id", "screen", "contract-preview", "nonce", "proof",
+  "generation", "digest",
+]);
+
+function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isPlainJsonObject(raw)) return null;
+  // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
+  if (Object.keys(raw).length === 0) return undefined;
+  return parseLocaleEntries(raw, SECTION_I18N_KEYS, (entry) => {
+    const label = entry.label;
+    return typeof label === "string" && label.trim().length > 0 && label.length <= 40 && !SECTION_CTRL_RE.test(label)
+      ? { label }
+      : null;
+  });
+}
+
 export function parseNavigation(value: unknown): ScreenNavigation | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const nav = value as ScreenNavigation;
-  const reserved = new Set(["app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity", "auth", "token", "key", "session", "session_key", "origin", "project", "workspace", "conversation", "thread", "message", "view", "appview", "record", "record_id", "segment", "segment_id", "screen", "contract-preview", "nonce", "generation", "digest"]);
-  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || reserved.has(nav.section_query) || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8 || new Set(nav.sections.map(s => s?.id)).size !== nav.sections.length || !nav.sections.every(s => s && Object.keys(s).sort().join() === "id,label" && typeof s.id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) && typeof s.label === "string" && s.label.trim().length > 0 && s.label.length <= 40) || !nav.sections.some(s => s.id === nav.default_section)) return null;
-  return nav;
+  const nav = value as Record<string, unknown>;
+  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || RESERVED_SECTION_QUERIES.has(nav.section_query) || typeof nav.default_section !== "string" || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8) return null;
+  const seen = new Set<string>();
+  const sections: ScreenSection[] = [];
+  for (const rawSection of nav.sections) {
+    if (!rawSection || typeof rawSection !== "object" || Array.isArray(rawSection)) return null;
+    const s = rawSection as Record<string, unknown>;
+    const keys = Object.keys(s);
+    if (!keys.includes("id") || !keys.includes("label") || keys.some((k) => k !== "id" && k !== "label" && k !== "i18n")) return null;
+    if (typeof s.id !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) || seen.has(s.id)) return null;
+    seen.add(s.id);
+    if (typeof s.label !== "string" || s.label.trim().length === 0 || s.label.length > 40 || SECTION_CTRL_RE.test(s.label)) return null;
+    const i18n = parseSectionI18n(s.i18n);
+    if (i18n === null) return null;
+    sections.push(i18n ? { id: s.id, label: s.label, i18n } : { id: s.id, label: s.label });
+  }
+  if (!seen.has(nav.default_section)) return null;
+  return { section_query: nav.section_query, default_section: nav.default_section, sections };
 }
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;

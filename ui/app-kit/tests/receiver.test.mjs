@@ -1,6 +1,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
+import { Window } from "happy-dom";
 import {
   DRAWER_CONTEXT_BYTES,
   HOST_DRAWER_VERBS,
@@ -1433,4 +1434,85 @@ test("createScreenBridge audio: 'v2' streams audioSession snapshots and preserve
   assert.deepEqual(await stopped, readySnap);
   assert.equal(bridge.getAudioSession().phase, "ready");
   unsub();
+});
+
+test("createScreenBridge sandboxForms prevents default actionless submit and cleans up on retire and reset", async () => {
+  for (const action of ["retire", "reset"]) {
+    const win = new Window({ url: "https://frame.local/" });
+    try {
+      const form = win.document.createElement("form");
+      win.document.body.append(form);
+      const bridge = createScreenBridge({
+        tag: "notes",
+        appName: "notes",
+        sandboxForms: true,
+      });
+      bridge.start({
+        boot: { ...boot, tag: "notes" },
+        document: win.document,
+        parent: { postMessage() {} },
+      });
+
+      const before = new win.Event("submit", { bubbles: true, cancelable: true });
+      form.dispatchEvent(before);
+      assert.equal(before.defaultPrevented, true, `${action}: actionless submit prevented while active`);
+
+      if (action === "retire") bridge.retire("done");
+      else bridge.reset();
+
+      const after = new win.Event("submit", { bubbles: true, cancelable: true });
+      form.dispatchEvent(after);
+      assert.equal(after.defaultPrevented, false, `${action}: listener cleaned up`);
+    } finally {
+      win.close();
+    }
+  }
+});
+
+test("createScreenBridge keeps mount alive on write/owner_required/slot 403 and retires on access revocation 403", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    surfaces: true,
+    calls: { "records.list": [], "records.create": ["name"] },
+    slots: { "publish.cancel": [] },
+    writeVerbs: ["records.create"],
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ actions: ["records.list", "records.create", "publish.cancel"] }));
+  await waitFor(() => bridge.getState().status === "ready", "bridge ready for 403 tests");
+  const { scope } = bridge.getSnapshot();
+
+  const writeForbidden = bridge.call(scope, "records.create", { name: "Ada" });
+  const writeReq = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.create"), "write call");
+  host.postMessage({ v: 2, op: "reply", id: writeReq.id, ok: false, refusal: { code: "forbidden", text: "Read-only role." } });
+  await assert.rejects(writeForbidden, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const ownerRequired = bridge.call(scope, "records.list", {});
+  const ownerReq = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.list"), "owner_required call");
+  host.postMessage({ v: 2, op: "reply", id: ownerReq.id, ok: false, refusal: { code: "owner_required", text: "Owner required." } });
+  await assert.rejects(ownerRequired, (err) => err instanceof ScreenBridgeError && err.status === 403 && err.code === "owner_required");
+  assert.equal(bridge.getState().status, "ready");
+
+  const slotForbidden = bridge.slot(scope, "publish.cancel", {});
+  const slotReq = await waitFor(() => inbox.find((m) => m.op === "slot" && m.verb === "publish.cancel"), "slot call");
+  host.postMessage({ v: 2, op: "slot-state", id: slotReq.id, state: "refused", refusal: { code: "forbidden", text: "Slot refused." } });
+  await assert.rejects(slotForbidden, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const revoked = bridge.call(scope, "records.create", { name: "Grace" });
+  const revokedReq = await waitFor(() => inbox.filter((m) => m.op === "call" && m.verb === "records.create")[1], "revoked write call");
+  host.postMessage({
+    v: 2,
+    op: "reply",
+    id: revokedReq.id,
+    ok: false,
+    refusal: { code: "forbidden", text: "This app's access is no longer available." },
+  });
+  await assert.rejects(revoked, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "error");
 });

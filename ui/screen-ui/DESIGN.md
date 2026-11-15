@@ -175,3 +175,13 @@ in the source provenance and archive artifact inventory. A working-tree archive
 is development evidence, not a published SDK release or an installed consumer
 upgrade. See `docs/guides/app-toolchain.md` in the source repository for the
 separate bridge receiver and frame-kit delivery contracts.
+
+
+## v1.1 Screen Primitives and Canonical `.s-*` Selectors
+
+- **Canonical `.s-*` aliases:** `.s-toolbar`, `.s-field`, `.s-confirm-wrap`, `.s-confirm-scrim`, and `.s-confirm` alias the legacy `.crm-*` selectors so shared components stay backwards-compatible while screen apps target `.s-*`.
+- **New components:**
+  - `FilterBar` (`FilterBarProps`, `FilterChipOption`) renders a responsive search box (`.s-filter-bar-search`), toggleable facet buttons with `aria-pressed` (`.s-filter-bar-chips`), Clear trigger, and trailing action slots (`.s-filter-bar-actions`).
+  - `StatusPill` (`StatusPillProps`, `StatusTone`) renders status badges (`neutral`, `ok`, `warn`, `fail`, `info`, `accent`) against `--color-ok`, `--color-warn`, `--color-fail`, `--color-info`, and `--color-accent`.
+  - `StagedApprovalBanner` (`StagedApprovalBannerProps`, `StagedApprovalTone`) presents staged confirmation / refusal context (`warn`, `info`, `fail`) with accessible `region`/`alert` roles and Discard / Confirm actions.
+  - `LocaleBridgeProvider` and `useScreenLocale` bind `bridge.getState().snapshot?.presentationLocale` (falling back to `context?.locale` when provided, with optional `messages` catalog or `translate` callback) into `LocaleTextProvider` / `useTranslate` without importing board runtime locale bundles.

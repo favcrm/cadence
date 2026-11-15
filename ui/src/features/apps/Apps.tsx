@@ -1,7 +1,8 @@
 import { canOpenInstall } from "../explorer/installAccess";
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
-import { useTranslate } from "../../lib/locale";
+import { useLocale, useTranslate } from "../../lib/locale";
+import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
@@ -21,6 +22,22 @@ import PageState from "../../ui/PageState";
 import { IconApps, IconLock, IconSettings } from "../../ui/icons";
 import "../explorer/explorer.css";
 
+function homeAppTitle(h: HomeInstallation, locale: string, t: TranslateFn): string {
+  return localizedAppTitle(
+    { title: h.title, i18n: parseAppDisplayI18n(h.i18n, { wire: true }), listing: h.listing },
+    locale,
+    t,
+  );
+}
+
+function homeAppTagline(h: HomeInstallation, locale: string, t: TranslateFn): string {
+  return localizedAppTagline(
+    { tagline: h.tagline, i18n: parseAppDisplayI18n(h.i18n, { wire: true }), listing: h.listing },
+    locale,
+    t,
+  );
+}
+
 /**
  * The Apps home (CAD-1129, `/apps`): the OS-style landing — a Needs-
  * attention rail, the operator's/member's favorites row, the installed
@@ -32,7 +49,7 @@ import "../explorer/explorer.css";
  * workspace-level home the ticket describes.
  */
 export default function Apps({ viewer }: { viewer: Viewer }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
@@ -108,10 +125,20 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const [noMatchBeforeExplore, noMatchAfterExplore] = noMatchCopy.split(/Explore|「探索」/);
   const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
 
+  const localizedById = useMemo(() => new Map(
+    (home ?? []).map((h) => [h.install_id, { title: homeAppTitle(h, locale, t), tagline: homeAppTagline(h, locale, t) }]),
+  ), [home, locale, t]);
+
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    let list = live.filter((h) => !needle || [h.name, h.title, h.tagline].filter(Boolean).join(" ").toLowerCase().includes(needle));
-    if (sort === "name") list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+    let list = live.filter((h) => {
+      if (!needle) return true;
+      const loc = localizedById.get(h.install_id);
+      return [h.name, h.title, loc?.title, h.tagline, loc?.tagline].filter(Boolean).join(" ").toLowerCase().includes(needle);
+    });
+    if (sort === "name") {
+      list = [...list].sort((a, b) => (localizedById.get(a.install_id)?.title ?? a.title).localeCompare(localizedById.get(b.install_id)?.title ?? b.title));
+    }
     if (sort === "attention") {
       const rank: Record<string, number> = { attention: 0, setup: 1, update: 2, off: 3, ok: 4 };
       list = [...list].sort((a, b) => (rank[a.attention.state] ?? 4) - (rank[b.attention.state] ?? 4));
@@ -121,7 +148,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
       list = [...list].sort((a, b) => (order.get(a.install_id) ?? 999) - (order.get(b.install_id) ?? 999));
     }
     return list;
-  }, [live, q, sort, favs]);
+  }, [live, q, sort, favs, localizedById]);
 
   const pin = (id: string) => {
     const cur = favs?.favorites ?? [];
@@ -166,7 +193,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
     return (
       <div key={h.install_id} className="attn-row">
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
-        <span className="txt"><b>{h.title}</b> · {h.attention.message ?? label}</span>
+        <span className="txt"><b>{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</b> · {h.attention.message ? t(h.attention.message) : label}</span>
         {isOp ? (
           <Button className="btn-sm" href={(s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`}>
             {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
@@ -272,7 +299,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                             checked={favs?.favorites.includes(h.install_id) ?? false}
                             disabled={favs === null}
                             onChange={() => pin(h.install_id)} />
-                          <span className="favpick-name">{h.title}</span>
+                          <span className="favpick-name">{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</span>
                         </label>
                       ))}
                     </div>
@@ -282,29 +309,34 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
             </div>
             {favorites.length > 0 ? (
               <div className="favs">
-                {favorites.map((h) => (
+                {favorites.map((h) => {
+                  const localized = localizedById.get(h.install_id);
+                  const title = localized?.title ?? homeAppTitle(h, locale, t);
+                  const tagline = localized?.tagline ?? homeAppTagline(h, locale, t);
+                  return (
                   <div key={h.install_id} className="card fav">
                     {(() => {
                       const href = openHref(h);
                       return href === null ? (
-                        <span className="open" aria-label={`${t("Open")} ${h.title}`}>
+                        <span className="open" aria-label={`${t("Open")} ${title}`}>
                           <AppGlyph name={h.name} icon={h.icon} />
-                          <span className="nm">{h.title}</span>
+                          <span className="nm">{title}</span>
                           <span className="ln">{t("No unique app page — see Manage")}</span>
                         </span>
                       ) : (
                         <Link href={href} className="open"
-                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
+                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${title}`}>
                           <AppGlyph name={h.name} icon={h.icon} />
-                          <span className="nm">{h.title}</span>
-                          <span className="ln">{h.tagline}</span>
+                          <span className="nm">{title}</span>
+                          <span className="ln">{tagline}</span>
                         </Link>
                       );
                     })()}
-                    <button className="star pinned absolute top-2 right-2" aria-label={`${t("Unpin")} ${h.title}`}
+                    <button className="star pinned absolute top-2 right-2" aria-label={`${t("Unpin")} ${title}`}
                       onClick={() => pin(h.install_id)}>★</button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : favs === null ? (
               <p className="hint">{t(favLoad.error ? "Favorites could not be loaded." : "Loading favorites…")}</p>
@@ -340,6 +372,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 <div className="apps-grid">
                   {items.map((h) => (
                     <InstalledCard key={h.install_id} h={h}
+                      localized={localizedById.get(h.install_id)}
                       href={openHref(h)}
                       settingsHref={settingsHref(h)}
                       onOpen={() => opened(h.install_id)} />
@@ -362,7 +395,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 {removedList.map((h) => (
                   <div key={h.install_id} className="rrow flex items-center gap-3 p-3">
                     <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
+                    <div className="grow"><b>{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
                     {h.attention.action === "restore" && (
                       <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
                         {t(busy === h.install_id ? "Restoring…" : "Restore")}
@@ -413,13 +446,14 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
  * listing fields come from the real `app_home` row — absent fields
  * leave clean slots, never fixture text.
  */
-function InstalledCard({ h, href, settingsHref, onOpen }: {
+function InstalledCard({ h, localized, href, settingsHref, onOpen }: {
   h: HomeInstallation;
+  localized?: { title: string; tagline: string };
   href: string | null;
   settingsHref: string | null;
   onOpen: () => void;
 }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const state = h.attention.state;
   const statusKey =
     state === "off" ? "Access off"
@@ -432,14 +466,15 @@ function InstalledCard({ h, href, settingsHref, onOpen }: {
   const statusId = `app-card-status-${h.install_id}`;
   const listing = h.listing;
   const category = listing?.category;
-  const summary = listing?.tagline ?? h.tagline;
+  const title = localized?.title ?? homeAppTitle(h, locale, t);
+  const summary = localized?.tagline ?? homeAppTagline(h, locale, t);
   const publisher = listing?.publisher?.name;
   const body = (
     <>
-      <AppCover name={h.name} title={h.title} category={category ?? ""} />
+      <AppCover name={h.name} title={title} category={category ?? ""} />
       <div className="app-card-copy">
-        {category && <span className="card-category">{category}</span>}
-        <h3 className="app-card-name" id={nameId}>{h.title}</h3>
+        {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
+        <h3 className="app-card-name" id={nameId}>{title}</h3>
         {summary && <p className="app-card-summary">{summary}</p>}
         {publisher && <span className="card-publisher">{publisher}</span>}
         {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
@@ -466,7 +501,7 @@ function InstalledCard({ h, href, settingsHref, onOpen }: {
       )}
       {settingsHref !== null && (
         <Link className="app-card-settings" href={settingsHref}
-          aria-label={`${t("Settings")} — ${h.title}`} title={t("Settings")}>
+          aria-label={`${t("Settings")} — ${title}`} title={t("Settings")}>
           <IconSettings size={15} />
         </Link>
       )}

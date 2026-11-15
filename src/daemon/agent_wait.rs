@@ -743,13 +743,17 @@ mod tests {
             })
             .unwrap();
         let t0 = Instant::now();
-        let err = shared
-            .dispatch(
+        // CAD-2215 resolves the caller's project scope before the wait, so
+        // the dead peer is asserted as the operator: the liveness check in
+        // the wait loop is what must free it, not a caller refusal.
+        let err = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+            shared.dispatch(
                 "agent_wait",
                 &json!({"alias": "w", "until": "idle", "timeout": 300}),
                 u32::MAX,
             )
-            .expect_err("dead peer must release the waiter");
+        })
+        .expect_err("dead peer must release the waiter");
         assert!(err.to_string().contains("calling process exited"), "{err}");
         assert!(
             t0.elapsed() < Duration::from_secs(5),

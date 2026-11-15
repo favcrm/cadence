@@ -259,6 +259,24 @@ impl CliActor {
             None => self.actor.clone(),
         }
     }
+
+    /// The project-policy spelling of this verified caller, or `None` when
+    /// its principal kind and actor prefix disagree (CAD-2321, operator
+    /// decision of 2026-11-15). Only a `users/` actor keys on the verified
+    /// `sub`; each kind is admitted with its own prefix alone, and any other
+    /// pair names no caller. Every project read of a CLI envelope — the
+    /// route's guards and the daemon's relayed reads — uses this one rule.
+    pub fn policy_actor(&self) -> Option<String> {
+        let prefix = self.actor.split_once('/').map(|(prefix, _)| prefix);
+        match (self.principal_kind.as_str(), prefix) {
+            ("user", None) if self.actor == "operator" => Some(self.actor.clone()),
+            ("user", Some("users")) => Some(crate::project_policy::policy_user_actor(&self.sub)),
+            ("agent", Some("agents")) | ("service", Some("service")) => {
+                Some(self.policy_spelling())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Extract the compact envelope from `Authorization`: exactly

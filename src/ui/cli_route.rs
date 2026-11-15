@@ -386,21 +386,18 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
     Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))
 }
 
-fn policy_actor(actor: &CliActor) -> String {
-    if actor.principal_kind == "user" && actor.actor != "operator" {
-        crate::project_policy::policy_user_actor(&actor.sub)
-    } else {
-        actor.policy_spelling()
-    }
-}
-
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
 /// (AOS-274 / SEC-003). A project that does not exist is left to the
-/// verb's own unknown-project answer; an unreadable tracker refuses.
+/// verb's own unknown-project answer; an unreadable tracker refuses, and
+/// so does a caller whose principal kind and actor disagree.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
-    if super::project_policy::refused(pm, key, &policy_actor(actor)) {
+    let refused = match actor.policy_actor() {
+        Some(spelling) => super::project_policy::refused(pm, key, &spelling),
+        None => true,
+    };
+    if refused {
         Some(cli_fail(404, "not_found", "unknown project"))
     } else {
         None
@@ -422,7 +419,10 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
 /// so a listing contributes no row, count or placeholder for a project
 /// the caller may not see.
 fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<String> {
-    super::project_policy::readable(pm, &policy_actor(actor))
+    actor
+        .policy_actor()
+        .map(|spelling| super::project_policy::readable(pm, &spelling))
+        .unwrap_or_default()
 }
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
@@ -463,7 +463,13 @@ fn dispatch(
                     "My work identity is not unambiguously bound",
                 );
             }
-            let policy_actor = policy_actor(actor);
+            let Some(policy_actor) = actor.policy_actor() else {
+                return cli_fail(
+                    403,
+                    "identity_unresolved",
+                    "My work identity is not unambiguously bound",
+                );
+            };
             let proof = super::operator::ReadRelayProof::Cli(envelope.to_owned());
             match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor, Some(&proof)) {
                 Ok(snapshot) => {
@@ -1001,8 +1007,15 @@ mod policy_tests {
         } else {
             "user"
         };
+        // Each spelling's own handle is its subject, as the issuer mints a
+        // `users/<sub>` actor (CAD-2215 keys a user's policy on `sub`).
+        let sub = match spelling.split_once('/') {
+            Some((_, handle)) => handle,
+            None if spelling == "operator" => "owner",
+            None => spelling,
+        };
         CliActor {
-            sub: "sub".into(),
+            sub: sub.into(),
             actor: spelling.into(),
             role_at_issue: role.into(),
             principal_kind: principal_kind.into(),
@@ -1012,7 +1025,7 @@ mod policy_tests {
             exp: i64::MAX,
             // Exactly what `verify` derives from the claims, so the helper
             // cannot drift from the production chain.
-            handle: cli_actor::handle_of(spelling, "sub"),
+            handle: cli_actor::handle_of(spelling, sub),
         }
     }
 
@@ -1246,12 +1259,34 @@ mod policy_tests {
 
     /// The board and the hosted CLI must name the same member, or a grant
     /// recorded on one surface would refuse the caller arriving through
-    /// the other (AOS-274 adapter mapping).
+    /// the other (AOS-274 adapter mapping). Since CAD-2215 the CLI keys a
+    /// user on the verified `sub`, so only a handle-shaped subject can hold a
+    /// grant; a subject that merely sanitizes to a granted spelling is
+    /// refused until grant identity migrates (a CAD-2215 known limitation).
     #[test]
     fn the_cli_keys_a_policy_on_the_spelling_the_board_stores() {
+        // A canonical, handle-shaped subject is admitted to its own grant.
+        let (_canonical_dir, canonical_pm) =
+            pm_with("policy:\n  version: 1\n  visibility: private\n  members:\n  - users/usr_9\n");
+        let canonical = CliActor {
+            sub: "usr_9".into(),
+            actor: "users/usr_9".into(),
+            role_at_issue: "member".into(),
+            principal_kind: "user".into(),
+            scopes: vec!["cli.read".into(), "cli.write".into()],
+            credential_id: "cred".into(),
+            jti: "jti".into(),
+            exp: i64::MAX,
+            handle: cli_actor::handle_of("users/usr_9", "usr_9"),
+        };
+        assert!(
+            restricted(&canonical_pm, "demo", &canonical).is_none(),
+            "the granted canonical member was refused through the hosted CLI"
+        );
+        assert!(readable_projects(&canonical_pm, &canonical).contains("demo"));
+
         // The store holds only the sanitized form — `Grant::parse` refuses
-        // a raw subject — and that is what the board derives from a
-        // session, so it is the only spelling a grant can carry.
+        // a raw subject — so a grant can never name this caller's `sub`.
         let (_dir, pm) = pm_with(
             "policy:\n  version: 1\n  visibility: private\n  members:\n  - users/auth0_usr_9_x\n",
         );
@@ -1266,13 +1301,13 @@ mod policy_tests {
             exp: i64::MAX,
             handle: cli_actor::handle_of("users/auth0|usr:9/x", "auth0|usr:9/x"),
         };
-        // The granted member is admitted on the hosted CLI too, though the
-        // envelope's `sub` is not itself handle-shaped.
-        assert!(
-            restricted(&pm, "demo", &sanitized).is_none(),
-            "the granted member was refused through the hosted CLI"
-        );
-        assert!(readable_projects(&pm, &sanitized).contains("demo"));
+        // The sanitized spelling matches the grant, but the `sub` is not
+        // handle-shaped, so the caller is refused on both the read guard and
+        // the listing.
+        let refusal = restricted(&pm, "demo", &sanitized)
+            .expect("a subject that only sanitizes to the grant was admitted");
+        assert_eq!(refusal.status_code(), 404);
+        assert!(!readable_projects(&pm, &sanitized).contains("demo"));
 
         // …and it widens nothing: a grant naming someone else still
         // refuses this caller, on both the read guard and the listing.

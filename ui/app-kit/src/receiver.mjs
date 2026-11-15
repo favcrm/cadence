@@ -14,6 +14,7 @@
  * Wire shapes follow `ui/src/features/workspace-apps/screen/screenProtocol.ts`.
  */
 import { ScreenBridgeError, ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
+import { installSandboxFormActions } from "./forms.mjs";
 
 export const MAX_STATE_BYTES = 32 * 1024;
 /** The encoded allowance for a 96 KiB image (base64 + prefix), matching
@@ -1028,10 +1029,11 @@ export function createScreenBridge(options = {}) {
     tag, appName, records = false, actions = false, media = false, surfaces = false,
     presentation = false, locale = false, audio = false, calls = {}, slots = {}, argBytes = ACTION_ARGS_BYTES,
     singleFlight = [], writeVerbs = [], route: routeConfig, observations: observationVerbs = [],
-    pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, createError,
+    pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, sandboxForms = false, createError,
   } = options;
   if (typeof tag !== "string" || !TAG.test(tag)) fail("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   if (appName !== undefined && (typeof appName !== "string" || appName.length === 0)) fail("appName must be a non-empty string when provided");
+  if (typeof sandboxForms !== "boolean") fail("sandboxForms must be a boolean");
   if (!isPlain(calls) || !isPlain(slots)) fail("calls and slots must be plain verb -> field-list maps");
   if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1) fail("maxInFlight must be a positive safe integer");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail("timeoutMs must be positive");
@@ -1102,6 +1104,7 @@ export function createScreenBridge(options = {}) {
   let currentState = makeState({ status: "loading", snapshot: null, error: null, pushes: 0, surface: initialSurface });
   let latestAudioSession = null;
   let receiver = null;
+  let cleanupSandboxForms = null;
   let retired = false;
   let retiredCause = null;
   let inFlight = 0;
@@ -1231,6 +1234,9 @@ export function createScreenBridge(options = {}) {
     const live = receiver;
     receiver = null;
     latestAudioSession = null;
+    const stopForms = cleanupSandboxForms;
+    cleanupSandboxForms = null;
+    stopForms?.();
     live?.teardown();
     setState({ status: "error", snapshot: null, error: err });
   };
@@ -1257,9 +1263,10 @@ export function createScreenBridge(options = {}) {
     }
   };
 
-  const cleanArgs = (verb, rawArgs, fieldsMap) => {
-    const allowed = fieldsMap[verb];
-    if (!allowed) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+  const cleanArgs = (verb, rawArgs, fieldsMap, extraFields) => {
+    const baseAllowed = fieldsMap[verb];
+    if (!baseAllowed) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+    const allowed = Array.isArray(extraFields) && extraFields.length > 0 ? [...baseAllowed, ...extraFields] : baseAllowed;
     const source = rawArgs === undefined ? {} : rawArgs;
     if (!isPlain(source)) throw makeError(`Invalid arguments for ${verb}`, 400, { code: "invalid" });
     const cleaned = {};
@@ -1300,7 +1307,7 @@ export function createScreenBridge(options = {}) {
       assertScope(scope);
       const fieldsMap = kind === "call" ? calls : slots;
       if (!(verb in fieldsMap) || !can(verb)) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
-      const args = cleanArgs(verb, rawArgs, fieldsMap);
+      const args = cleanArgs(verb, rawArgs, fieldsMap, extra.extraFields);
       if (inFlight >= maxInFlight) return Promise.reject(makeError("Screen bridge is busy; wait for the current request", 429, { code: "conflict" }));
       const lockKey = matchSingleFlight(verb);
       if (lockKey && activeSingleFlight.has(lockKey)) {
@@ -1331,7 +1338,11 @@ export function createScreenBridge(options = {}) {
           release();
           const mapped = mapError(err);
           const status = mapped.status;
-          const keepOnForbidden = status === 403 && (writeVerbSet.has(verb) || extra.keepAliveOnForbidden === true);
+          const accessRevoked = mapped.message === "This app's access is no longer available.";
+          const keepOnForbidden =
+            status === 403 &&
+            !accessRevoked &&
+            (kind === "slot" || writeVerbSet.has(verb) || mapped.code === "owner_required" || extra.keepAliveOnForbidden === true);
           if (status === 401 || status === 502 || status === 504 || (status === 403 && !keepOnForbidden)) retire(mapped);
           throw mapped;
         },
@@ -1384,6 +1395,10 @@ export function createScreenBridge(options = {}) {
         return;
       }
       receiver = created;
+      if (sandboxForms) {
+        cleanupSandboxForms?.();
+        cleanupSandboxForms = installSandboxFormActions(runtime.document ?? globalThis.document);
+      }
     },
     call: (scope, verb, args = {}, callOptions = {}) => dispatch("call", scope, verb, args, callOptions),
     slot: (scope, verb, args = {}, anchor = "footer", slotOptions = {}) => dispatch("slot", scope, verb, args, { ...slotOptions, anchor }),
@@ -1464,9 +1479,12 @@ export function createScreenBridge(options = {}) {
     patchRoute(patch = {}) {
       const snap = currentState.snapshot;
       if (!parsedRouteConfig || !snap || !("screen.route.patch" in calls) || !can("screen.route.patch", snap.actions) || !isPlain(patch)) return;
+      if (patch.section !== undefined && (typeof patch.section !== "string" || !parsedRouteConfig.sections.includes(patch.section))) return;
+      if (patch.view !== undefined && (typeof patch.view !== "string" || !parsedRouteConfig.views.includes(patch.view))) return;
       if (patch.record_id !== undefined && patch.record_id !== null && (typeof patch.record_id !== "string" || !ROUTABLE_ID.test(patch.record_id))) return;
       if (patch.segment_id !== undefined && patch.segment_id !== null && (typeof patch.segment_id !== "string" || !ROUTABLE_ID.test(patch.segment_id))) return;
-      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true }).catch(() => undefined);
+      if (patch.replace !== undefined && typeof patch.replace !== "boolean") return;
+      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true, extraFields: ["replace"] }).catch(() => undefined);
     },
     ownLeaveState() {
       const snap = currentState.snapshot;
@@ -1502,6 +1520,9 @@ export function createScreenBridge(options = {}) {
       const live = receiver;
       receiver = null;
       latestAudioSession = null;
+      const stopForms = cleanupSandboxForms;
+      cleanupSandboxForms = null;
+      stopForms?.();
       live?.teardown();
       retired = false;
       retiredCause = null;

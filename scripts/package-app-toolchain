@@ -20,10 +20,13 @@ PIN_NAMES = ("react", "react-dom", "vite", "@vitejs/plugin-react")
 APP_KIT_FILES = (
     "README.md",
     "package.json",
+    "src/forms.mjs",
     "src/index.mjs",
+    "src/react.mjs",
     "src/receiver.mjs",
     "src/refusal.mjs",
     "types/index.d.ts",
+    "types/react.d.ts",
 )
 
 

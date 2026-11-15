@@ -715,13 +715,12 @@ impl Shared {
         if params.get("cli_envelope").is_some() {
             let principal =
                 self.cli_principal(params, peer_pid, verb, crate::cli_actor::Scope::Read)?;
-            let actor = if principal.actor.principal_kind == "user"
-                && principal.actor.actor != "operator"
-            {
-                crate::project_policy::policy_user_actor(&principal.actor.sub)
-            } else {
-                principal.actor.policy_spelling()
-            };
+            // CAD-2321: a principal kind its actor prefix disagrees with
+            // names no project caller, so the relayed read refuses.
+            let actor = principal
+                .actor
+                .policy_actor()
+                .ok_or_else(|| Error::rejected(format!("{verb} refused: invalid read identity")))?;
             let scope = self.project_scope_for_actor(&actor)?;
             return Ok((scope, Some(principal), None));
         }

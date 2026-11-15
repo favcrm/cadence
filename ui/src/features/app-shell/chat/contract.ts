@@ -1,5 +1,12 @@
 import { FORBIDDEN_DESCRIPTOR_KEYS } from "../app-views/contract";
 import { HOST_ACTION_IDS, HOST_ATTACHMENT_IDS, type HostActionId, type HostAttachmentId } from "./registry";
+import {
+  isEnglishLocale,
+  MAX_I18N_LOCALES,
+  pickLocaleEntry,
+  validLocaleTag,
+  type TranslateFn,
+} from "../../workspace-apps/appLocale";
 
 /**
  * App chat contract v1 (CAD-1109/1110): strict runtime validation of the
@@ -19,31 +26,40 @@ import { HOST_ACTION_IDS, HOST_ATTACHMENT_IDS, type HostActionId, type HostAttac
 
 export const APP_CHAT_CONTRACT = "app-chat/v1" as const;
 
+export type ChatLabelI18n = Record<string, { label: string }>;
+export type ChatContextI18n = Record<string, { label?: string; prompts?: string[] }>;
+export type ChatCardI18n = Record<string, { title?: string; text?: string }>;
+
 export interface ChatContext {
   /** The shell's own screen id this entry answers to (D5). */
   id: string;
   label: string;
   prompts: string[];
-  record: { label: string; prompts: string[] } | null;
+  record: { label: string; prompts: string[]; i18n?: ChatContextI18n } | null;
+  i18n?: ChatContextI18n;
 }
 export interface ChatAttachment {
   id: HostAttachmentId;
   label: string | null;
+  i18n?: ChatLabelI18n;
 }
 export interface CardField {
   label: string;
   from: string;
+  i18n?: ChatLabelI18n;
 }
 export interface CardButton {
   label: string;
   run: HostActionId;
   view: string;
+  i18n?: ChatLabelI18n;
 }
 export interface DirectiveCardSpec {
   title: string;
   text: string | null;
   fields: CardField[];
   buttons: CardButton[];
+  i18n?: ChatCardI18n;
 }
 export type FrameSize = "small" | "medium" | "large";
 export type ChatDirectiveSpec =
@@ -52,6 +68,7 @@ export type ChatDirectiveSpec =
 export interface ChatSubject {
   kind: string;
   label: string;
+  i18n?: ChatLabelI18n;
 }
 export interface AppChat {
   contract: typeof APP_CHAT_CONTRACT;
@@ -149,26 +166,104 @@ function unique(seen: Set<string>, key: string, path: string, what: string): voi
   seen.add(key);
 }
 
+function parseI18nMap<T>(
+  raw: unknown,
+  path: string,
+  allowed: readonly string[],
+  parseEntry: (entry: Obj, entryPath: string) => T,
+): Record<string, T> | undefined {
+  if (raw === undefined) return undefined;
+  if (!isObj(raw)) fail(path, "expected an object");
+  const entries = Object.entries(raw);
+  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) {
+    fail(path, `expected 1 to ${MAX_I18N_LOCALES} locales`);
+  }
+  const out: Record<string, T> = {};
+  const seenLocales = new Set<string>();
+  for (const [locale, val] of entries) {
+    if (!validLocaleTag(locale)) fail(path, `invalid locale tag: ${JSON.stringify(locale)}`);
+    const lowerLocale = locale.toLowerCase();
+    if (seenLocales.has(lowerLocale)) fail(path, `duplicate locale tag: ${JSON.stringify(locale)}`);
+    seenLocales.add(lowerLocale);
+    const lp = `${path}.${locale}`;
+    const obj = object(val, lp, allowed);
+    if (Object.keys(obj).length === 0) fail(lp, "expected at least one localized field");
+    out[locale] = parseEntry(obj, lp);
+  }
+  return out;
+}
+
+function i18nText(v: unknown, path: string, max: number): string {
+  const s = text(v, path, max);
+  if (s.trim().length === 0) fail(path, "expected a non-blank string");
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x80 && c <= 0x9f) fail(path, "control characters are not allowed");
+  }
+  return s;
+}
+
+function parseLabelI18n(raw: unknown, path: string): ChatLabelI18n | undefined {
+  return parseI18nMap(raw, path, ["label"], (entry, lp) => ({
+    label: i18nText(entry.label, `${lp}.label`, 40),
+  }));
+}
+
+function parseContextI18n(raw: unknown, path: string): ChatContextI18n | undefined {
+  return parseI18nMap(raw, path, ["label", "prompts"], (entry, lp) => {
+    const out: { label?: string; prompts?: string[] } = {};
+    if (entry.label !== undefined) out.label = i18nText(entry.label, `${lp}.label`, 40);
+    if (entry.prompts !== undefined) {
+      const items = list(entry.prompts, `${lp}.prompts`, 3);
+      if (items.length === 0) fail(`${lp}.prompts`, "expected at least 1 entry");
+      out.prompts = items.map((p, i) => i18nText(p, `${lp}.prompts.${i}`, 80));
+    }
+    return out;
+  });
+}
+
+function parseCardI18n(raw: unknown, path: string): ChatCardI18n | undefined {
+  return parseI18nMap(raw, path, ["title", "text"], (entry, lp) => {
+    const out: { title?: string; text?: string } = {};
+    if (entry.title !== undefined) out.title = i18nText(entry.title, `${lp}.title`, 80);
+    if (entry.text !== undefined) out.text = i18nText(entry.text, `${lp}.text`, 240);
+    return out;
+  });
+}
+
 function parseCard(raw: unknown, path: string): DirectiveCardSpec {
-  const c = object(raw, path, ["title", "text", "fields", "buttons"]);
+  const c = object(raw, path, ["title", "text", "fields", "buttons", "i18n"]);
   const fields = list(c.fields, `${path}.fields`, 4).map((f, i) => {
     const p = `${path}.fields.${i}`;
-    const o = object(f, p, ["label", "from"]);
-    return { label: text(o.label, `${p}.label`, 40), from: ident(o.from, `${p}.from`) };
+    const o = object(f, p, ["label", "from", "i18n"]);
+    const i18n = parseLabelI18n(o.i18n, `${p}.i18n`);
+    return {
+      label: text(o.label, `${p}.label`, 40),
+      from: ident(o.from, `${p}.from`),
+      ...(i18n ? { i18n } : {}),
+    };
   });
   const buttons = list(c.buttons, `${path}.buttons`, 2).map((b, i) => {
     const p = `${path}.buttons.${i}`;
-    const o = object(b, p, ["label", "run", "view"]);
+    const o = object(b, p, ["label", "run", "view", "i18n"]);
     const run = ident(o.run, `${p}.run`);
     if (!(HOST_ACTION_IDS as readonly string[]).includes(run)) fail(`${p}.run`, `not a host action: ${run}`);
+    const i18n = parseLabelI18n(o.i18n, `${p}.i18n`);
     // open-view is the one v1 action and takes exactly a view id.
-    return { label: text(o.label, `${p}.label`, 40), run: run as HostActionId, view: ident(o.view, `${p}.view`) };
+    return {
+      label: text(o.label, `${p}.label`, 40),
+      run: run as HostActionId,
+      view: ident(o.view, `${p}.view`),
+      ...(i18n ? { i18n } : {}),
+    };
   });
+  const i18n = parseCardI18n(c.i18n, `${path}.i18n`);
   return {
     title: text(c.title, `${path}.title`, 80),
     text: c.text === undefined ? null : text(c.text, `${path}.text`, 240),
     fields,
     buttons,
+    ...(i18n ? { i18n } : {}),
   };
 }
 
@@ -185,25 +280,42 @@ export function parseAppChat(raw: unknown): AppChat {
   const seenContexts = new Set<string>();
   const contexts = list(root.contexts, "contexts", 12).map((raw, i): ChatContext => {
     const p = `contexts.${i}`;
-    const c = object(raw, p, ["id", "label", "prompts", "record"]);
+    const c = object(raw, p, ["id", "label", "prompts", "record", "i18n"]);
     const id = ident(c.id, `${p}.id`);
     unique(seenContexts, id, p, "context id");
     let record: ChatContext["record"] = null;
     if (c.record !== undefined) {
-      const r = object(c.record, `${p}.record`, ["label", "prompts"]);
-      record = { label: text(r.label, `${p}.record.label`, 40), prompts: prompts(r.prompts, `${p}.record.prompts`) };
+      const r = object(c.record, `${p}.record`, ["label", "prompts", "i18n"]);
+      const recI18n = parseContextI18n(r.i18n, `${p}.record.i18n`);
+      record = {
+        label: text(r.label, `${p}.record.label`, 40),
+        prompts: prompts(r.prompts, `${p}.record.prompts`),
+        ...(recI18n ? { i18n: recI18n } : {}),
+      };
     }
-    return { id, label: text(c.label, `${p}.label`, 40), prompts: prompts(c.prompts, `${p}.prompts`), record };
+    const i18n = parseContextI18n(c.i18n, `${p}.i18n`);
+    return {
+      id,
+      label: text(c.label, `${p}.label`, 40),
+      prompts: prompts(c.prompts, `${p}.prompts`),
+      record,
+      ...(i18n ? { i18n } : {}),
+    };
   });
 
   const seenAttachments = new Set<string>();
   const attachments = list(root.attachments, "attachments", 4).map((raw, i): ChatAttachment => {
     const p = `attachments.${i}`;
-    const a = object(raw, p, ["id", "label"]);
+    const a = object(raw, p, ["id", "label", "i18n"]);
     const id = ident(a.id, `${p}.id`);
     if (!(HOST_ATTACHMENT_IDS as readonly string[]).includes(id)) fail(`${p}.id`, `not a host capability: ${id}`);
     unique(seenAttachments, id, p, "attachment");
-    return { id: id as HostAttachmentId, label: a.label === undefined ? null : text(a.label, `${p}.label`, 40) };
+    const i18n = parseLabelI18n(a.i18n, `${p}.i18n`);
+    return {
+      id: id as HostAttachmentId,
+      label: a.label === undefined ? null : text(a.label, `${p}.label`, 40),
+      ...(i18n ? { i18n } : {}),
+    };
   });
 
   const seenMatches = new Set<string>();
@@ -230,10 +342,11 @@ export function parseAppChat(raw: unknown): AppChat {
   const seenKinds = new Set<string>();
   const subjects = list(root.subjects, "subjects", 8).map((raw, i): ChatSubject => {
     const p = `subjects.${i}`;
-    const s = object(raw, p, ["kind", "label"]);
+    const s = object(raw, p, ["kind", "label", "i18n"]);
     const kind = ident(s.kind, `${p}.kind`);
     unique(seenKinds, kind, p, "subject kind");
-    return { kind, label: text(s.label, `${p}.label`, 40) };
+    const i18n = parseLabelI18n(s.i18n, `${p}.i18n`);
+    return { kind, label: text(s.label, `${p}.label`, 40), ...(i18n ? { i18n } : {}) };
   });
 
   let showContext = false;
@@ -245,4 +358,67 @@ export function parseAppChat(raw: unknown): AppChat {
     }
   }
   return { contract: APP_CHAT_CONTRACT, app, contexts, attachments, directives, subjects, presentation: { showContext } };
+}
+
+/**
+ * Resolve localized display copy across an `AppChat` descriptor, preferring the
+ * descriptor's own `i18n` entries (with `zh-TW`/`zh-HK`/`zh-Hant` fallback)
+ * and falling back to the host dictionary `t` when rendering non-English locales.
+ */
+export function localizeAppChat(chat: AppChat, locale: string, t?: TranslateFn): AppChat {
+  const tx = (raw: string, override?: string): string => {
+    if (override !== undefined) return override;
+    if (!raw || isEnglishLocale(locale)) return raw;
+    return t ? t(raw) : raw;
+  };
+  return {
+    ...chat,
+    contexts: chat.contexts.map((ctx) => {
+      const entry = pickLocaleEntry(ctx.i18n, locale);
+      const recordEntry = ctx.record ? pickLocaleEntry(ctx.record.i18n, locale) : undefined;
+      return {
+        ...ctx,
+        label: tx(ctx.label, entry?.label),
+        prompts: entry?.prompts ?? ctx.prompts.map((p) => tx(p)),
+        record: ctx.record
+          ? {
+              ...ctx.record,
+              label: tx(ctx.record.label, recordEntry?.label),
+              prompts: recordEntry?.prompts ?? ctx.record.prompts.map((p) => tx(p)),
+            }
+          : null,
+      };
+    }),
+    attachments: chat.attachments.map((att) => {
+      const entry = pickLocaleEntry(att.i18n, locale);
+      return {
+        ...att,
+        label: att.label === null ? (entry?.label ?? null) : tx(att.label, entry?.label),
+      };
+    }),
+    directives: chat.directives.map((dir) => {
+      if (dir.card === null) return dir;
+      const cardEntry = pickLocaleEntry(dir.card.i18n, locale);
+      return {
+        ...dir,
+        card: {
+          ...dir.card,
+          title: tx(dir.card.title, cardEntry?.title),
+          text: dir.card.text === null ? (cardEntry?.text ?? null) : tx(dir.card.text, cardEntry?.text),
+          fields: dir.card.fields.map((f) => ({
+            ...f,
+            label: tx(f.label, pickLocaleEntry(f.i18n, locale)?.label),
+          })),
+          buttons: dir.card.buttons.map((b) => ({
+            ...b,
+            label: tx(b.label, pickLocaleEntry(b.i18n, locale)?.label),
+          })),
+        },
+      };
+    }),
+    subjects: chat.subjects.map((sub) => ({
+      ...sub,
+      label: tx(sub.label, pickLocaleEntry(sub.i18n, locale)?.label),
+    })),
+  };
 }
