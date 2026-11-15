@@ -25,6 +25,8 @@
 //! current policy and withholding reasons on demand.
 
 mod body;
+#[cfg(test)]
+mod cad2224_evidence_refusal_acceptance;
 pub mod cli;
 pub mod evidence;
 mod issue_matching;
