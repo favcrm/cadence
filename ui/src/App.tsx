@@ -125,6 +125,7 @@ import {
   type AppLocation,
   type Route,
   type Screen,
+  type SectionQueryInput,
 } from "./lib/router";
 import { humanThreadsAvailable } from "./lib/humanThreads";
 import { navigate, useHref } from "./lib/useLocation";
@@ -143,20 +144,20 @@ function currentLocation(): AppLocation {
   return readLocation(location.pathname, location.search, browserStoredProjectView());
 }
 
-/** Active section query key reported by the mounted workspace app, cleared on exit or reset. */
-let mountedAppSectionQuery: string | null = null;
+/** Active section query keys reported by the mounted workspace app or installed menu apps, cleared on exit or reset. */
+let mountedAppSectionQueries: readonly string[] = [];
 
 function navigationSearch(
   from: Route,
   to: Route,
   rawSearch: string,
-  sectionQuery?: string | null,
+  sectionQueries?: SectionQueryInput,
 ): string {
   return appNavigationSearch(
     from,
     to,
     contextNavigationSearch(from, to, rawSearch),
-    sectionQuery ?? mountedAppSectionQuery,
+    sectionQueries ?? mountedAppSectionQueries,
   );
 }
 
@@ -250,13 +251,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const fullHeight = screen === "home" || screen === "agents" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
-  // Hoisted here so route link builders (`hrefFor`, `projectHref`, `filterHref`)
-  // know the active app's declared `section_query` before leaving it.
   const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
   const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
-  const activeSectionQuery = onAppScreen ? (activeApp?.navigation?.section_query ?? null) : null;
-  /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), navigationSearch(route, r, search, activeSectionQuery), route);
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -328,7 +324,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [, notifyPersonalDrafts] = useState(0);
   useEffect(() => onPrivateSessionReset(() => {
     personalDrafts.clear();
-    mountedAppSectionQuery = null;
+    mountedAppSectionQueries = [];
   }), [personalDrafts]);
   useEffect(() => onIssueUnavailable((id) => {
     const suffix = `:${id}`;
@@ -376,7 +372,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
   useEffect(() => {
-    if (settingsTarget) navigate(hrefFor({ screen: "settings", section: settingsTarget }), { replace: true });
+    if (settingsTarget) {
+      const targetRoute: Route = { screen: "settings", section: settingsTarget };
+      navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
+    }
   }, [settingsTarget]);
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
@@ -904,16 +903,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     };
   }, []);
 
-  // The sidebar and the phone menu open a project page. The chip row
-  // and the memory picker filter the screen, and only a screen that has one.
-  const projectHref = (key: string) => {
-    const next = openProject(loc, key);
-    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQuery), route);
-  };
-  const filterHref = (key: string) => {
-    const next = withProject(loc, key);
-    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQuery), route);
-  };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
   // Board-level Apps menu (CAD-784, CAD-1116): the installed apps come
@@ -1016,25 +1005,73 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
-  const currentSectionQuery = onAppScreen ? (selectedMenuApp?.navigation?.section_query ?? activeSectionQuery) : null;
+  const rememberedSectionQuery = onAppScreen && last?.sectionQuery && (
+    (route.screen === "workspaceApp" && last.installId === route.installId) ||
+    (route.screen === "workspaceAppKey" && last.appKey === route.appKey)
+  ) ? last.sectionQuery : null;
+  const keyMatchedSectionQuery = route.screen === "workspaceAppKey"
+    ? installed.find((app) => app.kind === route.appKey)?.navigation?.section_query ?? null
+    : null;
+  const currentSectionQuery = onAppScreen
+    ? (selectedMenuApp?.navigation?.section_query ??
+        receipt?.navigation?.section_query ??
+        keyMatchedSectionQuery ??
+        rememberedSectionQuery)
+    : null;
+  const activeSectionQueries = useMemo(() => {
+    if (!onAppScreen) return [];
+    const set = new Set<string>();
+    if (currentSectionQuery) set.add(currentSectionQuery);
+    for (const app of menuApps) {
+      if (app.navigation?.section_query) set.add(app.navigation.section_query);
+    }
+    return Array.from(set);
+  }, [onAppScreen, currentSectionQuery, menuApps]);
   useEffect(() => {
-    mountedAppSectionQuery = currentSectionQuery;
+    mountedAppSectionQueries = activeSectionQueries;
     return () => {
-      mountedAppSectionQuery = null;
+      mountedAppSectionQueries = [];
     };
-  }, [currentSectionQuery]);
+  }, [activeSectionQueries]);
+  const activeAppKey = selectedMenuApp?.kind ?? receipt?.kind ?? (route.screen === "workspaceAppKey" ? route.appKey : null);
+  const activeDeclaredSectionQuery = selectedMenuApp?.navigation?.section_query ?? receipt?.navigation?.section_query ?? null;
   const activeSection = selectedMenuApp ? sectionFromSearch(search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {
-      if (prev !== null && prev.installId === activeId && prev.section === activeSection) return prev;
-      const next = { installId: activeId, section: activeSection };
+      if (
+        prev !== null &&
+        prev.installId === activeId &&
+        prev.section === activeSection &&
+        (prev.appKey ?? null) === activeAppKey &&
+        (prev.sectionQuery ?? null) === activeDeclaredSectionQuery
+      ) {
+        return prev;
+      }
+      const next: LastApp = {
+        installId: activeId,
+        section: activeSection,
+        ...(activeAppKey ? { appKey: activeAppKey } : {}),
+        ...(activeDeclaredSectionQuery ? { sectionQuery: activeDeclaredSectionQuery } : {}),
+      };
       writeLastApp(next);
       return next;
     });
-  }, [activeId, activeSection]);
+  }, [activeId, activeSection, activeAppKey, activeDeclaredSectionQuery]);
   // CAD-1692: the sidebar unfolds Apps on entering an app, judged from the route.
   useEffect(() => { noteAppScreen(onAppScreen, activeId); }, [onAppScreen, activeId]);
+  /** The href of a route, carrying the scope and drawer like `goTo`. */
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), navigationSearch(route, r, search, activeSectionQueries), route);
+  // The sidebar and the phone menu open a project page. The chip row
+  // and the memory picker filter the screen, and only a screen that has one.
+  const projectHref = (key: string) => {
+    const next = openProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
+  const filterHref = (key: string) => {
+    const next = withProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
   const appMenu = {
     ...buildAppNav({
       apps: menuApps,
@@ -1060,7 +1097,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         const targetSectionQuery = menuApps.find((app) => app.installId === installId)?.navigation?.section_query ?? null;
         return locationHref(
           goTo(loc, next),
-          stripAppRouteParams(navigationSearch(route, next, search, currentSectionQuery), targetSectionQuery),
+          stripAppRouteParams(navigationSearch(route, next, search, activeSectionQueries), targetSectionQuery),
           route,
         );
       },

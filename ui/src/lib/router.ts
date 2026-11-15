@@ -507,8 +507,23 @@ const APP_ROUTE_PARAMS = ["crm", "record", "ctx", "appview", "segment", "convers
 const HOST_QUERY_KEYS = new Set<string>([
   "tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page",
   "recruit", "ask", "h", "dm", "chat", "file", "mode", "q",
+  "c", "kind", "agent", "system",
+  "item", "outbox_q", "outbox_project",
   ...MY_WORK_URL_KEYS,
 ]);
+
+/** Global cross-route host query keys preserved even if explicitly passed as a section query. */
+const GLOBAL_HOST_QUERY_KEYS = new Set<string>(["project", "issue"]);
+
+export type SectionQueryInput = string | readonly (string | null | undefined)[] | null | undefined;
+
+function deleteSectionQueries(q: URLSearchParams, queries: SectionQueryInput): void {
+  if (!queries) return;
+  const list = typeof queries === "string" ? [queries] : queries;
+  for (const key of list) {
+    if (key && !GLOBAL_HOST_QUERY_KEYS.has(key)) q.delete(key);
+  }
+}
 
 export function isAppRoute(route: Route): boolean {
   return route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
@@ -526,7 +541,7 @@ export function appNavigationSearch(
   from: Route,
   to: Route,
   search: string,
-  activeSectionQuery?: string | null,
+  activeSectionQuery?: SectionQueryInput,
 ): string {
   if (!isAppRoute(from) || sameAppRoute(from, to)) return search;
   const q = new URLSearchParams(search);
@@ -534,19 +549,15 @@ export function appNavigationSearch(
   if (from.screen === "workspaceAppKey" && !HOST_QUERY_KEYS.has(from.appKey)) {
     q.delete(from.appKey);
   }
-  if (activeSectionQuery && !HOST_QUERY_KEYS.has(activeSectionQuery)) {
-    q.delete(activeSectionQuery);
-  }
+  deleteSectionQueries(q, activeSectionQuery);
   return q.toString();
 }
 
 /** Strip app-owned query parameters unconditionally before entering another app. */
-export function stripAppRouteParams(search: string, extraSectionQuery?: string | null): string {
+export function stripAppRouteParams(search: string, extraSectionQuery?: SectionQueryInput): string {
   const q = new URLSearchParams(search);
   for (const key of APP_ROUTE_PARAMS) q.delete(key);
-  if (extraSectionQuery && !HOST_QUERY_KEYS.has(extraSectionQuery)) {
-    q.delete(extraSectionQuery);
-  }
+  deleteSectionQueries(q, extraSectionQuery);
   return q.toString();
 }
 

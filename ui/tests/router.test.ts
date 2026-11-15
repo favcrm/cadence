@@ -373,8 +373,28 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
     "stripAppRouteParams drops declared target section_query and keeps unrelated params",
   );
   equal(
-    stripAppRouteParams("?project=cadence&record=r2&keep=1", "project"),
-    "project=cadence&keep=1",
-    "stripAppRouteParams preserves host query keys even if declared as extraSectionQuery",
+    stripAppRouteParams("?mode=edit&q=abc&section=pay&tab=runs&issue=CAD-1&project=cadence&keep=1", [
+      "mode",
+      "q",
+      "section",
+      "tab",
+    ]),
+    "issue=CAD-1&project=cadence&keep=1",
+    "stripAppRouteParams drops declared section_query keys even when overlapping screen-local names and accepts arrays",
+  );
+  equal(
+    appNavigationSearch(
+      hrLegacy,
+      { screen: "home" },
+      "?section=pay&mode=draft&q=filter&project=cadence&issue=CAD-2&keep=1",
+      ["section", "mode", "q"],
+    ),
+    "project=cadence&issue=CAD-2&keep=1",
+    "appNavigationSearch strips declared section_query arrays while preserving global project and issue params",
+  );
+  equal(
+    stripAppRouteParams("?project=cadence&issue=CAD-1&record=r2&keep=1", ["project", "issue"]),
+    "project=cadence&issue=CAD-1&keep=1",
+    "stripAppRouteParams preserves global cross-route host keys even if passed as extraSectionQuery",
   );
 }
