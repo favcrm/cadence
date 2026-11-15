@@ -228,15 +228,20 @@ async function boundaryChecks() {
     const { navigate } = require("../src/lib/useLocation") as typeof LocationModule;
     const { captureLoginNonce } = require("../src/features/auth/session") as typeof AuthSessionModule;
     const pathWithoutFragment = "/wiki/releases?view=read";
-    const intendedPath = `${pathWithoutFragment}#release-v1.2`;
-    await React.act(async () => navigate(intendedPath));
+    const dottedPath = `${pathWithoutFragment}#release-v1.2`;
+    const intendedPath = `${pathWithoutFragment}#research%20%26%20development`;
+    await React.act(async () => navigate(dottedPath));
     await flush();
     const hostedLink = host.querySelector('a[href^="/__platform/login"]') as HTMLAnchorElement | null;
     assert(hostedLink, "hosted refusal offers the platform sign-in handoff");
     assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${pathWithoutFragment}`, "hosted handoff never sends fragments to the platform");
     hostedLink.addEventListener("click", (event) => event.preventDefault());
     await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
-    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === intendedPath, "safe anchor stays in this tab for verified restoration");
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === dottedPath, "punctuation in a safe anchor stays in this tab for verified restoration");
+    await React.act(async () => navigate(intendedPath));
+    await flush();
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === intendedPath, "standalone ampersands in wiki anchors survive");
     for (const fragment of ["#access_token=secret", "#access_token%3Dsecret", "#bad%"]) {
       await React.act(async () => navigate(`${pathWithoutFragment}${fragment}`));
       await flush();

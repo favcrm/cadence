@@ -28,7 +28,7 @@ function safeReturnFragment(fragment: string): string {
   if (!fragment.startsWith("#")) return "";
   try {
     const anchor = decodeURIComponent(fragment.slice(1));
-    if (/[=&?]/u.test(anchor)) return "";
+    if (anchor.includes("=")) return "";
     return /^[\p{L}\p{M}\p{N}\p{P}\p{S} ]{1,200}$/u.test(anchor) ? fragment : "";
   } catch {
     return "";
