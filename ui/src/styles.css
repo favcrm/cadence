@@ -556,6 +556,10 @@ pre {
 }
 .turnbar[data-state="queued"],
 .turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
+.turnbar[data-state="needs_approval"] {
+  flex-wrap: wrap;
+  row-gap: .375rem;
+}
 .turnbar[data-state="failed"] { --tb: var(--color-fail); }
 /* A failure's detail is the operator's next step, not a label: wrap it on a
    narrow board instead of cutting the instruction off, inside a bounded
@@ -578,7 +582,7 @@ pre {
 }
 .tb-text {
   display: flex;
-  flex: 1;
+  flex: 1 1 12rem;
   align-items: baseline;
   gap: .5rem;
   min-width: 0;
@@ -597,13 +601,34 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.tb-detail-perm {
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  max-width: 100%;
+}
+.tb-risk {
+  flex: none;
+}
+.tb-cmd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-ink-200);
+}
 .tb-actions {
   display: flex;
   flex: none;
+  flex-wrap: wrap;
   align-items: center;
-  gap: .125rem;
+  gap: .25rem;
+  max-width: 100%;
 }
 .tb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
   height: 1.625rem;
   padding: 0 .5625rem;
   border: 0;
@@ -616,7 +641,40 @@ pre {
   cursor: pointer;
 }
 .tb-btn:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.tb-btn:disabled { opacity: .5; cursor: default; }
 .tb-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.tb-btn-primary {
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-accent);
+}
+.tb-btn-primary:hover {
+  background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+  color: var(--color-ink-100);
+}
+.tb-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: .05rem .3rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  font: 500 .65rem/1.1 "IBM Plex Mono", monospace;
+  color: var(--color-ink-400);
+}
+.turnbar-sub {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .25rem;
+  padding-top: .25rem;
+  padding-inline-start: 1rem;
+  border-top: 1px solid var(--color-ink-800);
+}
+.turnbar-error {
+  flex: 1 0 100%;
+  padding-inline-start: 1rem;
+}
 /* CAD-1700: an assistant reply waits unseen — a dot, not a count. */
 .navlink .navdot {
   flex: none;
@@ -628,7 +686,22 @@ pre {
 }
 .navlink .navbadge + .navdot { margin-left: .375rem; }
 @media (max-width: 1023.98px) {
-  .tb-btn { height: 2.25rem; }
+  .tb-btn { min-height: 2.25rem; height: auto; }
+}
+@media (max-width: 639.98px) {
+  .turnbar[data-state="needs_approval"] .tb-text {
+    flex: 1 1 calc(100% - 1rem);
+  }
+  .turnbar[data-state="needs_approval"] .tb-actions {
+    width: 100%;
+    padding-inline-start: 1rem;
+  }
+  .tb-btn {
+    min-height: 2.75rem;
+  }
+  .tb-kbd {
+    display: none;
+  }
 }
 .stopbtn {
   padding: .12rem .55rem;

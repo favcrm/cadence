@@ -21,6 +21,7 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
+import { appendRejectReplyDraft, PermissionReplyContext } from "../../home/PermissionCard";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -82,6 +83,7 @@ import {
 } from "../conversationClient";
 import {
   carryEarlyDraft,
+  composerDraftState,
   composerHasIntent,
   composerScope,
   moveComposerScope,
@@ -113,7 +115,7 @@ import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
 import type { ChatBinding, MediaComposerTarget } from "./types";
-import { usePendingPermission } from "./usePendingApproval";
+import { usePendingPermissionRequest } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
@@ -666,6 +668,7 @@ function AppRow({
  */
 function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
   const { t, formatNumber } = useLocale();
+  const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
   const documentVisible = useDocumentVisible();
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
@@ -1236,7 +1239,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // conversation's own running message; Cancel its own queued message.
   const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const permissionPending = usePendingPermission(entries);
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -1946,10 +1950,34 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;
 
+  const canReplyDraft = canSend && binding.error === null;
+  const focusPaneComposer = useCallback(() => {
+    const box = paneRef.current?.querySelector<HTMLTextAreaElement>(`#${COMPOSER_ID}`)
+      ?? (document.getElementById(COMPOSER_ID) as HTMLTextAreaElement | null);
+    box?.focus();
+  }, []);
+  const focusApprovalBar = useCallback(() => {
+    const bar = paneRef.current?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
+    if (!bar) return false;
+    const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
+    target.focus();
+    return true;
+  }, []);
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (!canReplyDraft) return;
+      const existing = composerDraftState(composerKey).text;
+      setComposerDraft(composerKey, appendRejectReplyDraft(existing, command));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
-    <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
+    <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
         className="btn btn-ghost btn-sm app-chat-rail"
@@ -2441,7 +2469,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
-      <TurnBar state={turnState} actions={turnActions} reconnecting={streamDown} />
+      <TurnBar
+        state={turnState}
+        actions={turnActions}
+        reconnecting={streamDown}
+        permission={
+          pendingPermission !== null
+            ? {
+                request: pendingPermission,
+                readOnly: !canControlTurns,
+                onRejectAndReply: canReplyDraft ? (req) => rejectAndReplyDraft(req.command) : undefined,
+                onFocusComposer: focusPaneComposer,
+              }
+            : null
+        }
+      />
       <Composer
         key={composerKey}
         density="compact"
@@ -2464,6 +2506,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return false;
         }}
         onNotice={setComposerNotice}
+        onArrowUpEmpty={turnState.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
@@ -2475,6 +2518,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       />
     </div>
     </ImageConversation.Provider>
+    </PermissionReplyContext.Provider>
     </AssistantActorProvider>
   );
 }

@@ -85,6 +85,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "compact", blurb: "Compact the session context now", kind: "act" },
   { name: "new", blurb: "Start fresh — the assistant stops using the messages so far", kind: "act" },
   { name: "stop", blurb: "Interrupt the running turn", kind: "act" },
+  { name: "permissions", blurb: "Pending permission requests and saved rules", kind: "read" },
 ];
 
 /** The verbs a board can run. A hosted board says so itself in `commands`:

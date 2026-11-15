@@ -137,6 +137,8 @@ export interface ComposerProps {
    * Absent while the stream is down (last known state) and in read-only.
    */
   stop?: { onStop: () => void } | null;
+  /** Optional Up-arrow handler when the composer is empty and no menu is open. */
+  onArrowUpEmpty?: () => boolean;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -400,6 +402,7 @@ export default function Composer({
   onResolveOriginal,
   actions,
   stop = null,
+  onArrowUpEmpty,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -629,6 +632,12 @@ export default function Composer({
         return;
       }
     }
+    if (e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && draft === "" && !matches.length && !block) {
+      if (onArrowUpEmpty?.()) {
+        e.preventDefault();
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -831,7 +840,7 @@ export default function Composer({
               >
                 <span className="num text-accent shrink-0">/{c.name}</span>
                 {c.arg && <span className="num text-ink-500 shrink-0">{c.arg}</span>}
-                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{c.blurb}</span>
+                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{t(c.blurb)}</span>
                 <span
                   className={`chip shrink-0 ${
                     c.kind === "read"

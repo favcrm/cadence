@@ -17,6 +17,20 @@ for (const [status, expected] of Object.entries(issueStatuses)) {
   }
 }
 
+const permissionLabels = {
+  "Reject & reply…": "拒絕並回覆…",
+  "Saved rules": "已儲存的規則",
+  "Needs your approval": "需要你的核准",
+  "Pending permission requests and saved rules": "待審核的權限請求與已儲存的規則",
+};
+
+for (const [key, expected] of Object.entries(permissionLabels)) {
+  const translated = translateUiText(key, "zh-TW");
+  if (translated !== expected) {
+    throw new Error(`Expected zh-TW permission label ${key} to be ${expected}, got ${translated}`);
+  }
+}
+
 const leavePrompt = "You have unsaved changes. Leave this page and discard your local edits?";
 if (translateUiText(leavePrompt, "zh-TW") !== "你有未儲存的變更。要離開此頁面並捨棄本機編輯內容嗎？") {
   throw new Error("Expected generic screen leave confirmation to translate in zh-TW");

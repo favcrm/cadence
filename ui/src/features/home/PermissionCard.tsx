@@ -1,8 +1,27 @@
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import { api, ApiError, type MasterPermissionRequest } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
 import { subscribeMasterChanged } from "../../lib/masterChanged";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+
+/**
+ * Provides a composer prefill callback for `Reject & reply…` across nested
+ * `PermissionCard` surfaces (`ThreadPermission`, `TodoCard`, and `/permissions`)
+ * without prop-drilling.
+ */
+export const PermissionReplyContext = createContext<((argv: string) => void) | null>(null);
+
+/** Formats the steering prefix seeded into the chat composer on reject-and-reply. */
+export function rejectReplyPrompt(command: string): string {
+  return command.includes("`") ? `Instead of "${command}": ` : `Instead of \`${command}\`: `;
+}
+
+/** Appends a reject-and-reply prompt while preserving any existing unsent text. */
+export function appendRejectReplyDraft(existing: string, command: string): string {
+  const prompt = rejectReplyPrompt(command);
+  return existing.trim() ? `${existing.trimEnd()}\n${prompt}` : prompt;
+}
 
 const listeners = new Set<() => void>();
 
@@ -75,6 +94,7 @@ export default function PermissionCard({
   readOnly,
   onDone,
   compact = false,
+  onRejectAndReply,
 }: {
   card: PermissionCardData;
   readOnly: boolean;
@@ -82,8 +102,14 @@ export default function PermissionCard({
   /** The To do card (CAD-1216): the whole reason in words and Allow once /
    *  Always / Deny. The command and folder live under Details. */
   compact?: boolean;
+  onRejectAndReply?: (argv: string) => void;
 }) {
   const t = useTranslate();
+  const gateBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
+  const blocked = readOnly || writeBlock !== null;
+  const ctxReply = useContext(PermissionReplyContext);
+  const reply = !blocked ? (onRejectAndReply ?? ctxReply) : null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [alwaysOpen, setAlwaysOpen] = useState(false);
@@ -91,12 +117,14 @@ export default function PermissionCard({
   const decided = card.status !== "pending";
   const act = compact ? "btn btn-sm" : "lnk text-label";
   const primary = compact ? "btn btn-sm btn-primary" : "lnk text-label";
-  const run = (work: () => Promise<unknown>, what: string) => {
+  const run = (work: () => Promise<unknown>, what: string, after?: () => void) => {
+    if (blocked || busy) return;
     setBusy(true);
     setError(null);
     work()
       .then(() => {
         publishPermission();
+        after?.();
         onDone(what);
       })
       .catch((e: ApiError) => setError(e.message ?? String(e)))
@@ -128,7 +156,7 @@ export default function PermissionCard({
           <button
             type="button"
             className={primary}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             onClick={() => run(() => api.permissionAllowOnce(card.id), "Allowed once")}
           >
             {t("Allow once")}
@@ -136,7 +164,7 @@ export default function PermissionCard({
           <button
             type="button"
             className={act}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             aria-expanded={alwaysOpen}
             onClick={() => {
               setRejectOpen(false);
@@ -148,7 +176,7 @@ export default function PermissionCard({
           <button
             type="button"
             className={act}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             aria-expanded={rejectOpen}
             onClick={() => {
               setAlwaysOpen(false);
@@ -164,7 +192,7 @@ export default function PermissionCard({
           <button
             type="button"
             className={act}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             onClick={() => run(() => api.permissionAlways(card.id, "exact", []), "Always: this command")}
           >
             {t("This exact command")}
@@ -173,7 +201,7 @@ export default function PermissionCard({
             <button
               type="button"
               className={act}
-              disabled={readOnly || busy}
+              disabled={blocked || busy}
               onClick={() =>
                 run(() => api.permissionAlways(card.id, "prefix", card.prefix ?? []), "Always: prefix")
               }
@@ -188,15 +216,26 @@ export default function PermissionCard({
           <button
             type="button"
             className={act}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             onClick={() => run(() => api.permissionReject(card.id, false), "Rejected")}
           >
             {t("Reject once")}
           </button>
+          {reply ? (
+            <button
+              type="button"
+              className={act}
+              disabled={blocked || busy}
+              data-permission-reject-reply
+              onClick={() => run(() => api.permissionReject(card.id, false), "Rejected", () => reply(card.argv))}
+            >
+              {t("Reject & reply…")}
+            </button>
+          ) : null}
           <button
             type="button"
             className={act}
-            disabled={readOnly || busy}
+            disabled={blocked || busy}
             onClick={() => run(() => api.permissionReject(card.id, true), "Rejected — won't ask again")}
           >
             {t("Don't ask again")}
@@ -218,7 +257,7 @@ export function permissionIdFromText(text: string): string | null {
   return m ? m[1] : null;
 }
 
-function cardFromRequest(req: MasterPermissionRequest): PermissionCardData {
+export function cardFromRequest(req: MasterPermissionRequest): PermissionCardData {
   return {
     id: req.id,
     argv: req.command,
@@ -250,7 +289,9 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
         setCard(req ? cardFromRequest(req) : null);
         setError(null);
       }).catch((e: ApiError) => {
-        if (alive && current === revision) setError(e.message ?? String(e));
+        if (!alive || current !== revision) return;
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) setCard(null);
+        setError(e.message ?? String(e));
       });
     };
     load();

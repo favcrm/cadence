@@ -28,6 +28,8 @@ export default function Composer({
   attachDestination,
   attachReason = "A writable Home conversation is required to attach files.",
   stop = null,
+  textareaId,
+  onArrowUpEmpty,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
@@ -40,6 +42,8 @@ export default function Composer({
   attachReason?: string;
   /** CAD-1880: this pane's running turn — Stop takes the send slot. */
   stop?: { onStop: () => void } | null;
+  textareaId?: string;
+  onArrowUpEmpty?: () => boolean;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
@@ -56,6 +60,8 @@ export default function Composer({
       }}
       refocusAfterSend
       stop={stop}
+      textareaId={textareaId}
+      onArrowUpEmpty={onArrowUpEmpty}
       attach={{
         enabled: attachEnabled,
         reason: attachReason,
