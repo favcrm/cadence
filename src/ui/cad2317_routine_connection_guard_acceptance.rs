@@ -1,17 +1,28 @@
 //! CAD-2317 independent guard-check acceptance test (authored from the ticket
 //! specification, separate from the implementer):
-//! 1. Operator-only mutation & approval boundary across Daemon RPC and the real
-//!    HTTP Board (`PublicBoard` signed Ed25519 `owner` vs `member` sessions,
-//!    unauthenticated HTTP, `Asserted::Agent`, and `Asserted::Unproven`), with
-//!    zero durable side effects on refusal paired with positive controls.
+//! 1. Operator-only mutation, read & decision boundaries across Daemon RPC and
+//!    the real HTTP Board (`PublicBoard` signed Ed25519 `owner` vs `member`
+//!    sessions, unauthenticated HTTP, `Asserted::Agent`, and
+//!    `Asserted::Unproven`), covering `routine_list`, `routine_show`,
+//!    `connection_policy_get`, `routine_create`, `routine_approve`,
+//!    `routine_run`, `routine_run_decide`, `routine_proposal_decide`, and
+//!    `connection_policy_set`, with zero durable side effects on refusal paired
+//!    with positive controls.
 //! 2. Digest & revision gate (`sha256` script + `fnv1a:` Context Markdown)
 //!    across `markdown`, `script`, and `script_then_markdown` routines, proving
 //!    unapproved, forged, and post-approval tampered scripts/playbooks refuse
 //!    across both RPC and HTTP with zero side effects until re-approved.
-//! 3. Connections isolation: shared connections refuse `external_event`
-//!    triggers while `allow_external_triggers == false`, admit them once enabled
-//!    by the owner, and scrub the enrolled shared credential first when
-//!    switching `visibility` from `shared` to `personal`.
+//! 3. Connections isolation & runtime `ConnectionPolicy` enforcement:
+//!    - Pinned and unpinned (`connection_account: None`, `event_source`
+//!      `"agenticos:inbound"` / `"agenticos.webhook"`) routines refuse
+//!      `external_event` triggers (`external_trigger_refused`, zero side
+//!      effects) while a shared connection has `allow_external_triggers == false`
+//!      and admit them once enabled by the owner.
+//!    - Switching `visibility` from `shared` to `personal` scrubs the enrolled
+//!      shared credential first.
+//!    - Runtime `platform_call` enforces `write_mode: "read_only"`
+//!      (`connection_read_only`) and `personal` `allowed_agents`
+//!      (`connection_agent_denied`) before any outbound adapter execution.
 
 #![cfg(all(test, feature = "test-seam"))]
 
@@ -22,7 +33,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tiny_http::{Header, Response, Server};
@@ -42,6 +53,7 @@ struct Rig {
     public_host: String,
     issuer: String,
     key: Ed25519KeyPair,
+    outbound_connector_hits: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -83,7 +95,71 @@ fn start() -> Rig {
     std::fs::set_permissions(&pm, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
+    let outbound_connector_hits = Arc::new(AtomicUsize::new(0));
     let mut threads = Vec::new();
+
+    let key = Ed25519KeyPair::from_seed_unchecked(&[231; 32]).unwrap();
+    let public_key = URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+    let platform = (3110..=3199)
+        .find_map(|port| Server::http(("127.0.0.1", port)).ok())
+        .expect("no free synthetic platform port in 3110..=3199");
+    let platform_port = match platform.server_addr() {
+        tiny_http::ListenAddr::IP(addr) => addr.port(),
+        _ => panic!("synthetic platform did not bind TCP"),
+    };
+    let public_host = format!("localhost:{platform_port}");
+    let issuer = format!("http://{public_host}");
+    let connector_base = format!("http://127.0.0.1:{platform_port}");
+    let platform_stop = stop.clone();
+    let connector_hits = outbound_connector_hits.clone();
+    threads.push(std::thread::spawn(move || {
+        while !platform_stop.load(Ordering::SeqCst) {
+            if let Ok(Some(mut request)) = platform.recv_timeout(Duration::from_millis(100)) {
+                let path = request.url().split('?').next().unwrap_or("");
+                let (status_code, body) = if path == "/.well-known/agenticos-board-jwks.json" {
+                    (
+                        200,
+                        json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":KID,"x":public_key}]}),
+                    )
+                } else if path == "/v1/runtime/connectors/connections" {
+                    connector_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({"ok": true, "data": {"connections": [], "cursor": null}}),
+                    )
+                } else if path == "/v1/runtime/connectors/draft" {
+                    connector_hits.fetch_add(1, Ordering::SeqCst);
+                    let mut raw = String::new();
+                    let _ = request.as_reader().read_to_string(&mut raw);
+                    let req_json: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+                    let conn_id = req_json["connectionId"].as_str().unwrap_or("conn_1");
+                    let caption = req_json["caption"].as_str().unwrap_or("draft");
+                    (
+                        200,
+                        json!({
+                            "ok": true,
+                            "data": {
+                                "connectionId": conn_id,
+                                "toolkit": "instagram",
+                                "displayName": "Synthetic Ops Page",
+                                "caption": caption,
+                                "mediaUrl": null,
+                            }
+                        }),
+                    )
+                } else {
+                    if path.starts_with("/v1/runtime/connectors/") {
+                        connector_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (404, json!({"ok": false, "error": {"code": "not_found"}}))
+                };
+                let response = Response::from_string(body.to_string())
+                    .with_status_code(status_code)
+                    .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+                let _ = request.respond(response);
+            }
+        }
+    }));
 
     let mut opts = crate::daemon::ServeOptions {
         test_seam: true,
@@ -102,6 +178,12 @@ fn start() -> Rig {
         None,
     )
     .expect("token fixture registration");
+    crate::platform::agenticos::register_with_deployment_pin(
+        &mut opts,
+        &connector_base,
+        Some("agenticos-manifest@1/publish_post@2"),
+    )
+    .expect("agenticos loopback fixture registration");
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     let daemon_state = state.clone();
@@ -114,35 +196,6 @@ fn start() -> Rig {
         assert!(Instant::now() < deadline, "synthetic daemon did not start");
         std::thread::sleep(Duration::from_millis(50));
     }
-
-    let key = Ed25519KeyPair::from_seed_unchecked(&[231; 32]).unwrap();
-    let public_key = URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
-    let platform = (3110..=3199)
-        .find_map(|port| Server::http(("127.0.0.1", port)).ok())
-        .expect("no free synthetic platform port in 3110..=3199");
-    let platform_port = match platform.server_addr() {
-        tiny_http::ListenAddr::IP(addr) => addr.port(),
-        _ => panic!("synthetic platform did not bind TCP"),
-    };
-    let public_host = format!("localhost:{platform_port}");
-    let issuer = format!("http://{public_host}");
-    let platform_stop = stop.clone();
-    threads.push(std::thread::spawn(move || {
-        while !platform_stop.load(Ordering::SeqCst) {
-            if let Ok(Some(request)) = platform.recv_timeout(Duration::from_millis(100)) {
-                let valid = request.url() == "/.well-known/agenticos-board-jwks.json";
-                let body = if valid {
-                    json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":KID,"x":public_key}]})
-                } else {
-                    json!({"error":"not_found"})
-                };
-                let response = Response::from_string(body.to_string())
-                    .with_status_code(if valid { 200 } else { 404 })
-                    .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-                let _ = request.respond(response);
-            }
-        }
-    }));
 
     let mut board_port = 0;
     for port in 3110..=3199 {
@@ -188,6 +241,7 @@ fn start() -> Rig {
         public_host,
         issuer,
         key,
+        outbound_connector_hits,
         stop,
         threads,
     }
@@ -438,6 +492,27 @@ fn enroll_shared_connection(rig: &Rig, account: &str, token: &str) -> String {
     enrolled["connection"]["id"]
         .as_str()
         .expect("enrolled connection id")
+        .to_string()
+}
+
+fn enroll_agenticos_connection(rig: &Rig, account: &str, token: &str, scopes: &[&str]) -> String {
+    let enrolled = rpc_as(
+        rig,
+        Asserted::Operator,
+        "platform_enroll",
+        json!({
+            "platform": "agenticos",
+            "account": account,
+            "shape": "token",
+            "token": token,
+            "scopes": scopes,
+            "accept_same_uid_risk": true,
+        }),
+    )
+    .expect("operator enrolls agenticos connection");
+    enrolled["account"]["connection_id"]
+        .as_str()
+        .expect("enrolled agenticos connection_id")
         .to_string()
 }
 
@@ -1464,4 +1539,897 @@ fn connections_isolation_gates_external_triggers_and_scrubs_shared_credentials_o
         "connection_show must not report live enrolled custody after RPC personal switch: \
          {show_after_rpc:?}"
     );
+}
+
+#[test]
+fn operator_only_read_and_decision_gates_refuse_unauthorized_callers_with_zero_side_effects() {
+    let rig = start();
+    let owner = session(&rig, "owner", "owner");
+    let member = session(&rig, "member", "member");
+    register_inbox_agent(&rig, "worker");
+
+    let wiki_rel = "global/playbooks/weekly-digest.md";
+    let md_rev = write_wiki_playbook(
+        &rig,
+        &owner,
+        wiki_rel,
+        "# Weekly Digest\nCompile summary and wait for owner sign-off.\n",
+    );
+    let conn_id = enroll_shared_connection(&rig, WORKSPACE_ACCOUNT_1, "shared-secret-token-r2");
+    rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": conn_id,
+            "visibility": "shared",
+            "write_mode": "read_only",
+            "allow_external_triggers": false,
+        }),
+    )
+    .expect("operator sets baseline connection policy");
+
+    let mut create_req = routine_create_payload(
+        "Weekly digest",
+        "worker",
+        "schedule",
+        "markdown",
+        Some("wiki:global/playbooks/weekly-digest.md"),
+        None,
+        None,
+    );
+    create_req["checklist"] = json!([
+        {
+            "id": "step_send",
+            "label": "Send weekly digest",
+            "requires_approval": true,
+        }
+    ]);
+    let created = rpc_as(&rig, Asserted::Operator, "routine_create", create_req)
+        .expect("operator creates checklist routine");
+    let rtn_id = created["routine"]["id"]
+        .as_str()
+        .expect("routine id")
+        .to_string();
+    rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_approve",
+        json!({"id": rtn_id, "expect_rev": md_rev}),
+    )
+    .expect("operator approves checklist routine");
+
+    let run_out = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_run",
+        json!({"id": rtn_id}),
+    )
+    .expect("operator starts waiting_approval routine run");
+    assert_eq!(run_out["run"]["state"], "waiting_approval");
+    let run_id_rpc = run_out["run"]["id"]
+        .as_str()
+        .expect("waiting run id")
+        .to_string();
+    let queued_after_initial_run = inbox_queued(&rig, "worker");
+    assert_eq!(queued_after_initial_run, 1);
+
+    // Stage two pending routine proposals as an agent (`routine_propose` is agent-callable).
+    let prop_rpc_out = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "routine_propose",
+        json!({
+            "name": "Agent proposed digest A",
+            "agent_alias": "worker",
+            "trigger_kind": "schedule",
+            "interval_mins": 60,
+            "timezone": "UTC",
+            "target_kind": "markdown",
+            "markdown_path": "wiki:global/playbooks/weekly-digest.md",
+        }),
+    )
+    .expect("worker stages routine proposal A");
+    assert_eq!(prop_rpc_out["proposal"]["state"], "pending");
+    assert_eq!(prop_rpc_out["proposal"]["proposed_by"], "worker");
+    let prop_id_rpc = prop_rpc_out["proposal"]["id"]
+        .as_str()
+        .expect("proposal A id")
+        .to_string();
+
+    let prop_http_out = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "routine_propose",
+        json!({
+            "name": "Agent proposed digest B",
+            "agent_alias": "worker",
+            "trigger_kind": "schedule",
+            "interval_mins": 60,
+            "timezone": "UTC",
+            "target_kind": "markdown",
+            "markdown_path": "wiki:global/playbooks/weekly-digest.md",
+        }),
+    )
+    .expect("worker stages routine proposal B");
+    assert_eq!(prop_http_out["proposal"]["state"], "pending");
+    let prop_id_http = prop_http_out["proposal"]["id"]
+        .as_str()
+        .expect("proposal B id")
+        .to_string();
+
+    // 1. Operator-only READ gates (`routine_list`, `routine_show`, `connection_policy_get` + HTTP peers).
+    for caller in [Asserted::Agent("worker".into()), Asserted::Unproven] {
+        assert!(
+            rpc_as(&rig, caller.clone(), "routine_list", json!({})).is_err(),
+            "routine_list must refuse {caller:?}"
+        );
+        assert!(
+            rpc_as(
+                &rig,
+                caller.clone(),
+                "routine_list",
+                json!({"agent_alias": "worker"}),
+            )
+            .is_err(),
+            "filtered routine_list must refuse {caller:?}"
+        );
+        assert!(
+            rpc_as(&rig, caller.clone(), "routine_show", json!({"id": rtn_id})).is_err(),
+            "routine_show must refuse {caller:?}"
+        );
+        assert!(
+            rpc_as(
+                &rig,
+                caller.clone(),
+                "connection_policy_get",
+                json!({"connection_id": conn_id}),
+            )
+            .is_err(),
+            "connection_policy_get must refuse {caller:?}"
+        );
+    }
+
+    for (label, cookie) in [("unauthenticated", None), ("member", Some(member.as_str()))] {
+        for path in [
+            "/api/routines".to_string(),
+            format!("/api/routines/{rtn_id}"),
+            format!("/api/connections/{conn_id}/policy"),
+        ] {
+            let (status, body) = status_and_json(get(&rig, &path, cookie));
+            assert_http_refused_auth(status, &format!("{label} GET {path}"), &body);
+        }
+    }
+
+    // Positive operator/owner read controls.
+    let list_op = rpc_as(&rig, Asserted::Operator, "routine_list", json!({}))
+        .expect("operator routine_list succeeds");
+    assert_eq!(list_op["routines"].as_array().unwrap().len(), 1);
+    assert_eq!(list_op["waiting_runs"].as_array().unwrap().len(), 1);
+    assert_eq!(list_op["staged_proposals"].as_array().unwrap().len(), 2);
+
+    let (list_http_status, list_http) = status_and_json(get(&rig, "/api/routines", Some(&owner)));
+    assert_eq!(
+        list_http_status, 200,
+        "owner GET /api/routines: {list_http}"
+    );
+    assert_eq!(list_http["waiting_runs"][0]["id"], run_id_rpc);
+
+    let show_op = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_show",
+        json!({"id": rtn_id}),
+    )
+    .expect("operator routine_show succeeds");
+    assert_eq!(show_op["routine"]["id"], rtn_id);
+    assert_eq!(show_op["routine"]["runs"][0]["id"], run_id_rpc);
+
+    let (show_http_status, show_http) =
+        status_and_json(get(&rig, &format!("/api/routines/{rtn_id}"), Some(&owner)));
+    assert_eq!(show_http_status, 200);
+    assert_eq!(show_http["routine"]["id"], rtn_id);
+
+    let pol_op = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_get",
+        json!({"connection_id": conn_id}),
+    )
+    .expect("operator connection_policy_get succeeds");
+    assert_eq!(pol_op["policy"]["write_mode"], "read_only");
+
+    let (pol_http_status, pol_http) = status_and_json(get(
+        &rig,
+        &format!("/api/connections/{conn_id}/policy"),
+        Some(&owner),
+    ));
+    assert_eq!(pol_http_status, 200);
+    assert_eq!(pol_http["policy"]["write_mode"], "read_only");
+
+    // 2. Operator-only RUN DECISION gate (`routine_run_decide` + `POST /api/routine-runs/<id>/decide`).
+    for decision in ["approve", "dismiss"] {
+        for caller in [Asserted::Agent("worker".into()), Asserted::Unproven] {
+            assert!(
+                rpc_as(
+                    &rig,
+                    caller.clone(),
+                    "routine_run_decide",
+                    json!({"run_id": run_id_rpc, "decision": decision}),
+                )
+                .is_err(),
+                "routine_run_decide ({decision}) must refuse {caller:?}"
+            );
+        }
+        for (label, cookie) in [("unauthenticated", None), ("member", Some(member.as_str()))] {
+            let (status, body) = status_and_json(post(
+                &rig,
+                &format!("/api/routine-runs/{run_id_rpc}/decide"),
+                cookie,
+                &json!({"decision": decision}),
+            ));
+            assert_http_refused_auth(
+                status,
+                &format!("{label} POST /api/routine-runs/{run_id_rpc}/decide ({decision})"),
+                &body,
+            );
+        }
+    }
+
+    // Zero durable side effects from all refused run decisions.
+    assert_eq!(
+        inbox_queued(&rig, "worker"),
+        queued_after_initial_run,
+        "refused routine_run_decide calls must enqueue zero follow-up messages"
+    );
+    let show_still_waiting = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_show",
+        json!({"id": rtn_id}),
+    )
+    .unwrap();
+    assert_eq!(
+        show_still_waiting["routine"]["runs"][0]["state"], "waiting_approval",
+        "refused routine_run_decide must leave run waiting_approval: {show_still_waiting}"
+    );
+
+    // Positive RPC control for `routine_run_decide`.
+    let decided_run_rpc = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_run_decide",
+        json!({"run_id": run_id_rpc, "decision": "approve"}),
+    )
+    .expect("operator routine_run_decide succeeds");
+    assert_eq!(decided_run_rpc["ok"], true);
+    assert_eq!(decided_run_rpc["run"]["state"], "completed");
+    assert_eq!(inbox_queued(&rig, "worker"), queued_after_initial_run + 1);
+
+    // Start a second waiting_approval run to verify the HTTP owner decision path end-to-end.
+    let run_out_2 = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_run",
+        json!({"id": rtn_id}),
+    )
+    .expect("operator starts second waiting_approval run");
+    assert_eq!(run_out_2["run"]["state"], "waiting_approval");
+    let run_id_http = run_out_2["run"]["id"]
+        .as_str()
+        .expect("second waiting run id")
+        .to_string();
+    let queued_before_http_decide = inbox_queued(&rig, "worker");
+
+    for (label, cookie) in [("unauthenticated", None), ("member", Some(member.as_str()))] {
+        let (status, body) = status_and_json(post(
+            &rig,
+            &format!("/api/routine-runs/{run_id_http}/decide"),
+            cookie,
+            &json!({"decision": "approve"}),
+        ));
+        assert_http_refused_auth(
+            status,
+            &format!("{label} POST /api/routine-runs/{run_id_http}/decide"),
+            &body,
+        );
+    }
+    assert_eq!(inbox_queued(&rig, "worker"), queued_before_http_decide);
+
+    let (decide_http_status, decided_run_http) = status_and_json(post(
+        &rig,
+        &format!("/api/routine-runs/{run_id_http}/decide"),
+        Some(&owner),
+        &json!({"decision": "approve"}),
+    ));
+    assert_eq!(
+        decide_http_status, 200,
+        "owner POST /api/routine-runs/{run_id_http}/decide failed: {decided_run_http}"
+    );
+    assert_eq!(decided_run_http["run"]["state"], "completed");
+    assert_eq!(
+        inbox_queued(&rig, "worker"),
+        queued_before_http_decide + 1,
+        "owner HTTP run approval enqueues follow-up action prompt"
+    );
+
+    // 3. Operator-only PROPOSAL DECISION gate (`routine_proposal_decide` + `POST /api/routine-proposals/<id>/decide`).
+    for decision in ["approve", "dismiss"] {
+        for caller in [Asserted::Agent("worker".into()), Asserted::Unproven] {
+            assert!(
+                rpc_as(
+                    &rig,
+                    caller.clone(),
+                    "routine_proposal_decide",
+                    json!({"proposal_id": prop_id_rpc, "decision": decision}),
+                )
+                .is_err(),
+                "routine_proposal_decide ({decision}) must refuse {caller:?}"
+            );
+        }
+        for prop_id in [&prop_id_rpc, &prop_id_http] {
+            for (label, cookie) in [("unauthenticated", None), ("member", Some(member.as_str()))] {
+                let (status, body) = status_and_json(post(
+                    &rig,
+                    &format!("/api/routine-proposals/{prop_id}/decide"),
+                    cookie,
+                    &json!({"decision": decision}),
+                ));
+                assert_http_refused_auth(
+                    status,
+                    &format!("{label} POST /api/routine-proposals/{prop_id}/decide ({decision})"),
+                    &body,
+                );
+            }
+        }
+    }
+
+    // Zero durable side effects from all refused proposal decisions.
+    let list_before_prop_decide =
+        rpc_as(&rig, Asserted::Operator, "routine_list", json!({})).unwrap();
+    assert_eq!(
+        list_before_prop_decide["routines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "refused routine_proposal_decide calls must create zero routines: {list_before_prop_decide}"
+    );
+    let pending_ids: Vec<&str> = list_before_prop_decide["staged_proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["state"] == "pending")
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert!(
+        pending_ids.contains(&prop_id_rpc.as_str()) && pending_ids.contains(&prop_id_http.as_str()),
+        "both proposals must remain pending after unauthorized attempts: {list_before_prop_decide}"
+    );
+
+    // Positive RPC control for `routine_proposal_decide`.
+    let prop_decided_rpc = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_proposal_decide",
+        json!({"proposal_id": prop_id_rpc, "decision": "approve"}),
+    )
+    .expect("operator routine_proposal_decide succeeds");
+    assert_eq!(prop_decided_rpc["ok"], true);
+    assert_eq!(prop_decided_rpc["proposal"]["state"], "approved");
+    assert_eq!(prop_decided_rpc["routine"]["status"], "on");
+    assert_eq!(prop_decided_rpc["routine"]["approved_rev"], md_rev);
+
+    // Positive HTTP owner control for `POST /api/routine-proposals/<id>/decide`.
+    let (prop_http_status, prop_decided_http) = status_and_json(post(
+        &rig,
+        &format!("/api/routine-proposals/{prop_id_http}/decide"),
+        Some(&owner),
+        &json!({"decision": "approve"}),
+    ));
+    assert_eq!(
+        prop_http_status, 200,
+        "owner POST /api/routine-proposals/{prop_id_http}/decide failed: {prop_decided_http}"
+    );
+    assert_eq!(prop_decided_http["proposal"]["state"], "approved");
+    assert_eq!(prop_decided_http["routine"]["status"], "on");
+    assert_eq!(prop_decided_http["routine"]["approved_rev"], md_rev);
+
+    let list_after_prop_decide =
+        rpc_as(&rig, Asserted::Operator, "routine_list", json!({})).unwrap();
+    assert_eq!(
+        list_after_prop_decide["routines"].as_array().unwrap().len(),
+        3
+    );
+    assert!(list_after_prop_decide["staged_proposals"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn runtime_connection_policy_enforces_read_only_and_allowed_agents_on_platform_call() {
+    let rig = start();
+    let owner = session(&rig, "owner", "owner");
+    register_inbox_agent(&rig, "worker");
+    register_inbox_agent(&rig, "helper");
+
+    // 1. `write_mode: "read_only"` blocks non-read `platform_call` with `connection_read_only`
+    //    and zero outbound adapter traffic, while read tools continue to succeed.
+    let ops_conn_id = enroll_agenticos_connection(
+        &rig,
+        "ops-social",
+        "xK9vM2qR7zL4pN8wT3aB",
+        &["sources", "draft", "publish"],
+    );
+    rpc_as(
+        &rig,
+        Asserted::Operator,
+        "platform_grant",
+        json!({
+            "agent": "worker",
+            "platform": "agenticos",
+            "account": "ops-social",
+            "scopes": ["sources", "draft", "publish"],
+        }),
+    )
+    .expect("grant worker scopes on agenticos/ops-social");
+
+    rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": ops_conn_id,
+            "visibility": "shared",
+            "write_mode": "ask_approval",
+            "allow_external_triggers": false,
+        }),
+    )
+    .expect("configure ops-social as shared + ask_approval");
+
+    let hits_before_draft = rig.outbound_connector_hits.load(Ordering::SeqCst);
+    let pre_draft = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "ops-social",
+            "tool": "post_draft",
+            "input": {"connectionId": "conn_1", "caption": "Allowed draft before read_only"},
+        }),
+    )
+    .expect("worker post_draft succeeds while write_mode == ask_approval");
+    assert_eq!(pre_draft["result"], "executed");
+    assert_eq!(pre_draft["effect"], "draft");
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_before_draft + 1,
+        "loopback adapter executed pre-check draft"
+    );
+
+    // Switch connection policy to `write_mode: "read_only"`.
+    let ro_set = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": ops_conn_id,
+            "visibility": "shared",
+            "write_mode": "read_only",
+            "allow_external_triggers": false,
+        }),
+    )
+    .expect("operator sets write_mode == read_only");
+    assert_eq!(ro_set["policy"]["write_mode"], "read_only");
+
+    let hits_at_ro = rig.outbound_connector_hits.load(Ordering::SeqCst);
+    for non_read_tool in ["post_draft", "publish_post"] {
+        let err = rpc_as(
+            &rig,
+            Asserted::Agent("worker".into()),
+            "platform_call",
+            json!({
+                "platform": "agenticos",
+                "account": "ops-social",
+                "tool": non_read_tool,
+                "input": {"connectionId": "conn_1", "caption": "Must be blocked by read_only"},
+            }),
+        )
+        .expect_err("non-read platform_call must refuse under write_mode == read_only");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("connection_read_only"),
+            "expected connection_read_only refusal on {non_read_tool}, got: {msg}"
+        );
+    }
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_at_ro,
+        "connection_read_only refusal must happen before any outbound adapter execution"
+    );
+
+    // Read tool (`connections_list`) remains permitted under `write_mode: "read_only"`.
+    let read_ok = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "ops-social",
+            "tool": "connections_list",
+            "input": {},
+        }),
+    )
+    .expect("read tool connections_list succeeds under write_mode == read_only");
+    assert_eq!(read_ok["result"], "executed");
+    assert_eq!(read_ok["effect"], "read");
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_at_ro + 1
+    );
+
+    // Restoring `write_mode: "ask_approval"` via HTTP owner endpoint re-admits `post_draft`.
+    let (restore_status, restore_body) = status_and_json(post(
+        &rig,
+        &format!("/api/connections/{ops_conn_id}/policy"),
+        Some(&owner),
+        &json!({
+            "visibility": "shared",
+            "write_mode": "ask_approval",
+            "allow_external_triggers": false,
+        }),
+    ));
+    assert_eq!(
+        restore_status, 200,
+        "owner restore ask_approval: {restore_body}"
+    );
+    let post_restore = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "ops-social",
+            "tool": "post_draft",
+            "input": {"connectionId": "conn_1", "caption": "Re-enabled draft"},
+        }),
+    )
+    .expect("post_draft succeeds again after restoring write_mode == ask_approval");
+    assert_eq!(post_restore["effect"], "draft");
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_at_ro + 2
+    );
+
+    // 2. Restricting a `personal` connection's `allowed_agents` to `["helper"]` refuses
+    //    `worker`'s `platform_call` with `connection_agent_denied` before any outbound call.
+    let seed_conn_id = enroll_agenticos_connection(
+        &rig,
+        "personal-social",
+        "yJ8uN3rS6wM5qP9xV4cD",
+        &["sources", "draft", "publish"],
+    );
+    let switched_personal = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": seed_conn_id,
+            "visibility": "personal",
+            "write_mode": "ask_approval",
+            "allowed_agents": ["helper"],
+        }),
+    )
+    .expect("switch personal-social account policy to personal");
+    assert_eq!(switched_personal["shared_credential_cleared"], true);
+
+    let personal_conn_id = enroll_agenticos_connection(
+        &rig,
+        "personal-social",
+        "zH7tP4sU5vN6rQ2yW8eF",
+        &["sources", "draft", "publish"],
+    );
+    let pinned_personal = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": personal_conn_id,
+            "visibility": "personal",
+            "write_mode": "ask_approval",
+            "allowed_agents": ["helper"],
+        }),
+    )
+    .expect("pin personal connection allowed_agents to helper");
+    assert_eq!(pinned_personal["shared_credential_cleared"], false);
+    assert_eq!(pinned_personal["policy"]["visibility"], "personal");
+    assert_eq!(
+        pinned_personal["policy"]["allowed_agents"],
+        json!(["helper"])
+    );
+
+    // Grant BOTH `worker` and `helper` platform scopes so `worker` passes `check_grant`
+    // and is refused specifically at the `ConnectionPolicy` `allowed_agents` guard.
+    for agent_alias in ["worker", "helper"] {
+        rpc_as(
+            &rig,
+            Asserted::Operator,
+            "platform_grant",
+            json!({
+                "agent": agent_alias,
+                "platform": "agenticos",
+                "account": "personal-social",
+                "scopes": ["sources", "draft", "publish"],
+            }),
+        )
+        .expect("grant scopes on agenticos/personal-social");
+    }
+
+    let hits_before_denied = rig.outbound_connector_hits.load(Ordering::SeqCst);
+    for (tool, input) in [
+        ("connections_list", json!({})),
+        (
+            "post_draft",
+            json!({"connectionId": "conn_1", "caption": "Disallowed agent call"}),
+        ),
+    ] {
+        let err = rpc_as(
+            &rig,
+            Asserted::Agent("worker".into()),
+            "platform_call",
+            json!({
+                "platform": "agenticos",
+                "account": "personal-social",
+                "tool": tool,
+                "input": input,
+            }),
+        )
+        .expect_err("disallowed agent platform_call must refuse on personal connection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("connection_agent_denied"),
+            "expected connection_agent_denied for worker on {tool}, got: {msg}"
+        );
+    }
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_before_denied,
+        "connection_agent_denied must refuse before any outbound adapter execution"
+    );
+
+    // Positive control: allowed agent `helper` succeeds on the same personal connection.
+    let helper_read = rpc_as(
+        &rig,
+        Asserted::Agent("helper".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "personal-social",
+            "tool": "connections_list",
+            "input": {},
+        }),
+    )
+    .expect("allowed helper agent connections_list succeeds");
+    assert_eq!(helper_read["result"], "executed");
+    let helper_draft = rpc_as(
+        &rig,
+        Asserted::Agent("helper".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "personal-social",
+            "tool": "post_draft",
+            "input": {"connectionId": "conn_1", "caption": "Helper permitted draft"},
+        }),
+    )
+    .expect("allowed helper agent post_draft succeeds");
+    assert_eq!(helper_draft["effect"], "draft");
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_before_denied + 2
+    );
+
+    // Owner adds `worker` to `allowed_agents` via HTTP -> `worker` now succeeds.
+    let (expand_status, expand_body) = status_and_json(post(
+        &rig,
+        &format!("/api/connections/{personal_conn_id}/policy"),
+        Some(&owner),
+        &json!({
+            "visibility": "personal",
+            "write_mode": "ask_approval",
+            "allowed_agents": ["helper", "worker"],
+        }),
+    ));
+    assert_eq!(
+        expand_status, 200,
+        "owner expand allowed_agents: {expand_body}"
+    );
+    assert_eq!(expand_body["shared_credential_cleared"], false);
+
+    let worker_now_ok = rpc_as(
+        &rig,
+        Asserted::Agent("worker".into()),
+        "platform_call",
+        json!({
+            "platform": "agenticos",
+            "account": "personal-social",
+            "tool": "post_draft",
+            "input": {"connectionId": "conn_1", "caption": "Worker now permitted"},
+        }),
+    )
+    .expect("worker platform_call succeeds once added to allowed_agents");
+    assert_eq!(worker_now_ok["effect"], "draft");
+    assert_eq!(
+        rig.outbound_connector_hits.load(Ordering::SeqCst),
+        hits_before_denied + 3
+    );
+}
+
+#[test]
+fn unpinned_event_routine_refuses_external_triggers_until_shared_connection_opts_in() {
+    let rig = start();
+    let owner = session(&rig, "owner", "owner");
+    register_inbox_agent(&rig, "worker");
+
+    let wiki_rel = "global/playbooks/inbound-event.md";
+    let md_rev = write_wiki_playbook(
+        &rig,
+        &owner,
+        wiki_rel,
+        "# Inbound Event Triage\nInspect incoming provider webhook payload.\n",
+    );
+
+    let shared_conn_id = enroll_agenticos_connection(
+        &rig,
+        "shared-workspace",
+        "wG6sQ5tV4uP7sR3zX9fH",
+        &["sources"],
+    );
+    rpc_as(
+        &rig,
+        Asserted::Operator,
+        "connection_policy_set",
+        json!({
+            "connection_id": shared_conn_id,
+            "visibility": "shared",
+            "write_mode": "read_only",
+            "allow_external_triggers": false,
+        }),
+    )
+    .expect("configure shared agenticos connection with allow_external_triggers == false");
+
+    let mut unpinned_ids = Vec::new();
+    for (name, event_source) in [
+        ("Unpinned colon inbound", "agenticos:inbound"),
+        ("Unpinned dot webhook", "agenticos.webhook"),
+    ] {
+        let created = rpc_as(
+            &rig,
+            Asserted::Operator,
+            "routine_create",
+            json!({
+                "name": name,
+                "agent_alias": "worker",
+                "trigger_kind": "event",
+                "event_source": event_source,
+                "target_kind": "markdown",
+                "markdown_path": "wiki:global/playbooks/inbound-event.md",
+            }),
+        )
+        .expect("operator creates unpinned event routine");
+        assert!(
+            created["routine"]["connection_account"].is_null(),
+            "routine must have connection_account == None: {created}"
+        );
+        let id = created["routine"]["id"]
+            .as_str()
+            .expect("unpinned routine id")
+            .to_string();
+        let approved = rpc_as(
+            &rig,
+            Asserted::Operator,
+            "routine_approve",
+            json!({"id": id, "expect_rev": md_rev}),
+        )
+        .expect("operator approves unpinned event routine");
+        assert_eq!(approved["routine"]["status"], "on");
+        unpinned_ids.push((event_source, id));
+    }
+
+    let queued_before = inbox_queued(&rig, "worker");
+    assert_eq!(queued_before, 0);
+
+    // Both `"agenticos:inbound"` and `"agenticos.webhook"` unpinned routines must refuse
+    // `external_event` across RPC and HTTP with `external_trigger_refused` and zero side effects.
+    for (event_source, rtn_id) in &unpinned_ids {
+        let rpc_err = rpc_as(
+            &rig,
+            Asserted::Operator,
+            "routine_run",
+            json!({"id": rtn_id, "trigger_source": "external_event"}),
+        )
+        .expect_err("unpinned event routine must refuse external_event on RPC");
+        let rpc_msg = rpc_err.to_string();
+        assert!(
+            rpc_msg.contains("external_trigger_refused"),
+            "expected external_trigger_refused on RPC for {event_source}, got: {rpc_msg}"
+        );
+
+        let (http_status, http_body) = status_and_json(post(
+            &rig,
+            &format!("/api/routines/{rtn_id}/run"),
+            Some(&owner),
+            &json!({"trigger_source": "external_event"}),
+        ));
+        assert!(
+            !(200..300).contains(&http_status),
+            "unpinned {event_source} external_event via HTTP must refuse, got {http_status}: {http_body}"
+        );
+        assert!(
+            http_body.to_string().contains("external_trigger_refused"),
+            "expected external_trigger_refused in HTTP error for {event_source}, got: {http_body}"
+        );
+
+        let shown = rpc_as(
+            &rig,
+            Asserted::Operator,
+            "routine_show",
+            json!({"id": rtn_id}),
+        )
+        .unwrap();
+        assert!(
+            shown["routine"]["runs"].as_array().unwrap().is_empty(),
+            "refused unpinned external_event for {event_source} must record zero runs: {shown}"
+        );
+    }
+    assert_eq!(
+        inbox_queued(&rig, "worker"),
+        queued_before,
+        "refused unpinned external_event triggers must enqueue zero messages"
+    );
+
+    // Once the owner enables `allow_external_triggers: true` on the shared `agenticos`
+    // connection, both unpinned event routines succeed on `trigger_source: "external_event"`.
+    let (opt_in_status, opt_in_body) = status_and_json(post(
+        &rig,
+        &format!("/api/connections/{shared_conn_id}/policy"),
+        Some(&owner),
+        &json!({
+            "visibility": "shared",
+            "write_mode": "read_only",
+            "allow_external_triggers": true,
+        }),
+    ));
+    assert_eq!(
+        opt_in_status, 200,
+        "owner enable allow_external_triggers on shared agenticos connection: {opt_in_body}"
+    );
+    assert_eq!(opt_in_body["policy"]["allow_external_triggers"], true);
+
+    let rtn_colon = &unpinned_ids[0].1;
+    let ok_rpc = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "routine_run",
+        json!({"id": rtn_colon, "trigger_source": "external_event"}),
+    )
+    .expect("unpinned agenticos:inbound succeeds via RPC after opt-in");
+    assert_eq!(ok_rpc["run"]["state"], "completed");
+    assert_eq!(inbox_queued(&rig, "worker"), queued_before + 1);
+
+    let rtn_dot = &unpinned_ids[1].1;
+    let (ok_http_status, ok_http_body) = status_and_json(post(
+        &rig,
+        &format!("/api/routines/{rtn_dot}/run"),
+        Some(&owner),
+        &json!({"trigger_source": "external_event"}),
+    ));
+    assert_eq!(
+        ok_http_status, 200,
+        "unpinned agenticos.webhook succeeds via HTTP after opt-in: {ok_http_body}"
+    );
+    assert_eq!(ok_http_body["run"]["state"], "completed");
+    assert_eq!(inbox_queued(&rig, "worker"), queued_before + 2);
 }

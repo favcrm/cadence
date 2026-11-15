@@ -12,6 +12,7 @@ import type {
   RoutinePayload,
   RoutineRun,
   RoutinesPayload,
+  StagedRoutineProposal,
 } from "../../lib/types";
 
 async function answer<T>(resp: Response): Promise<T> {
@@ -79,6 +80,16 @@ export const routinesApi = {
     write<{ ok: boolean; run: RoutineRun }>(
       `/api/routines/${encodeURIComponent(id)}/run`,
       body ?? {},
+    ),
+  runDecide: (runId: string, decision: "approve" | "dismiss") =>
+    write<{ ok: boolean; run: RoutineRun }>(
+      `/api/routine-runs/${encodeURIComponent(runId)}/decide`,
+      { decision },
+    ),
+  proposalDecide: (proposalId: string, decision: "approve" | "dismiss") =>
+    write<{ ok: boolean; proposal: StagedRoutineProposal; routine?: Routine }>(
+      `/api/routine-proposals/${encodeURIComponent(proposalId)}/decide`,
+      { decision },
     ),
   pause: (id: string, reason?: string) =>
     write<{ ok: boolean; routine: Routine }>(

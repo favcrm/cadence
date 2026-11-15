@@ -1621,19 +1621,23 @@ function ConnectionPolicyPanel({
   const baseMode = row.policy?.write_mode ?? "ask_approval";
   const baseExt = row.policy?.allow_external_triggers ?? false;
   const baseDef = row.policy?.is_default ?? false;
+  const baseAgents = row.policy?.allowed_agents ?? [];
 
   const [visibility, setVisibility] = useState<"shared" | "personal">(baseVis);
   const [writeMode, setWriteMode] = useState<"ask_approval" | "read_only">(baseMode);
   const [allowExternal, setAllowExternal] = useState(baseExt);
   const [isDefault, setIsDefault] = useState(baseDef);
+  const [allowedAgents, setAllowedAgents] = useState<string[]>(baseAgents);
   const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const agentsState = useMaybeResource(resources.agents);
 
   useEffect(() => {
     setVisibility(row.policy?.visibility ?? "shared");
     setWriteMode(row.policy?.write_mode ?? "ask_approval");
     setAllowExternal(row.policy?.allow_external_triggers ?? false);
     setIsDefault(row.policy?.is_default ?? false);
+    setAllowedAgents(row.policy?.allowed_agents ?? []);
     setStatusMsg(null);
   }, [
     row.id,
@@ -1641,16 +1645,34 @@ function ConnectionPolicyPanel({
     row.policy?.write_mode,
     row.policy?.allow_external_triggers,
     row.policy?.is_default,
+    row.policy?.policy_revision,
   ]);
+
+  useEffect(() => {
+    if (visibility === "personal") {
+      void resources.agents.revalidate();
+    }
+  }, [visibility]);
 
   const effectiveExt = visibility === "shared" ? allowExternal : false;
   const effectiveDef = visibility === "personal" ? isDefault : false;
+  const effectiveAgents = visibility === "personal" ? allowedAgents : [];
+  const baseAgentsKey = [...baseAgents].sort().join(",");
+  const currAgentsKey = [...effectiveAgents].sort().join(",");
   const dirty =
     visibility !== baseVis ||
     writeMode !== baseMode ||
     effectiveExt !== baseExt ||
-    effectiveDef !== baseDef;
+    effectiveDef !== baseDef ||
+    currAgentsKey !== baseAgentsKey;
   const clearsShared = baseVis === "shared" && visibility === "personal";
+  const rosterAgents = agentsState?.data?.agents ?? [];
+
+  const toggleAllowedAgent = (alias: string) => {
+    setAllowedAgents((prev) =>
+      prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias],
+    );
+  };
 
   const savePolicy = async () => {
     if (saving || !canWrite) return;
@@ -1662,7 +1684,7 @@ function ConnectionPolicyPanel({
         write_mode: writeMode,
         allow_external_triggers: effectiveExt,
         is_default: effectiveDef,
-        allowed_agents: row.policy?.allowed_agents ?? [],
+        allowed_agents: effectiveAgents,
       });
       setStatusMsg({
         ok: true,
@@ -1717,21 +1739,54 @@ function ConnectionPolicyPanel({
           </p>
         )}
         {visibility === "personal" && (
-          <button
-            type="button"
-            role="checkbox"
-            aria-checked={isDefault}
-            disabled={!canWrite || saving}
-            className="conn-policy-toggle mt-1"
-            onClick={() => setIsDefault((v) => !v)}
-          >
-            <span className="conn-policy-box" aria-hidden>
-              {isDefault ? "✓" : ""}
-            </span>
-            <span className="min-w-0 break-words">
-              {t("Default personal account for this service")}
-            </span>
-          </button>
+          <>
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={isDefault}
+              disabled={!canWrite || saving}
+              className="conn-policy-toggle mt-1"
+              onClick={() => setIsDefault((v) => !v)}
+            >
+              <span className="conn-policy-box" aria-hidden>
+                {isDefault ? "✓" : ""}
+              </span>
+              <span className="min-w-0 break-words">
+                {t("Default personal account for this service")}
+              </span>
+            </button>
+            {rosterAgents.length > 0 && (
+              <div className="mt-2 space-y-1.5 min-w-0">
+                <span className="slabel">{t("Agent access")}</span>
+                <p className="text-micro text-ink-400 break-words">
+                  {allowedAgents.length === 0
+                    ? t("All workspace agents can use this personal account on your turns. Select specific agents to restrict access.")
+                    : t("Only checked agents may call this personal account.")}
+                </p>
+                <div className="space-y-1">
+                  {rosterAgents.map((agentRow) => {
+                    const checked = allowedAgents.includes(agentRow.alias);
+                    return (
+                      <button
+                        key={agentRow.alias}
+                        type="button"
+                        role="checkbox"
+                        aria-checked={checked}
+                        disabled={!canWrite || saving}
+                        className="conn-policy-toggle"
+                        onClick={() => toggleAllowedAgent(agentRow.alias)}
+                      >
+                        <span className="conn-policy-box" aria-hidden>
+                          {checked ? "✓" : ""}
+                        </span>
+                        <span className="min-w-0 break-words num">{agentRow.alias}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
 

@@ -31,10 +31,14 @@ export function CredentialRequestCard({
   const readyToContinue = isResumableCompletedRequest(request);
   const [selectedAccount, setSelectedAccount] = useState<string>("");
   const [continuing, setContinuing] = useState(false);
-  const [resumed, setResumed] = useState(false);
+  const [resumed, setResumed] = useState(Boolean(request.resumed));
   const [resumeErr, setResumeErr] = useState<string | null>(null);
 
-  const canContinue = readyToContinue || selectedAccount !== "";
+  useEffect(() => {
+    if (request.resumed) setResumed(true);
+  }, [request.resumed]);
+
+  const canContinue = !resumed && (readyToContinue || selectedAccount !== "");
 
   const handleContinue = async () => {
     if (continuing || !canContinue) return;
@@ -198,7 +202,9 @@ export default function CredentialRequestList({
         <CredentialRequestCard
           key={request.request_id}
           request={request}
-          alternateAccounts={connections.filter((c) => c.provider === request.provider)}
+          alternateAccounts={connections.filter(
+            (c) => c.provider === request.provider && c.status.custody_available !== false,
+          )}
         />
       ))}
     </div>
@@ -214,12 +220,29 @@ export default function CredentialRequestList({
 export function RecentCredentialRequestList() {
   const t = useTranslate();
   const [requests, setRequests] = useState<CredentialRequest[] | null>(null);
+  const [connections, setConnections] = useState<Connection[]>([]);
   useEffect(() => {
     let live = true;
     api
       .credentialRequests({ limit: 20 })
       .then((reply) => {
-        if (live) setRequests(reply.requests);
+        if (!live) return;
+        setRequests(reply.requests);
+        if (
+          reply.requests.some(
+            (r) =>
+              r.state === "pending" ||
+              r.state === "submitting" ||
+              isResumableCompletedRequest(r),
+          )
+        ) {
+          api
+            .connections()
+            .then((res) => {
+              if (live) setConnections(res.connections ?? []);
+            })
+            .catch(() => {});
+        }
       })
       .catch(() => {
         if (live) setRequests([]);
@@ -239,7 +262,13 @@ export function RecentCredentialRequestList() {
       </p>
       <div className="cred-chat-list">
         {requests.map((request) => (
-          <CredentialRequestCard key={request.request_id} request={request} />
+          <CredentialRequestCard
+            key={request.request_id}
+            request={request}
+            alternateAccounts={connections.filter(
+              (c) => c.provider === request.provider && c.status.custody_available !== false,
+            )}
+          />
         ))}
       </div>
     </section>

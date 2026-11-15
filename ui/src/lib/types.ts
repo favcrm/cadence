@@ -571,6 +571,8 @@ export interface Overview {
   routine_needs?: Routine[];
   /** CAD-2317: operator-only pending staged routine/playbook proposals. */
   routine_proposals?: StagedRoutineProposal[];
+  /** CAD-2317: operator-only routine runs paused on an approval-gated checklist step. */
+  routine_step_holds?: RoutineRun[];
   generated_at: number;
 }
 
@@ -1621,6 +1623,10 @@ export interface CredentialRequest {
     custody_epoch: number | null;
     context_current: boolean;
   };
+  /** CAD-2317: durable one-shot inline chat resume projection. */
+  resumed?: boolean;
+  resumed_connection_id?: string | null;
+  resumed_message_id?: string | null;
 }
 
 /** CAD-1085: an agent's durable connection/access projection — metadata
@@ -1862,12 +1868,15 @@ export interface RoutineRun {
   approved_rev: string | null;
   approved_sha256: string | null;
   checklist_state: ChecklistStep[];
+  checklist?: ChecklistStep[];
   script_output: unknown;
   message_id: string | null;
   error: string | null;
   started_at: number;
   finished_at: number | null;
   deduped?: boolean;
+  routine_name?: string;
+  agent_alias?: string;
 }
 
 export interface Routine {
@@ -1917,6 +1926,7 @@ export interface StagedRoutineProposal {
 export interface RoutinesPayload {
   routines: Routine[];
   staged_proposals: StagedRoutineProposal[];
+  waiting_runs?: RoutineRun[];
 }
 
 export interface RoutinePayload {

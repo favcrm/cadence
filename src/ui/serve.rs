@@ -2583,6 +2583,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             if !proposals.is_empty() {
                                 overview["routine_proposals"] = json!(proposals);
                             }
+                            let step_holds: Vec<Value> =
+                                res["waiting_runs"].as_array().cloned().unwrap_or_default();
+                            if !step_holds.is_empty() {
+                                overview["routine_step_holds"] = json!(step_holds);
+                            }
                         }
                     } else if actor != "operator" {
                         let proof = read_admission

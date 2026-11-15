@@ -122,6 +122,22 @@ pub(crate) enum RoutineAction {
         #[arg(long)]
         then_markdown: Option<String>,
     },
+    /// Approve or dismiss a routine run step waiting for external write/send approval.
+    RunDecide {
+        run_id: String,
+        #[arg(long, conflicts_with = "dismiss")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        dismiss: bool,
+    },
+    /// Approve or dismiss a staged agent routine or playbook proposal.
+    ProposalDecide {
+        proposal_id: String,
+        #[arg(long, conflicts_with = "dismiss")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        dismiss: bool,
+    },
 }
 
 impl RoutineAction {
@@ -229,21 +245,35 @@ fn run_routine(state_dir: &Path, action: &RoutineAction) -> Result<i32> {
             thread,
             connection,
         } => {
+            if on_event.is_some() && (cron.is_some() || interval_mins.is_some()) {
+                return Err(Error::usage(
+                    "pass either `--on <event>` or `--cron` / `--interval-mins`, not both",
+                ));
+            }
             let mut params = json!({ "id": id });
             if let Some(v) = name {
                 params["name"] = json!(v);
             }
             if let Some(v) = cron {
+                params["trigger_kind"] = json!("schedule");
                 params["cron"] = json!(v);
+                params["interval_mins"] = Value::Null;
+                params["event_source"] = Value::Null;
             }
             if let Some(v) = interval_mins {
+                params["trigger_kind"] = json!("schedule");
                 params["interval_mins"] = json!(v);
+                params["cron"] = Value::Null;
+                params["event_source"] = Value::Null;
             }
             if let Some(v) = tz {
                 params["timezone"] = json!(v);
             }
             if let Some(v) = on_event {
+                params["trigger_kind"] = json!("event");
                 params["event_source"] = json!(v);
+                params["cron"] = Value::Null;
+                params["interval_mins"] = Value::Null;
             }
             if markdown.is_some() || script.is_some() || then_markdown.is_some() {
                 let (tk, md, sp) = resolve_target_args(markdown, script, then_markdown)?;
@@ -331,6 +361,50 @@ fn run_routine(state_dir: &Path, action: &RoutineAction) -> Result<i32> {
                     "target_kind": target_kind,
                     "markdown_path": md_path,
                     "script_path": sp_path,
+                }),
+            )?);
+        }
+        RoutineAction::RunDecide {
+            run_id,
+            approve,
+            dismiss,
+        } => {
+            let decision = match (approve, dismiss) {
+                (true, false) => "approve",
+                (false, true) => "dismiss",
+                _ => {
+                    return Err(Error::usage(
+                        "pass exactly one of `--approve` or `--dismiss`",
+                    ))
+                }
+            };
+            print_json(&rpc(
+                "routine_run_decide",
+                json!({
+                    "run_id": run_id,
+                    "decision": decision,
+                }),
+            )?);
+        }
+        RoutineAction::ProposalDecide {
+            proposal_id,
+            approve,
+            dismiss,
+        } => {
+            let decision = match (approve, dismiss) {
+                (true, false) => "approve",
+                (false, true) => "dismiss",
+                _ => {
+                    return Err(Error::usage(
+                        "pass exactly one of `--approve` or `--dismiss`",
+                    ))
+                }
+            };
+            print_json(&rpc(
+                "routine_proposal_decide",
+                json!({
+                    "proposal_id": proposal_id,
+                    "decision": decision,
                 }),
             )?);
         }

@@ -1429,7 +1429,7 @@ fn verb_for(
             return Err(unsupported(
                 "routine",
                 "--script",
-                "local workspace shell scripts cannot run in hosted Cloudflare Workers; use `--markdown wiki:<path>.md` or connect a local runner (`cadence agent watch`)",
+                "local workspace shell scripts cannot run in hosted Cloudflare Workers; run against a local workspace daemon (`cadence routine ...` without `--org`) or wait for hosted routine Worker routes",
             ));
         }
         _ => return Err(unavailable(command_path)),

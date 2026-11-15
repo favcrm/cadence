@@ -800,9 +800,27 @@ fn readiness_projection(shared: &Shared, request: &CredentialRequest) -> Value {
     }
 }
 
+pub(super) fn credential_request_ready(shared: &Shared, request: &CredentialRequest) -> bool {
+    readiness_projection(shared, request)["ready"] == true
+}
+
+fn attach_resume_projection(shared: &Shared, request: &CredentialRequest, row: &mut Value) {
+    if let Ok(Some(res)) = shared
+        .store
+        .credential_request_resolution(&request.request_id)
+    {
+        row["resumed"] = json!(true);
+        row["resumed_connection_id"] = json!(res.connection_id);
+        row["resumed_message_id"] = json!(res.message_id);
+    } else {
+        row["resumed"] = json!(false);
+    }
+}
+
 fn request_response(shared: &Shared, request: &CredentialRequest, now_ms: i64) -> Value {
     let mut row = request.to_json(now_ms);
     row["readiness"] = readiness_projection(shared, request);
+    attach_resume_projection(shared, request, &mut row);
     json!({"request": row})
 }
 
@@ -1155,6 +1173,7 @@ pub(crate) fn rpc_credential_entry(
                 .map(|row| {
                     let mut projected = row.to_json(now);
                     projected["readiness"] = readiness_projection(shared, row);
+                    attach_resume_projection(shared, row, &mut projected);
                     projected
                 })
                 .collect();

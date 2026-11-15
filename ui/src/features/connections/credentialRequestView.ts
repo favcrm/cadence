@@ -183,11 +183,14 @@ export function actionableRequests(requests: CredentialRequest[]): CredentialReq
 
 /** True when a completed credential request can resume a paused chat turn. */
 export function isResumableCompletedRequest(
-  request: Pick<CredentialRequest, "state" | "status">,
+  request: Pick<CredentialRequest, "state" | "status"> &
+    Partial<Pick<CredentialRequest, "resumed" | "readiness">>,
 ): boolean {
   return (
     request.state === "done" &&
-    (request.status === "saved" || request.status === "verified")
+    (request.status === "saved" || request.status === "verified") &&
+    !request.resumed &&
+    request.readiness?.ready !== false
   );
 }
 

@@ -25,6 +25,8 @@ pub(super) enum Route<'a> {
     Update(&'a str),
     Approve(&'a str),
     Run(&'a str),
+    RunDecide(&'a str),
+    ProposalDecide(&'a str),
     Pause(&'a str),
     Resume(&'a str),
     Remove(&'a str),
@@ -70,6 +72,22 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             };
         }
         return valid_segment(tail).then_some(Route::Show(tail));
+    }
+    if let Some(tail) = path.strip_prefix("/api/routine-runs/") {
+        if let Some((id, "decide")) = tail.split_once('/') {
+            if valid_segment(id) {
+                return Some(Route::RunDecide(id));
+            }
+        }
+        return None;
+    }
+    if let Some(tail) = path.strip_prefix("/api/routine-proposals/") {
+        if let Some((id, "decide")) = tail.split_once('/') {
+            if valid_segment(id) {
+                return Some(Route::ProposalDecide(id));
+            }
+        }
+        return None;
     }
     if let Some(tail) = path.strip_prefix("/api/connections/") {
         if let Some((id, "policy")) = tail.split_once('/') {
@@ -158,6 +176,14 @@ pub(super) fn handle_write(request: &mut Request, state_dir: &Path, route: Route
         Route::Run(id) => {
             body["id"] = json!(id);
             ("routine_run", body)
+        }
+        Route::RunDecide(id) => {
+            body["run_id"] = json!(id);
+            ("routine_run_decide", body)
+        }
+        Route::ProposalDecide(id) => {
+            body["proposal_id"] = json!(id);
+            ("routine_proposal_decide", body)
         }
         Route::Pause(id) => {
             body["id"] = json!(id);

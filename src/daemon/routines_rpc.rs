@@ -17,12 +17,11 @@
 //!   credential first (`revoke_inner_expected`), leaving zero shared secret
 //!   material attached to the personal policy.
 
-use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -238,27 +237,46 @@ impl Shared {
             return Err(Error::rejected("script_path must not be empty"));
         }
         let path = Path::new(raw);
+        let scripts_dir = self.state_dir.join("scripts");
         let full = if path.is_absolute() {
             let pm_canon = pm.dir.canonicalize()?;
-            let state_canon = self.state_dir.canonicalize()?;
-            let meta = std::fs::symlink_metadata(path)
-                .map_err(|_| Error::rejected(format!("script target '{raw}' does not exist")))?;
-            if meta.file_type().is_symlink() {
+            let scripts_canon = scripts_dir.canonicalize().ok();
+            if let Ok(rel) = path
+                .strip_prefix(&pm.dir)
+                .or_else(|_| path.strip_prefix(&pm_canon))
+            {
+                ensure_no_symlinks_under(&pm.dir, rel)?
+            } else if let Ok(rel) = path.strip_prefix(&scripts_dir).or_else(|_| {
+                scripts_canon
+                    .as_deref()
+                    .ok_or(path.strip_prefix(&scripts_dir).unwrap_err())
+                    .and_then(|sc| path.strip_prefix(sc))
+            }) {
+                ensure_no_symlinks_under(&scripts_dir, rel)?
+            } else {
                 return Err(Error::rejected(
-                    "symlinks are not permitted in routine script_path",
+                    "script_path must reside inside the workspace tracker or state_dir/scripts",
                 ));
             }
-            let canon = path
-                .canonicalize()
-                .map_err(|_| Error::rejected(format!("script target '{raw}' does not exist")))?;
-            if !canon.starts_with(&pm_canon) && !canon.starts_with(&state_canon) {
-                return Err(Error::rejected(
-                    "script_path must reside inside the workspace tracker or state directory",
-                ));
-            }
-            canon
         } else {
-            ensure_no_symlinks_under(&pm.dir, path)?
+            match ensure_no_symlinks_under(&pm.dir, path) {
+                Ok(found) => found,
+                Err(pm_err) => {
+                    if let Ok(rel) = path.strip_prefix("scripts") {
+                        if scripts_dir.is_dir() {
+                            if let Ok(found) = ensure_no_symlinks_under(&scripts_dir, rel) {
+                                found
+                            } else {
+                                return Err(pm_err);
+                            }
+                        } else {
+                            return Err(pm_err);
+                        }
+                    } else {
+                        return Err(pm_err);
+                    }
+                }
+            }
         };
         let meta = std::fs::symlink_metadata(&full)
             .map_err(|_| Error::rejected(format!("script target '{raw}' does not exist")))?;
@@ -278,7 +296,7 @@ impl Shared {
         routine_id: &str,
         due_instant: i64,
         verified_bytes: &[u8],
-    ) -> std::result::Result<Vec<u8>, String> {
+    ) -> std::result::Result<(Vec<u8>, bool), String> {
         let exec_dir = self.state_dir.join("routine-exec");
         if let Err(e) = std::fs::create_dir_all(&exec_dir) {
             return Err(format!("failed to create routine-exec dir: {e}"));
@@ -316,90 +334,65 @@ impl Shared {
             c.arg(&tmp_script);
             c
         };
+        let safe_path = std::env::var_os("PATH")
+            .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin"));
+        // Strict environment allowlist: strips DENIED_ENV, CLOUD_SECRET_ENV,
+        // SSH_AUTH_SOCK, and ambient user HOME credentials, and runs inside a
+        // dedicated process group via `proc::run_bounded_limited` so timeouts
+        // SIGKILL `-pgid` and never hang daemon pipe readers.
         cmd.current_dir(&workdir)
+            .env_clear()
+            .env("PATH", safe_path)
+            .env("LANG", "C.UTF-8")
+            .env("TZ", "UTC")
+            .env("HOME", &exec_dir)
+            .env("TMPDIR", &exec_dir)
             .env("CADENCE_ROUTINE_ID", routine_id)
-            .env("CADENCE_ROUTINE_DUE", due_instant.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match crate::reaper::spawn(&mut cmd) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_script);
-                return Err(format!("failed to spawn routine script: {e}"));
-            }
-        };
+            .env("CADENCE_ROUTINE_DUE", due_instant.to_string());
 
-        let stdout_handle = child.stdout.take().map(|mut out| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = (&mut out)
-                    .take(MAX_SCRIPT_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut buf);
-                let _ = std::io::copy(&mut out, &mut std::io::sink());
-                buf
-            })
-        });
-        let stderr_handle = child.stderr.take().map(|mut err| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = (&mut err).take(4096).read_to_end(&mut buf);
-                let _ = std::io::copy(&mut err, &mut std::io::sink());
-                buf
-            })
-        });
-
-        let deadline = Instant::now() + SCRIPT_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let _ = std::fs::remove_file(&tmp_script);
-                        if let Some(h) = stdout_handle {
-                            let _ = h.join();
-                        }
-                        if let Some(h) = stderr_handle {
-                            let _ = h.join();
-                        }
-                        return Err("routine script timed out after 30s".to_string());
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = std::fs::remove_file(&tmp_script);
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = stderr_handle {
-                        let _ = h.join();
-                    }
-                    return Err(format!("failed waiting for routine script: {e}"));
-                }
-            }
-        };
+        let outcome =
+            crate::proc::run_bounded_limited(&mut cmd, SCRIPT_TIMEOUT, MAX_SCRIPT_OUTPUT_BYTES);
         let _ = std::fs::remove_file(&tmp_script);
 
-        let stdout = stdout_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        if !status.success() {
-            let err_text = String::from_utf8_lossy(&stderr).trim().to_string();
-            let detail = if err_text.is_empty() {
-                format!("script exited with status {status}")
-            } else {
-                format!("script exited with status {status}: {err_text}")
-            };
-            return Err(detail);
+        match outcome {
+            Ok((output, _bounds)) => {
+                if output.status.code() == Some(10) {
+                    return Ok((output.stdout, true));
+                }
+                if !output.status.success() {
+                    let err_slice = &output.stderr[..output.stderr.len().min(4096)];
+                    let err_text = String::from_utf8_lossy(err_slice).trim().to_string();
+                    let detail = if err_text.is_empty() {
+                        format!("script exited with status {}", output.status)
+                    } else {
+                        format!("script exited with status {}: {err_text}", output.status)
+                    };
+                    return Err(detail);
+                }
+                Ok((output.stdout, false))
+            }
+            Err(crate::proc::BoundedError::TimedOut { .. }) => {
+                Err("routine script timed out after 30s".to_string())
+            }
+            Err(crate::proc::BoundedError::Spawn(e)) => {
+                Err(format!("failed to spawn routine script: {e}"))
+            }
+            Err(crate::proc::BoundedError::Wait(e)) => {
+                Err(format!("failed waiting for routine script: {e}"))
+            }
         }
-        Ok(stdout)
+    }
+
+    fn admit_routine_read(&self, op: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        if self.operator_connection(op, params, peer_pid).is_ok() {
+            return Ok(());
+        }
+        if let Ok(super::identity::Caller::Agent(verified)) = self.caller_identity(peer_pid) {
+            if crate::master::is_master(&verified.agent.alias) {
+                return Ok(());
+            }
+        }
+        self.operator_connection(op, params, peer_pid).map(|_| ())
     }
 
     pub(super) fn project_routine(&self, routine: &Routine) -> Result<Value> {
@@ -417,7 +410,8 @@ impl Shared {
         Ok(routine.to_json(current_rev.as_deref(), current_sha.as_deref(), thread_live))
     }
 
-    pub(super) fn rpc_routine_list(&self, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_routine_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.admit_routine_read("routine list", params, peer_pid)?;
         let agent = optional_str(params, "agent_alias").or_else(|| optional_str(params, "agent"));
         let rows = self.store.routine_list(agent)?;
         let mut routines = Vec::with_capacity(rows.len());
@@ -430,13 +424,27 @@ impl Shared {
             .into_iter()
             .map(|p| p.to_json())
             .collect::<Vec<_>>();
+        let waiting_runs = self
+            .store
+            .routine_runs_waiting_approval()?
+            .into_iter()
+            .filter(|(r, _)| agent.is_none_or(|a| r.agent_alias == a))
+            .map(|(routine, run)| {
+                let mut item = run.to_json(false);
+                item["routine_name"] = json!(routine.name);
+                item["agent_alias"] = json!(routine.agent_alias);
+                item
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "routines": routines,
             "staged_proposals": proposals,
+            "waiting_runs": waiting_runs,
         }))
     }
 
-    pub(super) fn rpc_routine_show(&self, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_routine_show(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.admit_routine_read("routine show", params, peer_pid)?;
         let id = required_str(params, "id")?;
         let routine = self.store.routine_get(id)?;
         let mut projected = self.project_routine(&routine)?;
@@ -535,6 +543,7 @@ impl Shared {
         }
         let patch = RoutineUpdate {
             name: optional_str(params, "name").map(str::to_string),
+            trigger_kind: optional_str(params, "trigger_kind").map(str::to_string),
             cron: opt_nullable_str("cron"),
             interval_mins: params.get("interval_mins").map(Value::as_i64),
             timezone: optional_str(params, "timezone").map(str::to_string),
@@ -648,6 +657,151 @@ impl Shared {
         self.execute_routine_gated(id, due_instant, now_epoch, trigger_source)
     }
 
+    fn verify_routine_connection_policy(
+        &self,
+        routine: &Routine,
+        trigger_source: &str,
+    ) -> Result<Option<(String, String)>> {
+        let is_external_event = trigger_source == "external_event"
+            || (routine.trigger_kind == "event" && trigger_source != "manual");
+        let enrolled = self.store.platform_credentials().unwrap_or_default();
+
+        if let Some(ref conn_ref) = routine.connection_account {
+            let matched = self.store.connection_credential(conn_ref)?.or_else(|| {
+                enrolled
+                    .iter()
+                    .find(|r| r.connection_id == *conn_ref || r.account == *conn_ref)
+                    .cloned()
+            });
+            let (conn_id, provider, account) = if let Some(ref rec) = matched {
+                (
+                    rec.connection_id.as_str(),
+                    rec.platform.as_str(),
+                    rec.account.as_str(),
+                )
+            } else if let Some(rest) = conn_ref.strip_prefix("acct:") {
+                let (prov, acct) = rest.split_once(':').unwrap_or(("", ""));
+                (conn_ref.as_str(), prov, acct)
+            } else {
+                (conn_ref.as_str(), "", "")
+            };
+
+            let policy = self
+                .store
+                .connection_policy_resolve(conn_id, provider, account)?;
+            if !policy.allowed_agents.is_empty()
+                && !policy
+                    .allowed_agents
+                    .iter()
+                    .any(|a| a == &routine.agent_alias)
+            {
+                return Err(Error::rejected(format!(
+                    "connection_agent_denied: agent '{}' is not permitted to use connection '{}'",
+                    routine.agent_alias, conn_id
+                )));
+            }
+            if is_external_event && policy.visibility == "shared" && !policy.allow_external_triggers
+            {
+                return Err(Error::rejected(
+                    "external_trigger_refused: shared workspace connection does not allow incoming external event triggers",
+                ));
+            }
+            let out_prov = if provider.is_empty() {
+                policy.provider.clone()
+            } else {
+                provider.to_string()
+            };
+            let out_acct = if account.is_empty() {
+                conn_id.to_string()
+            } else {
+                account.to_string()
+            };
+            return Ok(Some((out_prov, out_acct)));
+        }
+
+        // Unpinned (`Default`) connection resolution + untrusted inbound event gate.
+        let mut candidate_providers: Vec<String> = Vec::new();
+        if let Some(ref src) = routine.event_source {
+            let prefix = src
+                .split([':', '.', '/'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if !prefix.is_empty() {
+                if matches!(prefix.as_str(), "email" | "gmail" | "mail") {
+                    candidate_providers.push("smtp".to_string());
+                }
+                candidate_providers.push(prefix);
+            }
+        }
+
+        // Prefer an enrolled personal `is_default` account allowed for this agent.
+        for rec in &enrolled {
+            if !candidate_providers.is_empty()
+                && !candidate_providers.iter().any(|p| p == &rec.platform)
+            {
+                continue;
+            }
+            if let Ok(pol) = self.store.connection_policy_resolve(
+                &rec.connection_id,
+                &rec.platform,
+                &rec.account,
+            ) {
+                let agent_ok = pol.allowed_agents.is_empty()
+                    || pol.allowed_agents.iter().any(|a| a == &routine.agent_alias);
+                if pol.visibility == "personal" && pol.is_default && agent_ok {
+                    return Ok(Some((rec.platform.clone(), rec.account.clone())));
+                }
+            }
+        }
+
+        if is_external_event {
+            let all_policies = self.store.connection_policies_all().unwrap_or_default();
+            for rec in &enrolled {
+                let matches_provider = if !candidate_providers.is_empty() {
+                    candidate_providers.iter().any(|p| p == &rec.platform)
+                } else {
+                    self.store
+                        .platform_grant(&routine.agent_alias, &rec.platform, &rec.account)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                };
+                if !matches_provider {
+                    continue;
+                }
+                let pol = self.store.connection_policy_resolve(
+                    &rec.connection_id,
+                    &rec.platform,
+                    &rec.account,
+                )?;
+                if pol.visibility == "shared" && !pol.allow_external_triggers {
+                    return Err(Error::rejected(
+                        "external_trigger_refused: shared workspace connection does not allow incoming external event triggers",
+                    ));
+                }
+            }
+            for pol in &all_policies {
+                if !candidate_providers.is_empty()
+                    && !candidate_providers.iter().any(|p| p == &pol.provider)
+                {
+                    continue;
+                }
+                if candidate_providers.is_empty() {
+                    continue;
+                }
+                if pol.visibility == "shared" && !pol.allow_external_triggers {
+                    return Err(Error::rejected(
+                        "external_trigger_refused: shared workspace connection does not allow incoming external event triggers",
+                    ));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     pub(super) fn execute_routine_gated(
         self: &Arc<Self>,
         id: &str,
@@ -657,11 +811,13 @@ impl Shared {
     ) -> Result<Value> {
         let routine = self.store.routine_get(id)?;
 
-        // 1. Destination thread live check before any effect.
+        // 1. Destination thread live check before any effect (persisting
+        //    `repoint_required` so scheduled ticks do not hot-loop).
         if !self
             .store
             .destination_thread_live(routine.destination_thread.as_deref())?
         {
+            let _ = self.store.routine_mark_repoint_required(id);
             return Err(Error::rejected(
                 "repoint_required: destination thread is missing or archived",
             ));
@@ -672,23 +828,15 @@ impl Shared {
             return Err(Error::rejected("routine is paused"));
         }
 
-        // 3. Untrusted inbound event isolation on shared workspace connections.
-        if (trigger_source == "external_event"
-            || (routine.trigger_kind == "event" && trigger_source != "manual"))
-            && routine.connection_account.is_some()
-        {
-            let conn_id = routine.connection_account.as_deref().unwrap_or("");
-            let policy = self.store.connection_policy_get(conn_id, "")?;
-            if policy.visibility == "shared" && !policy.allow_external_triggers {
-                return Err(Error::rejected(
-                    "external_trigger_refused: shared workspace connection does not allow incoming external event triggers",
-                ));
-            }
-        }
+        // 3. Connection policy & untrusted inbound event isolation on shared workspace connections.
+        let resolved_connection =
+            self.verify_routine_connection_policy(&routine, trigger_source)?;
 
-        // 4. Live Markdown revision gate (zero side effects on mismatch).
+        // 4. Live Markdown revision gate (zero run/script/queue side effects on mismatch;
+        //    marks `waiting_approval` in SQLite so the scheduler stops polling).
         let verified_markdown = if routine.requires_markdown() {
             let approved_rev = routine.approved_rev.as_deref().ok_or_else(|| {
+                let _ = self.store.routine_mark_approval_drift(id);
                 Error::rejected(
                     "unapproved_revision: routine markdown target requires owner approval",
                 )
@@ -696,6 +844,7 @@ impl Shared {
             let md_path = routine.markdown_path.as_deref().unwrap_or("");
             let (text, live_rev) = self.resolve_routine_markdown(md_path)?;
             if live_rev != approved_rev {
+                let _ = self.store.routine_mark_approval_drift(id);
                 return Err(Error::rejected(format!(
                     "unapproved_revision: markdown target changed (approved '{approved_rev}', live '{live_rev}'); owner re-approval required"
                 )));
@@ -705,15 +854,17 @@ impl Shared {
             None
         };
 
-        // 5. Live Script SHA-256 digest gate (zero side effects on mismatch —
+        // 5. Live Script SHA-256 digest gate (zero run/script/queue side effects on mismatch —
         //    a modified script is NEVER spawned and records no run row).
         let verified_script = if routine.requires_script() {
             let approved_sha = routine.approved_sha256.as_deref().ok_or_else(|| {
+                let _ = self.store.routine_mark_approval_drift(id);
                 Error::rejected("unapproved_digest: routine script target requires owner approval")
             })?;
             let sp_path = routine.script_path.as_deref().unwrap_or("");
             let (bytes, live_sha) = self.resolve_routine_script(sp_path)?;
             if !live_sha.eq_ignore_ascii_case(approved_sha) {
+                let _ = self.store.routine_mark_approval_drift(id);
                 return Err(Error::rejected(format!(
                     "unapproved_digest: script digest changed (approved '{approved_sha}', live '{live_sha}'); owner re-approval required"
                 )));
@@ -746,10 +897,10 @@ impl Shared {
         let mut script_output: Option<Value> = None;
         if let Some(ref script_bytes) = verified_script {
             match self.execute_verified_script(&routine.id, due_instant, script_bytes) {
-                Ok(stdout) => {
+                Ok((stdout, exit_ten_empty)) => {
                     let (has_items, parsed) = classify_script_stdout(&stdout);
                     script_output = parsed;
-                    if !has_items {
+                    if exit_ten_empty || !has_items {
                         let finished = self.store.routine_finish_run(
                             &run.id,
                             RunOutcome::SkippedEmpty {
@@ -778,27 +929,85 @@ impl Shared {
 
         let mut message_id: Option<String> = None;
         if let Some(ref md_text) = verified_markdown {
-            if self.store.agent(&routine.agent_alias).is_ok() {
-                let mut prompt = format!(
-                    "# Routine: {}\nTarget: `{}`\n\n{}",
-                    routine.name,
-                    routine.markdown_path.as_deref().unwrap_or(""),
-                    md_text
-                );
-                if let Some(ref out) = script_output {
-                    prompt.push_str("\n\n## Script Pre-check Output\n```json\n");
-                    prompt.push_str(
-                        &serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string()),
-                    );
-                    prompt.push_str("\n```\n");
+            let agent_row = match self.store.agent(&routine.agent_alias) {
+                Ok(a) => a,
+                Err(e) => {
+                    let failed = self.store.routine_finish_run(
+                        &run.id,
+                        RunOutcome::Failed {
+                            error: format!(
+                                "target agent '{}' is unavailable: {e}",
+                                routine.agent_alias
+                            ),
+                        },
+                    )?;
+                    self.wake();
+                    return Ok(json!({
+                        "ok": false,
+                        "run": failed.to_json(false),
+                    }));
                 }
-                let mid = format!("msg-rtn-{}", uuid::Uuid::new_v4().simple());
-                if self
-                    .store
-                    .enqueue(&routine.agent_alias, &prompt, None, &mid, "user")
-                    .is_ok()
-                {
+            };
+            let mut prompt = format!(
+                "# Routine: {}\nTarget: `{}`\n",
+                routine.name,
+                routine.markdown_path.as_deref().unwrap_or(""),
+            );
+            if let Some((ref prov, ref acct)) = resolved_connection {
+                if prov.is_empty() {
+                    prompt.push_str(&format!("Connection account: `{acct}`\n"));
+                } else {
+                    prompt.push_str(&format!("Connection account: `{prov}/{acct}`\n"));
+                }
+            }
+            prompt.push('\n');
+            prompt.push_str(md_text);
+            if let Some(ref out) = script_output {
+                prompt.push_str("\n\n## Script Pre-check Output\n```json\n");
+                prompt.push_str(
+                    &serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string()),
+                );
+                prompt.push_str("\n```\n");
+            }
+            let mid = format!("msg-rtn-{}", uuid::Uuid::new_v4().simple());
+            match self.store.enqueue_steered_for_with_conversation(
+                &routine.agent_alias,
+                Some(&agent_row.uid),
+                &prompt,
+                None,
+                &mid,
+                "user",
+                None,
+                None,
+                None,
+                &crate::store::Sender::Operator,
+                &crate::store::Steer::NONE,
+                None,
+                None,
+                None,
+                routine.destination_thread.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Ok(_) => {
+                    self.notify_agent(&routine.agent_alias);
                     message_id = Some(mid);
+                }
+                Err(e) => {
+                    let failed = self.store.routine_finish_run(
+                        &run.id,
+                        RunOutcome::Failed {
+                            error: format!("failed to enqueue routine turn: {e}"),
+                        },
+                    )?;
+                    self.wake();
+                    return Ok(json!({
+                        "ok": false,
+                        "run": failed.to_json(false),
+                    }));
                 }
             }
         }
@@ -831,6 +1040,270 @@ impl Shared {
             "ok": true,
             "run": finished.to_json(false),
         }))
+    }
+
+    pub(super) fn rpc_routine_run_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("routine run decide", params, peer_pid)?;
+        let run_id = params
+            .get("run_id")
+            .or_else(|| params.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("routine run decide requires 'run_id'"))?;
+        let decision = required_str(params, "decision")?;
+        let approve = match decision {
+            "approve" | "approved" => true,
+            "dismiss" | "dismissed" | "reject" | "rejected" => false,
+            _ => {
+                return Err(Error::rejected(
+                    "routine run decision must be 'approve' or 'dismiss'",
+                ))
+            }
+        };
+
+        let existing_run = self.store.routine_run_get(run_id)?;
+        if existing_run.state != "waiting_approval" {
+            return Err(Error::rejected(format!(
+                "routine run '{run_id}' is '{}' and is not waiting for approval",
+                existing_run.state
+            )));
+        }
+        let routine = self.store.routine_get(&existing_run.routine_id)?;
+
+        let mut follow_up_msg: Option<String> = None;
+        if approve {
+            let agent_row = self.store.agent(&routine.agent_alias)?;
+            let step_labels = existing_run
+                .checklist_state
+                .iter()
+                .filter(|s| s.state == "waiting_approval" || s.requires_approval)
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = format!(
+                "Owner approved routine '{}' step(s): {}. Proceed with the approved action.",
+                routine.name,
+                if step_labels.is_empty() {
+                    "external action"
+                } else {
+                    &step_labels
+                }
+            );
+            let conv = routine
+                .destination_thread
+                .as_deref()
+                .filter(|t| self.store.destination_thread_live(Some(t)).unwrap_or(false));
+            let mid = format!("msg-rtnstep-{}", uuid::Uuid::new_v4().simple());
+            self.store.enqueue_steered_for_with_conversation(
+                &routine.agent_alias,
+                Some(&agent_row.uid),
+                &body,
+                None,
+                &mid,
+                "user",
+                None,
+                None,
+                None,
+                &crate::store::Sender::Operator,
+                &crate::store::Steer::NONE,
+                None,
+                None,
+                None,
+                conv,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            self.notify_agent(&routine.agent_alias);
+            follow_up_msg = Some(mid);
+        }
+
+        let updated = self
+            .store
+            .routine_run_decide(run_id, decision, follow_up_msg.as_deref())?;
+        self.wake();
+        Ok(json!({
+            "ok": true,
+            "run": updated.to_json(false),
+        }))
+    }
+
+    pub(super) fn rpc_routine_proposal_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("routine proposal decide", params, peer_pid)?;
+        let proposal_id = params
+            .get("proposal_id")
+            .or_else(|| params.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("routine proposal decide requires 'proposal_id'"))?;
+        let decision = required_str(params, "decision")?;
+        let approve = match decision {
+            "approve" | "approved" => true,
+            "dismiss" | "dismissed" | "reject" | "rejected" => false,
+            _ => {
+                return Err(Error::rejected(
+                    "proposal decision must be 'approve' or 'dismiss'",
+                ))
+            }
+        };
+
+        let existing = self.store.staged_proposal_get(proposal_id)?;
+        if existing.state != "pending" {
+            return Err(Error::rejected(format!(
+                "staged proposal '{proposal_id}' is already '{}'",
+                existing.state
+            )));
+        }
+
+        if !approve {
+            let decided = self.store.staged_proposal_decide(proposal_id, "dismiss")?;
+            self.wake();
+            return Ok(json!({
+                "ok": true,
+                "proposal": decided.to_json(),
+            }));
+        }
+
+        match existing.kind.as_str() {
+            "wiki_propose" => {
+                let path = existing
+                    .payload
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("wiki_propose payload is missing 'path'"))?;
+                let text = existing
+                    .payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("wiki_propose payload is missing 'text'"))?;
+                let pm = self.pm()?;
+                let write_out =
+                    crate::wiki::write(&pm, &crate::wiki::Caller::Operator, path, text, None)?;
+                if write_out["committed"] == true {
+                    self.wiki_index.kick();
+                }
+                let decided = self.store.staged_proposal_decide(proposal_id, "approve")?;
+                self.wake();
+                Ok(json!({
+                    "ok": true,
+                    "proposal": decided.to_json(),
+                    "wiki": write_out,
+                }))
+            }
+            "routine_propose" => {
+                let payload = &existing.payload;
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&existing.title)
+                    .to_string();
+                let agent_alias = payload
+                    .get("agent_alias")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::rejected("routine_propose payload is missing 'agent_alias'")
+                    })?
+                    .to_string();
+                let trigger_kind = payload
+                    .get("trigger_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("schedule")
+                    .to_string();
+                let cron = payload
+                    .get("cron")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let interval_mins = payload.get("interval_mins").and_then(Value::as_i64);
+                let timezone = payload
+                    .get("timezone")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let event_source = payload
+                    .get("event_source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let target_kind = payload
+                    .get("target_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("markdown")
+                    .to_string();
+                let markdown_path = payload
+                    .get("markdown_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let script_path = payload
+                    .get("script_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let checklist: Vec<ChecklistStep> = payload
+                    .get("checklist")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| Error::rejected(format!("invalid proposal checklist: {e}")))?
+                    .unwrap_or_default();
+
+                let mut approved_rev: Option<String> = None;
+                let mut approved_sha: Option<String> = None;
+                if matches!(target_kind.as_str(), "markdown" | "script_then_markdown") {
+                    let md = markdown_path.as_deref().ok_or_else(|| {
+                        Error::rejected("routine_propose requires 'markdown_path'")
+                    })?;
+                    let (_, live_rev) = self.resolve_routine_markdown(md)?;
+                    approved_rev = Some(live_rev);
+                }
+                if matches!(target_kind.as_str(), "script" | "script_then_markdown") {
+                    let sp = script_path
+                        .as_deref()
+                        .ok_or_else(|| Error::rejected("routine_propose requires 'script_path'"))?;
+                    let (_, live_sha) = self.resolve_routine_script(sp)?;
+                    approved_sha = Some(live_sha);
+                }
+
+                let now_epoch = crate::issue::time::now_epoch();
+                let created = self.store.routine_create(RoutineCreate {
+                    name,
+                    agent_alias,
+                    trigger_kind,
+                    cron,
+                    interval_mins,
+                    timezone,
+                    event_source,
+                    target_kind,
+                    markdown_path,
+                    script_path,
+                    destination_thread: None,
+                    connection_account: None,
+                    checklist,
+                    inputs: json!({}),
+                    now_epoch,
+                })?;
+                let activated = self.store.routine_approve(
+                    &created.id,
+                    approved_rev,
+                    approved_sha,
+                    now_epoch,
+                )?;
+                let decided = self.store.staged_proposal_decide(proposal_id, "approve")?;
+                self.wake();
+                Ok(json!({
+                    "ok": true,
+                    "proposal": decided.to_json(),
+                    "routine": self.project_routine(&activated)?,
+                }))
+            }
+            other => Err(Error::rejected(format!(
+                "unsupported proposal kind '{other}'"
+            ))),
+        }
     }
 
     pub(super) fn rpc_routine_pause(
@@ -960,7 +1433,8 @@ impl Shared {
         }))
     }
 
-    pub(super) fn rpc_connection_policy_get(&self, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_connection_policy_get(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("connection policy get", params, peer_pid)?;
         let id = params
             .get("connection_id")
             .or_else(|| params.get("id"))
@@ -1086,6 +1560,16 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("credential request continue", params, peer_pid)?;
         let request_id = required_str(params, "request_id")?;
+        if self
+            .store
+            .credential_request_resolution(request_id)?
+            .is_some()
+        {
+            return Err(Error::rejected(
+                "credential_request_already_resumed: paused reply was already continued",
+            ));
+        }
+
         let request = self
             .store
             .credential_request(request_id)?
@@ -1101,7 +1585,6 @@ impl Shared {
                 )
             })?;
 
-        // Verify either the request completed (`done` + `saved`/`verified`) or an explicit alternate enrolled connection was chosen.
         let override_supplied = optional_str(params, "connection_id").is_some();
         let request_ready =
             request.state == "done" && matches!(request.status.as_str(), "saved" | "verified");
@@ -1110,48 +1593,108 @@ impl Shared {
                 "reconnect is not complete yet; complete sign-in or choose another connected account",
             ));
         }
-        if override_supplied {
-            let alt = self
-                .store
-                .connection_credential(&chosen_connection_id)?
-                .ok_or_else(|| Error::rejected("selected alternate connection is unavailable"))?;
-            if alt.platform != request.provider {
-                return Err(Error::rejected(
-                    "selected connection belongs to a different provider",
-                ));
-            }
-        }
 
-        let mut message_id: Option<String> = None;
-        let target_alias = self
+        // Verify live enrolled credential + unlocked custody readiness (`CAD-1085`).
+        let cred = self
             .store
-            .agents()?
-            .into_iter()
-            .find(|a| Some(a.uid.as_str()) == request.target_agent_uid.as_deref())
-            .map(|a| a.alias)
-            .or_else(|| self.store.agent("master").ok().map(|a| a.alias));
-
-        if let Some(alias) = target_alias {
-            let mid = format!("msg-resume-{}", uuid::Uuid::new_v4().simple());
-            let body = format!(
-                "Connection '{}' ({}) is ready. Continue your paused reply.",
-                request.provider, chosen_connection_id
-            );
-            if self
-                .store
-                .enqueue(&alias, &body, None, &mid, "user")
-                .is_ok()
-            {
-                message_id = Some(mid);
-            }
+            .connection_credential(&chosen_connection_id)?
+            .ok_or_else(|| Error::rejected("selected connection is unavailable or revoked"))?;
+        if cred.platform != request.provider {
+            return Err(Error::rejected(
+                "selected connection belongs to a different provider",
+            ));
         }
+        if !override_supplied
+            && cred
+                .custody
+                .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+            && !super::credential_entry_rpc::credential_request_ready(self, &request)
+        {
+            return Err(Error::rejected(
+                "custody_not_ready: credential custody key is locked or protected context changed",
+            ));
+        }
+        {
+            let _admission = self.custody_operation()?;
+            crate::platform::load_credential(
+                &self.store,
+                &self.platform_custody,
+                &cred.platform,
+                &cred.account,
+            )
+            .map_err(|_| {
+                Error::rejected("custody_not_ready: credential custody is locked or unavailable")
+            })?;
+        }
+
+        let agents = self.store.agents()?;
+        let target_agent = agents
+            .iter()
+            .find(|a| {
+                a.archived_at.is_none()
+                    && (Some(a.uid.as_str()) == request.target_agent_uid.as_deref()
+                        || Some(a.uid.as_str()) == request.requester_participant.as_deref())
+            })
+            .cloned()
+            .or_else(|| {
+                self.store
+                    .agent("master")
+                    .ok()
+                    .filter(|a| a.archived_at.is_none())
+            })
+            .ok_or_else(|| {
+                Error::rejected(
+                    "target agent for paused conversation is unavailable; cannot continue reply",
+                )
+            })?;
+
+        let mid = format!("msg-resume-{}", uuid::Uuid::new_v4().simple());
+        let body = format!(
+            "Connection '{}' ({} / {}) is ready. Continue your paused reply.",
+            request.provider, cred.account, chosen_connection_id
+        );
+        let conv = request
+            .conversation_id
+            .as_deref()
+            .filter(|c| self.store.destination_thread_live(Some(c)).unwrap_or(false))
+            .or(request.conversation_id.as_deref());
+        self.store.enqueue_steered_for_with_conversation(
+            &target_agent.alias,
+            Some(&target_agent.uid),
+            &body,
+            None,
+            &mid,
+            "user",
+            None,
+            None,
+            None,
+            &crate::store::Sender::Operator,
+            &crate::store::Steer::NONE,
+            None,
+            None,
+            None,
+            conv,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        self.notify_agent(&target_agent.alias);
+        let resolution = self.store.record_credential_request_resolution(
+            request_id,
+            &chosen_connection_id,
+            &mid,
+            conv,
+        )?;
         self.wake();
         Ok(json!({
             "ok": true,
-            "request_id": request_id,
-            "connection_id": chosen_connection_id,
+            "request_id": resolution.request_id,
+            "connection_id": resolution.connection_id,
             "resumed": true,
-            "message_id": message_id,
+            "message_id": resolution.message_id,
+            "conversation_id": resolution.conversation_id,
         }))
     }
 

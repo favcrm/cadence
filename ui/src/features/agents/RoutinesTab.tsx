@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
-import type { Routine, StagedRoutineProposal } from "../../lib/types";
+import type { Connection, Routine, RoutineRun, StagedRoutineProposal } from "../../lib/types";
 import Button from "../../ui/Button";
 import DrawerShell, { type DrawerMenuItem } from "../app-shell/shared/DrawerShell";
 import type { TabContext } from "./AgentTabs";
@@ -42,7 +43,7 @@ function statusMeta(r: Routine): { label: string; tone: "ok" | "warn" | "ink" } 
 
 function scheduleSummary(r: Routine, t: (s: string) => string): string {
   if (r.trigger_kind === "event") {
-    return `${t("When")} ${r.event_source ?? t("event")}`;
+    return `${t("On event:")} ${r.event_source ?? t("event")}`;
   }
   const tz = r.timezone ?? "UTC";
   if (r.cron === "0 9 * * *") return `${t("Every day · 09:00")} (${tz})`;
@@ -74,6 +75,8 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [proposals, setProposals] = useState<StagedRoutineProposal[]>([]);
+  const [waitingRuns, setWaitingRuns] = useState<RoutineRun[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [notServed, setNotServed] = useState(false);
 
@@ -83,6 +86,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const [busy, setBusy] = useState(false);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [repointThread, setRepointThread] = useState("");
+  const [editConnAccount, setEditConnAccount] = useState("");
 
   // New routine drawer state
   const [newName, setNewName] = useState("");
@@ -97,6 +101,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const [markdownPath, setMarkdownPath] = useState("wiki:global/playbooks/triage.md");
   const [scriptPath, setScriptPath] = useState("scripts/check.sh");
   const [destThread, setDestThread] = useState("");
+  const [newConnAccount, setNewConnAccount] = useState("");
   const [createErr, setCreateErr] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -108,6 +113,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         setNotServed(false);
         setRoutines(res.routines);
         setProposals(res.staged_proposals ?? []);
+        setWaitingRuns(res.waiting_runs ?? []);
       })
       .catch((e: unknown) => {
         if (e instanceof ApiError && (e.status === 501 || e.status === 404)) {
@@ -117,6 +123,12 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         }
         setLoadErr(e instanceof ApiError ? e.message : t("Could not load routines."));
       });
+    api
+      .connections()
+      .then((res) => {
+        setConnections((res.connections ?? []).filter((conn) => conn.kind === "enrolled"));
+      })
+      .catch(() => {});
   }, [c.alias, c.operator, t]);
 
   useEffect(() => {
@@ -136,6 +148,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         if (!live) return;
         setDetail(res.routine);
         setRepointThread(res.routine.destination_thread ?? "");
+        setEditConnAccount(res.routine.connection_account ?? "");
       })
       .catch(() => {
         if (!live) return;
@@ -198,6 +211,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     setMarkdownPath("wiki:global/playbooks/triage.md");
     setScriptPath("scripts/check.sh");
     setDestThread("");
+    setNewConnAccount("");
     setCreateErr(null);
   };
 
@@ -266,6 +280,9 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     }
     if (destThread.trim()) {
       body.destination_thread = destThread.trim();
+    }
+    if (newConnAccount.trim()) {
+      body.connection_account = newConnAccount.trim();
     }
 
     setBusy(true);
@@ -358,12 +375,49 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     try {
       const res = await routinesApi.update(r.id, {
         destination_thread: repointThread.trim() ? repointThread.trim() : null,
+        connection_account: editConnAccount.trim() ? editConnAccount.trim() : null,
       });
       setDetail(res.routine);
       load();
-      c.toast("ok", t("Destination thread updated."));
+      c.toast("ok", t("Delivery settings updated."));
     } catch (e: unknown) {
-      setActionErr(e instanceof ApiError ? e.message : t("Could not update destination thread."));
+      setActionErr(e instanceof ApiError ? e.message : t("Could not update delivery settings."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const decideProposal = async (id: string, decision: "approve" | "dismiss") => {
+    if (busy) return;
+    setBusy(true);
+    setActionErr(null);
+    try {
+      const res = await routinesApi.proposalDecide(id, decision);
+      load();
+      if (decision === "approve" && res.routine) {
+        setOpenId(res.routine.id);
+      }
+      c.toast("ok", decision === "approve" ? t("Proposal approved.") : t("Proposal dismissed."));
+    } catch (e: unknown) {
+      setLoadErr(e instanceof ApiError ? e.message : t("Could not record routine proposal decision."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const decideRun = async (runId: string, decision: "approve" | "dismiss") => {
+    if (busy) return;
+    setBusy(true);
+    setActionErr(null);
+    try {
+      await routinesApi.runDecide(runId, decision);
+      if (openId) {
+        routinesApi.show(openId).then((res) => setDetail(res.routine)).catch(() => {});
+      }
+      load();
+      c.toast("ok", decision === "approve" ? t("Step approved.") : t("Step dismissed."));
+    } catch (e: unknown) {
+      setActionErr(e instanceof ApiError ? e.message : t("Could not record step decision."));
     } finally {
       setBusy(false);
     }
@@ -463,6 +517,52 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         <p className="text-label text-ink-500">{t("Loading routines…")}</p>
       ) : (
         <>
+          {waitingRuns.length > 0 && (
+            <section data-work-panel="waiting-routine-steps">
+              <div className="ap-panel-h">
+                <h3>{t("Waiting step approvals")}</h3>
+              </div>
+              <div className="ap-rows">
+                {waitingRuns.map((run) => {
+                  const waitingStep =
+                    (run.checklist_state ?? run.checklist ?? []).find(
+                      (s) => s.state === "waiting_approval",
+                    )?.label ?? t("Ask for approval first");
+                  return (
+                    <div key={run.id} className="ap-row flex-wrap gap-2">
+                      <span className="min-w-0">
+                        <b className="text-ink-100">{run.routine_name ?? run.routine_id}</b>{" "}
+                        <span className="text-warn text-micro">({waitingStep})</span>
+                      </span>
+                      {c.writable ? (
+                        <span className="flex flex-wrap items-center gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={() => void decideRun(run.id, "approve")}
+                            disabled={busy}
+                          >
+                            {t("Approve & send")}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => void decideRun(run.id, "dismiss")}
+                            disabled={busy}
+                          >
+                            {t("Dismiss")}
+                          </Button>
+                        </span>
+                      ) : (
+                        <small className="num text-warn">{t("Waiting for you")}</small>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
           {agentProposals.length > 0 && (
             <section data-work-panel="staged-routines">
               <div className="ap-panel-h">
@@ -470,14 +570,35 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
               </div>
               <div className="ap-rows">
                 {agentProposals.map((p) => (
-                  <div key={p.id} className="ap-row">
-                    <span>
+                  <div key={p.id} className="ap-row flex-wrap gap-2">
+                    <span className="min-w-0">
                       {p.title}{" "}
                       <span className="text-ink-500 text-micro">
                         ({p.kind === "wiki_propose" ? t("Playbook draft") : t("Routine draft")})
                       </span>
                     </span>
-                    <small className="num text-warn">{t("Waiting for you")}</small>
+                    {c.writable ? (
+                      <span className="flex flex-wrap items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={() => void decideProposal(p.id, "approve")}
+                          disabled={busy}
+                        >
+                          {t("Approve")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => void decideProposal(p.id, "dismiss")}
+                          disabled={busy}
+                        >
+                          {t("Dismiss")}
+                        </Button>
+                      </span>
+                    ) : (
+                      <small className="num text-warn">{t("Waiting for you")}</small>
+                    )}
                   </div>
                 ))}
               </div>
@@ -718,6 +839,25 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                   )}
 
                   <div className="rtn-field">
+                    <label htmlFor="rtn-conn-account">{t("Connection account")}</label>
+                    <select
+                      id="rtn-conn-account"
+                      className="rtn-input"
+                      value={newConnAccount}
+                      onChange={(e) => setNewConnAccount(e.target.value)}
+                    >
+                      <option value="">{t("Default account")}</option>
+                      {connections.map((conn) => (
+                        <option key={conn.id} value={conn.id}>
+                          {conn.provider} · {conn.account}
+                          {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
+                          {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="rtn-field">
                     <label htmlFor="rtn-thread">{t("Destination thread (optional)")}</label>
                     <input
                       id="rtn-thread"
@@ -902,6 +1042,26 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     </dl>
                     {c.writable && (
                       <div className="rtn-field mt-2">
+                        <label htmlFor="rtn-edit-conn">{t("Connection account")}</label>
+                        <select
+                          id="rtn-edit-conn"
+                          className="rtn-input"
+                          value={editConnAccount}
+                          onChange={(e) => setEditConnAccount(e.target.value)}
+                        >
+                          <option value="">{t("Default account")}</option>
+                          {editConnAccount &&
+                            !connections.some((conn) => conn.id === editConnAccount) && (
+                              <option value={editConnAccount}>{editConnAccount}</option>
+                            )}
+                          {connections.map((conn) => (
+                            <option key={conn.id} value={conn.id}>
+                              {conn.provider} · {conn.account}
+                              {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
+                              {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
+                            </option>
+                          ))}
+                        </select>
                         <label htmlFor="rtn-repoint">{t("Destination thread")}</label>
                         <div className="flex flex-wrap gap-2">
                           <input
@@ -917,7 +1077,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                             onClick={() => void saveRepointThread(activeRoutine)}
                             disabled={busy}
                           >
-                            {t("Save thread")}
+                            {t("Save delivery")}
                           </Button>
                         </div>
                       </div>
@@ -954,7 +1114,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                   ) : (
                     <div className="ap-rows">
                       {activeRoutine.runs.map((run) => (
-                        <div key={run.id} className="ap-row">
+                        <div key={run.id} className="ap-row flex-wrap gap-2">
                           <span className="min-w-0">
                             <b className="text-ink-200">{run.state}</b>{" "}
                             <span className="text-ink-500 text-micro">({run.trigger_source})</span>
@@ -967,7 +1127,29 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                               <span className="block text-micro text-fail break-words">{run.error}</span>
                             )}
                           </span>
-                          <small className="num">{fmtTime(run.started_at)}</small>
+                          <span className="flex flex-wrap items-center gap-1.5">
+                            {c.writable && run.state === "waiting_approval" && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="primary"
+                                  onClick={() => void decideRun(run.id, "approve")}
+                                  disabled={busy}
+                                >
+                                  {t("Approve & send")}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  onClick={() => void decideRun(run.id, "dismiss")}
+                                  disabled={busy}
+                                >
+                                  {t("Dismiss")}
+                                </Button>
+                              </>
+                            )}
+                            <small className="num">{fmtTime(run.started_at)}</small>
+                          </span>
                         </div>
                       ))}
                     </div>

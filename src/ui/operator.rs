@@ -118,6 +118,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/routines/*/update", RouteClass::OperatorOnly),
     route("POST", "/api/routines/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/routines/*/run", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/routine-runs/*/decide",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/routine-proposals/*/decide",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/routines/*/pause", RouteClass::OperatorOnly),
     route("POST", "/api/routines/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/routines/*/remove", RouteClass::OperatorOnly),

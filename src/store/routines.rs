@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS staged_routine_proposals (
     updated REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS staged_routine_proposals_state ON staged_routine_proposals(state, created DESC);
+
+CREATE TABLE IF NOT EXISTS credential_request_resolutions (
+    request_id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    conversation_id TEXT,
+    resumed_at REAL NOT NULL
+);
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,6 +289,7 @@ impl RoutineRun {
             "approved_rev": self.approved_rev,
             "approved_sha256": self.approved_sha256,
             "checklist": self.checklist_state,
+            "checklist_state": self.checklist_state,
             "script_output": self.script_output,
             "message_id": self.message_id,
             "error": self.error,
@@ -312,6 +321,7 @@ pub struct RoutineCreate {
 #[derive(Debug, Clone)]
 pub struct RoutineUpdate {
     pub name: Option<String>,
+    pub trigger_kind: Option<String>,
     pub cron: Option<Option<String>>,
     pub interval_mins: Option<Option<i64>>,
     pub timezone: Option<String>,
@@ -392,6 +402,7 @@ impl ConnectionPolicy {
             "allowed_agents": self.allowed_agents,
             "policy_revision": self.policy_revision,
             "updated": self.updated,
+            "updated_at": self.updated,
         })
     }
 }
@@ -423,6 +434,7 @@ pub struct StagedRoutineProposal {
 
 impl StagedRoutineProposal {
     pub fn to_json(&self) -> Value {
+        let decided_at = (self.state != "pending").then_some(self.updated);
         json!({
             "id": self.id,
             "kind": self.kind,
@@ -431,9 +443,20 @@ impl StagedRoutineProposal {
             "title": self.title,
             "payload": self.payload,
             "created": self.created,
+            "created_at": self.created,
             "updated": self.updated,
+            "decided_at": decided_at,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialRequestResolution {
+    pub request_id: String,
+    pub connection_id: String,
+    pub message_id: String,
+    pub conversation_id: Option<String>,
+    pub resumed_at: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -610,16 +633,25 @@ pub fn next_due_instant(
                     continue;
                 }
             }
-            if let Some(ref doms) = parsed.dom {
-                if !doms.contains(&local.day()) {
-                    continue;
+            match (&parsed.dom, &parsed.dow) {
+                (Some(doms), Some(dows)) => {
+                    let w = local.weekday().num_days_from_sunday();
+                    if !doms.contains(&local.day()) && !dows.contains(&w) {
+                        continue;
+                    }
                 }
-            }
-            if let Some(ref dows) = parsed.dow {
-                let w = local.weekday().num_days_from_sunday();
-                if !dows.contains(&w) {
-                    continue;
+                (Some(doms), None) => {
+                    if !doms.contains(&local.day()) {
+                        continue;
+                    }
                 }
+                (None, Some(dows)) => {
+                    let w = local.weekday().num_days_from_sunday();
+                    if !dows.contains(&w) {
+                        continue;
+                    }
+                }
+                (None, None) => {}
             }
             if !parsed.hours.contains(&local.hour()) {
                 continue;
@@ -989,6 +1021,9 @@ impl Store {
                 }
                 cur.name = trimmed;
             }
+            if let Some(tk) = patch.trigger_kind {
+                cur.trigger_kind = tk;
+            }
             if let Some(cron) = patch.cron {
                 cur.cron = cron;
             }
@@ -1071,16 +1106,17 @@ impl Store {
             let inputs_json = serde_json::to_string(&cur.inputs)?;
             tx.execute(
                 "UPDATE routines SET
-                    name = ?2, cron = ?3, interval_mins = ?4, timezone = ?5,
-                    event_source = ?6, target_kind = ?7, markdown_path = ?8,
-                    approved_rev = ?9, script_path = ?10, approved_sha256 = ?11,
-                    destination_thread = ?12, connection_account = ?13,
-                    checklist_json = ?14, inputs_json = ?15, status = ?16,
-                    pause_reason = ?17, next_due_at = ?18, updated = ?19
+                    name = ?2, trigger_kind = ?3, cron = ?4, interval_mins = ?5, timezone = ?6,
+                    event_source = ?7, target_kind = ?8, markdown_path = ?9,
+                    approved_rev = ?10, script_path = ?11, approved_sha256 = ?12,
+                    destination_thread = ?13, connection_account = ?14,
+                    checklist_json = ?15, inputs_json = ?16, status = ?17,
+                    pause_reason = ?18, next_due_at = ?19, updated = ?20
                  WHERE id = ?1",
                 params![
                     cur.id,
                     cur.name,
+                    cur.trigger_kind,
                     cur.cron,
                     cur.interval_mins,
                     cur.timezone,
@@ -1726,6 +1762,251 @@ impl Store {
             },
         )?)
     }
+
+    pub fn staged_proposal_get(&self, proposal_id: &str) -> Result<StagedRoutineProposal> {
+        let conn = self.conn();
+        conn.query_opt(
+            "SELECT * FROM staged_routine_proposals WHERE id = ?1",
+            params![proposal_id],
+            |row| {
+                let raw: String = row.get("payload_json")?;
+                Ok(StagedRoutineProposal {
+                    id: row.get("id")?,
+                    kind: row.get("kind")?,
+                    proposed_by: row.get("proposed_by")?,
+                    state: row.get("state")?,
+                    title: row.get("title")?,
+                    payload: serde_json::from_str(&raw).unwrap_or_else(|_| json!({})),
+                    created: row.get("created")?,
+                    updated: row.get("updated")?,
+                })
+            },
+        )?
+        .ok_or_else(|| Error::rejected(format!("staged proposal '{proposal_id}' not found")))
+    }
+
+    pub fn staged_proposal_decide(
+        &self,
+        proposal_id: &str,
+        decision: &str,
+    ) -> Result<StagedRoutineProposal> {
+        let next_state = match decision {
+            "approve" | "approved" => "approved",
+            "dismiss" | "dismissed" | "reject" | "rejected" => "dismissed",
+            _ => {
+                return Err(Error::rejected(
+                    "proposal decision must be 'approve' or 'dismiss'",
+                ))
+            }
+        };
+        let id = proposal_id.to_string();
+        let next_state = next_state.to_string();
+        self.write_tx(move |tx| {
+            let existing = tx
+                .query_opt(
+                    "SELECT * FROM staged_routine_proposals WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        let raw: String = row.get("payload_json")?;
+                        Ok(StagedRoutineProposal {
+                            id: row.get("id")?,
+                            kind: row.get("kind")?,
+                            proposed_by: row.get("proposed_by")?,
+                            state: row.get("state")?,
+                            title: row.get("title")?,
+                            payload: serde_json::from_str(&raw).unwrap_or_else(|_| json!({})),
+                            created: row.get("created")?,
+                            updated: row.get("updated")?,
+                        })
+                    },
+                )?
+                .ok_or_else(|| Error::rejected(format!("staged proposal '{id}' not found")))?;
+            if existing.state != "pending" {
+                return Err(Error::rejected(format!(
+                    "staged proposal '{id}' is already '{}'",
+                    existing.state
+                )));
+            }
+            let ts = now();
+            tx.execute(
+                "UPDATE staged_routine_proposals SET state = ?2, updated = ?3 WHERE id = ?1",
+                params![id, next_state, ts],
+            )?;
+            Ok(StagedRoutineProposal {
+                state: next_state,
+                updated: ts,
+                ..existing
+            })
+        })
+    }
+
+    pub fn routine_mark_repoint_required(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.write_tx(move |tx| {
+            tx.execute(
+                "UPDATE routines SET status = 'repoint_required', pause_reason = 'destination_thread_missing', updated = ?2 WHERE id = ?1 AND status = 'on'",
+                params![id, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn routine_mark_approval_drift(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.write_tx(move |tx| {
+            tx.execute(
+                "UPDATE routines SET status = 'waiting_approval', pause_reason = 'approval_drift', updated = ?2 WHERE id = ?1 AND status = 'on'",
+                params![id, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn routine_run_get(&self, run_id: &str) -> Result<RoutineRun> {
+        let conn = self.conn();
+        conn.query_opt(
+            "SELECT * FROM routine_runs WHERE id = ?1",
+            params![run_id],
+            row_routine_run,
+        )?
+        .ok_or_else(|| Error::rejected(format!("routine run '{run_id}' not found")))
+    }
+
+    pub fn routine_runs_waiting_approval(&self) -> Result<Vec<(Routine, RoutineRun)>> {
+        let conn = self.conn();
+        let runs = conn.query_vec(
+            "SELECT * FROM routine_runs WHERE state = 'waiting_approval' ORDER BY started_at DESC, id DESC",
+            [],
+            row_routine_run,
+        )?;
+        let mut out = Vec::with_capacity(runs.len());
+        for run in runs {
+            if let Ok(routine) = get_routine_in(&*conn, &run.routine_id) {
+                out.push((routine, run));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn routine_run_decide(
+        &self,
+        run_id: &str,
+        decision: &str,
+        follow_up_message_id: Option<&str>,
+    ) -> Result<RoutineRun> {
+        let approve = match decision {
+            "approve" | "approved" => true,
+            "dismiss" | "dismissed" | "reject" | "rejected" => false,
+            _ => {
+                return Err(Error::rejected(
+                    "routine run decision must be 'approve' or 'dismiss'",
+                ))
+            }
+        };
+        let run_id = run_id.to_string();
+        let follow_up_msg = follow_up_message_id.map(str::to_string);
+        self.write_tx(move |tx| {
+            let mut run = tx
+                .query_opt(
+                    "SELECT * FROM routine_runs WHERE id = ?1",
+                    params![run_id],
+                    row_routine_run,
+                )?
+                .ok_or_else(|| Error::rejected(format!("routine run '{run_id}' not found")))?;
+            if run.state != "waiting_approval" {
+                return Err(Error::rejected(format!(
+                    "routine run '{run_id}' is '{}' and is not waiting for approval",
+                    run.state
+                )));
+            }
+            for step in &mut run.checklist_state {
+                if step.state == "waiting_approval" || step.requires_approval {
+                    step.state = if approve {
+                        "approved".to_string()
+                    } else {
+                        "dismissed".to_string()
+                    };
+                }
+            }
+            let final_state = if approve { "completed" } else { "dismissed" };
+            let checklist_json = serde_json::to_string(&run.checklist_state)?;
+            let message_id = follow_up_msg.or(run.message_id);
+            let ts = now();
+            tx.execute(
+                "UPDATE routine_runs SET state = ?2, checklist_state_json = ?3, message_id = ?4, finished_at = ?5 WHERE id = ?1",
+                params![run_id, final_state, checklist_json, message_id, ts],
+            )?;
+            tx.execute(
+                "UPDATE routines SET last_run_state = ?2, updated = ?3 WHERE id = ?1",
+                params![run.routine_id, final_state, ts],
+            )?;
+            tx.query_opt(
+                "SELECT * FROM routine_runs WHERE id = ?1",
+                params![run_id],
+                row_routine_run,
+            )?
+            .ok_or_else(|| Error::internal("missing updated routine run"))
+        })
+    }
+
+    pub fn credential_request_resolution(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CredentialRequestResolution>> {
+        let conn = self.conn();
+        Ok(conn.query_opt(
+            "SELECT * FROM credential_request_resolutions WHERE request_id = ?1",
+            params![request_id],
+            |row| {
+                Ok(CredentialRequestResolution {
+                    request_id: row.get("request_id")?,
+                    connection_id: row.get("connection_id")?,
+                    message_id: row.get("message_id")?,
+                    conversation_id: row.get("conversation_id")?,
+                    resumed_at: row.get("resumed_at")?,
+                })
+            },
+        )?)
+    }
+
+    pub fn record_credential_request_resolution(
+        &self,
+        request_id: &str,
+        connection_id: &str,
+        message_id: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<CredentialRequestResolution> {
+        let req_id = request_id.to_string();
+        let conn_id = connection_id.to_string();
+        let msg_id = message_id.to_string();
+        let conv_id = conversation_id.map(str::to_string);
+        self.write_tx(move |tx| {
+            let existing: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM credential_request_resolutions WHERE request_id = ?1",
+                params![req_id],
+                |r| r.get(0),
+            )?;
+            if existing > 0 {
+                return Err(Error::rejected(
+                    "credential_request_already_resumed: paused reply was already continued",
+                ));
+            }
+            let ts = now();
+            tx.execute(
+                "INSERT INTO credential_request_resolutions (
+                    request_id, connection_id, message_id, conversation_id, resumed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![req_id, conn_id, msg_id, conv_id, ts],
+            )?;
+            Ok(CredentialRequestResolution {
+                request_id: req_id,
+                connection_id: conn_id,
+                message_id: msg_id,
+                conversation_id: conv_id,
+                resumed_at: ts,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1886,6 +2167,7 @@ mod tests {
                 &created.id,
                 RoutineUpdate {
                     name: None,
+                    trigger_kind: None,
                     cron: None,
                     interval_mins: None,
                     timezone: None,

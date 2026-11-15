@@ -951,6 +951,16 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "credential_request_resolutions",
+        &[
+            "request_id",
+            "connection_id",
+            "message_id",
+            "conversation_id",
+            "resumed_at",
+        ],
+    ),
+    (
         "credential_requests",
         &[
             "request_id",
@@ -3409,6 +3419,14 @@ fn classify_private_work(
         || count_where(&conn, "messages", "source='cloud_agent'")? > 0
     {
         found.push("cloud-agent state");
+    }
+    if count_where(
+        &conn,
+        "connection_policies",
+        "visibility='personal' OR owner_user_id IS NOT NULL",
+    )? > 0
+    {
+        found.push("personal connection policies");
     }
     drop(conn);
     classify_state_dir(state_dir, &mut found)?;

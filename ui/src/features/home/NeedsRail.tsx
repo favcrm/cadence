@@ -13,6 +13,9 @@ import { READ_ONLY_COPY } from "./AnswerForm";
 import TodoCard from "./TodoCard";
 import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
 import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
+import { resources } from "../../lib/resources";
+import { routinesApi } from "../agents/routinesApi";
+import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
@@ -66,8 +69,48 @@ export default function NeedsRail({
   const split = todoSplit(overview.data?.needs_me);
   const { updates, decided } = split;
   const staged = useDecisions(decisionsOn);
-  const waitingRoutines = overview.data?.routine_needs ?? [];
-  const routineProposals = overview.data?.routine_proposals ?? [];
+  const [decidedRoutineIds, setDecidedRoutineIds] = useState<Record<string, boolean>>({});
+  const [decidingRoutineId, setDecidingRoutineId] = useState<string | null>(null);
+  const [routineActionErr, setRoutineActionErr] = useState<string | null>(null);
+  const waitingRoutines = (overview.data?.routine_needs ?? []).filter(
+    (r) => !decidedRoutineIds[r.id],
+  );
+  const routineProposals = (overview.data?.routine_proposals ?? []).filter(
+    (p) => !decidedRoutineIds[p.id],
+  );
+  const routineStepHolds = (overview.data?.routine_step_holds ?? []).filter(
+    (run) => !decidedRoutineIds[run.id],
+  );
+
+  const decideProposal = async (id: string, decision: "approve" | "dismiss") => {
+    if (decidingRoutineId || readOnly) return;
+    setDecidingRoutineId(id);
+    setRoutineActionErr(null);
+    try {
+      await routinesApi.proposalDecide(id, decision);
+      setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }));
+      void resources.overview.refresh();
+    } catch {
+      setRoutineActionErr(t("Could not record routine proposal decision."));
+    } finally {
+      setDecidingRoutineId(null);
+    }
+  };
+
+  const decideStepHold = async (id: string, decision: "approve" | "dismiss") => {
+    if (decidingRoutineId || readOnly) return;
+    setDecidingRoutineId(id);
+    setRoutineActionErr(null);
+    try {
+      await routinesApi.runDecide(id, decision);
+      setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }));
+      void resources.overview.refresh();
+    } catch {
+      setRoutineActionErr(t("Could not record step decision."));
+    } finally {
+      setDecidingRoutineId(null);
+    }
+  };
   const stagedCards = useMemo(() => staged.pending.map((w) => stagedNeed(w, t)), [staged.pending, t]);
   const todo = useMemo(() => withStaged(split.todo, stagedCards), [split.todo, stagedCards]);
   // The staged detail: the ids that were waiting when it opened, and where in them it is.
@@ -138,7 +181,8 @@ export default function NeedsRail({
   const count =
     cards.filter((n) => !isDone(n)).length +
     waitingRoutines.length +
-    routineProposals.length;
+    routineProposals.length +
+    routineStepHolds.length;
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
@@ -203,11 +247,68 @@ export default function NeedsRail({
       {overview.data && cards.length === 0 && decisionsOn && staged.phase === "error" && (
         <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
-      {overview.data && cards.length === 0 && waitingRoutines.length === 0 && routineProposals.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
+      {overview.data && cards.length === 0 && waitingRoutines.length === 0 && routineProposals.length === 0 && routineStepHolds.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
         <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
       )}
-      {(waitingRoutines.length > 0 || routineProposals.length > 0) && (
+      {routineActionErr && (
+        <p className="px-3 py-2 text-micro text-fail break-words" role="alert">
+          {routineActionErr}
+        </p>
+      )}
+      {(waitingRoutines.length > 0 || routineProposals.length > 0 || routineStepHolds.length > 0) && (
         <ul className="todo-list" data-routine-needs>
+          {routineStepHolds.map((run) => {
+            const alias = run.agent_alias ?? "master";
+            const waitingStep =
+              (run.checklist_state ?? run.checklist ?? []).find(
+                (s) => s.state === "waiting_approval",
+              )?.label ?? t("Ask for approval first");
+            return (
+              <li
+                key={run.id}
+                className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0"
+              >
+                <div className="min-w-0 flex-1">
+                  <span className="block text-label font-medium text-ink-100 truncate">
+                    {run.routine_name ?? run.routine_id}
+                  </span>
+                  <span className="block text-micro text-warn truncate">
+                    {waitingStep}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  {!readOnly && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        loading={decidingRoutineId === run.id}
+                        disabled={decidingRoutineId !== null}
+                        onClick={() => void decideStepHold(run.id, "approve")}
+                      >
+                        {t("Approve & send")}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={decidingRoutineId !== null}
+                        onClick={() => void decideStepHold(run.id, "dismiss")}
+                      >
+                        {t("Dismiss")}
+                      </Button>
+                    </>
+                  )}
+                  <Link
+                    href={`/agents/${encodeURIComponent(alias)}?tab=routines`}
+                    className="btn btn-sm btn-secondary"
+                    onClick={() => setDrawer(false)}
+                  >
+                    {t("Review")}
+                  </Link>
+                </div>
+              </li>
+            );
+          })}
           {routineProposals.map((p) => {
             const alias =
               typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : "master";
@@ -217,8 +318,8 @@ export default function NeedsRail({
                 ? `/wiki/${wikiPath.replace(/^wiki:/, "")}`
                 : `/agents/${encodeURIComponent(alias)}?tab=routines`;
             return (
-              <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
-                <div className="min-w-0">
+              <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0">
+                <div className="min-w-0 flex-1">
                   <span className="block text-label font-medium text-ink-100 truncate">
                     {p.title}
                   </span>
@@ -226,13 +327,36 @@ export default function NeedsRail({
                     {p.kind === "wiki_propose" ? t("Playbook draft") : t("Routine draft")}
                   </span>
                 </div>
-                <Link
-                  href={href}
-                  className="btn btn-sm btn-secondary shrink-0"
-                  onClick={() => setDrawer(false)}
-                >
-                  {t("Review")}
-                </Link>
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  {!readOnly && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        loading={decidingRoutineId === p.id}
+                        disabled={decidingRoutineId !== null}
+                        onClick={() => void decideProposal(p.id, "approve")}
+                      >
+                        {t("Approve")}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={decidingRoutineId !== null}
+                        onClick={() => void decideProposal(p.id, "dismiss")}
+                      >
+                        {t("Dismiss")}
+                      </Button>
+                    </>
+                  )}
+                  <Link
+                    href={href}
+                    className="btn btn-sm btn-secondary"
+                    onClick={() => setDrawer(false)}
+                  >
+                    {t("Review")}
+                  </Link>
+                </div>
               </li>
             );
           })}
