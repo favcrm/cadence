@@ -6190,6 +6190,15 @@ mod cad2009_follow_closed_stdout_acceptance {
         let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (mut completed, completion) = UnixStream::pair().unwrap();
+        // CAD-2215: every page proves its reader. A numeric `--after` is a
+        // proven operator's position, so the CLI first probes one tail page
+        // for that proof before it sends the number.
+        let reader_scope = if job_events {
+            cadence_core::board_api::JOB_EVENTS_OPERATOR_SCOPE_ACK
+        } else {
+            cadence_core::board_api::AGENT_EVENTS_OPERATOR_SCOPE_ACK
+        };
+        let probe = usize::from(after.is_some());
 
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
@@ -6232,8 +6241,18 @@ mod cad2009_follow_closed_stdout_acceptance {
                         assert_eq!(request["method"], "agent_events");
                         assert_eq!(request["params"]["alias"], "SYNTHETIC");
                     }
-                    let response = match requests.len() {
-                        0 => {
+                    let response = match requests.len().checked_sub(probe) {
+                        None => {
+                            assert_eq!(request["params"]["tail"], true);
+                            assert!(request["params"].get("after").is_none(), "{request}");
+                            json!({"ok": true, "result": {
+                                "events": [],
+                                "cursor": 0,
+                                "has_older": false,
+                                "_reader_scope": reader_scope
+                            }})
+                        }
+                        Some(0) => {
                             match after {
                                 None => assert_eq!(request["params"]["tail"], true),
                                 Some(cursor) => {
@@ -6249,10 +6268,11 @@ mod cad2009_follow_closed_stdout_acceptance {
                                     "data": {}
                                 }],
                                 "cursor": 1,
-                                "has_older": false
+                                "has_older": false,
+                                "_reader_scope": reader_scope
                             }})
                         }
-                        1 => {
+                        Some(1) => {
                             assert_eq!(request["params"]["after"], 1);
                             // A regression gets a final refusal instead of
                             // hanging forever. The test still requires exit 0
@@ -6320,7 +6340,7 @@ mod cad2009_follow_closed_stdout_acceptance {
         );
         assert_eq!(
             requests.len(),
-            1,
+            1 + probe,
             "the follower requested another page after its first output encountered EPIPE \
              (job_events={job_events}, after={after:?}): {requests:?}"
         );
@@ -16010,8 +16030,8 @@ mod cad2102_paid_read_unknown {
     }
 
     /// A first receipt must prove effect=read, a strict six-scale USD price and
-    /// a non-null result; a repeated replay may be sparse and may carry an
-    /// explicit null result.
+    /// a non-null result. A repeated replay may be sparse, but since CAD-2226
+    /// it must still carry a result: a null-result replay is unknown.
     #[test]
     fn cad2102_unusable_first_receipts_are_unknown_and_a_sparse_replay_is_accepted() {
         let provider = Provider::start(vec![
@@ -16053,6 +16073,9 @@ mod cad2102_paid_read_unknown {
             })),
             Answer::Drop,
             Answer::Receipt(json!({"ok": true, "data": {"repeated": true, "result": null}})),
+            Answer::Receipt(
+                json!({"ok": true, "data": {"repeated": true, "result": { "clicks": 7 }}}),
+            ),
         ]);
         let fixture = Fixture::start(&provider.base);
         enroll(&fixture);
@@ -16109,12 +16132,30 @@ mod cad2102_paid_read_unknown {
             .key
             .strip_prefix("read-")
             .expect("the operation key carries the daemon's read- prefix");
-        let sparse = run_call(&fixture, Some(handle));
-        let _ = provider.next("the sparse replay");
+        let empty = run_call(&fixture, Some(handle));
+        let replayed = provider.next("a sparse replay with a null result");
         provider.assert_quiet();
+        assert_eq!(
+            replayed.key, seen.key,
+            "CAD-2102: the replay must reuse the lost read's key"
+        );
+        let error = assert_unknown(&empty, "a sparse replay with a null result");
+        assert!(
+            error_text(&error).contains(&seen.key),
+            "CAD-2226: the null-result replay's unknown names its key {}: {error}",
+            seen.key
+        );
+
+        let sparse = run_call(&fixture, Some(handle));
+        let replayed = provider.next("the sparse replay");
+        provider.assert_quiet();
+        assert_eq!(
+            replayed.key, seen.key,
+            "CAD-2102: the replay must reuse the lost read's key"
+        );
         assert!(
             sparse.status.success(),
-            "CAD-2102: a sparse null-result replay failed: {}",
+            "CAD-2102: a sparse replay with a result failed: {}",
             stderr(&sparse)
         );
         assert_no_credential(&sparse, "the sparse replay");
@@ -16122,10 +16163,7 @@ mod cad2102_paid_read_unknown {
             serde_json::from_slice(&sparse.stdout).expect("the sparse replay prints its result");
         let data = &value["platform_result"]["data"];
         assert_eq!(data["repeated"], json!(true));
-        assert!(
-            data.get("result").is_some_and(Value::is_null),
-            "CAD-2102: an explicit null replay result must be preserved: {value}"
-        );
+        assert_eq!(data["result"]["clicks"], json!(7), "{value}");
     }
 
     /// A direct daemon `platform_call` that bypasses the CLI cannot have its

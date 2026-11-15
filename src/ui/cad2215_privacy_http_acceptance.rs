@@ -39,6 +39,8 @@ mod cad2215_cli_privacy_http_acceptance;
 mod cad2215_stream_privacy_http_acceptance;
 #[path = "cad2215_thread_privacy_http_acceptance.rs"]
 mod cad2215_thread_privacy_http_acceptance;
+#[path = "cad2321_relay_actor_kind_http_acceptance.rs"]
+mod cad2321_relay_actor_kind_http_acceptance;
 
 #[path = "cad2215_agent_legacy_http_acceptance.rs"]
 mod cad2215_agent_legacy_http_acceptance;
