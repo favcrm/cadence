@@ -21,11 +21,17 @@ file moved out of these trees still counts; type changes and deletions included)
                                root one is all of daemon::tests, about 190
                                tests). Any other file under src/daemon/tests/
                                (not .rs), added, changed or deleted, also
-                               selects all of daemon::tests.
+                               selects all of daemon::tests, and so does every
+                               daemon change while any `path` attribute
+                               (`#[path]`, `#[cfg_attr(.., path = ..)]`) exists
+                               there: a file's path may then not be its module.
   tests/suite.rs               the single integration target (CAD-1727). Each
                                changed line maps to its enclosing `#[test]`
                                fn; a changed helper selects its enclosing
-                               `mod`. A deletion selects the items on both
+                               `mod`. Names match by suffix at a `::`
+                               boundary, so a misread enclosing module can
+                               only widen the selection, never drop a test.
+                               A deletion selects the items on both
                                sides of it. A change outside any test fn or mod
                                (top-level helper, `use`) cannot be bounded, so
                                it selects the whole `suite` binary (about 224
@@ -38,9 +44,10 @@ file moved out of these trees still counts; type changes and deletions included)
 A path under src/daemon/tests/ whose components are not plain identifiers
 (non-ASCII, quotes, backslashes, spaces) selects all of daemon::tests; such a
 name is never written to an output or a regex. Paths are read NUL-separated
-and unquoted (`-z`, `core.quotePath=false`) and include type changes.
+and unquoted (`-z`, `core.quotePath=false`).
 
-Fail closed, bounded: nothing under those two paths is dropped. An unbounded
+Fail closed, bounded: nothing added, changed, moved or deleted under those two
+paths is dropped (a deleted .rs file leaves its `mod` line to clippy). An unbounded
 change widens to one binary or one module tree, never to the full suite, and a
 selection that matches no test fails the run (`--no-tests fail`).
 Known limit: a helper is assumed to serve only the module it lives in. Today no
