@@ -861,13 +861,41 @@ pub(super) fn assemble(
         }
     }
 
-    // CAD-615: a pending permission request is the operator's to decide.
-    for req in crate::master_perm::board_requests(state_dir, now).unwrap_or_default() {
+    // CAD-615 / CAD-616: pending permission requests (master and brokered
+    // workers) are the operator's to decide; suppress redundant generic
+    // `approval` probe rows for handles already surfaced here.
+    let perm_requests = crate::master_perm::board_requests(state_dir, now).unwrap_or_default();
+    let covered: std::collections::HashSet<&str> = perm_requests
+        .iter()
+        .filter(|r| r.status == "pending")
+        .map(|r| r.id.as_str())
+        .collect();
+    if !covered.is_empty() {
+        needs.retain(|i| {
+            !(i.json["kind"].as_str() == Some("approval")
+                && i.json["request"]
+                    .as_str()
+                    .is_some_and(|h| covered.contains(h)))
+        });
+    }
+    for req in perm_requests {
         let age = (now - req.created).max(0);
         let command = req.argv.join(" ");
+        let who = if req.requested_by.is_empty() {
+            crate::master::ALIAS
+        } else {
+            req.requested_by.as_str()
+        };
+        let row_project = daemon
+            .agents
+            .iter()
+            .find(|a| a["alias"].as_str() == Some(who))
+            .map(|a| agent_project(a, &repo_paths))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| agent_project(&json!({"cwd": req.cwd}), &repo_paths));
         let title = if req.decision_label.is_empty() {
             format!(
-                "master wants to run: {command} — risk {}",
+                "{who} wants to run: {command} — risk {}",
                 match req.risk {
                     crate::master_perm::Risk::Low => "low",
                     crate::master_perm::Risk::Medium => "medium",
@@ -882,11 +910,12 @@ pub(super) fn assemble(
             "master_permission",
             &title,
             age,
-            "",
+            &row_project,
             None,
             &format!("cadence master allow-once {}", req.id),
         )
         .about("permission", &req.id)
+        .for_agent(who)
         .since(Some(req.created))
         .with_display(
             // The title is the label, else the sanitized reason (omitted
@@ -898,6 +927,9 @@ pub(super) fn assemble(
         );
         row.json["permission"] = crate::master_perm::request_json(&req);
         row.json["reason"] = json!(req.reason);
+        if who != crate::master::ALIAS {
+            row.json["agent"] = json!(who);
+        }
         needs.push(row);
     }
 

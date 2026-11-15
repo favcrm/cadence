@@ -517,6 +517,34 @@ async function main() {
       text().includes("fresh mount") && !text().includes("unmounted"),
       "Unmounted read cannot affect a new instance",
     );
+    await fresh();
+    rules = [
+      { ...sample()[0], agent: "master" },
+      { ...sample()[1], id: "allow/worker-cat", effect: "allow", agent: "worker-alpha", by: "operator" },
+    ];
+    await click(button("Refresh rules"));
+    await choose("Agent", "worker-alpha");
+    assert(
+      host.querySelectorAll("[data-rule]").length === 1 &&
+        host.querySelector('[data-agent="worker-alpha"]')?.textContent?.trim() === "worker-alpha",
+      "Agent filter narrows saved rules and displays worker alias badge",
+    );
+    await click(revoke("allow/worker-cat"));
+    assert(
+      text().includes("The agent may need permission again."),
+      "Worker allow revoke copy names agent",
+    );
+    await click(button("Confirm revoke"));
+    const lastPost = posts.at(-1);
+    assert(
+      Number(posts.length) === 1 &&
+        lastPost?.path === "/api/master/permissions/rules/allow%2Fworker-cat/revoke" &&
+        lastPost?.body === JSON.stringify({ agent: "worker-alpha" }),
+      "Worker rule revoke sends agent in POST body",
+    );
+    rules = [{ ...sample()[0], agent: "master" }];
+    lastPost!.resolve(json({ ok: true }));
+    await flush();
   }
   await React.act(async () => root.unmount());
   console.log(`permissionsWorkspace ${only ?? "all"}: PASS`);

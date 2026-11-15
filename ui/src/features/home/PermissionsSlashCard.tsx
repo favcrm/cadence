@@ -71,12 +71,15 @@ export default function PermissionsSlashCard({
     };
   }, [load]);
 
-  const confirmRevoke = (ruleId: string) => {
+  const ruleKey = (rule: MasterPermissionRule) => `${rule.agent ?? "master"}:${rule.id}`;
+
+  const confirmRevoke = (rule: MasterPermissionRule) => {
+    const key = ruleKey(rule);
     if (blocked || busyId !== null) return;
-    setBusyId(ruleId);
+    setBusyId(key);
     setActionError(null);
     api
-      .permissionRevoke(ruleId)
+      .permissionRevoke(rule.id, rule.agent && rule.agent !== "master" ? rule.agent : undefined)
       .then(() => {
         if (!alive.current) return;
         setConfirmId(null);
@@ -129,6 +132,11 @@ export default function PermissionsSlashCard({
                 data-permissions-pending={req.id}
               >
                 <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                  {req.requested_by && req.requested_by !== "master" ? (
+                    <span className="chip bg-ink-800 text-ink-300 shrink-0" data-permission-agent={req.requested_by}>
+                      <bdi>{cleanPermissionInline(req.requested_by)}</bdi>
+                    </span>
+                  ) : null}
                   <span className="chip bg-ink-800 text-ink-300 shrink-0">{t(req.risk)}</span>
                   <code className="num text-micro text-ink-200 break-all min-w-0">
                     <bdi>{cleanPermissionInline(req.command)}</bdi>
@@ -177,12 +185,14 @@ export default function PermissionsSlashCard({
           ) : (
             <ul className="divide-y divide-ink-700 rounded border border-ink-700 bg-ink-900">
               {rules.map((rule) => {
-                const confirming = confirmId === rule.id;
-                const busy = busyId === rule.id;
+                const key = ruleKey(rule);
+                const confirming = confirmId === key;
+                const busy = busyId === key;
+                const agent = rule.agent || "master";
                 const scopeText = rule.scope === "exact" ? t("Exact command") : t("Argument pattern");
                 return (
                   <li
-                    key={rule.id}
+                    key={key}
                     className="px-2.5 py-2 flex flex-wrap items-start justify-between gap-2 min-w-0"
                     data-permission-rule={rule.id}
                     onKeyDown={(e) => {
@@ -199,6 +209,9 @@ export default function PermissionsSlashCard({
                           data-effect={rule.effect}
                         >
                           {rule.effect === "allow" ? t("Allow") : t("Deny")}
+                        </span>
+                        <span className="chip bg-ink-800 text-ink-300" data-rule-agent={agent}>
+                          <bdi>{cleanPermissionInline(agent)}</bdi>
                         </span>
                         <span className="text-ink-400">{scopeText}</span>
                       </div>
@@ -225,7 +238,7 @@ export default function PermissionsSlashCard({
                             className="btn btn-sm border-fail text-fail"
                             disabled={blocked || busy}
                             data-permission-confirm-revoke={rule.id}
-                            onClick={() => confirmRevoke(rule.id)}
+                            onClick={() => confirmRevoke(rule)}
                           >
                             {busy ? t("Revoking…") : t("Confirm revoke")}
                           </button>
@@ -238,7 +251,7 @@ export default function PermissionsSlashCard({
                           data-permission-revoke={rule.id}
                           onClick={() => {
                             setActionError(null);
-                            setConfirmId(rule.id);
+                            setConfirmId(key);
                           }}
                         >
                           {t("Revoke")}

@@ -1191,13 +1191,15 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
         } else {
             "approval"
         };
-        items.push(row(
+        let mut r = row(
             20,
             "approval",
             &format!("{method} {what} for {alias}"),
             age,
             &cmd_agent_respond(alias, handle, method),
-        ));
+        );
+        r.json["request"] = json!(handle);
+        items.push(r);
     }
     items
 }

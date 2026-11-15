@@ -2435,11 +2435,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if let Err(resp) = operator::admit_operator_read(&request, state_dir, opts) {
                 send(request, resp);
             } else {
-                let resp = match client::rpc(state_dir, "master_permission_list", json!({})) {
-                    Ok(out) => json_response(out),
-                    Err(e) => home::rpc_err(&e, "master_permission_list"),
-                };
-                send(request, resp);
+                send(request, home::list_permissions(state_dir, raw_query));
             }
         }
         // The serving binary's build id and nothing else — cheap, and
@@ -2548,11 +2544,36 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             };
             match Pm::at(pm_dir) {
                 Ok(pm) => {
+                    let is_operator_viewer = actor == "operator"
+                        && operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                    if is_operator_viewer && super::project_policy::reads_every_project(&pm, &actor)
+                    {
+                        if let Some(needs) = overview["needs_me"].as_array_mut() {
+                            for row in needs.iter_mut() {
+                                if row["kind"].as_str() == Some("master_permission")
+                                    && row["project"].as_str() == Some("")
+                                {
+                                    row["project"] = Value::Null;
+                                }
+                            }
+                        }
+                    }
                     let readable = super::project_policy::readable(&pm, &actor);
                     super::project_policy::retain_overview(&mut overview, &readable);
-                    if actor == "operator"
-                        && operator::admit_operator_read(&request, state_dir, opts).is_ok()
-                    {
+                    if let Some(needs) = overview["needs_me"].as_array_mut() {
+                        if is_operator_viewer {
+                            for row in needs.iter_mut() {
+                                if row["kind"].as_str() == Some("master_permission")
+                                    && row["project"].is_null()
+                                {
+                                    row["project"] = json!("");
+                                }
+                            }
+                        } else {
+                            needs.retain(|r| r["kind"].as_str() != Some("master_permission"));
+                        }
+                    }
+                    if is_operator_viewer {
                         if let Ok(res) = crate::client::rpc(state_dir, "routine_list", json!({})) {
                             let waiting: Vec<Value> = res["routines"]
                                 .as_array()

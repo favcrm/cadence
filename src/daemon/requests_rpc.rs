@@ -67,7 +67,10 @@ impl Shared {
             Provider(Value, Value),
             /// A `request_open` brokered request: the answer is parked
             /// for the blocked `request_wait` caller instead.
-            Brokered,
+            Brokered {
+                accepted: bool,
+                reason: Option<String>,
+            },
         }
         let claim = {
             let mut map = self.pending.lock().unwrap();
@@ -82,10 +85,10 @@ impl Shared {
             };
             let method = req.method.clone();
             if method.starts_with("cadence/") {
-                let answer = match decision {
-                    Some("accept") if answers.is_none() => json!({"decision": "accept"}),
+                let (answer, accepted) = match decision {
+                    Some("accept") if answers.is_none() => (json!({"decision": "accept"}), true),
                     Some("decline") if answers.is_none() => {
-                        json!({"decision": "decline", "reason": reason})
+                        (json!({"decision": "decline", "reason": reason}), false)
                     }
                     _ => return Err(Error::rejected("Respond with decision accept or decline")),
                 };
@@ -98,7 +101,7 @@ impl Shared {
                     .unwrap()
                     .insert(handle.to_string(), (alias.clone(), answer));
                 map.remove(handle);
-                Claim::Brokered
+                Claim::Brokered { accepted, reason }
             } else {
                 let request_id = req.id.clone();
                 let request_params = req.params.clone();
@@ -163,7 +166,17 @@ impl Shared {
             }
         };
         match claim {
-            Claim::Brokered => {}
+            Claim::Brokered { accepted, reason } => {
+                if let Ok(Some(_)) = crate::master_perm::settle_from_respond(
+                    &self.state_dir,
+                    handle,
+                    accepted,
+                    reason.as_deref(),
+                    crate::master_perm::clock(),
+                ) {
+                    self.bump_master_rev();
+                }
+            }
             Claim::Provider(request_id, response) => {
                 let adapter = self
                     .lifecycle
@@ -248,6 +261,11 @@ impl Shared {
             return Err(Self::foreign_request("request_open", &caller, &alias));
         }
         let agent = self.store.agent(&alias)?;
+        if agent.role == "reviewer" {
+            return Err(Error::rejected(
+                "reviewer sessions are read-only and cannot open tool approval requests",
+            ));
+        }
         let brokered = agent
             .params
             .as_ref()
@@ -282,6 +300,55 @@ impl Shared {
                  effect — a handle belongs to one request (CAD-506)"
             )));
         }
+        // Check existing handle ownership before policy evaluation so retries
+        // or CAD-452 foreign handle collisions resolve without duplicate I/O.
+        if let Some(existing) = self.held_handle_response(&handle, &alias)? {
+            return Ok(existing);
+        }
+        let pending_perm = if kind == "approval" && !crate::master::is_master(&alias) {
+            let pm_dir = self.pm().ok().map(|pm| pm.dir);
+            let cwd_buf = optional_str(params, "cwd")
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| (!agent.cwd.is_empty()).then(|| std::path::PathBuf::from(&agent.cwd)))
+                .unwrap_or_else(|| pm_dir.clone().unwrap_or_else(|| self.state_dir.clone()));
+            let (_checkouts, states) = self.perm_roots();
+            let state_refs = Self::perm_states(&states);
+            match crate::master_perm::evaluate_worker(
+                &self.state_dir,
+                pm_dir.as_deref(),
+                &alias,
+                &handle,
+                tool,
+                &input,
+                input_summary,
+                &cwd_buf,
+                &state_refs,
+                crate::master_perm::clock(),
+            )? {
+                crate::master_perm::WorkerEval::Allowed { rule_id, argv, cwd } => {
+                    self.audit_perm(
+                        "permission_used",
+                        json!({
+                            "kind": "rule",
+                            "rule_id": rule_id,
+                            "agent": alias,
+                            "handle": handle,
+                            "argv": argv,
+                            "cwd": cwd,
+                        }),
+                    );
+                    return Ok(json!({
+                        "request": handle,
+                        "state": "answered",
+                        "answer": {"decision": "accept"},
+                    }));
+                }
+                crate::master_perm::WorkerEval::Pending(req) => Some(req),
+            }
+        } else {
+            None
+        };
         // A handle names one agent's request until that agent's wait
         // collects the answer (CAD-452). `agent respond` parks the
         // answer and drops the pending entry, so the mailbox is checked
@@ -293,24 +360,8 @@ impl Shared {
         {
             let mut pending = self.pending.lock().unwrap();
             let answered = self.answered.lock().unwrap();
-            let held = pending
-                .get(&handle)
-                .map(|req| (&req.alias, "waiting_input", "already pending for"))
-                .or_else(|| {
-                    answered
-                        .get(&handle)
-                        .map(|(owner, _)| (owner, "answered", "holding an answer parked for"))
-                });
-            if let Some((owner, state, what)) = held {
-                if *owner == alias {
-                    // The owner's retry: its wait collects any answer.
-                    return Ok(json!({"request": handle, "state": state, "existing": true}));
-                }
-                return Err(Error::rejected(format!(
-                    "request_open refused: handle '{handle}' is {what} '{owner}' — a \
-                     handle names one agent's request until that agent's wait collects \
-                     its answer (CAD-452)"
-                )));
+            if let Some(existing) = Self::check_held_handle(&pending, &answered, &handle, &alias)? {
+                return Ok(existing);
             }
             drop(answered);
             pending.insert(
@@ -324,6 +375,12 @@ impl Shared {
                     params: json!({"kind": kind, "tool": tool,
                                "input_summary": input_summary, "input": input}),
                 },
+            );
+        }
+        if let Some(req) = &pending_perm {
+            self.audit_perm(
+                "permission_requested",
+                crate::master_perm::request_json(req),
             );
         }
         // Requests only arrive mid-turn; relax/stop may have moved the
@@ -345,29 +402,32 @@ impl Shared {
         );
         // An upstream PM gets exactly one notice naming the agent and
         // the respond command — deterministic id, so a retried open
-        // can never double-notify.
+        // can never double-notify. Master handles operator-only
+        // permissions via the board rather than waking a turn.
         if let Some(pm) = self.upstream_of(&alias) {
-            let delivery = Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                format!("cadence-notice:request:{handle}").as_bytes(),
-            )
-            .simple()
-            .to_string();
-            let payload = json!({"request": handle, "worker": alias,
-                                 "tool": tool, "input_summary": input_summary});
-            let body = format!(
-                "A managed worker is waiting on a tool-permission decision. This is an \
-                 informational notice, not a result; do not treat it as worker output. \
-                 Answer it with `cadence agent respond {alias} --request {handle} \
-                 --decision accept|decline [--reason \"why\"]` — `cadence agent requests \
-                 {alias}` shows the full input. {payload}"
-            );
-            if self
-                .store
-                .enqueue_task(&pm, &body, None, &delivery, "worker_notice", None)
-                .is_ok()
-            {
-                self.notify_agent(&pm);
+            if !crate::master::is_master(&pm) {
+                let delivery = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("cadence-notice:request:{handle}").as_bytes(),
+                )
+                .simple()
+                .to_string();
+                let payload = json!({"request": handle, "worker": alias,
+                                     "tool": tool, "input_summary": input_summary});
+                let body = format!(
+                    "A managed worker is waiting on a tool-permission decision. This is an \
+                     informational notice, not a result; do not treat it as worker output. \
+                     Answer it with `cadence agent respond {alias} --request {handle} \
+                     --decision accept|decline [--reason \"why\"]` — `cadence agent requests \
+                     {alias}` shows the full input. {payload}"
+                );
+                if self
+                    .store
+                    .enqueue_task(&pm, &body, None, &delivery, "worker_notice", None)
+                    .is_ok()
+                {
+                    self.notify_agent(&pm);
+                }
             }
         }
         // An open request counts as provider activity — a worker
@@ -488,6 +548,14 @@ impl Shared {
             pending.remove(handle).map(|req| req.alias)
         };
         if let Some(alias) = alias {
+            if !crate::master::is_master(&alias) {
+                let _ = crate::master_perm::expire_by_id(
+                    &self.state_dir,
+                    handle,
+                    crate::master_perm::clock(),
+                );
+                self.bump_master_rev();
+            }
             self.relax_waiting(&alias);
             let _ = self
                 .store
@@ -502,5 +570,77 @@ impl Shared {
         }
         self.wake();
         Ok(json!({"state": "closed"}))
+    }
+
+    fn check_held_handle(
+        pending: &std::collections::HashMap<String, PendingRequest>,
+        answered: &std::collections::HashMap<String, (String, Value)>,
+        handle: &str,
+        alias: &str,
+    ) -> Result<Option<Value>> {
+        let held = pending
+            .get(handle)
+            .map(|req| (&req.alias, "waiting_input", "already pending for"))
+            .or_else(|| {
+                answered
+                    .get(handle)
+                    .map(|(owner, _)| (owner, "answered", "holding an answer parked for"))
+            });
+        let Some((owner, state, what)) = held else {
+            return Ok(None);
+        };
+        if owner == alias {
+            return Ok(Some(
+                json!({"request": handle, "state": state, "existing": true}),
+            ));
+        }
+        Err(Error::rejected(format!(
+            "request_open refused: handle '{handle}' is {what} '{owner}' — a \
+             handle names one agent's request until that agent's wait collects \
+             its answer (CAD-452)"
+        )))
+    }
+
+    fn held_handle_response(&self, handle: &str, alias: &str) -> Result<Option<Value>> {
+        let pending = self.pending.lock().unwrap();
+        let answered = self.answered.lock().unwrap();
+        Self::check_held_handle(&pending, &answered, handle, alias)
+    }
+
+    /// Park the answer for an operator-decided brokered worker permission
+    /// request and wake `request_wait`.
+    pub(super) fn settle_brokered_permission(
+        &self,
+        alias: &str,
+        handle: &str,
+        accept: bool,
+        reason: Option<String>,
+    ) {
+        let settled = {
+            let mut pending = self.pending.lock().unwrap();
+            let mut answered = self.answered.lock().unwrap();
+            if pending
+                .get(handle)
+                .is_some_and(|r| r.alias == alias && r.method.starts_with("cadence/"))
+            {
+                let answer = if accept {
+                    json!({"decision": "accept"})
+                } else {
+                    json!({"decision": "decline", "reason": reason})
+                };
+                answered.insert(handle.to_string(), (alias.to_string(), answer));
+                pending.remove(handle);
+                true
+            } else {
+                false
+            }
+        };
+        if settled {
+            self.relax_waiting(alias);
+            let _ = self
+                .store
+                .event_public(alias, "input_answered", json!({"request": handle}));
+            self.wake();
+        }
     }
 }

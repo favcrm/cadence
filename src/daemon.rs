@@ -5856,6 +5856,8 @@ fn pm_dir_of_with(
 }
 
 #[cfg(test)]
+mod cad616_worker_permission_refusal_acceptance;
+#[cfg(test)]
 mod tests;
 
 /// Content hash for spec-drift detection — the same value the CLI

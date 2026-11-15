@@ -168,6 +168,7 @@ async function main() {
   const React = require("react") as typeof import("react");
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const { TurnBar } = require("../src/features/app-shell/chat/TurnBar") as typeof import("../src/features/app-shell/chat/TurnBar");
+  const { turnBarState } = require("../src/features/app-shell/chat/turnBarState") as typeof import("../src/features/app-shell/chat/turnBarState");
   const {
     default: PermissionCard,
     PermissionEnabledContext,
@@ -678,6 +679,94 @@ async function main() {
     "ThreadPermission under PermissionEnabledContext=false makes zero /api/master/permissions calls",
   );
   assert(host.querySelector("[data-permission-thread='perm-disabled']") !== null, "ThreadPermission still renders message text when disabled");
+
+  // ---- 10. CAD-616: worker attribution, idle turnBarState approval, and agent-scoped revoke ----
+  assert(
+    rejectReplyPrompt("git status", "worker-1") === "For worker-1, instead of `git status`: ",
+    "worker rejectReplyPrompt names worker alias",
+  );
+  assert(
+    rejectReplyPrompt("echo `hi`", "worker-1") === 'For worker-1, instead of "echo `hi`": ',
+    "worker rejectReplyPrompt falls back to quotes when command contains backtick",
+  );
+  assert(
+    turnBarState(
+      { master: null, entries: [], pendingMessages: [], awaitingApproval: true, reconnecting: false },
+      "conv-home",
+    ).kind === "approval",
+    "idle turnBarState returns approval when awaitingApproval is true",
+  );
+
+  await render(
+    React.createElement(TurnBar, {
+      state: { kind: "approval" },
+      reconnecting: false,
+      actions: { onReview: () => undefined },
+      permission: {
+        request: { ...makeReq("perm-w1", "ls -la", null), requested_by: "worker-1" },
+        readOnly: false,
+        onRejectAndReply: () => undefined,
+        onFocusComposer: () => undefined,
+      },
+    }),
+  );
+  assert(
+    host.querySelector("[data-turn-agent='worker-1']")?.textContent?.trim() === "worker-1",
+    "TurnBar renders worker attribution chip",
+  );
+
+  await render(
+    React.createElement(PermissionCard, {
+      card: cardFromRequest({ ...makeReq("perm-w2", "git diff", null), requested_by: "worker-1" }),
+      readOnly: false,
+      onDone: () => undefined,
+    }),
+  );
+  assert(
+    host.querySelector("[data-permission-agent='worker-1']")?.textContent?.trim() === "worker-1",
+    "PermissionCard renders worker attribution chip",
+  );
+  assert(
+    (host.querySelector("[data-permission-reason]")?.textContent ?? "").includes("Tool request:"),
+    "PermissionCard uses Tool request label for worker requests",
+  );
+
+  savedRules.push({
+    id: "rule-w1",
+    effect: "allow",
+    scope: "exact",
+    argv: ["ls", "-la"],
+    tail: [],
+    cwd: "/repo",
+    agent: "worker-1",
+    by: "operator",
+    at: 1700000200,
+  } as (typeof savedRules)[number] & { agent: string });
+  permGetMode = "ok";
+  permPostStatus = 200;
+  calls.length = 0;
+  await render(React.createElement(PermissionsSlashCard, { readOnly: false }));
+  assert(
+    host.querySelector("[data-rule-agent='worker-1']")?.textContent?.trim() === "worker-1",
+    "PermissionsSlashCard renders worker badge on worker rule",
+  );
+  const w1Revoke = host.querySelector<HTMLButtonElement>("[data-permission-revoke='rule-w1']");
+  assert(w1Revoke !== null, "Worker rule revoke button present");
+  await React.act(async () => { w1Revoke.click(); });
+  await settle();
+  const w1Confirm = host.querySelector<HTMLButtonElement>("[data-permission-confirm-revoke='rule-w1']");
+  assert(w1Confirm !== null, "Worker rule confirm revoke button present");
+  await React.act(async () => { w1Confirm.click(); });
+  await settle();
+  assert(
+    calls.some(
+      (c) =>
+        c.method === "POST"
+        && c.path === "/api/master/permissions/rules/rule-w1/revoke"
+        && JSON.stringify(c.body) === JSON.stringify({ agent: "worker-1" }),
+    ),
+    "PermissionsSlashCard passes agent in revoke POST body",
+  );
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

@@ -11,19 +11,22 @@ import { cleanPermissionInline, cleanPermissionReason } from "./permissionFormat
  * `PermissionCard` surfaces (`ThreadPermission`, `TodoCard`, and `/permissions`)
  * without prop-drilling.
  */
-export const PermissionReplyContext = createContext<((argv: string) => void) | null>(null);
+export const PermissionReplyContext = createContext<((argv: string, requestedBy?: string) => void) | null>(null);
 
 /** Gates legacy in-thread `ThreadPermission` rule fetches on non-hosted boards. */
 export const PermissionEnabledContext = createContext<boolean>(true);
 
 /** Formats the steering prefix seeded into the chat composer on reject-and-reply. */
-export function rejectReplyPrompt(command: string): string {
-  return command.includes("`") ? `Instead of "${command}": ` : `Instead of \`${command}\`: `;
+export function rejectReplyPrompt(command: string, requestedBy?: string): string {
+  const quoted = command.includes("`") ? `instead of "${command}": ` : `instead of \`${command}\`: `;
+  return requestedBy && requestedBy !== "master"
+    ? `For ${cleanPermissionInline(requestedBy)}, ${quoted}`
+    : `I${quoted.slice(1)}`;
 }
 
 /** Appends a reject-and-reply prompt while preserving any existing unsent text. */
-export function appendRejectReplyDraft(existing: string, command: string): string {
-  const prompt = rejectReplyPrompt(command);
+export function appendRejectReplyDraft(existing: string, command: string, requestedBy?: string): string {
+  const prompt = rejectReplyPrompt(command, requestedBy);
   return existing.trim() ? `${existing.trimEnd()}\n${prompt}` : prompt;
 }
 
@@ -46,6 +49,7 @@ export interface PermissionCardData {
   cwd: string;
   reason: string;
   risk: string;
+  requestedBy?: string;
   prefix: string[] | null;
   status: string;
   decisionLabel: string;
@@ -59,15 +63,24 @@ const REASON_CAP = 2000;
  * Allow (never refused, never clamped). Only characters that cannot be
  * seen are removed.
  */
-export function ReasonBlock({ reason, label = "Master says:" }: { reason: string; label?: string }) {
+export function ReasonBlock({
+  reason,
+  label,
+  requestedBy,
+}: {
+  reason: string;
+  label?: string;
+  requestedBy?: string;
+}) {
   const t = useTranslate();
   const [more, setMore] = useState(false);
   const text = cleanPermissionReason(reason);
   const long = text.length > REASON_CAP;
   const shown = long && !more ? text.slice(0, REASON_CAP) : text;
+  const effectiveLabel = label ?? (requestedBy && requestedBy !== "master" ? "Tool request:" : "Master says:");
   return (
     <div className="rounded border border-ink-700 bg-ink-900 px-2 py-1.5 min-w-0" data-permission-reason>
-      <p className="text-micro text-ink-400">{t(label)}</p>
+      <p className="text-micro text-ink-400">{t(effectiveLabel)}</p>
       <p
         className={`text-label text-ink-300 whitespace-pre-wrap break-words ${more ? "max-h-[50vh] overflow-y-auto" : ""}`}
         tabIndex={more ? 0 : undefined}
@@ -104,7 +117,7 @@ export default function PermissionCard({
   /** The To do card (CAD-1216): the whole reason in words and Allow once /
    *  Always / Deny. The command and folder live under Details. */
   compact?: boolean;
-  onRejectAndReply?: (argv: string) => void;
+  onRejectAndReply?: (argv: string, requestedBy?: string) => void;
 }) {
   const t = useTranslate();
   const gateBlock = useContext(WriteGate);
@@ -118,6 +131,7 @@ export default function PermissionCard({
   const [rejectOpen, setRejectOpen] = useState(false);
   const decided = card.status !== "pending";
   const act = compact ? "btn btn-sm" : "lnk text-label";
+  const isWorker = Boolean(card.requestedBy && card.requestedBy !== "master");
   const primary = compact ? "btn btn-sm btn-primary" : "lnk text-label";
   const run = (work: () => Promise<unknown>, what: string, after?: () => void) => {
     if (blocked || busy) return;
@@ -147,6 +161,11 @@ export default function PermissionCard({
       {compact ? null : (
         <>
           <p className="text-micro text-ink-300 break-all">
+            {isWorker ? (
+              <span className="chip bg-ink-800 text-ink-300 mr-1" data-permission-agent={card.requestedBy}>
+                <bdi>{cleanPermissionInline(card.requestedBy!)}</bdi>
+              </span>
+            ) : null}
             <span className="chip bg-ink-800 text-ink-300 mr-1">{t(card.risk)}</span>
             <bdi>{cleanPermissionInline(card.argv)}</bdi>
           </p>
@@ -157,12 +176,22 @@ export default function PermissionCard({
           ) : null}
         </>
       )}
-      {compact && card.risk !== "low" ? (
-        <p className="text-micro text-warn" data-permission-risk={card.risk}>
-          {card.risk === "high" ? t("High risk") : t("Some risk")}: {t("Master wants to run a command that can change or delete things.")}
+      {compact && isWorker ? (
+        <p className="text-micro text-ink-300">
+          <span className="chip bg-ink-800 text-ink-300 mr-1" data-permission-agent={card.requestedBy}>
+            <bdi>{cleanPermissionInline(card.requestedBy!)}</bdi>
+          </span>
         </p>
       ) : null}
-      {card.reason ? <ReasonBlock reason={card.reason} /> : null}
+      {compact && card.risk !== "low" ? (
+        <p className="text-micro text-warn" data-permission-risk={card.risk}>
+          {card.risk === "high" ? t("High risk") : t("Some risk")}:{" "}
+          {isWorker
+            ? t("An agent wants to run a command that can change or delete things.")
+            : t("Master wants to run a command that can change or delete things.")}
+        </p>
+      ) : null}
+      {card.reason ? <ReasonBlock reason={card.reason} requestedBy={card.requestedBy} /> : null}
       {decided ? (
         <p className="text-micro text-ok" data-permission-decided>
           <bdi>{cleanPermissionInline(t(card.decisionLabel || card.status))}</bdi>
@@ -243,7 +272,9 @@ export default function PermissionCard({
               className={act}
               disabled={blocked || busy}
               data-permission-reject-reply
-              onClick={() => run(() => api.permissionReject(card.id, false), "Rejected", () => reply(card.argv))}
+              onClick={() =>
+                run(() => api.permissionReject(card.id, false), "Rejected", () => reply(card.argv, card.requestedBy))
+              }
             >
               {t("Reject & reply…")}
             </button>
@@ -280,6 +311,7 @@ export function cardFromRequest(req: MasterPermissionRequest): PermissionCardDat
     cwd: req.cwd,
     reason: req.reason,
     risk: req.risk,
+    requestedBy: req.requested_by ?? "master",
     prefix: req.prefix,
     status: req.status,
     decisionLabel: req.decision_label ?? "",

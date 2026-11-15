@@ -182,6 +182,11 @@ export function TurnBar({
         detailNode = (
           <span className="tb-detail tb-detail-perm">
             {reconnecting ? `${t("last known")} · ` : ""}
+            {req.requested_by && req.requested_by !== "master" ? (
+              <span className="chip bg-ink-800 text-ink-300 tb-agent" data-turn-agent={req.requested_by}>
+                <bdi>{cleanPermissionInline(req.requested_by)}</bdi>
+              </span>
+            ) : null}
             <span className="chip bg-ink-800 text-ink-300 tb-risk" data-turn-risk={req.risk}>
               {t(req.risk)}
             </span>

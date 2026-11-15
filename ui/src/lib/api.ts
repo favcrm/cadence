@@ -554,6 +554,7 @@ export interface MasterPermissionRequest {
   reason: string;
   risk: string;
   status: string;
+  requested_by?: string;
   decision_label?: string;
   expires_at: number;
   prefix: string[] | null;
@@ -566,6 +567,7 @@ export interface MasterPermissionRule {
   argv: string[];
   tail: string[];
   cwd: string;
+  agent?: string;
   by: string;
   at: number;
 }
@@ -1135,10 +1137,15 @@ export const api = {
     post<Record<string, unknown>>(`/api/master/permissions/${encodeURIComponent(id)}/reject`, {
       dont_ask_again: dontAskAgain,
     }),
-  permissionRules: () =>
-    get<{ requests: MasterPermissionRequest[]; rules: MasterPermissionRule[] }>("/api/master/permissions"),
-  permissionRevoke: (id: string) =>
-    post<Record<string, unknown>>(`/api/master/permissions/rules/${encodeURIComponent(id)}/revoke`, {}),
+  permissionRules: (agent?: string) =>
+    get<{ requests: MasterPermissionRequest[]; rules: MasterPermissionRule[] }>(
+      agent ? `/api/master/permissions?agent=${encodeURIComponent(agent)}` : "/api/master/permissions",
+    ),
+  permissionRevoke: (id: string, agent?: string) =>
+    post<Record<string, unknown>>(
+      `/api/master/permissions/rules/${encodeURIComponent(id)}/revoke`,
+      agent ? { agent } : {},
+    ),
   needDecide: (verb: "snooze" | "dismiss", kind: string, id: string, secs?: number) =>
     post<Record<string, unknown>>(
       `/api/needs/${verb}`,

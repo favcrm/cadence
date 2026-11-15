@@ -1430,7 +1430,7 @@ impl Shared {
         }
     }
 
-    fn perm_roots(&self) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    pub(super) fn perm_roots(&self) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
         let mut states = vec![self.state_dir.clone()];
         if let Ok(prod) = crate::home::state_default() {
             if prod != self.state_dir {
@@ -1453,11 +1453,11 @@ impl Shared {
         (checkouts, states)
     }
 
-    fn perm_states(states: &[std::path::PathBuf]) -> Vec<&std::path::Path> {
+    pub(super) fn perm_states(states: &[std::path::PathBuf]) -> Vec<&std::path::Path> {
         states.iter().map(std::path::PathBuf::as_path).collect()
     }
 
-    fn audit_perm(&self, kind: &str, payload: Value) {
+    pub(super) fn audit_perm(&self, kind: &str, payload: Value) {
         let _ = self.store.event_public(PERM_AUDIT_STREAM, kind, payload);
         // CAD-1700: every audited permission change (ask, decide, revoke)
         // moves the master push stamp; the store write it follows is done.
@@ -1609,24 +1609,29 @@ impl Shared {
             &state_refs,
             crate::master_perm::clock(),
         )?;
+        let owner = req.requested_by.clone();
         let body = crate::master_perm::request_json(&req);
         self.audit_perm(
             "permission_decided",
-            json!({"id": id, "decision": "allow_once", "argv": req.argv}),
+            json!({"id": id, "decision": "allow_once", "agent": owner, "argv": req.argv}),
         );
-        self.tell_master(
-            &format!("decision/{id}"),
-            &format!(
-                "Operator allowed once: `{}` ({id}). Retry that exact command.",
-                req.argv.join(" ")
-            ),
-        );
+        if owner == ALIAS {
+            self.tell_master(
+                &format!("decision/{id}"),
+                &format!(
+                    "Operator allowed once: `{}` ({id}). Retry that exact command.",
+                    req.argv.join(" ")
+                ),
+            );
+        } else {
+            self.settle_brokered_permission(&owner, id, true, None);
+        }
         self.wake();
         Ok(body)
     }
 
     /// `master_permission_always` — operator only. Saves a rule to
-    /// `agents/master/permissions.yaml` and commits it as the operator.
+    /// `agents/<agent>/permissions.yaml` and commits it as the operator.
     pub(super) fn rpc_master_permission_always(
         &self,
         params: &Value,
@@ -1655,27 +1660,32 @@ impl Shared {
             &state_refs,
             crate::master_perm::clock(),
         )?;
+        let owner = req.requested_by.clone();
         let pm = self.pm()?;
-        if let Err(e) = self.persist_rule(&pm, rule.clone()) {
+        if let Err(e) = self.persist_rule(&pm, &owner, rule.clone()) {
             let _ = crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
             return Err(e);
         }
         let body = json!({
             "request": crate::master_perm::request_json(&req),
-            "rule": crate::master_perm::rule_json(&rule),
+            "rule": crate::master_perm::rule_json_for(&rule, &owner),
         });
         self.audit_perm(
             "permission_decided",
-            json!({"id": id, "decision": "always", "rule": body["rule"].clone()}),
+            json!({"id": id, "decision": "always", "agent": owner, "rule": body["rule"].clone()}),
         );
-        self.tell_master(
-            &format!("decision/{id}"),
-            &format!(
-                "Operator always-allowed `{}` as rule {}.",
-                req.argv.join(" "),
-                rule.id
-            ),
-        );
+        if owner == ALIAS {
+            self.tell_master(
+                &format!("decision/{id}"),
+                &format!(
+                    "Operator always-allowed `{}` as rule {}.",
+                    req.argv.join(" "),
+                    rule.id
+                ),
+            );
+        } else {
+            self.settle_brokered_permission(&owner, id, true, None);
+        }
         self.wake();
         Ok(body)
     }
@@ -1690,11 +1700,13 @@ impl Shared {
         self.operator_connection("master reject", params, peer_pid)?;
         let id = required_str(params, "id")?;
         let dont = params["dont_ask_again"].as_bool().unwrap_or(false);
+        let reason = optional_str(params, "reason").map(str::to_string);
         let (req, rule) =
             crate::master_perm::reject(&self.state_dir, id, dont, crate::master_perm::clock())?;
+        let owner = req.requested_by.clone();
         if let Some(rule) = &rule {
             let pm = self.pm()?;
-            if let Err(e) = self.persist_rule(&pm, rule.clone()) {
+            if let Err(e) = self.persist_rule(&pm, &owner, rule.clone()) {
                 let _ =
                     crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
                 return Err(e);
@@ -1702,20 +1714,24 @@ impl Shared {
         }
         self.audit_perm(
             "permission_decided",
-            json!({"id": id, "decision": "reject", "dont_ask_again": dont, "argv": req.argv}),
+            json!({"id": id, "decision": "reject", "agent": owner, "dont_ask_again": dont, "argv": req.argv}),
         );
-        self.tell_master(
-            &format!("decision/{id}"),
-            &format!(
-                "Operator rejected `{}` ({id}){}.",
-                req.argv.join(" "),
-                if dont {
-                    " and will not be asked again"
-                } else {
-                    ""
-                }
-            ),
-        );
+        if owner == ALIAS {
+            self.tell_master(
+                &format!("decision/{id}"),
+                &format!(
+                    "Operator rejected `{}` ({id}){}.",
+                    req.argv.join(" "),
+                    if dont {
+                        " and will not be asked again"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        } else {
+            self.settle_brokered_permission(&owner, id, false, reason);
+        }
         self.wake();
         Ok(crate::master_perm::request_json(&req))
     }
@@ -1727,59 +1743,97 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("master revoke-permission", params, peer_pid)?;
+        self.operator_connection_on_agent("master revoke-permission", params, peer_pid)?;
         let id = required_str(params, "id")?;
         let pm = self.pm()?;
-        let _lock = pm.lock()?;
-        let rule = crate::master_perm::revoke_rule(&pm.dir, ALIAS, id)?;
-        let path = crate::master_perm::rules_file(&pm.dir, ALIAS)?;
-        crate::issue::write::commit(
+        let explicit_owner = optional_str(params, "agent")
+            .or_else(|| optional_str(params, "alias"))
+            .filter(|s| !s.is_empty());
+        let owner = match explicit_owner {
+            Some(who) => {
+                crate::master_perm::alias_ok(who)?;
+                who.to_string()
+            }
+            None => crate::master_perm::find_rule_owner(&pm.dir, id)?,
+        };
+        let target_path = crate::master_perm::rules_file(&pm.dir, &owner)?;
+        let lock = pm.lock_for_paths(std::slice::from_ref(&target_path))?;
+        let rule = crate::master_perm::revoke_rule(&pm.dir, &owner, id)?;
+        crate::issue::write::commit_scoped(
             &pm,
-            std::slice::from_ref(&path),
-            "agents/master: revoke a permission rule",
+            &lock,
+            std::slice::from_ref(&target_path),
+            &format!("agents/{owner}: revoke a permission rule"),
             &[],
             "operator",
         )?;
-        self.audit_perm("permission_revoked", crate::master_perm::rule_json(&rule));
+        let body = crate::master_perm::rule_json_for(&rule, &owner);
+        self.audit_perm("permission_revoked", body.clone());
         self.wake();
-        Ok(crate::master_perm::rule_json(&rule))
+        Ok(body)
     }
 
     /// `master_permission_list` — operator only. Pending requests and
-    /// the rules file.
+    /// the rules files across master and managed agents.
     pub(super) fn rpc_master_permission_list(
         &self,
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("master permissions", params, peer_pid)?;
+        self.operator_connection_on_agent("master permissions", params, peer_pid)?;
+        let filter = optional_str(params, "agent")
+            .or_else(|| optional_str(params, "alias"))
+            .filter(|s| !s.is_empty());
+        if let Some(who) = filter {
+            crate::master_perm::alias_ok(who)?;
+        }
         let pending =
             crate::master_perm::board_requests(&self.state_dir, crate::master_perm::clock())?;
-        let rules = self
-            .pm()
-            .ok()
-            .and_then(|pm| crate::master_perm::read_rules(&pm.dir, ALIAS).ok())
-            .unwrap_or_default();
+        let requests: Vec<Value> = pending
+            .iter()
+            .filter(|r| filter.is_none_or(|who| r.requested_by == who))
+            .map(crate::master_perm::request_json)
+            .collect();
+        let rules: Vec<Value> = match self.pm() {
+            Ok(pm) => match filter {
+                Some(who) => crate::master_perm::read_rules(&pm.dir, who)?
+                    .iter()
+                    .map(|r| crate::master_perm::rule_json_for(r, who))
+                    .collect(),
+                None => crate::master_perm::list_all_rules(&pm.dir)
+                    .iter()
+                    .map(|(owner, r)| crate::master_perm::rule_json_for(r, owner))
+                    .collect(),
+            },
+            Err(_) => Vec::new(),
+        };
         Ok(json!({
-            "requests": pending.iter().map(crate::master_perm::request_json).collect::<Vec<_>>(),
-            "rules": rules.iter().map(crate::master_perm::rule_json).collect::<Vec<_>>(),
+            "requests": requests,
+            "rules": rules,
         }))
     }
 
-    fn persist_rule(&self, pm: &crate::issue::Pm, rule: crate::master_perm::Rule) -> Result<()> {
-        let _lock = pm.lock()?;
-        let mut rules = crate::master_perm::read_rules(&pm.dir, ALIAS)?;
+    fn persist_rule(
+        &self,
+        pm: &crate::issue::Pm,
+        owner: &str,
+        rule: crate::master_perm::Rule,
+    ) -> Result<()> {
+        let target_path = crate::master_perm::rules_file(&pm.dir, owner)?;
+        let lock = pm.lock_for_paths(std::slice::from_ref(&target_path))?;
+        let mut rules = crate::master_perm::read_rules(&pm.dir, owner)?;
         rules.push(rule);
-        let path = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules)?;
-        if let Err(e) = crate::issue::write::commit(
+        let path = crate::master_perm::write_rules(&pm.dir, owner, &rules)?;
+        if let Err(e) = crate::issue::write::commit_scoped(
             pm,
+            &lock,
             std::slice::from_ref(&path),
-            "agents/master: update permissions.yaml",
+            &format!("agents/{owner}: update permissions.yaml"),
             &[],
             "operator",
         ) {
             rules.pop();
-            let _ = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules);
+            let _ = crate::master_perm::write_rules(&pm.dir, owner, &rules);
             return Err(e);
         }
         Ok(())
