@@ -5,14 +5,20 @@
 //! The rule: a scoped `agent_show` carries the target's `instructions`,
 //! `params` and `cwd` only for the briefing read (an include flag set), only
 //! when the reader is the connection itself, and only when the caller rule
-//! admits that connection as the agent or its group root. A relayed reader
-//! (`read_as`, `public_session`) is someone other than the connection, so it
-//! gets none of the three, even when the relayed identity names the group root
-//! and the connection is the operator. Each relayed read must succeed (the
-//! guard under test strips fields; it does not refuse the read) and leave the
-//! tracker tree unchanged. The positive control sends the same briefing read
-//! from the group root and from the member itself, so the refusals cannot pass
-//! vacuously.
+//! admits that connection as the agent or its group root. Refused, each with
+//! the tracker tree unchanged:
+//!
+//! * a relayed reader (`read_as`, `public_session`) on an operator
+//!   connection, even when the relayed identity names the group root. The
+//!   read succeeds with the three stripped;
+//! * an un-relayed agent the caller rule does not admit: a stranger outside
+//!   the group, and a peer worker inside it. For a plain-joined member the
+//!   read succeeds with the three stripped. For a profile member the earlier
+//!   job check (`profile launch instructions`) refuses the whole read, and
+//!   that refusal is asserted instead.
+//!
+//! The positive control sends the same briefing read from the group root and
+//! from the member itself, so the refusals cannot pass vacuously.
 
 use crate::daemon::Shared;
 use crate::store::NewAgent;
@@ -24,6 +30,8 @@ use std::sync::Arc;
 
 const JOB: &str = "zq-relayed-briefing-job-2310: settle the vendor invoices";
 const MEMBER: &str = "member";
+/// Joined by the group root with no profile and no catalogue hire.
+const PLAIN: &str = "plain";
 const LANE: &str = "lane-cad2310-relay-cwd";
 const HOST: &str = "relay.board.localhost:3112";
 
@@ -89,6 +97,37 @@ impl World {
                 }),
             )
             .expect("the group root registers its member against the profile");
+        for (alias, cwd) in [
+            (PLAIN, world.lane()),
+            ("peer", world.dir.path().to_path_buf()),
+        ] {
+            world
+                .call(
+                    Asserted::Agent("root".into()),
+                    "agent_register",
+                    json!({
+                        "alias": alias, "provider": "fake", "endpoint_kind": "fake",
+                        "cwd": cwd, "params": "{\"upstream\":\"root\"}",
+                    }),
+                )
+                .expect("the group root registers a plain member");
+        }
+        world
+            .shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "stranger",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "pm",
+                cwd: &root_cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
         world
     }
 
@@ -135,16 +174,23 @@ impl World {
     /// A relayed briefing read on an operator connection: the read succeeds,
     /// names the member, and carries no job, `params` or `cwd`.
     fn assert_relay_stripped(&self, case: &str, params: Value) {
+        self.assert_stripped(case, Asserted::Operator, params);
+    }
+
+    /// A briefing read by `who`: the read succeeds, names its target, and
+    /// carries no job, `params` or `cwd`.
+    fn assert_stripped(&self, case: &str, who: Asserted, params: Value) {
         let before = self.tree();
+        let target = params["alias"].clone();
         let got = self
-            .call(Asserted::Operator, "agent_show", params)
-            .unwrap_or_else(|e| panic!("{case}: the relayed read itself must succeed: {e}"));
+            .call(who, "agent_show", params)
+            .unwrap_or_else(|e| panic!("{case}: the read itself must succeed: {e}"));
         let agent = &got["agent"];
-        assert_eq!(agent["alias"], MEMBER, "{case}: {got}");
+        assert_eq!(agent["alias"], target, "{case}: {got}");
         for field in ["instructions", "params", "cwd"] {
             assert!(
                 agent.get(field).is_none_or(Value::is_null),
-                "{case}: a relayed reader got `{field}`: {got}"
+                "{case}: an unadmitted reader got `{field}`: {got}"
             );
         }
         let text = got.to_string();
@@ -211,6 +257,53 @@ fn a_public_session_member_gets_no_job_params_or_cwd() {
     world.assert_relay_stripped("public_session member", params);
 }
 
+/// An un-relayed agent outside the caller rule reads the plain member.
+fn assert_plain_member_stripped_for(who: &str) {
+    let world = World::new();
+    world.assert_stripped(
+        &format!("{who} reads the plain member"),
+        Asserted::Agent(who.into()),
+        crate::briefing::briefing_read(PLAIN),
+    );
+}
+
+#[test]
+fn a_stranger_agent_gets_no_params_or_cwd_of_a_plain_member() {
+    assert_plain_member_stripped_for("stranger");
+}
+
+#[test]
+fn a_peer_worker_gets_no_params_or_cwd_of_a_plain_member() {
+    assert_plain_member_stripped_for("peer");
+}
+
+#[test]
+fn a_stranger_or_a_peer_worker_is_refused_a_profile_members_briefing_read() {
+    let world = World::new();
+    for who in ["stranger", "peer"] {
+        let before = world.tree();
+        let refused = world
+            .call(
+                Asserted::Agent(who.into()),
+                "agent_show",
+                crate::briefing::briefing_read(MEMBER),
+            )
+            .expect_err("an unadmitted agent must not read a profile member's job")
+            .to_string();
+        assert!(
+            refused.contains("profile launch instructions refused"),
+            "{who}: refused by something other than the job check: {refused}"
+        );
+        assert!(!refused.contains(JOB), "{who}: the refusal leaked the job");
+        assert!(!refused.contains(LANE), "{who}: the refusal leaked the cwd");
+        assert_eq!(
+            before,
+            world.tree(),
+            "{who}: a refusal moved the tracker tree"
+        );
+    }
+}
+
 #[test]
 fn control_the_group_root_and_the_member_itself_get_the_job_params_and_cwd() {
     let world = World::new();
@@ -232,6 +325,23 @@ fn control_the_group_root_and_the_member_itself_get_the_job_params_and_cwd() {
         assert_eq!(agent["params"]["upstream"], "root", "{who}: {got}");
         assert_eq!(
             agent["cwd"],
+            json!(world.lane().to_str().unwrap()),
+            "{who}: {got}"
+        );
+    }
+    // The plain member's group root and the member itself get its params and
+    // cwd (it has no job), so the plain-member refusals are not vacuous.
+    for who in ["root", PLAIN] {
+        let got = world
+            .call(
+                Asserted::Agent(who.into()),
+                "agent_show",
+                crate::briefing::briefing_read(PLAIN),
+            )
+            .unwrap_or_else(|e| panic!("{who}: the plain briefing read must succeed: {e}"));
+        assert_eq!(got["agent"]["params"]["upstream"], "root", "{who}: {got}");
+        assert_eq!(
+            got["agent"]["cwd"],
             json!(world.lane().to_str().unwrap()),
             "{who}: {got}"
         );
