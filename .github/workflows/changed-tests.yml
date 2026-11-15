@@ -1,0 +1,105 @@
+# CAD-2307: a narrow, written exception to CAD-1970 (AGENTS.md "Testing
+# principles"). The full suite stays off pull requests; this job runs ONLY the
+# daemon tests (src/daemon/tests/**) and suite tests (tests/suite.rs) that the
+# PR adds or changes, under the test-seam feature, in one build with no shards.
+# A setup panic in a new test then shows on the PR instead of after a 25-40
+# minute tests.yml run.
+#
+# Selection is scripts/changed-test-filter (a nextest filterset from the diff).
+# A PR that touches no such file reports success after the cheap select step;
+# the build and run steps are skipped, so the check name always reports and is
+# safe to mark required. Marking it required is an operator ruleset action.
+name: changed-tests
+
+on:
+  pull_request:
+
+concurrency:
+  group: changed-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Same as ci.yml: rust-cache and sccache hash these into their keys.
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  changed-tests:
+    runs-on: instabox-medium
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select the changed tests
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          python3 scripts/changed-test-filter --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT" > "$RUNNER_TEMP/filter.txt"
+          {
+            echo "### changed-tests"
+            if [ -s "$RUNNER_TEMP/filter.txt" ]; then
+              echo "Selected filterset: \`$(cat "$RUNNER_TEMP/filter.txt")\`"
+            else
+              echo "No daemon or suite test file changed; nothing to run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: scripts/ci-rust-toolchain --profile minimal
+        if: ${{ steps.select.outputs.selected == 'true' }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.select.outputs.selected == 'true' }}
+        with:
+          shared-key: gate-test-ld2
+          save-if: false
+      - name: Enable fast linker (mold/lld; falls back to the default linker)
+        if: ${{ steps.select.outputs.selected == 'true' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
+      - name: Enable shared sccache (read-only; no-op without credentials)
+        if: ${{ steps.select.outputs.selected == 'true' }}
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      - name: Install pinned cargo-nextest
+        if: ${{ steps.select.outputs.selected == 'true' }}
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
+      # One build of only the targets that hold the selected tests. The run
+      # refuses an empty selection (cadence-nextest passes --no-tests fail),
+      # so a filter that stopped matching anything fails instead of passing.
+      - name: Run the changed tests under test-seam
+        if: ${{ steps.select.outputs.selected == 'true' }}
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+          CARGO_ARGS: ${{ steps.select.outputs.cargo_args }}
+          FILTER: ${{ steps.select.outputs.filter }}
+        run: |
+          set -eu
+          # Same isolation as scripts/run-result-tests and stress.yml: a
+          # private HOME/XDG/TMPDIR, toolchain homes pinned first.
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          scratch=$(mktemp -d "$RUNNER_TEMP/changed-tests-home.XXXXXX")
+          export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
+                 XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
+                 XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+          # shellcheck disable=SC2086
+          scripts/cadence-nextest --locked --features test-seam $CARGO_ARGS -E "$FILTER" --test-threads 2
+      - name: sccache statistics
+        if: ${{ !cancelled() && steps.select.outputs.selected == 'true' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats

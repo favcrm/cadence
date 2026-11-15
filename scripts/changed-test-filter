@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""CAD-2307: the nextest filterset for the tests a pull request adds or changes.
+
+    scripts/changed-test-filter --base BASE_SHA [--head HEAD] [--github-output FILE]
+
+Prints the filterset on stdout (empty when the diff touches no selectable
+test) and notices on stderr. With --github-output it also writes `selected=`
+(true/false), `filter=` and `cargo_args=` (the cargo flags that narrow the
+build to the targets holding the selected tests).
+
+Selection, from the merge-base diff of added, copied, modified and renamed files:
+
+  src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
+                               `mod.rs` selects its directory; the root
+                               `src/daemon/tests/mod.rs` selects the modules
+                               whose `mod x;` line the diff adds.
+  tests/suite.rs               the single integration target (CAD-1727). Each
+                               changed line maps to its enclosing `#[test]`
+                               fn; a changed helper selects its enclosing
+                               `mod`. A change outside any test fn or mod
+                               (top-level helper, `use`) cannot be bounded and
+                               is reported on stderr, not widened to the suite.
+
+Nothing here runs a test; the workflow runs the filterset under test-seam.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+
+DAEMON_ROOT = "src/daemon/tests/"
+SUITE = "tests/suite.rs"
+LIB = "binary_id(=cadence-agent)"
+SUITE_BIN = "binary_id(=cadence-agent::suite)"
+
+
+def git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"changed-test-filter: git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def daemon_prefix(path):
+    """daemon::tests:: module path for a file under src/daemon/tests/."""
+    parts = path[len(DAEMON_ROOT):-len(".rs")].split("/")
+    if parts[-1] == "mod":
+        parts.pop()
+    return "daemon::tests::" + "".join(p + "::" for p in parts)
+
+
+def root_mod_prefixes(base, head):
+    """Modules newly declared in src/daemon/tests/mod.rs."""
+    diff = git("diff", "-U0", f"{base}...{head}", "--", DAEMON_ROOT + "mod.rs")
+    return [f"daemon::tests::{m}::" for m in re.findall(r"^\+\s*mod (\w+);", diff, re.M)]
+
+
+def suite_spans(text):
+    """[(start, end, kind, qualified name, is_test)] for fns and mods, 1-based.
+
+    CI runs rustfmt, so an item's closing brace sits at its own indentation;
+    that delimits a span without parsing Rust. A span starts at the first
+    attribute or comment line directly above the item.
+    """
+    lines = text.splitlines()
+    spans, stack = [], []
+    above = None
+    for i, line in enumerate(lines, 1):
+        s = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if s.startswith(("#[", "//")):
+            above = above or i
+            continue
+        item = re.match(
+            r"(?:pub(?:\([\w:]+\))? )?(?:(mod) (\w+) \{$|(?:async )?(?:unsafe )?(fn) (\w+))", s
+        )
+        if item:
+            kind = item.group(1) or item.group(3)
+            name = item.group(2) or item.group(4)
+            start = above or i
+            is_test = any(
+                re.match(r"#\[(?:\w+::)?test\b", lines[j - 1].strip()) for j in range(start, i)
+            )
+            mods = [x[3].rsplit("::", 1)[-1] for x in stack if x[1] == "mod"]
+            stack.append((start, kind, indent, "::".join(mods + [name]), is_test))
+        elif s == "}" and stack and stack[-1][2] == indent:
+            start, kind, _, qual, is_test = stack.pop()
+            spans.append((start, i, kind, qual, is_test))
+        above = None
+    return spans
+
+
+def changed_lines(base, head, path):
+    diff = git("diff", "-U0", f"{base}...{head}", "--", path)
+    out = set()
+    for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff, re.M):
+        start = int(m.group(1))
+        count = 1 if m.group(2) is None else int(m.group(2))
+        out.update(range(start, start + max(count, 1)))
+    return out
+
+
+def suite_filters(base, head):
+    spans = suite_spans(git("show", f"{head}:{SUITE}"))
+    exact, mods, unbounded = set(), set(), []
+    for line in sorted(changed_lines(base, head, SUITE)):
+        inside = [s for s in spans if s[0] <= line <= s[1]]
+        fns = [s for s in inside if s[2] == "fn"]
+        ms = [s for s in inside if s[2] == "mod"]
+        inner = min(fns, key=lambda s: s[1] - s[0]) if fns else None
+        if inner and inner[4]:
+            exact.add(inner[3])
+        elif ms:
+            mods.add(min(ms, key=lambda s: s[1] - s[0])[3])
+        else:
+            unbounded.append(line)
+    # A mod selected whole subsumes its exact tests.
+    mods = {m for m in mods if not any(m.startswith(o + "::") for o in mods)}
+    exact = {e for e in exact if not any(e.startswith(m + "::") for m in mods)}
+    parts = [f"test(={e})" for e in sorted(exact)]
+    parts += [f"test(/^{m}::/)" for m in sorted(mods)]
+    return parts, unbounded
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--github-output")
+    args = ap.parse_args()
+    files = git("diff", "--name-only", "--diff-filter=ACMR",
+                f"{args.base}...{args.head}").splitlines()
+    daemon, suite = [], []
+    for p in files:
+        if p.startswith(DAEMON_ROOT) and p.endswith(".rs"):
+            if p == DAEMON_ROOT + "mod.rs":
+                daemon += root_mod_prefixes(args.base, args.head)
+            else:
+                daemon.append(daemon_prefix(p))
+    if SUITE in files:
+        suite, unbounded = suite_filters(args.base, args.head)
+        if unbounded:
+            print(f"changed-test-filter: {SUITE} lines {unbounded[:10]} are outside any "
+                  "test fn or mod; not selected", file=sys.stderr)
+    cargo, clauses = [], []
+    if daemon:
+        cargo.append("--lib")
+        keep = {p for p in daemon if not any(p != o and p.startswith(o) for o in daemon)}
+        alts = " or ".join(f"test(/^{p}/)" for p in sorted(keep))
+        clauses.append(f"({LIB} and ({alts}))")
+    if suite:
+        cargo += ["--test", "suite"]
+        clauses.append(f"({SUITE_BIN} and ({' or '.join(suite)}))")
+    flt = " or ".join(clauses)
+    print(flt)
+    if args.github_output:
+        with open(args.github_output, "a") as f:
+            f.write(f"selected={'true' if flt else 'false'}\n")
+            f.write(f"filter={flt}\n")
+            f.write(f"cargo_args={' '.join(cargo)}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+#!/bin/sh
+# CAD-2307: run this worktree's pre-push hook for the current HEAD before
+# `git push`, so the long compile happens in your shell instead of inside the
+# push. GitHub drops an SSH push whose hook runs for minutes (rc=141); the
+# hook's Boat sandbox then stays warm, and the push's own hook run reuses it.
+#
+#   scripts/pre-push-check [<remote-ref>]    # default refs/heads/<current branch>
+#
+# This feeds the installed hook the same stdin line git would, so the hook's
+# own plan, Boat/local mode, head binding and receipt are the ones used. It
+# never reimplements the plan, and it does not replace the hook: `git push`
+# still runs it.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+hooks=$(git config --get core.hooksPath || true)
+hook="${hooks:-$(git rev-parse --git-path hooks)}/pre-push"
+[ -x "$hook" ] || {
+    echo "pre-push-check: no pre-push hook at $hook; run scripts/boat-build --receipt -- scripts/pre-push --base origin/main" >&2
+    exit 1
+}
+head=$(git rev-parse HEAD)
+ref=${1:-refs/heads/$(git symbolic-ref --short HEAD)}
+exec "$hook" origin "" <<IN
+$ref $head $ref 0000000000000000000000000000000000000000
+IN

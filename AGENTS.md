@@ -356,8 +356,13 @@ targets, lints it, and proves the release seam on the merge
 queue and main; the suite runs on a schedule and on demand (`tests.yml`), where
 a red test finds its owner instead of blocking an unrelated push. Per-module
 acceptance suites, integration targets and contract tests for the CI scripts
-themselves are retired. Write a test only when it earns its place, and
-then to these rules:
+themselves are retired. One narrow exception (CAD-2307): `changed-tests.yml`
+runs, on a PR, only the daemon tests (`src/daemon/tests/**`) and suite tests
+(`tests/suite.rs`) that PR adds or changes, under `--features test-seam`, in
+one build with no shards. `scripts/changed-test-filter` derives the nextest
+filter from the diff, and a PR that touches no such file skips the build and
+run. The full suite stays off PRs. Write a test only when it earns its place,
+and then to these rules:
 
 - **Direct functions, not processes.** Business logic is tested by calling it.
   If a test needs a daemon, a board, a socket or a spawned CLI to reach the
@@ -583,6 +588,15 @@ limitation; only an authorized operator can decide an exception.
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
   inventory restoration establishes its inputs.
+- Run the pre-push plan yourself before `git push`:
+  `scripts/pre-push-check`. It feeds the installed hook the line git would, so
+  the hook's own plan and receipt are used, and the long compile happens in
+  your shell instead of inside the push. GitHub drops an SSH push whose hook
+  runs for minutes (rc=141, "Connection to github.com closed by remote host").
+  Run it right before the push: it leaves the Boat sandbox warm (30 minutes),
+  so the push's own hook run reuses it and is short. The hook still runs on
+  every push; nothing here skips or caches it. If a push dies with rc=141,
+  retry it once.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`. Example: `scripts/boat-build -- cargo
   test --locked --features test-seam --test daemon <FILTER> --
