@@ -2786,7 +2786,9 @@ the original query and fragment, adding only a missing installation pin.
 
 Installed apps use the board header for `Apps / App name / Section`; the
 version is secondary metadata, and a default section adds no duplicate leaf.
-Sections come only from the active screen's declared `section_query`.
+Sections come only from the active app's declared `section_query`, using the
+verified installation declaration before screen readiness and in native outlets.
+Section labels use the same app-provided locale resolver as sidebar navigation.
 Parent navigation retains installation/context pins and unrelated query
 parameters while clearing record and segment selection. The aligned
 **Assistant** button controls the right-hand chat pane without remounting the

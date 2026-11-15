@@ -114,7 +114,7 @@ await rejected(
 // ships no screen of its own.
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage", "localStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
@@ -658,6 +658,43 @@ async function mountColdCold(url: string, install: string, scope: string) {
   await React.act(async () => { ambiguousRoot.unmount(); });
   ambiguous.remove();
 }
+
+// Installation-declared sections remain navigable before any screen-ready
+// callback, including the native Social outlet, with the app's own labels.
+const declaredNavigation = {
+  section_query: "tab", default_section: "overview",
+  sections: [
+    { id: "overview", label: "Overview" },
+    { id: "insights", label: "Insights", i18n: { "zh-TW": { label: "專屬洞察" } } },
+  ],
+};
+for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-social"]] as const) {
+  Object.assign(fixture, { navigation: declaredNavigation });
+  for (const locale of ["en", "zh-TW"]) {
+    win.localStorage.setItem("cadence-locale", locale);
+    const surface = document.createElement("div");
+    document.body.append(surface);
+    const cold = createRoot(surface);
+    history.pushState(null, "", `/app-installations/${installId}?tab=insights&record=rec-1&hr=leave&accounting=reports`);
+    await React.act(async () => {
+      cold.render(React.createElement(AppShell, { installId, viewer: { operator: true, readOnly: false } }));
+    });
+    const header = () => surface.querySelector('nav[aria-label="Breadcrumb"]')!;
+    const expected = locale === "zh-TW" ? "專屬洞察" : "Insights";
+    await settle(() => equal(header().querySelector('[aria-current="page"]')?.textContent, expected, `${installId} declares its ${locale} section without a frame`));
+    assert(!surface.querySelector("iframe"), "the breadcrumb needs no mounted frame receipt");
+    const parent = header().querySelector("a")!;
+    assert(parent, "a declared section gives its app a parent link");
+    const target = new URL(parent.getAttribute("href")!, "http://localhost");
+    assert(!target.searchParams.has("tab") && !target.searchParams.has("record"), "the app parent clears section and record selection");
+    equal([target.searchParams.get("hr"), target.searchParams.get("accounting")], ["leave", "reports"], "the parent preserves unrelated app queries");
+    await click(parent);
+    await settle(() => assert(!header().querySelector(".app-header-section"), "the default section adds no duplicate leaf"));
+    await React.act(async () => { cold.unmount(); });
+    surface.remove();
+  }
+}
+win.localStorage.removeItem("cadence-locale");
 
 // The assistant activity panel never asks before it has a context (an empty
 // context ID is a 400 on every poll).

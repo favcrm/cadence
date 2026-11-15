@@ -30,7 +30,7 @@ import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
 import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
-import { displayI18nFromListing, localizedAppTitle, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
+import { displayI18nFromListing, localizedAppTitle, localizedSectionLabel, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -1093,10 +1093,13 @@ export default function AppShell({
   // section when it declares navigation, else its screen tag.
   const section = effectiveNavigation ? sectionFromSearch(href.split("?")[1] ?? "", effectiveNavigation) : null;
   const chatScreen = chatScreenFor(installation, verified, section, view);
-  const headerSection = verified && screenNavigation && section !== screenNavigation.default_section
-    ? screenNavigation.sections.find((item) => item.id === section)?.label ?? null
-    : verified && view === "new" ? "New" : null;
-  const appParentHref = appSectionHref(href, screenNavigation);
+  const currentHeaderSection = verified && effectiveNavigation && section !== effectiveNavigation.default_section
+    ? effectiveNavigation.sections.find((item) => item.id === section) ?? null
+    : null;
+  const headerSection = currentHeaderSection
+    ? localizedSectionLabel(currentHeaderSection, locale, t)
+    : verified && view === "new" ? t("New") : null;
+  const appParentHref = appSectionHref(href, effectiveNavigation);
   // `open-view` card action: a declared section of the mounted screen, or
   // the generic list/new view, within this installation and context.
   const openView = useCallback(
@@ -1162,7 +1165,7 @@ export default function AppShell({
           {headerSection !== null && (
             <>
               <span className="text-ink-600" aria-hidden="true">/</span>
-              <span className="app-header-section" aria-current="page" title={t(headerSection)}>{t(headerSection)}</span>
+              <span className="app-header-section" aria-current="page" title={headerSection}>{headerSection}</span>
             </>
           )}
         </span>,
