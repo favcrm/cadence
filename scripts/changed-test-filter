@@ -80,6 +80,9 @@ def daemon_prefix(path):
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 ATTRS = re.compile(r"^(?:#\[[^\]]*\]\s*)+")
+# `#[path = ...]` or `#[cfg_attr(..., path = ...)]`: a module whose file is
+# named elsewhere.
+PATH_ATTR = re.compile(r"#\[[^\]]*\bpath\s*=")
 MOD_DECL = re.compile(r"(?:pub(?:\([\w:]+\))? )?mod (\w+);$")
 
 
@@ -105,7 +108,7 @@ def classify_mod_diff(diff, parent):
         raw = line[1:].strip()
         if not raw:
             continue
-        if raw.startswith("#[path"):
+        if PATH_ATTR.search(raw):
             # A module whose file is named elsewhere: its later edits would not
             # map back to it, so treat the directory as changed.
             widen = True
@@ -210,16 +213,23 @@ def suite_spans(text):
     )
     for i, (orig, line) in enumerate(zip(lines, masked), 1):
         s = orig.strip()
-        if s.startswith(("#[", "//")):
+        if s.startswith("//"):
             above = above or i
             continue
+        if s.startswith("#["):
+            # Attributes may share a line with the item (`#[test] fn x() {`):
+            # record the line, then scan what follows them, braces included.
+            above = above or i
+            line = ATTRS.sub("", line.strip())
+            if not line:
+                continue
         item = item_re.match(line.strip())
         if item:
             kind = item.group(1) or item.group(3)
             name = item.group(2) or item.group(4)
             start = above or i
             is_test = any(
-                re.match(r"#\[(?:\w+::)?test\b", lines[j - 1].strip()) for j in range(start, i)
+                re.match(r"#\[(?:\w+::)?test\b", lines[j - 1].strip()) for j in range(start, i + 1)
             )
             mods = [x["name"].rsplit("::", 1)[-1] for x in stack if x["kind"] == "mod"]
             stack.append(dict(start=start, kind=kind, name="::".join(mods + [name]),
@@ -274,8 +284,11 @@ def suite_filters(base, head):
     # A mod selected whole subsumes its exact tests.
     mods = {m for m in mods if not any(m.startswith(o + "::") for o in mods)}
     exact = {e for e in exact if not any(e.startswith(m + "::") for m in mods)}
-    parts = [f"test(={e})" for e in sorted(exact)]
-    parts += [f"test(/^{m}::/)" for m in sorted(mods)]
+    # Anchored at the end and at a `::` boundary, not at the start: if the
+    # scanner ever misreads an enclosing module, a dropped prefix still
+    # matches the real test (at worst a same-named test elsewhere also runs).
+    parts = [f"test(/(^|::){e}$/)" for e in sorted(exact)]
+    parts += [f"test(/(^|::){m}::/)" for m in sorted(mods)]
     return parts, unbounded
 
 
@@ -298,6 +311,12 @@ def main():
                               f"{args.base}...{args.head}").split("\0") if f]
     daemon, suite = [], []
     whole_suite = False
+    # A `path` attribute anywhere under src/daemon/tests/ means a file's path
+    # may not be its module path: every daemon change then selects the whole
+    # daemon::tests tree rather than a guessed module.
+    redirected = subprocess.run(
+        ["git", "grep", "-q", "-E", r"#\[[^]]*\bpath[[:space:]]*=", args.head, "--", DAEMON_ROOT],
+        capture_output=True).returncode == 0
     for p in deleted:
         if p.startswith(DAEMON_ROOT) and not p.endswith(".rs"):
             daemon.append("daemon::tests::")
@@ -308,7 +327,7 @@ def main():
         if p.startswith(DAEMON_ROOT):
             rel = p[len(DAEMON_ROOT):]
             names = rel[:-3].split("/") if rel.endswith(".rs") else None
-            if names is None or not all(SAFE_NAME.match(n) for n in names):
+            if redirected or names is None or not all(SAFE_NAME.match(n) for n in names):
                 # A non-Rust file, or a name that cannot be a module path: never
                 # put it in a regex or an output; select the whole module tree.
                 daemon.append("daemon::tests::")
