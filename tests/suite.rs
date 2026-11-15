@@ -11822,7 +11822,6 @@ if (mode === 'keys') {
 
     // ---- static: the properties a mistake here would break ---------------
 
-    // CAD-2307 probe
     #[test]
     fn only_a_dispatch_runs_it_and_nothing_is_granted_by_default() {
         for wf in all() {
