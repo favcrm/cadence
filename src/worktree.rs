@@ -360,6 +360,9 @@ if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     fi
     output=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
     rc=$?
+    # The plan's progress and failure detail go to stderr; the receipt
+    # keeps only its last line.
+    printf '%s\n' "$output" >&2
     line=$(printf '%s\n' "$output" | tail -n 1)
 else
     if [ ! -x scripts/boat-build ]; then
@@ -372,7 +375,12 @@ else
     line=$(printf '%s\n' "$output" | tail -n 1)
     [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
 fi
+# CAD-2341: a clean pass names the head the plan started on. A commit or
+# branch switch during the run (local mode reads HEAD when it ends) leaves
+# the receipt unmarked, so the next push runs the plan.
 if [ "$rc" -eq 0 ] && [ -n "$tree_clean" ] &&
+    [ "$(git rev-parse HEAD 2>/dev/null)" = "$head" ] &&
+    case "$line" in "head=$head "*) true ;; *) false ;; esac &&
     st=$(git status --porcelain --untracked-files=normal 2>/dev/null) && [ -z "$st" ]; then
     line="$line tree=clean"
 fi
