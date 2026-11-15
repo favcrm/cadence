@@ -324,6 +324,22 @@ if [ ! -x scripts/pre-push ]; then
         "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 0
 fi
+# CAD-2307: GitHub drops an SSH push whose hook runs for minutes (rc=141).
+# `scripts/pre-push-check` runs this hook before the push and records the
+# receipt. A pass is recorded as `tree=clean` only when the working tree had no
+# edits, staged, unstaged or untracked, before and after the plan ran, so it describes the
+# commit and not the files beside it. The skip needs all of: no PRE_PUSH_TESTS
+# at this push, the pushed commit is HEAD, a clean tree now, and a receipt for
+# this head that says rc=0 and tree=clean. Any other receipt (failure, skipped,
+# refused, dirty-recorded) runs the plan again.
+if [ -z "$(git status --porcelain 2>/dev/null)" ]; then tree_clean=1; else tree_clean=; fi
+if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -n "$tree_clean" ] && [ -f "$out" ]; then
+    prev=$(cat "$out" 2>/dev/null)
+    case "$prev" in
+        *steps=skipped*|*steps=refused*) ;;
+        "head=$head "*" rc=0 "*" tree=clean") echo "pre-push: recorded clean pass for $head; not re-running the plan"; exit 0 ;;
+    esac
+fi
 if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     if [ "$pushed" != "$head" ]; then
         printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
@@ -343,6 +359,7 @@ else
     line=$(printf '%s\n' "$output" | tail -n 1)
     [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
 fi
+[ "$rc" -eq 0 ] && [ -n "$tree_clean" ] && [ -z "$(git status --porcelain 2>/dev/null)" ] && line="$line tree=clean"
 printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
 exit $rc
 "#;

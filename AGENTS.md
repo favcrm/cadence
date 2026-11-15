@@ -583,6 +583,19 @@ limitation; only an authorized operator can decide an exception.
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
   inventory restoration establishes its inputs.
+- Run the pre-push plan yourself before `git push`:
+  `scripts/pre-push-check`. It feeds the installed hook the line git would, so
+  the hook's own plan and receipt are used, and the long compile happens in
+  your shell instead of inside the push. GitHub drops an SSH push whose hook
+  runs for minutes (rc=141, "Connection to github.com closed by remote host").
+  The hook records a `tree=clean` rc=0 receipt for the head, and only when the
+  working tree had no edits both before and after the plan ran
+  (`pre-push-check` refuses a dirty tree). The push's own hook run returns at once only for a receipt that
+  says rc=0 and `tree=clean` for that exact head, on a clean tree now, with no
+  `PRE_PUSH_TESTS` set. A failure, a dirty-recorded pass, a new commit or an
+  edited tree runs the plan again. A lane minted before this hook change gets
+  it when `issue start` re-heals the hook; until then the push reruns the plan
+  (several minutes). If a push dies with rc=141, retry it once.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`. Example: `scripts/boat-build -- cargo
   test --locked --features test-seam --test daemon <FILTER> --
