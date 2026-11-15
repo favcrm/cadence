@@ -30,8 +30,8 @@ use super::{
     app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
     business_templates, cli_route, connections, credential_entry, crm_send, delivery_sync,
     endpoints, home, lane, locale, member_assist, my_work, operator, platform_account, read_model,
-    social_publish, stages, threads, topics, updates, wiki, wiki_envelope, work_conversations,
-    workflows,
+    routines, social_publish, stages, threads, topics, updates, wiki, wiki_envelope,
+    work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1609,6 +1609,7 @@ read_route_enums!(
     crm_send::Route,
     app_release::Route<'_>,
     app_runs::Route<'_>,
+    routines::Route<'_>,
     social_publish::Route<'_>,
 );
 
@@ -2549,7 +2550,41 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 Ok(pm) => {
                     let readable = super::project_policy::readable(&pm, &actor);
                     super::project_policy::retain_overview(&mut overview, &readable);
-                    if actor != "operator" {
+                    if actor == "operator"
+                        && operator::admit_operator_read(&request, state_dir, opts).is_ok()
+                    {
+                        if let Ok(res) = crate::client::rpc(state_dir, "routine_list", json!({})) {
+                            let waiting: Vec<Value> = res["routines"]
+                                .as_array()
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|r| {
+                                            matches!(
+                                                r["status"].as_str(),
+                                                Some("waiting_approval" | "repoint_required")
+                                            )
+                                        })
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !waiting.is_empty() {
+                                overview["routine_needs"] = json!(waiting);
+                            }
+                            let proposals: Vec<Value> = res["staged_proposals"]
+                                .as_array()
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|p| p["state"].as_str() == Some("pending"))
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !proposals.is_empty() {
+                                overview["routine_proposals"] = json!(proposals);
+                            }
+                        }
+                    } else if actor != "operator" {
                         let proof = read_admission
                             .as_ref()
                             .expect("private read admission")
@@ -3209,6 +3244,17 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 credential_entry::route(&path),
                 operator::admit_operator_read,
                 |req, route| credential_entry::handle_read(req, state_dir, opts, route),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                routines::route(&path),
+                operator::admit_operator_read,
+                |_req, route| routines::handle_read(state_dir, route, raw_query),
             ) {
                 send(request, response);
                 return;

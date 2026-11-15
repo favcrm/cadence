@@ -93,6 +93,7 @@ pub use topics::{
 mod inbox;
 mod kickoff;
 pub(crate) use kickoff::last_sha_line;
+pub mod routines;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
 #[cfg(test)]

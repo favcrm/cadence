@@ -567,6 +567,10 @@ export interface Overview {
   monitoring?: Monitoring;
   /** Sources that missed their time bound — the view narrowed. */
   degraded?: { source: string; subject?: string; detail: string }[];
+  /** CAD-2317: operator-only routines awaiting approval or repointing. */
+  routine_needs?: Routine[];
+  /** CAD-2317: operator-only pending staged routine/playbook proposals. */
+  routine_proposals?: StagedRoutineProposal[];
   generated_at: number;
 }
 
@@ -1599,6 +1603,7 @@ export interface CredentialRequest {
   state: "pending" | "submitting" | "done" | "cancelled" | "expired" | "unknown";
   status: string;
   result_code: string | null;
+  result_connection_id?: string | null;
   verification_request_id: string | null;
   /** CAD-1085: server-selected absolute URL of the trusted entry page for
    *  this request. Present only when the deployment has a pinned separate
@@ -1689,6 +1694,21 @@ export interface Connection {
     execution_authority: boolean;
     network_checked: boolean;
   };
+  /** CAD-2317: personal vs shared access & safety policy. */
+  policy?: ConnectionPolicy | null;
+}
+
+export interface ConnectionPolicy {
+  connection_id: string;
+  provider: string;
+  visibility: "shared" | "personal";
+  owner_user_id: string | null;
+  is_default: boolean;
+  write_mode: "ask_approval" | "read_only";
+  allow_external_triggers: boolean;
+  allowed_agents: string[];
+  policy_revision: number;
+  updated_at: number;
 }
 
 export interface ConnectionsPayload {
@@ -1815,4 +1835,90 @@ export interface ProjectTimeline {
   events: TimelineEvent[];
   next_before: string | null;
   truncated: boolean;
+}
+
+/** CAD-2317: Routines (`Context Markdown` playbooks & `sha256`-pinned scripts). */
+export interface ChecklistStep {
+  id: string;
+  label: string;
+  requires_approval: boolean;
+  state: string;
+}
+
+export interface RoutineRun {
+  id: string;
+  routine_id: string;
+  due_instant: number;
+  trigger_source: "manual" | "schedule" | "external_event" | string;
+  state:
+    | "running"
+    | "completed"
+    | "skipped_empty"
+    | "skipped_stale"
+    | "skipped_overlap"
+    | "waiting_approval"
+    | "failed"
+    | string;
+  approved_rev: string | null;
+  approved_sha256: string | null;
+  checklist_state: ChecklistStep[];
+  script_output: unknown;
+  message_id: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+  deduped?: boolean;
+}
+
+export interface Routine {
+  id: string;
+  name: string;
+  agent_alias: string;
+  trigger_kind: "schedule" | "event";
+  cron: string | null;
+  interval_mins: number | null;
+  timezone: string | null;
+  event_source: string | null;
+  target_kind: "markdown" | "script" | "script_then_markdown";
+  markdown_path: string | null;
+  approved_rev: string | null;
+  current_rev: string | null;
+  script_path: string | null;
+  approved_sha256: string | null;
+  current_sha256: string | null;
+  approval_drift: boolean;
+  destination_thread: string | null;
+  connection_account: string | null;
+  checklist: ChecklistStep[];
+  inputs: Record<string, unknown>;
+  status: "on" | "waiting_approval" | "repoint_required" | "paused";
+  stored_status: string;
+  pause_reason: string | null;
+  consecutive_failures: number;
+  next_due_at: number | null;
+  last_run_at: number | null;
+  last_run_state: string | null;
+  created: number;
+  updated: number;
+  runs?: RoutineRun[];
+}
+
+export interface StagedRoutineProposal {
+  id: string;
+  kind: "wiki_propose" | "routine_propose" | string;
+  proposed_by: string;
+  title: string;
+  payload: Record<string, unknown>;
+  state: "pending" | "approved" | "rejected" | string;
+  created_at: number;
+  decided_at: number | null;
+}
+
+export interface RoutinesPayload {
+  routines: Routine[];
+  staged_proposals: StagedRoutineProposal[];
+}
+
+export interface RoutinePayload {
+  routine: Routine;
 }

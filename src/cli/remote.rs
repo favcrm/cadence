@@ -1425,6 +1425,13 @@ fn verb_for(
             }
             "platform_call"
         }
+        Commands::Routine { action } if action.uses_local_script() => {
+            return Err(unsupported(
+                "routine",
+                "--script",
+                "local workspace shell scripts cannot run in hosted Cloudflare Workers; use `--markdown wiki:<path>.md` or connect a local runner (`cadence agent watch`)",
+            ));
+        }
         _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))

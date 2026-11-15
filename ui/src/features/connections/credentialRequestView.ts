@@ -180,3 +180,23 @@ export function targetLabel(request: Pick<CredentialRequest, "verb" | "display_a
 export function actionableRequests(requests: CredentialRequest[]): CredentialRequest[] {
   return requests.filter((request) => request.state === "pending" || request.state === "submitting");
 }
+
+/** True when a completed credential request can resume a paused chat turn. */
+export function isResumableCompletedRequest(
+  request: Pick<CredentialRequest, "state" | "status">,
+): boolean {
+  return (
+    request.state === "done" &&
+    (request.status === "saved" || request.status === "verified")
+  );
+}
+
+/** Requests shown inline in a chat conversation: pending entry + ready-to-resume turns. */
+export function chatVisibleRequests(requests: CredentialRequest[]): CredentialRequest[] {
+  return requests.filter(
+    (request) =>
+      request.state === "pending" ||
+      request.state === "submitting" ||
+      isResumableCompletedRequest(request),
+  );
+}

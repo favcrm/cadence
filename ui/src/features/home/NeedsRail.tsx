@@ -66,6 +66,8 @@ export default function NeedsRail({
   const split = todoSplit(overview.data?.needs_me);
   const { updates, decided } = split;
   const staged = useDecisions(decisionsOn);
+  const waitingRoutines = overview.data?.routine_needs ?? [];
+  const routineProposals = overview.data?.routine_proposals ?? [];
   const stagedCards = useMemo(() => staged.pending.map((w) => stagedNeed(w, t)), [staged.pending, t]);
   const todo = useMemo(() => withStaged(split.todo, stagedCards), [split.todo, stagedCards]);
   // The staged detail: the ids that were waiting when it opened, and where in them it is.
@@ -133,7 +135,10 @@ export default function NeedsRail({
 
   const cards = todo.filter((n) => !marksFor(local, n).hidden);
   const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
-  const count = cards.filter((n) => !isDone(n)).length;
+  const count =
+    cards.filter((n) => !isDone(n)).length +
+    waitingRoutines.length +
+    routineProposals.length;
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
@@ -198,8 +203,63 @@ export default function NeedsRail({
       {overview.data && cards.length === 0 && decisionsOn && staged.phase === "error" && (
         <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
-      {overview.data && cards.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
+      {overview.data && cards.length === 0 && waitingRoutines.length === 0 && routineProposals.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
         <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
+      )}
+      {(waitingRoutines.length > 0 || routineProposals.length > 0) && (
+        <ul className="todo-list" data-routine-needs>
+          {routineProposals.map((p) => {
+            const alias =
+              typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : "master";
+            const wikiPath = typeof p.payload?.path === "string" ? p.payload.path : null;
+            const href =
+              p.kind === "wiki_propose" && wikiPath
+                ? `/wiki/${wikiPath.replace(/^wiki:/, "")}`
+                : `/agents/${encodeURIComponent(alias)}?tab=routines`;
+            return (
+              <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
+                <div className="min-w-0">
+                  <span className="block text-label font-medium text-ink-100 truncate">
+                    {p.title}
+                  </span>
+                  <span className="block text-micro text-ink-400 truncate">
+                    {p.kind === "wiki_propose" ? t("Playbook draft") : t("Routine draft")}
+                  </span>
+                </div>
+                <Link
+                  href={href}
+                  className="btn btn-sm btn-secondary shrink-0"
+                  onClick={() => setDrawer(false)}
+                >
+                  {t("Review")}
+                </Link>
+              </li>
+            );
+          })}
+          {waitingRoutines.map((r) => (
+            <li key={r.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
+              <div className="min-w-0">
+                <span className="block text-label font-medium text-ink-100 truncate">
+                  {r.name}
+                </span>
+                <span className="block text-micro text-ink-400 truncate">
+                  {r.status === "repoint_required"
+                    ? t("Choose thread")
+                    : r.approval_drift && (r.approved_rev !== null || r.approved_sha256 !== null)
+                      ? t("Playbook or script updated — approve to run")
+                      : t("Approve routine before first run")}
+                </span>
+              </div>
+              <Link
+                href={`/agents/${encodeURIComponent(r.agent_alias)}?tab=routines`}
+                className="btn btn-sm btn-secondary shrink-0"
+                onClick={() => setDrawer(false)}
+              >
+                {t("Review")}
+              </Link>
+            </li>
+          ))}
+        </ul>
       )}
       <ul className="todo-list">
         {cards.map((n, i) => (

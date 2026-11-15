@@ -1821,6 +1821,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=67", [])?;
                 tx.commit()?;
             }
+            if version < 68 {
+                // CAD-2317: routines, routine_runs, connection_policies, and
+                // staged_routine_proposals. Additive tables only.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::routines::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=68", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

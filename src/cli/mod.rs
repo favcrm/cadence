@@ -73,6 +73,7 @@ mod resume;
 mod resume_helpers;
 mod review;
 mod rollout;
+mod routine;
 mod sandbox;
 mod secret;
 mod self_info;
@@ -153,6 +154,7 @@ use resume_helpers::{
     resume_sweep, stop_group,
 };
 use rollout::RolloutAction;
+use routine::RoutineAction;
 use secret::SecretAction;
 use serde_json::json;
 use serde_json::Value;

@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { routinesApi } from "../agents/routinesApi";
 import { useTranslate } from "../../lib/locale";
-import type { CredentialRequest } from "../../lib/types";
+import type { Connection, CredentialRequest } from "../../lib/types";
 import Button from "../../ui/Button";
 import { errorCopy } from "./credentialRequestView";
 import {
-  actionableRequests,
+  chatVisibleRequests,
   entryHref,
+  isResumableCompletedRequest,
   stateLabel,
   targetLabel,
   verbTitle,
@@ -14,24 +16,49 @@ import {
 import "./credentials.css";
 
 /**
- * CAD-1085: the trusted structured chat component.
- *
- * It renders requests fetched from the authenticated board read for this
- * exact conversation — never from message text. A model reply that prints
- * JSON, a URL or a form cannot create one of these cards; only a durable
- * `credential_requests` row linked to the conversation does. The card holds
- * no input and no credential: opening it navigates to the top-level trusted
- * entry page.
+ * CAD-1085 / CAD-2317: the trusted structured chat component + metadata-only
+ * inline "Continue reply" resume after reconnect or personal account selection.
  */
-export function CredentialRequestCard({ request }: { request: CredentialRequest }) {
+export function CredentialRequestCard({
+  request,
+  alternateAccounts = [],
+}: {
+  request: CredentialRequest;
+  alternateAccounts?: Connection[];
+}) {
   const t = useTranslate();
   const href = entryHref(request);
+  const readyToContinue = isResumableCompletedRequest(request);
+  const [selectedAccount, setSelectedAccount] = useState<string>("");
+  const [continuing, setContinuing] = useState(false);
+  const [resumed, setResumed] = useState(false);
+  const [resumeErr, setResumeErr] = useState<string | null>(null);
+
+  const canContinue = readyToContinue || selectedAccount !== "";
+
+  const handleContinue = async () => {
+    if (continuing || !canContinue) return;
+    setContinuing(true);
+    setResumeErr(null);
+    try {
+      await routinesApi.credentialRequestContinue(
+        request.request_id,
+        selectedAccount ? { connection_id: selectedAccount } : undefined,
+      );
+      setResumed(true);
+    } catch {
+      setResumeErr(t("Could not continue the paused reply — check connection readiness first."));
+    } finally {
+      setContinuing(false);
+    }
+  };
+
   return (
     <section className="card cred-chat-card" data-credential-request={request.request_id}>
       <div className="cred-chat-head">
         <span className="text-label font-medium text-ink-100">{t(verbTitle(request.verb))}</span>
         <span className="cred-chat-state" data-tone={request.state === "pending" ? "pending" : "quiet"}>
-          {t(stateLabel(request))}
+          {resumed ? t("Reply resumed") : t(stateLabel(request))}
         </span>
       </div>
       <p className="text-micro text-ink-400 mt-1">
@@ -59,28 +86,70 @@ export function CredentialRequestCard({ request }: { request: CredentialRequest 
           </div>
         ) : null}
       </dl>
-      {href !== null ? (
-        <Button
-          variant="secondary"
-          size="sm"
-          href={href}
-          title={t("Open the trusted entry page in its own origin")}
-        >
-          {t("Open secure entry")}
-        </Button>
-      ) : (
-        <p className="text-micro text-warn mt-1" role="status">
-          {t("Trusted credential entry is unsupported on this deployment — no form is served on this board.")}
+
+      {alternateAccounts.length > 0 && !resumed && (
+        <div className="mt-2 min-w-0">
+          <label className="block text-micro text-ink-400 mb-1" htmlFor={`cred-alt-${request.request_id}`}>
+            {t("Or choose another connected account")}
+          </label>
+          <select
+            id={`cred-alt-${request.request_id}`}
+            className="w-full min-w-0 rounded border border-ink-700 bg-ink-875 px-2 py-1 text-label text-ink-100"
+            value={selectedAccount}
+            onChange={(e) => setSelectedAccount(e.target.value)}
+          >
+            <option value="">{t("Keep requested account")}</option>
+            {alternateAccounts.map((acc) => (
+              <option key={acc.id} value={acc.id}>
+                {acc.account}
+                {acc.policy?.is_default ? ` (${t("Default")})` : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {resumeErr && (
+        <p className="text-micro text-fail mt-1" role="alert">
+          {resumeErr}
         </p>
       )}
+
+      <div className="flex flex-wrap items-center gap-2 mt-2">
+        {!readyToContinue &&
+          (href !== null ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              href={href}
+              title={t("Open the trusted entry page in its own origin")}
+            >
+              {t("Open secure entry")}
+            </Button>
+          ) : (
+            <p className="text-micro text-warn" role="status">
+              {t("Trusted credential entry is unsupported on this deployment — no form is served on this board.")}
+            </p>
+          ))}
+        {canContinue && !resumed && (
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => void handleContinue()}
+            loading={continuing}
+          >
+            {t("Continue reply")}
+          </Button>
+        )}
+      </div>
     </section>
   );
 }
 
 /**
- * The conversation's pending requests. The read is authenticated,
- * server-bound to this conversation and metadata only; a failure shows
- * nothing (never a fabricated card).
+ * The conversation's pending or ready-to-continue requests. The read is
+ * authenticated, server-bound to this conversation and metadata only; a failure
+ * shows nothing (never a fabricated card).
  */
 export default function CredentialRequestList({
   conversationId,
@@ -92,6 +161,7 @@ export default function CredentialRequestList({
   className?: string;
 }) {
   const [requests, setRequests] = useState<CredentialRequest[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
   useEffect(() => {
     if (!enabled || !conversationId) {
       setRequests([]);
@@ -101,7 +171,17 @@ export default function CredentialRequestList({
     api
       .credentialRequests({ conversation: conversationId })
       .then((reply) => {
-        if (live) setRequests(actionableRequests(reply.requests));
+        if (!live) return;
+        const visible = chatVisibleRequests(reply.requests);
+        setRequests(visible);
+        if (visible.length > 0) {
+          api
+            .connections()
+            .then((res) => {
+              if (live) setConnections(res.connections ?? []);
+            })
+            .catch(() => {});
+        }
       })
       .catch(() => {
         // A refused/unreachable read renders no card; it never invents one.
@@ -115,7 +195,11 @@ export default function CredentialRequestList({
   return (
     <div className={className ? `cred-chat-list ${className}` : "cred-chat-list"}>
       {requests.map((request) => (
-        <CredentialRequestCard key={request.request_id} request={request} />
+        <CredentialRequestCard
+          key={request.request_id}
+          request={request}
+          alternateAccounts={connections.filter((c) => c.provider === request.provider)}
+        />
       ))}
     </div>
   );

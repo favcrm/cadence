@@ -53,6 +53,7 @@ mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad811_installed_crm_qa_fixture;
+mod routines_rpc;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
     let raw = params
@@ -4687,6 +4688,20 @@ impl Shared {
             "endpoint_enable" => self.rpc_endpoint_set_enabled(params, true, peer_pid),
             "endpoint_disable" => self.rpc_endpoint_set_enabled(params, false, peer_pid),
             "endpoint_remove" => self.rpc_endpoint_remove(params, peer_pid),
+            "routine_list" => self.rpc_routine_list(params),
+            "routine_show" => self.rpc_routine_show(params),
+            "routine_create" => self.rpc_routine_create(params, peer_pid),
+            "routine_update" => self.rpc_routine_update(params, peer_pid),
+            "routine_approve" => self.rpc_routine_approve(params, peer_pid),
+            "routine_run" => self.rpc_routine_run(params, peer_pid),
+            "routine_pause" => self.rpc_routine_pause(params, peer_pid),
+            "routine_resume" => self.rpc_routine_resume(params, peer_pid),
+            "routine_remove" => self.rpc_routine_remove(params, peer_pid),
+            "wiki_propose" => self.rpc_wiki_propose(params),
+            "routine_propose" => self.rpc_routine_propose(params),
+            "connection_policy_get" => self.rpc_connection_policy_get(params),
+            "connection_policy_set" => self.rpc_connection_policy_set(params, peer_pid),
+            "credential_request_continue" => self.rpc_credential_request_continue(params, peer_pid),
             "agent_unfence" => self.rpc_unfence(params, peer_pid),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
