@@ -1,3 +1,4 @@
+import { boardSupports } from "./capabilities";
 import type { Meta } from "./types";
 
 /**
@@ -6,5 +7,5 @@ import type { Meta } from "./types";
  * loads the wiki is not hidden (the pre-meta default).
  */
 export function wikiAvailable(meta: Pick<Meta, "hosted" | "wiki"> | null | undefined): boolean {
-  return meta?.hosted !== true || meta.wiki === true;
+  return boardSupports(meta, "wiki");
 }

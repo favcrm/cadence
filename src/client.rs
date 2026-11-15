@@ -1001,16 +1001,33 @@ impl<'a> RpcSession<'a> {
         Ok(Self { state_dir, stream })
     }
 
+    /// Connect to one daemon within a bounded deadline.
+    pub fn connect_timeout(state_dir: &'a Path, timeout: Duration) -> Result<Self> {
+        let socket = rpc_socket_path(state_dir)?;
+        let stream = connect_bounded(&socket, Instant::now() + timeout)?;
+        Ok(Self { state_dir, stream })
+    }
+
     /// Distinguish a complete daemon answer from an unusable transport frame.
     /// There is no reconnect or replay after a request has been written.
     pub fn answer(&mut self, method: &str, params: Value) -> Result<Result<Value>> {
+        self.answer_timeout(method, params, Duration::from_secs(700))
+    }
+
+    /// Like [`Self::answer`], with a bounded deadline for this exchange.
+    pub fn answer_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Result<Value>> {
         let mut request = proto::request(method, params);
         if let Some(test_caller) = crate::test_seam::caller_frame(self.state_dir)? {
             request[crate::test_seam::FRAME_FIELD] = test_caller;
         }
         let mut body = request.to_string();
         body.push('\n');
-        let deadline = Instant::now() + Duration::from_secs(700);
+        let deadline = Instant::now() + timeout;
         let fd = self.stream.as_raw_fd();
         write_bounded(fd, body.as_bytes(), deadline)?;
         let line = read_line_with_limit(fd, deadline, RPC_SESSION_FRAME_CAP)?;

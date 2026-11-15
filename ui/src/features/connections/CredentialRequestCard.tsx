@@ -84,14 +84,16 @@ export function CredentialRequestCard({ request }: { request: CredentialRequest 
  */
 export default function CredentialRequestList({
   conversationId,
+  enabled = true,
   className,
 }: {
   conversationId: string | null | undefined;
+  enabled?: boolean;
   className?: string;
 }) {
   const [requests, setRequests] = useState<CredentialRequest[]>([]);
   useEffect(() => {
-    if (!conversationId) {
+    if (!enabled || !conversationId) {
       setRequests([]);
       return;
     }
@@ -108,7 +110,7 @@ export default function CredentialRequestList({
     return () => {
       live = false;
     };
-  }, [conversationId]);
+  }, [enabled, conversationId]);
   if (requests.length === 0) return null;
   return (
     <div className={className ? `cred-chat-list ${className}` : "cred-chat-list"}>

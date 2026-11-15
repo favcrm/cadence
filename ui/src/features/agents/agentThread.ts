@@ -8,6 +8,7 @@ import {
   loadThread,
   newMessageId,
   settlePending,
+  type PendingAttachment,
   type ThreadState,
 } from "../home/thread";
 
@@ -26,7 +27,7 @@ export async function sendToAgent(
   text: string,
   message = newMessageId(),
   refs?: ThreadRef[],
-  attachments?: { id: string }[],
+  attachments?: PendingAttachment[],
 ): Promise<void> {
   const body = text.trim();
   if (!body) return;

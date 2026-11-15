@@ -60,7 +60,7 @@ pub fn valid_connected_read_receipt(envelope: &Value) -> bool {
     {
         return false;
     }
-    repeated || (!result.is_null() && data["effect"] == "read" && valid_price)
+    !result.is_null() && (repeated || (data["effect"] == "read" && valid_price))
 }
 
 /// Only operations AgenticOS v2 has qualified are declared. A provider whose
@@ -461,6 +461,34 @@ mod tests {
         assert_eq!(call.body["connection_id"], "con_alpha");
         assert_eq!(call.body["max_charge_minor"], 25);
         assert_eq!(call.body["input"], input());
+    }
+
+    #[test]
+    fn a_replay_without_a_result_is_uncertain_and_is_not_retried() {
+        let (base, seen, worker) = door(
+            json!({"ok": true, "data": {"repeated": true, "result": null}}),
+            200,
+        );
+        let adapter = AgenticosProviderAdapter::new(&base).unwrap();
+        let error = adapter
+            .execute_connected_read(
+                "prod",
+                b"hct_test_token",
+                &ConnectedRead {
+                    tool: "search_console_report",
+                    input: &input(),
+                    connection: "con_alpha",
+                    max_charge_minor: 25,
+                    idempotency_key: "req-missing-result",
+                },
+            )
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(
+            matches!(&error, AppCapabilityError::Uncertain(_)),
+            "{error}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -926,6 +926,7 @@ pub(super) fn agent_action(
 pub(super) fn master_summary(
     state_dir: &std::path::Path,
     query: &dyn Fn(&str) -> Option<String>,
+    policy_actor: &str,
 ) -> HttpResp {
     let Some(since) = query("since")
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -933,7 +934,11 @@ pub(super) fn master_summary(
     else {
         return err_response(400, "since must be epoch seconds");
     };
-    match client::rpc(state_dir, "master_summary", json!({ "since": since })) {
+    match client::rpc(
+        state_dir,
+        "master_summary",
+        json!({ "since": since, "read_as": policy_actor }),
+    ) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, "master_summary"),
     }
@@ -943,9 +948,40 @@ pub(super) fn master_summary(
 /// chips (model/effort/context) and in-flight turn. A plain read like
 /// `/api/threads/<alias>`; a daemon without `master_state` answers 501
 /// and the UI falls back to the agents payload.
-pub(super) fn master_state(state_dir: &std::path::Path, operator: bool) -> HttpResp {
-    match client::rpc(state_dir, "master_state", json!({})) {
+///
+/// CAD-2215: the daemon answers for the reader this request proved, so the
+/// relay carries that proof (a member's signed session, the anonymous
+/// service identity, or nothing at all for a proven operator) and never a
+/// member/app field of its own. The board-level redaction below stays as
+/// defence in depth: it is not what decides authority.
+pub(super) fn master_state(
+    state_dir: &std::path::Path,
+    operator: bool,
+    proof: &super::operator::ReadRelayProof,
+) -> HttpResp {
+    use cadence_core::board_api::{MASTER_STATE_SCOPE_ACK, READER_SCOPE_FIELD};
+    let mut params = json!({});
+    proof.attach(&mut params);
+    let relayed = !matches!(proof, super::operator::ReadRelayProof::Operator);
+    match client::rpc(state_dir, "master_state", params) {
         Ok(mut out) => {
+            // CAD-2215: a relayed NON-operator answer must carry the ack; a
+            // daemon without it is a mixed-version daemon that may have
+            // ignored the proof and built the global document. That answer
+            // is unavailable — never an empty (or full) "success". A
+            // proven operator's own relay is exempt: its full document is
+            // correct for it either way.
+            let ack = out
+                .as_object_mut()
+                .and_then(|fields| fields.remove(READER_SCOPE_FIELD));
+            let confirmed = ack.as_ref().and_then(Value::as_str) == Some(MASTER_STATE_SCOPE_ACK);
+            if relayed && !operator && !confirmed {
+                return err_response(
+                    503,
+                    "master state unavailable for this reader — the daemon did not \
+                     confirm a reader-scoped answer",
+                );
+            }
             if !operator {
                 super::member_view::redact_master_state(&mut out);
             }

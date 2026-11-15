@@ -20,8 +20,10 @@ import { parseRunSlotReceipt, type ActionRefusal, type ActionResult, type ReplyM
 export const SLOT_GUARD_MS = 500;
 export const SLOT_TTL_MS = 120_000;
 
-/** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame). */
-export interface SlotCard { target: string; caption: string; image: string | null; title?: string; detail?: string }
+/** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame).
+ *  `disclosure` is host-owned explanatory text for a decision this board asks for (e.g. a
+ *  publishing consent); the frame never supplies it. */
+export interface SlotCard { target: string; caption: string; image: string | null; title?: string; detail?: string; disclosure?: string }
 export interface RecordCard {
   operation: string;
   facts: { label: string; value: string; strong?: boolean }[];

@@ -47,9 +47,9 @@ mod threads;
 pub use threads::{
     operator_only_kind, tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender,
     Thread, ThreadEntry, CONVERSATION_LIMIT, KIND_ARTIFACT, KIND_ASSISTANT_TEXT,
-    KIND_HIRE_PROPOSAL, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT,
-    PAGE_MAX as THREAD_PAGE_MAX, RECRUIT_INSTALL, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
-    SUBJECT_CAMPAIGN, SUBJECT_WHATSAPP,
+    KIND_HIRE_PROPOSAL, KIND_MESSAGE, KIND_SURFACE, KIND_TOOL_CALL, KIND_TOOL_RESULT,
+    KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, RECRUIT_INSTALL, ROLE_AGENT, ROLE_OPERATOR,
+    ROLE_SYSTEM, SUBJECT_CAMPAIGN, SUBJECT_WHATSAPP,
 };
 pub use threads::{CliAuthority, MemberAuthority};
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
@@ -103,6 +103,9 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+mod endpoint;
+pub use endpoint::AgentEndpoint;
+pub(crate) use monitors::{ProjectMonitorView, MAX_MONITOR_TASKS};
 mod business_templates;
 pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};
@@ -119,9 +122,10 @@ pub use chat_files::{
 };
 mod assistants;
 pub use assistants::{
-    AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding,
-    AssistantBootstrapUpdate,
+    assist_request_id, AssistDispatchExpect, AssistRecipient, AssistRequest, AssistRequestQueued,
+    AssistantBinding, AssistantBootstrapUpdate,
 };
+pub(crate) use assistants::{PrivateJobDenials, PrivateJobReader};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;
@@ -134,6 +138,8 @@ pub mod app_contexts;
 pub mod app_effects;
 pub mod app_explorer;
 pub mod app_media;
+pub mod app_member_grants;
+mod app_member_threads;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;
@@ -144,11 +150,15 @@ pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
-pub(crate) use plans::DispatchPlan;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
+pub(crate) use plans::{DispatchPlan, TaskHistoryEvent};
 mod quota;
 mod schema;
+/// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`
+/// bind for the explicit operator initialization.
+pub(crate) mod scoped_cursor_keys;
 pub(crate) mod seal;
+pub(crate) use scoped_cursor_keys::CursorKeyringInit;
 pub(crate) mod wiki_transfers;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};

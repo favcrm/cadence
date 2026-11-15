@@ -203,6 +203,464 @@ fn audit_reviewers_set_is_a_registered_owner_write() {
 }
 
 #[test]
+fn timeline_on_an_older_board_is_a_release_order_refusal() {
+    use super::timeline_board_too_old;
+    let args = |before: bool| {
+        let mut m = serde_json::Map::new();
+        m.insert("project".into(), serde_json::json!("atlas"));
+        if before {
+            m.insert("before".into(), serde_json::json!("cursor"));
+        }
+        m
+    };
+    let old = timeline_board_too_old(
+        "project_timeline",
+        501,
+        Some("not_implemented"),
+        &args(false),
+    )
+    .unwrap();
+    assert!(
+        old.contains("cannot serve the project timeline yet"),
+        "{old}"
+    );
+    assert!(old.contains("501") && !old.contains("retry"), "{old}");
+    let relay = timeline_board_too_old(
+        "project_timeline",
+        400,
+        Some("invalid_request"),
+        &args(false),
+    )
+    .unwrap();
+    assert!(
+        relay.contains("cannot serve the project timeline yet"),
+        "{relay}"
+    );
+    // A bad cursor is a real 400 from a current board; other verbs are untouched.
+    assert!(timeline_board_too_old(
+        "project_timeline",
+        400,
+        Some("invalid_request"),
+        &args(true)
+    )
+    .is_none());
+    assert!(timeline_board_too_old("project_ls", 501, None, &args(false)).is_none());
+}
+
+/// CAD-2260. The statuses and codes are the ones the tenant board gives in
+/// agenticos-v2 `apps/api/src/tenant-board/cli.ts` (`tenantWikiCall`): a
+/// `write` carrying `transfer` fails the argument check, `job_status` is not
+/// implemented, and a `read` of a missing path is `404 not_found`.
+#[test]
+fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
+    use super::wiki_copy_unserved;
+    let transfer = |op: &str| {
+        let mut m = serde_json::Map::new();
+        m.insert("path".into(), json!("projects/demo/notes"));
+        m.insert("transfer".into(), json!({ "op": op }));
+        m
+    };
+    for (verb, op, status, code, nothing) in [
+        // local → wiki, into a new or an existing folder
+        ("write", "begin", 400, Some("invalid_request"), "copied"),
+        // the same, from a board that refuses the transfer by one stable code
+        ("write", "begin", 501, Some("not_implemented"), "copied"),
+        // wiki → local
+        (
+            "job_status",
+            "export",
+            501,
+            Some("not_implemented"),
+            "copied",
+        ),
+        // --resume reads the admitted job first
+        ("job_status", "status", 501, Some("not_implemented"), "read"),
+        // a 501 whose code this client does not know: the code is not echoed
+        ("job_status", "export", 501, Some("unknown_verb"), "copied"),
+    ] {
+        let error = wiki_copy_unserved(verb, status, code, &transfer(op)).unwrap();
+        let text = error.to_string();
+        assert_eq!(error.code(), Some("not_implemented"), "{text}");
+        assert_eq!(error.kind(), "rejected", "{text}");
+        assert!(text.contains("does not serve `wiki cp`"), "{text}");
+        assert!(
+            text.contains("wiki put") && text.contains("wiki upload"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("HTTP {status}")), "{text}");
+        assert!(text.ends_with(&format!("Nothing was {nothing}")), "{text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("retry"),
+            "a healthy board must not read as an outage or an unrecognised refusal: {text}"
+        );
+    }
+    // After `begin` was admitted a refusal is not proof that nothing moved, and
+    // a board that serves transfers answers 400 to a bad chunk: both keep the
+    // decoded refusal.
+    for (op, status, code) in [
+        ("chunk", 400, Some("invalid_request")),
+        ("chunk", 501, Some("not_implemented")),
+        ("apply", 501, Some("not_implemented")),
+        ("finish", 501, Some("not_implemented")),
+        ("begin", 400, Some("unknown_verb")),
+        ("begin", 400, None),
+        ("begin", 409, Some("path_conflict")),
+    ] {
+        assert!(
+            wiki_copy_unserved("write", status, code, &transfer(op)).is_none(),
+            "{op} {status} {code:?}"
+        );
+    }
+    // A per-entry export read pins a `rev`; earlier entries may already be on
+    // disk, so it keeps the decoded refusal too.
+    let mut pinned = transfer("export");
+    pinned["transfer"]["rev"] = json!("rev-1");
+    assert!(wiki_copy_unserved("job_status", 501, Some("not_implemented"), &pinned).is_none());
+    // A text `wiki put` carries no transfer and keeps its own refusals.
+    let mut put = serde_json::Map::new();
+    put.insert("path".into(), json!("projects/demo/notes/a.md"));
+    put.insert("text".into(), json!("hello"));
+    assert!(wiki_copy_unserved("write", 400, Some("invalid_request"), &put).is_none());
+    assert!(wiki_copy_unserved("write", 501, Some("not_implemented"), &put).is_none());
+}
+
+/// CAD-2261: every code a transfer-serving board (AOS-566) refuses a `wiki cp`
+/// operation with becomes one plain sentence that keeps the code.
+#[test]
+fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
+    use super::wiki_copy_refusal;
+    let with = |op: &str| {
+        let mut m = serde_json::Map::new();
+        m.insert("path".into(), json!("projects/demo/notes"));
+        m.insert("transfer".into(), json!({ "op": op }));
+        m
+    };
+    for (verb, op, status, code) in [
+        ("write", "begin", 409, "destination_changed"),
+        ("write", "begin", 413, "payload_too_large"),
+        ("write", "begin", 409, "job_conflict"),
+        ("write", "begin", 400, "manifest_invalid"),
+        ("write", "finish", 400, "transfer_invalid"),
+        ("job_status", "status", 404, "not_found"),
+        ("job_status", "export", 404, "not_found"),
+        ("write", "chunk", 404, "not_found"),
+        ("write", "apply", 404, "not_found"),
+        ("write", "finish", 404, "not_found"),
+        ("write", "apply", 409, "stage_incomplete"),
+        ("write", "finish", 409, "entries_pending"),
+        ("write", "chunk", 409, "chunk_conflict"),
+        ("write", "chunk", 409, "job_closed"),
+        ("write", "chunk", 409, "entry_decided"),
+        ("job_status", "export", 409, "revision_changed"),
+    ] {
+        let error = wiki_copy_refusal(verb, status, Some(code), &with(op)).unwrap();
+        // The copy client trusts exactly these codes as definite refusals.
+        assert!(super::is_wiki_copy_refusal(code), "{code}");
+        let text = error.to_string();
+        assert_eq!(error.code(), Some(code), "{text}");
+        assert_eq!(error.kind(), "rejected", "{text}");
+        assert!(
+            text.ends_with(&format!("({code}, HTTP {status})")),
+            "{text}"
+        );
+        for banned in [
+            "unknown",
+            "did not match",
+            "retry later",
+            "MiB",
+            "Tenant remote call",
+        ] {
+            assert!(!text.contains(banned), "{banned}: {text}");
+        }
+    }
+    let missing_job = wiki_copy_refusal("job_status", 404, Some("not_found"), &with("status"));
+    assert!(missing_job
+        .unwrap()
+        .to_string()
+        .contains("no such copy job"));
+    let missing_page = wiki_copy_refusal("job_status", 404, Some("not_found"), &with("export"));
+    assert!(missing_page
+        .unwrap()
+        .to_string()
+        .contains("no readable page"));
+    // Mid-job the wrapper gives the next step, so no "without `--resume`" here.
+    let gone = wiki_copy_refusal("write", 404, Some("not_found"), &with("chunk")).unwrap();
+    assert!(
+        gone.to_string().contains("no longer has this copy job"),
+        "{gone}"
+    );
+    assert!(!gone.to_string().contains("--resume"), "{gone}");
+    // A `begin` never meets a job that does not exist yet.
+    assert!(wiki_copy_refusal("write", 404, Some("not_found"), &with("begin")).is_none());
+    // A board without transfers: the CAD-2260 refusal now says what unblocks it.
+    let old = super::wiki_copy_unserved("write", 501, Some("not_implemented"), &with("begin"));
+    assert!(old.unwrap().to_string().contains("has to be updated first"));
+    assert!(
+        wiki_copy_refusal("write", 409, Some("destination_changed"), &with("begin"))
+            .unwrap()
+            .to_string()
+            .contains("--update")
+    );
+    assert!(
+        wiki_copy_refusal("write", 413, Some("payload_too_large"), &with("begin"))
+            .unwrap()
+            .to_string()
+            .contains("wiki upload")
+    );
+    // A text `wiki put` shares the verb and keeps its own refusals.
+    let mut put = serde_json::Map::new();
+    put.insert("path".into(), json!("projects/demo/notes/a.md"));
+    put.insert("text".into(), json!("hello"));
+    assert!(wiki_copy_refusal("write", 413, Some("payload_too_large"), &put).is_none());
+    // A status or code the board does not send for a transfer is left alone.
+    assert!(wiki_copy_refusal("write", 409, Some("revision_conflict"), &with("begin")).is_none());
+    assert!(wiki_copy_refusal("write", 400, Some("invalid_request"), &with("begin")).is_none());
+    assert!(wiki_copy_refusal("write", 409, None, &with("begin")).is_none());
+    assert!(wiki_copy_refusal("read", 404, Some("not_found"), &with("status")).is_none());
+}
+
+/// CAD-2261: the refusals in the board's own fixture (a byte-identical copy of
+/// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json` at
+/// `67a3839ae1222b2e6a9be7904aca270f5a449aea`) replayed through the real
+/// request path: the board's exact bytes in, the board's code out.
+#[test]
+fn wiki_cp_refusals_in_the_board_fixture_reach_the_user_plainly() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/agenticos/wiki-transfer.contract.json"
+    ))
+    .unwrap();
+    let mut replayed = 0;
+    for step in fixture["steps"].as_array().unwrap() {
+        let status = step["response"]["status"].as_u64().unwrap() as u16;
+        if status < 400 {
+            continue;
+        }
+        let label = step["label"].as_str().unwrap();
+        let verb = step["action"].as_str().unwrap();
+        let args = step["arguments"].as_object().unwrap().clone();
+        let body = step["response"]["body"].clone();
+        let code = body["error"]["code"].as_str().unwrap().to_string();
+        if verb != "read" && wiki_transfer_shape(verb, &args).is_err() {
+            // The client refuses this one before any request; the board's
+            // answer to it is still mapped.
+            let error = super::wiki_copy_refusal(verb, status, Some(code.as_str()), &args).unwrap();
+            assert_eq!(error.code(), Some(code.as_str()), "{label}");
+            replayed += 1;
+            continue;
+        }
+        let line: &'static str = match status {
+            400 => "400 Bad Request",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            413 => "413 Payload Too Large",
+            other => panic!("{label}: no status line for {other}"),
+        };
+        let answer = body.clone();
+        let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+            if i == 0 {
+                upload_authorize_answer(socket);
+            } else {
+                write_answer(socket, line, "", &answer);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let error = call_verb_in(&target, verb, args, 5, &dir, |_| {}, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2, "{label}: sent once");
+        let text = error.to_string();
+        assert_eq!(error.code(), Some(code.as_str()), "{label}: {text}");
+        assert_eq!(error.kind(), "rejected", "{label}: {text}");
+        assert!(!text.contains("unknown"), "{label}: {text}");
+        assert!(!text.contains("Tenant remote call"), "{label}: {text}");
+        // The sentence the user reads, not only the code.
+        let expected = match (verb, code.as_str()) {
+            ("read", "not_found") => "no readable page at that path",
+            (_, "job_conflict") => "already holds this job id for a different copy",
+            (_, "destination_changed") => "Copy again with `--update`",
+            (_, "not_found") => "no such copy job for this login",
+            (_, other) => panic!("{label}: no expected sentence for {other}"),
+        };
+        assert!(text.contains(expected), "{label}: {text}");
+        replayed += 1;
+    }
+    assert!(replayed > 0, "the fixture holds no refusal");
+}
+
+/// CAD-2271: the copy client trusts a hosted mid-job error as "nothing
+/// changed" by its code alone. That holds only if a code from the refusal
+/// table reaches a `chunk`, `apply` or `finish` error through
+/// [`wiki_copy_refusal`] and nothing else. So each table code, answered at a
+/// status that has no row for it, comes back through the real request path
+/// without that code.
+#[test]
+fn a_board_code_off_its_row_is_not_a_trusted_refusal() {
+    let lines: &[(u16, &'static str)] = &[
+        (400, "400 Bad Request"),
+        (404, "404 Not Found"),
+        (409, "409 Conflict"),
+        (413, "413 Payload Too Large"),
+        (422, "422 Unprocessable Entity"),
+    ];
+    let root = "projects/demo/notes";
+    let mut checked = 0;
+    for op in ["chunk", "apply", "finish"] {
+        let mut transfer = json!({"op": op, "job_id": "job-1", "root": root});
+        if op != "finish" {
+            transfer["entry_id"] = json!("entry-1");
+        }
+        if op == "chunk" {
+            transfer["offset"] = json!(0);
+            transfer["data_base64"] = json!("");
+        }
+        let args = json!({"path": root, "transfer": transfer});
+        let mut seen_codes: Vec<&str> = Vec::new();
+        for row in super::WIKI_COPY_REFUSALS {
+            if seen_codes.contains(&row.code) {
+                continue;
+            }
+            seen_codes.push(row.code);
+            let mapped_at = |status: u16| {
+                super::WIKI_COPY_REFUSALS.iter().any(|r| {
+                    r.code == row.code
+                        && r.status == status
+                        && (r.ops.is_empty() || r.ops.contains(&op))
+                })
+            };
+            for &(status, line) in lines.iter().filter(|(status, _)| !mapped_at(*status)) {
+                let (error, seen) = wiki_call_refused(line, row.code, "write", args.clone());
+                let text = error.to_string();
+                assert!(
+                    !error.code().is_some_and(super::is_wiki_copy_refusal),
+                    "{op} {status} {}: {text}",
+                    row.code
+                );
+                assert_eq!(seen.len(), 2, "{op} {status} {}: sent once", row.code);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0);
+}
+
+/// CAD-2275: the copy client trusts a table row as "nothing changed", and
+/// the row is matched before the after-forward 5xx classification. A 5xx
+/// row would therefore call a write that may have landed refused, so every
+/// row must be a 4xx.
+#[test]
+fn every_wiki_copy_refusal_row_is_a_4xx() {
+    assert!(!super::WIKI_COPY_REFUSALS.is_empty());
+    for row in super::WIKI_COPY_REFUSALS {
+        assert!(
+            (400..500).contains(&row.status),
+            "{} {} is not a 4xx",
+            row.status,
+            row.code
+        );
+    }
+}
+
+#[test]
+fn a_missing_wiki_page_on_a_hosted_board_is_named_by_code() {
+    let error = message_family_refusal("read", 404, Some("not_found"), reject("generic"));
+    assert_eq!(error.code(), Some("not_found"));
+    let text = error.to_string();
+    assert!(text.contains("no readable page at that path"), "{text}");
+    assert!(!text.contains("generic"), "{text}");
+    // Another verb's 404 keeps the decoded refusal.
+    let other = message_family_refusal("enumerate", 404, Some("not_found"), reject("generic"));
+    assert!(other.to_string().contains("generic"));
+}
+
+/// CAD-2260: one wiki call against a fake board that authorizes it and then
+/// refuses it in the body shape the tenant board's `fail()` writes. The board
+/// serves exactly those two requests. Returns the refusal and the paths it saw.
+fn wiki_call_refused(
+    status_line: &'static str,
+    code: &'static str,
+    verb: &str,
+    args: Value,
+) -> (Error, Vec<String>) {
+    let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+        if i == 0 {
+            upload_authorize_answer(socket);
+        } else {
+            write_answer(
+                socket,
+                status_line,
+                "",
+                &json!({"ok": false, "error": {
+                    "code": code, "message": "Tenant remote call refused."}}),
+            );
+        }
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let out = call_verb_in(
+        &target,
+        verb,
+        args.as_object().unwrap().clone(),
+        5,
+        &dir,
+        |_| {},
+        |_| {},
+    );
+    server.join().unwrap();
+    let paths = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    (out.unwrap_err(), paths)
+}
+
+/// CAD-2260, through the request path: the requests `wiki cp` sends to a board
+/// without transfers each come back as one clear refusal, sent once.
+#[test]
+fn wiki_cp_against_a_board_without_transfers_is_one_clear_refusal_sent_once() {
+    let manifest = json!({"version": 1, "source_id": "local:demo",
+        "root": "projects/demo/notes", "entries": []});
+    for (verb, args, status_line, code) in [
+        (
+            "write",
+            json!({"path": "projects/demo/notes",
+                "transfer": {"op": "begin", "job_id": "job-1", "manifest": manifest}}),
+            "400 Bad Request",
+            "invalid_request",
+        ),
+        (
+            "job_status",
+            json!({"path": "projects/demo/notes/a.md",
+                "transfer": {"op": "export", "path": "projects/demo/notes/a.md"}}),
+            "501 Not Implemented",
+            "not_implemented",
+        ),
+    ] {
+        let (error, seen) = wiki_call_refused(status_line, code, verb, args);
+        let text = error.to_string();
+        assert_eq!(error.code(), Some("not_implemented"), "{verb}: {text}");
+        assert!(text.contains("does not serve `wiki cp`"), "{verb}: {text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("retry"),
+            "{verb}: {text}"
+        );
+        assert!(!text.contains("Tenant remote call"), "{verb}: {text}");
+        assert_eq!(
+            seen,
+            ["/__platform/wiki/authorize", "/__platform/wiki/call"],
+            "{verb}: one request, never replayed"
+        );
+    }
+    // The discovery read of a destination that does not exist yet.
+    let (error, _) = wiki_call_refused(
+        "404 Not Found",
+        "not_found",
+        "read",
+        json!({"path": "projects/demo/notes", "offset": 0, "bytes": 0}),
+    );
+    assert_eq!(error.code(), Some("not_found"), "{error}");
+}
+
+#[test]
 fn project_verbs_are_a_registered_read_and_owner_write() {
     // CAD-1999: the client refuses a verb missing from REMOTE_VERBS before a
     // request exists, so the registry read and the owner write must both be
@@ -212,6 +670,9 @@ fn project_verbs_are_a_registered_read_and_owner_write() {
 
     assert!(REMOTE_VERBS.contains(&"project_ls"));
     assert!(REMOTE_VERBS.contains(&"project_new"));
+    assert!(REMOTE_VERBS.contains(&"project_timeline"));
+    assert_eq!(cli_requested_scopes("project_timeline"), &["cli.read"]);
+    assert!(!mutating_cli_verb("project_timeline"));
     assert_eq!(cli_requested_scopes("project_ls"), &["cli.read"]);
     assert_eq!(cli_requested_scopes("project_new"), &["cli.write"]);
     assert!(!mutating_cli_verb("project_ls"));
@@ -3077,6 +3538,25 @@ fn cad2150_board_without_review_text_gets_a_typed_refusal_only_when_asked() {
     assert!(result.unwrap_err().to_string().contains("Release order"));
 }
 
+/// CAD-2277: a board that predates `limit` on `issue_ls` answers `400
+/// invalid_request`; only a call carrying `limit` gets the typed code so
+/// `src/cli/remote.rs` can retry once without `limit` and slice locally.
+#[test]
+fn cad2277_board_without_issue_ls_limit_gets_typed_refusal_only_when_limit_sent() {
+    let refused = json!({"ok": false, "error": {"code": "invalid_request"}});
+    let mut with_limit = json!({"project": "ops"}).as_object().unwrap().clone();
+    with_limit.insert("limit".to_string(), json!(5));
+    let (result, _) = run(vec![(400, "", refused.clone())], "issue_ls", with_limit, 10);
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), Some(super::ISSUE_LS_LIMIT_UNSUPPORTED));
+
+    let without_limit = json!({"project": "ops"}).as_object().unwrap().clone();
+    let (plain_result, _) = run(vec![(400, "", refused)], "issue_ls", without_limit, 10);
+    let plain_err = plain_result.unwrap_err();
+    assert_eq!(plain_err.code(), None);
+    assert_eq!(plain_err.kind(), "rejected");
+}
+
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
 /// capability_unavailable) is a release-order refusal — never "no evidence"
 /// and never a fallback to the older repo-scoped verb. The matching write
@@ -4713,6 +5193,485 @@ fn hosted_platform_in_progress_replay_preserves_same_key_reconciliation() {
 }
 
 #[test]
+fn hosted_connected_read_in_progress_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let body = json!({"ok": false, "error": {"code": "idempotency_in_progress"}});
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let err = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an in-progress read must not be automatically retried"),
+    )
+    .expect_err("an in-progress read has no final receipt");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(err.to_string().contains("platform status"), "{err}");
+    assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn hosted_connected_read_without_a_receipt_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-2"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for body in [
+        json!({"ok": true}),
+        json!({"ok": true, "data": {}}),
+        json!({"ok": true, "data": {"repeated": true, "result": null}}),
+        json!({"ok": true, "data": {"repeated": true, "result": {"rows": []}}}),
+        json!({"ok": true, "data": {
+            "repeated": true, "result": {"rows": []}, "effect": "read",
+            "price": {"currency": "USD", "scale": 6, "amount": "invalid"}
+        }}),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(200, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a missing receipt must not be automatically retried"),
+        )
+        .expect_err("a missing receipt does not prove the read failed");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(err.to_string().contains("platform status"), "{err}");
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn hosted_connected_read_accepts_a_complete_settled_receipt_and_replay() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-3"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for repeated in [false, true] {
+        let receipt = json!({"ok": true, "data": {
+            "repeated": repeated,
+            "result": {"rows": []},
+            "effect": "read",
+            "price": {"currency": "USD", "scale": 6, "amount": "0.000025"}
+        }});
+        let (listener, requests, _server) = fake_worker(vec![(200, "", receipt.clone())]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let answer = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a settled read must not be automatically retried"),
+        )
+        .expect("a complete settled receipt is accepted");
+        assert!(matches!(answer, RemoteAnswer::Ok(body) if body == receipt));
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
+/// CAD-2226: the three owner-enrollment operations ride `platform_call`. A 2xx
+/// is printed only when it carries the complete documented row shape; an
+/// incomplete read is a refusal, never an invented empty list. Unknown additive
+/// fields stay accepted so a newer server is not frozen out.
+#[test]
+fn hosted_connection_reads_require_the_complete_documented_rows() {
+    let provider = json!({
+        "provider": "google_search_console",
+        "descriptor_available": false,
+        "manifest_status": "missing",
+        "reviewed_pin": null,
+        "reported_pin": null,
+        "enrollment": "available",
+        "read": {
+            "slug": "google_search_console",
+            "qualified": true,
+            "pinned": true,
+            "projected": true
+        }
+    });
+    let connection = json!({
+        "id": "con_synthetic",
+        "provider": "google_search_console",
+        "account": "",
+        "kind": "enrolled",
+        "revision": null,
+        "registration_digest": null,
+        "scopes": [],
+        "status": {
+            "adapter_registered": true,
+            "descriptor_available": true,
+            "custody_available": true,
+            "manifest_status": "matched",
+            "reviewed_pin": "google-search-console@1",
+            "reported_pin": "google-search-console@1",
+            "execution_authority": true,
+            "network_checked": false
+        }
+    });
+    let without = |row: &Value, key: &str| {
+        let mut row = row.clone();
+        row.as_object_mut().unwrap().remove(key);
+        row
+    };
+    let mut bad_read = provider.clone();
+    bad_read["read"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projected");
+    let mut bad_descriptor = provider.clone();
+    bad_descriptor["descriptor_available"] = json!("yes");
+    let mut bad_status = connection.clone();
+    bad_status["status"]
+        .as_object_mut()
+        .unwrap()
+        .remove("custody_available");
+    let mut bad_kind = connection.clone();
+    bad_kind["kind"] = json!("enrolled_elsewhere");
+    let mut bad_scopes = connection.clone();
+    bad_scopes["scopes"] = json!([1]);
+    let mut additive_provider = provider.clone();
+    additive_provider
+        .as_object_mut()
+        .unwrap()
+        .insert("future".into(), json!(true));
+    let mut additive_connection = connection.clone();
+    additive_connection
+        .as_object_mut()
+        .unwrap()
+        .insert("future".into(), json!(true));
+
+    let cases: [(&str, &str, Value, Vec<Value>); 2] = [
+        (
+            "connection_providers",
+            "providers",
+            additive_provider,
+            vec![
+                json!({}),
+                without(&provider, "enrollment"),
+                bad_read,
+                bad_descriptor,
+                json!("google_search_console"),
+            ],
+        ),
+        (
+            "connection_list",
+            "connections",
+            additive_connection,
+            vec![
+                json!({}),
+                without(&connection, "revision"),
+                bad_status,
+                bad_kind,
+                bad_scopes,
+                json!("con_synthetic"),
+            ],
+        ),
+    ];
+    for (operation, field, good, bad) in cases {
+        let args = json!({ "operation": operation })
+            .as_object()
+            .cloned()
+            .unwrap();
+        let call = |body: Value| {
+            let (listener, requests, _server) = fake_worker(vec![(200, "", body)]);
+            let target = target(&listener);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("a");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            store_credential(&dir, &target.endpoint);
+            let answer = call_verb_in(
+                &target,
+                "platform_call",
+                args.clone(),
+                10,
+                &dir,
+                |_| {},
+                |_| panic!("a read is never retried"),
+            );
+            assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+            answer
+        };
+        for row in bad {
+            let err = call(json!({"ok": true, "data": { field: [row] }}))
+                .expect_err("an incomplete row proves nothing");
+            assert_eq!(err.kind(), "rejected", "{err}");
+            let text = err.to_string().to_ascii_lowercase();
+            assert!(text.contains("incomplete"), "{text}");
+            assert!(
+                !text.contains("no connections") && !text.contains("no providers"),
+                "an unusable answer must not become an empty list: {text}"
+            );
+        }
+        // A legitimate empty list and a row with tolerable additive fields
+        // both stay valid.
+        for body in [
+            json!({"ok": true, "data": { field: [] }}),
+            json!({"ok": true, "data": { field: [good.clone()], "future": true }}),
+        ] {
+            let answer = call(body.clone()).expect("a complete answer is accepted");
+            assert!(matches!(answer, RemoteAnswer::Ok(received) if received == body));
+        }
+    }
+}
+
+/// Enrollment is a mutation: a 2xx without a verified HTTPS link leaves the
+/// outcome unknown, so this client neither claims a link nor repeats the call.
+#[test]
+fn hosted_connection_start_requires_an_https_link_and_never_retries() {
+    let args = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for body in [
+        json!({"ok": true}),
+        json!({"ok": true, "data": {}}),
+        json!({"ok": true, "data": {"url": "http://provider.example.test/oauth"}}),
+        json!({"ok": true, "data": {"url": "/oauth"}}),
+        json!({"ok": true, "data": {"url": "https://"}}),
+        json!({"ok": true, "data": {"url": "https://provider.example.test:999999/oauth"}}),
+        json!({"ok": true, "data": {"url": "https://provider.example.test:notaport/x"}}),
+        json!({"ok": true, "data": {"url": "https://user:secret@provider.example.test/x"}}),
+        json!({"ok": true, "data": {"url": "not-a-url"}}),
+        json!({"ok": false, "data": {"url": "https://provider.example.test/oauth"}}),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(200, "", body.clone())]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("an enrollment start is never retried automatically"),
+        )
+        .expect_err("an unverified link is not a success");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(
+            text.contains("connection ls"),
+            "the link that may exist must be reconciled by a read: {text}"
+        );
+        assert!(
+            !text.contains("https://provider"),
+            "a failed answer must not echo a link it did not verify: {text}"
+        );
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+
+    let receipt = json!({"ok": true, "data": {
+        "url": "https://provider.example.test/oauth?synthetic=1"
+    }});
+    let (listener, requests, _server) = fake_worker(vec![(200, "", receipt.clone())]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let answer = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an enrollment start is never retried automatically"),
+    )
+    .expect("a verified HTTPS link is the success");
+    assert!(matches!(answer, RemoteAnswer::Ok(body) if body == receipt));
+    assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+}
+
+/// A hosted server that predates these operations answers the unknown
+/// operation. That is a release-order refusal, not an empty list and not a
+/// missing link, and it never falls back to the local daemon.
+#[test]
+fn hosted_connection_operations_refuse_honestly_on_an_older_server() {
+    for (operation, field) in [
+        ("connection_providers", "providers"),
+        ("connection_list", "connections"),
+        ("connection_start", "url"),
+    ] {
+        let args = if operation == "connection_start" {
+            json!({"operation": operation, "body": {"toolkit": "google_search_console"}})
+        } else {
+            json!({ "operation": operation })
+        }
+        .as_object()
+        .cloned()
+        .unwrap();
+        for (status, code) in [
+            (501u16, None),
+            (400, Some("invalid_request")),
+            (400, Some("unknown_verb")),
+        ] {
+            let body = match code {
+                Some(code) => json!({"ok": false, "error": {"code": code}}),
+                None => json!({"ok": false, "error": {"code": "not_implemented"}}),
+            };
+            let (listener, requests, _server) = fake_worker(vec![(status, "", body)]);
+            let target = target(&listener);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("a");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            store_credential(&dir, &target.endpoint);
+
+            let err = call_verb_in(
+                &target,
+                "platform_call",
+                args.clone(),
+                10,
+                &dir,
+                |_| {},
+                |_| panic!("an older server's refusal is not retried"),
+            )
+            .expect_err("an older server cannot serve the operation");
+            assert_eq!(err.kind(), "rejected", "{err}");
+            let text = err.to_string().to_ascii_lowercase();
+            assert!(
+                text.contains("update the hosted server first"),
+                "{operation} {status}: {text}"
+            );
+            assert!(
+                text.contains(operation),
+                "the refusal names the operation the server lacks: {text}"
+            );
+            if operation == "connection_start" {
+                assert!(
+                    text.contains("no authorization link"),
+                    "an older server must not yield an invented link: {text}"
+                );
+            } else {
+                assert!(
+                    text.contains("not an empty list"),
+                    "an older server must not yield an invented empty {field}: {text}"
+                );
+            }
+            assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+        }
+    }
+}
+
+/// An uncertain enrollment start is the same unresolved outcome a lost
+/// response is: never a link, never an automatic second attempt.
+#[test]
+fn hosted_connection_start_uncertainty_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for (status, body) in [
+        (409u16, json!({"ok": false, "error": {"code": "uncertain"}})),
+        (
+            409,
+            json!({"ok": false, "error": {"code": "idempotency_in_progress"}}),
+        ),
+        (
+            500,
+            json!({"ok": false, "error": {"code": "provider_unavailable"}}),
+        ),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(status, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("an uncertain start must not be automatically retried"),
+        )
+        .expect_err("an uncertain start has no verified link");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(text.contains("connection ls"), "{text}");
+        assert!(
+            text.contains("does not prove"),
+            "an empty connection list does not prove no link was issued: {text}"
+        );
+        assert!(
+            text.contains("deliberate new enrollment"),
+            "a second start must be described as a deliberate new act, not a retry: {text}"
+        );
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
 fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
     let args = json!({"operation": "tools"}).as_object().cloned().unwrap();
     let body = json!({
@@ -6333,6 +7292,43 @@ fn cad2127_platform_status_and_artifact_are_read_only_effects() {
     }
 }
 
+// CAD-2226: the owner-enrollment reads change nothing, while starting an
+// enrollment mints a one-time provider link — a possible mutation whose lost
+// answer is reconciled by the connection read, never by `platform status`.
+#[test]
+fn hosted_connection_operations_are_reads_or_a_mutation() {
+    for operation in ["connection_providers", "connection_list"] {
+        let arguments = json!({"operation": operation})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+        assert!(
+            matches!(effect, Effect::Read),
+            "`{operation}` must not be treated as a mutation"
+        );
+        assert!(effect.reconciliation().is_none(), "{operation}");
+    }
+
+    let arguments = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+    assert!(effect.is_mutation(), "starting an enrollment mints a link");
+    let note = effect
+        .reconciliation()
+        .expect("an uncertain start has a read that reconciles it");
+    assert!(note.contains("connection ls"), "{note}");
+    assert!(
+        !note.contains("platform status"),
+        "an enrollment link is not a platform request: {note}"
+    );
+}
+
 // CAD-2127: a 503 to a read cannot have started or billed anything, so it is
 // `rejected` availability — never the paid-call unknown that says the caller
 // may have been charged.
@@ -7403,6 +8399,70 @@ mod agent_credential_refusals {
             assert_eq!(r.trail(), want, "{verb} {status} {code} at {stage}");
             assert!(r.notes().is_empty(), "{verb}: {:?}", r.notes());
         }
+    }
+
+    // 1b. A cached bearer the board stops accepting is dropped and re-minted
+    // once — the cache must not fail every verb until it ages out.
+    #[test]
+    fn a_cached_credential_401_is_dropped_and_re_minted_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let authorizes = AtomicUsize::new(0);
+        let r = rig(12, move |route, req| {
+            // The first send mints and authorizes; the second send's cached
+            // bearer is the one the board refuses.
+            if agent(req)
+                && route == "authorize"
+                && authorizes.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                return Some(Reply::Json(401, refused("unauthorized")));
+            }
+            None
+        });
+        let slot = r.slot(CLAIM, 1);
+        r.comment(Some(&slot)).unwrap();
+        r.comment(Some(&slot)).unwrap();
+        assert_eq!(
+            r.trail(),
+            vec![
+                MINT,
+                "authorize:A",
+                "call:A",
+                "authorize:A",
+                MINT,
+                "authorize:A",
+                "call:A",
+            ],
+            "cached 401 was not re-minted exactly once"
+        );
+        assert!(r.notes().is_empty(), "{:?}", r.notes());
+    }
+
+    // 1c. A policy 401 is authorization, not a stale bearer: no re-mint.
+    #[test]
+    fn a_policy_401_on_a_cached_credential_is_not_re_minted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let authorizes = AtomicUsize::new(0);
+        let r = rig(8, move |route, req| {
+            if agent(req)
+                && route == "authorize"
+                && authorizes.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                return Some(Reply::Json(
+                    401,
+                    json!({"ok": false, "error": {
+                        "code": "unauthorized", "reason": "scope_not_granted"}}),
+                ));
+            }
+            None
+        });
+        let slot = r.slot(CLAIM, 1);
+        r.comment(Some(&slot)).unwrap();
+        r.comment(Some(&slot)).unwrap_err();
+        assert_eq!(
+            r.trail(),
+            vec![MINT, "authorize:A", "call:A", "authorize:A"],
+            "a policy 401 was re-minted"
+        );
     }
 
     // 2. Exactly `human_session_required` falls back, once; nothing else does.

@@ -58,15 +58,17 @@ interface NavListProps {
   homeCount?: number;
   /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
   noWiki?: boolean;
+  /** Additional nav screens unsupported on this board (see boardSupports). */
+  hiddenScreens?: readonly Screen[];
   /** Desktop rail hides nested rows without changing their stored fold state. */
   rail?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, rail = false }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, hiddenScreens, rail = false }: NavListProps) {
   const { t } = useLocale();
-  const items = navItems(noWiki);
+  const items = navItems(noWiki, hiddenScreens);
   const prefs = useSidebarPrefs();
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.

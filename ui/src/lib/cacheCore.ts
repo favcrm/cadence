@@ -94,6 +94,8 @@ export class Resource<T> {
   private epoch = 0;
   /** Invalidated while nobody watched: the next `revalidate` fetches. */
   private invalid = false;
+  /** Server answered 501 Not Implemented: do not retry via invalidate/revalidate. */
+  private notImplemented = false;
   private readonly listeners = new Set<() => void>();
   private readonly fetcher: () => Promise<T>;
   private readonly isEmpty: (data: T) => boolean;
@@ -146,6 +148,7 @@ export class Resource<T> {
     const run = fetcher().then(
       (data) => {
         if (epoch !== this.epoch) return;
+        this.notImplemented = false;
         if (this.generation !== started) {
           // A local write landed while this was in flight: its data is
           // newer than this answer. Drop it and ask again.
@@ -165,6 +168,7 @@ export class Resource<T> {
         // A local write since the request started is fresher than any
         // failure of it.
         if (this.generation !== started) return;
+        this.notImplemented = typeof e === "object" && e !== null && "status" in e && e.status === 501;
         const discard = this.discardOnError(e);
         this.set({
           data: discard ? null : this.state.data,
@@ -204,6 +208,7 @@ export class Resource<T> {
    * (never more than one).
    */
   invalidate = (): Promise<void> => {
+    if (this.notImplemented) return Promise.resolve();
     if (this.inflight) {
       this.trailing = true;
       return this.inflight;
@@ -216,6 +221,7 @@ export class Resource<T> {
    * `freshMs`. Joins a request in flight; never blanks loaded data.
    */
   revalidate = (): Promise<void> => {
+    if (this.notImplemented) return Promise.resolve();
     if (this.inflight) return this.inflight;
     const { asOf } = this.state;
     if (
@@ -275,6 +281,7 @@ export class Resource<T> {
   /** Clear private observations while keeping shared resource handles valid. */
   reset = (): void => {
     this.pause();
+    this.notImplemented = false;
     this.generation += 1;
     this.set({ data: null, status: "loading", error: null, discarded: false, asOf: null, inFlight: false });
   };

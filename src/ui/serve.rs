@@ -2,7 +2,7 @@
 //! accept loop (`serve`), the response/static-file helpers they share, the
 //! embedded SPA build, and the `/api/agents` read model it serves.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -625,6 +625,437 @@ pub(crate) fn task_issue_map_from(state_dir: &Path, list: &Value) -> HashMap<Str
     map
 }
 
+pub(super) struct MemberJobState {
+    pub(super) bindings: HashMap<String, TaskBinding>,
+    pub(super) outcomes: board::JobOutcomes,
+    pub(super) fingerprint: u64,
+}
+
+/// Resolve member-visible jobs once for both issue status and task strips.
+pub(super) fn readable_job_state(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+) -> Result<MemberJobState> {
+    crate::issue::write::checked_project_dirs(pm)?;
+    let readable = super::project_policy::readable(pm, actor);
+    let mut params = json!({"all": true, "tasks_detail": true});
+    proof.attach(&mut params);
+    let mut list = client::rpc(state_dir, "job_list", params)?;
+    // CAD-2215: a relayed NON-operator answer must carry the daemon's
+    // job-scope acknowledgement, added by that same reply after it re-proved
+    // the reader's membership, project scope and private-job denials. A
+    // daemon without it is a mixed-version daemon that may have ignored the
+    // proof and built the global list: that answer is unavailable — never an
+    // empty (or full) "success". A proven operator's own relay is exempt,
+    // because a full list is correct for it either way. The marker never
+    // reaches a client and never enters the fingerprint.
+    let relayed = !matches!(proof, operator::ReadRelayProof::Operator);
+    let ack = list
+        .as_object_mut()
+        .and_then(|fields| fields.remove(crate::daemon::jobs_rpc::JOB_SCOPE_FIELD));
+    let confirmed =
+        ack.as_ref().and_then(Value::as_str) == Some(crate::daemon::jobs_rpc::JOB_SCOPE_ACK);
+    if relayed && !confirmed {
+        return Err(Error::internal(
+            "job scope unavailable — the daemon did not confirm a reader-scoped answer",
+        ));
+    }
+    let jobs = list["jobs"]
+        .as_array()
+        .ok_or_else(|| Error::internal("job task scope is unavailable"))?;
+    if jobs.iter().any(|job| {
+        job["issue"].as_str().is_some_and(|issue| !issue.is_empty()) && !job["task_list"].is_array()
+    }) {
+        return Err(Error::internal("job task scope is unavailable"));
+    }
+    let mut issue_access = HashMap::new();
+    for job in jobs {
+        let Some(issue) = job["issue"].as_str().filter(|issue| !issue.is_empty()) else {
+            return Err(Error::internal("job issue scope is unavailable"));
+        };
+        if issue_access.contains_key(issue) {
+            continue;
+        }
+        let admitted = match crate::issue::write::issue_dir(pm, issue) {
+            Ok((project, _)) => readable.contains(&project.key),
+            Err(Error::Rejected(_)) => false,
+            Err(error) => return Err(error),
+        };
+        issue_access.insert(issue.to_string(), admitted);
+    }
+    if issue_access.values().any(|admitted| !admitted) {
+        return Err(Error::internal("job issue scope changed"));
+    }
+    Ok(MemberJobState {
+        bindings: task_issue_map_from(state_dir, &list),
+        outcomes: board::outcomes_from_jobs(jobs),
+        fingerprint: super::stream::value_fp(&list),
+    })
+}
+
+/// Resolve each task through its job and the tracker's current project policy.
+pub(super) fn readable_task_bindings(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+) -> Result<HashMap<String, TaskBinding>> {
+    Ok(readable_job_state(state_dir, pm, actor, proof)?.bindings)
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct MemberAgentScope {
+    aliases: HashSet<String>,
+    running: HashMap<String, HashSet<String>>,
+}
+
+impl MemberAgentScope {
+    /// True when the daemon proved this alias visible to the reader. A stream
+    /// may name a row — or its tombstone — only for one of these.
+    pub(super) fn has_alias(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+
+    /// The daemon-verified aliases this reader may see, for deciding which
+    /// thread pages its own stream may speak for.
+    pub(super) fn aliases(&self) -> impl Iterator<Item = &String> {
+        self.aliases.iter()
+    }
+}
+
+pub(super) fn consume_agent_scope(reply: &mut Value, expected: &str) -> bool {
+    matches!(
+        reply.as_object_mut()
+            .and_then(|fields| fields.remove(cadence_core::board_api::READER_SCOPE_FIELD)),
+        Some(Value::String(value)) if value == expected
+    )
+}
+
+/// Ask the daemon to re-verify the reader before projecting cached board rows.
+pub(super) fn member_agent_scope(
+    state_dir: &Path,
+    proof: &operator::ReadRelayProof,
+) -> Result<MemberAgentScope> {
+    let mut params = json!({"board": true});
+    proof.attach(&mut params);
+    let mut list = client::rpc(state_dir, "agent_list", params)?;
+    if !consume_agent_scope(&mut list, cadence_core::board_api::AGENT_LIST_SCOPE_ACK) {
+        return Err(Error::rejected("agent read scope is unavailable"));
+    }
+    let rows = list["agents"]
+        .as_array()
+        .ok_or_else(|| Error::internal("agent read scope is unavailable"))?;
+    let mut scope = MemberAgentScope {
+        aliases: HashSet::new(),
+        running: HashMap::new(),
+    };
+    for row in rows {
+        let alias = row["alias"]
+            .as_str()
+            .ok_or_else(|| Error::internal("agent read scope has no alias"))?;
+        scope.aliases.insert(alias.to_owned());
+        let ids = row["visible_running_messages"]
+            .as_array()
+            .ok_or_else(|| Error::internal("running message scope is unavailable"))?;
+        let mut visible = HashSet::with_capacity(ids.len());
+        for id in ids {
+            visible.insert(
+                id.as_str()
+                    .ok_or_else(|| Error::internal("running message scope is malformed"))?
+                    .to_string(),
+            );
+        }
+        scope.running.insert(alias.to_string(), visible);
+    }
+    Ok(scope)
+}
+
+/// The daemon's scoped status rule (CAD-2215) over a board row's visible
+/// running set: `busy` only when the reader's own work proves it, `null`
+/// otherwise — never `idle`, because a hidden project's turn may be running
+/// right now. The card's stored `state` comes from the shared operator
+/// snapshot, so it is always replaced, never forwarded.
+fn visible_agent_state(running: Option<&HashSet<String>>) -> Value {
+    match running {
+        Some(ids) if !ids.is_empty() => json!("busy"),
+        _ => Value::Null,
+    }
+}
+
+pub(super) fn restrict_member_agent_rows(payload: &mut Value, scope: &MemberAgentScope) {
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        rows.retain(|row| {
+            row["alias"]
+                .as_str()
+                .is_some_and(|alias| scope.aliases.contains(alias))
+        });
+    }
+    if let Some(by_issue) = payload["by_issue"].as_object_mut() {
+        for rows in by_issue.values_mut().filter_map(Value::as_array_mut) {
+            rows.retain(|row| {
+                row["alias"]
+                    .as_str()
+                    .is_some_and(|alias| scope.aliases.contains(alias))
+            });
+        }
+    }
+    if let Some(profiles) = payload["profiles"].as_array_mut() {
+        for profile in profiles {
+            if let Some(runtimes) = profile["runtimes"].as_array_mut() {
+                runtimes.retain(|runtime| {
+                    runtime
+                        .as_str()
+                        .is_some_and(|alias| scope.aliases.contains(alias))
+                });
+            }
+        }
+    }
+}
+
+/// Filter the operator snapshot's issue strips using the daemon's live
+/// member-specific agent and job bindings before any card is serialized.
+pub(super) fn scope_member_board(
+    read: &mut read_model::BoardRead,
+    scope: &MemberAgentScope,
+    bindings: &HashMap<String, TaskBinding>,
+) {
+    read.by_issue.retain(|issue, rows| {
+        rows.retain(|row| {
+            scope.aliases.contains(&row.alias)
+                && bindings
+                    .get(&row.task)
+                    .is_some_and(|binding| binding.issue == *issue)
+        });
+        for row in rows.iter_mut() {
+            if row.message.as_ref().is_some_and(|id| {
+                !scope
+                    .running
+                    .get(&row.alias)
+                    .is_some_and(|ids| ids.contains(id))
+            }) {
+                row.message = None;
+            }
+            row.resume = None;
+            // CAD-2215: the card's strip comes from the shared operator
+            // snapshot, so its state is the stored one — replaced with the
+            // reader's own proof, exactly as `scope_member_agents` does.
+            let state = visible_agent_state(scope.running.get(&row.alias));
+            row.state = state.as_str().map(str::to_string);
+        }
+        !rows.is_empty()
+    });
+}
+
+/// Build cards from the current member-visible jobs and agent bindings.
+pub(super) fn readable_member_board(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+    project: Option<&str>,
+) -> Result<read_model::BoardRead> {
+    let jobs = readable_job_state(state_dir, pm, actor, proof)?;
+    let scope = member_agent_scope(state_dir, proof)?;
+    member_board_over(state_dir, pm, actor, proof, project, &jobs, &scope)
+}
+
+/// [`readable_member_board`] over the job and agent scopes a caller already
+/// resolved for this read — the stream decides a whole batch of frames from
+/// one projection instead of one per frame.
+pub(super) fn member_board_over(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+    project: Option<&str>,
+    jobs: &MemberJobState,
+    scope: &MemberAgentScope,
+) -> Result<read_model::BoardRead> {
+    let readable = super::project_policy::readable(pm, actor);
+    let mut read = read_model::get(state_dir, &pm.dir).board_readable(
+        pm,
+        project,
+        &readable,
+        (&jobs.outcomes, jobs.fingerprint),
+    );
+    scope_member_board(&mut read, scope, &jobs.bindings);
+    if super::project_policy::readable(pm, actor) != readable
+        || readable_job_state(state_dir, pm, actor, proof)?.fingerprint != jobs.fingerprint
+        || member_agent_scope(state_dir, proof)? != *scope
+    {
+        return Err(Error::rejected("member read scope changed"));
+    }
+    Ok(read)
+}
+
+pub(super) fn scope_member_agents(
+    payload: &mut Value,
+    bindings: &HashMap<String, TaskBinding>,
+    scope: &MemberAgentScope,
+) {
+    redact_agents_payload(payload);
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        for row in rows {
+            let allowed_messages = row["alias"]
+                .as_str()
+                .and_then(|alias| scope.running.get(alias));
+            let mut visible = HashSet::new();
+            let mut issues = Vec::<String>::new();
+            if let Some(tasks) = row["tasks"].as_array_mut() {
+                tasks.retain(|task| {
+                    let Some(id) = task["task"].as_str() else {
+                        return false;
+                    };
+                    let Some(binding) = bindings.get(id) else {
+                        return false;
+                    };
+                    if task["issue"].as_str() != Some(binding.issue.as_str())
+                        || task["job"].as_str() != Some(binding.job.as_str())
+                    {
+                        return false;
+                    }
+                    visible.insert(id.to_string());
+                    if !issues.contains(&binding.issue) {
+                        issues.push(binding.issue.clone());
+                    }
+                    true
+                });
+                for task in tasks {
+                    if task["message"]["id"].as_str().is_some_and(|id| {
+                        !allowed_messages.is_some_and(|messages| messages.contains(id))
+                    }) {
+                        task["message"] = Value::Null;
+                    }
+                }
+            }
+            row["on"] = json!(issues);
+            if let Some(messages) = row["running_messages"].as_array_mut() {
+                messages.retain(|message| {
+                    message["task"]
+                        .as_str()
+                        .is_some_and(|task| visible.contains(task))
+                        && message["id"].as_str().is_some_and(|id| {
+                            allowed_messages.is_some_and(|messages| messages.contains(id))
+                        })
+                });
+            }
+            let (running, first) = row["running_messages"]
+                .as_array()
+                .map(|messages| (messages.len(), messages.first().cloned()))
+                .unwrap_or_default();
+            row["running"] = json!(running);
+            row["message"] = first.unwrap_or(Value::Null);
+            // CAD-2215: this row was rebuilt from the shared operator
+            // snapshot, so its `state` is the stored one, and `dead` turns on
+            // the unknown-message fence. Both move on hidden work, so the row
+            // gets the daemon's scoped derivation instead.
+            row["state"] = visible_agent_state(allowed_messages);
+            if let Some(fields) = row.as_object_mut() {
+                for key in [
+                    "queued",
+                    "unread",
+                    "oldest_unread_age_secs",
+                    "unknown",
+                    "parked",
+                    "fenced",
+                    "recovery",
+                    "resume",
+                    "resume_hint",
+                    "last_activity",
+                    "silent_secs",
+                    "stalled",
+                    "state_label",
+                    "event_cursor",
+                    "dead",
+                ] {
+                    fields.remove(key);
+                }
+            }
+        }
+    }
+    if let Some(by_issue) = payload["by_issue"].as_object_mut() {
+        by_issue.retain(|issue, rows| {
+            let Some(rows) = rows.as_array_mut() else {
+                return false;
+            };
+            rows.retain(|row| {
+                row["task"]
+                    .as_str()
+                    .and_then(|task| bindings.get(task))
+                    .is_some_and(|binding| binding.issue == *issue)
+            });
+            for row in rows.iter_mut() {
+                let allowed = row["alias"]
+                    .as_str()
+                    .and_then(|alias| scope.running.get(alias));
+                if row["message"]
+                    .as_str()
+                    .is_some_and(|id| !allowed.is_some_and(|messages| messages.contains(id)))
+                {
+                    row["message"] = Value::Null;
+                }
+                row["state"] = visible_agent_state(allowed);
+            }
+            !rows.is_empty()
+        });
+    }
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("totals");
+    }
+}
+
+fn scope_member_agent_detail(detail: &mut Value, bindings: &HashMap<String, TaskBinding>) {
+    detail["agent"] = super::member_view::member_agent_row(&detail["agent"]);
+    if let Some(agent) = detail["agent"].as_object_mut() {
+        agent.remove("event_cursor");
+    }
+    let mut visible = HashSet::new();
+    let mut issues = Vec::<String>::new();
+    if let Some(tasks) = detail["tasks"].as_array_mut() {
+        tasks.retain(|task| {
+            let Some(id) = task.as_str() else {
+                return false;
+            };
+            let Some(binding) = bindings.get(id) else {
+                return false;
+            };
+            visible.insert(id.to_string());
+            if !issues.contains(&binding.issue) {
+                issues.push(binding.issue.clone());
+            }
+            true
+        });
+    }
+    detail["on"] = json!(issues);
+    if let Some(running) = detail["running"].as_array_mut() {
+        running.retain(|message| {
+            message["task"]
+                .as_str()
+                .is_some_and(|id| visible.contains(id))
+        });
+    }
+    if let Some(events) = detail["events"].as_array_mut() {
+        events.retain(|event| {
+            event["task_id"]
+                .as_str()
+                .is_some_and(|id| visible.contains(id))
+        });
+        for event in events {
+            if let Some(payload) = event["payload"].as_object_mut() {
+                payload.remove("message");
+                payload.remove("turn_id");
+            }
+        }
+    }
+    if let Some(fields) = detail.as_object_mut() {
+        for key in ["queued", "unknown", "fenced", "recovery", "resume", "stats"] {
+            fields.remove(key);
+        }
+    }
+}
+
 /// Keep an ad-hoc current-message description useful without putting the
 /// queued prompt or provider credentials in browser JSON. The shared argv
 /// scrubber handles credential-shaped flags, headers, URIs and token forms;
@@ -703,30 +1134,71 @@ pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
 }
 
+pub(crate) enum AgentReadError {
+    Unavailable,
+    Daemon(String),
+}
+
 /// The tail of an agent's event log for the agent page — the last `n`
 /// events via the daemon's `agent_events` RPC (the one the CLI long-polls).
-/// An RPC error is returned, not swallowed: the caller serves `[]` plus an
-/// `events_error` so an empty history is never silently a failed read.
+/// An operator sees an `events_error` for a failed read; a member cannot
+/// receive the earlier detail when its scoped event read fails.
 pub(crate) fn agent_events_tail(
     state_dir: &Path,
     alias: &str,
     cursor: i64,
     n: i64,
-) -> std::result::Result<Vec<Value>, String> {
-    let after = (cursor - n).max(0);
-    let reply = client::rpc(
-        state_dir,
-        "agent_events",
-        json!({"alias": alias, "after": after}),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(reply["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
-        .collect())
+    proof: Option<&operator::ReadRelayProof>,
+) -> std::result::Result<Vec<Value>, AgentReadError> {
+    let mut params = if proof.is_some() {
+        json!({"alias": alias, "tail": true,
+            "cursor_format": cadence_core::board_api::AGENT_EVENTS_CURSOR_FORMAT})
+    } else {
+        json!({"alias": alias, "after": (cursor - n).max(0)})
+    };
+    if let Some(proof) = proof {
+        proof.attach(&mut params);
+    }
+    let mut reply = client::rpc(state_dir, "agent_events", params)
+        .map_err(|e| AgentReadError::Daemon(e.to_string()))?;
+    if proof.is_some()
+        && !consume_agent_scope(&mut reply, cadence_core::board_api::AGENT_EVENTS_SCOPE_ACK)
+    {
+        return Err(AgentReadError::Unavailable);
+    }
+    let mut events = reply["events"].as_array().cloned().ok_or_else(|| {
+        if proof.is_some() {
+            AgentReadError::Unavailable
+        } else {
+            AgentReadError::Daemon("agent events are unavailable".to_string())
+        }
+    })?;
+    if proof.is_some()
+        && events.iter().any(|event| {
+            event.get("seq").is_some()
+                || event.get("event_seq").is_some()
+                || event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || event
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+    {
+        return Err(AgentReadError::Unavailable);
+    }
+    if proof.is_some() {
+        let start = events.len().saturating_sub(n.max(0) as usize);
+        events.drain(..start);
+        Ok(events)
+    } else {
+        Ok(events
+            .into_iter()
+            .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+            .collect())
+    }
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
@@ -975,25 +1447,37 @@ pub(crate) fn agent_detail(
     state_dir: &Path,
     alias: &str,
     operator: bool,
-) -> std::result::Result<Value, String> {
+    proof: &operator::ReadRelayProof,
+    #[cfg(test)] after_show: Option<&super::AgentDetailReadHook>,
+) -> std::result::Result<Value, AgentReadError> {
     // CAD-1752: the saved job text is the operator's to read; a member's
     // detail never carries `instructions`.
-    let show = client::rpc(
-        state_dir,
-        "agent_show",
-        json!({"alias": alias, "active_only": true,
-               "include_catalogue_instructions": operator,
-               "include_profile_instructions": operator, "include_stats": true}),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut params = json!({"alias": alias, "active_only": true,
+        "include_catalogue_instructions": operator,
+        "include_profile_instructions": operator, "include_stats": true});
+    proof.attach(&mut params);
+    let mut show = client::rpc(state_dir, "agent_show", params)
+        .map_err(|e| AgentReadError::Daemon(e.to_string()))?;
+    if !operator && !consume_agent_scope(&mut show, cadence_core::board_api::AGENT_SHOW_SCOPE_ACK) {
+        return Err(AgentReadError::Unavailable);
+    }
+    #[cfg(test)]
+    if !operator {
+        if let Some(hook) = after_show {
+            hook(alias);
+        }
+    }
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
-    let (events, events_error) = match agent_events_tail(state_dir, alias, cursor, 20) {
-        Ok(events) if operator => (events, None),
-        // A non-operator (fail closed) gets only the allowlisted fields.
-        Ok(events) => (events.iter().map(member_event).collect(), None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
+    let (events, events_error) =
+        match agent_events_tail(state_dir, alias, cursor, 20, (!operator).then_some(proof)) {
+            Ok(events) if operator => (events, None),
+            // A non-operator (fail closed) gets only the allowlisted fields.
+            Ok(events) => (events.iter().map(member_event).collect(), None),
+            Err(AgentReadError::Unavailable) => return Err(AgentReadError::Unavailable),
+            Err(AgentReadError::Daemon(error)) if operator => (Vec::new(), Some(error)),
+            Err(AgentReadError::Daemon(_)) => return Err(AgentReadError::Unavailable),
+        };
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let running: Vec<Value> = show["messages"]
@@ -1012,10 +1496,15 @@ pub(crate) fn agent_detail(
             }
         })
         .collect();
-    let fenced =
-        show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
+    // CAD-2215: a fence is `attention` or an unreconciled `unknown` row, and a
+    // scoped `agent_show` reports neither. A non-operator therefore gets
+    // `null` (unavailable), never a fabricated `false`.
+    let fenced = operator.then(|| {
+        show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention")
+    });
     let (tasks, issues) = match show["task_bindings"].as_array() {
         Some(rows) => task_binding_view(rows),
+        None if !operator => return Err(AgentReadError::Unavailable),
         None => legacy_task_view(state_dir, alias),
     };
     Ok(json!({
@@ -1026,7 +1515,10 @@ pub(crate) fn agent_detail(
         "events": events,
         "events_error": events_error,
         "fenced": fenced,
-        "recovery": if fenced { agent["error"].clone() } else { Value::Null },
+        "recovery": match fenced {
+            Some(true) => agent["error"].clone(),
+            _ => Value::Null,
+        },
         "resume": registry::resume_command(
             provider, kind,
             agent["thread_id"].as_str().unwrap_or_default(),
@@ -1193,7 +1685,9 @@ fn table_read_guard(
 fn read_dispatch(
     request: &mut Request,
     state_dir: &Path,
+    pm_dir: &Path,
     opts: &ServeOpts,
+    admission: Option<&operator::ReadAdmission>,
     bound: endpoints::Bound<'_>,
 ) -> HttpResp {
     let row = bound.endpoint;
@@ -1215,14 +1709,87 @@ fn read_dispatch(
         endpoints::RouteId::AutomaticUpdatesGet => {
             app_explorer::automatic_updates_get(state_dir, bound.get("id").unwrap_or_default())
         }
+        endpoints::RouteId::MemberAccessGet => app_explorer::member_access_get(
+            request,
+            bound.get("id").unwrap_or_default(),
+            state_dir,
+            opts,
+        ),
         endpoints::RouteId::AgentDetail => {
             let alias = bound.get("alias").unwrap_or_default();
             // The viewer verdict the OperatorOnly reads use: only the
             // operator's session (with peer proof) gets the saved job text.
             let operator = operator::admit_operator_read(request, state_dir, opts).is_ok();
-            match agent_detail(state_dir, alias, operator) {
-                Ok(detail) => json_response(detail),
-                Err(error) => err_response(404, &error),
+            let Some(admission) = admission else {
+                return err_response(503, "read admission is missing");
+            };
+            let proof = admission.relay_proof();
+            match agent_detail(
+                state_dir,
+                alias,
+                operator,
+                &proof,
+                #[cfg(test)]
+                opts.agent_detail_show_hook.as_deref(),
+            ) {
+                Ok(mut detail) => {
+                    #[cfg(test)]
+                    if let Some(hook) = opts.agent_detail_read_hook.as_ref() {
+                        hook(alias);
+                    }
+                    if operator {
+                        if let Err(response) =
+                            operator::admit_operator_read(request, state_dir, opts)
+                        {
+                            return response;
+                        }
+                    } else {
+                        let actor = match operator::read_actor(admission, request, state_dir, opts)
+                        {
+                            Ok(actor) => actor,
+                            Err(response) => return response,
+                        };
+                        let pm = match Pm::at(pm_dir) {
+                            Ok(pm) => pm,
+                            Err(_) => {
+                                return err_response(503, "project task scope is unavailable")
+                            }
+                        };
+                        let jobs = match readable_job_state(state_dir, &pm, &actor, &proof) {
+                            Ok(jobs) => jobs,
+                            Err(_) => {
+                                return err_response(503, "project task scope is unavailable")
+                            }
+                        };
+                        let scope = match member_agent_scope(state_dir, &proof) {
+                            Ok(scope) => scope,
+                            Err(_) => return err_response(503, "agent read scope is unavailable"),
+                        };
+                        let current_jobs = readable_job_state(state_dir, &pm, &actor, &proof);
+                        let current_scope = member_agent_scope(state_dir, &proof);
+                        if current_jobs
+                            .as_ref()
+                            .map(|current| current.fingerprint)
+                            .ok()
+                            != Some(jobs.fingerprint)
+                            || current_scope.as_ref().ok() != Some(&scope)
+                        {
+                            return err_response(503, "agent read scope changed");
+                        }
+                        if !detail["agent"]["alias"]
+                            .as_str()
+                            .is_some_and(|target| scope.has_alias(target))
+                        {
+                            return err_response(404, "Unknown managed agent");
+                        }
+                        scope_member_agent_detail(&mut detail, &jobs.bindings);
+                    }
+                    json_response(detail)
+                }
+                Err(AgentReadError::Unavailable) => {
+                    err_response(503, "agent read scope is unavailable")
+                }
+                Err(AgentReadError::Daemon(error)) => err_response(404, &error),
             }
         }
         endpoints::RouteId::AgentRoles => match client::rpc(state_dir, "agent_roles", json!({})) {
@@ -1666,7 +2233,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // its session bounce) before any per-row role guard. A path the table does
     // not own falls through to the chain below, unchanged.
     if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
-        let response = read_dispatch(&mut request, state_dir, opts, bound);
+        let response = read_dispatch(
+            &mut request,
+            state_dir,
+            pm_dir,
+            opts,
+            read_admission.as_ref(),
+            bound,
+        );
         send(request, response);
         return;
     }
@@ -1687,12 +2261,21 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     match path.as_str() {
         "/api/my-work" => {
-            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let response = my_work::get(&request, state_dir, pm_dir, opts, admission, raw_query);
             send(request, response);
         }
         p if p.starts_with("/api/my-work/issues/") => {
             let id = &p["/api/my-work/issues/".len()..];
-            let response = my_work::get_issue(&request, state_dir, pm_dir, opts, id, raw_query);
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let response =
+                my_work::get_issue(&request, state_dir, pm_dir, opts, admission, id, raw_query);
             send(request, response);
         }
         "/api/locale" => {
@@ -1966,6 +2549,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 Ok(pm) => {
                     let readable = super::project_policy::readable(&pm, &actor);
                     super::project_policy::retain_overview(&mut overview, &readable);
+                    if actor != "operator" {
+                        let proof = read_admission
+                            .as_ref()
+                            .expect("private read admission")
+                            .relay_proof();
+                        overview["monitoring"] =
+                            match readable_task_bindings(state_dir, &pm, &actor, &proof) {
+                                Ok(bindings) => {
+                                    let allowed = bindings.into_keys().collect::<HashSet<_>>();
+                                    let mut relay = json!({});
+                                    proof.attach(&mut relay);
+                                    crate::overview::monitoring_for_tasks(
+                                        state_dir, &allowed, &relay,
+                                    )
+                                }
+                                Err(_) => crate::overview::monitoring_unavailable(
+                                    "project task scope is unavailable",
+                                ),
+                            };
+                    }
                     send(request, json_response(overview));
                 }
                 Err(e) => send(request, err_response(503, &e.to_string())),
@@ -2030,10 +2633,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, &e.to_string()));
                     return;
                 }
-                let read = read_model::get(state_dir, pm_dir).board(&pm, filter.as_deref());
-                // CAD-405: each card carries its `work` block.
-                let by_id = read.by_id();
-                let ctx = read.ctx(&by_id);
                 let actor = match read_admission
                     .as_ref()
                     .map(|a| operator::read_actor(a, &request, state_dir, opts))
@@ -2051,6 +2650,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // AOS-274: filter before the slice and the card, so a
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
+                let model = read_model::get(state_dir, pm_dir);
+                let read = if actor == "operator" {
+                    model.board(&pm, filter.as_deref())
+                } else {
+                    let Some(admission) = read_admission.as_ref() else {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    };
+                    let proof = admission.relay_proof();
+                    match readable_member_board(state_dir, &pm, &actor, &proof, filter.as_deref()) {
+                        Ok(read) => read,
+                        Err(_) => {
+                            send(
+                                request,
+                                err_response(503, "member read scope is unavailable"),
+                            );
+                            return;
+                        }
+                    }
+                };
+                let by_id = read.by_id();
+                let ctx = read.ctx(&by_id);
                 let body = cadence_core::board_api::IssuesResponse {
                     issues: read
                         .views
@@ -2080,7 +2701,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // the caller's readable set is applied to the view slice
                 // first: a restricted project contributes no epic, child
                 // or count.
-                let read = read_model::get(state_dir, pm_dir).board(&pm, None);
                 let actor = match read_admission
                     .as_ref()
                     .map(|a| operator::read_actor(a, &request, state_dir, opts))
@@ -2093,6 +2713,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     None => {
                         send(request, err_response(503, "read admission is missing"));
                         return;
+                    }
+                };
+                let read = if actor == "operator" {
+                    read_model::get(state_dir, pm_dir).board(&pm, None)
+                } else {
+                    let Some(admission) = read_admission.as_ref() else {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    };
+                    match readable_member_board(
+                        state_dir,
+                        &pm,
+                        &actor,
+                        &admission.relay_proof(),
+                        None,
+                    ) {
+                        Ok(read) => read,
+                        Err(_) => {
+                            send(
+                                request,
+                                err_response(503, "member read scope is unavailable"),
+                            );
+                            return;
+                        }
                     }
                 };
                 let readable = super::project_policy::readable(&pm, &actor);
@@ -2116,17 +2760,75 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
-        "/api/milestones" => send(
-            request,
-            stages::milestones(state_dir, pm_dir, query("project").as_deref()),
-        ),
+        "/api/milestones" => {
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let actor = match operator::read_actor(admission, &request, state_dir, opts) {
+                Ok(actor) => actor,
+                Err(response) => {
+                    send(request, response);
+                    return;
+                }
+            };
+            let response = stages::milestones(
+                state_dir,
+                pm_dir,
+                query("project").as_deref(),
+                &actor,
+                &admission.relay_proof(),
+            );
+            send(request, response);
+        }
         "/api/agents" => {
             // CAD-1767: running-message text is the operator's; anyone else
             // (fail closed) gets the allowlisted rows.
             let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
             let mut payload = read_model::get(state_dir, pm_dir).agents();
             if !operator {
-                redact_agents_payload(&mut payload);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|admission| operator::read_actor(admission, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(response)) => {
+                        send(request, response);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let proof = read_admission
+                    .as_ref()
+                    .expect("private read admission")
+                    .relay_proof();
+                let scope = match member_agent_scope(state_dir, &proof) {
+                    Ok(scope) => scope,
+                    Err(_) => {
+                        send(
+                            request,
+                            err_response(503, "agent read scope is unavailable"),
+                        );
+                        return;
+                    }
+                };
+                let bindings = match Pm::at(pm_dir)
+                    .and_then(|pm| readable_task_bindings(state_dir, &pm, &actor, &proof))
+                {
+                    Ok(bindings) => bindings,
+                    Err(_) => {
+                        send(
+                            request,
+                            err_response(503, "project task scope is unavailable"),
+                        );
+                        return;
+                    }
+                };
+                restrict_member_agent_rows(&mut payload, &scope);
+                scope_member_agents(&mut payload, &bindings, &scope);
             }
             send(request, json_response(payload))
         }
@@ -2211,33 +2913,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, err_response(405, "stream is GET only"));
             } else {
                 let admission = read_admission.expect("private stream admission");
-                // AOS-274: the stream is one shared, unfiltered frame
-                // source. A caller who cannot read every project is
-                // refused live updates rather than served rows and
-                // counts from projects it may not see.
-                let complete = match Pm::at(pm_dir) {
-                    Ok(pm) => match operator::read_actor(&admission, &request, state_dir, opts) {
-                        Ok(actor) => super::project_policy::reads_every_project(&pm, &actor),
-                        Err(resp) => {
-                            send(request, resp);
-                            return;
-                        }
-                    },
-                    // Fail closed when the tracker cannot be read.
-                    Err(_) => false,
+                let actor = match operator::read_actor(&admission, &request, state_dir, opts) {
+                    Ok(actor) => actor,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
                 };
-                if !complete {
+                // A signed member's stream is projected per reader: every
+                // caller the project policy can describe gets live updates for
+                // what it may read, and a caller it cannot describe (or a
+                // tracker that cannot be checked) is refused before the head.
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                if !operator && !super::stream::member_stream_available(pm_dir, &actor) {
                     send(
                         request,
-                        err_response(
-                            403,
-                            "live updates are unavailable for a project-restricted workspace",
-                        ),
+                        err_response(403, "live updates are unavailable for this reader"),
                     );
                     return;
                 }
-                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
-                stream_events(request, state_dir, pm_dir, admission, operator);
+                stream_events(
+                    request,
+                    state_dir,
+                    pm_dir,
+                    admission,
+                    operator,
+                    &actor,
+                    #[cfg(test)]
+                    opts.member_stream_batch_hook.as_deref(),
+                );
             }
         }
         _ => {
@@ -2634,9 +3338,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let wiki_caller =
                     match operator::board_caller(&request, state_dir, opts, false, None) {
                         Ok(operator::Caller::Operator(_)) => crate::wiki::Caller::Operator,
-                        Ok(operator::Caller::Named(named)) => {
-                            crate::wiki::Caller::User(named.author)
+                        Ok(operator::Caller::Named(named)) if named.operator => {
+                            crate::wiki::Caller::Operator
                         }
+                        Ok(operator::Caller::Named(named))
+                            if crate::ident::is_handle(&named.sub, crate::ident::HANDLE_MAX)
+                                && named.author == named.sub =>
+                        {
+                            crate::wiki::Caller::User(named.sub)
+                        }
+                        Ok(operator::Caller::Named(_)) => crate::wiki::Caller::Public,
                         Ok(operator::Caller::Agent(alias)) => crate::wiki::Caller::Agent {
                             alias,
                             project: None,
@@ -2673,14 +3384,31 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/summary?since=` — "since you left" (CAD-328).
             if path == "/api/master/summary" {
-                send(request, home::master_summary(state_dir, &query));
+                let Some(admission) = read_admission.as_ref() else {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                };
+                let actor = match operator::read_actor(admission, &request, state_dir, opts) {
+                    Ok(actor) => actor,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                };
+                send(request, home::master_summary(state_dir, &query, &actor));
                 return;
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).
             if path == "/api/master/state" {
                 // CAD-1767: only a proven operator reads the turn's text.
                 let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
-                send(request, home::master_state(state_dir, operator));
+                // CAD-2215: the reader's own proof goes to the daemon, which
+                // re-proves it and answers only for that reader.
+                let proof = read_admission
+                    .as_ref()
+                    .expect("private read admission")
+                    .relay_proof();
+                send(request, home::master_state(state_dir, operator, &proof));
                 return;
             }
             // CAD-819: the cross-agent work conversation view (read-only).
@@ -2736,7 +3464,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // other reader gets the member view (fail closed).
                 let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
                 match sub {
-                    None => send(request, threads::read(state_dir, alias, &query, operator)),
+                    None => send(
+                        request,
+                        threads::read(
+                            state_dir,
+                            alias,
+                            &query,
+                            operator,
+                            &read_admission
+                                .as_ref()
+                                .expect("private read admission")
+                                .relay_proof(),
+                        ),
+                    ),
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
@@ -2771,16 +3511,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 };
                 match Pm::at(pm_dir) {
                     Ok(pm) => {
-                        let read = read_model::get(state_dir, pm_dir).board(&pm, None);
-                        let by_id: std::collections::HashMap<String, &board::View> = read
-                            .views
-                            .iter()
-                            .map(|v| (v.issue.front.id.clone(), v))
-                            .collect();
-                        let Some(view) = by_id.get(&id) else {
-                            send(request, err_response(404, "unknown issue"));
-                            return;
-                        };
                         // AOS-274: a restricted project answers like an
                         // absent issue, without naming the project.
                         let actor = match read_admission
@@ -2796,6 +3526,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                                 send(request, err_response(503, "read admission is missing"));
                                 return;
                             }
+                        };
+                        let read = if actor == "operator" {
+                            read_model::get(state_dir, pm_dir).board(&pm, None)
+                        } else {
+                            let Some(admission) = read_admission.as_ref() else {
+                                send(request, err_response(503, "read admission is missing"));
+                                return;
+                            };
+                            match readable_member_board(
+                                state_dir,
+                                &pm,
+                                &actor,
+                                &admission.relay_proof(),
+                                None,
+                            ) {
+                                Ok(read) => read,
+                                Err(_) => {
+                                    send(
+                                        request,
+                                        err_response(503, "member read scope is unavailable"),
+                                    );
+                                    return;
+                                }
+                            }
+                        };
+                        let by_id = read.by_id();
+                        let Some(view) = by_id.get(&id) else {
+                            send(request, err_response(404, "unknown issue"));
+                            return;
                         };
                         if super::project_policy::refused(&pm, &view.issue.project, &actor) {
                             send(request, err_response(404, "unknown issue"));
@@ -3505,7 +4264,14 @@ mod read_dispatch_tests {
             "precondition: the empty alias fails its validator"
         );
 
-        let response = read_dispatch(&mut request, state.path(), &ServeOpts::default(), bound);
+        let response = read_dispatch(
+            &mut request,
+            state.path(),
+            state.path(),
+            &ServeOpts::default(),
+            None,
+            bound,
+        );
 
         // The row's own pair, not a generic status, and never `agent_detail`.
         assert_eq!(response.status_code(), StatusCode(400));

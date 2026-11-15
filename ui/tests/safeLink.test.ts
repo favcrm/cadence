@@ -17,6 +17,7 @@ const { NeedRows } = require("../src/features/home/Overview");
 const { Links } = require("../src/features/issues/Links");
 const { PrPanel } = require("../src/features/issues/PrPanel");
 const { MilestoneCheckpoint } = require("../src/features/projects/Milestones");
+const { LocaleProvider } = require("../src/lib/locale");
 
 /**
  * CAD-1080: every surface that renders an externally-influenced href goes
@@ -69,7 +70,8 @@ const ovRows = (link: string | null) =>
 const detail = (url: string) =>
   ({ id: "CAD-1", rev: 1, refs: [{ kind: "pr", url, label: "PR #1" }, { kind: "url", url, label: "ref" }], links: { parent: null, children: [], blocked_by: [], blocks: [], relates: [], duplicate_of: null, duplicates: [] }, reports: [] }) as never;
 const links = (url: string) =>
-  renderToStaticMarkup(h(Links, { detail: detail(url), readOnly: true, hrefFor: (id: string) => `/i/${id}`, onWrite: (async () => {}) as never, onError: () => {} }));
+  // Links reads its labels from the locale (CAD-2253), so it renders inside the app's provider.
+  renderToStaticMarkup(h(LocaleProvider, null, h(Links, { detail: detail(url), readOnly: true, hrefFor: (id: string) => `/i/${id}`, onWrite: (async () => {}) as never, onError: () => {} })));
 const prPanel = (url: string) =>
   renderToStaticMarkup(h(PrPanel, { detail: detail(url), readOnly: true, onWrite: (async () => {}) as never, onError: () => {} }));
 const ms = (entry: string) =>

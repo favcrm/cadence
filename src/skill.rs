@@ -121,11 +121,36 @@ const WEBSITE_BUILDER: BundledSkill = BundledSkill {
     ],
 };
 
-pub const SKILL_NAMES: [&str; 4] = [
+const INCIDENT_RESPONSE: BundledSkill = BundledSkill {
+    name: "incident-response",
+    // Publish the entry point after its references, not before them.
+    files: &[
+        (
+            "references/postmortem-template.html",
+            include_str!("../skills/incident-response/references/postmortem-template.html"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/incident-response/SKILL.md"),
+        ),
+    ],
+};
+
+const DELIVERABLE_QA: BundledSkill = BundledSkill {
+    name: "deliverable-qa",
+    files: &[(
+        "SKILL.md",
+        include_str!("../skills/deliverable-qa/SKILL.md"),
+    )],
+};
+
+pub const SKILL_NAMES: [&str; 6] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
     COMPANY_OUTPUTS.name,
     WEBSITE_BUILDER.name,
+    INCIDENT_RESPONSE.name,
+    DELIVERABLE_QA.name,
 ];
 
 /// Provider skill directories that receive links to each selected bundle.
@@ -155,11 +180,15 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             BUSINESS_DOCUMENTS,
             COMPANY_OUTPUTS,
             WEBSITE_BUILDER,
+            INCIDENT_RESPONSE,
+            DELIVERABLE_QA,
         ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
         Some("company-outputs") => Ok(&[BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
         Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
+        Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
+        Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -799,5 +828,52 @@ mod tests {
         };
         assert_eq!(business["name"], "business-documents");
         assert!(!paths(&business).contains(&"references/proposal.md".to_string()));
+    }
+
+    #[test]
+    fn incident_response_bundle_installs_skill_and_generic_postmortem_template() {
+        assert!(SKILL_NAMES.contains(&"incident-response"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("incident-response")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("incident-response");
+        assert!(root.join("SKILL.md").is_file());
+        assert!(root.join("references/postmortem-template.html").is_file());
+
+        let second = sync(dir.path(), false, Some("incident-response")).unwrap();
+        assert_eq!(second["wrote"], false);
+
+        match show(
+            "incident-response",
+            Some("references/postmortem-template.html"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(html) => {
+                assert!(html.contains("--doc-accent"));
+                assert!(html.contains("@page"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn deliverable_qa_bundle_installs_one_procedure_with_the_gate_pass_lines() {
+        assert!(SKILL_NAMES.contains(&"deliverable-qa"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("deliverable-qa")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("deliverable-qa");
+        assert!(root.join("SKILL.md").is_file());
+        let second = sync(dir.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(second["wrote"], false);
+        match show("deliverable-qa", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                // The exact two lines the merge gate counts (scripts/enqueue-reviewed).
+                assert!(text.contains("Browser QA: pass\n   Head: <full 40-hex sha>"));
+                assert!(text.contains("never approves on a person's behalf"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
     }
 }

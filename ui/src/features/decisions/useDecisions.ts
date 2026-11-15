@@ -223,7 +223,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
   }
 
   /** Approve or deny one decision. Never retries; never submits twice. */
-  async function decide(id: string, verb: Verb): Promise<DecideResult> {
+  async function decide(id: string, verb: Verb, reason?: string): Promise<DecideResult> {
     const epoch = lifetime;
     const current = state.rows.find((r) => r.id === id);
     // One decision at a time: a second click while one is in flight is dropped.
@@ -231,6 +231,8 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     for (const attempt of state.attempts.values()) if (attempt.phase === "busy") return "unconfirmed";
     if (state.attempts.get(id)?.phase === "unconfirmed") return "unconfirmed";
     setAttempt(id, { phase: "busy", verb });
+    const note = verb === "deny" && typeof reason === "string" ? reason.trim().slice(0, 500) : "";
+    const payload = note ? JSON.stringify({ reason: note }) : "{}";
     let status = 0;
     try {
       status = await withPrivateOperation(async (operation) => {
@@ -238,7 +240,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
           method: "POST",
           credentials: "same-origin",
           headers: { accept: "application/json", "content-type": "application/json" },
-          body: "{}",
+          body: payload,
         });
         return response.status;
       });

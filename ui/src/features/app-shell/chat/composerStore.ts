@@ -32,6 +32,7 @@
 import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
 import { beginPrivateOperation, onPrivateSessionReset, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
 import type { ThreadRef } from "../../../lib/types";
+import type { PendingAttachment } from "../../home/thread";
 import {
   attachFits,
   attachRefusal,
@@ -411,11 +412,11 @@ export function attachHold(key: string): AttachItem[] {
 }
 
 /** The ready rows one submit is about to carry, frozen by row identity:
- *  the `{id}` array for the send plus each row's key and upload
+ *  the attachment list for the send plus each row's key and upload
  *  generation. File ids are not row identity — two distinct rows can
  *  legitimately hold the same dedup id. */
 export interface ReadyCapture {
-  ids: { id: string }[];
+  ids: PendingAttachment[];
   rows: { key: string; generation: number }[];
 }
 
@@ -426,7 +427,12 @@ export function captureReady(key: string, expectedDestination?: AttachDestinatio
   }
   const rows = ready;
   return {
-    ids: rows.map((i) => ({ id: i.id! })),
+    ids: rows.map((i) => ({
+      id: i.id!,
+      name: i.name,
+      size: i.size,
+      mime: i.mime || i.file.type || "application/octet-stream",
+    })),
     rows: rows.map((i) => ({ key: i.key, generation: i.generation })),
   };
 }

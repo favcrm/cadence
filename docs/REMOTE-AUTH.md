@@ -76,11 +76,20 @@ requires both selectors, and is never persisted. Invalid environment credentials
 fail without falling back to stored credentials. `login --token-stdin` explicitly
 uses stdin; browser login explicitly uses a new grant, regardless of environment.
 
-All status checks contact the issuer, so expired/revoked credentials fail on
-the next check. Redirects are refused; bearer credentials are never forwarded
-to another host. CLI network connections require HTTPS origins without paths,
-userinfo, query strings or fragments. No issuer response body or credential is
-printed on errors.
+An issuer-status check contacts the issuer, so an expired or revoked
+ephemeral credential fails on the next check. A saved hosted workspace is
+different: with `--org <name>`, a saved selection, or exactly one registered
+remote, `cadence auth status` reports that session's local state without any
+issuer call — `state`, `scopes`, `access_expires_at`,
+`session_idle_expires_at`, `session_absolute_expires_at` and
+`live_verified: false`. The states are `renewable` and
+`access_valid_until_expiry` (exit 0) and `reauthentication_required`,
+`no_credential`, `invalid_local_credential` and `unavailable` (exit 1). A
+present `CADENCE_TOKEN` still wins, and explicit `--issuer` or `--auth-dir`
+keep the issuer path. Redirects are refused; bearer credentials are never
+forwarded to another host. CLI network connections require HTTPS origins
+without paths, userinfo, query strings or fragments. No issuer response body
+or credential is printed on errors.
 
 ## Storage and logout
 
@@ -113,6 +122,75 @@ credential using AgenticOS connected devices. Logout does not clear an environme
 token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
+
+## Managed agents and saved hosted logins (CAD-2148)
+
+**A managed agent credential is not a boundary around the member's saved
+login.** File mode `0600` restricts access by ordinary users with other UIDs,
+not by privileged processes or an unconfined process running as the same user.
+`CADENCE_ALIAS` is an accidental-change guard, not caller authentication. A
+managed CLI currently reads the member's login to mint its claim-bound agent
+credential; some operations and compatibility fallbacks still use the login.
+See the [hosted-workspace guide](guides/hosted-workspace.md) for those paths
+and their attribution.
+
+For a local endpoint, assume a same-user agent can read the member's login
+unless the actual launch and every route to that credential have been
+independently isolated. Cadence does not currently establish that boundary
+for these local endpoints:
+
+- **Codex managed stdio and managed-WS:** no hosted-login isolation is
+  established. The managed-WS loopback endpoint is unauthenticated;
+  loopback is not same-user isolation.
+- **Claude managed worker:** Cadence's Landlock wrapper is for the master;
+  it does not wrap an ordinary managed worker.
+- **Pi or OMP managed worker:** Landlock is opt-in and limits filesystem
+  paths. Explicit extra grants or another allowed path can include the login.
+- **Claude, Devin or Cursor PTY:** a normal same-user launch has no
+  separate-user credential boundary. Real profiles refuse the split-UID path
+  until native session preparation is supported. A reviewer role is refused
+  here: a reviewer is always a headless process or a hosted board session.
+
+Reviewer agents (`role: reviewer`) are the exception for `gh`: a reviewer is
+always a headless process the daemon starts, or a hosted board session, and at
+launch its worker does not inherit the operator's `gh` configuration. The daemon
+pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
+passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
+provisioned a read-only token. With no such token `gh` is unauthenticated — the
+fail-closed direction, never the operator's account. The token's scope is the
+operator's responsibility; nothing here can verify it. `GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are always
+overridden — empty when nothing is provisioned — because `gh` prefers them over
+the config file and an inherited value would defeat the config pin. A role that
+reads as a review (`reviewer`, `Reviewer`, `code-reviewer`, `review`) gets the
+pin; other roles are unchanged. The daemon applies it when it starts the child,
+after the adapter's own scrub, on every local headless launch: Pi/OMP, Claude,
+Codex stdio and Codex managed-WS.
+
+The pin covers `gh` only. The operator's SSH agent and the git credential
+helpers under `HOME` are NOT covered, so a local reviewer can still push as the
+operator. The pin is an environment, not an identity boundary: a same-user
+worker can override its environment or read the operator's saved hosted login
+(the limits above), so only a separate user is a credential boundary. A
+reviewer reports its findings back (turn result, or hosted ticket tools);
+whoever dispatched it posts the PR comment or ticket comment.
+
+The remote Devin and cloud sandbox adapters launch no local actor. That does
+not establish what credentials or access the remote runtime receives.
+
+Pi/OMP Landlock does not gate network access or path-named Unix-socket
+connections and is not a capability sandbox against arbitrary execution.
+The protected split-UID managed-Pi path unconditionally refuses to launch in
+the current implementation. Enabling it needs future implementation and
+external sealed-helper, namespace-policy and restore-lineage pins; supplying
+those pins alone is not enough. Do not treat either an agent credential or a
+`confined` label as proof that a human login is unreachable.
+
+If that login must remain private from an agent, do not rely on same-user
+confinement to protect it. Use a separately controlled account or host, with
+its own authorized identity, only after verifying its filesystem, process and
+socket access. Do not copy the member's login into an agent environment to
+make a hosted command work.
 
 ## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
@@ -238,7 +316,7 @@ verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
 `message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
 `issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
-`team_remove`, `project_policy`, `project_ls`, `project_new`, `message_send` — and
+`team_remove`, `project_policy`, `project_ls`, `project_timeline`, `project_new`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -304,11 +382,16 @@ The gateway's real refusal shapes (AOS-243):
   can itself send a blocked report; if its answer is lost, the result remains
   unknown alongside the local failure. If a correlated receipt confirms the
   remote action but local custody cannot be recorded, the error says the action
-  was confirmed and identifies the local failure. Inspect `cadence agent status`
-  in the same selected workspace and retain the assignment, claim, generation
-  and operation identifiers before deciding whether to retry. Unsupported work
-  kinds are never started locally; a confirmed receipt is recorded before that
-  local refusal.
+  was confirmed and identifies the local failure. This holds for queue, claim,
+  report and reassignment alike. Every message names the workspace, assignment
+  and generation; then per path: queue names its `idempotency_key`; claim and
+  report name `claim_id` (only when the row has one) and `expected_generation`;
+  reassignment names `operation_id` and `expected_generation`. Inspect
+  `cadence agent assignments` in the same selected workspace (it takes the same
+  local lock, so fix the local fault first), and retain those identifiers
+  before deciding whether to retry; do not replay blindly. Repeating the same
+  queue command reuses its `idempotency_key`. Unsupported work kinds are never
+  started locally; a confirmed receipt is recorded before that local refusal.
 - Hosted app release mutations retain the caller's operation UUID. On an
   unproved response, inspect `app catalog operation` or `reconcile` for that
   UUID in the same workspace; do not create a new operation blindly.

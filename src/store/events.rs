@@ -1573,6 +1573,143 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Select authorized event bindings before applying either page boundary.
+    /// A message, task and job named together must agree on the same work.
+    pub(crate) fn events_scoped(
+        &self,
+        alias: &str,
+        after: i64,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+        tail: bool,
+    ) -> Result<Vec<Event>> {
+        let (comparison, order, bound) = if tail {
+            ("<", "DESC", i64::MAX)
+        } else {
+            (">", "ASC", after)
+        };
+        self.events_scoped_window(alias, comparison, order, bound, limit, issues, denied, tail)
+    }
+
+    /// One reverse window of the same project-scoped stream, strictly below
+    /// `before` and returned oldest first. This is the resume point of a
+    /// reverse scan that skipped rows a projection filtered out: pass
+    /// `i64::MAX` for the newest window, then the lowest `seq` of the previous
+    /// window (exclusive) to continue past those rows. Without this bound a
+    /// scan cannot look older than the newest `limit` rows it already saw.
+    pub(crate) fn events_scoped_before(
+        &self,
+        alias: &str,
+        before: i64,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<Vec<Event>> {
+        self.events_scoped_window(alias, "<", "DESC", before, limit, issues, denied, true)
+    }
+
+    /// The `selected` seqs that the scoped authorization predicate still
+    /// admits, in ONE exact-set query.
+    ///
+    /// The caller passes at most one page of seqs as a JSON array; the predicate
+    /// is the same one the page was selected with, now evaluated against the
+    /// CURRENT task/job/issue/denial bindings. Only `seq` is projected, so no
+    /// event payload is copied, and there is no numeric-span bound and no
+    /// per-row query.
+    pub(crate) fn events_scoped_admitted_seqs(
+        &self,
+        alias: &str,
+        selected: &[i64],
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        self.events_alias_in(&conn, alias)?;
+        let message_scope = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let denied_tasks = serde_json::to_string(&denied.tasks)?;
+        let denied_jobs = serde_json::to_string(&denied.jobs)?;
+        let issues = serde_json::to_string(issues)?;
+        let limit = selected.len() as i64;
+        let selected = serde_json::to_string(selected)?;
+        let sql = scoped_events_sql(
+            "seq",
+            "seq IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))",
+            "ASC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                alias,
+                selected,
+                issues,
+                message_scope,
+                limit,
+                Self::DAEMON_STREAM,
+                denied_tasks,
+                denied_jobs,
+                denied.exclude_cloud
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn events_scoped_window(
+        &self,
+        alias: &str,
+        comparison: &str,
+        order: &str,
+        bound: i64,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+        reverse: bool,
+    ) -> Result<Vec<Event>> {
+        let conn = self.conn();
+        self.events_alias_in(&conn, alias)?;
+        let message_scope = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let denied_tasks = serde_json::to_string(&denied.tasks)?;
+        let denied_jobs = serde_json::to_string(&denied.jobs)?;
+        let issues = serde_json::to_string(issues)?;
+        let sql = scoped_events_sql(
+            "seq,alias,kind,payload,job_id,task_id,at",
+            &format!("seq {comparison} ?2"),
+            order,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                alias,
+                bound,
+                issues,
+                message_scope,
+                limit,
+                Self::DAEMON_STREAM,
+                denied_tasks,
+                denied_jobs,
+                denied.exclude_cloud
+            ],
+            row_event,
+        )?;
+        let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if reverse {
+            events.reverse();
+        }
+        Ok(events)
+    }
+
     /// Event streams that exist without an `agents` row — the daemon
     /// writes `wal_checkpointed` here. Only the events read path
     /// accepts it; sends still require a registered alias.
@@ -1729,4 +1866,44 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// The one authorization predicate shared by every scoped event read.
+///
+/// The caller supplies the projection, the sequence condition (`seq > ?2`,
+/// `seq < ?2`, or an exact selected-set match on `?2`) and the order. The
+/// placeholder numbering is fixed: ?1 alias, ?2 sequence bound, ?3 issues,
+/// ?4 the shared message-project filter, ?5 limit, ?6 daemon stream, ?7 denied
+/// tasks, ?8 denied jobs, ?9 cloud exclusion.
+fn scoped_events_sql(columns: &str, seq_condition: &str, order: &str) -> String {
+    let message_type = "CASE WHEN json_valid(events.payload) THEN json_type(events.payload,'$.message') ELSE 'invalid' END";
+    let message_id =
+        "CASE WHEN json_valid(events.payload) THEN json_extract(events.payload,'$.message') END";
+    format!(
+        "SELECT {columns} FROM events
+         WHERE alias=?1 AND {seq_condition} AND json_valid(events.payload)
+           AND (events.task_id IS NOT NULL OR events.job_id IS NOT NULL OR ({message_type})='text')
+           AND (events.task_id IS NULL OR EXISTS (
+               SELECT 1 FROM tasks t JOIN jobs j ON j.id=t.job_id
+               WHERE t.id=events.task_id AND (events.job_id IS NULL OR events.job_id=t.job_id)
+                 AND j.issue_id IN (SELECT value FROM json_each(?3))))
+           AND (events.job_id IS NULL OR EXISTS (
+               SELECT 1 FROM jobs j WHERE j.id=events.job_id
+                 AND j.issue_id IN (SELECT value FROM json_each(?3))))
+           AND (({message_type}) IS NULL OR (({message_type})='text' AND EXISTS (
+               SELECT 1 FROM messages WHERE messages.id=({message_id})
+                 AND (messages.alias=events.alias OR events.task_id IS NOT NULL OR events.job_id IS NOT NULL)
+                 AND (events.task_id IS NULL OR messages.task_id=events.task_id)
+                 AND (events.job_id IS NULL OR EXISTS (
+                     SELECT 1 FROM tasks t WHERE t.id=messages.task_id AND t.job_id=events.job_id))
+                 {filter})))
+           AND (events.task_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM json_each(?7) WHERE value=events.task_id))
+           AND (events.job_id IS NULL OR events.task_id IS NOT NULL OR NOT EXISTS (
+               SELECT 1 FROM json_each(?8) WHERE value=events.job_id))
+           AND (?9=0 OR NOT EXISTS (SELECT 1 FROM cloud_agents WHERE alias=events.alias))
+           AND (events.alias<>?6 OR events.kind<>'assist_intent')
+         ORDER BY seq {order} LIMIT ?5",
+        filter = super::messages::INDEX_PROJECT_FILTER,
+    )
 }

@@ -53,7 +53,8 @@ unless ALL of these hold for the pinned head:
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, any
     head-pinned note whose Risk is not exactly `auto`, or a workflow-issued
-    review on any change outside docs/roles/workflow-auto-paths.toml),
+    review on a change workflow_auto_reasons refuses; the rule is
+    docs/roles/risk-classes.md trigger 7),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
 
@@ -66,7 +67,9 @@ under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); th
 workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
 gate, security, schema and release PRs, and two of them satisfy other PRs. A
 hosted board has no readiness record, so a hosted `routine` PR takes those two
-workflow reviews and the operator approval they carry (CAD-2135). A hosted `ui/**`
+workflow reviews and the operator approval they carry (CAD-2135), unless this
+gate's dry run reports `class: auto` (CAD-2254: workflow_auto_reasons enforces
+docs/roles/risk-classes.md trigger 7; being on the list is not enough). A hosted `ui/**`
 PR takes those two workflow reviews, operator approval, and `--browser-qa <url>`
 naming a comment on this PR that is exactly the lines `Browser QA: pass` and
 `Head: <full sha>` (CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
@@ -176,7 +179,13 @@ RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # write `risk: auto` (a prompt-injected model can), so no path is eligible by
 # default.
 WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
-WORKFLOW_NEVER_PREFIXES = ("agents.", "claude.", "gemini.")  # basename prefixes, lower-case
+# Basename prefixes (compared casefolded, any directory) of files that can load as
+# agent instructions: never eligible, whatever the list says.
+WORKFLOW_NEVER_PREFIXES = ("agents.", "claude.", "gemini.", "agent.", "warp.", "qwen.",
+                           "crush.", "copilot-instructions.")
+# CAD-2254: whatever that list says, the trust-boundary, identity, secret and UI
+# trees keep the operator: every one-review exclude glob and these risk-paths tables.
+WORKFLOW_NEVER_TABLES = ("trigger1", "trigger3")
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -233,21 +242,24 @@ REGULAR_MODES = ("100644", "100755")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-def run(argv, input_text=None):
-    """(returncode, stdout, stderr); a missing binary is rc 127."""
+def run(argv, input_text=None, exact=False):
+    """(returncode, stdout, stderr); a missing binary is rc 127. `exact` decodes the
+    output as UTF-8 without the newline translation of text mode, which would read
+    a `\r` inside a path name as `\n` (CAD-2257); it takes no input."""
     # A host can carry several Cadence builds. `cadence` on PATH may predate the
     # hosted verbs this gate needs, so let the caller name the build it means
     # instead of making every refusal look like a gate failure.
     if argv and argv[0] == "cadence":
         argv = [os.environ.get("CADENCE_BIN", "cadence"), *argv[1:]]
     try:
-        r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
+        r = subprocess.run(argv, input=input_text, capture_output=True, text=not exact)
+        out, err = (r.stdout.decode(), r.stderr.decode(errors="replace")) if exact else (r.stdout, r.stderr)
     except OSError as e:
         return 127, "", str(e)
     except UnicodeDecodeError:
         # A path name that is not UTF-8 cannot be judged: fail closed with a reason.
         return 1, "", f"{argv[0]} printed output that is not valid UTF-8 (a non-UTF-8 path name?)"
-    return r.returncode, r.stdout, r.stderr
+    return r.returncode, out, err
 
 
 def stale_cli_hint(text):
@@ -387,7 +399,7 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
         raise RuntimeError(f"{anchor} and {head} have {len(bases)} merge bases ({', '.join(b[:12] for b in bases)}), "
                            "so the changed set is ambiguous (fail closed)")
     mb = bases[0]
-    rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head])
+    rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head], exact=True)
     if rc != 0:
         raise RuntimeError(f"git diff failed: {err.strip()}")
     rc, num, err = run(["git", "diff", "--numstat", "--no-renames", mb, head])
@@ -412,30 +424,79 @@ def risk_globs(toml_text):
     return globs if all(isinstance(g, str) for g in globs) else None
 
 
-def workflow_auto_reasons(changes, toml_text):
+def workflow_never_globs(one_text, risk_text):
+    """The globs neither a workflow review nor a ticket scope approval may carry to
+    merge (CAD-2254), or None if unreadable.
+
+    Every `one_review_exclude` glob of the one-review list plus risk-paths trigger 1
+    and trigger 3 (docs/roles/risk-classes.md trigger 7 states the rule). A list
+    missing, malformed, without its key or empty (CAD-2257: an empty one excludes
+    nothing) is unreadable, so the caller fails closed."""
+    lists = [glob_list(one_text, ("one_review_exclude",))]
+    lists += [glob_list(risk_text, (table, "paths")) for table in WORKFLOW_NEVER_TABLES]
+    if not all(lists):
+        return None
+    return [g for globs in lists for g in globs]
+
+
+def protected_ignoring_case(path, risk, never):
+    """Is `path`, compared without case, a human-class or never-eligible path (CAD-2254)?
+
+    Git treats `docs/Roles/x.md` and `docs/roles/x.md` as different paths, but a
+    case-insensitive checkout (the macOS build) puts them in one directory, so a
+    name that differs only by case from a protected path is not ordinary. `risk`
+    is risk_globs' list and `never` is workflow_never_globs' list."""
+    return is_human_path(path, list(risk) + list(never), fold=True)
+
+
+def unprintable(c):
+    """A control, format or line/paragraph separator character, or a space other than
+    U+0020: it can start a new output line, hide text or pass for another character
+    (CAD-2257)."""
+    cat = unicodedata.category(c)
+    return cat in ("Cc", "Cf", "Zl", "Zp") or (cat == "Zs" and c != " ")
+
+
+def shown(text):
+    """`text` with every unprintable character escaped, so a path name inside a line
+    the gate prints cannot start another line or hide text (CAD-2257)."""
+    return "".join(
+        {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(c) or
+        (f"\\u{ord(c):04x}" if ord(c) < 0x10000 else f"\\U{ord(c):08x}")
+        if unprintable(c) else c
+        for c in text)
+
+
+def workflow_auto_reasons(changes, toml_text, never, risk):
     """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
 
-    A positive allowlist: every change must be a plain add or modify of a regular
-    file with new mode 100644 (a modify keeps its mode) on a path matching
-    WORKFLOW_AUTO_FILE's `[auto] paths`. A delete, rename (seen as a delete plus an
-    add), symlink, submodule, executable or mode change, a path not on the list and a
-    missing or unreadable file all need the operator. An EMPTY list is valid and
-    means every path needs the operator. Whatever the list says, a path with a
-    segment starting with `.` (.github, .claude, .gitattributes) or a basename
-    starting `agents.`, `claude.` or `gemini.` (any case, any directory: they can
-    load as agent instructions) is never eligible."""
+    A positive allowlist over `changes`, checked path by path against
+    WORKFLOW_AUTO_FILE's `[auto] paths`, `never` (workflow_never_globs' list, None
+    when unreadable: every path then needs the operator) and `risk` (risk_globs'
+    list, for the case check). docs/roles/risk-classes.md trigger 7 states the rule;
+    this function is its enforcement. Paths are returned raw; every line the gate
+    prints passes through `shown`."""
     globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
         return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
                 "cannot stand in for the operator (fail closed)"]
+    if never is None:
+        return [f"cannot read the one-review excludes of {ONE_REVIEW_FILE} or trigger 1 and 3 of "
+                f"{RISK_PATHS_FILE} at the diff's anchor, so a workflow review cannot stand in "
+                "for the operator (fail closed)"]
     out = []
     for status, old_mode, new_mode, path in changes:
         segs = path.split("/")
         if (not path or path.startswith("/") or "\\" in path or ".." in path
-                or any(seg in ("", ".") for seg in segs)):
+                or any(seg in ("", ".") or seg.endswith((".", " ")) for seg in segs)
+                or any(unprintable(c) for c in path)):
             why = "an odd path name"
-        elif any(seg.startswith(".") for seg in segs) or segs[-1].lower().startswith(WORKFLOW_NEVER_PREFIXES):
+        elif any(seg.startswith(".") for seg in segs) or segs[-1].casefold().startswith(WORKFLOW_NEVER_PREFIXES):
             why = "a hidden or agent-instruction file name"
+        elif any(glob_match(g, path) for g in never):
+            why = "a trust-boundary, identity, secret or UI path, never eligible"
+        elif not is_human_path(path, risk) and protected_ignoring_case(path, risk, never):
+            why = "a name that differs only by case from a protected path, never eligible"
         elif not ((status == "A" and old_mode == "000000" and new_mode == "100644")
                   or (status == "M" and old_mode == "100644" and new_mode == "100644")):
             why = "not a plain add or modify of a 100644 file"
@@ -475,12 +536,15 @@ def lean_class_reasons(klass, changes, one, human_paths, lines):
              "refusing rather than merging on fewer reviews)"] if out else [])
 
 
-def is_human_path(path, risk=()):
+def is_human_path(path, risk=(), fold=False):
+    """Is `path` human-class by name or by a `risk` glob? `fold` compares casefolded."""
+    f = str.casefold if fold else str
+    path = f(path)
     base = path.rsplit("/", 1)[-1]
     segs = path.split("/")[:-1]
-    return (path in HUMAN_EXACT or path.startswith(HUMAN_PREFIXES)
-            or base in HUMAN_BASENAMES or ".github" in segs or ".cargo" in segs
-            or any(glob_match(g, path) for g in risk))
+    return (path in {f(p) for p in HUMAN_EXACT} or path.startswith(tuple(f(p) for p in HUMAN_PREFIXES))
+            or base in {f(b) for b in HUMAN_BASENAMES} or ".github" in segs or ".cargo" in segs
+            or any(glob_match(f(g), path) for g in risk))
 
 
 # ---- required checks --------------------------------------------------------
@@ -1581,12 +1645,11 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
     if not isinstance(body, str) or str(ticket.get("id", "")).lower() != issue.lower():
         why.append(f"cannot read the body of ticket {issue}")
     # Paths: never trigger 1 or 3, never a two-review (exclude) path.
-    t13 = [g for t in ("trigger1", "trigger3") for g in (glob_list(risk_text, (t, "paths")) or [None])]
-    exc = glob_list(one_text, ("one_review_exclude",))
-    if None in t13 or exc is None:
+    never = workflow_never_globs(one_text, risk_text)
+    if never is None:
         why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the diff's anchor")
     else:
-        hit = [p for p in paths if any(glob_match(g, p) for g in t13 + exc)]
+        hit = [p for p in paths if any(glob_match(g, p) for g in never)]
         if hit:
             why.append(f"trigger 1/3 or two-review path needs a per-head approval: {', '.join(hit[:5])}")
     if not paths:
@@ -2004,8 +2067,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
 
     # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
     # or (CAD-2081) a workflow-issued review on any change outside the workflow
-    # auto-paths allowlist. `cadence delivery requirements` does not report that last
-    # rule; this script adds it.
+    # auto-paths allowlist or on a path it can never make eligible (CAD-2254).
+    # `cadence delivery requirements` does not report that last rule; this script
+    # adds it.
     rc, risk_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                              f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={lists_ref}"])
                         if lists_ref else (1, "", ""))
@@ -2026,7 +2090,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             rc, auto_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                                     f"repos/{repo}/contents/{WORKFLOW_AUTO_FILE}?ref={main_tip}"])
             auto_text = auto_text if rc == 0 else None
-        why += workflow_auto_reasons(changes, auto_text)
+        why += workflow_auto_reasons(changes, auto_text,
+                                     workflow_never_globs(one_text, risk_text), risk or ())
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
@@ -2210,7 +2275,7 @@ def enqueue(args, repo):
     rc, out, err = run(["gh", "pr", "merge", str(args.pr), "-R", repo, "--auto", "--squash",
                         "--match-head-commit", args.head])
     if rc != 0:
-        print(f"{ME}: gh pr merge failed: {(err or out).strip()}", file=sys.stderr)
+        print(f"{ME}: gh pr merge failed: {shown((err or out).strip())}", file=sys.stderr)
     else:
         deadline = time.monotonic() + args.poll_secs
         while True:
@@ -2226,18 +2291,19 @@ def enqueue(args, repo):
         if rc == 0:
             break
     if rc != 0:
-        print(f"{ME}: DANGER: --disable-auto failed; auto-merge may still be on: {(err or out).strip()}", file=sys.stderr)
+        print(f"{ME}: DANGER: --disable-auto failed; auto-merge may still be on: {shown((err or out).strip())}", file=sys.stderr)
     else:
         print(f"{ME}: auto-merge disabled again", file=sys.stderr)
     return 1
 
 
 def self_test():
-    """CAD-2049: the independence rule over fixed documents. No network, no files.
+    """CAD-2049, CAD-2081, CAD-2254: the gate's rules over fixed documents. No network, no files.
 
     The gate cannot approve its own change, so this is the reproducible check
-    the ticket asks for: it runs the counting function the gate runs, over the
-    three shapes that decide the rule."""
+    those tickets ask for: it runs the functions the gate runs, over the shapes
+    that decide the independence rule, the workflow-row rules and the
+    workflow-only route's path rules."""
     def row(name, reviewer_id, login, kind="combined", outcome="pass"):
         return {"name": name, "stamp": "20261103-000000", "reviewer": login,
                 "reviewer_id": reviewer_id, "github_login": login, "repo": "o/r",
@@ -2301,6 +2367,65 @@ def self_test():
         ok = not counted and any(expected in r for r in reasons)
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'no refusal'}")
         failures += 0 if ok else 1
+
+    # CAD-2254: the workflow-only route's path rules over fixed lists. The size
+    # trigger and a non-`auto` Risk are decided inline in evaluate; the suite's
+    # cad2254 block covers those two.
+    auto = '[auto]\npaths = ["docs/**/*.md", "src/**"]\n'
+    risk = ["docs/roles/**", "scripts/**", "docs/design/**"]
+    never = workflow_never_globs(
+        'one_review_exclude = ["src/daemon/**", "ui/**"]\n',
+        '[trigger1]\npaths = ["src/peer.rs"]\n[trigger3]\npaths = ["src/secret/**"]\n')
+
+    def plain(path):
+        return [("M", "100644", "100644", path)]
+
+    auto_cases = [
+        ("an ordinary listed path is eligible", plain("docs/guides/x.md"), never, None),
+        ("a one-review excluded tree keeps the operator", plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a UI path keeps the operator", plain("ui/src/x.tsx"), never, "never eligible"),
+        ("a trigger 1 path keeps the operator", plain("src/peer.rs"), never, "never eligible"),
+        ("a trigger 3 path keeps the operator", plain("src/secret/x.rs"), never, "never eligible"),
+        ("an excluded path beside an ordinary one keeps the operator",
+         plain("docs/x.md") + plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a case alias of a protected path keeps the operator",
+         plain("docs/Roles/x.md"), never, "differs only by case"),
+        ("a case alias of an exact human-class name keeps the operator",
+         plain("docs/team.md"), never, "differs only by case"),
+        ("a case alias under a risk glob keeps the operator",
+         plain("docs/Design/x.md"), never, "differs only by case"),
+        ("an emptied never-eligible list keeps the operator", plain("docs/x.md"),
+         workflow_never_globs('one_review_exclude = []\n', '[trigger1]\npaths = ["a"]\n[trigger3]\npaths = ["b"]\n'),
+         "fail closed"),
+        ("a zero-width character makes an odd path name", plain("docs/x\u200b.md"), never,
+         "an odd path name"),
+        ("a trailing-dot directory makes an odd path name", plain("docs/dir./x.md"), never,
+         "an odd path name"),
+        ("a newline prints escaped, not as a new line", plain("docs/a\nb.md"), never, "a\\nb.md (an odd path name)"),
+        ("a no-break space makes an odd path name, printed escaped", plain("docs/a\u00a0b.md"), never,
+         "a\\u00a0b.md (an odd path name)"),
+        ("a further agent-instruction name keeps the operator", plain("docs/AGENT.md"), never,
+         "agent-instruction file name"),
+        ("a lookalike of an agent-instruction name stays eligible", plain("docs/agenda.md"), never, None),
+        ("an agent-instruction name spelled with a folding character keeps the operator",
+         plain("docs/agent\u017f.md"), never, "agent-instruction file name"),
+        ("an unlisted path keeps the operator", plain("contracts/x.json"), never, "not on the list"),
+        ("a delete keeps the operator", [("D", "100644", "000000", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("a mode change keeps the operator", [("M", "100644", "100755", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("unreadable never-eligible lists keep the operator", plain("docs/x.md"),
+         workflow_never_globs(None, None), "fail closed"),
+    ]
+    for label, changes, never_globs, expected in auto_cases:
+        reasons = [shown(r) for r in workflow_auto_reasons(changes, auto, never_globs, risk)]
+        ok = (not reasons) if expected is None else any(expected in r for r in reasons)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'eligible'}")
+        failures += 0 if ok else 1
+    ok = (is_human_path("tests/x.rs", ["tests/**"]) and is_human_path("docs/design/x.md", ["docs/design/**"])
+          and not is_human_path("docs/guides/x.md", ["tests/**", "docs/design/**"]))
+    print(f"{'ok  ' if ok else 'FAIL'} a risk-paths trigger glob makes a path human-class")
+    failures += 0 if ok else 1
     return 0 if not failures else 1
 
 
@@ -2368,7 +2493,7 @@ def check_gate_copy(dry_run):
     if dry_run:
         print(f"{ME}: gate {short} (differs from origin/main; dry run continues)", flush=True)
         for p in problems:
-            print(f"{ME}: warning: {p}; a real enqueue refuses; {how}", file=sys.stderr)
+            print(f"{ME}: warning: {shown(p)}; a real enqueue refuses; {how}", file=sys.stderr)
         return []
     print(f"{ME}: gate {short} (differs from origin/main)", flush=True)
     return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
@@ -2410,7 +2535,7 @@ def main(argv):
     gate_refusals = check_gate_copy(args.dry_run)
     if gate_refusals:
         for r in gate_refusals:
-            print(f"{ME}: refused: {r}", file=sys.stderr)
+            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
         return 1
     repo = args.repo
     try:
@@ -2442,11 +2567,13 @@ def main(argv):
                     reasons += post_gate_signature(args, repo)
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
+    # Every report and refusal line is escaped: a path name in it cannot print a line
+    # of its own (CAD-2257).
     for line in report:
-        print(f"{ME}: {line}")
+        print(f"{ME}: {shown(line)}")
     if reasons:
         for r in reasons:
-            print(f"{ME}: refused: {r}", file=sys.stderr)
+            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
         return 1
     if args.dry_run:
         print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {args.head}; nothing enqueued")

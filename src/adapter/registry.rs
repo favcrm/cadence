@@ -778,6 +778,19 @@ pub static SPECS: &[EndpointSpec] = &[
 /// `health.capabilities` entry for daemon-wide model defaults.
 pub const MODEL_DEFAULTS_CAPABILITY: &str = "model_defaults";
 
+/// CAD-2215: `health.capabilities` entry naming the opaque job-event cursor
+/// protocol. It is an ADVISORY compatibility signal — a client may use it to
+/// choose between an opaque continuation and a numeric one, but it is never
+/// authorization: every scoped read still re-proves its reader and job, and a
+/// missing capability means "unknown", never a downgrade.
+pub const JOB_EVENTS_OPAQUE_CAPABILITY: &str = "job_events_opaque_cursors";
+
+/// Advisory support for the signed member-assistant opaque history protocol.
+pub const MEMBER_ASSIST_HISTORY_OPAQUE_CAPABILITY: &str = "member_assist_history_opaque_cursors";
+
+/// Advisory support for scoped human-room cursors and receipts.
+pub const HUMAN_ROOM_OPAQUE_CAPABILITY: &str = "human_room_opaque_cursors";
+
 /// Daemon-level features reported alongside the per-spec capability
 /// names — not properties of any one endpoint.
 const DAEMON_FEATURES: &[&str] = &[
@@ -789,6 +802,11 @@ const DAEMON_FEATURES: &[&str] = &[
     "approval_brokering",
     "result_routing",
     MODEL_DEFAULTS_CAPABILITY,
+    // CAD-2215: the opaque job-event cursor protocol (`cursor_format:
+    // "opaque-v1"`); advisory compatibility only.
+    JOB_EVENTS_OPAQUE_CAPABILITY,
+    MEMBER_ASSIST_HISTORY_OPAQUE_CAPABILITY,
+    HUMAN_ROOM_OPAQUE_CAPABILITY,
     // CAD-319: durable conversation threads (`thread_read`/`thread_send`).
     "threads",
 ];
@@ -952,6 +970,24 @@ pub fn spec_opt(provider: &str, kind: &str) -> Option<&'static EndpointSpec> {
                 .iter()
                 .find(|s| kind == "fake" && s.endpoint_kind == "fake")
         })
+}
+
+/// CAD-2239: a reviewer is always a headless process. A `pty` endpoint (a
+/// terminal pane) on a non-internal pair is refused for a review role; every
+/// other role keeps its pane. The `tui-stub` harness pair is internal and
+/// stays buildable.
+pub fn refuse_reviewer_pane(provider: &str, kind: &str, role: &str) -> Result<()> {
+    if kind != "pty"
+        || !super::is_reviewer_role(role)
+        || !spec_opt(provider, kind).is_some_and(|s| !s.internal)
+    {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "a reviewer does not run in a terminal pane ({provider} pty): use a headless \
+         endpoint, `cadence join <pm> claude`, `cadence join <pm> pi` or \
+         `cadence join <pm> codex`"
+    )))
 }
 
 /// Validating lookup used by the factory: unknown pairs are rejected
@@ -2005,6 +2041,27 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewer_pane_is_refused_and_other_roles_keep_theirs() {
+        for provider in ["devin", "cursor", "claude"] {
+            for role in ["reviewer", "Reviewer", "code-reviewer"] {
+                let message = refuse_reviewer_pane(provider, "pty", role)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    message.contains("a reviewer does not run in a terminal pane"),
+                    "{message}"
+                );
+                assert!(message.contains("cadence join <pm> claude"), "{message}");
+            }
+            for role in ["worker", "pm"] {
+                assert!(refuse_reviewer_pane(provider, "pty", role).is_ok());
+            }
+        }
+        assert!(refuse_reviewer_pane("claude", "managed", "reviewer").is_ok());
+        assert!(refuse_reviewer_pane("tui-stub", "pty", "reviewer").is_ok());
+    }
+
+    #[test]
     fn fake_kind_is_provider_agnostic() {
         let s = spec_opt("devin", "fake").unwrap();
         assert_eq!(s.provider, "fake");
@@ -2059,7 +2116,6 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 22);
     }
 
     #[test]

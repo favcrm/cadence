@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod cloud;
+mod role_env;
 
 /// Environment names a spawned worker must not inherit. Devin cloud
 /// credentials stay on the daemon.
@@ -29,6 +30,19 @@ pub fn cloud_secret_env_prefix() -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// Create `dir` (recursive) at mode 0700, tightening an existing one.
+pub(super) fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub(crate) use role_env::{is_reviewer_role, reviewer_gh_env, RoleEnv};
 
 /// The daemon's own tracker and profile. Every agent it launches must
 /// share them, so a sandbox worker's `cadence issue …` reaches the
@@ -884,6 +898,10 @@ pub fn build(
     // produced inline. `fake` resolves for any provider via the
     // registry's provider-agnostic lookup, so no bypass is needed here.
     registry::spec(&agent.provider, &agent.endpoint_kind)?;
+    // CAD-2239: a reviewer is headless. Every open path (launch, resume,
+    // relaunch, restore, restart) builds here, so a stored reviewer pane row
+    // is refused too.
+    registry::refuse_reviewer_pane(&agent.provider, &agent.endpoint_kind, &agent.role)?;
     // Only the PTY layer and the managed-Pi seam consume the fixed agent-UID
     // launch context; every other provider/endpoint refuses a split launch
     // here rather than silently executing as the protected operator. The
@@ -1569,6 +1587,94 @@ mod tests {
         eprintln!(
             "scratch agents/ 4 logs: before={before} bytes, after={after} bytes, cap={}",
             PROVIDER_LOG_MAX_BYTES
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_env_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // CAD-844: a reviewer's `gh` must not read the operator's saved login. It
+    // gets a private empty config plus, only when provisioned, a token under
+    // its own name; other roles are unchanged.
+    #[test]
+    fn a_reviewer_gets_a_private_empty_gh_config() {
+        let state = tempfile::tempdir().unwrap();
+        let agent_dir = state.path().join("agents/rev-1");
+        let env = ProviderEnv::default();
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .to_vec();
+        let config = pairs
+            .iter()
+            .find(|(name, _)| name == "GH_CONFIG_DIR")
+            .expect("a reviewer is pinned");
+        let path = std::path::PathBuf::from(&config.1);
+        assert!(path.starts_with(&agent_dir), "{path:?}");
+        assert!(
+            std::fs::read_dir(&path).unwrap().next().is_none(),
+            "the reviewer gh config must start empty"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Both token names are pinned empty: an inherited value would
+        // otherwise override the config pin and authenticate as the operator.
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(key, value)| key == name && value.is_empty()),
+                "{name} is pinned empty when the operator provisioned nothing"
+            );
+        }
+        assert!(reviewer_gh_env(&env, "developer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .is_empty());
+        assert!(reviewer_gh_env(&env, "pm", &agent_dir)
+            .unwrap()
+            .pairs()
+            .is_empty());
+        for role in ["Reviewer", "review", "code-reviewer"] {
+            assert!(
+                !reviewer_gh_env(&env, role, &agent_dir)
+                    .unwrap()
+                    .pairs()
+                    .is_empty(),
+                "a role that reads as a review is pinned whatever its spelling: {role}"
+            );
+        }
+
+        env.set("CADENCE_REVIEWER_GH_TOKEN", "ghp_read_only_synthetic");
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .to_vec();
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GH_TOKEN" && value == "ghp_read_only_synthetic"),
+            "the provisioned reviewer token is the only credential passed"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GITHUB_TOKEN" && value.is_empty()),
+            "the generic token stays empty even when the reviewer token is set"
         );
     }
 }

@@ -42,7 +42,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
+export type ProjectSection = "overview" | "timeline" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
 /** `members` is hosted-only (CAD-2115): a native board serves no tenant member
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
@@ -113,8 +113,10 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
  * advertise it; a local board keeps it. The route still explains itself if
  * reached by a deep link.
  */
-export function navItems(noWiki: boolean): typeof NAV {
-  return noWiki ? NAV.filter((item) => item.screen !== "wiki") : NAV;
+export function navItems(noWiki: boolean, hiddenScreens?: readonly Screen[]): typeof NAV {
+  const hidden = new Set<Screen>(hiddenScreens);
+  if (noWiki) hidden.add("wiki");
+  return hidden.size === 0 ? NAV : NAV.filter((item) => !hidden.has(item.screen));
 }
 
 /**
@@ -239,7 +241,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "overview" };
-      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
+      if (slug && (b === "overview" || b === "timeline" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
         return { screen: "projects", slug, section: b };
       }
     }
@@ -495,8 +497,11 @@ function scopedRoute(route: Route, project: string): Route {
 
 /** Query parameters only the mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
- *  the ctx/conversation/record selectors were minted for. */
-const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install"] as const;
+ *  the ctx/conversation/record selectors were minted for. `drawer` and
+ *  `drawer_size` are the host's return hint for the drawer surface an app
+ *  asked to open (a connect that leaves the board and comes back); they are
+ *  the app page's alone and never follow the operator elsewhere. */
+const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install", "drawer", "drawer_size"] as const;
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = "", from: Route | null = null): string {

@@ -538,6 +538,7 @@ struct SettingsBody {
     config: ModelDefaults,
 }
 
+// Mirrored by `canonical_model_id` in remote_cli.rs; see its "Seam note (CAD-2096)".
 pub fn validate_model_id(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

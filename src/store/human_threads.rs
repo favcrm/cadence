@@ -222,11 +222,12 @@ struct Room {
     kind: String,
     creator: String,
     topic: String,
+    created: u64,
 }
 
 fn room_in(conn: &impl StoreConn, room: &str) -> Result<Option<Room>> {
     Ok(conn.query_opt(
-        "SELECT org,kind,creator,topic_id FROM human_rooms WHERE id=?",
+        "SELECT org,kind,creator,topic_id,created FROM human_rooms WHERE id=?",
         [room],
         |r| {
             Ok(Room {
@@ -234,6 +235,7 @@ fn room_in(conn: &impl StoreConn, room: &str) -> Result<Option<Room>> {
                 kind: r.get(1)?,
                 creator: r.get(2)?,
                 topic: r.get(3)?,
+                created: r.get::<_, f64>(4)?.to_bits(),
             })
         },
     )?)
@@ -256,6 +258,33 @@ fn readable_room(conn: &impl StoreConn, actor: &VerifiedHuman, room: &str) -> Re
         return Err(Error::rejected("Room not found"));
     }
     Ok(row)
+}
+
+/// The room incarnation and the member's current join boundary. Both are
+/// checked in the same transaction as a scoped history read or marker write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HumanRoomCursorScope {
+    pub(crate) topic: String,
+    pub(crate) created: u64,
+    pub(crate) cutoff: i64,
+}
+
+fn human_room_cursor_scope_in(
+    conn: &impl StoreConn,
+    actor: &VerifiedHuman,
+    room: &str,
+) -> Result<HumanRoomCursorScope> {
+    let row = readable_room(conn, actor, room)?;
+    let cutoff = conn.query_row(
+        "SELECT cutoff FROM human_room_members WHERE room=? AND kind='human' AND member=? AND removed IS NULL",
+        params![room, actor.id],
+        |r| r.get(0),
+    )?;
+    Ok(HumanRoomCursorScope {
+        topic: row.topic,
+        created: row.created,
+        cutoff,
+    })
 }
 
 /// Refuse unless the actor is the room's creator and an active member.
@@ -769,6 +798,51 @@ impl Store {
         })
     }
 
+    /// Resolve the current room incarnation and join boundary for cursor
+    /// binding. This is an authorization check, not a caller-provided scope.
+    pub(crate) fn human_room_cursor_scope(
+        &self,
+        actor: &VerifiedHuman,
+        room: &str,
+    ) -> Result<HumanRoomCursorScope> {
+        self.read_tx(|conn| human_room_cursor_scope_in(conn, actor, room))
+    }
+
+    /// Read under the same membership and cutoff used to open the cursor.
+    pub(crate) fn human_room_history_scoped(
+        &self,
+        actor: &VerifiedHuman,
+        room: &str,
+        expected: &HumanRoomCursorScope,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<TopicPost>, bool)> {
+        self.read_tx(|conn| {
+            let current = human_room_cursor_scope_in(conn, actor, room)?;
+            if &current != expected {
+                return Err(Error::rejected(
+                    "human room read refused: membership changed",
+                ));
+            }
+            let rows = page_rows(
+                conn,
+                &current.topic,
+                current.cutoff,
+                before.unwrap_or(i64::MAX),
+                limit,
+            )?;
+            let more = match rows.first() {
+                Some(oldest) => conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM topic_posts WHERE topic_id=? AND seq>? AND seq<?)",
+                    params![current.topic, current.cutoff, oldest.seq],
+                    |r| r.get::<_, bool>(0),
+                )?,
+                None => false,
+            };
+            Ok((rows, more))
+        })
+    }
+
     /// Server-side directory of verified principals for one org. Records a
     /// presentation name for an id; it grants no room access. Existing
     /// non-empty names are kept. Callers must derive the tuples from a
@@ -943,6 +1017,17 @@ impl Store {
                 |r| r.get::<_, String>(0),
             )?)
         })
+    }
+
+    /// Current membership cutoff for a native agent's private room. A
+    /// changed cutoff invalidates cursors from the earlier visible history.
+    pub(crate) fn human_agent_cutoff(
+        &self,
+        org: &str,
+        agent_uid: &str,
+        topic: &str,
+    ) -> Result<i64> {
+        self.read_tx(|conn| agent_cutoff_in(conn, org, agent_uid, topic))
     }
 
     /// A page of a room's history for an active agent member: rows after the
@@ -1613,23 +1698,34 @@ impl Store {
     /// Mark the room read up to `seq`. Monotonic: a lower seq never moves the
     /// marker back. Returns the unread count after the update, counting posts
     /// from others that the actor may see.
-    pub fn human_room_mark_read(&self, actor: &VerifiedHuman, room: &str, seq: i64) -> Result<i64> {
+    pub(crate) fn human_room_mark_read(
+        &self,
+        actor: &VerifiedHuman,
+        room: &str,
+        seq: i64,
+        expected: &HumanRoomCursorScope,
+    ) -> Result<i64> {
         self.write_tx(|conn| {
-            let row = readable_room(conn, actor, room)?;
-            // A requested seq past the newest post would hide future posts;
-            // clamp it to the room's current maximum and never below zero.
-            let top = max_seq(conn, &row.topic)?;
-            let seq = seq.clamp(0, top);
+            let current = human_room_cursor_scope_in(conn, actor, room)?;
+            if &current != expected {
+                return Err(Error::rejected(
+                    "human room mark refused: membership changed",
+                ));
+            }
+            let visible = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM topic_posts WHERE topic_id=? AND seq=? AND seq>?)",
+                params![current.topic, seq, current.cutoff],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if !visible {
+                return Err(Error::rejected("human room read cursor is unavailable"));
+            }
             conn.execute(
                 "INSERT INTO human_read_markers(room,human,seq) VALUES(?,?,?)
                  ON CONFLICT(room,human) DO UPDATE SET seq=MAX(seq,excluded.seq)",
                 params![room, actor.id, seq],
             )?;
-            let cutoff: i64 = conn.query_row(
-                "SELECT cutoff FROM human_room_members WHERE room=? AND kind='human' AND member=?",
-                params![room, actor.id],
-                |r| r.get(0),
-            )?;
+            let cutoff = current.cutoff;
             let marker: i64 = conn.query_row(
                 "SELECT seq FROM human_read_markers WHERE room=? AND human=?",
                 params![room, actor.id],
@@ -1638,7 +1734,7 @@ impl Store {
             Ok(conn.query_row(
                 "SELECT COUNT(*) FROM topic_posts
                   WHERE topic_id=? AND seq>? AND seq>? AND (sender_uid IS NULL OR sender_uid<>?)",
-                params![row.topic, cutoff, marker, actor.id],
+                params![current.topic, cutoff, marker, actor.id],
                 |r| r.get(0),
             )?)
         })

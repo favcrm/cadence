@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, isolate, sentFields, type StagedChange, type StagedWrite } from "./stagedWrite";
+import { ageText, failureReason, isolate, outcomeOf, sentFields, stagedDomain, stagedDomainLabel, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -88,8 +88,32 @@ export function noticeText(n: DecisionNotice, t: Say): string {
   }
 }
 
-/** The body for one write. Keyed by the write, so its Show raw state is its own. */
-function Body({ write, notice, state, t }: { write: StagedWrite; notice: DecisionNotice | null; state: ReactNode; t: Say }) {
+type DetailTabId = "approvals" | "overview" | "evidence" | "audit";
+
+/** The Approvals tab body for one write. Keyed by write.id, so its disclosure states are its own. */
+function ApprovalsTab({
+  write,
+  notice,
+  state,
+  pending,
+  off,
+  denyOpen,
+  onToggleDenyOpen,
+  denyReason,
+  onDenyReasonChange,
+  t,
+}: {
+  write: StagedWrite;
+  notice: DecisionNotice | null;
+  state: ReactNode;
+  pending: boolean;
+  off: boolean;
+  denyOpen: boolean;
+  onToggleDenyOpen: () => void;
+  denyReason: string;
+  onDenyReasonChange: (next: string) => void;
+  t: Say;
+}) {
   // An incomplete summary opens the raw call: that is the source of truth.
   const [raw, setRaw] = useState(!write.changesComplete);
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
@@ -179,13 +203,32 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
           ))}
         </p>
       )}
+      {pending && !off && (
+        <div>
+          <button type="button" className="rv-dlnk dx-rawbtn dx-deny-toggle" aria-expanded={denyOpen} onClick={onToggleDenyOpen}>
+            {denyOpen ? t("Hide deny note") : t("Add deny note (optional)")}
+          </button>
+          {denyOpen && (
+            <div className="dx-deny-box">
+              <textarea
+                value={denyReason}
+                onChange={(e) => onDenyReasonChange(e.target.value)}
+                maxLength={500}
+                rows={2}
+                placeholder={t("Why are you denying this request? (optional)")}
+                aria-label={t("Deny note (optional)")}
+              />
+            </div>
+          )}
+        </div>
+      )}
       <div>
         <button type="button" className="rv-dlnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
           {raw ? t("Hide raw") : t("Show raw")}
         </button>
         {raw && (
           <pre className="rv-tech dx-raw" tabIndex={0}>
-            {write.raw}
+            <B>{write.raw}</B>
           </pre>
         )}
       </div>
@@ -193,10 +236,227 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
   );
 }
 
+function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: StagedDomain; via: string; t: Say }) {
+  const name = write.origin?.label ?? t("The assistant");
+  const originText =
+    write.origin === null
+      ? t("the assistant")
+      : `${write.origin.label} (${write.origin.kind === "agent" || write.origin.kind === "person" ? t(write.origin.kind) : write.origin.kind})`;
+  return (
+    <div className="wi-panel dx-panel">
+      <section className="dx-sec" aria-label={t("Overview")}>
+        <h4 className="rv-h">{t("What this request does")}</h4>
+        <div className="dx-kv-card">
+          <dl className="dx-kv-list">
+            <div className="dx-kv-line">
+              <dt>{t("Domain")}</dt>
+              <dd>{t(stagedDomainLabel(domain))}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Kind")}</dt>
+              <dd>{write.kind === "create_issue" ? t("Issue proposal") : t("App write")}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Surface")}</dt>
+              <dd>{write.app ? <B>{write.app}</B> : t("Workspace board")}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Target record")}</dt>
+              <dd>
+                {write.target ? (
+                  <>
+                    <B>{write.target.label}</B>
+                    {write.target.id ? (
+                      <>
+                        {" · "}
+                        <span className="dx-id">
+                          <B>{write.target.id}</B>
+                        </span>
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  t("New item")
+                )}
+              </dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Asked by")}</dt>
+              <dd>{write.origin === null ? t("the assistant") : <B>{originText}</B>}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Channel")}</dt>
+              <dd>
+                <B>{via}</B>
+              </dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+      {write.reason !== null && (
+        <section className="dx-sec">
+          <h4 className="rv-h">{fill(t("{name}'s note · not verified"), { name: <B>{name}</B> })}</h4>
+          <blockquote className="dx-quote">
+            <B>{write.reason}</B>
+          </blockquote>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function EvidenceTab({ write, t }: { write: StagedWrite; t: Say }) {
+  // Incomplete summaries open the raw call automatically; complete ones keep
+  // raw fields (such as expected_revision) behind Show raw per CAD-2186.
+  const [raw, setRaw] = useState(!write.changesComplete);
+  return (
+    <div className="wi-panel dx-panel">
+      <section className="dx-sec" aria-label={t("Evidence")}>
+        <h4 className="rv-h">{t("Recorded comparison")}</h4>
+        <div className="dx-kv-card">
+          <dl className="dx-kv-list">
+            <div className="dx-kv-line">
+              <dt>{t("Fields listed")}</dt>
+              <dd>{String(write.changes.length)}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Unchanged fields")}</dt>
+              <dd>{String(write.unchangedCount)}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Summary coverage")}</dt>
+              <dd>{write.changesComplete ? t("Complete") : t("Incomplete — check raw call")}</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+      {(write.consent !== null || write.effects.length > 0) && (
+        <section className="dx-sec">
+          {write.consent !== null && (
+            <p className="rv-note dx-consent">
+              <span>{t("Consent supplied with this write · reported, not verified")}</span>
+              {write.consent.map(([k, v]) => (
+                <span key={k} className="dx-kv">
+                  <B>{k.replace(/_/g, " ")}</B>: <B>{v}</B>
+                </span>
+              ))}
+            </p>
+          )}
+          {write.effects.length > 0 && (
+            <p className="rv-note dx-eff">
+              {write.effects.map((e, i) => (
+                <span key={i}>
+                  {i > 0 && " · "}
+                  <B>{e}</B>
+                </span>
+              ))}
+            </p>
+          )}
+        </section>
+      )}
+      <section className="dx-sec">
+        <h4 className="rv-h">{t("Exact staged payload")}</h4>
+        <div>
+          <button type="button" className="rv-dlnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
+            {raw ? t("Hide raw") : t("Show raw")}
+          </button>
+          {raw && (
+            <pre className="rv-tech dx-raw" tabIndex={0}>
+              <B>{write.raw}</B>
+            </pre>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+const isoOrDash = (ms: number) => (Math.abs(ms) <= 8.64e15 ? new Date(ms).toISOString() : "—");
+
+function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
+  const [rawCode, setRawCode] = useState(false);
+  const outcome = outcomeOf(write);
+  const receipt = write.result;
+  return (
+    <div className="wi-panel dx-panel">
+      <section className="dx-sec" aria-label={t("Audit")}>
+        <h4 className="rv-h">{t("Approval gate & receipt")}</h4>
+        <div className="dx-kv-card">
+          <dl className="dx-kv-list">
+            <div className="dx-kv-line">
+              <dt>{t("Request ID")}</dt>
+              <dd>
+                <span className="dx-id">
+                  <B>{write.id}</B>
+                </span>
+              </dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Authority")}</dt>
+              <dd>{t("Workspace owner only")}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Status")}</dt>
+              <dd>{t(outcome)}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Staged")}</dt>
+              <dd>{`${ageText(write.createdAt, t)} (${isoOrDash(write.createdAt)})`}</dd>
+            </div>
+            <div className="dx-kv-line">
+              <dt>{t("Decided")}</dt>
+              <dd>{write.decidedAt !== null ? `${ageText(write.decidedAt, t)} (${isoOrDash(write.decidedAt)})` : t("Waiting for owner")}</dd>
+            </div>
+            {write.decisionReason ? (
+              <div className="dx-kv-line">
+                <dt>{t("Decision note")}</dt>
+                <dd>
+                  <B>{write.decisionReason}</B>
+                </dd>
+              </div>
+            ) : null}
+            {receipt ? (
+              <div className="dx-kv-line">
+                <dt>{t("Execution receipt")}</dt>
+                <dd>
+                  {receipt.ticket ? (
+                    <B>{receipt.ticket}</B>
+                  ) : receipt.record?.id ? (
+                    <B>{receipt.record.id}</B>
+                  ) : receipt.ok === false ? (
+                    `${t("Did not apply")}: ${t(failureReason(write))}`
+                  ) : receipt.ok ? (
+                    t("Applied")
+                  ) : (
+                    t("Did not apply")
+                  )}
+                </dd>
+              </div>
+            ) : null}
+          </dl>
+        </div>
+        {receipt?.code && (
+          <div>
+            <button type="button" className="rv-dlnk dx-rawbtn" aria-expanded={rawCode} onClick={() => setRawCode((r) => !r)}>
+              {rawCode ? t("Hide raw") : t("Show raw")}
+            </button>
+            {rawCode && (
+              <pre className="rv-tech dx-raw" tabIndex={0}>
+                <B>{receipt.code}</B>
+              </pre>
+            )}
+          </div>
+        )}
+      </section>
+      <p className="rv-note">{t("Approved writes run at most once as the workspace owner. Denials run nothing.")}</p>
+    </div>
+  );
+}
+
 /** How long a newly shown item ignores Approve and Deny. */
 const ARM_MS = 800;
 
-const TABBABLE = 'button:not([disabled]), a[href], pre[tabindex="0"], [tabindex]:not([tabindex="-1"])';
+const TABBABLE = 'button:not([disabled]):not([tabindex="-1"]), a[href]:not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), pre[tabindex="0"], [tabindex]:not([tabindex="-1"])';
 
 /**
  * CAD-2186: one staged write in the shared DrawerShell, with the queue of
@@ -241,6 +501,9 @@ export default function StagedWriteDetail({
   idRef.current = id;
   const atRef = useRef(at);
   atRef.current = at;
+  const [tab, setTab] = useState<DetailTabId>("approvals");
+  const [denyOpen, setDenyOpen] = useState(false);
+  const [denyReason, setDenyReason] = useState("");
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
@@ -249,9 +512,12 @@ export default function StagedWriteDetail({
     };
   }, []);
 
-  // A new item is a new subject: land on its title (the first mount is the shell's).
+  // A new item is a new subject: land on its title (the first mount is the shell's), and reset tab + deny note.
   const first = useRef(true);
   useEffect(() => {
+    setTab("approvals");
+    setDenyOpen(false);
+    setDenyReason("");
     if (first.current) {
       first.current = false;
       return;
@@ -309,12 +575,19 @@ export default function StagedWriteDetail({
   useEffect(() => {
     armedAt.current = Date.now() + ARM_MS;
   }, [id]);
+  const toggleDenyOpen = () => {
+    setDenyOpen((prev) => {
+      if (prev) setDenyReason("");
+      return !prev;
+    });
+  };
   const act = (verb: Verb, forId: string, clicks: number) => {
     if (clicks > 1 || Date.now() < armedAt.current) return;
     // The click is for the row that was on screen when the handler was made.
     if (forId !== idRef.current) return;
     if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
-    void run(() => store.decide(forId, verb));
+    const reason = verb === "deny" && denyOpen ? denyReason : undefined;
+    void run(() => store.decide(forId, verb, reason));
   };
   const check = () => {
     if (busy !== undefined) return;
@@ -385,6 +658,7 @@ export default function StagedWriteDetail({
   const via = write.origin === null ? t(store.conversation === null ? "in Home" : "in this conversation") : t("via {via}").replace("{via}", write.origin.via.toLowerCase() === "cli" ? "CLI" : write.origin.via);
   const link = safeLink(write.recordLink);
   const where = [write.app, write.target?.label].filter((p): p is string => !!p).join(" · ");
+  const domain = stagedDomain(write);
   const off = block !== null || busy !== undefined || lost || uncertain || !pending;
   const spin = (verb: Verb) => busy?.phase === "busy" && busy.verb === verb && attempt?.phase === "busy";
 
@@ -414,7 +688,45 @@ export default function StagedWriteDetail({
           </div>
         </>
       }
-      tabs={[{ id: "detail", label, panel: <Body key={write.id} write={write} notice={decisions.notice} state={state} t={t} /> }]}
+      pills={<span className="dx-domain-chip" data-domain={domain}>{t(stagedDomainLabel(domain))}</span>}
+      tab={tab}
+      onTab={(next) => setTab(next as DetailTabId)}
+      tabs={[
+        {
+          id: "approvals",
+          label: t("Approvals"),
+          panel: (
+            <ApprovalsTab
+              key={write.id}
+              write={write}
+              notice={decisions.notice}
+              state={state}
+              pending={pending}
+              off={off}
+              denyOpen={denyOpen}
+              onToggleDenyOpen={toggleDenyOpen}
+              denyReason={denyReason}
+              onDenyReasonChange={setDenyReason}
+              t={t}
+            />
+          ),
+        },
+        {
+          id: "overview",
+          label: t("Overview"),
+          panel: <OverviewTab write={write} domain={domain} via={via} t={t} />,
+        },
+        {
+          id: "evidence",
+          label: t("Evidence"),
+          panel: <EvidenceTab key={write.id} write={write} t={t} />,
+        },
+        {
+          id: "audit",
+          label: t("Audit"),
+          panel: <AuditTab key={write.id} write={write} t={t} />,
+        },
+      ]}
       foot={
         <>
           <div className="crm-drawer-actions">

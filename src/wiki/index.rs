@@ -2,8 +2,9 @@
 //!
 //! The tracker Git tree is the source of truth. The SQLite database is a
 //! disposable search cache: a changed wiki tree rebuilds it in one transaction,
-//! including moves and removals. No caller identity is stored in the index;
-//! every hit is checked against the wiki's existing path allowlist at query time.
+//! including moves and removals. Separate project and personal corpora prevent
+//! inaccessible pages from influencing a caller's search ranking; every hit is
+//! also checked against the wiki's path allowlist at query time.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,33 +19,40 @@ use super::{allowed, normalize, normalize_dir, vault_dir, Caller, Op, SEARCH_CAP
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
-// v2 rebuilds indexes created before committed Git objects became the
-// source of the indexed text (v1 read the mutable worktree).
-const SCHEMA: &str = "wiki-fts-v3";
+// v4 repartitions project memory and personal wiki paths, including older
+// cached rows, before a search can score a corpus for a member.
+const SCHEMA: &str = "wiki-fts-v4";
 
-/// The FTS table for paths that name no project (`global/`, `users/`, `agents/`).
+/// The FTS table for paths without a project or personal owner.
 const INDEX_GLOBAL: &str = "wiki_index_global";
 const CHUNK_BYTES: usize = 4096;
 
-/// One FTS table per project, plus one for everything that names no project.
-///
-/// CAD-2187: `bm25` scores with statistics that belong to the table it reads,
-/// so a shared table makes a private page part of the corpus that ranks
-/// everyone else's. Partitioning by project gives each caller exactly the
-/// corpus they may read; the cost is that a score no longer means the same
-/// thing across projects, which is the honest reading of "search inside a
-/// project" anyway.
+/// `bm25` uses table-wide statistics, so project and personal pages need
+/// separate corpora rather than post-ranking path filtering.
 pub(super) fn table_for(path: &str) -> String {
-    match super::project_of_path(path) {
-        Some(key) => format!("wiki_index_p_{}", hex_of(key)),
-        None => INDEX_GLOBAL.to_string(),
+    if let Some(key) = super::project_of_path(path) {
+        format!("wiki_index_p_{}", hex_of(key))
+    } else if let Some(owner) = path
+        .strip_prefix("users/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|owner| !owner.is_empty())
+    {
+        format!("wiki_index_u_{}", hex_of(owner))
+    } else {
+        INDEX_GLOBAL.to_string()
     }
 }
 
 /// A table name suffix. Hex, not the key itself: a project key is user data,
 /// and a table name is interpolated into SQL.
 fn hex_of(text: &str) -> String {
-    text.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(text.len() * 2);
+    for byte in text.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 /// Every chunk table currently in the database.
@@ -56,7 +64,7 @@ fn chunk_tables(conn: &Connection) -> Result<Vec<String>> {
             // second drop would fail the rebuild.
             "SELECT name FROM sqlite_master WHERE type='table'
              AND sql LIKE 'CREATE VIRTUAL TABLE%'
-             AND (name = ?1 OR name LIKE 'wiki_index_p_%')",
+             AND (name = ?1 OR name LIKE 'wiki_index_p_%' OR name LIKE 'wiki_index_u_%')",
         )
         .map_err(db_error)?;
     let names = stmt
@@ -1056,6 +1064,21 @@ fn search_from_connection(
             tables.push(table);
         }
     }
+    match caller {
+        Caller::Operator => tables.extend(
+            existing
+                .iter()
+                .filter(|table| table.starts_with("wiki_index_u_"))
+                .cloned(),
+        ),
+        Caller::User(owner) => {
+            let table = format!("wiki_index_u_{}", hex_of(owner));
+            if existing.contains(&table) {
+                tables.push(table);
+            }
+        }
+        _ => {}
+    }
     let mut matches = Vec::new();
     for table in tables {
         let sql = format!(
@@ -1095,6 +1118,13 @@ fn search_from_connection(
     let mut out = Vec::new();
     for (path, line, rev, heading, source, snippet, score) in matches {
         if !norm.is_empty() && path != norm && !path.starts_with(&format!("{norm}/")) {
+            continue;
+        }
+        if super::project_of_path(&path).is_some_and(|key| {
+            readable
+                .binary_search_by(|project| project.as_str().cmp(key))
+                .is_err()
+        }) {
             continue;
         }
         // The table already bounds the corpus by project; the coarse table

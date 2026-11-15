@@ -20,12 +20,10 @@
 //! attribution derived from the verified envelope's actor — never
 //! operator authority (a `users/…`-derived handle, and `source` carries
 //! the provenance label where the verb has no author field). The
-//! message verbs do NOT relay verbatim: the raw signed envelope rides
-//! to `cli_message_send`/`cli_message_read`/`cli_message_inbox` as
-//! `cli_envelope` over this proven board connection, and the daemon
-//! re-verifies it against its own trust root (CAD-1568) — a
-//! `cli_*`-carrying relayed call can never widen into operator
-//! attribution or another member's mail.
+//! agent-list/show and message verbs carry the raw signed envelope to the
+//! daemon as `cli_envelope` over the proven board connection. The daemon
+//! re-verifies it against its own trust root and applies project scope before
+//! paginating the response.
 //!
 //! Fail closed: a missing, forged, expired, wrong-audience or
 //! wrong-org envelope, an unlisted verb, or an insufficient scope is a
@@ -328,7 +326,35 @@ fn arg_strs(args: &Value, key: &str) -> Result<Vec<String>, HttpResp> {
 /// `invalid_request`, a daemon-internal failure `capability_unavailable`
 /// — never a fabricated success.
 fn rpc(state_dir: &Path, method: &str, params: Value) -> HttpResp {
-    match client::rpc(state_dir, method, params) {
+    rpc_response(client::rpc(state_dir, method, params))
+}
+
+/// Require each non-operator agent reply to prove that this daemon applied the
+/// signed CLI reader's scope. Never forward the internal acknowledgement.
+fn scoped_agent_reply(
+    result: crate::error::Result<Value>,
+    actor: &CliActor,
+    expected: &str,
+) -> Result<Value, HttpResp> {
+    match result {
+        Ok(mut reply) => {
+            let confirmed = super::serve::consume_agent_scope(&mut reply, expected);
+            if actor.actor != "operator" && !confirmed {
+                Err(cli_fail(
+                    503,
+                    "capability_unavailable",
+                    "agent read scope is unavailable",
+                ))
+            } else {
+                Ok(reply)
+            }
+        }
+        Err(error) => Err(rpc_response(Err(error))),
+    }
+}
+
+fn rpc_response(result: crate::error::Result<Value>) -> HttpResp {
+    match result {
         Ok(v) => json_ok(v),
         Err(e @ crate::error::Error::Structured(_)) => {
             let code = e.code().unwrap_or("invalid_request").to_string();
@@ -360,13 +386,21 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
     Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))
 }
 
+fn policy_actor(actor: &CliActor) -> String {
+    if actor.principal_kind == "user" && actor.actor != "operator" {
+        crate::project_policy::policy_user_actor(&actor.sub)
+    } else {
+        actor.policy_spelling()
+    }
+}
+
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
 /// (AOS-274 / SEC-003). A project that does not exist is left to the
 /// verb's own unknown-project answer; an unreadable tracker refuses.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
-    if super::project_policy::refused(pm, key, &actor.policy_spelling()) {
+    if super::project_policy::refused(pm, key, &policy_actor(actor)) {
         Some(cli_fail(404, "not_found", "unknown project"))
     } else {
         None
@@ -388,7 +422,7 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
 /// so a listing contributes no row, count or placeholder for a project
 /// the caller may not see.
 fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<String> {
-    super::project_policy::readable(pm, &actor.policy_spelling())
+    super::project_policy::readable(pm, &policy_actor(actor))
 }
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
@@ -418,8 +452,20 @@ fn dispatch(
             if actor.actor != "operator" && !actor.actor.starts_with("users/") {
                 return cli_fail(403, "human_session_required", "my_work requires a user");
             }
-            let policy_actor = actor.policy_spelling();
-            match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor) {
+            if actor.actor != "operator"
+                && (actor.handle != actor.sub
+                    || crate::project_policy::policy_user_actor(&actor.sub)
+                        == "service/unresolved-member")
+            {
+                return cli_fail(
+                    403,
+                    "identity_unresolved",
+                    "My work identity is not unambiguously bound",
+                );
+            }
+            let policy_actor = policy_actor(actor);
+            let proof = super::operator::ReadRelayProof::Cli(envelope.to_owned());
+            match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor, Some(&proof)) {
                 Ok(snapshot) => {
                     match snapshot.payload(pm_dir, &actor.handle, Some(&actor.sub), &policy_actor) {
                         Some(body) => json_ok(body),
@@ -434,19 +480,25 @@ fn dispatch(
             }
         }
         Verb::Status => {
-            // `cadence status` is daemon health plus the agent list —
-            // the same pair the board's own header reads.
+            // The daemon re-verifies the envelope before projecting agents.
             let health = client::rpc(state_dir, "health", json!({}));
-            let agents = client::rpc(state_dir, "agent_list", json!({"board": true}));
+            let agents = client::rpc(
+                state_dir,
+                "agent_list",
+                json!({"board": true, "cli_envelope": envelope}),
+            );
+            let agents =
+                scoped_agent_reply(agents, actor, cadence_core::board_api::AGENT_LIST_SCOPE_ACK);
             match (health, agents) {
                 (Ok(h), Ok(a)) => json_ok(json!({
                     "daemon": h, "agents": a["agents"], "live": a["live"],
                 })),
-                (Err(e), _) | (_, Err(e)) => write_err(&e),
+                (Err(e), _) => write_err(&e),
+                (_, Err(response)) => response,
             }
         }
         Verb::AgentList => {
-            let mut params = json!({"board": true});
+            let mut params = json!({"board": true, "cli_envelope": envelope});
             for key in ["states", "providers", "kinds"] {
                 match arg_strs(args, key) {
                     Ok(v) if !v.is_empty() => params[key] = json!(v),
@@ -454,17 +506,38 @@ fn dispatch(
                     Err(resp) => return resp,
                 }
             }
-            rpc(state_dir, "agent_list", params)
+            match scoped_agent_reply(
+                client::rpc(state_dir, "agent_list", params),
+                actor,
+                cadence_core::board_api::AGENT_LIST_SCOPE_ACK,
+            ) {
+                Ok(reply) => json_ok(reply),
+                Err(response) => response,
+            }
         }
         Verb::AgentShow => match arg_str(args, "alias") {
             Ok(Some(alias)) => {
-                let mut params = json!({"alias": alias});
+                let mut params = json!({"alias": alias, "cli_envelope": envelope});
                 match arg_u64(args, "limit") {
                     Ok(Some(n)) => params["limit"] = json!(n),
                     Ok(None) => {}
                     Err(resp) => return resp,
                 }
-                rpc(state_dir, "agent_show", params)
+                match client::rpc(state_dir, "agent_show", params) {
+                    Err(crate::error::Error::Rejected(message))
+                        if message == "Unknown managed agent" =>
+                    {
+                        cli_fail(404, "not_found", "Unknown managed agent")
+                    }
+                    result => match scoped_agent_reply(
+                        result,
+                        actor,
+                        cadence_core::board_api::AGENT_SHOW_SCOPE_ACK,
+                    ) {
+                        Ok(reply) => json_ok(reply),
+                        Err(response) => response,
+                    },
+                }
             }
             _ => cli_fail(400, "invalid_request", "agent_show needs arguments.alias"),
         },

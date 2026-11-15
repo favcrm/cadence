@@ -72,7 +72,8 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
     };
     const label = labels[event.kind];
     if (!label) return [];
-    return [{ key: `event-${event.seq}`, label, text: event.task_id ?? "", at: event.at }];
+    const id = typeof event.seq === "number" ? event.seq : event.id;
+    return [{ key: `event-${id}`, label, text: event.task_id ?? "", at: event.at }];
   });
   const notes = entries.flatMap((raw): AgentUpdate[] => {
     const entry = asEntry(raw);

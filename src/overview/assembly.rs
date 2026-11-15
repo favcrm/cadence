@@ -588,11 +588,12 @@ pub(super) fn assemble(
         // CAD-383: in-flight claims per project, with their age.
         let claim_clock = claim::Clock::new(line_times.as_ref());
         // CAD-378: the review loop's recorded PR per issue, for lanes
-        // whose tracker carries no `pr` ref.
+        // whose tracker carries no `pr` ref. CAD-2215: only verified
+        // ordinary records — a legacy candidate owns no PR.
         let delivery_prs: std::collections::BTreeMap<String, String> =
             crate::delivery::records(state_dir)
                 .into_values()
-                .filter(|r| !r.state.terminal())
+                .filter(|r| !r.state.terminal() && r.origin.is_verified_ordinary())
                 .filter_map(|r| r.pr.map(|pr| (r.issue, pr)))
                 .collect();
         for p in &projects {

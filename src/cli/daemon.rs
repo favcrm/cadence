@@ -36,6 +36,12 @@ pub(crate) enum DaemonAction {
     /// `daemon stop` is lease-free. A following start of the same
     /// build is also lease-free.
     Stop,
+    /// Bind the operator-provisioned scoped-cursor keyring record to this
+    /// workspace exactly once. The record is fixed at
+    /// `<state-dir>/scoped-cursors.json`; this verb carries no paths, keys or
+    /// identity fields. Idempotent when the same material is already bound;
+    /// any different material fails closed and is never rewritten.
+    CursorKeyInit,
     /// Stop, wait for exit, start, and report a before/after table of
     /// every agent's state (and pane pid for pty agents). The lease
     /// gates a build change and a schema crossing. This command still
@@ -149,6 +155,11 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             Ok(0)
         }
         DaemonAction::Stop => daemon_stop(&state_dir),
+        DaemonAction::CursorKeyInit => {
+            let answer = client::rpc(&state_dir, "scoped_cursor_initialize", json!({}))?;
+            print_json(&answer);
+            Ok(0)
+        }
         DaemonAction::Restart {
             when_idle,
             timeout,
@@ -467,8 +478,10 @@ pub(crate) fn daemon_restart(
     // `turn_adopted`/`turn_adopt_refused` to a busy agent's tail page,
     // and an older restart's events can never masquerade as this
     // one's.
-    let mut event_cursors: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut event_cursors: std::collections::HashMap<
+        String,
+        Option<super::events::AgentEventsAfter>,
+    > = std::collections::HashMap::new();
     // Aliases whose pre-stop tail read failed — the verdict cannot
     // bound their event history, so it must fail rather than silently
     // drop the check (CAD-694).
@@ -480,13 +493,19 @@ pub(crate) fn daemon_restart(
         let Some(alias) = a["alias"].as_str().map(str::to_string) else {
             continue;
         };
-        match client::rpc(
-            state_dir,
-            "agent_events",
-            json!({"alias": alias, "tail": true}),
-        ) {
-            Ok(v) => {
-                event_cursors.insert(alias, v["cursor"].as_i64().unwrap_or(0));
+        // CAD-2215: the pre-stop position is whatever the daemon says this
+        // reader may hold — a numeric sequence only for a proven operator,
+        // an opaque continuation otherwise. A page outside the protocol is a
+        // failed read, never a guessed zero.
+        let request = super::events::agent_events_request(&alias, None, true, 0);
+        let cursor = client::rpc(state_dir, "agent_events", request).and_then(|mut page| {
+            let reader = super::events::agent_events_ack(&mut page)?;
+            let page = super::events::agent_events_page(page, reader, None)?;
+            super::events::agent_events_next(&page, reader)
+        });
+        match cursor {
+            Ok(cursor) => {
+                event_cursors.insert(alias, cursor);
             }
             Err(_) => cursor_misses.push(alias),
         }
@@ -685,34 +704,72 @@ pub(crate) fn daemon_restart(
             // missing cursor means the pre-stop fetch failed; paging
             // from zero could pick up an older restart's verdicts, so
             // the column stays `-` instead.
-            if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
-                let mut seq = cursor;
+            if let Some(cursor) = event_cursors.get(alias.as_str()).cloned() {
+                let mut position = cursor;
                 let mut kinds: Vec<String> = Vec::new();
                 // A failed page leaves this restart's verdict unknown —
                 // recorded and failed below, never silently skipped.
                 let mut pages_failed = false;
+                let mut reader: Option<super::events::AgentEventsReader> = None;
                 // Bounded: a restart's adopt verdicts land within a few
-                // events; 20 pages of 100 is far past any real gap and
-                // keeps a pathological event stream from looping.
+                // events; 20 pages of up to 100 visible events is far past
+                // any real gap and keeps a pathological event stream from
+                // looping.
                 for _ in 0..20 {
-                    let page = client::rpc(
-                        state_dir,
-                        "agent_events",
-                        serde_json::json!({"alias": alias, "after": seq}),
+                    let request = super::events::agent_events_request(
+                        alias.as_str(),
+                        position.as_ref(),
+                        false,
+                        0,
                     );
-                    let Ok(v) = page else {
+                    // Each page must name the reader it was scoped for; a
+                    // daemon that answers outside the protocol, changes the
+                    // reader, or serves numeric positions to a scoped
+                    // continuation leaves this restart's verdict unverified.
+                    let parsed =
+                        client::rpc(state_dir, "agent_events", request).and_then(|mut page| {
+                            let ack = super::events::agent_events_ack(&mut page)?;
+                            if reader.is_some_and(|established| established != ack) {
+                                return Err(Error::rejected(
+                                    "restart: the daemon changed the agent-event reader scope",
+                                ));
+                            }
+                            if ack == super::events::AgentEventsReader::Operator
+                                && matches!(
+                                    position.as_ref(),
+                                    Some(super::events::AgentEventsAfter::Token(_))
+                                )
+                            {
+                                return Err(Error::rejected(
+                                    "restart: an operator stream cannot continue from an \
+                                     opaque cursor",
+                                ));
+                            }
+                            let page =
+                                super::events::agent_events_page(page, ack, position.as_ref())?;
+                            Ok((ack, page))
+                        });
+                    let Ok((ack, page)) = parsed else {
                         pages_failed = true;
                         break;
                     };
-                    let events = v["events"].as_array().cloned().unwrap_or_default();
+                    reader = Some(ack);
+                    let events = page["events"].as_array().cloned().unwrap_or_default();
                     let n = events.len();
                     for e in &events {
                         if let Some(k) = e["kind"].as_str() {
                             kinds.push(k.to_string());
                         }
                     }
-                    seq = v["cursor"].as_i64().unwrap_or(seq);
-                    if n < 100 {
+                    let Ok(next) = super::events::agent_events_next(&page, ack) else {
+                        pages_failed = true;
+                        break;
+                    };
+                    position = next;
+                    // A short page is the end of the stream for both readers:
+                    // an operator page is 100 scanned rows and a scoped page
+                    // is up to 100 VISIBLE rows.
+                    if n < 100 || position.is_none() {
                         break;
                     }
                 }

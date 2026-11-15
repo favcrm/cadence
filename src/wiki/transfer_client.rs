@@ -96,6 +96,14 @@ trait Channel {
     fn discover(&mut self, path: &str) -> Result<()>;
     /// Current destination revision from an existing read, never a new if_rev guess.
     fn current_rev(&mut self, path: &str) -> Result<String>;
+    /// CAD-2271: whether an error this channel's `transfer` returned proves
+    /// the request changed nothing. Only the hosted channel can tell (see
+    /// [`hosted_stop_is_unchanged`]). A local daemon's code crosses the
+    /// socket unchanged and its refusal can follow a publish, so the
+    /// default, which the local channel keeps, trusts nothing.
+    fn proves_unchanged(&self, _error: &Error) -> bool {
+        false
+    }
 }
 
 struct LocalChannel<'a> {
@@ -230,6 +238,25 @@ impl Channel for RemoteChannel<'_> {
             Err(error) if is_absent(&error) || is_directory_range(&error) => Ok(ABSENT.to_string()),
             Err(error) => Err(error),
         }
+    }
+
+    fn proves_unchanged(&self, error: &Error) -> bool {
+        hosted_stop_is_unchanged(error)
+    }
+}
+
+/// CAD-2271: a hosted transfer error that proves the request changed
+/// nothing. Either the board refused it with one of its own transfer codes
+/// (only [`crate::remote_cli::is_wiki_copy_refusal`] codes, which on the
+/// hosted path come only from the board's refusal table), or the board never
+/// ran the request: `timeout` at the command deadline or during session
+/// renewal, `waking` when the gateway answered that the board was still
+/// waking or this copy's wake budget ran out before sending.
+fn hosted_stop_is_unchanged(error: &Error) -> bool {
+    match (error.kind(), error.code()) {
+        ("rejected", Some(code)) => crate::remote_cli::is_wiki_copy_refusal(code),
+        ("busy", Some(code)) => matches!(code, "timeout" | "waking"),
+        _ => false,
     }
 }
 
@@ -385,39 +412,39 @@ fn import_local(
             .get(&id)
             .ok_or_else(|| Error::rejected("wiki cp job status omitted an admitted entry"))?;
         if !entry_progress.decided {
-            if let Err(error) = send_entry(
+            // The board's record of this entry disagrees with the manifest it
+            // admitted. A resume reads the same record, so only a new job helps.
+            // The `dir` and empty-file cases match `send_entry`'s early returns.
+            if item.kind != "dir" && item.size != 0 && entry_progress.received > item.size {
+                return Err(Error::rejected(format!(
+                    "wiki cp job {job_id}: the board holds {} staged bytes for '{}', more than \
+                     its pinned size {}; resuming this job cannot fix that — copy again without \
+                     `--resume`",
+                    entry_progress.received, item.rel, item.size
+                )));
+            }
+            if let Err(stop) = send_entry(
                 channel,
                 &root,
                 job_id,
                 item,
                 &local,
                 entry_progress.received,
+                deadline,
             ) {
                 // A dropped chunk is ambiguous: do not finish and do not
-                // retry. The transport's own kind is kept — an `unknown`
-                // chunk may have staged, so it is not a rejection — and
-                // only the same job can reconcile it.
-                let message = if error.kind() == "unknown" {
-                    format!(
-                        "wiki cp job {job_id} stopped on '{}': {error} — the chunk may or may \
-                         not have been staged; reconcile the same job with `--resume {job_id}` \
-                         before repeating anything; this attempt was not retried",
-                        item.rel
-                    )
-                } else {
-                    format!(
-                        "wiki cp job {job_id} stopped on '{}': {error} — resume with \
-                         --resume {job_id}; this attempt was not retried",
-                        item.rel
-                    )
-                };
-                return Err(write_outcome(error, message));
+                // retry. An unchanged stop (the board's own refusal, the
+                // deadline before sending, or `waking`) or a local source
+                // problem reads as stopped; a channel error or a chunk answer
+                // this client could not read is reconciled by the same job.
+                return Err(chunk_stopped(job_id, &item.rel, stop));
             }
         }
-        match channel.transfer(
+        match send_step(
+            channel,
             &root,
             json!({"op": "apply", "job_id": job_id, "root": root, "entry_id": id}),
-            true,
+            deadline,
         ) {
             Ok(body) => {
                 // One apply. The answer must be this entry's — `entry_id`
@@ -475,41 +502,22 @@ fn import_local(
                     }
                 }
             }
-            Err(error) => {
+            Err(stop) => {
                 // The apply may have committed before the reply was lost:
-                // keep `unknown` as unknown so the caller reconciles the
-                // same job instead of redoing the write.
-                let message = if error.kind() == "unknown" {
-                    format!(
-                        "wiki cp job {job_id} apply '{}' was not confirmed: {error} — this \
-                         attempt was not retried; reconcile that job with `--resume {job_id}` \
-                         before repeating anything",
-                        item.rel
-                    )
-                } else {
-                    format!(
-                        "wiki cp job {job_id} apply '{}' was not confirmed: {error} — not retried",
-                        item.rel
-                    )
-                };
-                return Err(write_outcome(error, message));
+                // unless the stop proves otherwise, the caller reconciles
+                // the same job instead of redoing the write.
+                return Err(apply_stopped(job_id, &item.rel, stop));
             }
         }
     }
 
-    let finished = channel
-        .transfer(
-            &root,
-            json!({"op": "finish", "job_id": job_id, "root": root}),
-            true,
-        )
-        .map_err(|error| {
-            let message = format!(
-                "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the \
-                 same job with `--resume {job_id}` before repeating anything"
-            );
-            write_outcome(error, message)
-        })?;
+    let finished = send_step(
+        channel,
+        &root,
+        json!({"op": "finish", "job_id": job_id, "root": root}),
+        deadline,
+    )
+    .map_err(|stop| finish_stopped(job_id, stop))?;
     if identity(&finished, "job_id") != Some(job_id)
         || identity(&finished, "digest") != Some(expected_digest.as_str())
         || identity(&finished, "root") != Some(root.as_str())
@@ -571,18 +579,146 @@ fn import_local(
     }
 }
 
-/// Keep what the transport said about a write while adding this attempt's
-/// context. A transport `unknown` means the request may have reached the
-/// server, so reporting it as a definite rejection would tell the caller to
-/// redo a write that may already exist; every other kind stays the refusal
-/// this job reported. An op-level answer this client cannot trust goes
-/// through [`unproved`] instead.
-fn write_outcome(error: Error, message: impl Into<String>) -> Error {
-    let message = message.into();
-    if error.kind() == "unknown" {
-        Error::unknown(message)
-    } else {
-        Error::rejected(message)
+/// CAD-2271: how a chunk, apply or finish ended without completing. Where
+/// the error came from decides what it proves, not its kind: a local daemon
+/// can publish a page and then answer `busy` or `rejected` when it fails to
+/// record the outcome, and a lost local reply is `internal`.
+enum Stop {
+    /// Nothing changed: the command deadline passed before this client sent
+    /// the request, or the channel proved the refusal
+    /// ([`Channel::proves_unchanged`]). Read as stopped, with one next step.
+    Unchanged(Error),
+    /// The channel answered with an error it cannot prove changed nothing,
+    /// so the step may have landed: `unknown`, reconciled by the same job.
+    Unconfirmed(Error),
+    /// This client stopped while preparing or checking a chunk, before this
+    /// run applied the file: a local source problem (`rejected`, exit 3), or
+    /// a chunk answer it could not read (`unknown`, exit 1). Not the local
+    /// daemon: its refusals are [`Stop::Unconfirmed`]. There is no `From`
+    /// into `Stop`: each site names its class, so a channel error cannot
+    /// become `Client` through `?`.
+    Client(Error),
+}
+
+/// A [`Stop::Client`] from anything this client raises itself, I/O included.
+fn client_stop(error: impl Into<Error>) -> Stop {
+    Stop::Client(error.into())
+}
+
+/// Send one chunk, apply or finish. A command deadline that has already
+/// passed stops it before anything is sent; an error the channel returns
+/// counts as [`Stop::Unchanged`] only when the channel proves it.
+fn send_step(
+    channel: &mut dyn Channel,
+    root: &str,
+    op: Value,
+    deadline: Instant,
+) -> std::result::Result<Value, Stop> {
+    ensure_deadline(deadline).map_err(Stop::Unchanged)?;
+    channel.transfer(root, op, true).map_err(|error| {
+        if channel.proves_unchanged(&error) {
+            Stop::Unchanged(error)
+        } else {
+            Stop::Unconfirmed(error)
+        }
+    })
+}
+
+/// A chunk that did not complete. An unchanged stop gets the plain next
+/// step. A channel error, or a chunk answer this client could not read, may
+/// have staged the chunk, and only the same job can tell. A local source
+/// problem stopped before this run applied the file, so it makes no staging
+/// claim. (A resumed `unresolved` entry may already be published by an
+/// earlier run, so the message speaks only for this run.)
+fn chunk_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
+    let what = format!("wiki cp job {job_id} stopped on '{rel}'");
+    let hedged = |error: &Error| {
+        Error::unknown(format!(
+            "{what}: {error} — the chunk may or may not have been staged; reconcile the same job \
+             with `--resume {job_id}` before repeating anything; this attempt was not retried"
+        ))
+    };
+    match stop {
+        Stop::Unchanged(error) => job_refused(job_id, &what, error),
+        Stop::Unconfirmed(error) => hedged(&error),
+        Stop::Client(error) if error.kind() == "unknown" => hedged(&error),
+        Stop::Client(error) => Error::rejected(format!(
+            "{what}: {error} — this run did not apply this file and did not finish the job; \
+             copy again without `--resume`"
+        )),
+    }
+}
+
+/// An apply that did not complete. It may have committed unless the stop
+/// is unchanged, so it is reconciled, never redone.
+fn apply_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
+    match stop {
+        Stop::Unchanged(error) => job_refused(
+            job_id,
+            &format!("wiki cp job {job_id} apply '{rel}' stopped"),
+            error,
+        ),
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
+            "wiki cp job {job_id} apply '{rel}' was not confirmed: {error} — this attempt was \
+             not retried; reconcile that job with `--resume {job_id}` before repeating anything"
+        )),
+    }
+}
+
+/// A finish that did not complete, on the same terms as [`apply_stopped`].
+fn finish_stopped(job_id: &str, stop: Stop) -> Error {
+    match stop {
+        Stop::Unchanged(error) => job_refused(
+            job_id,
+            &format!("wiki cp job {job_id} finish stopped"),
+            error,
+        ),
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
+            "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the same job \
+             with `--resume {job_id}` before repeating anything"
+        )),
+    }
+}
+
+/// CAD-2261: a chunk, apply or finish that stopped with nothing changed — a
+/// board refusal, or this client stopping first, such as at the command
+/// deadline — with its next step. A job the board no longer has cannot be
+/// resumed; anything else is resumed with the same job.
+///
+/// CAD-2271: the stop keeps its kind and code. A board refusal stays
+/// `rejected` with the board's code (exit 3). A pre-send stop stays `busy`
+/// (exit 75), which `--resume` retries: `timeout` at the command deadline or
+/// during session renewal, or `waking`, either because the board's gateway
+/// answered that the board was still waking or because this copy's wake
+/// budget ran out before sending.
+///
+/// CAD-2275: a `waking` stop gets this client's own sentence, true in both
+/// cases. The wake budget's text says "retry", and a plain rerun would start
+/// a new job.
+fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
+    let message = match error.code() {
+        Some("not_found") => {
+            format!("{what}: {error} — that job is gone, so copy again without `--resume`")
+        }
+        Some("waking") => format!(
+            "{what}: the board did not run the request — it was still waking, or this copy's \
+             `--wake-timeout` ran out first; resume with `--resume {job_id}`, with a larger \
+             `--wake-timeout`; this attempt was not retried"
+        ),
+        _ => format!(
+            "{what}: {error} — resume with `--resume {job_id}`; this attempt was not retried"
+        ),
+    };
+    match error.code() {
+        Some(code) => Error::Structured(crate::error::Structured {
+            kind: error.kind(),
+            code: code.to_string(),
+            message,
+            revision: None,
+        }),
+        // Not reached: every unchanged stop carries a code. Without one,
+        // nothing proves the stop, so it is reconciled.
+        None => Error::unknown(message),
     }
 }
 
@@ -632,6 +768,9 @@ fn optional_job_id(body: &Value, job_id: &str) -> bool {
     }
 }
 
+/// Send one entry's remaining chunks. A chunk request goes through
+/// [`send_step`]; anything this client finds itself (the local source, an
+/// answer it cannot read) is a [`Stop::Client`].
 fn send_entry(
     channel: &mut dyn Channel,
     root: &str,
@@ -639,12 +778,14 @@ fn send_entry(
     item: &Walked,
     local_root: &Path,
     received: u64,
-) -> Result<()> {
+    deadline: Instant,
+) -> std::result::Result<(), Stop> {
     if item.kind == "dir" {
         return Ok(());
     }
     if item.size == 0 {
-        let body = channel.transfer(
+        let body = send_step(
+            channel,
             root,
             json!({
                 "op": "chunk",
@@ -654,7 +795,7 @@ fn send_entry(
                 "offset": 0,
                 "data_base64": "",
             }),
-            true,
+            deadline,
         )?;
         let want_entry = entry_id(&item.rel);
         if identity(&body, "job_id") != Some(job_id)
@@ -662,27 +803,21 @@ fn send_entry(
         {
             // Dispatched: a body that names another job or entry cannot be
             // read as this chunk's acknowledgment.
-            return Err(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
-            )));
+            ))));
         }
         if body["received"].as_u64() != Some(0) {
             // Dispatched: the stage may hold these bytes even though the
             // answer did not confirm an empty file. The caller adds the
             // same-job reconciliation.
-            return Err(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' did not confirm an empty file",
                 item.rel
-            )));
+            ))));
         }
         return Ok(());
-    }
-    if received > item.size {
-        return Err(Error::rejected(format!(
-            "staged length {received} exceeds source size {}",
-            item.size
-        )));
     }
     let path = if item.single_file {
         local_root.to_path_buf()
@@ -690,19 +825,19 @@ fn send_entry(
         local_root.join(&item.rel)
     };
     // Re-check the ancestor chain, then open only through no-follow fds.
-    let mut file = open_contained(&path)?;
+    let mut file = open_contained(&path).map_err(client_stop)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut hashed = 0u64;
     while hashed < received {
         let want =
             usize::try_from((received - hashed).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
-            )));
+            ))));
         }
         hasher.update(&buf[..n]);
         hashed += n as u64;
@@ -711,16 +846,17 @@ fn send_entry(
     while offset < item.size {
         let want =
             usize::try_from((item.size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
-            )));
+            ))));
         }
         hasher.update(&buf[..n]);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-        let body = channel.transfer(
+        let body = send_step(
+            channel,
             root,
             json!({
                 "op": "chunk",
@@ -730,7 +866,7 @@ fn send_entry(
                 "offset": offset,
                 "data_base64": data_base64,
             }),
-            true,
+            deadline,
         )?;
         // Dispatched: a reply that names another job or entry, that this
         // client cannot read, or that acknowledges other bytes than were
@@ -741,32 +877,32 @@ fn send_entry(
         if identity(&body, "job_id") != Some(job_id)
             || identity(&body, "entry_id") != Some(want_entry.as_str())
         {
-            return Err(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
-            )));
+            ))));
         }
         let want = offset + n as u64;
         let got = body["received"].as_u64().ok_or_else(|| {
-            Error::unknown(format!(
+            client_stop(Error::unknown(format!(
                 "chunk '{}' did not confirm its received bytes",
                 item.rel
-            ))
+            )))
         })?;
         if got != want {
-            return Err(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' confirmed {got} bytes where {want} were sent",
                 item.rel
-            )));
+            ))));
         }
         offset = got;
     }
     let digest = hex_encode(hasher.finalize());
     if item.sha256.as_deref() != Some(digest.as_str()) {
-        return Err(Error::rejected(format!(
+        return Err(client_stop(Error::rejected(format!(
             "source '{}' changed after the manifest was pinned",
             item.rel
-        )));
+        ))));
     }
     Ok(())
 }
@@ -1834,6 +1970,11 @@ fn optional_sha(body: &Value) -> Result<Option<String>> {
 }
 
 fn is_absent(error: &Error) -> bool {
+    // A hosted board names a missing path by code (CAD-2260); a daemon says it
+    // in its message.
+    if error.code() == Some("not_found") {
+        return true;
+    }
     let text = error.to_string().to_ascii_lowercase();
     text.contains("no such") || text.contains("not found") || text.contains("does not exist")
 }
@@ -2701,6 +2842,530 @@ mod tests {
         fn current_rev(&mut self, _path: &str) -> Result<String> {
             Ok(ABSENT.to_string())
         }
+    }
+
+    /// CAD-2261: the first cross-language vector. Every manifest the tenant
+    /// board admitted in the AOS-566 fixture (a byte-identical copy of
+    /// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json`
+    /// at `67a3839ae1222b2e6a9be7904aca270f5a449aea`) must hash here to the
+    /// digest the board answered, or no hosted copy could ever begin.
+    #[test]
+    fn manifest_digest_matches_the_tenant_board_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/agenticos/wiki-transfer.contract.json"
+        ))
+        .unwrap();
+        let mut vectors = 0;
+        for step in fixture["steps"].as_array().unwrap() {
+            let transfer = &step["arguments"]["transfer"];
+            if transfer["op"] != "begin" || step["response"]["status"] != 200 {
+                continue;
+            }
+            let manifest: Manifest = serde_json::from_value(transfer["manifest"].clone()).unwrap();
+            check_manifest(&manifest).unwrap();
+            assert_eq!(
+                manifest_digest(&manifest).unwrap(),
+                step["response"]["body"]["digest"].as_str().unwrap(),
+                "{}",
+                step["label"]
+            );
+            vectors += 1;
+        }
+        assert!(vectors > 0, "the fixture holds no admitted manifest");
+    }
+
+    fn exit(error: &Error) -> i32 {
+        crate::error::exit_code_for_kind(error.kind())
+    }
+
+    /// CAD-2261: a board refusal wrapped as "wiki cp job J stopped on …"
+    /// keeps the board's code. CAD-2271: this client's own deadline stop
+    /// keeps `busy` and its code, so it exits 75 and `--resume` retries it.
+    #[test]
+    fn the_job_wrapper_keeps_the_board_code() {
+        let refused = job_refused(
+            "J",
+            "wiki cp job J stopped on 'a.bin'",
+            Error::invalid("stage_incomplete", "not all bytes yet (stage_incomplete)"),
+        );
+        assert_eq!(
+            (refused.kind(), refused.code()),
+            ("rejected", Some("stage_incomplete"))
+        );
+        assert_eq!(exit(&refused), 3);
+        assert!(refused.to_string().starts_with("wiki cp job J stopped"));
+        let late = job_refused(
+            "J",
+            "wiki cp job J finish stopped",
+            Error::busy_coded("timeout", "deadline elapsed"),
+        );
+        assert_eq!((late.kind(), late.code()), ("busy", Some("timeout")));
+        assert_eq!(exit(&late), 75);
+    }
+
+    /// CAD-2275: the board's record of an entry holding more bytes than its
+    /// pinned size cannot be fixed by resuming (a resume reads the same
+    /// record), so it says to copy again, before any chunk is sent.
+    #[test]
+    fn an_over_staged_entry_says_to_copy_again() {
+        struct OverStaged {
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for OverStaged {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap().to_string();
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = manifest_digest(&manifest).unwrap();
+                        self.job_id = Some(job_id.clone());
+                        Ok(json!({"job_id": job_id, "digest": digest, "root": root}))
+                    }
+                    "status" => Ok(json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": 10, "outcome": "pending"}],
+                        "next_offset": null
+                    })),
+                    other => panic!("unexpected transfer operation: {other}"),
+                }
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2275-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        let mut channel = OverStaged {
+            entry: entry_id("note.txt"),
+            job_id: None,
+            operations: Vec::new(),
+        };
+        let error = import_local(
+            &request,
+            "global/synthetic",
+            &mut channel,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert_eq!(channel.operations, ["begin", "status"], "no chunk was sent");
+        assert_eq!((error.kind(), exit(&error)), ("rejected", 3), "{text}");
+        assert!(
+            text.contains("holds 10 staged bytes for 'note.txt', more than its pinned size 3"),
+            "{text}"
+        );
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+        assert!(text.contains("resuming this job cannot fix that"), "{text}");
+        assert!(!text.contains("this run did not apply"), "{text}");
+    }
+
+    /// CAD-2275: a `waking` stop names one next step. The wake budget's own
+    /// text says "retry", and a plain rerun would start a new job, so this
+    /// client says what happened and to resume the same job.
+    #[test]
+    fn a_waking_stop_names_one_next_step() {
+        let waking = job_refused(
+            "J",
+            "wiki cp job J apply 'a.md' stopped",
+            Error::busy_coded(
+                "waking",
+                "org 'demo' is still waking after 120s — retry, or pass a larger --wake-timeout",
+            ),
+        );
+        let text = waking.to_string();
+        assert_eq!(
+            (waking.kind(), waking.code(), exit(&waking)),
+            ("busy", Some("waking"), 75),
+            "{text}"
+        );
+        assert!(text.contains("the board did not run the request"), "{text}");
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+        assert!(text.contains("a larger `--wake-timeout`"), "{text}");
+        assert!(!text.contains("retry"), "{text}");
+        assert!(!text.contains("still waking after"), "{text}");
+    }
+
+    /// CAD-2261: a mid-job stop tells the user one next step that works. A
+    /// job the board no longer has is copied again; an unchanged stop is
+    /// resumed; anything that may have reached the board or daemon (a lost
+    /// local reply is `internal`) is reconciled, never called refused.
+    /// CAD-2271: and its exit code says which: 3 refused, 75 stopped before
+    /// sending, 1 not confirmed.
+    #[test]
+    fn a_mid_job_stop_names_one_next_step_that_works() {
+        let gone = apply_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid(
+                "not_found",
+                "the board no longer has this copy job",
+            )),
+        );
+        let text = gone.to_string();
+        assert_eq!((gone.kind(), gone.code()), ("rejected", Some("not_found")));
+        assert_eq!(exit(&gone), 3);
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+        assert!(!text.contains("--resume J"), "{text}");
+
+        let short = apply_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid("stage_incomplete", "not all bytes yet")),
+        );
+        let text = short.to_string();
+        assert_eq!(short.code(), Some("stage_incomplete"));
+        assert!(
+            text.starts_with("wiki cp job J apply 'a.bin' stopped: "),
+            "{text}"
+        );
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+
+        let late = finish_stopped(
+            "J",
+            Stop::Unchanged(Error::busy_coded("timeout", "deadline elapsed")),
+        );
+        assert!(
+            late.to_string().contains("resume with `--resume J`"),
+            "{late}"
+        );
+        assert_eq!(
+            (late.kind(), late.code(), exit(&late)),
+            ("busy", Some("timeout"), 75)
+        );
+
+        // A lost reply may have committed: never "stopped" or "refused".
+        for lost in [
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::internal("io: timed out")),
+            ),
+            finish_stopped("J", Stop::Unconfirmed(Error::internal("io: timed out"))),
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::unknown("reply lost")),
+            ),
+            finish_stopped("J", Stop::Unconfirmed(Error::unknown("reply lost"))),
+        ] {
+            let text = lost.to_string();
+            assert!(text.contains("was not confirmed"), "{text}");
+            assert!(text.contains("reconcile"), "{text}");
+            assert!(
+                !text.contains("stopped") && !text.contains("refused"),
+                "{text}"
+            );
+            assert_eq!((lost.kind(), exit(&lost)), ("unknown", 1), "{text}");
+        }
+        // A native daemon can publish and then fail to record the outcome:
+        // its `busy`, a code-less `rejected` or its own code is not proof of
+        // no effect.
+        for after_publish in [
+            apply_stopped(
+                "J",
+                "a.md",
+                Stop::Unconfirmed(Error::busy_coded("busy", "guarded core writer is busy")),
+            ),
+            finish_stopped(
+                "J",
+                Stop::Unconfirmed(Error::busy_coded("busy", "guarded core writer is busy")),
+            ),
+            apply_stopped(
+                "J",
+                "a.md",
+                Stop::Unconfirmed(Error::rejected("the daemon's hosted lease is lost")),
+            ),
+            finish_stopped(
+                "J",
+                Stop::Unconfirmed(Error::invalid("storage_unavailable", "store unavailable")),
+            ),
+        ] {
+            let text = after_publish.to_string();
+            assert!(text.contains("was not confirmed"), "{text}");
+            assert!(!text.contains("stopped"), "{text}");
+            assert_eq!(exit(&after_publish), 1, "{text}");
+        }
+        let chunk = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Unconfirmed(Error::internal("io: reset")),
+        );
+        assert!(
+            chunk
+                .to_string()
+                .contains("may or may not have been staged"),
+            "{chunk}"
+        );
+        assert_eq!(exit(&chunk), 1);
+        let chunk = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid("chunk_conflict", "differ")),
+        );
+        assert_eq!(chunk.code(), Some("chunk_conflict"));
+        assert_eq!(exit(&chunk), 3);
+        assert!(
+            chunk.to_string().contains("resume with `--resume J`"),
+            "{chunk}"
+        );
+        // CAD-2275: a local source problem stopped before this run applied
+        // the file. It is a refusal (exit 3) that speaks only for this run
+        // and names one next step that always works: a new copy. It never
+        // also says the chunk may or may not have been staged, so "nothing
+        // was sent" from a refused path cannot contradict the wrapper.
+        for source in [
+            Error::rejected("source 'a.bin' changed after the manifest was pinned"),
+            Error::rejected("source 'a.bin' shrank during copy"),
+            refused_path(Path::new("notes/a.bin"), "a symlink"),
+            Error::internal("io: read failed"),
+        ] {
+            let error = chunk_stopped("J", "a.bin", Stop::Client(source));
+            let text = error.to_string();
+            assert_eq!(
+                (error.kind(), error.code(), exit(&error)),
+                ("rejected", None, 3),
+                "{text}"
+            );
+            assert!(
+                text.contains("this run did not apply this file and did not finish the job"),
+                "{text}"
+            );
+            assert!(!text.contains("may or may not have been staged"), "{text}");
+            assert!(text.contains("copy again without `--resume`"), "{text}");
+            assert!(!text.contains("--resume J"), "{text}");
+        }
+        // A chunk answer this client could not read may have staged it.
+        let unread = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Client(Error::unknown(
+                "chunk 'a.bin' did not confirm its received bytes",
+            )),
+        );
+        let text = unread.to_string();
+        assert_eq!(exit(&unread), 1);
+        assert!(text.contains("may or may not have been staged"), "{text}");
+    }
+
+    /// CAD-2271: a stop at the command deadline is decided before anything is
+    /// sent, so it is unchanged on every channel and exits 75.
+    #[test]
+    fn a_deadline_stop_sends_nothing_and_exits_busy() {
+        struct Counts(u32);
+        impl Channel for Counts {
+            fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+                self.0 += 1;
+                Ok(json!({}))
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Ok(ABSENT.to_string())
+            }
+        }
+        let mut channel = Counts(0);
+        let stop = send_step(
+            &mut channel,
+            "global/synthetic",
+            json!({"op": "finish", "job_id": "J", "root": "global/synthetic"}),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(channel.0, 0, "nothing was sent");
+        let error = finish_stopped("J", stop);
+        let text = error.to_string();
+        assert_eq!(
+            (error.kind(), error.code(), exit(&error)),
+            ("busy", Some("timeout"), 75),
+            "{text}"
+        );
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+    }
+
+    /// CAD-2271: a local daemon's code crosses the socket unchanged and its
+    /// refusal can follow a publish, so no code it sends makes a stop
+    /// definite. Only the hosted channel trusts the board's refusal table.
+    #[test]
+    fn a_coded_refusal_from_the_local_daemon_is_never_definite() {
+        let daemon = LocalChannel {
+            state_dir: Path::new("/nonexistent-cad2271"),
+            deadline: Instant::now(),
+        };
+        // The real hosted channel, never sent anything here.
+        let target = crate::remote_cli::RemoteTarget {
+            org: "synthetic".to_string(),
+            endpoint: "https://synthetic.invalid".to_string(),
+            org_id: "ws_synthetic".to_string(),
+            identity: None,
+        };
+        let hosted = RemoteChannel {
+            target: &target,
+            wake_timeout: 0,
+            deadline: Instant::now(),
+        };
+        let mut codes = 0;
+        for code in crate::remote_cli::wiki_copy_refusal_codes() {
+            let refusal = Error::invalid(code, "refused");
+            assert!(!daemon.proves_unchanged(&refusal), "{code}");
+            assert!(hosted.proves_unchanged(&refusal), "{code}");
+            codes += 1;
+        }
+        assert!(codes > 0);
+        for stop in [
+            Error::busy_coded("timeout", "deadline elapsed"),
+            Error::busy_coded("waking", "still waking"),
+        ] {
+            assert!(!daemon.proves_unchanged(&stop), "{stop}");
+            assert!(hosted.proves_unchanged(&stop), "{stop}");
+        }
+        for other in [
+            Error::rejected("no code"),
+            Error::invalid("storage_unavailable", "store unavailable"),
+            Error::busy_coded("busy", "writer is busy"),
+            Error::internal("io: reset"),
+            Error::unknown("reply lost"),
+        ] {
+            assert!(!hosted.proves_unchanged(&other), "{other}");
+        }
+
+        // Through a whole copy: the same refusal after `apply` is a stop on a
+        // hosted channel and "not confirmed" on any other.
+        struct RefusesApply {
+            hosted: bool,
+            refusal: Box<dyn Fn() -> Error>,
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for RefusesApply {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap().to_string();
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = manifest_digest(&manifest).unwrap();
+                        self.job_id = Some(job_id.clone());
+                        Ok(json!({"job_id": job_id, "digest": digest, "root": root}))
+                    }
+                    "status" => Ok(json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": 0, "outcome": "pending"}],
+                        "next_offset": null
+                    })),
+                    "chunk" => {
+                        let sent = base64::engine::general_purpose::STANDARD
+                            .decode(op["data_base64"].as_str().unwrap())
+                            .unwrap()
+                            .len() as u64;
+                        Ok(json!({
+                            "job_id": self.job_id.as_deref().unwrap(),
+                            "entry_id": self.entry,
+                            "received": op["offset"].as_u64().unwrap() + sent,
+                        }))
+                    }
+                    "apply" => Err((self.refusal)()),
+                    other => panic!("unexpected transfer operation: {other}"),
+                }
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+            fn proves_unchanged(&self, error: &Error) -> bool {
+                self.hosted && hosted_stop_is_unchanged(error)
+            }
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2271-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        let run = |hosted: bool, code: &'static str| {
+            let mut channel = RefusesApply {
+                hosted,
+                refusal: Box::new(move || Error::invalid(code, "refused after apply")),
+                entry: entry_id("note.txt"),
+                job_id: None,
+                operations: Vec::new(),
+            };
+            let error = import_local(
+                &request,
+                "global/synthetic",
+                &mut channel,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(channel.operations, ["begin", "status", "chunk", "apply"]);
+            error
+        };
+        for code in crate::remote_cli::wiki_copy_refusal_codes() {
+            let error = run(false, code);
+            let text = error.to_string();
+            assert_eq!(
+                (error.kind(), exit(&error)),
+                ("unknown", 1),
+                "{code}: {text}"
+            );
+            assert!(text.contains("was not confirmed"), "{code}: {text}");
+            assert!(!text.contains("stopped"), "{code}: {text}");
+        }
+        let error = run(true, "not_found");
+        let text = error.to_string();
+        assert_eq!(
+            (error.kind(), error.code(), exit(&error)),
+            ("rejected", Some("not_found"), 3),
+            "{text}"
+        );
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+    }
+
+    /// CAD-2260: a hosted board names a missing path by code, with no
+    /// "not found" wording. Discovery must read that as a new import root, and
+    /// must not hide any other refusal.
+    #[test]
+    fn a_hosted_not_found_is_a_new_destination_for_discovery() {
+        let missing = || Error::invalid("not_found", "no page at that path (HTTP 404)");
+        assert!(is_absent(&missing()));
+        discover_read_or_list(Err(missing()), || unreachable!("absent needs no listing")).unwrap();
+        let denied = Error::invalid("forbidden", "not permitted (HTTP 403)");
+        assert!(!is_absent(&denied));
+        assert!(discover_read_or_list(Err(denied), || unreachable!()).is_err());
     }
 
     #[test]

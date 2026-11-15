@@ -1,11 +1,30 @@
 //! CAD-535: `cadence project` — moved verbatim from src/main.rs.
 
 use super::*;
-use cadence_agent::issue::cli::PolicyVisibility;
+use cadence_agent::issue::cli::{IssueAction, PolicyVisibility, ProjectAction};
 
 /// `cadence project` verbs.
 #[derive(Subcommand)]
 pub(crate) enum ProjectCmd {
+    /// List registered projects. On a selected hosted org this reads the
+    /// org's own registry, including projects that exist only as their
+    /// tickets' key; `--sort`, `--limit` and `--fields` refuse there.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Sort by key prefix default_owner; `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a local project or register a project in a hosted workspace.
     ///
     /// Locally, optionally register a git repo and seed `<pm>/<key>/PROJECT.md`
@@ -67,6 +86,22 @@ pub(crate) enum ProjectCmd {
 
 pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
     match action {
+        ProjectCmd::Ls {
+            sort,
+            limit,
+            fields,
+            json,
+        } => cadence_agent::issue::cli::run(
+            &IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort,
+                    limit,
+                    fields,
+                    json,
+                },
+            },
+            state_dir,
+        ),
         ProjectCmd::New {
             key,
             name,

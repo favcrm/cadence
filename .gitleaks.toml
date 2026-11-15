@@ -1,0 +1,20 @@
+# Extend the default ruleset: this file ADDS one allowlist, it never replaces
+# the rules gitleaks ships with (`useDefault` is required — without it a
+# repository config silently disables every built-in rule).
+[extend]
+useDefault = true
+
+# CAD-2215: fixture identities are not credentials.
+#
+# The acceptance fixtures drive the real member job-request path, so they carry
+# the wire field `request_key` and database ids next to quoted literals
+# (`"request_key": "cad2215-absent"`, `'cad2215-secret-task'`). The
+# `generic-api-key` rule reads those as `key = "<value>"` and reports them.
+#
+# The allowlist matches the extracted SECRET, not the line, and only when the
+# whole value is a `cad2215-` fixture id. A real key on the same line, or a
+# non-fixture value, is still reported.
+[[allowlists]]
+description = "CAD-2215 synthetic acceptance-fixture ids"
+regexTarget = "secret"
+regexes = ['''^['"]?cad2215-[a-z0-9-]+['"]?$''']

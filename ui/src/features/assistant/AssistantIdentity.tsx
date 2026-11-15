@@ -42,7 +42,10 @@ import {
   identityLook,
   messageLabel,
   messagePlaceholder,
+  mutatePersonalProfile,
   readConversationIdentity,
+  readPersonalBootstrap,
+  readPersonalIdentity,
   scopeDescriptor,
   WORKSPACE_ALIAS,
   type AssistantScope,
@@ -50,15 +53,54 @@ import {
   type IdentityRead,
   type ConversationIdentityRead,
   type IdentityRecord,
+  type PersonalProfileMutation,
+  type PersonalProfileOutcome,
 } from "./identity";
 import "./assistant-identity.css";
 
-/** One explicit personal-avatar request through the existing private
- *  chat. `pendingLook` never becomes the displayed identity: only an
- *  authorized state refresh can do that. */
+export type PersonalProfileSaveChange = {
+  expected_revision: number;
+  name?: string | null;
+  look?: AvatarLook;
+};
+
+export type PersonalProfileSaveResult =
+  | { ok: true; identity: IdentityRecord }
+  | { ok: false; unsupported?: true; conflict?: true; error: string };
+
+export function postPersonalProfile(req: PersonalProfileMutation): Promise<PersonalProfileOutcome> {
+  return mutatePersonalProfile((body) => api.memberAssistProfileUpdate(body), req);
+}
+
+export function toPersonalUpdateMutation(change: PersonalProfileSaveChange): PersonalProfileMutation {
+  return {
+    expected_revision: change.expected_revision,
+    action: "update",
+    ...(change.name !== undefined ? { name: change.name ?? "" } : {}),
+    ...(change.look !== undefined ? { look: change.look } : {}),
+  };
+}
+
+export function toPersonalCompleteMutation(input: {
+  expected_revision: number;
+  name?: string;
+  look: AvatarLook;
+}): PersonalProfileMutation {
+  return {
+    expected_revision: input.expected_revision,
+    action: "complete",
+    ...(input.name !== undefined ? { name: input.name } : {}),
+    look: input.look,
+  };
+}
+
+/** Personal identity controls. Hosted boards carry `saveProfile` (`POST /api/member-assistant/profile`);
+ *  native boards (or boards predating AOS-570) use `requestLook` chat turns.
+ *  `pendingLook` never becomes the displayed identity before a committed read. */
 export interface PersonalLookRequest {
   requestLook: (look: AvatarLook) => Promise<{ ok: boolean; error?: string }>;
   pendingLook: AvatarLook | null;
+  saveProfile?: (change: PersonalProfileSaveChange) => Promise<PersonalProfileSaveResult>;
 }
 
 export type WorkspaceIdentityChange = {
@@ -117,6 +159,8 @@ export function useConversationActor(
   canEdit: boolean,
   conversation: string | null,
   sendPersonalRequest: ((text: string) => Promise<void>) | null,
+  canEditPersonal: boolean = sendPersonalRequest !== null,
+  committedPersonal: IdentityRecord | null = null,
 ): AssistantActorValue {
   const hosted = master.data !== null && Object.hasOwn(master.data, "actor_identity");
   const source = hosted && conversation !== null ? resources.masterConversation(conversation) : resources.masterState;
@@ -133,9 +177,18 @@ export function useConversationActor(
   const scopeKey = `${sessionKey() ?? ""}:${privateSessionGeneration()}:${conversation ?? ""}:${view.scope ?? ""}`;
   const scoped = saved !== null && saved.scope === scopeKey ? saved : null;
   const liveCommitted = scoped !== null && live.state === "ready" && String(live.identity.revision) !== scoped.before;
-  const read: IdentityRead = scoped !== null && live.state === "ready" && !liveCommitted
+  const baseRead: IdentityRead = scoped !== null && live.state === "ready" && !liveCommitted
     ? { state: "ready", identity: scoped.identity }
     : live;
+  const read: IdentityRead =
+    view.scope === "personal" &&
+    committedPersonal !== null &&
+    baseRead.state === "ready" &&
+    typeof committedPersonal.revision === "number" &&
+    typeof baseRead.identity.revision === "number" &&
+    committedPersonal.revision > baseRead.identity.revision
+      ? { state: "ready", identity: committedPersonal }
+      : baseRead;
 
   useEffect(() => {
     if (liveCommitted) setSaved(null);
@@ -163,6 +216,22 @@ export function useConversationActor(
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }, [view.scope, read, sendPersonalRequest, scopeKey, source]);
+
+  const saveProfile = useCallback(
+    async (change: PersonalProfileSaveChange): Promise<PersonalProfileSaveResult> => {
+      if (!hosted || view.scope !== "personal" || !canEditPersonal || read.state !== "ready") {
+        return { ok: false, error: "The saved assistant identity could not be read." };
+      }
+      const before = String(change.expected_revision);
+      const outcome = await postPersonalProfile(toPersonalUpdateMutation(change));
+      void source.refresh();
+      if (source !== resources.masterState) void resources.masterState.refresh();
+      if (!outcome.ok) return outcome;
+      setSaved({ identity: outcome.identity, before, scope: scopeKey });
+      return { ok: true, identity: outcome.identity };
+    },
+    [hosted, view.scope, canEditPersonal, read, source, scopeKey],
+  );
 
   const save = useCallback(
     async (change: WorkspaceIdentityChange): Promise<WorkspaceSaveResult> => {
@@ -201,11 +270,15 @@ export function useConversationActor(
     alias: view.scope === "workspace" ? WORKSPACE_ALIAS : view.scope === "personal" && read.state === "ready" ? (current.data?.alias ?? "assistant") : "",
     read,
     ...(model ? { model } : {}),
-    personal: view.scope === "personal" && sendPersonalRequest !== null && read.state === "ready"
-      ? { requestLook, pendingLook: pending?.scope === scopeKey ? pending.look : null }
+    personal: view.scope === "personal" && read.state === "ready" && (sendPersonalRequest !== null || (hosted && canEditPersonal))
+      ? {
+          requestLook,
+          pendingLook: pending?.scope === scopeKey ? pending.look : null,
+          ...(hosted && canEditPersonal ? { saveProfile } : {}),
+        }
       : null,
     workspace: view.scope === "workspace" ? { canEdit, save } : null,
-  }), [view.scope, current.data?.alias, read, model, sendPersonalRequest, requestLook, pending, scopeKey, canEdit, save]);
+  }), [view.scope, current.data?.alias, read, model, sendPersonalRequest, hosted, canEditPersonal, requestLook, saveProfile, pending, scopeKey, canEdit, save]);
 }
 
 /** The actor's real avatar (the canonical AgentAvatar artwork). While the
@@ -420,6 +493,339 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
   );
 }
 
+const QUICK_NAMES = ["Nova", "Atlas", "Kai", "Milo"] as const;
+
+export interface HostedPersonalBootstrap {
+  bootstrap: string | null;
+  identity: IdentityRecord | null;
+  resuming: boolean;
+  complete: (input: {
+    expected_revision: number;
+    name?: string;
+    look: AvatarLook;
+  }) => Promise<PersonalProfileOutcome>;
+  defer: (expected_revision: number) => Promise<PersonalProfileOutcome>;
+  resume: () => Promise<void>;
+}
+
+/** CAD-2269: single-flight personal bootstrap read + fenced mutations for hosted
+ *  MasterHome (where `GET /api/master/state` projects `identity` without
+ *  `bootstrap_state`). Scoped by session and conversation; disabled on native boards. */
+export function useHostedPersonalBootstrap(
+  enabled: boolean,
+  conversation: string | null,
+  observedRevision: number | null,
+): HostedPersonalBootstrap {
+  const scopeKey = `${sessionKey() ?? ""}:${privateSessionGeneration()}:${conversation ?? ""}`;
+  const [state, setState] = useState<{
+    scope: string;
+    bootstrap: string | null;
+    identity: IdentityRecord | null;
+  } | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const gate = useRef<{ inflight: boolean; again: boolean; scope: string }>({
+    inflight: false,
+    again: false,
+    scope: "",
+  });
+  const alive = useRef(true);
+  const current = state !== null && state.scope === scopeKey ? state : null;
+
+  const refreshMaster = useCallback(() => {
+    void resources.masterState.refresh();
+    if (conversation !== null) void resources.masterConversation(conversation).refresh();
+  }, [conversation]);
+
+  const load = useCallback(() => {
+    if (!enabled) return;
+    const g = gate.current;
+    if (g.inflight && g.scope === scopeKey) {
+      g.again = true;
+      return;
+    }
+    g.inflight = true;
+    g.scope = scopeKey;
+    api
+      .memberAssistState()
+      .then((next) => {
+        if (!alive.current || gate.current.scope !== scopeKey) return;
+        const parsed = readPersonalIdentity(next);
+        const bootstrap = readPersonalBootstrap(next);
+        setState({
+          scope: scopeKey,
+          bootstrap,
+          identity: parsed.state === "ready" ? parsed.identity : null,
+        });
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (gate.current.scope !== scopeKey) return;
+        gate.current.inflight = false;
+        if (gate.current.again && alive.current) {
+          gate.current.again = false;
+          load();
+        }
+      });
+  }, [enabled, scopeKey]);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return;
+    load();
+  }, [enabled, load, observedRevision]);
+
+  const runMutation = useCallback(
+    async (req: PersonalProfileMutation): Promise<PersonalProfileOutcome> => {
+      const outcome = await postPersonalProfile(req);
+      if (outcome.ok) {
+        setState({
+          scope: scopeKey,
+          bootstrap: outcome.bootstrap,
+          identity: outcome.identity,
+        });
+        refreshMaster();
+        return outcome;
+      }
+      if (outcome.conflict) {
+        load();
+        refreshMaster();
+      }
+      return outcome;
+    },
+    [scopeKey, refreshMaster, load],
+  );
+
+  const complete = useCallback(
+    (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
+      runMutation(toPersonalCompleteMutation(input)),
+    [runMutation],
+  );
+
+  const defer = useCallback(
+    (expected_revision: number) => runMutation({ expected_revision, action: "defer" }),
+    [runMutation],
+  );
+
+  const resume = useCallback(async () => {
+    if (current === null || current.identity === null || resuming) return;
+    setResuming(true);
+    await runMutation({ expected_revision: Number(current.identity.revision), action: "resume" });
+    setResuming(false);
+  }, [current, resuming, runMutation]);
+
+  return useMemo<HostedPersonalBootstrap>(
+    () => ({
+      bootstrap: current?.bootstrap ?? null,
+      identity: current?.identity ?? null,
+      resuming,
+      complete,
+      defer,
+      resume,
+    }),
+    [current, resuming, complete, defer, resume],
+  );
+}
+
+/** CAD-2269: minimal first-entry setup card for the user's personal assistant.
+ *  Avatar + Name + Skip for now — zero required chat turns. */
+export function AssistantBootstrapCard({
+  identity,
+  onComplete,
+  onDefer,
+}: {
+  identity: IdentityRecord;
+  onComplete: (input: {
+    expected_revision: number;
+    name?: string;
+    look: AvatarLook;
+  }) => Promise<PersonalProfileOutcome>;
+  onDefer: (expected_revision: number) => Promise<PersonalProfileOutcome>;
+}) {
+  const t = useTranslate();
+  const headingId = useId();
+  const [base, setBase] = useState(identity);
+  const [name, setName] = useState(identity.name ?? "");
+  const [look, setLook] = useState<AvatarLook>(identity.look);
+  const [busy, setBusy] = useState<"complete" | "defer" | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const trimmed = name.trim();
+  const dirty = (trimmed === "" ? null : trimmed) !== base.name || look !== base.look;
+  const stale = Number(identity.revision) > Number(base.revision);
+
+  useEffect(() => {
+    if (stale && !dirty) {
+      setBase(identity);
+      setName(identity.name ?? "");
+      setLook(identity.look);
+    }
+  }, [stale, dirty, identity]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy !== null || stale || unsupported) return;
+    setBusy("complete");
+    setError(null);
+    const outcome = await onComplete({
+      expected_revision: Number(base.revision),
+      ...(trimmed !== "" ? { name: trimmed } : {}),
+      look,
+    });
+    setBusy(null);
+    if (!outcome.ok) {
+      if (outcome.unsupported) setUnsupported(true);
+      setError(t(outcome.error));
+    }
+  };
+
+  const skip = async () => {
+    if (busy !== null || unsupported) return;
+    setBusy("defer");
+    setError(null);
+    const outcome = await onDefer(Number(identity.revision));
+    setBusy(null);
+    if (!outcome.ok) {
+      if (outcome.unsupported) setUnsupported(true);
+      setError(t(outcome.error));
+    }
+  };
+
+  return (
+    <section
+      className="card assistant-bootstrap"
+      aria-labelledby={headingId}
+      data-assistant-bootstrap="pending"
+    >
+      <div className="assistant-bootstrap-head">
+        <span className="assistant-face">
+          <AgentAvatar slug={look} size={36} still />
+        </span>
+        <div className="min-w-0">
+          <h2 id={headingId} className="assistant-bootstrap-title">
+            {t("Name your assistant")}
+          </h2>
+          <p className="assistant-scope">{t("Private to you in this workspace.")}</p>
+        </div>
+      </div>
+
+      <form className="assistant-edit" onSubmit={(event) => void submit(event)}>
+        <fieldset className="assistant-looks" disabled={busy !== null || unsupported}>
+          <legend className="text-label text-ink-300">{t("Avatar")}</legend>
+          <div className="assistant-look-grid">
+            {AVATAR_LOOKS.map((option) => (
+              <button
+                key={option}
+                type="button"
+                className="assistant-look"
+                aria-pressed={look === option}
+                aria-label={t(LOOK_LABEL[option])}
+                title={t(LOOK_LABEL[option])}
+                data-assistant-look={option}
+                onClick={() => setLook(option)}
+              >
+                <span className="assistant-face">
+                  <AgentAvatar slug={option} size={34} still />
+                </span>
+              </button>
+            ))}
+          </div>
+        </fieldset>
+
+        <div className="assistant-field">
+          <label className="assistant-field">
+            <span>{t("Name")}</span>
+            <input
+              className="field"
+              value={name}
+              maxLength={80}
+              disabled={busy !== null || unsupported}
+              autoComplete="off"
+              placeholder={t("e.g. Nova")}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          <div className="assistant-name-chips">
+            {QUICK_NAMES.map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                className="chip assistant-name-chip"
+                aria-pressed={trimmed === preset}
+                disabled={busy !== null || unsupported}
+                onClick={() => setName(preset)}
+              >
+                {preset}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {stale && (
+          <>
+            <p className="assistant-about-pending" role="status">
+              {t("Your assistant identity changed elsewhere. Reload before saving.")}
+            </p>
+            <div>
+              <Button
+                type="button"
+                size="sm"
+                disabled={busy !== null || unsupported}
+                onClick={() => {
+                  setBase(identity);
+                  setName(identity.name ?? "");
+                  setLook(identity.look);
+                  setError(null);
+                }}
+              >
+                {t("Reload identity")}
+              </Button>
+            </div>
+          </>
+        )}
+
+        {error !== null && (
+          <p className="assistant-about-error" role="alert">
+            {error}
+          </p>
+        )}
+
+        <div className="assistant-bootstrap-actions">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            loading={busy === "defer"}
+            disabled={busy !== null || unsupported}
+            onClick={() => void skip()}
+          >
+            {t("Skip for now")}
+          </Button>
+          <Button
+            type="submit"
+            size="sm"
+            variant="primary"
+            loading={busy === "complete"}
+            disabled={busy !== null || stale || unsupported}
+          >
+            {busy === "complete"
+              ? t("Saving…")
+              : trimmed !== ""
+                ? t("Start with {name}").replace("{name}", trimmed)
+                : t("Save assistant")}
+          </Button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
 function PersonalIdentityDetails({
   actor,
   identity,
@@ -429,8 +835,26 @@ function PersonalIdentityDetails({
 }) {
   const t = useTranslate();
   const request = actor.personal;
+  const [directUnsupported, setDirectUnsupported] = useState(false);
+  const [fallbackNote, setFallbackNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+
+  if (request?.saveProfile !== undefined && identity !== null && !directUnsupported) {
+    return (
+      <PersonalIdentityEditor
+        request={request}
+        identity={identity}
+        onUnsupported={(lookChanged) => {
+          setDirectUnsupported(true);
+          setFallbackNote(
+            t("Direct profile edits aren’t available on this board yet. Ask in chat to change my name."),
+          );
+          if (lookChanged !== null) void request.requestLook(lookChanged);
+        }}
+      />
+    );
+  }
 
   const pick = async (look: AvatarLook) => {
     if (request === null || sending) return;
@@ -444,7 +868,7 @@ function PersonalIdentityDetails({
   return (
     <>
       <p className="assistant-about-note">
-        {t("Ask me in this conversation to change my name or how I communicate. Your history and access stay the same.")}
+        {fallbackNote ?? t("Ask me in this conversation to change my name or how I communicate. Your history and access stay the same.")}
       </p>
       {request === null && (
         <p className="assistant-about-note">{t("Avatar changes are unavailable on a read-only board.")}</p>
@@ -482,6 +906,129 @@ function PersonalIdentityDetails({
         </p>
       )}
     </>
+  );
+}
+
+function PersonalIdentityEditor({
+  request,
+  identity,
+  onUnsupported,
+}: {
+  request: PersonalLookRequest;
+  identity: IdentityRecord;
+  onUnsupported: (lookChanged: AvatarLook | null) => void;
+}) {
+  const t = useTranslate();
+  const [base, setBase] = useState(identity);
+  const [name, setName] = useState(identity.name ?? "");
+  const [look, setLook] = useState<AvatarLook>(identity.look);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const stale = Number(identity.revision) > Number(base.revision);
+
+  const nextName = name.trim() === "" ? null : name.trim();
+  const dirty = nextName !== base.name || look !== base.look;
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!request.saveProfile || pending || !dirty || stale) return;
+    setPending(true);
+    setError(null);
+    setNotice(null);
+    const result = await request.saveProfile({
+      expected_revision: Number(base.revision),
+      ...(nextName !== base.name ? { name: nextName ?? "" } : {}),
+      ...(look !== base.look ? { look } : {}),
+    });
+    setPending(false);
+    if (!result.ok) {
+      if (result.unsupported) {
+        onUnsupported(look !== base.look ? look : null);
+        return;
+      }
+      setError(t(result.error));
+      return;
+    }
+    setBase(result.identity);
+    setName(result.identity.name ?? "");
+    setLook(result.identity.look);
+    setNotice(t("Saved. The new identity applies to the next turn."));
+  };
+
+  return (
+    <form className="assistant-edit" onSubmit={(event) => void submit(event)}>
+      <p className="assistant-about-note">
+        {t("Private to you in this workspace. Ask in chat anytime to adjust how I communicate.")}
+      </p>
+      <label className="assistant-field">
+        <span>{t("Display name")}</span>
+        <input
+          className="field"
+          value={name}
+          maxLength={80}
+          disabled={pending}
+          autoComplete="off"
+          onChange={(event) => setName(event.target.value)}
+          placeholder={t("Not named yet")}
+        />
+      </label>
+      <fieldset className="assistant-looks" disabled={pending}>
+        <legend className="text-label text-ink-300">{t("Avatar")}</legend>
+        <div className="assistant-look-grid">
+          {AVATAR_LOOKS.map((option) => (
+            <button
+              key={option}
+              type="button"
+              className="assistant-look"
+              aria-pressed={look === option}
+              aria-label={t(LOOK_LABEL[option])}
+              title={t(LOOK_LABEL[option])}
+              data-assistant-look={option}
+              onClick={() => setLook(option)}
+            >
+              <span className="assistant-face">
+                <AgentAvatar slug={option} size={34} still />
+              </span>
+            </button>
+          ))}
+        </div>
+      </fieldset>
+      {stale && (
+        <>
+          <p className="assistant-about-pending" role="status">
+            {t("Your assistant identity changed elsewhere. Your draft has been kept. Reload before editing again.")}
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            disabled={pending}
+            onClick={() => {
+              setBase(identity);
+              setName(identity.name ?? "");
+              setLook(identity.look);
+              setError(null);
+              setNotice(null);
+            }}
+          >
+            {t("Reload identity")}
+          </Button>
+        </>
+      )}
+      {error !== null && (
+        <p className="assistant-about-error" role="alert">
+          {`${t("The save could not be confirmed. Refresh to check the saved identity; it was not retried.")} ${error}`}
+        </p>
+      )}
+      {notice !== null && (
+        <p className="assistant-about-pending" role="status">
+          {notice}
+        </p>
+      )}
+      <Button type="submit" size="sm" variant="primary" loading={pending} disabled={pending || !dirty || stale}>
+        {pending ? t("Saving…") : t("Save identity")}
+      </Button>
+    </form>
   );
 }
 

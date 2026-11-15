@@ -14,6 +14,7 @@ import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
+import MemberAccessPanel from "./MemberAccessPanel";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
 import { automaticUpgradeClaim, installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "./automaticUpdates";
 import { Loading, Notice } from "../app-shell/shared/States";
@@ -27,7 +28,15 @@ import "./explorer.css";
  * non-operators and the daemon's `operator_connection` gate is the
  * second layer.
  */
-export default function ManageApp({ installId, viewer }: { installId: string; viewer: Viewer }) {
+export default function ManageApp({
+  installId,
+  viewer,
+  automaticUpdatesEnabled = true,
+}: {
+  installId: string;
+  viewer: Viewer;
+  automaticUpdatesEnabled?: boolean;
+}) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
   const [home, setHome] = useState<HomeInstallation | null>(null);
@@ -93,7 +102,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   }, [installId, reread, isOp]);
 
   useEffect(() => {
-    if (!isOp) return;
+    if (!automaticUpdatesEnabled || !isOp) return;
     const controller = new AbortController();
     setAutomatic(false);
     automaticRef.current = false;
@@ -112,7 +121,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => { if (!controller.signal.aborted) setAutomaticReady(false); });
     return () => controller.abort();
-  }, [installId, isOp]);
+  }, [automaticUpdatesEnabled, installId, isOp]);
 
   useEffect(() => {
     // The saved preference is armed only after the server confirms it.
@@ -355,6 +364,11 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
       {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
       {removed && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
+
+      {/* CAD-2215: exact-conversation member access, above the rest of
+          Manage. It re-reads the daemon's list itself and refuses every
+          write it cannot prove from that answer. */}
+      <MemberAccessPanel installId={installId} operator={isOp} />
 
       <div className="mgrid mt-5">
         <div className="card mcard">

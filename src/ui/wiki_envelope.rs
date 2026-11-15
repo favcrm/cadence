@@ -156,6 +156,8 @@ pub(crate) fn handle(
             "the envelope's granted wiki scopes do not cover this action",
         );
     }
+    let unresolved_user = grant.actor.starts_with("users/")
+        && grant.actor != crate::project_policy::policy_user_actor(&grant.sub);
     // Single-use: consume the jti like the CLI route, so a captured
     // wiki bearer cannot be replayed at this route either.
     if !consume_jti(state_dir, &grant) {
@@ -165,15 +167,19 @@ pub(crate) fn handle(
             "the envelope's jti was already consumed",
         );
     }
-    // Only a verified `users/` or the owner `operator` maps to a daemon
-    // identity. A service or agent envelope has no `wiki_as` claim the
-    // daemon accepts, so it is refused rather than relayed as an agent.
-    let Some(attribution) = relay_claim(&grant.actor) else {
-        return refuse(
-            403,
-            "insufficient_scope",
-            "this envelope's actor has no wiki identity on this board",
-        );
+    // Only an unambiguous verified user or owner maps to a daemon identity.
+    // A lossy user handle keeps only the public read ceiling, never writes.
+    let attribution = if unresolved_user {
+        "public".to_string()
+    } else {
+        let Some(attribution) = relay_claim(&grant.actor) else {
+            return refuse(
+                403,
+                "insufficient_scope",
+                "this envelope's actor has no wiki identity on this board",
+            );
+        };
+        attribution
     };
     // The board's configured `--read-only` refuses every write route, as
     // `operator::admit` does for browser writes. Checked before the daemon

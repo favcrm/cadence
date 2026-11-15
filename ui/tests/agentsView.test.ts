@@ -454,7 +454,7 @@ async function main() {
   tab = "skills";
   await render();
   assert(!host.querySelector("[data-drawer]"), "the settings drawer closes with its section");
-  assert(host.querySelectorAll(".ap-mrow").length === 4, "skills are rows");
+  assert(host.querySelectorAll(".ap-mrow").length === 5, "skills are rows");
   await React.act(() => host.querySelector<HTMLElement>(".ap-mrow")!.click());
   assert(host.querySelector("[data-drawer='agent-item']")?.textContent?.includes("Source"), "a row opens one drawer with its details");
   assert(!host.querySelector(".ap-rows")?.textContent?.includes("Source"), "details live in the drawer, not the row");

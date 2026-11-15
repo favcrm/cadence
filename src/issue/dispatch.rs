@@ -80,23 +80,33 @@ fn kickoff_body(
     endpoint_kind: &str,
 ) -> String {
     let sha7: String = base_sha.chars().take(7).collect();
-    let report = if crate::adapter::registry::report_hint(provider, endpoint_kind)
-        == crate::adapter::registry::Reporting::Explicit
-    {
-        " Report: `cadence message result <id> --token <turn_id> --text '<summary>'` \
-         (`cadence self` prints both)."
+    let explicit = crate::adapter::registry::report_hint(provider, endpoint_kind)
+        == crate::adapter::registry::Reporting::Explicit;
+    let report = if explicit {
+        " Report: `cadence message result <id> --token <turn_id> --report <done-report-file> \
+         --text '<summary>'` (`cadence self` prints the id and token). That one call files the \
+         done report once, records the `Report:` link the review loop follows, and completes the \
+         turn — do not also run `cadence report file` for it."
     } else {
         ""
+    };
+    let completion = if explicit {
+        " End its text with a final `SHA: <full committed head>` line; that text is the contract."
+            .to_string()
+    } else {
+        format!(
+            " For implementation completion, file `cadence report file --task {issue} --kind done \
+             --file <f>` once with frontmatter `sha: <full committed head>` and `pr: <PR URL>`, \
+             then include the exact `Report: {issue}/reports/<name>` line the CLI printed in your \
+             final answer, ending it with `SHA: <same full head>`."
+        )
     };
     format!(
         "read {} — {issue}: {title}. Your worktree exists: {} (branch \
          {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
          main; reply to {reply_to}. Company questions: read the \
          \"Business knowledge\" section of \
-         $HOME/.agents/skills/cadence/SKILL.md.{report} For implementation completion, \
-         file `cadence report file --task {issue} --kind done --file <f>` with frontmatter \
-         `sha: <full committed head>` and `pr: <PR URL>`. End your returned result \
-         (or explicit message result text) with a final `SHA: <same full head>` line.",
+         $HOME/.agents/skills/cadence/SKILL.md.{report}{completion}",
         note.display(),
         wt_dir.display()
     )

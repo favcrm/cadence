@@ -1,0 +1,19 @@
+{
+  "install_id": "qa-template",
+  "name": "app-template",
+  "title": "App template",
+  "version": "0.1.0",
+  "summary": "A minimal Cadence screen app built with @cadence/app-kit.",
+  "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "catalog_generation": "qa-board-fixture",
+  "storage_kind": "workspace",
+  "project_link": null,
+  "approved": true,
+  "executable": true,
+  "approval": { "state": "approved" },
+  "guide": "",
+  "files": ["app.md", "screens/main/client.js", "screens/main/screens.json", "screens/main/styles.css", "workflows/hello.md"],
+  "capabilities": {},
+  "connection_slots": [],
+  "workflows": []
+}

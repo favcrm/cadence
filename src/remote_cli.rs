@@ -149,6 +149,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     // workspace has registered, plus the ones that exist only as their
     // tickets' key. A read; the write beside it is `project_new`.
     "project_ls",
+    // CAD-2240: one project's timeline (ticket changes, comments, messages,
+    // reviews), newest first. A read.
+    "project_timeline",
     // cli.write
     "issue_new",
     "issue_comment",
@@ -182,6 +185,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
     // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
     // operation, so this client asks for the historical pair.
+    // CAD-2226: `connection_providers`/`connection_list` are the owner's
+    // reads and `connection_start` the enrollment write; all three are
+    // refused to a managed caller here and the board requires a live human
+    // owner.
     "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
@@ -241,7 +248,8 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_context"
         | "agent_profile_show"
         | "agent_roles"
-        | "project_ls" => &["cli.read"],
+        | "project_ls"
+        | "project_timeline" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" | "audit_verdict_project" => &["cli.write"],
@@ -328,6 +336,7 @@ const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been regist
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
     "the team change may or may not have been applied — inspect `team list` or \
@@ -390,7 +399,8 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
-        | "project_ls" => Effect::Read,
+        | "project_ls"
+        | "project_timeline" => Effect::Read,
         // cli.write: every one of these can change durable state.
         "issue_new" => mutation(RECONCILE_ISSUE_NEW),
         "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),
@@ -451,14 +461,17 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 Effect::Read
             }
         }
-        Surface::Cli
-            if verb == "platform_call"
-                && matches!(
-                    arguments.get("operation").and_then(Value::as_str),
-                    Some("tools" | "status" | "artifact")
-                ) =>
-        {
-            Effect::Read
+        Surface::Cli if verb == "platform_call" => {
+            match arguments.get("operation").and_then(Value::as_str) {
+                Some(
+                    "tools" | "status" | "artifact" | "connection_providers" | "connection_list",
+                ) => Effect::Read,
+                // CAD-2226: starting an owner enrollment mints a one-time provider
+                // link, so its lost or unusable answer is a possible mutation; the
+                // read above the link (`connection ls`) is what reconciles it.
+                Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                _ => cli_effect(verb),
+            }
         }
         Surface::Cli => cli_effect(verb),
         Surface::Wiki => wiki_effect(verb),
@@ -568,6 +581,183 @@ fn tracker_unavailable_before_verb(status: u16, body: Option<&Value>) -> bool {
 /// nothing about the write it answered.
 fn is_object_body(body: Option<&Value>) -> bool {
     body.is_some_and(Value::is_object)
+}
+
+/// CAD-2226: the hosted connection operations answer with the relay's own
+/// `{ok:true,data:…}` envelope. A 2xx proves a read only when the complete
+/// documented row shape is present: an absent, foreign or malformed answer is
+/// not an empty list, and printing one would tell the person their workspace
+/// has no providers or connections when nobody saw the catalog. Unknown
+/// additive fields are tolerated so a newer server is not frozen out; a
+/// missing or mistyped documented field is not.
+fn connection_rows(answer: &Value, field: &str, row_ok: fn(&Value) -> bool) -> bool {
+    answer.get("ok").and_then(Value::as_bool) == Some(true)
+        && answer
+            .get("data")
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_array)
+            .is_some_and(|rows| rows.iter().all(row_ok))
+}
+
+/// The hosted connector toolkit grammar (`connectorToolkitSlugSchema`): a
+/// lowercase identifier of at most 64 characters. The enrollment request, the
+/// provider rows and the enrolled-connection rows all use exactly this
+/// identity grammar. A hosted enrollment sends it verbatim, so a malformed one
+/// must refuse here — the relay would otherwise answer `invalid_request`, and
+/// that answer is reserved below for a server that predates the operation.
+pub fn connection_toolkit_slug(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn optional_pin(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Null | Value::String(_)))
+}
+
+fn provider_read(read: &Value) -> bool {
+    read.as_object().is_some_and(|read| {
+        read.get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && read.get("qualified").is_some_and(Value::is_boolean)
+            && read.get("pinned").is_some_and(Value::is_boolean)
+            && read.get("projected").is_some_and(Value::is_boolean)
+    })
+}
+
+/// One provider row: the toolkit identity, its manifest state, whether
+/// enrollment can start, and the qualified-read projection (or `null`).
+fn connection_provider_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                row.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(row.get("reviewed_pin"))
+            && optional_pin(row.get("reported_pin"))
+            && matches!(
+                row.get("enrollment").and_then(Value::as_str),
+                Some("available" | "read_unqualified")
+            )
+            && match row.get("read") {
+                Some(Value::Null) => true,
+                Some(read) => provider_read(read),
+                None => false,
+            }
+    })
+}
+
+/// The nested status of one enrolled connection. The two literal fields are
+/// the projection's own invariant, not a caller preference.
+fn connection_status(status: &Value) -> bool {
+    status.as_object().is_some_and(|status| {
+        status.get("adapter_registered").and_then(Value::as_bool) == Some(true)
+            && status
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && status
+                .get("custody_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                status.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(status.get("reviewed_pin"))
+            && optional_pin(status.get("reported_pin"))
+            && status
+                .get("execution_authority")
+                .is_some_and(Value::is_boolean)
+            && status.get("network_checked").and_then(Value::as_bool) == Some(false)
+    })
+}
+
+/// One enrolled connection row. `account` may be empty (no non-secret display
+/// name recorded); it is never a connected-account id.
+fn connection_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("id").and_then(Value::as_str).is_some_and(|id| {
+            !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
+        }) && row
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row.get("account").is_some_and(Value::is_string)
+            && row.get("kind").and_then(Value::as_str) == Some("enrolled")
+            && row.get("revision").is_some_and(Value::is_null)
+            && row.get("registration_digest").is_some_and(Value::is_null)
+            && row
+                .get("scopes")
+                .and_then(Value::as_array)
+                .is_some_and(|scopes| scopes.iter().all(Value::is_string))
+            && row.get("status").is_some_and(connection_status)
+    })
+}
+
+pub fn connection_providers_answer(answer: &Value) -> bool {
+    connection_rows(answer, "providers", connection_provider_row)
+}
+
+pub fn connection_list_answer(answer: &Value) -> bool {
+    connection_rows(answer, "connections", connection_row)
+}
+
+/// The one-time provider authorization link, only when the answer carries one
+/// this client can hand to a person: HTTPS, a real host, no embedded
+/// credentials, no control byte. Anything else is never printed and never
+/// becomes a success.
+pub fn connection_authorization_url(answer: &Value) -> Option<&str> {
+    if answer.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let url = answer.get("data")?.get("url")?.as_str()?;
+    https_authorization_url(url).then_some(url)
+}
+
+/// The same URI parse the browser-login links use (`remote_auth`), plus the
+/// explicit u16 port fit the URI crate does not enforce: it validates the
+/// authority's characters but accepts `host:999999` as an authority. The
+/// original string is returned unchanged, so a query is never re-encoded.
+fn https_authorization_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 4096 || !url.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let raw = authority.as_str();
+    if raw.contains('@') || uri.host().is_none_or(str::is_empty) {
+        return false;
+    }
+    // An IPv6 literal keeps its own colons; its port, if any, follows `]`.
+    let port = match raw.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((_, tail)) => tail.strip_prefix(':'),
+            None => return false,
+        },
+        None => raw.split_once(':').map(|(_, port)| port),
+    };
+    port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    })
 }
 
 /// The tenant's `requiredText` uses ECMAScript `String.trim`, whose whitespace
@@ -909,6 +1099,25 @@ fn normalized_email_matches(sent: &str, received: &str) -> bool {
 fn lowercase_chars(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars().flat_map(char::to_lowercase)
 }
+
+// Seam note (CAD-2096): mirrors of native settings rules.
+// The receipt validators in this file re-state, read-only, what the native settings
+// path normalizes or projects. Owner: the native side. Families and counterparts:
+//   settings_snapshot_document          <- agent_settings::build_snapshot (shape)
+//   normalized_pin_pair / provider_pin_matches <- normalize_pin / parse_pin_text
+//   canonical_model_id                  <- model_defaults::validate_model_id
+//   settings_field/tri/trimmed matchers, opt_bool semantics <- settings_rpc::opt_bool
+//   settings_apply_scope                <- agent_settings::parse_overlay
+//   settings_apply_exact, settings_apply_pins_exact <- pi_pins and project_pi
+//   settings_pin_removed                <- the Pi-extension pin retention rule
+//   settings_same_id_set                <- post-apply id sets
+//   settings_rename_applied             <- the native same-id refusal
+//   settings_sync_files_exact           <- export_status
+// They are not shared code because the native functions return `Result` and write
+// state, while this side is a read-only, fail-closed check of what a hosted tenant
+// says it committed. Update rule: a change to native normalization OR projection
+// changes the matching validator here in the same PR, with receipt tests for the old
+// and new spelling, since a hosted tenant may lag the client.
 
 /// A native settings save answers the committed snapshot document: a
 /// nonempty revision token plus the `config` document it wrote. The native
@@ -1863,6 +2072,9 @@ fn settings_receipt_correlates(
 /// Stable code for a board that refused `include_body` on the verdict read.
 pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
 
+/// Stable code for a board that predates `limit` on `issue_ls`.
+pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
+
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
 /// explicit `project` — plus `issue` for the two approvals — so the answer is
 /// that project's evidence and no other's. They are newer than the tenant
@@ -1998,6 +2210,10 @@ fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()>
 /// instead of the broad cli.* pair the other verbs request.
 pub const REMOTE_SETTINGS_VERB: &str = "settings_agents";
 pub const REMOTE_MASTER_STATUS_VERB: &str = "master_status";
+
+/// A `401`: the bearer is not accepted. A managed caller may drop a cached
+/// agent credential and re-mint once; it must never fall back to the login.
+pub(super) const CREDENTIAL_REJECTED: &str = "credential_rejected";
 
 /// The hosted scope a `settings_agents` operation needs — the AOS-290
 /// operation table in `hosted-cadence-auth.ts` classifies the same names;
@@ -3114,6 +3330,19 @@ fn authorize(
     match status {
         200 => envelope_of(surface, body),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
+        401 => {
+            // Only a 401 about the bearer itself may be answered by re-minting
+            // a cached agent credential. A policy 401 (for example
+            // `scope_not_granted`) is authorization and stays final.
+            let (refusal, _) = decode_refusal(status, body.as_ref());
+            match refusal {
+                Refusal::Authentication | Refusal::Uncertain => Err(Error::invalid(
+                    CREDENTIAL_REJECTED,
+                    refusal_error(status, body.as_ref()).to_string(),
+                )),
+                _ => Err(refusal_error(status, body.as_ref())),
+            }
+        }
         403 if refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED) => {
             Err(Error::invalid(
                 agent_credential::HUMAN_SESSION_REQUIRED,
@@ -4117,9 +4346,10 @@ const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a li
 /// CAD-1568: actionable text for a verb's typed refusals, keyed on the
 /// container's bounded `error.code` — the raw `error.message` the route
 /// returns is never shown (a `cli_fail` body can carry arbitrary server
-/// text). Today it covers the `cli_message_*` family and CAD-1999's
-/// `project_new` registry refusals. Unknown or absent codes keep the
-/// generic decoded refusal unchanged.
+/// text). Today it covers the `cli_message_*` family, CAD-1999's
+/// `project_new` registry refusals and a wiki `read` of a missing path
+/// (CAD-2260). Unknown or absent codes keep the generic decoded refusal
+/// unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
         ("message_send", Some("recipient_class_unsupported")) => Some((
@@ -4269,6 +4499,14 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
              1-32 lowercase letters, digits or hyphens, --name 1-200 bytes, and \
              --prefix 1-16 letters/digits starting with a letter; nothing was written",
         )),
+        // CAD-2260: the tenant board answers a wiki `read` with `404
+        // not_found` for a missing path, and for a blob whose stored bytes are
+        // gone. The code is what `wiki cp` reads as "the destination is new".
+        ("read", Some("not_found")) => Some((
+            "not_found",
+            "this workspace's wiki has no readable page at that path for this login; nothing \
+             was read",
+        )),
         _ => None,
     };
     match action {
@@ -4306,6 +4544,17 @@ pub fn local_status(target: &RemoteTarget) -> Value {
         Ok(dir) => local_status_at(&dir, target),
         Err(_) => json!({"state": "unavailable", "live_verified": false}),
     }
+}
+
+/// CAD-1988: the documented `auth status` object for one hosted workspace and
+/// the exit code a status read should carry. Local only; no network call.
+pub fn status_report(dir: &Path, target: &RemoteTarget) -> (Value, i32) {
+    let report = local_status_at(dir, target);
+    let code = match report["state"].as_str() {
+        Some("renewable" | "access_valid_until_expiry") => 0,
+        _ => 1,
+    };
+    (report, code)
 }
 
 /// `local_status` with the credential dir injectable, so tests never touch the
@@ -4635,7 +4884,17 @@ pub fn cloud_agent_peer_owner(
         }
         found = Some(pin);
     }
-    found.ok_or_else(|| reject("no enrolled cloud-peer credential for this source"))
+    found.ok_or_else(|| {
+        // No record at all is MISSING authority for this source, and the
+        // projection withholds the row and names that reason rather than
+        // failing the page — a page failure would disclose the row's
+        // existence. A present-but-expired or mismatched record stays a
+        // plain refusal: it names a credential the operator must repair.
+        Error::gate_coded(
+            "cloud_agent_authority_missing",
+            "no enrolled cloud-peer credential for this source",
+        )
+    })
 }
 
 fn load_peer(
@@ -5056,6 +5315,252 @@ fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
     ))
 }
 
+/// CAD-2240: a board that predates `project_timeline` answers `501
+/// not_implemented`; an older control relay rejects the unknown verb name as
+/// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
+/// an outage. A current board also answers 400 to a bad cursor, so a 400 only
+/// counts when no `--before` was sent; the client validates the key, kinds
+/// and `--since` range locally, the inputs a current board answers 400 to.
+fn timeline_board_too_old(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<String> {
+    if verb != "project_timeline" {
+        return None;
+    }
+    let unknown_verb = status == 400
+        && matches!(code, Some("invalid_request" | "unknown_verb"))
+        && !arguments.contains_key("before");
+    if status != 501 && !unknown_verb {
+        return None;
+    }
+    Some(format!(
+        "this board cannot serve the project timeline yet (HTTP {status}{}) — update the board \
+         first, then use this client. Nothing was read",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
+}
+
+/// CAD-2260: a hosted tenant board serves the wiki's text `write`, `read` and
+/// `enumerate`, but not the `wiki cp` transfer operations (CAD-914). It answers
+/// `job_status` with `501 not_implemented`, and refuses a `write` that carries
+/// `transfer` at its argument check with `400 invalid_request`. Neither is an
+/// outage or a mistake in the command, so say the board does not serve the
+/// copy and name the verbs it does serve.
+///
+/// Matched by operation, and only the ones a copy opens with: `begin` (an
+/// import), an `export` that carries no `rev` (planning; the per-entry byte
+/// reads always pin one), and `status` (what `--resume` reads first). A board
+/// that serves transfers also answers 400 to a bad chunk or receipt, and a
+/// refusal after part of a copy moved is not proof that nothing did, so
+/// `chunk`, `apply`, `finish` and a pinned `export` keep the decoded refusal.
+/// A 400 counts on `begin` alone, whose manifest this client checked before
+/// sending it. `status` is also read after `begin` and by `--wait-index`, so
+/// it claims only that nothing was read.
+fn wiki_copy_unserved(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    let transfer = arguments.get("transfer")?;
+    let op = transfer.get("op").and_then(Value::as_str)?;
+    let outcome = match (verb, op, status, code) {
+        ("write", "begin", 400, Some("invalid_request")) | ("write", "begin", 501, _) => "copied",
+        ("job_status", "export", 501, _) if transfer.get("rev").is_none() => "copied",
+        ("job_status", "status", 501, _) => "read",
+        _ => return None,
+    };
+    // Echo only a code this client names itself, never other board text.
+    let shown = match code {
+        Some(known @ ("invalid_request" | "not_implemented")) => format!(", {known}"),
+        _ => String::new(),
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}): it predates \
+             transfer support, so the board has to be updated first. Until then copy one page at \
+             a time: `wiki put <path> --file <file>` writes a text page, `wiki upload` sends a \
+             binary file and `wiki cat` reads a page. Nothing was {outcome}"
+        ),
+    ))
+}
+
+/// One refusal a board that serves `wiki cp` (AOS-566) sends for a transfer
+/// operation, and the sentence this client prints for it.
+struct WikiCopyRefusal {
+    status: u16,
+    code: &'static str,
+    /// The transfer `op`s this row answers; empty answers every op.
+    ops: &'static [&'static str],
+    text: &'static str,
+}
+
+/// CAD-2261/CAD-2271: the one list of a hosted board's own transfer
+/// refusals. [`wiki_copy_refusal`] prints from it and
+/// [`is_wiki_copy_refusal`] trusts only its codes, so the two cannot drift.
+///
+/// CAD-2275: every row is a 4xx, a refusal the board gives before it acts.
+/// [`wiki_copy_refusal`] runs before the after-forward 5xx classification,
+/// so a 5xx row would be trusted as "nothing changed" when the write may
+/// have landed. A test holds this.
+const WIKI_COPY_REFUSALS: &[WikiCopyRefusal] = &[
+    WikiCopyRefusal {
+        status: 409,
+        code: "destination_changed",
+        ops: &[],
+        text: "a file this copy would write is already on the board with other content, changed \
+               after it was read, or has a folder in its place, so the board refused this copy \
+               and wrote nothing new. Copy again with `--update` to replace a changed file. \
+               `--update` cannot replace a folder: to copy a file into a folder, name the file \
+               inside it (`wiki:<folder>/<name>`)",
+    },
+    WikiCopyRefusal {
+        status: 413,
+        code: "payload_too_large",
+        ops: &[],
+        text: "a file in this copy, or the copy as a whole, is larger than this board accepts \
+               through `wiki cp`, so it refused this copy and wrote nothing new. Send a large \
+               binary file on its own with `wiki upload`, split a long page, or copy fewer files \
+               at a time",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "job_conflict",
+        ops: &[],
+        text: "the board already holds this job id for a different copy (another source, \
+               destination or member), so it refused the job and wrote nothing new. Copy again \
+               without `--resume` to start a new job",
+    },
+    WikiCopyRefusal {
+        status: 400,
+        code: "manifest_invalid",
+        ops: &[],
+        text: "the board does not accept this copy's file list: a name, path, kind or size is \
+               outside what it allows, for example a path longer than its limit. It wrote \
+               nothing new; rename or leave out that file and copy again",
+    },
+    WikiCopyRefusal {
+        status: 400,
+        code: "transfer_invalid",
+        ops: &[],
+        text: "the board refused this request as malformed or out of range and changed nothing. \
+               If it repeats, update this Cadence client; the board may need an update too",
+    },
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["export"],
+        text: "the board has no readable page or folder at that path for this login",
+    },
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["status"],
+        text: "the board has no such copy job for this login and destination: it may have been \
+               removed after being left idle, started for another destination, or belong to \
+               someone else. Copy again without `--resume`",
+    },
+    // Mid-job, the job wrapper adds the job id and what to try next.
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["chunk", "apply", "finish"],
+        text: "the board no longer has this copy job for this login",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "stage_incomplete",
+        ops: &[],
+        text: "the board has not received all of this file's bytes yet, so the rest still has \
+               to be sent",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "entries_pending",
+        ops: &[],
+        text: "the board still has files in this job that were not applied",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "chunk_conflict",
+        ops: &[],
+        text: "the bytes sent for this file differ from what the board already holds for it, \
+               usually because two runs of the same job overlapped or the local file changed",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "job_closed",
+        ops: &[],
+        text: "this copy job is already finished",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "entry_decided",
+        ops: &[],
+        text: "the board already settled this file in this job",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "revision_changed",
+        ops: &[],
+        text: "the file changed on the board while it was being copied out; copy it out again \
+               with `--update` to replace what was already written",
+    },
+];
+
+/// CAD-2271: whether `code` is a hosted board's own transfer refusal, that
+/// is, one with a row in [`WIKI_COPY_REFUSALS`]. On the hosted path only
+/// [`wiki_copy_refusal`] gives a transfer error one of these codes, and the
+/// board answered it before it changed anything.
+pub(crate) fn is_wiki_copy_refusal(code: &str) -> bool {
+    WIKI_COPY_REFUSALS.iter().any(|row| row.code == code)
+}
+
+/// Every code with a row in [`WIKI_COPY_REFUSALS`], for the copy client's
+/// tests.
+#[cfg(test)]
+pub(crate) fn wiki_copy_refusal_codes() -> impl Iterator<Item = &'static str> {
+    WIKI_COPY_REFUSALS.iter().map(|row| row.code)
+}
+
+/// CAD-2261: a board that serves `wiki cp` (AOS-566) refuses a transfer
+/// operation with a code of its own. Say what happened and what to do, keep
+/// the board's code as the error's code, and never show the board's text.
+///
+/// Only a request that carries `transfer` is mapped: a text `wiki put` shares
+/// the `write` verb, and the board's request cap answers it with
+/// `413 payload_too_large` too. A transfer-serving board never answers a
+/// transfer operation with `invalid_request` or 501, so this never meets the
+/// "does not serve" answers of [`wiki_copy_unserved`], which runs first. The
+/// board's limits are its own: no number is named here.
+fn wiki_copy_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    if !matches!(verb, "write" | "job_status") {
+        return None;
+    }
+    let op = arguments
+        .get("transfer")?
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = code?;
+    let row = WIKI_COPY_REFUSALS.iter().find(|row| {
+        row.status == status && row.code == code && (row.ops.is_empty() || row.ops.contains(&op))
+    })?;
+    Some(Error::invalid(
+        row.code,
+        format!("{} ({}, HTTP {status})", row.text, row.code),
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5241,11 +5746,18 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
-        let agent_cred = match on_agent {
-            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note)?,
-            None => None,
+        let (agent_cred, from_cache) = match on_agent {
+            Some(slot) => match agent_credential::bearer(slot, target, dir, deadline, &note)? {
+                Some((credential, source)) => (
+                    Some(credential),
+                    matches!(source, agent_credential::Source::Cached),
+                ),
+                None => (None, false),
+            },
+            None => (None, false),
         };
         let using_agent = agent_cred.is_some();
         let cred = match agent_cred {
@@ -5273,17 +5785,11 @@ fn call_verb_until_retry(
         // settings.* scope; `master_status` needs settings.read. A login
         // without the needed scope is refused here, before a request is
         // built — never downgraded to another verb or the local org.
-        if using_agent && (verb == REMOTE_SETTINGS_VERB || verb == REMOTE_MASTER_STATUS_VERB) {
-            return Err(reject(format!(
-                "a managed agent session can't use `{}` — it needs a person's login; \
-                 nothing was sent",
-                if verb == REMOTE_SETTINGS_VERB {
-                    "settings agents"
-                } else {
-                    "master status"
-                }
-            )));
-        }
+        //
+        // CAD-2165: the managed refusal for these owner-class verbs lives in
+        // `cli::remote`, which runs before this call. It is not repeated here:
+        // duplicating it implied a second authority, and the scope checks
+        // below still refuse an agent credential that lacks the operation.
         if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
             let operation = arguments
                 .get("operation")
@@ -5335,6 +5841,25 @@ fn call_verb_until_retry(
             }
             continue;
         }
+        // CAD-2165: a cached bearer the board no longer accepts (rotation or
+        // revocation) is dropped and re-minted once. A freshly minted bearer is
+        // the agent's own refusal and stays final, and a 401 is answered before
+        // the verb runs, so the retry cannot double-apply a write.
+        let rejected_cached = using_agent
+            && from_cache
+            && !reissued
+            && match &answered {
+                Ok((401, ..)) => true,
+                Err(error) => error.code() == Some(CREDENTIAL_REJECTED),
+                _ => false,
+            };
+        if rejected_cached {
+            if let Some(slot) = on_agent {
+                slot.invalidate();
+            }
+            reissued = true;
+            continue;
+        }
         let (status, retry_after, body) = answered?;
         if effect.is_mutation() {
             if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
@@ -5359,6 +5884,22 @@ fn call_verb_until_retry(
                 {
                     return Err(Error::unknown(format!(
                         "remote tool returned no usable receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("connected_read")
+                    if !body.as_ref().is_some_and(|answer| {
+                        crate::platform::agenticos_provider::valid_connected_read_receipt(answer)
+                            && answer.pointer("/data/effect").and_then(Value::as_str)
+                                == Some("read")
+                            && answer.pointer("/data/price").is_some()
+                            && answer
+                                .pointer("/data/result")
+                                .is_some_and(|result| !result.is_null())
+                    }) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected read returned no usable settled receipt — {}",
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
@@ -5399,6 +5940,31 @@ fn call_verb_until_retry(
                         .is_some_and(Value::is_array) =>
                 {
                     return Err(reject("the remote tool catalog is unavailable"));
+                }
+                Some("connection_providers")
+                    if !body.as_ref().is_some_and(connection_providers_answer) =>
+                {
+                    return Err(reject(
+                        "the hosted connection providers answer is incomplete — \
+                         nothing was listed; no empty catalog is reported",
+                    ));
+                }
+                Some("connection_list") if !body.as_ref().is_some_and(connection_list_answer) => {
+                    return Err(reject(
+                        "the hosted connection list answer is incomplete — \
+                         nothing was listed; no empty connection list is reported",
+                    ));
+                }
+                Some("connection_start")
+                    if !body
+                        .as_ref()
+                        .is_some_and(|answer| connection_authorization_url(answer).is_some()) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connection enrollment returned no usable authorization \
+                         link — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
                 }
                 _ => {}
             }
@@ -5547,8 +6113,12 @@ fn call_verb_until_retry(
             && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
         // A funded platform call may still be in progress or uncertain on
         // a same-key replay; preserve its dedicated reconciliation guidance.
-        let platform_outcome_unknown = platform_operation == Some("call")
-            && !board_gate_refused(body.as_ref())
+        // CAD-2226: an uncertain `connection_start` is the same unresolved
+        // outcome — the one-time link may exist but cannot be read back.
+        let platform_outcome_unknown = matches!(
+            platform_operation,
+            Some("call" | "connected_read" | "connection_start")
+        ) && !board_gate_refused(body.as_ref())
             && !tracker_unavailable_before_verb(status, body.as_ref())
             && ((status == 409
                 && matches!(
@@ -5563,6 +6133,22 @@ fn call_verb_until_retry(
         // update it, not that coordination is unavailable.
         if let Some(error) = profile_board_too_old(verb, status) {
             return Err(error);
+        }
+        if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
+        {
+            return Err(reject(why));
+        }
+        if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
+            return Err(error);
+        }
+        // A 409 that carries a `conflict` body stays a checked conflict.
+        let conflict_body = body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        if !conflict_body {
+            if let Some(error) =
+                wiki_copy_refusal(verb, status, refusal_code.as_deref(), &arguments)
+            {
+                return Err(error);
+            }
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())
@@ -5613,6 +6199,19 @@ fn call_verb_until_retry(
                 "the board does not know `include_body` for verdicts",
             ));
         }
+        // CAD-2277: a board that predates `limit` on `issue_ls` refuses the field
+        // as `invalid_request` (400). Surface a typed code so the CLI can retry
+        // once without `limit` and slice locally instead of failing outright.
+        if verb == "issue_ls"
+            && arguments.contains_key("limit")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                ISSUE_LS_LIMIT_UNSUPPORTED,
+                "the board does not know `limit` for `issue ls`",
+            ));
+        }
         if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
             let checked_conflict = body.as_ref().is_some_and(|b| {
                 b.get("conflict").is_some()
@@ -5623,6 +6222,16 @@ fn call_verb_until_retry(
                     return Err(reject(why));
                 }
             }
+        }
+        if platform_operation == Some("connected_read")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                "invalid_request",
+                "the connected read was refused: check the input and connection, or update \
+                 the hosted tenant server if it predates connected-read support",
+            ));
         }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
@@ -5638,6 +6247,37 @@ fn call_verb_until_retry(
             return Err(reject(format!(
                 "the tenant could not serve `platform {op_name}` (HTTP {status}{}) — update the \
                  tenant server first, then this Cadence client; nothing was started or billed",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
+        // CAD-2226: a hosted server that predates the owner-enrollment
+        // operations answers the unknown operation with 501 or 400
+        // `invalid_request`/`unknown_verb`. That is a release-order problem:
+        // it is not an empty catalog, not an empty connection list and not a
+        // missing link, so nothing is invented and nothing falls back to the
+        // local daemon.
+        if matches!(
+            platform_operation,
+            Some("connection_providers" | "connection_list" | "connection_start")
+        ) && (status == 501
+            || (status == 400
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("invalid_request" | "unknown_verb")
+                )))
+        {
+            let operation = platform_operation.unwrap_or_default();
+            let consequence = if operation == "connection_start" {
+                "no authorization link exists and no account was linked"
+            } else {
+                "this is not an empty list"
+            };
+            return Err(reject(format!(
+                "the hosted tenant server does not serve `platform call` operation \
+                 `{operation}` (HTTP {status}{}) — update the hosted server first, then this \
+                 Cadence client; {consequence}",
                 refusal_code
                     .as_deref()
                     .map_or(String::new(), |c| format!(", {c}"))
@@ -6075,9 +6715,11 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
 }
 
 mod agent_credential;
-pub use agent_credential::{
-    bind_managed_session, bound_session, unbind_managed_session, AgentSlot,
-};
+pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};
+// The test seam is absent from a release or CI-profile build; only a debug
+// build or the explicit `test-seam` feature may reset the session binding.
+#[cfg(any(debug_assertions, feature = "test-seam"))]
+pub use agent_credential::unbind_managed_session;
 pub mod probe;
 
 #[cfg(test)]

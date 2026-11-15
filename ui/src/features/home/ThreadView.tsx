@@ -3,7 +3,7 @@ import { useTranslate } from "../../lib/locale";
 import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
 import type { ThreadRef } from "../../lib/types";
-import Md from "../../ui/Md";
+import Md, { healStreamingMarkdown } from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
@@ -15,8 +15,18 @@ import { useImageConversation } from "../canvas/imageConversation";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
-import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import AgentForm, { ACTION_MARK } from "./AgentForm";
+import {
+  isArtifactPutCall,
+  isCardItem,
+  stepSummary,
+  toolSteps,
+  type PendingAttachment,
+  type ThreadEntry,
+  type ThreadItem,
+} from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
+import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -166,7 +176,7 @@ export function ThreadItemView({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     conversation?: string,
   ) => void;
   onDiscard: (message: string) => void;
@@ -184,9 +194,10 @@ export function ThreadItemView({
       return (
         <Bubble who={t("You")} at={time(item.entry.created)} me>
           <div className={`chat-bubble ${bodyText} text-ink-100 whitespace-pre-wrap`}>
-            <span>{item.entry.text}</span>
+            <span>{formAnswerText(item.entry.text, entryRefs(item.entry.payload))}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>
+          {isFormAnswer(entryRefs(item.entry.payload)) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
           <RefChips refs={entryRefs(item.entry.payload)} onOpenIssue={onOpenIssue} />
         </Bubble>
       );
@@ -216,7 +227,8 @@ export function ThreadItemView({
             }`}
             data-pending={item.pending.state}
           >
-            {item.pending.text}
+            {formAnswerText(item.pending.text, item.pending.refs ?? [])}
+            <AttachmentRows files={pendingAttachments(item.pending.attachments)} />
           </div>
           <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
           {item.pending.state === "failed" && (
@@ -268,6 +280,8 @@ export function ThreadItemView({
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "ticket":
       return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} readOnly={readOnly} />;
+    case "form":
+      return <AgentForm entry={item.entry} status={item.status} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -397,12 +411,20 @@ function SystemNote({
   );
 }
 
+/** CAD-2285: an operator message citing a form is that form's answer. */
+const isFormAnswer = (refs: ThreadRef[]): boolean => refs.some((r) => r.kind === "surface");
+/** The answer's readable lines; the A2UI action after them is for the master. */
+const formAnswerText = (text: string, refs: ThreadRef[]): string =>
+  isFormAnswer(refs) ? text.split(ACTION_MARK)[0] : text;
+
 /** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
- *  each under the text. An `issue` ref is a real link to its page so a
+ *  each under the text, except a form answer's `surface` ref, which the
+ *  bubble names instead. An `issue` ref is a real link to its page so a
  *  result sent with citations is one tap from the work it names
  *  (CAD-1574); other kinds stay a label. */
-function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id: string) => void }) {
+function RefChips({ refs: all, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id: string) => void }) {
   const t = useTranslate();
+  const refs = all.filter((r) => r.kind !== "surface");
   if (refs.length === 0) return null;
   return (
     <span className="refsrow" aria-label={t("cited rows")}>
@@ -457,6 +479,21 @@ export function entryAttachments(payload: unknown): EntryAttachment[] {
       typeof (a as EntryAttachment).name === "string" &&
       typeof (a as EntryAttachment).size === "number" &&
       typeof (a as EntryAttachment).mime === "string",
+  );
+}
+
+/** Optimistic attachment rows carried on a pending send while it awaits its
+ *  stored `operator` entry. Entries that carry `{id}` only (for example a retry
+ *  seeded from a legacy envelope) omit chips until the stored row arrives. */
+export function pendingAttachments(attachments?: PendingAttachment[]): EntryAttachment[] {
+  if (!Array.isArray(attachments)) return [];
+  return attachments.filter(
+    (a): a is EntryAttachment =>
+      !!a &&
+      typeof a.id === "string" &&
+      typeof a.name === "string" &&
+      typeof a.size === "number" &&
+      typeof a.mime === "string",
   );
 }
 
@@ -881,10 +918,19 @@ export function ThreadTurn({
   head = true,
   continued = false,
   copy = true,
+  previewConversation = null,
+  previewTransform,
 }: {
   items: ThreadItem[];
   running?: boolean;
   density?: Density;
+  /** The conversation whose live preview text this turn may paint, when the
+   *  host has one. Absent (an app that never sends previews) changes nothing. */
+  previewConversation?: string | null;
+  /** Presentation rewrite for the live preview, exactly what this surface
+   *  already applies to committed text (an app pane's id redaction). Home
+   *  passes nothing and paints the server's text unchanged. */
+  previewTransform?: (text: string) => string;
   /** Only a transcript with no `turn_result` anywhere may treat its last
    *  worker note as an older answer; a new transcript's intermediate note
    *  must stay in the trace. */
@@ -919,6 +965,13 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
+  // The assistant's actual in-flight words (CAD-2228), replaced frame by
+  // frame. It paints only while this turn is still generating and has no
+  // committed answer, and it is never presented as a stored reply.
+  const preview = useConversationPreview(previewConversation, streaming);
+  const previewText =
+    preview === null || previewTransform === undefined ? preview : previewTransform(preview);
+  const hasPreview = previewText !== null && previewText.trim() !== "";
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -953,10 +1006,20 @@ export function ThreadTurn({
           answered={shown != null}
         />
       )}
+      {/* Its name row and trace say the turn is live; this is the only
+          place its own words appear before the committed answer replaces
+          them. No timestamp, no copy, no stored row. */}
+      {hasPreview && previewText !== null && (
+        <div className="answer" data-kind="preview" aria-live="off">
+          <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
+            <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} />
+          </div>
+        </div>
+      )}
       {/* Dots, then the current step. Under the trace once steps exist,
           so the disclosure names the turn and the bubble names what is
           running now. */}
-      {streaming && <TypingDots label={typingLabel} />}
+      {streaming && (!hasPreview || tool !== "") && <TypingDots label={typingLabel} />}
       {shown && (
         <div data-item-key={shown.key}>
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
@@ -965,7 +1028,11 @@ export function ThreadTurn({
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
-            item.type === "artifact" || item.type === "image" || item.type === "video" ? (
+            item.type === "form" ? (
+              <div key={item.key} data-item-key={item.key}>
+                <AgentForm entry={item.entry} status={item.status} />
+              </div>
+            ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
               <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
                 {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
               </div>

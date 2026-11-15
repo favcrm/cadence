@@ -4,11 +4,11 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
-import type { Connection, ConnectionProvider } from "../../lib/types";
+import type { Connection, ConnectionProvider, ConnectionSite } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import { IconRefresh, IconWarning } from "../../ui/icons";
+import { IconCheck, IconLock, IconPin, IconRefresh, IconWarning } from "../../ui/icons";
 import PageState from "../../ui/PageState";
 import {
   acceptsHosted,
@@ -825,6 +825,293 @@ function ConnectionsDetail({
   );
 }
 
+/** A property permission that may be pinned. Static strings, exact match. */
+const SITE_SELECTABLE: Record<string, true> = {
+  siteOwner: true,
+  siteFullUser: true,
+};
+
+function sitePermissionLabel(permission: string): string {
+  if (permission === "siteOwner") return "Owner";
+  if (permission === "siteFullUser") return "Full access";
+  return "View only";
+}
+
+function siteKind(siteUrl: string): string {
+  return siteUrl.startsWith("sc-domain:") ? "Domain property" : "URL-prefix property";
+}
+
+/**
+ * The Search Console read target. A hosted Search Console account can expose
+ * several exact properties; one is pinned at connection level. The list is a
+ * provider read, never inferred from the account or the connection.
+ */
+function SearchConsoleProperty({ row, canWrite }: { row: Connection; canWrite: boolean }) {
+  const t = useTranslate();
+  const headingId = useId();
+  const [sites, setSites] = useState<ConnectionSite[] | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    setNote(null);
+    setSites(null);
+    setSelected(null);
+    setDraft(null);
+    api
+      .connectionSites(row.id)
+      .then((reply) => {
+        if (!alive) return;
+        setSites(reply.sites);
+        setSelected(reply.selected);
+        setDraft(reply.selected);
+      })
+      .catch((e: unknown) => {
+        if (!alive) return;
+        setError(e instanceof ApiError && e.message ? e.message : "The property list is unavailable.");
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [row.id, reload]);
+
+  const selectableSites = (sites ?? []).filter(
+    (site) => SITE_SELECTABLE[site.permission_level] === true,
+  );
+  const restrictedOnly = sites !== null && sites.length > 0 && selectableSites.length === 0;
+  const changed = draft !== null && draft !== selected;
+
+  const save = () => {
+    if (!draft || !changed || saving) return;
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    api
+      .connectionSelectSite(row.id, { site_url: draft })
+      .then((reply) => {
+        setSelected(reply.site.site_url);
+        setDraft(reply.site.site_url);
+        setNote(
+          `Pinned. Search Console reports for this connection now use ${reply.site.site_url}.`,
+        );
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof ApiError && e.message ? e.message : "The property could not be pinned.");
+      })
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div className="mt-4 border-t border-ink-700 pt-4" aria-labelledby={headingId}>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="slabel">{t("Read target")}</div>
+          <h3 id={headingId} className="text-cardtitle font-medium text-ink-100 mt-1">
+            {t("Search Console property")}
+          </h3>
+          <p className="text-label text-ink-400 mt-1 max-w-[36rem] break-words">
+            {t(
+              "Reports use the exact property identifier. A domain property covers every URL on that domain; a URL-prefix property covers only that prefix.",
+            )}
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setReload((value) => value + 1)}
+          loading={loading}
+          disabled={saving}
+          icon={<IconRefresh />}
+        >
+          {t("Refresh")}
+        </Button>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-ink-700 bg-ink-850 px-2.5 py-2 min-w-0">
+        <span className={`chip ${selected ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-400"}`}>
+          {selected ? <IconCheck size={11} /> : <IconPin size={11} />}
+          {selected ? t("Pinned") : t("Not pinned")}
+        </span>
+        {selected ? (
+          <code className="num text-label text-ink-200 break-all min-w-0">{selected}</code>
+        ) : (
+          <span className="text-label text-ink-400">{t("No property pinned")}</span>
+        )}
+        <span className="ml-auto text-micro text-ink-500">
+          {selected
+            ? t("Used by search_console_report")
+            : t("Reports must name a property until one is pinned")}
+        </span>
+      </div>
+
+      {loading && (
+        <div className="mt-3 grid gap-1.5" aria-label={t("Loading properties")} aria-busy="true">
+          {[0, 1, 2].map((index) => (
+            <div key={index} className="h-12 rounded border border-ink-700 bg-ink-850 animate-pulse" />
+          ))}
+        </div>
+      )}
+
+      {!loading && error && (
+        <div className="mt-3 rounded border border-fail/30 bg-fail/5 px-3 py-2.5" role="alert">
+          <p className="text-label text-ink-200 break-words">{t(error)}</p>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="mt-2"
+            onClick={() => setReload((value) => value + 1)}
+            icon={<IconRefresh />}
+          >
+            {t("Try again")}
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && sites !== null && sites.length === 0 && (
+        <div className="mt-3 rounded border border-dashed border-ink-700 px-3 py-3">
+          <p className="text-label text-ink-200 font-medium">{t("No properties found")}</p>
+          <p className="text-label text-ink-400 mt-1 break-words">
+            {t(
+              "This account has no Search Console property it can read. Add the account to a property in Google Search Console, then refresh.",
+            )}
+          </p>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="mt-2"
+            onClick={() => setReload((value) => value + 1)}
+            icon={<IconRefresh />}
+          >
+            {t("Refresh")}
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && sites !== null && sites.length > 0 && (
+        <div
+          className="mt-3 grid gap-1.5"
+          role="radiogroup"
+          aria-labelledby={headingId}
+          aria-label={t("Search Console properties")}
+        >
+          {sites.map((site, index) => {
+            const usable = SITE_SELECTABLE[site.permission_level] === true;
+            const checked = draft === site.site_url;
+            const inputId = `${headingId}-site-${index}`;
+            return (
+              <label
+                key={site.site_url}
+                htmlFor={inputId}
+                className={`flex items-start gap-2 rounded border px-2.5 py-2 min-w-0 ${
+                  checked
+                    ? "border-accent/50 bg-accent/10"
+                    : "border-ink-700 bg-ink-850"
+                } ${usable && canWrite && !saving ? "cursor-pointer" : "opacity-70"}`}
+              >
+                <input
+                  id={inputId}
+                  type="radio"
+                  name={`${headingId}-property`}
+                  value={site.site_url}
+                  checked={checked}
+                  disabled={!usable || !canWrite || saving}
+                  onChange={() => {
+                    setDraft(site.site_url);
+                    setNote(null);
+                  }}
+                  className="mt-1 accent-[var(--color-accent)]"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="num text-label text-ink-100 block break-words">
+                    {site.site_url}
+                  </span>
+                  <span className="text-micro text-ink-500 block">
+                    {t(siteKind(site.site_url))}
+                    {" · "}
+                    {usable
+                      ? t("Selectable for reports")
+                      : t("Owner or Full access required to pin")}
+                  </span>
+                </span>
+                <span
+                  className={`chip shrink-0 ${
+                    usable ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-500"
+                  }`}
+                >
+                  {t(sitePermissionLabel(site.permission_level))}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      {!loading && !error && restrictedOnly && (
+        <p className="mt-2 flex items-start gap-1.5 text-label text-warn break-words" role="status">
+          <IconLock className="mt-0.5 shrink-0" />
+          <span>
+            {t(
+              "No property can be pinned. Every property on this account only grants view access; ask a property owner for Owner or Full access, then refresh.",
+            )}
+          </span>
+        </p>
+      )}
+
+      {!loading && !error && canWrite && selectableSites.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={save}
+            loading={saving}
+            disabled={!changed}
+          >
+            {changed ? t("Pin property") : t("Pinned")}
+          </Button>
+          <span className="text-micro text-ink-500 break-words">
+            {changed
+              ? t("Pin applies to reports for this connection; it does not change Google Search Console.")
+              : t("This property is already pinned.")}
+          </span>
+        </div>
+      )}
+
+      {!loading && !error && !canWrite && selectableSites.length > 0 && (
+        <p className="mt-2 text-micro text-ink-500">
+          {t("Only the workspace owner can pin a property.")}
+        </p>
+      )}
+
+      {note && (
+        <p className="mt-2 flex items-start gap-1.5 text-label text-accent break-words" role="status">
+          <IconCheck className="mt-0.5 shrink-0" />
+          <span>{t(note)}</span>
+        </p>
+      )}
+
+      <p className="mt-3 flex items-start gap-1.5 text-micro text-ink-500 break-words">
+        <IconLock className="mt-0.5 shrink-0" />
+        <span>
+          {t(
+            "Only Owner and Full access properties can be pinned. Refreshing reads the provider; it sends no report and makes no change.",
+          )}
+        </span>
+      </p>
+    </div>
+  );
+}
+
 /** One connection's detail: metadata, local check, rotate and revoke. */
 export function ConnectionDetail({
   row,
@@ -865,6 +1152,8 @@ export function ConnectionDetail({
   const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string; suffix?: string } | null>(null);
   const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
+  const shownCapabilities =
+    capabilities ?? (row.read?.qualified === true ? row.read.slug : null);
   const verify = providerMetaPending
     ? { supported: false, reason: "" }
     : verificationSupport(provider ?? null);
@@ -1078,10 +1367,10 @@ export function ConnectionDetail({
             </dd>
           </div>
         )}
-        {capabilities && (
+        {shownCapabilities && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">{t("Capabilities")}</dt>
-            <dd className="text-ink-200 break-words">{capabilities}</dd>
+            <dd className="text-ink-200 break-words">{shownCapabilities}</dd>
           </div>
         )}
       </dl>
@@ -1137,6 +1426,10 @@ export function ConnectionDetail({
         </dl>
       </details>
 
+      {hostedBoard && row.provider === "google_search_console" && (
+        <SearchConsoleProperty row={row} canWrite={canWrite} />
+      )}
+
       {note && (
         <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
           {t(note.text)}{note.suffix ? " " + t(note.suffix) : ""}
@@ -1152,9 +1445,21 @@ export function ConnectionDetail({
         </p>
       )}
       {canWrite && hostedBoard && !isSmtpSender(row) && (
-        <p className="text-label text-ink-400 mt-3">
-          {t("This account is managed through its own sign-in. To change it, connect it again from Add.")}
-        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setRotating(false);
+              setRevoking((v) => !v);
+            }}
+          >
+            {t("Disconnect…")}
+          </Button>
+          <span className="text-micro text-ink-500">
+            {t("Disconnecting also removes this account's grants and pinned property.")}
+          </span>
+        </div>
       )}
       {canWrite && hostedBoard && isSmtpSender(row) && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
@@ -1232,7 +1537,12 @@ export function ConnectionDetail({
         <RotateForm row={row} hostedBoard={hostedBoard} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (
-        <RevokeConfirm row={row} onDone={onRevoked} onClose={() => setRevoking(false)} />
+        <RevokeConfirm
+          row={row}
+          onDone={onRevoked}
+          onClose={() => setRevoking(false)}
+          hostedPlatform={hostedBoard && !isSmtpSender(row)}
+        />
       )}
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in connections are always present — they carry no credential and cannot be edited or disconnected through credential management.")}</p>
@@ -1519,10 +1829,14 @@ function RevokeConfirm({
   row,
   onDone,
   onClose,
+  hostedPlatform = false,
 }: {
   row: Connection;
   onDone: () => void;
   onClose: () => void;
+  /** A hosted platform account: revoke disables the provider account and
+   *  removes its selected property, not a local SMTP binding. */
+  hostedPlatform?: boolean;
 }) {
   const t = useTranslate();
   const [armed, setArmed] = useState(false);
@@ -1569,7 +1883,11 @@ function RevokeConfirm({
 
   return (
     <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
-      <p className="text-label text-ink-200 break-words">{t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}</p>
+      <p className="text-label text-ink-200 break-words">
+        {hostedPlatform
+          ? t("Disconnecting disables this provider account and revokes its connection grants. The pinned Search Console property is removed. This cannot be undone — connecting the account again creates a new connection.")
+          : t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}
+      </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
           type="checkbox"
@@ -1579,7 +1897,10 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          {t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}</span>
+          {hostedPlatform
+            ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned property.").replace("{connectionLabel}", () => connectionLabel(row))
+            : t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}
+        </span>
       </label>
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -1588,7 +1909,11 @@ function RevokeConfirm({
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="danger" size="sm" onClick={submit} loading={busy} disabled={!armed}>
-          {busy ? t("Disconnecting…") : t("Disconnect")}
+          {busy
+            ? t("Disconnecting…")
+            : hostedPlatform
+              ? t("Disconnect account")
+              : t("Disconnect")}
         </Button>
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>

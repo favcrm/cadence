@@ -1,11 +1,8 @@
 //! The `[A-Za-z0-9_-]` identifier grammar, in one place.
 //!
-//! More than one producer has to agree on it. An attribution handle lands
-//! in the store's comment-author / `<actor> via board` grammar (CAD-1300),
-//! and a project-policy grant is only matchable by a caller whose key was
-//! derived the same way. Three separate copies of this derivation is how a
-//! member ends up refused on one surface and admitted on another, so the
-//! grammar, the bound and the sanitizer live here (AOS-274).
+//! More than one producer has to agree on it for attribution fields.
+//! Sanitized handles are lossy and must not establish authorization by
+//! themselves; an authorization decision must use an unambiguous subject.
 
 /// The longest handle any derivation keeps. A longer subject is cut, so
 /// nothing longer can ever be a caller key — the store refuses such a grant
@@ -13,9 +10,7 @@
 pub(crate) const HANDLE_MAX: usize = 64;
 
 /// `raw` in the identifier grammar: every character outside the grammar
-/// becomes `_`, cut to [`HANDLE_MAX`]. Two subjects that differ only
-/// outside the grammar collide, which is the point: the store holds one
-/// spelling per member.
+/// becomes `_`, cut to [`HANDLE_MAX`]. Distinct subjects can collide.
 pub(crate) fn sanitized(raw: &str) -> String {
     raw.chars()
         .map(|c| if is_ident_char(c) { c } else { '_' })

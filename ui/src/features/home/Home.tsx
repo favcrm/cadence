@@ -1,5 +1,5 @@
-import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -31,9 +31,11 @@ import Composer from "./Composer";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
+  AssistantBootstrapCard,
   AssistantFace,
   useAssistantActor,
   useConversationActor,
+  useHostedPersonalBootstrap,
 } from "../assistant/AssistantIdentity";
 import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
@@ -43,10 +45,13 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
+import PermissionsSlashCard from "./PermissionsSlashCard";
+import { appendRejectReplyDraft, PermissionReplyContext } from "./PermissionCard";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
 import { TurnBar } from "../app-shell/chat/TurnBar";
-import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
+import { composerDraftState, setComposerDraft } from "../app-shell/chat/composerStore";
+import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
@@ -84,6 +89,7 @@ import {
   threadItems,
   visibleWindow,
   WINDOW,
+  type PendingAttachment,
   type ThreadEntry,
   type ThreadItem,
 } from "./thread";
@@ -366,6 +372,8 @@ function WorkingRow({
 /** A `/` command's answer card (CAD-551), kept client-side — a read's
  * result, a mutation's ack (the durable system line also lands via the
  * stream), or the failure the daemon returned. */
+const HOME_COMPOSER_ID = "cadence-home-composer";
+
 interface CmdResult {
   id: number;
   name: string;
@@ -373,6 +381,8 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
+  /** Composer-local rich slash cards handled completely in client state. */
+  kind?: "permissions";
   /** This board cannot run the command: nothing was sent, and nothing failed. */
   unavailable?: boolean;
   /** The verb exists, but what was typed was not a use of it: nothing was sent. */
@@ -417,7 +427,17 @@ function CmdJson({ value }: { value: unknown }) {
   );
 }
 
-function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
+function CmdCard({
+  cmd,
+  onOpenIssue,
+  readOnly,
+  permissionsHref,
+}: {
+  cmd: CmdResult;
+  onOpenIssue: (id: string) => void;
+  readOnly: boolean;
+  permissionsHref: string;
+}) {
   const t = useTranslate();
   return (
     <div className="cmdcard card px-3 py-2 ml-8 min-w-0" data-cmd={cmd.name}>
@@ -438,7 +458,9 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
-      {cmd.value !== undefined ? (
+      {cmd.kind === "permissions" ? (
+        <PermissionsSlashCard readOnly={readOnly} permissionsHref={permissionsHref} />
+      ) : cmd.value !== undefined ? (
         <CmdJson value={cmd.value} />
       ) : (
         cmd.text && (
@@ -536,7 +558,7 @@ const retry = (
   message: string,
   text: string,
   refs?: ThreadRef[],
-  attachments?: { id: string }[],
+  attachments?: PendingAttachment[],
   conversation?: string,
 ) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
@@ -551,6 +573,7 @@ const discard = (message: string) => resources.masterThread.write((s) => discard
  */
 const ThreadList = memo(function ThreadList({
   items,
+  conversation,
   limit,
   moreBefore,
   loadingEarlier,
@@ -564,6 +587,9 @@ const ThreadList = memo(function ThreadList({
   stale,
 }: {
   items: ThreadItem[];
+  /** The Home conversation this list shows (CAD-2228): its live preview
+   *  text paints on the turn that is generating. */
+  conversation: string | null;
   limit: number;
   moreBefore: boolean;
   loadingEarlier: boolean;
@@ -575,7 +601,7 @@ const ThreadList = memo(function ThreadList({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     conversation?: string,
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
@@ -649,6 +675,7 @@ const ThreadList = memo(function ThreadList({
       <Conversation
         mode={{ kind: "home" }}
         items={shown}
+        conversation={conversation}
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
@@ -691,7 +718,7 @@ const ThreadList = memo(function ThreadList({
             // One assistant turn: face, "now", and the typing bubble. HomeList
             // paints it as its own row under the message, and keeps that row's
             // key when the real steps arrive, so the head does not splash.
-            node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
+            node: needsTypingTurn ? <ThreadTurn items={[]} running previewConversation={conversation} /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
             ...(anchorItem === null ? { fallback: true as const } : {}),
           };
@@ -743,9 +770,11 @@ export default function Home({
   resolveAppPath,
   setupNotice = null,
   operator = null,
+  credentialRequestsEnabled = true,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
   /** CAD-1817: the verified session proves operator authority, the only
    *  viewer that may edit the workspace coordinator's identity. `null`
    *  is unproven, never an operator. */
@@ -812,6 +841,7 @@ export default function Home({
       resolveAppPath={resolveAppPath}
       setupNotice={setupNotice}
       operator={operator}
+      credentialRequestsEnabled={credentialRequestsEnabled}
     />
   );
 }
@@ -830,9 +860,11 @@ function MasterHome({
   resolveAppPath,
   setupNotice = null,
   operator = null,
+  credentialRequestsEnabled = true,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
@@ -876,8 +908,10 @@ function MasterHome({
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
-  const writeBlock = useWriteBlock(readOnly);
+  const gateBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
   const block = composerBlock(writeBlock, status, hosted);
+  const effectiveReadOnly = readOnly || writeBlock !== null;
   const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
   const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
@@ -924,7 +958,8 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
-  const permissionPending = usePendingPermission(threadEntries);
+  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted !== true);
+  const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
   // A first connection in progress is not an outage, so it shows no notice.
@@ -962,6 +997,7 @@ function MasterHome({
     const warn = "bg-warn/10 text-warn";
     const ok = "bg-ok/15 text-ok";
     if (status.kind === "unknown") return { label: status.kind, tone: "bg-ink-800 text-ink-400" };
+    if (status.kind === "unavailable") return { label: t("Availability unknown"), tone: warn };
     if (status.kind !== "running") return { label: status.kind === "absent" ? t("not started") : status.kind, tone: warn };
     if (streamReconnecting && activeTurn) {
       return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };
@@ -1055,7 +1091,7 @@ function MasterHome({
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
-  // reconnect `streamInto` resumes with `?after=<last id>` and the
+  // reconnect the subscription resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
   useThreadStream(
     resources.masterThread,
@@ -1064,6 +1100,11 @@ function MasterHome({
       || !Object.hasOwn(master.data, "actor_identity")
       || thread.data?.conversation !== undefined),
     setLink,
+    undefined,
+    undefined,
+    // CAD-2228: this stream's preview frames are the home conversation's
+    // in-flight text, shown only while that conversation generates.
+    homeConversation ?? null,
   );
 
   // Keep master_state honest: it follows the agents resource's
@@ -1133,18 +1174,33 @@ function MasterHome({
     const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
     if (!receipt.ok) throw new Error(receipt.error);
   }, [readOnly, block, homeConversation, engage]);
+  const homePersonalRevision =
+    homeProjection?.scope === "personal" &&
+    homeProjection.identity !== null &&
+    typeof homeProjection.identity === "object" &&
+    "revision" in homeProjection.identity &&
+    typeof homeProjection.identity.revision === "number"
+      ? homeProjection.identity.revision
+      : null;
+  const personalBootstrap = useHostedPersonalBootstrap(
+    hosted === true && !readOnly && homeProjection?.scope === "personal",
+    homeConversation ?? null,
+    homePersonalRevision,
+  );
   const actor = useConversationActor(
     master,
     operator === true && !readOnly,
     homeConversation ?? null,
     readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+    !readOnly,
+    personalBootstrap.identity,
   );
   const onRetrySend = useCallback(
     (
       message: string,
       text: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       conversation?: string,
     ) => {
       engage();
@@ -1372,6 +1428,10 @@ function MasterHome({
         ]);
         return false;
       }
+      if (name === "permissions") {
+        setCmds((c) => [...c, { id, name, ok: true, kind: "permissions" }]);
+        return;
+      }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api
         .masterCommand(name, arg || undefined)
@@ -1430,6 +1490,10 @@ function MasterHome({
 
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
+  const bootstrapCardIdentity =
+    !readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "pending"
+      ? personalBootstrap.identity ?? (actor.read.state === "ready" ? actor.read.identity : null)
+      : null;
 
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
@@ -1444,8 +1508,33 @@ function MasterHome({
     });
   };
 
+  const focusHomeComposer = useCallback(() => {
+    const box = dockRef.current?.querySelector<HTMLTextAreaElement>(`#${HOME_COMPOSER_ID}`)
+      ?? (document.getElementById(HOME_COMPOSER_ID) as HTMLTextAreaElement | null);
+    box?.focus();
+  }, []);
+
+  const focusApprovalBar = useCallback(() => {
+    const bar = dockRef.current?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
+    if (!bar) return false;
+    const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
+    target.focus();
+    return true;
+  }, []);
+
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (effectiveReadOnly) return;
+      const existing = composerDraftState("home").text;
+      setComposerDraft("home", appendRejectReplyDraft(existing, command));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1496,12 +1585,25 @@ function MasterHome({
                 <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
                   {headerChip.label}
                 </span>
+                {actor.scope === "personal" && personalBootstrap.bootstrap === "pending" && (
+                  <span className="text-micro text-ink-500">{t("first-time setup")}</span>
+                )}
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
                 <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} scope={scopeDescriptor(actor.scope, t)} />
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {!readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "deferred" && (
+                <button
+                  type="button"
+                  className="lnk text-label"
+                  disabled={personalBootstrap.resuming}
+                  onClick={() => void personalBootstrap.resume()}
+                >
+                  {t("Finish setup")}
+                </button>
+              )}
               <AssistantAboutButton />
             </div>
           </div>
@@ -1527,21 +1629,29 @@ function MasterHome({
             data-chat-scroll
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
-            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && (
+            {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
+              <AssistantBootstrapCard
+                identity={bootstrapCardIdentity}
+                onComplete={personalBootstrap.complete}
+                onDefer={personalBootstrap.defer}
+              />
+            )}
+            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <NotStarted status={status} hosted={hosted} />
               </div>
             )}
-            {thread.data?.cloudWithheld == null && empty && !showNotStarted && (
+            {thread.data?.cloudWithheld == null && empty && !showNotStarted && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
               </div>
             )}
 
-            <CredentialRequestList conversationId={homeConversation} className="mx-1" />
+            <CredentialRequestList conversationId={homeConversation} enabled={credentialRequestsEnabled} className="mx-1" />
             <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}
+              conversation={homeConversation ?? null}
               limit={limit}
               moreBefore={moreBefore}
               loadingEarlier={loadingEarlier}
@@ -1556,7 +1666,13 @@ function MasterHome({
             />
             </ImageConversation.Provider>
             {cmds.map((c) => (
-              <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
+              <CmdCard
+                key={c.id}
+                cmd={c}
+                onOpenIssue={onOpenIssue}
+                readOnly={effectiveReadOnly}
+                permissionsHref={permissionsHref}
+              />
             ))}
           </div>
 
@@ -1592,9 +1708,16 @@ function MasterHome({
                             ? [{ kind: r.kind, id: r.id }]
                             : [];
                         });
-                        const attachments = list("attachments").flatMap((item) => {
-                          const a = item as { id?: unknown };
-                          return typeof a.id === "string" ? [{ id: a.id }] : [];
+                        const attachments = list("attachments").flatMap((item): PendingAttachment[] => {
+                          const a = item as { id?: unknown; name?: unknown; size?: unknown; mime?: unknown };
+                          return typeof a.id === "string"
+                            ? [{
+                                id: a.id,
+                                ...(typeof a.name === "string" ? { name: a.name } : {}),
+                                ...(typeof a.size === "number" ? { size: a.size } : {}),
+                                ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                              }]
+                            : [];
                         });
                         const mediaRefs = list("media_refs").flatMap((item) => {
                           if (!item || typeof item !== "object") return [];
@@ -1616,6 +1739,16 @@ function MasterHome({
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
                 },
               }}
+              permission={
+                pendingPermission !== null
+                  ? {
+                      request: pendingPermission,
+                      readOnly: effectiveReadOnly,
+                      onRejectAndReply: (req) => rejectAndReplyDraft(req.command),
+                      onFocusComposer: focusHomeComposer,
+                    }
+                  : null
+              }
             />
             {/* Another conversation's turn (an app's), with its link: Home's
                 own turn is the turn bar above. */}
@@ -1634,6 +1767,8 @@ function MasterHome({
               commands={offered}
               onSent={engage}
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
+              textareaId={HOME_COMPOSER_ID}
+              onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
@@ -1646,6 +1781,7 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </PermissionReplyContext.Provider>
     </AssistantActorProvider>
   );
 }

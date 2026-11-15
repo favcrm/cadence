@@ -1,4 +1,5 @@
 import type { LanePayload } from "../features/issues/lane";
+import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
 import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
@@ -27,10 +28,13 @@ import type {
   AppsPayload,
   ConnectionPayload,
   ConnectionProvidersPayload,
+  ConnectionSitePayload,
+  ConnectionSitesPayload,
   ConnectionsPayload,
   ConnectionVerificationPayload,
   CredentialRequest,
   Health,
+  ProjectTimeline,
   ProtectedEntry,
   IssueCard,
   IssueDetail,
@@ -56,8 +60,6 @@ import type {
   Overview,
   Project,
   ProjectContext,
-  ProjectPolicy,
-  ProjectPolicyPayload,
   ContextRole,
   ThreadRef,
   WorkflowPreview,
@@ -213,6 +215,23 @@ export interface MemberAssistantIdentity {
   revision: number;
 }
 
+export type MemberAssistProfileAction = "update" | "complete" | "defer" | "resume";
+
+/** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — zero-token
+ *  fenced update of the signed-in subject's personal assistant identity
+ *  (`name`, `look`) and `bootstrap_state` lifecycle. */
+export interface MemberAssistProfileRequest {
+  expected_revision: number;
+  action: MemberAssistProfileAction;
+  name?: string;
+  look?: AvatarLook;
+}
+
+export interface MemberAssistProfileResult extends MemberAssistState {
+  action: MemberAssistProfileAction;
+  applies: "next_turn";
+}
+
 /** `POST /api/master/identity` (CAD-1817): the proven operator's
  *  workspace-identity edit. Only the supplied fields change; an empty
  *  string clears `name`/`tone`. */
@@ -229,15 +248,14 @@ export interface MasterIdentityUpdateResult {
   applies: "next_turn";
 }
 
-/** `POST /api/member-assistant/history` — the member's bound conversation
- *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
- *  forward resume watermark. A member names no thread — the binding's
- *  own conversation is always the read. */
+/** The member's bound assistant history, with opaque page positions. */
 export interface MemberAssistHistory {
-  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  conversation: { id: string; alias: string };
   entries: unknown[];
-  cursor?: number;
-  more_before?: boolean;
+  cursor: string | null;
+  before_cursor: string | null;
+  more_before: boolean | null;
+  more_after: boolean | null;
 }
 
 /** `POST /api/member-assistant/send` receipt: the accepted message id and
@@ -358,6 +376,31 @@ async function write<T extends object | undefined>(
   });
 }
 
+function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unknown): T {
+  if (status < 200 || status >= 300) {
+    const record =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    const nested =
+      record && typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const nestedCode =
+      typeof record?.code === "string"
+        ? record.code
+        : typeof nested?.code === "string"
+          ? nested.code
+          : undefined;
+    throw new ApiError(
+      errorMessage(parsed, fallbackMessage),
+      status,
+      record ? { ...record, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
+    );
+  }
+  return parsed as T;
+}
+
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
 async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
@@ -372,16 +415,25 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    if (!resp.ok) {
-      // Some routes nest the code under `error`, as the read path already allows for.
-      const nestedCode = parsed?.code ?? parsed?.error?.code;
-      throw new ApiError(
-        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
-        resp.status,
-        parsed ? { ...parsed, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
-      );
-    }
-    return parsed as T;
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+  });
+}
+
+/** A board write whose verb is PUT and which answers its own JSON. */
+async function put<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
   });
 }
 
@@ -582,21 +634,26 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
-  /** `GET /api/projects/<key>/policy` (CAD-1950) — the recorded access
-   *  policy, whether there is one, and whether this build may record
-   *  `private`. */
+  /** `GET /api/projects/<key>/policy` — the board's own policy record. The
+   *  native and hosted shapes differ (CAD-2255), so this is handed back
+   *  untyped and `features/projects/policyContract` validates it. */
   projectPolicy: (project: string) =>
-    get<ProjectPolicyPayload>(`/api/projects/${encodeURIComponent(project)}/policy`),
-  /** `POST /api/projects/<key>/policy` (CAD-1950) — the same writer the CLI
-   *  calls. `members` is the full grant list and replaces what was there. */
-  setProjectPolicy: (
+    get<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`),
+  /** `POST /api/projects/<key>/policy` (CAD-1950, native) — the same writer
+   *  the CLI calls. `members` is the full grant list. */
+  setProjectPolicyNative: (
     project: string,
     req: { visibility: "workspace-visible" | "private"; members: string[] },
   ) =>
-    post<{ project: string; policy: ProjectPolicy; committed: boolean }>(
-      `/api/projects/${encodeURIComponent(project)}/policy`,
-      req,
-    ),
+    post<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
+  /** `PUT /api/projects/<key>/policy` (AOS-530, hosted) — `grants` are
+   *  verified member subject ids and `if_rev` pins the stored revision
+   *  (`""` for a project with no row yet). */
+  setProjectPolicyHosted: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; grants: string[]; if_rev: string },
+  ) =>
+    put<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
     if (expectedRevision) query.set("expected_revision", expectedRevision);
@@ -762,7 +819,7 @@ export const api = {
    *  authority: the contextual Threads reply pins the recorded sender it
    *  is answering, and the daemon refuses before any side effect when
    *  the alias now names a different uid. Ordinary sends omit it. */
-  threadSend: (
+  threadSend: async (
     alias: string,
     text: string,
     message: string,
@@ -773,24 +830,38 @@ export const api = {
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     expectedRecipientUid?: string,
-  ) =>
-    post<Record<string, unknown>>(
+  ): Promise<Record<string, unknown>> => {
+    const payload: Record<string, unknown> = {
+      text,
+      message,
+      ...(refs && refs.length > 0 ? { refs } : {}),
+      ...(app ? { app } : {}),
+      // CAD-1098: only a selector; the daemon resolves scope, subject and install.
+      ...(conversation ? { conversation } : {}),
+      // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+      // grammar and existence, never the client's metadata.
+      ...(attachments && attachments.length > 0
+        ? { attachments: attachments.map((a) => ({ id: a.id })) }
+        : {}),
+      ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+      ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
+    };
+    const hasNativeOnlyContext =
+      (refs !== undefined && refs.length > 0) ||
+      (mediaRefs !== undefined && mediaRefs.length > 0) ||
+      Boolean(expectedRecipientUid);
+    if (alias === "master" && !hasNativeOnlyContext) {
+      const viaSocket = await sendMasterMessageViaSocket(alias, payload, operation);
+      if (viaSocket !== null) {
+        return unwrapPostJson<Record<string, unknown>>(viaSocket.status, `${viaSocket.status}`, viaSocket.body);
+      }
+    }
+    return post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      {
-        text,
-        message,
-        ...(refs && refs.length > 0 ? { refs } : {}),
-        ...(app ? { app } : {}),
-        // CAD-1098: only a selector; the daemon resolves scope, subject and install.
-        ...(conversation ? { conversation } : {}),
-        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
-        // grammar and existence, never the client's metadata.
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
-        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
-      },
+      payload,
       operation,
-    ),
+    );
+  },
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
    *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
@@ -879,12 +950,15 @@ export const api = {
    *  assistant envelope server-side. Body is `{}`. */
   memberAssistState: () =>
     post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — fenced
+   *  actor-bound personal identity and bootstrap lifecycle update. */
+  memberAssistProfileUpdate: (body: MemberAssistProfileRequest) =>
+    post<MemberAssistProfileResult>(`/api/member-assistant/profile`, body),
   /** `POST /api/member-assistant/history` — a page of the member's bound
-   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
-   *  fields; a member never names a thread (the binding owns it). */
+   *  conversation. Positions are opaque; the binding owns the thread. */
   memberAssistHistory: (page: {
-    after?: number;
-    before?: number;
+    after?: string;
+    before?: string;
     tail?: boolean;
     limit?: number;
   }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
@@ -1172,6 +1246,20 @@ export const api = {
   connection: (id: string) =>
     get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),
   /**
+   * `GET /api/connections/<id>/sites` — the live Search Console properties
+   * and the current connection-level pin (operator-only). A provider
+   * refusal is an error, never an empty list.
+   */
+  connectionSites: (id: string) =>
+    get<ConnectionSitesPayload>(`/api/connections/${encodeURIComponent(id)}/sites`),
+  /**
+   * `POST /api/connections/<id>/site` — pin one verified Search Console
+   * property (operator-only). The server re-reads the provider list before
+   * storing the exact identifier.
+   */
+  connectionSelectSite: (id: string, body: { site_url: string }) =>
+    post<ConnectionSitePayload>(`/api/connections/${encodeURIComponent(id)}/site`, body),
+  /**
    * `POST /api/connections` — enroll a scoped token for a supported
    * provider (CAD-688). Operator-only. The token crosses this one
    * request into daemon custody; the caller clears it immediately and
@@ -1429,6 +1517,16 @@ export const api = {
   /** `GET /api/milestones?project=` — progress and worst health per milestone. */
   milestones: (project: string) =>
     get<{ milestones: MilestoneRow[] }>(`/api/milestones?project=${encodeURIComponent(project)}`),
+  /** CAD-2240: `GET /api/projects/<key>/timeline` — hosted boards only; any other board answers 501. */
+  projectTimeline: (project: string, query: { before?: string | null; kinds?: string[]; open?: boolean; limit?: number }, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (query.limit) params.set("limit", String(query.limit));
+    if (query.before) params.set("before", query.before);
+    if (query.kinds?.length) params.set("kind", query.kinds.join(","));
+    if (query.open) params.set("open", "1");
+    const qs = params.toString();
+    return get<ProjectTimeline>(`/api/projects/${encodeURIComponent(project)}/timeline${qs ? `?${qs}` : ""}`, signal);
+  },
   /** `POST /api/epics/<id>/stage` — relays `epic_stage`; operator-only on the board. */
   moveStage: (epic: string, stage: string, note?: string) =>
     post<{ epic: string; from: string; to: string; by: string; at: string }>(
@@ -1452,13 +1550,25 @@ export const api = {
   /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
    *  merge approval for the exact head the drawer showed. A moved head
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
-  approveHead: (repo: string, pr: number, head: string) =>
-    post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  approveHead: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    post<{ approval_id: string }>("/api/approvals/approve", {
+      repo,
+      pr,
+      head,
+      ...(context?.issue ? { issue: context.issue } : {}),
+      ...(context?.project ? { project: context.project } : {}),
+    }),
   /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
    *  approval in force, revoked, or none. */
-  approvalState: (repo: string, pr: number, head: string) =>
-    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
-      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+  approvalState: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    get<{
+      state: "in-force" | "revoked" | "missing";
+      approval_id?: string;
+      board_revocable?: boolean;
+      verdicts?: unknown[];
+      precheck?: { verdicts?: unknown[] };
+    }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}${context?.issue ? `&issue=${encodeURIComponent(context.issue)}` : ""}${context?.project ? `&project=${encodeURIComponent(context.project)}` : ""}`,
     ),
   /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
   revokeApproval: (id: string, reason: string) =>

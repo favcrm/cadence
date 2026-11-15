@@ -619,11 +619,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     issuer,
                     org,
                     auth_dir,
-                } => cadence_agent::remote_auth::status(
-                    auth_dir.as_deref(),
-                    issuer.as_deref(),
-                    org.as_deref(),
-                ),
+                } => org::auth_status(auth_dir.as_deref(), issuer.as_deref(), org.as_deref()),
                 AuthAction::Logout { auth_dir, org } => {
                     if let Some(org) = org {
                         let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -1007,6 +1003,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Thread { .. }
         | Commands::Topic { .. }
         | Commands::Monitor { .. }
+        | Commands::Endpoint { .. }
         | Commands::Status { .. }
         | Commands::Team { .. }
         | Commands::McpPermission { .. }

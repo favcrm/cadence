@@ -1637,7 +1637,15 @@ impl Store {
                     WHERE c.is_cloud GROUP BY c.message_id \
                  ) \
                  SELECT i.id, m.sender_uid, m.recipient_uid, \
-                        c.message_id IS NOT NULL, c.agent_id, \
+                        (c.message_id IS NOT NULL OR EXISTS ( \
+                            SELECT 1 FROM origins missing \
+                            WHERE missing.message_id=i.id AND missing.origin IS NOT NULL \
+                              AND NOT EXISTS (SELECT 1 FROM messages parent WHERE parent.id=missing.origin) \
+                        ) OR ( \
+                            EXISTS (SELECT 1 FROM origins a WHERE a.message_id=i.id) \
+                            AND NOT EXISTS (SELECT 1 FROM origins a \
+                                            WHERE a.message_id=i.id AND a.origin IS NULL) \
+                        )), c.agent_id, \
                         c.owner_issuer, c.owner_subject \
                    FROM ids i LEFT JOIN messages m ON m.id=i.id \
                    LEFT JOIN cloud c ON c.message_id=i.id",

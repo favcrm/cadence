@@ -120,6 +120,7 @@ const ADVANCED: &[&str] = &[
     "delivery",
     "devin",
     "document",
+    "endpoint",
     "events",
     "idea",
     "intake",

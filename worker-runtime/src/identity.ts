@@ -111,6 +111,53 @@ export function readGenerationIdentity(
   return { conversation, task, cutoff: cutoffValue };
 }
 
+/**
+ * The summarization request of the exact compaction task attested by the
+ * engine's current phase, or nothing. A task's pinned tail does not change on
+ * a retry or after recovery, and its task id is distinct from the generation
+ * waiting for it.
+ */
+export function readCompactionIdentity(sql: TaskSql, taskId: number): GenerationIdentity | null {
+  if (!Number.isSafeInteger(taskId) || taskId <= 0) return null;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, conversation_id, record FROM pi_tasks
+          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`,
+        taskId,
+      )
+      .toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || row?.id !== taskId) return null;
+    const record = parseRecord(row.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    const checkpoint = (state as Record<string, unknown>).checkpoint;
+    if (
+      record?.id !== taskId ||
+      record.conversationId !== row.conversation_id ||
+      record.kind !== "pi.compaction" ||
+      (state as Record<string, unknown>).status !== "running" ||
+      typeof checkpoint !== "object" ||
+      checkpoint === null ||
+      Array.isArray(checkpoint)
+    )
+      return null;
+    const request = checkpoint as Record<string, unknown>;
+    if (request.phase !== "summarize") return null;
+    const part = (value: unknown): string | null =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0
+        ? String(value)
+        : null;
+    const conversation = part(record.conversationId);
+    const cutoff = part(request.tail);
+    if (conversation === null || cutoff === null) return null;
+    return { conversation, task: String(taskId), cutoff };
+  } catch {
+    return null;
+  }
+}
+
 /** The engine's stored pieces of one entry: its kind, its data and its messages. */
 export interface StoredEntryData {
   readonly kind: unknown;
@@ -334,6 +381,61 @@ function entryText(model: unknown): string | null {
   if (message.role !== "user" || typeof message.content !== "string")
     return null;
   return message.content;
+}
+
+/**
+ * Whether a blocking compaction the run itself waited on ended in a terminal
+ * failure.
+ *
+ * Only a compaction the run waited on counts: the engine creates a blocking
+ * threshold compaction as a child of the generation that needs it, while a
+ * background one is conversation-owned and may fail while its concurrent
+ * generation still succeeds. The owning generation must also have settled —
+ * the child commits its outcome before the generation reads it and ends the
+ * run — so a read between those commits reports nothing yet.
+ *
+ * The message is the caller's own sentence: a failed compaction's stored error
+ * may carry provider prose, and this adapter never hands that out.
+ */
+export function readCompactionFailure(sql: TaskSql, conversationId: number): boolean {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return false;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, record FROM pi_tasks
+          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
+          ORDER BY id DESC LIMIT 1`,
+        conversationId,
+      )
+      .toArray();
+    const row = rows[0];
+    if (row === undefined || !Number.isSafeInteger(row.id)) return false;
+    const id = Number(row.id);
+    // A record written after the failure — a placed summary, an answer, or the
+    // next input — means the failure belongs to history, not to the run on
+    // screen.
+    const latest = sql
+      .exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId)
+      .toArray()[0]?.latest;
+    if (typeof latest === "number" && id <= latest) return false;
+    const record = parseRecord(row.record);
+    const owner = record?.owner;
+    if (!Number.isSafeInteger(owner)) return false;
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return false;
+    const terminal = state as Record<string, unknown>;
+    if (terminal.status !== "terminal") return false;
+    const outcome = terminal.outcome;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return false;
+    const status = (outcome as Record<string, unknown>).status;
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned") return false;
+    const parent = sql
+      .exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner as number)
+      .toArray()[0];
+    return parent === undefined || parent.status === "terminal";
+  } catch {
+    return false;
+  }
 }
 
 /** One stored `record` column's parsed JSON body, or `null` when it is not one. */

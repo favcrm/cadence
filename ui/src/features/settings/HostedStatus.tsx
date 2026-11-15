@@ -14,9 +14,11 @@ import { connectionsNeedingAttention } from "./connectionsView";
 export default function HostedStatus({
   meta,
   canReadConnections,
+  partialUpdates = false,
 }: {
   meta: { build_commit?: string | null };
   canReadConnections: boolean;
+  partialUpdates?: boolean;
 }) {
   const t = useTranslate();
   const listRes = canReadConnections ? resources.connections : null;
@@ -45,6 +47,14 @@ export default function HostedStatus({
             </small>
           </span>
         </div>
+        {partialUpdates && (
+          <div className="settings-row">
+            <span className="settings-row-text">
+              <b>{t("Sync")}</b>
+              <small>{t("Some projections refresh periodically in the background")}</small>
+            </span>
+          </div>
+        )}
         {listRes && list && !rows && (
           <div className="settings-row">
             <span className="settings-row-text">

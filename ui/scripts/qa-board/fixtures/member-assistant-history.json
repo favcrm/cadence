@@ -1,0 +1,12 @@
+{
+  "conversation": { "id": "cm_qa_board", "alias": "assistant" },
+  "entries": [
+    { "id": "csrid_qa_1", "role": "member", "kind": "message", "text": "Get a quote for 500 tote bags from the supplier.", "message": "m_qa_1", "created": 1794600000 },
+    { "id": "csrid_qa_2", "role": "agent", "kind": "tool_call", "text": "browser: open shop.example-supplier.test", "message": "m_qa_1", "created": 1794600005 },
+    { "id": "csrid_qa_3", "role": "agent", "kind": "turn_result", "text": "The quote form needs you to sign in. Open the Browser card to take over.", "message": "m_qa_1", "created": 1794600010 }
+  ],
+  "cursor": "csc1_3",
+  "before_cursor": "csc1_0",
+  "more_before": false,
+  "more_after": false
+}

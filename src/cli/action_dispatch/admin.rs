@@ -39,6 +39,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             apps,
             snapshot_working_tree,
             redact_history_secrets,
+            attest_chat_custody_absent,
         } => export::run(
             state_dir,
             out,
@@ -47,6 +48,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             apps,
             snapshot_working_tree,
             redact_history_secrets,
+            attest_chat_custody_absent,
         ),
         Commands::Restore {
             source,

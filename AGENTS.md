@@ -9,6 +9,36 @@ path `cadence agent show` prints, report with
 and discover peers with `cadence agent list`.
 <!-- cadence:end -->
 
+## Reviewer agents are read-only
+
+A reviewer is always a headless process the daemon starts, or a hosted board
+session: a reviewer pane is refused at register, build, open and adoption. The
+daemon pins a reviewer's `gh` credentials when it starts the process (at
+launch), not by brief. That is not a claim about the whole environment: the
+operator's SSH agent and the git credential helpers under `HOME` are NOT
+covered, so a local reviewer can still `git push` as the operator. The
+mechanisms, in the order they apply:
+
+- `gh` runs with a private empty `GH_CONFIG_DIR` under the reviewer's state dir
+  (`adapter::reviewer_gh_env`, CAD-844); `GH_TOKEN` is set only from the
+  operator's `CADENCE_REVIEWER_GH_TOKEN`, which must carry read-only scopes
+  (`contents:read`, `pull_requests:read`, `metadata:read`). `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are emptied. With no
+  token, `gh` is unauthenticated and fails closed. Every local headless launch
+  applies it.
+- The hosted gate refuses every tracker-mutation verb from a live
+  `role='reviewer'` agent credential (`checkCliCall`, code `reviewer_read_only`,
+  HTTP 403). It keeps the `cli.read` verbs, the reviewer's own verdict
+  (`issue_review`, `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
+- A reviewer reports back (its turn result, or its ticket tools in a hosted
+  session). Whoever dispatched it posts the PR comment or ticket comment.
+- Never run a reviewer under the operator's login or under a bridge grant that
+  carries `cli.write`. A brief is a denylist; this section names the credential
+  and the gate instead.
+- The pin is an environment, not an identity boundary: a same-user worker can
+  override it or read the operator's saved login, and only a separate user is a
+  credential boundary (`docs/REMOTE-AUTH.md`).
+
 ## Where the rules live
 
 This file holds the principles and the commands, not the policy. Where
@@ -143,8 +173,9 @@ the code you just wrote.
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
   satisfy the requirement. A hosted `routine` PR has no readiness record, so it
-  takes those two workflow rows and the operator approval they carry under the
-  auto-paths rule below (CAD-2135).
+  takes those two workflow rows and the operator approval they carry (CAD-2135),
+  unless the gate's dry run reports `class: auto` (the auto-paths rule below;
+  being on the list is not enough).
   A hosted `ui/**` PR takes those two rows, operator approval and `--browser-qa
   <url>`, naming an unedited comment on this PR by a repository member that is exactly the lines `Browser QA: pass` and
   `Head: <full sha>` (CAD-2173). Until it ends, a `ui/**` PR can instead take
@@ -155,9 +186,9 @@ the code you just wrote.
   advisory. Of the advisory links, it checks
   only that they are separate https URLs; it proves neither head binding nor
   that Browser QA ran. A second attested human is not required.
-- **Agents file no hosted verdict in this workspace.** Post findings as a PR
-  comment; that comment is the advisory link for `standards`, `spec-security` or
-  `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
+- **Agents file no hosted verdict in this workspace.** A reviewer reports its
+  findings back; the dispatcher posts them as a PR comment, and that comment is
+  the advisory link for `standards`, `spec-security` or `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
   refuses every owner-attested row while the author's login has no attested
   principal. A filed row has no retraction verb and is head-pinned; a
   same-person row refuses, `--exception` included, and moving the head voids
@@ -166,7 +197,7 @@ the code you just wrote.
   (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
   first pass on gate, security, schema and release PRs, where fresh-session Opus
   reviews stay the real review; two rows satisfy other PRs, with the operator
-  check still applying outside the auto-paths allowlist.
+  check still applying unless the gate's dry run reports `class: auto`.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -216,13 +247,23 @@ the code you just wrote.
     applies. The gate therefore inverts the rule: a PR with any workflow-issued
   row needs the operator's approval unless EVERY changed path matches
   `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
-  change is a plain add or modify (mode 100644). That list is EMPTY (`paths =
-  []`) and the reader and rules stay, so today the operator approves every
-  merge, and workflow rows only satisfy the two reviews. Enabling a path later
-  is one reviewed line and a later, deliberate decision, made only after reading
-  what the path holds. Whatever the list says, a path with a segment starting
-  with `.` or a basename starting `agents.`, `claude.` or `gemini.` is never
-  eligible. `cadence delivery requirements` does not report this rule; the
+  change is a plain add or modify (mode 100644). That list names Markdown
+  documentation only, `docs/**/*.md` (CAD-2254). A PR whose every path is on
+  it and in no human-class list (`docs/roles/**`, `docs/AUDIT.md` and the
+  other rule-7 documents stay human), with both workflow reviews passing at
+  its head, merges without the operator unless the size trigger, a non-`auto`
+  `Risk:` or the board's own approval requirement applies. Every other PR
+  still takes the
+  operator's approval, and workflow rows only satisfy its two reviews. No
+  code is listed: the path lists are not a complete map of sensitive code.
+  Adding a path is one reviewed line and a deliberate decision, made only
+  after reading what the path holds. Whatever the list says, some paths are
+  never eligible (hidden, agent-instruction and odd names, the one-review
+  excludes, the trigger 1 and 3 trees, and case variants of protected
+  paths), and an unreadable or emptied list means the operator:
+  `docs/roles/risk-classes.md` trigger 7 states the rule and
+  `workflow_auto_reasons` in `scripts/enqueue-reviewed` enforces it.
+  `cadence delivery requirements` does not report this rule; the
   script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
   force the operator. A workflow row that is not a pass refuses in every class.
   The tenant stops re-filing, not re-rolling: a run can be cancelled and
@@ -284,8 +325,9 @@ the code you just wrote.
   `Risk:` is `auto` or `human (<triggers>)`. The
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
-  thing. Link the note from the ticket. Hosted: one PR comment per review axis,
-  linked in the ticket comment (no verdict note); under the temporary
+  thing. Link the note from the ticket. Hosted: the dispatcher posts one PR comment per
+  review axis from the reviewer's report, linked in the ticket comment (no
+  verdict note); under the temporary
   `--exception` the gate wants `standards=` and `spec-security=` as two
   distinct PR comment URLs even when one review is required.
 - Before enqueueing, post one ticket comment for that head: every required
@@ -472,6 +514,17 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
+- Ask the operator only when the gate does (CAD-2254). Run
+  `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
+  `class:` line:
+  - `class: auto` and the dry run ends with every rule holding: enqueue the
+    PR yourself and report the merge. Do not ask for an approval the gate
+    does not need.
+  - `class: human (...)`, or a refusal that names a missing operator
+    approval: ask the operator once, and name the trigger the gate gives.
+  - A workflow review that says revise: fix the finding, push, and let the
+    new head be reviewed. Ask for `cadence audit accept-revise` only when
+    the finding is wrong, and say why it is wrong.
 - Temporary path (CAD-1946, remove this note when it ends): while the hosted
   reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
   --head <sha> --exception --advisory standards=<url> --advisory
@@ -614,8 +667,15 @@ Cadence's setting is the source of truth; this file names no model.
   `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …` commands),
   port 3010, the installed `~/.local/bin/cadence` or the tailnet. Never
   restart the daemon. Never signal or kill a process you did not start.
-- A production deploy needs exactly these two lines to the operator, and
-  nothing else:
+- A merge is not a release. Before handing over an update, confirm a build
+  that contains the change is promoted and published (`docs/RELEASING.md`,
+  "Prepare and promote the exact candidate"): a manual `staging.yml` dispatch
+  whose `promote` job succeeded with a matching `production-candidate`
+  receipt, then a successful `promotion-completion` run, its `publish-release`
+  job included. Green main CI and the automatic staging run promote nothing.
+  Dispatch a promotion only when the operator asks, and never approve it. Only
+  then send the operator exactly these two lines, and nothing else, to run
+  from a plain terminal. Never run them yourself, even when asked:
 
   ```
   cadence update --check --as operator:<name>

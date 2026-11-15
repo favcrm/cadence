@@ -138,17 +138,30 @@ the attempt if the callback fails. Attachment bytes are not written to the
 transcript. This callback does not enable image-returning tools; those retain
 their separate `acceptsToolImages` opt-in.
 
-**Context budget.** The gateway refuses a request that exceeds a trusted hosted
-size budget — the serialized context or the fully translated request including
-images — with a JSON 400 whose `error.type` is `invalid_request_error` and
-whose `error.code` is `context_budget_exceeded`. The runtime records a fresh
-task-bound refusal marker before the engine commits the failure. On transcript
-reads it presents `The context limit was reached. Start a fresh conversation
-or split the task and retry.` only when the marker and the entry's authoring
-task agree. The marker survives a restart and is invalidated before a repeated
-generation request, so unrelated HTTP or streamed error text cannot claim this
-reason. The marker triggers neither compaction nor retry. The raw gateway
-text stays private, the limit is unchanged and the task is not narrowed.
+**Context budget.** The runtime shortens long tool results from completed
+earlier turns in model requests, with an explicit incomplete-content notice.
+This shaping leaves the stored transcript and current operation's tool results
+unchanged. Artifact reads may be paged; use the returned continuation rather
+than assuming an earlier excerpt is complete.
+
+When the gateway refuses its byte budget with a JSON 400 whose `error.type` is
+`invalid_request_error` and `error.code` is `context_budget_exceeded`, the
+runtime records a task-bound marker and lets the engine attempt at most one
+overflow-triggered compaction per generation. The selected summary must not
+consume the current operation; if a safe cut is unavailable, it is declined.
+A long summary source is split into complete messages for the gateway's
+per-message limit, without discarding its content.
+
+The summary is a separately funded model request, identified by the actual
+durable compaction task and its pinned checkpoint tail, not by a concurrent
+generation. Missing or ambiguous task provenance refuses the request before
+dispatch. If compaction fails, finds no safe cut, or the retry still exceeds the
+budget, the transcript reports `The context limit was reached. Start a fresh
+conversation or split the task and retry.` only when the marker and the
+entry's authoring task agree. It remains hidden while recovery is in progress.
+The marker survives a restart and is invalidated before a repeated generation
+request; unrelated HTTP or streamed error text cannot claim this reason. Raw
+gateway text stays private and the gateway's limits are unchanged.
 
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
@@ -256,9 +269,9 @@ which settles the turn unanswered. A skipped hook, or a hook that cannot
 establish the scope — an unattributable run, a mixed run, a malformed stored
 scope — authors nothing and is therefore refused rather than sent unscoped. A
 fresh object per attempt is what makes an attestation un-reusable by any later
-request. Compaction's summarizer keeps the original unguarded path, and the
-operation guard composes with the identity guard on the same `Models`: both
-checks run, in install order.
+request. These generation guards compose on the same `Models` in install
+order. The compaction summarizer does not receive those generation context
+messages; its separate task-bound funding check fails closed instead.
 
 Each tool call receives `ToolInvocation.app`, the same resolved scope, after
 the refusal and live-authorization checks, so structured admission stays the
@@ -274,10 +287,40 @@ replaces the model, provider, session, turn or queue state. An unavailable or
 malformed projection fails the connection with a `503` capability refusal
 instead of serving a stale or partial header. `masterState` applies the same
 precedence to the HTTP header read.
-The composed master frame is serialized once before opening the watch or
-returning SSE `200`. Serialization failures (such as cycles or bigint values)
-and callable root `toJSON` hooks refuse with `503`. Ordinary data fields remain
-allowed; values shadowed by reserved runtime fields do not invalidate the frame.
+The watch attaches before the initial master state is read, closing the gap
+between that read and subscription. The composed frame is serialized before
+SSE `200`, then refreshed on turn and queue transitions. Serialization failures
+(such as cycles or bigint values) and callable root `toJSON` hooks refuse with
+`503`; a later state failure ends the stream. Ordinary fields remain allowed,
+and values shadowed by reserved runtime fields do not invalidate the frame.
+
+The thread stream also sends `preview` events with `{ "text": string | null }`
+for in-flight assistant text. They have no `id` and are not transcript
+entries: retry, cancellation or reconnect can replace them, while the committed
+entry and its `seq` remain authoritative. Thinking and tool arguments are not
+previewed. The preview stops at the first `{` or sensitive confirmation key
+anywhere in a message, including across text blocks; that suffix stays withheld
+until commit. This conservative rule also stops previews at benign braces.
+Preview text and tracked content blocks are bounded; an oversized partial is not
+a substitute for the final answer.
+The run's first engine submission must resolve to the operation in the current
+`master` turn; an older snapshot or buffered batch is suppressed when they
+differ or the submission cannot be resolved. A turn change clears the previous
+preview before the new header is sent.
+
+The browser clears a preview as soon as its connection closes, even if the
+status probe cannot answer. The browser opts in to partial board feeds with
+`accept_degraded=1`; when one declares degraded coverage, recovery refresh
+stays enabled while local invalidations continue, and Hosted Status
+(`/settings/status`) notes the background refresh without showing a
+workspace-wide warning banner. Older browsers remain on polling rather than
+treating the partial feed as complete.
+
+A slow thread reader reconnects from its last received durable `id` after the
+queued data crosses 256 KiB; already queued entries drain before closure. One
+crossing frame, or an oversized initial master frame plus the first entry, can
+exceed that threshold so the cursor can advance. The host must still
+revalidate session, tenant, role and conversation access on delivery.
 
 `HostedSession.recordCount()` reports active stored runtime records, not the
 number of expanded UI transcript parts. A host can combine it with `state()`
@@ -415,8 +458,9 @@ returns not found; an unavailable catalog is reported as unavailable rather
 than as an empty list. Hosted calls refuse `--platform`, `--account` and
 `--project` instead of silently changing the selected workspace.
 
-The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query` and
-`--input`, or accepts an explicit `--request <handle>`. If a call fails with a
+The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query`,
+`--input` and, for a connected read, `--connection`, or accepts an explicit
+`--request <handle>`. If a call fails with a
 timeout, 5xx or uncertain outcome, inspect its recorded state read-only before
 retrying:
 
@@ -436,6 +480,83 @@ persistence, and **replaying `platform call` will start and charge a new call
 when the original request was not recorded**. To deliberately run the same
 input again after a recorded call, pass a fresh `--request <handle>`.
 
+When the workspace has a qualified Search Console tool and an existing
+connection, a read names that connection explicitly. The same connection and
+input are needed to derive and verify its status:
+
+```sh
+REPORT='{"site_url":"sc-domain:example.test","start_date":"2026-01-01","end_date":"2026-01-31","dimensions":["query"]}'
+cadence --org acme platform call search_console_report --connection con_example --input "$REPORT"
+cadence --org acme platform status --tool search_console_report --connection con_example --input "$REPORT"
+```
+
+The read uses the workspace balance; `--max-charge` belongs to the separate
+local device protocol. A connection does not choose a Search Console property
+implicitly: enrollment links the provider account only, and the verified
+property is pinned separately in
+[Workspace connections and Search Console properties](#workspace-connections-and-search-console-properties).
+
+A replay without a recorded result is not a successful report. Hosted and
+local-device clients refuse to present a missing result as success and do not
+automatically dispatch another read.
+
+### Owner enrollment from the CLI (Search Console first)
+
+An owner enrolls a provider account from a plain shell, in three steps. The
+reads use `cli.read` (or `cli.write`); starting an enrollment is a mutation and
+needs `cli.write`:
+
+```sh
+cadence --org acme connection providers
+cadence --org acme connection ls
+cadence --org acme connection enroll google_search_console --no-open
+```
+
+`connection providers` lists the workspace's open toolkits and their read
+eligibility, including those that cannot yet be enrolled. The status
+`enrollment: available` means a qualified read exists; starting also requires
+the workspace's connector to be configured. The other requested providers
+are not qualified by this build.
+`connection ls` lists the accounts already linked to the workspace — a pending
+authorization the provider has not completed yet does not appear there.
+`connection enroll` answers one document whose `entry_url` is a one-time
+provider authorization link:
+
+```json
+{"entry_url":"https://provider.example/oauth?synthetic-request"}
+```
+
+Open that link yourself, in your own browser. The hosted server never opens a
+browser of its own, and this client prints the link exactly once as the
+successful command's output — it is never written to a log, a receipt, an
+error, or a diagnostic line. `--no-open` is the same behavior here (a hosted
+enrollment never opens a browser either way). Treat the link as a bearer
+secret until it is used. Provider permissions depend on the configured OAuth
+app; inspect the consent screen and do not proceed if it requests more than
+the intended read-only access. This flow does not verify the app's scopes.
+
+The three operations are for the live human workspace owner. A managed caller
+(an agent pane or a grant-bound child) is refused in this client before any
+request exists, because the stored login is the owner's and would otherwise
+act as the owner; the hosted server independently requires a live human owner.
+Local-only enrollment flags refuse instead of being dropped: `--scope` (the
+configured OAuth app determines provider scopes), `--shape` (the server records
+the account shape the provider authorizes) and `--agent` (a hosted enrollment
+binds the owner, not an agent). Enrollment links an account only: choosing a
+verified Search Console property is the separate, owner-only step in
+[Workspace connections and Search Console properties](#workspace-connections-and-search-console-properties).
+
+If the answer to `connection enroll` is lost, times out or is otherwise
+uncertain, the client reports an unknown outcome and never retries and never
+claims a link. The link cannot be read back, and `connection ls` lists only
+accounts whose provider callback already completed: an empty list does not
+prove that no link or pending authorization was issued. Starting again is a
+deliberate new enrollment, not a reconciliation step — it can create a second
+one-time link. A hosted server that predates these operations answers the
+unknown operation; that refusal says to update the hosted server first and
+never invents an empty list or a missing link, and the client never falls back
+to the local daemon.
+
 An image submission may return a queued job. Poll its returned `data.job.id`
 with the same workspace and `cli.write` grant, then download a succeeded job's
 retained artifact (`data.job.artifacts[].ref`) to a new local file:
@@ -445,10 +566,51 @@ cadence --org acme platform call get_media_job --query '{"jobId":"med_job_from_s
 cadence --org acme platform artifact med_job_from_submit.<64-hex-sha256> --out ./circle.png
 ```
 
-`get_media_job` is a live GET of the existing job (it can advance and settle
-that job, never starting a second generation). `platform artifact` streams the
-workspace's retained image bytes, verifies the SHA-256 digest and byte length
-in a private spool, and writes `<out>` only after verification succeeds.
+`get_media_job` is a live GET of the existing image job (it can advance and
+settle that job, never starting a second generation). For a video started by
+`media_generate`, read the existing job with
+`cadence --org acme platform call job_status --input '{"jobId":"med_job_from_submit"}'`.
+`platform artifact` reads retained PNG/JPEG images or MP4/WebM video in bounded
+pages. It verifies the full SHA-256 digest and byte length in a private spool
+on the destination filesystem, then publishes `<out>` without replacing an
+existing file. If the destination path changes during publication, the result
+may be uncertain; inspect the original directory before retrying. Images are
+limited to 10 MiB and videos to 100 MiB. Video retrieval also requires a server
+that supports video artifact pages.
+
+## Workspace connections and Search Console properties
+
+The hosted workspace owns its provider credentials and its enrolled accounts.
+Connection commands are owner-only and require a live human owner's `cli.read`
+/ `cli.write` grant; a member or a managed agent is refused.
+
+After `connection enroll` links a Search Console account (above), the account
+appears in `connection ls` with its exact connection ID. A Search Console
+account can expose several properties, including domain properties
+(`sc-domain:example.test`) and URL-prefix properties (`https://example.test/`).
+List them and pin one:
+
+```sh
+cadence --org acme connection sites <connection-id>
+cadence --org acme connection select-site <connection-id> 'sc-domain:example.test'
+```
+
+The site list includes `selected`, the exact property currently pinned or
+`null`.
+
+The selected property is stored by its exact provider identifier; it is not
+normalized. Only `siteOwner` and `siteFullUser` properties can be selected — a
+restricted or unverified property is refused. Once a property is selected,
+`search_console_report` reads for that connection must use exactly that
+`site_url`; a different value is refused before pricing or dispatch. Selecting
+again replaces the pin.
+
+Revoke the account when it is no longer needed; this disables the provider
+account, revokes its connection grants and drops the selected property:
+
+```sh
+cadence --org acme connection revoke <connection-id>
+```
 
 ## A teammate's own-agent collaboration flow
 
@@ -471,6 +633,7 @@ cadence --org acme issue new "Review shared handover" --project demo
 cadence --org acme issue show <issue-id>
 cadence --org acme issue comment <issue-id> -m "Read projects/demo/handover.md; updating the agreed approach."
 cadence --org acme issue set <issue-id> status=doing --if-rev <issue-rev>
+cadence --org acme issue project timeline demo --since 7d
 ```
 
 Use the exact revision returned by each corresponding read, not a guessed one.
@@ -481,6 +644,13 @@ Search results are discovery, not evidence:
 read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
+
+`wiki cp` copies a file or a folder into the hosted wiki and out of it on a
+board released since 2026-11-12 (AOS-566); see "Recursive copy" in
+`docs/guides/wiki-knowledge.md` for the board's limits, the timeout and what each
+exit code of a stopped job means. An older
+board answers `not_implemented` and copies nothing; there, write pages one at a
+time with `wiki put` (text) or `wiki upload` (binary).
 
 To start the issue on the already connected local default agent, the person
 operating that machine explicitly runs:
@@ -555,10 +725,17 @@ equal to the tip, a merge time, and the default branch as its base (GitHub keeps
 that head after a squash). A branch pushed but not merged does not release, and
 neither does a lane merged without a PR, a non-GitHub `origin`, or a case where
 `gh` is missing, not signed in or times out. The release also refuses
-when the worktree holds gitignored files other than top-level `target/` and
-`node_modules/` (for example `.env`, `docs/*`, `docs/target/`), naming a sample,
-because removal deletes them; git reports an ignored directory as one entry, so a
-file kept inside `target/` or `node_modules/` is deleted with it. When the
+when the worktree holds gitignored files it may not delete, naming a sample,
+because removal deletes them. It may delete top-level `target/`, any
+`node_modules/` or `__pycache__/` directory (or a symlink to one) at any depth,
+and the lane's `.env` while it is exactly what lane setup last wrote: when every
+line setup writes is its own (the cargo-shim `PATH`, the slot env), it records
+the file's sha256 in the worktree's own git dir, and one changed or extra line
+keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept
+(CAD-2290). Anything else ignored (for example `docs/*`, `claudedocs/`,
+`docs/target/`, or a lane's `.env` from before CAD-2290, which has no record)
+refuses. Git reports an ignored directory as one entry, so a file kept inside
+one of those directories is deleted with it. When the
 refusal will not change (the ledger cannot identify the lane, or no PR or
 ancestry evidence can exist), take the manual path: verify the merge, that
 nothing is using the lane and that you do not need its ignored files, then
@@ -714,8 +891,15 @@ renewal is another mint, and the file goes when the assignment ends.
 Stays on the member's login: claim, daemon reports and `agent report`; every
 wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
 `audit_verdict_project`). Not available to a managed agent session at all:
-`settings agents` and `master status`. They always refuse, and their message
-talks about a login grant; read it as "a managed agent session can't use this".
+`settings agents`, `master status` and `master resume`. They always refuse —
+owner-class settings authority is never delegated — and the refusal names the
+operator's plain shell and the grant-bound local path.
+
+An artifact review rides the agent credential, so it is recorded as the agent;
+on a login fallback it is recorded as the member. A member's agent can
+therefore review an artifact that member attached. That is attribution, not
+independent review: the merge gate, not artifact review, is what judges
+independence, and it still refuses the author's principal.
 
 **This is attribution and server-side refusal, not a security boundary.** The
 session runs as the same OS user and can still read the member's login file
@@ -728,7 +912,8 @@ What the client does when the credential is not available:
 | mint `404`, or `409 renewable_login_required` | keeps the login, one line on stderr |
 | authorize or call `403 human_session_required` (a workspace not yet updated to accept it) | keeps the login for the rest of the command, one line on stderr |
 | any other mint answer, or an unusable `200` | refuses; nothing is sent and the login is not used in its place |
-| the agent's own refusals: `401`, `403 forbidden`, and the rest | final, never retried on the login |
+| the agent's own refusals: `403 forbidden` and the rest | final, never retried on the login |
+| a `401` to a **cached** agent credential | drop the cache and re-mint once; a `401` to one just minted is final |
 
 ### Leaving a message for a role on a ticket
 
@@ -797,7 +982,12 @@ change, even where the board asks for fewer or no approval; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
 A hosted `routine` PR has no readiness record, because a hosted board has no
 delivery record to prove it from. It takes a pass from both review workflows at
-its head and the operator approval a workflow row needs; the gate's refusal names
+its head and the operator approval a workflow row needs, unless the gate's dry run
+reports `class: auto`. Matching `docs/roles/workflow-auto-paths.toml` is not enough
+on its own: a path that is human-class (for example `docs/INSTALL-AGENT.md` and
+`docs/REMOTE-AUTH.md`, CAD-2256), never eligible, a case variant of a protected
+path, or not a plain add or modify still needs the operator
+(`docs/roles/risk-classes.md` trigger 7 states the rule). The gate's refusal names
 what to dispatch. The exception also still waives this until it ends. The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. Agents in this workspace do
@@ -923,6 +1113,15 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
   immutable-notice snapshot pages under one captured watermark, then resumes newer
   events. Older generations cannot replace newer local custody. A transient claim
   failure retains its pending invalidation; blocked work needs explicit resumption.
+- When the daemon's workspace worker picks up a kickoff from the board for a
+  fenced default agent (`attention`, or holding an unknown message), it does not
+  queue it: the assignment is reported `blocked` with that reason instead of
+  `running` (CAD-2259). Resume the agent (reconcile or `agent unfence` first if
+  it holds an unknown message) or connect another default, then run
+  `cadence --org acme agent connect --local --alias <alias>` again (the saved
+  checkout is kept) to pick the blocked work up. `issue start <id> --repo`
+  without `--profile` sends from the CLI and is not checked this way yet
+  (CAD-2274).
 - Native custody is bounded to 512 entries / 4 MiB. The server limits unacknowledged
   events to 64 with a 30-second progress deadline. Slow consumers are disconnected,
   not treated as successful execution. When the inbox is full, inspect it and use

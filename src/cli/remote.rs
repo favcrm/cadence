@@ -17,6 +17,11 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
 }
 
+/// The kinds a hosted project timeline entry can carry (CAD-2240).
+const TIMELINE_KINDS: [&str; 7] = [
+    "created", "status", "owner", "claim", "comment", "message", "review",
+];
+
 pub(super) const HOSTED_ISSUE_LS_REFUSAL: &str = "the remote route's filter does not implement it";
 
 /// The presence checks and names used by both hosted routing and offline discovery.
@@ -30,13 +35,12 @@ struct HostedIssueLsOptions {
     blocked: bool,
     at: bool,
     sort: bool,
-    limit: bool,
     fields: bool,
     summary: bool,
 }
 
 impl HostedIssueLsOptions {
-    fn restrictions(self) -> [(&'static str, bool); 11] {
+    fn restrictions(self) -> [(&'static str, bool); 10] {
         [
             ("--stage", self.stage),
             ("--health", self.health),
@@ -46,14 +50,13 @@ impl HostedIssueLsOptions {
             ("--blocked", self.blocked),
             ("--at", self.at),
             ("--sort", self.sort),
-            ("--limit", self.limit),
             ("--fields", self.fields),
             ("--summary", self.summary),
         ]
     }
 }
 
-pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 11] {
+pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 10] {
     HostedIssueLsOptions::default()
         .restrictions()
         .map(|(flag, _)| flag)
@@ -253,7 +256,6 @@ fn verb_for(
                 blocked: *blocked,
                 at: at.is_some(),
                 sort: sort.is_some(),
-                limit: limit.is_some(),
                 fields: !fields.is_empty(),
                 summary: *summary,
             };
@@ -261,6 +263,14 @@ fn verb_for(
                 if present {
                     return Err(unsupported("issue ls", flag, HOSTED_ISSUE_LS_REFUSAL));
                 }
+            }
+            if let Some(n) = limit {
+                if !(1..=5000).contains(n) {
+                    return Err(Error::rejected(
+                        "remote `issue ls` --limit must be 1 to 5000 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
             }
             if project.len() > 1 {
                 return Err(Error::rejected(
@@ -800,6 +810,31 @@ fn verb_for(
             }
             "project_new"
         }
+        Commands::Project {
+            action:
+                ProjectCmd::Ls {
+                    sort,
+                    limit,
+                    fields,
+                    json: _,
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
+        }
         // CAD-1999: `issue project ls` reads the hosted registry, which
         // includes projects that exist only as their tickets' key. The
         // route takes no arguments, so the local row transforms refuse
@@ -831,6 +866,83 @@ fn verb_for(
                 }
             }
             "project_ls"
+        }
+        // CAD-2240: `issue project timeline <key>` reads one project's
+        // timeline. `--since` takes the grammar other listers accept and
+        // crosses the wire as an ISO instant; a kind the board does not
+        // know refuses here, before a request exists.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Timeline {
+                            key,
+                            since,
+                            kinds,
+                            open,
+                            limit,
+                            before,
+                            json: _,
+                        },
+                },
+        } => {
+            let key_ok = key.len() <= 32
+                && key.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !key_ok {
+                return Err(Error::rejected(format!(
+                    "'{key}' is not a project key (lower-case letters, digits and hyphens, \
+                     at most 32) — nothing was sent"
+                )));
+            }
+            args.insert("project".into(), json!(key));
+            if let Some(n) = limit {
+                if !(1..=100).contains(n) {
+                    return Err(Error::rejected(
+                        "--limit must be 1 to 100 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
+            }
+            if let Some(cursor) = before {
+                args.insert("before".into(), json!(cursor));
+            }
+            if let Some(bad) = kinds.iter().find(|k| !TIMELINE_KINDS.contains(&k.as_str())) {
+                return Err(Error::rejected(format!(
+                    "--kind '{bad}' is not a timeline kind ({}) — nothing was sent",
+                    TIMELINE_KINDS.join(", ")
+                )));
+            }
+            if !kinds.is_empty() {
+                let mut unique: Vec<&String> = Vec::new();
+                for kind in kinds {
+                    if !unique.contains(&kind) {
+                        unique.push(kind);
+                    }
+                }
+                args.insert("kinds".into(), json!(unique));
+            }
+            if let Some(spec) = since {
+                let at = cadence_agent::filter::parse_time(
+                    "since",
+                    spec,
+                    cadence_agent::issue::time::now_epoch(),
+                )?;
+                // An instant past year 9999 has no ISO form the board can read; its
+                // 400 would read as an older board (see `timeline_board_too_old`).
+                if !(0..=253_402_300_799).contains(&at) {
+                    return Err(Error::rejected(
+                        "--since is outside years 0000 to 9999 (an epoch is in seconds) — nothing was sent",
+                    ));
+                }
+                args.insert("since".into(), json!(cadence_agent::issue::time::iso(at)));
+            }
+            if *open {
+                args.insert("open_only".into(), json!(true));
+            }
+            "project_timeline"
         }
         Commands::Message {
             action:
@@ -999,6 +1111,82 @@ fn verb_for(
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        // CAD-2226: the three owner-enrollment acts ride the existing
+        // `platform_call` relay. The hosted workspace owns its stored login,
+        // its provider consent and every account it links, so a local flag
+        // naming any of them refuses here rather than being dropped from a
+        // request that would then enroll something else.
+        Commands::Connection { action } => {
+            match action {
+                ConnectionAction::Providers => {
+                    args.insert("operation".into(), json!("connection_providers"));
+                }
+                ConnectionAction::Ls => {
+                    args.insert("operation".into(), json!("connection_list"));
+                }
+                ConnectionAction::Enroll {
+                    provider,
+                    scopes,
+                    shape,
+                    agent,
+                    // Hosted enrollment prints the returned link for the
+                    // person's own browser; it never opens one here, so the
+                    // flag selects nothing on the wire.
+                    no_open: _,
+                } => {
+                    if !scopes.is_empty() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--scope",
+                            "a hosted enrollment takes the scopes the provider's own consent \
+                             screen grants, never a caller-selected list",
+                        ));
+                    }
+                    if shape.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--shape",
+                            "the hosted server records the shape of the account the provider \
+                             authorizes",
+                        ));
+                    }
+                    if agent.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--agent",
+                            "a hosted enrollment binds the live workspace owner, not a local \
+                             agent alias",
+                        ));
+                    }
+                    if !cadence_agent::remote_cli::connection_toolkit_slug(provider) {
+                        return Err(Error::invalid(
+                            "connection_start",
+                            "toolkit must be 1-64 of a-z 0-9 _ - starting with a-z",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("connection_start"));
+                    args.insert("body".into(), json!({"toolkit": provider}));
+                }
+                ConnectionAction::Sites { connection_id } => {
+                    args.insert("operation".into(), json!("connection_sites"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::SelectSite {
+                    connection_id,
+                    site_url,
+                } => {
+                    args.insert("operation".into(), json!("connection_select_site"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                    args.insert("body".into(), json!({ "siteUrl": site_url }));
+                }
+                ConnectionAction::Revoke { connection_id } => {
+                    args.insert("operation".into(), json!("connection_revoke"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                _ => return Err(unavailable(command_path)),
+            }
+            "platform_call"
+        }
         Commands::Platform { action } => {
             // CAD-1678: a hosted workspace owns its catalog, its accounts and
             // its per-project default, so a flag naming any of them cannot
@@ -1048,26 +1236,20 @@ fn verb_for(
                             "a hosted workspace resolves its own project",
                         ));
                     }
-                    // CAD-1974: the connected-read door is the local
-                    // `agenticos-provider` adapter. The hosted board has no
-                    // route for it in this build, so the flags refuse here
-                    // rather than being dropped from a call that then reads
-                    // the wrong account.
-                    if connection.is_some() {
-                        return Err(unsupported(
-                            "platform call",
-                            "--connection",
-                            "a hosted workspace has no connected-read door in this build; \
-                             run the read against the local agenticos-provider account",
-                        ));
-                    }
                     if max_charge.is_some() {
                         return Err(unsupported(
                             "platform call",
                             "--max-charge",
-                            "a hosted workspace has no connected-read door in this build; \
-                             run the read against the local agenticos-provider account",
+                            "a hosted workspace funds calls from its own balance",
                         ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_call",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
                     }
                     if !valid_platform_tool_slug(tool) {
                         return Err(Error::invalid(
@@ -1088,6 +1270,11 @@ fn verb_for(
                             "platform call needs --input or, on a hosted org, --query",
                         ));
                     }
+                    if connection.is_some() && (body.is_none() || query.is_some()) {
+                        return Err(Error::usage(
+                            "a hosted connected read takes --input and no --query",
+                        ));
+                    }
                     // The handle names the retry: an identical call replays the
                     // door's recorded outcome instead of charging again, so a
                     // second intentional run needs a fresh --request.
@@ -1101,11 +1288,26 @@ fn verb_for(
                             }
                             request.clone()
                         }
-                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
+                        None => platform_replay_key(
+                            tool,
+                            query.as_ref(),
+                            body.as_ref(),
+                            connection.as_deref(),
+                        ),
                     };
-                    args.insert("operation".into(), json!("call"));
+                    args.insert(
+                        "operation".into(),
+                        json!(if connection.is_some() {
+                            "connected_read"
+                        } else {
+                            "call"
+                        }),
+                    );
                     args.insert("tool".into(), json!(tool));
                     args.insert("key".into(), json!(key));
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
+                    }
                     if let Some(body) = body {
                         args.insert("body".into(), body);
                     }
@@ -1119,6 +1321,7 @@ fn verb_for(
                     tool,
                     input,
                     query,
+                    connection,
                 } => {
                     let body = match input {
                         Some(input) => Some(super::platform::parse_platform_input(input)?),
@@ -1132,6 +1335,19 @@ fn verb_for(
                         return Err(Error::usage(
                             "platform status with --input or --query requires --tool <tool>",
                         ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_status",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
+                        if tool.is_none() || body.is_none() || query.is_some() || job.is_some() {
+                            return Err(Error::usage(
+                                "connected-read status takes --connection with --tool and --input, and no --query or --job",
+                            ));
+                        }
                     }
                     let key = match request {
                         Some(request) => {
@@ -1153,6 +1369,7 @@ fn verb_for(
                                 tool.as_deref().unwrap_or_default(),
                                 query.as_ref(),
                                 body.as_ref(),
+                                connection.as_deref(),
                             ))
                         }
                         None => None,
@@ -1189,6 +1406,9 @@ fn verb_for(
                     }
                     if let Some(query) = query {
                         args.insert("query".into(), query);
+                    }
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
                     }
                 }
                 PlatformAction::Artifact { reference, .. } => {
@@ -1257,12 +1477,19 @@ fn valid_platform_tool_slug(value: &str) -> bool {
 /// from the tool and its input means a resubmitted identical call reads the
 /// door's recorded outcome instead of charging a second time, while a
 /// different input is a different call.
-fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) -> String {
+fn platform_replay_key(
+    tool: &str,
+    query: Option<&Value>,
+    body: Option<&Value>,
+    connection: Option<&str>,
+) -> String {
     use sha2::{Digest, Sha256};
     #[derive(serde::Serialize)]
     struct Material<'a> {
         // The field order preserves the existing BTreeMap serialization.
         body: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        connection: Option<&'a str>,
         query: Option<&'a Value>,
         tool: &'a str,
     }
@@ -1277,8 +1504,16 @@ fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) 
         }
     }
     let mut writer = HashWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, &Material { body, query, tool })
-        .expect("JSON values serialize to the hash writer");
+    serde_json::to_writer(
+        &mut writer,
+        &Material {
+            body,
+            connection,
+            query,
+            tool,
+        },
+    )
+    .expect("JSON values serialize to the hash writer");
     format!("pcli_{:x}", writer.0.finalize())
 }
 
@@ -1837,6 +2072,8 @@ fn artifact(
 
 /// Maximum size of a retained media artifact (`10 MiB`, matching `ARTIFACT_BYTES_MAX`).
 const PLATFORM_MEDIA_ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Video is streamed into custody with a separate 100 MiB limit.
+const PLATFORM_VIDEO_ARTIFACT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 fn remote_platform_artifact<E, P>(
     target: &cadence_agent::remote_cli::RemoteTarget,
@@ -1896,15 +2133,262 @@ where
     Ok(0)
 }
 
+// A private directory on the destination filesystem keeps the spool name
+// inaccessible to other users. Both it and the destination directory stay
+// open: renaming a directory cannot substitute the verified file at publish.
+struct MediaArtifactSpool {
+    parent: std::fs::File,
+    directory: std::fs::File,
+    directory_name: std::ffi::CString,
+    file: Option<std::fs::File>,
+}
+
+impl MediaArtifactSpool {
+    fn new(out: &std::path::Path) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        let parent_path = out
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let parent = std::fs::File::open(parent_path)
+            .map_err(|e| Error::rejected(format!("cannot open destination directory: {e}")))?;
+        let directory_name = std::ffi::CString::new(format!(
+            ".cadence-media-artifact-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("generated directory name contains no NUL");
+        // SAFETY: parent is open and directory_name is a single generated component.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), directory_name.as_ptr(), 0o700) } != 0 {
+            return Err(Error::rejected(format!(
+                "cannot create private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: open a directory relative to parent, without following a substitute symlink.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                directory_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::rejected(format!(
+                "cannot open private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: fd was just returned by openat and is not owned elsewhere.
+        let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = directory
+            .metadata()
+            .map_err(|e| Error::rejected(format!("cannot inspect media artifact spool: {e}")))?;
+        // A foreign user could have replaced the name between mkdirat and openat.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(Error::rejected(
+                "media artifact spool directory is not private",
+            ));
+        }
+        let mut spool = Self {
+            parent,
+            directory,
+            directory_name,
+            file: None,
+        };
+        // SAFETY: directory is private and pinned; O_EXCL refuses any existing name.
+        let fd = unsafe {
+            libc::openat(
+                spool.directory.as_raw_fd(),
+                c"artifact".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::rejected(format!(
+                "cannot open private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: fd was just returned by openat and is not owned elsewhere.
+        spool.file = Some(unsafe { std::fs::File::from_raw_fd(fd) });
+        Ok(spool)
+    }
+
+    fn parent_matches(&self, out: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = out
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match (self.parent.metadata(), std::fs::metadata(parent)) {
+            (Ok(pinned), Ok(current)) => {
+                pinned.dev() == current.dev() && pinned.ino() == current.ino()
+            }
+            _ => false,
+        }
+    }
+
+    fn publish(&self, out: &std::path::Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        self.file
+            .as_ref()
+            .expect("opened spool")
+            .sync_all()
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "cannot sync media artifact spool: {e}; nothing was written"
+                ))
+            })?;
+        let leaf = out
+            .file_name()
+            .and_then(|name| std::ffi::CString::new(name.as_bytes()).ok())
+            .ok_or_else(|| Error::rejected("media artifact destination needs a valid file name"))?;
+        if !self.parent_matches(out) {
+            return Err(Error::rejected(
+                "destination directory changed during download; nothing was written",
+            ));
+        }
+        // Prefer a no-replace rename: some filesystems cannot make hard links.
+        // Both directories are pinned and the source is private.
+        let renamed =
+            media_rename_noreplace(self.directory.as_raw_fd(), self.parent.as_raw_fd(), &leaf)
+                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
+        if !renamed {
+            // SAFETY: linkat refuses an existing destination and only resolves
+            // the source name inside our pinned private directory.
+            let rc = unsafe {
+                libc::linkat(
+                    self.directory.as_raw_fd(),
+                    c"artifact".as_ptr(),
+                    self.parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::rejected(format!(
+                    "cannot create {}: {}",
+                    out.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        let same_file = match (
+            self.file.as_ref().expect("opened spool").metadata(),
+            std::fs::symlink_metadata(out),
+        ) {
+            (Ok(verified), Ok(current)) => {
+                verified.dev() == current.dev() && verified.ino() == current.ino()
+            }
+            _ => false,
+        };
+        if !same_file {
+            return Err(Error::unknown(format!(
+                "destination changed during publication; the verified artifact may be in the original directory, not {}; inspect before retrying",
+                out.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn media_rename_noreplace(
+    source: std::os::fd::RawFd,
+    destination: std::os::fd::RawFd,
+    leaf: &std::ffi::CStr,
+) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: both descriptors are open directories and both names are valid C strings.
+    let rc = unsafe {
+        libc::renameat2(
+            source,
+            c"artifact".as_ptr(),
+            destination,
+            leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both descriptors are open directories and both names are valid C strings.
+    let rc = unsafe {
+        libc::renameatx_np(
+            source,
+            c"artifact".as_ptr(),
+            destination,
+            leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        if rc == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (source, destination, leaf);
+        Ok(false)
+    }
+}
+
+impl Drop for MediaArtifactSpool {
+    fn drop(&mut self) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: this name is relative to the private directory we opened.
+        unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"artifact".as_ptr(), 0) };
+        // Remove the directory only if its original name still identifies our
+        // pinned directory. A renamed or substituted directory is left alone.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.directory_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd was just returned by openat and is not owned elsewhere.
+            let current = unsafe { std::fs::File::from_raw_fd(fd) };
+            if let (Ok(a), Ok(b)) = (current.metadata(), self.directory.metadata()) {
+                if a.dev() == b.dev() && a.ino() == b.ino() {
+                    // SAFETY: removes only an empty directory at this basename.
+                    unsafe {
+                        libc::unlinkat(
+                            self.parent.as_raw_fd(),
+                            self.directory_name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    };
+                }
+            }
+        }
+    }
+}
+
 fn collect_platform_artifact(
     reference: &str,
     out: &std::path::Path,
     mut fetch: impl FnMut(u64) -> Result<Value>,
 ) -> Result<Value> {
     use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
-    #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::io::Write;
 
     if !valid_media_artifact_ref(reference) {
         return Err(Error::invalid(
@@ -1919,17 +2403,7 @@ fn collect_platform_artifact(
         )));
     }
     let (expected_job, expected_digest) = reference.split_once('.').expect("validated ref");
-    let mut spool = {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".cadence-media-artifact-");
-        #[cfg(unix)]
-        builder.permissions(std::fs::Permissions::from_mode(0o600));
-        builder.tempfile().map_err(|e| {
-            Error::rejected(format!(
-                "cannot open private media artifact spool: {e}; nothing was written"
-            ))
-        })?
-    };
+    let mut spool = MediaArtifactSpool::new(out)?;
     let mut offset = 0u64;
     let mut pinned_total: Option<u64> = None;
     let mut pinned_mime: Option<String> = None;
@@ -1951,7 +2425,7 @@ fn collect_platform_artifact(
         let mime = data
             .get("mime")
             .and_then(Value::as_str)
-            .filter(|m| matches!(*m, "image/png" | "image/jpeg"))
+            .filter(|m| matches!(*m, "image/png" | "image/jpeg" | "video/mp4" | "video/webm"))
             .ok_or_else(|| {
                 Error::rejected(
                     "remote media artifact has an unsupported or missing MIME type; nothing was written",
@@ -1972,7 +2446,14 @@ fn collect_platform_artifact(
         let total = data
             .get("total")
             .and_then(Value::as_u64)
-            .filter(|t| *t > 0 && *t <= PLATFORM_MEDIA_ARTIFACT_MAX_BYTES)
+            .filter(|t| {
+                let max = if mime.starts_with("video/") {
+                    PLATFORM_VIDEO_ARTIFACT_MAX_BYTES
+                } else {
+                    PLATFORM_MEDIA_ARTIFACT_MAX_BYTES
+                };
+                *t > 0 && *t <= max
+            })
             .ok_or_else(|| {
                 Error::rejected(
                     "remote media artifact total size is missing or out of bounds; nothing was written",
@@ -2020,11 +2501,16 @@ fn collect_platform_artifact(
                 "remote media artifact page made no progress or exceeded total; nothing was written",
             ));
         }
-        spool.write_all(&chunk).map_err(|e| {
-            Error::rejected(format!(
-                "cannot write media artifact spool: {e}; nothing was written"
-            ))
-        })?;
+        spool
+            .file
+            .as_mut()
+            .expect("opened spool")
+            .write_all(&chunk)
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "cannot write media artifact spool: {e}; nothing was written"
+                ))
+            })?;
         hasher.update(&chunk);
         offset += chunk.len() as u64;
         if offset == total {
@@ -2042,34 +2528,7 @@ fn collect_platform_artifact(
             "the media artifact's bytes do not match its SHA-256 digest; nothing was written",
         ));
     }
-    spool.seek(SeekFrom::Start(0)).map_err(|e| {
-        Error::rejected(format!(
-            "cannot rewind media artifact spool: {e}; nothing was written"
-        ))
-    })?;
-    let mut verified_bytes = Vec::with_capacity(total as usize);
-    spool.read_to_end(&mut verified_bytes).map_err(|e| {
-        Error::rejected(format!(
-            "cannot read media artifact spool: {e}; nothing was written"
-        ))
-    })?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut target_file = options
-        .open(out)
-        .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
-    if let Err(error) = target_file
-        .write_all(&verified_bytes)
-        .and_then(|()| target_file.sync_all())
-    {
-        let _ = std::fs::remove_file(out);
-        return Err(Error::rejected(format!(
-            "cannot write {}: {error}; partial file removed",
-            out.display()
-        )));
-    }
+    spool.publish(out)?;
     Ok(json!({
         "ref": reference,
         "jobId": expected_job,
@@ -2614,11 +3073,12 @@ where
     // lands as RemoteOwner: blanket settings authority with no agent
     // grant binding. A managed caller (CADENCE_ALIAS — worker, master or
     // a daemon-approved argv child under CADENCE_GRANT_TOKEN) spending it
-    // would impersonate the human owner. There is no client-side
-    // agents/<h> credential path yet (remote_auth notes per-agent
-    // enrollment is not configured), so remote settings verbs are refused
-    // for managed callers outright — never narrowed to "no grant" and
-    // never silently allowed. Operators on their own shell unaffected.
+    // would impersonate the human owner. Since CAD-2149 a managed session
+    // does hold an agent credential, but that one is deliberately not
+    // owner-class and binds no settings grant, so settings and master
+    // diagnostics are still refused for managed callers outright — never
+    // narrowed to "no grant" and never silently allowed. Operators on their
+    // own shell are unaffected.
     if (matches!(&command, Commands::Settings { .. })
         || matches!(
             &command,
@@ -2634,9 +3094,8 @@ where
             "settings_agent_session_required",
             format!(
                 "remote `{}` refused for a managed caller: the call would spend the \
-             stored owner login — owner-class settings authority an agent can \
-             never hold — and there is no hosted agent-principal credential to \
-             bind a settings grant to yet; the operator runs this from a plain \
+             stored owner login, and owner-class settings authority is never \
+             delegated to an agent credential; the operator runs this from a plain \
              shell, or grant-bound ops run on the local daemon (`cadence \
              settings agents grant request …`)",
                 name(&command)
@@ -2891,6 +3350,14 @@ where
     ) {
         refuse_managed(&target, "project new")?;
     }
+    // CAD-2226: provider enrollment and the reads around it are the live human
+    // owner's own acts — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller spending the stored login would act as that
+    // owner, so it refuses before a request exists; the board independently
+    // requires a live human owner for the same three operations.
+    if let Some(verb) = connection_owner_verb(&command) {
+        refuse_managed(&target, verb)?;
+    }
     let mut command = command;
     if let Commands::Agent {
         action: AgentAction::Profile { action },
@@ -2939,6 +3406,14 @@ where
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let issue_ls_fallback = (verb == "issue_ls")
+        .then(|| {
+            let n = args.get("limit").and_then(Value::as_u64)? as usize;
+            let mut without_limit = args.clone();
+            without_limit.remove("limit");
+            Some((n, without_limit))
+        })
+        .flatten();
     let out = match cadence_agent::remote_cli::call_verb(
         &target,
         verb,
@@ -2949,26 +3424,56 @@ where
     ) {
         Ok(out) => out,
         Err(error) => {
-            if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
-                eprint_line(&format!(
-                    "remote send `{id}` was not confirmed — it may or may not have \
-                     been recorded. Reconcile before resubmitting: `cadence message \
-                     read {id} --org {}` returns your durable message and its state. \
-                     If nothing is recorded, retry `send` with the same --message {id} \
-                     — the same id and content does not enqueue another message.",
-                    target.org
-                ));
+            // Hosted wire compatibility: if an older board predates `limit` on
+            // `issue_ls` and answers `400 invalid_request`, retry once without
+            // `limit`, slice locally, and state on stderr what was not applied
+            // server-side. If the retry also refuses (for instance another bad
+            // filter value), surface that refusal unchanged.
+            if let Some((n, without_limit)) = issue_ls_fallback.filter(|_| {
+                error.code() == Some(cadence_agent::remote_cli::ISSUE_LS_LIMIT_UNSUPPORTED)
+            }) {
+                match cadence_agent::remote_cli::call_verb(
+                    &target,
+                    verb,
+                    without_limit,
+                    deadline,
+                    wake_timeout,
+                    eprint_line,
+                ) {
+                    Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(mut body)) => {
+                        truncate_issue_ls_body(&mut body, n);
+                        eprint_line(&format!(
+                            "remote board on `{}` predates server-side `issue_ls` limit; \
+                             truncated to {n} locally.",
+                            target.org
+                        ));
+                        cadence_agent::remote_cli::RemoteAnswer::Ok(body)
+                    }
+                    Ok(other) => other,
+                    Err(retry_err) => return remote_failure(retry_err),
+                }
+            } else {
+                if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote send `{id}` was not confirmed — it may or may not have \
+                         been recorded. Reconcile before resubmitting: `cadence message \
+                         read {id} --org {}` returns your durable message and its state. \
+                         If nothing is recorded, retry `send` with the same --message {id} \
+                         — the same id and content does not enqueue another message.",
+                        target.org
+                    ));
+                }
+                if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote platform call `{key}` on org `{}` was not confirmed — \
+                         reconcile read-only with `cadence --org {} platform status --request {key}` \
+                         before repeating; replaying `platform call` returns a recorded outcome, \
+                         or starts and charges a new call if `{key}` was not recorded.",
+                        target.org, target.org
+                    ));
+                }
+                return remote_failure(error);
             }
-            if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
-                eprint_line(&format!(
-                    "remote platform call `{key}` on org `{}` was not confirmed — \
-                     reconcile read-only with `cadence --org {} platform status --request {key}` \
-                     before repeating; replaying `platform call` returns a recorded outcome, \
-                     or starts and charges a new call if `{key}` was not recorded.",
-                    target.org, target.org
-                ));
-            }
-            return remote_failure(error);
         }
     };
     match out {
@@ -2988,6 +3493,24 @@ where
                 Err(error) => return remote_failure(error),
             }
             if wiki_text(&command, &body)? {
+                return Ok(0);
+            }
+            // CAD-2226: a hosted enrollment's only useful output is the
+            // one-time provider link the transport verified. Print it for the
+            // person's own browser — this server-side flow never opens one —
+            // and note that it enrolls the account only.
+            if matches!(
+                &command,
+                Commands::Connection {
+                    action: ConnectionAction::Enroll { .. }
+                }
+            ) {
+                print_json(&hosted_enrollment_document(&body)?);
+                eprint_line(
+                    "Open this one-time link in your own browser; no browser was opened here. \
+                     It enrolls the provider account only — selecting a verified property \
+                     (for example a Search Console site) is not part of enrollment.",
+                );
                 return Ok(0);
             }
             if matches!(&command, Commands::Platform { .. }) {
@@ -3401,6 +3924,41 @@ fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// The connection acts a hosted org serves, named as the stable command a
+/// refusal quotes. Every other `connection` action keeps the local custody
+/// path and refuses on a hosted org rather than half-mapping to a relay
+/// operation that does not exist.
+fn connection_owner_verb(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Connection {
+            action: ConnectionAction::Providers,
+        } => Some("connection providers"),
+        Commands::Connection {
+            action: ConnectionAction::Ls,
+        } => Some("connection ls"),
+        Commands::Connection {
+            action: ConnectionAction::Enroll { .. },
+        } => Some("connection enroll"),
+        _ => None,
+    }
+}
+
+/// CAD-2226: the user-facing success of a hosted enrollment is the one-time
+/// provider link, and only a link the transport verified. It is printed for
+/// the person's own browser — nothing here opens one, logs it or repeats it.
+fn hosted_enrollment_document(body: &Value) -> Result<Value> {
+    let url = cadence_agent::remote_cli::connection_authorization_url(body).ok_or_else(|| {
+        Error::unknown(
+            "remote connection enrollment returned no usable authorization link — the provider \
+             link may or may not exist. An account appears in `cadence --org <org> connection ls` \
+             only after the provider callback completes, so an empty list does not prove no link \
+             was issued; nothing is retried automatically, and starting again is a deliberate new \
+             enrollment",
+        )
+    })?;
+    Ok(json!({ "entry_url": url }))
+}
+
 /// CAD-1593: `restore` against a remote org. Only `--portable` forms exist
 /// remotely — everything else refuses before a request is built, exactly
 /// like the local flag checks, so a misplaced knob is a usage error, never
@@ -3598,6 +4156,12 @@ fn migration_outcome_exit_code(receipt: &Value) -> i32 {
     }
 }
 
+fn truncate_issue_ls_body(body: &mut Value, limit: usize) {
+    if let Some(issues) = body.get_mut("issues").and_then(Value::as_array_mut) {
+        issues.truncate(limit);
+    }
+}
+
 pub(super) fn remote_failure(error: Error) -> Result<i32> {
     if error.kind() == "busy" && error.code() == Some("waking") {
         // The wake verdict is a nonzero status (75): print it through the
@@ -3630,6 +4194,110 @@ mod tests {
         let err = refuse_managed(&target, "audit accept-revise").unwrap_err();
         assert!(err.to_string().contains("managed caller"), "{err}");
         assert!(err.to_string().contains("Nothing was sent"), "{err}");
+    }
+
+    /// Through the real hosted call site: the endpoint is unreachable and the
+    /// credential directory is absent, so a missing gate would answer a
+    /// transport error instead of the managed-caller refusal.
+    #[test]
+    fn hosted_owner_enrollment_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let enroll = || Commands::Connection {
+            action: ConnectionAction::Enroll {
+                provider: "google_search_console".into(),
+                scopes: Vec::new(),
+                shape: None,
+                agent: None,
+                no_open: true,
+            },
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Providers,
+                },
+                1,
+                None,
+                Some("connection providers".into()),
+            ),
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Ls,
+                },
+                1,
+                None,
+                Some("connection ls".into()),
+            ),
+            run(
+                target(),
+                enroll(),
+                1,
+                None,
+                Some("connection enroll".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("managed caller"), "{err}");
+            assert!(err.to_string().contains("Nothing was sent"), "{err}");
+        }
+    }
+
+    // CAD-2165: the managed refusal for owner-class settings names the reason
+    // and refuses before any request, including `master resume`.
+    #[test]
+    fn hosted_settings_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Settings {
+                    action: settings::SettingsAction::Agents {
+                        grant: None,
+                        action: settings::AgentsAction::Show,
+                    },
+                },
+                1,
+                None,
+                Some("settings agents show".into()),
+            ),
+            run(
+                target(),
+                Commands::Master {
+                    action: MasterAction::Resume { grant: None },
+                },
+                1,
+                None,
+                Some("master resume".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("managed caller"), "{error}");
+            assert!(error.to_string().contains("never delegated"), "{error}");
+        }
     }
 
     #[test]
@@ -3751,6 +4419,62 @@ mod read_contract_tests {
             connection: None,
             max_charge: None,
         })
+    }
+
+    #[test]
+    fn hosted_connected_read_retry_key_binds_the_connection() {
+        let call = |connection: &str| {
+            platform(PlatformAction::Call {
+                tool: "search_console_report".into(),
+                input: Some(r#"{"site_url":"sc-domain:example.test"}"#.into()),
+                query: None,
+                request: None,
+                platform: None,
+                account: None,
+                project: None,
+                connection: Some(connection.into()),
+                max_charge: None,
+            })
+        };
+        let (_, first) = outcome(&call("con_first")).expect("hosted read should be accepted");
+        let (_, repeat) = outcome(&call("con_first")).expect("identical read should be accepted");
+        let (_, different) = outcome(&call("con_second")).expect("other connection is distinct");
+        assert!(valid_platform_handle(first["key"].as_str().unwrap()));
+        assert_eq!(first["key"], repeat["key"]);
+        assert_ne!(first["key"], different["key"]);
+    }
+
+    #[test]
+    fn hosted_connected_read_status_uses_the_same_connection_bound_key() {
+        let input = r#"{"site_url":"sc-domain:example.test"}"#;
+        let call = platform(PlatformAction::Call {
+            tool: "search_console_report".into(),
+            input: Some(input.into()),
+            query: None,
+            request: None,
+            platform: None,
+            account: None,
+            project: None,
+            connection: Some("con_first".into()),
+            max_charge: None,
+        });
+        let (_, call_args) = outcome(&call).unwrap();
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "platform",
+            "status",
+            "--tool",
+            "search_console_report",
+            "--connection",
+            "con_first",
+            "--input",
+            input,
+        ])
+        .expect("status accepts the connection needed to identify the read");
+        let (_, status_args) = outcome(&cli.command).unwrap();
+        assert_eq!(status_args["key"], call_args["key"]);
+        assert_eq!(status_args["connectionId"], "con_first");
+        assert_eq!(status_args["body"], call_args["body"]);
     }
 
     #[test]
@@ -3886,6 +4610,218 @@ mod read_contract_tests {
         ] {
             let refused = outcome(&platform(action)).unwrap_err();
             assert!(refused.contains(label), "{label}: {refused}");
+        }
+    }
+
+    fn connection(action: ConnectionAction) -> Commands {
+        Commands::Connection { action }
+    }
+
+    fn enroll(
+        toolkit: &str,
+        scopes: Vec<String>,
+        shape: Option<&str>,
+        agent: Option<&str>,
+        no_open: bool,
+    ) -> Commands {
+        connection(ConnectionAction::Enroll {
+            provider: toolkit.into(),
+            scopes,
+            shape: shape.map(str::to_string),
+            agent: agent.map(str::to_string),
+            no_open,
+        })
+    }
+
+    #[test]
+    fn hosted_connection_owner_reads_map_to_their_relay_operations() {
+        for (action, operation) in [
+            (ConnectionAction::Providers, "connection_providers"),
+            (ConnectionAction::Ls, "connection_list"),
+        ] {
+            let (verb, args) = outcome(&connection(action)).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!(operation));
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                1,
+                "a hosted connection read carries the operation and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_sends_only_the_exact_toolkit_body() {
+        for no_open in [true, false] {
+            let (verb, args) = outcome(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                no_open,
+            ))
+            .unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!("connection_start"));
+            assert_eq!(
+                args["body"],
+                json!({"toolkit": "google_search_console"}),
+                "the relay admits exactly the toolkit"
+            );
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                2,
+                "--no-open selects nothing on the wire: hosted enrollment never opens a browser"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_local_only_flags() {
+        for (label, scopes, shape, agent) in [
+            (
+                "--scope",
+                vec!["search_console.read".to_string()],
+                None,
+                None,
+            ),
+            ("--shape", Vec::new(), Some("token"), None),
+            ("--agent", Vec::new(), None, Some("synthetic-worker")),
+        ] {
+            let refused =
+                outcome(&enroll("google_search_console", scopes, shape, agent, true)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+            assert!(
+                refused.contains("cannot"),
+                "a discarded local flag must refuse, not be dropped: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_an_unsafe_toolkit_before_dispatch() {
+        for toolkit in [
+            String::new(),
+            "Google".into(),
+            "../etc".into(),
+            "a b".into(),
+            "UPPER".into(),
+            "a.b".into(),
+            "1abc".into(),
+            "_abc".into(),
+            "a".repeat(65),
+        ] {
+            let refused = outcome(&enroll(&toolkit, Vec::new(), None, None, true)).unwrap_err();
+            assert!(refused.contains("toolkit"), "{toolkit:?}: {refused}");
+        }
+        // The server's own grammar is accepted, hyphens and digits included.
+        let (_, args) = outcome(&enroll(
+            "google-search_console2",
+            Vec::new(),
+            None,
+            None,
+            true,
+        ))
+        .expect("a lowercase identifier toolkit is accepted");
+        assert_eq!(args["body"]["toolkit"], json!("google-search_console2"));
+    }
+
+    #[test]
+    fn hosted_connection_actions_outside_owner_enrollment_stay_unavailable() {
+        // Only the three owner-enrollment acts are routed. Local credential
+        // custody, rotation, revocation and SMTP keep refusing instead of
+        // being half-mapped to a hosted operation that does not exist.
+        for action in [
+            ConnectionAction::Show {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Check {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Revoke {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Manage { no_open: true },
+        ] {
+            let refused = outcome(&connection(action)).unwrap_err();
+            assert!(
+                refused.contains("not available on a remote org"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_three_owner_enrollment_acts_are_the_managed_caller_gate() {
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Providers)),
+            Some("connection providers")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Ls)),
+            Some("connection ls")
+        );
+        assert_eq!(
+            connection_owner_verb(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                true
+            )),
+            Some("connection enroll")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Show {
+                connection_id: "con_synthetic".into()
+            })),
+            None
+        );
+        assert_eq!(connection_owner_verb(&Commands::MyWork), None);
+    }
+
+    #[test]
+    fn a_hosted_enrollment_success_is_only_its_validated_link() {
+        let url = "https://provider.example.test/oauth?synthetic=1";
+        let body = json!({"ok": true, "data": {"url": url}});
+        let document = hosted_enrollment_document(&body).expect("a validated HTTPS link succeeds");
+        assert_eq!(document, json!({"entry_url": url}));
+        assert_eq!(
+            document.as_object().unwrap().len(),
+            1,
+            "the link is the only user-facing value, and it is never repeated"
+        );
+        // The opaque query and an explicit valid port are preserved verbatim.
+        for url in [
+            "https://provider.example.test/oauth?a=1&b=%2F&c=two+words",
+            "https://provider.example.test:443/oauth",
+            "https://[2001:db8::1]:8443/oauth",
+        ] {
+            let body = json!({"ok": true, "data": {"url": url}});
+            assert_eq!(
+                hosted_enrollment_document(&body).expect("a valid HTTPS link succeeds"),
+                json!({"entry_url": url})
+            );
+        }
+        for refused in [
+            json!({"ok": true}),
+            json!({"ok": true, "data": {}}),
+            json!({"ok": false, "data": {"url": url}}),
+            json!({"ok": true, "data": {"url": "http://provider.example.test/oauth"}}),
+            json!({"ok": true, "data": {"url": "/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test}not"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:notaport/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:999999/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:65536/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://user:secret@provider.example.test/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test/\n"}}),
+        ] {
+            assert!(
+                hosted_enrollment_document(&refused).is_err(),
+                "must not report a link it cannot verify: {refused}"
+            );
         }
     }
 
@@ -4267,6 +5203,7 @@ mod read_contract_tests {
             l.owner = vec!["me".into()];
             l.plan = vec!["approved".into()];
             l.open = true;
+            l.limit = Some(10);
         }))
         .unwrap();
         assert_eq!(verb, "issue_ls");
@@ -4275,8 +5212,22 @@ mod read_contract_tests {
             json!({
                 "project": "ops",
                 "status": ["doing"], "tag": ["t"], "owner": ["me"],
-                "plan": ["approved"], "open": true,
+                "plan": ["approved"], "open": true, "limit": 10,
             })
+        );
+
+        for bad_limit in [0usize, 5001usize] {
+            let err = outcome(&issue_ls(|l| l.limit = Some(bad_limit))).unwrap_err();
+            assert!(err.contains("--limit"), "{bad_limit}: {err}");
+        }
+
+        let mut legacy_body = json!({
+            "issues": [{"id": "OPS-1"}, {"id": "OPS-2"}, {"id": "OPS-3"}]
+        });
+        truncate_issue_ls_body(&mut legacy_body, 2);
+        assert_eq!(
+            legacy_body,
+            json!({"issues": [{"id": "OPS-1"}, {"id": "OPS-2"}]})
         );
     }
 
@@ -4300,7 +5251,6 @@ mod read_contract_tests {
             ("--blocked", |l| l.blocked = true),
             ("--at", |l| l.at = Some("HEAD~1".into())),
             ("--sort", |l| l.sort = Some("id".into())),
-            ("--limit", |l| l.limit = Some(5)),
             ("--fields", |l| l.fields = vec!["id".into()]),
             ("--summary", |l| l.summary = true),
         ];
@@ -4841,6 +5791,29 @@ mod read_contract_tests {
             assert!(err.contains("issue project policy"), "{err}");
         }
 
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: None,
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: Some(5),
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
+
         let (verb, args) = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::Ls {
@@ -4854,6 +5827,52 @@ mod read_contract_tests {
         .unwrap();
         assert_eq!(verb, "project_ls");
         assert_eq!(args, json!({}));
+
+        let timeline = |kinds: Vec<String>, limit| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Project {
+                    action: ProjectAction::Timeline {
+                        key: "atlas".into(),
+                        since: Some("2026-11-01".into()),
+                        kinds,
+                        open: true,
+                        limit,
+                        before: Some("cursor".into()),
+                        json: false,
+                    },
+                },
+            })
+        };
+        let (verb, args) = timeline(vec!["status".into(), "review".into()], Some(20)).unwrap();
+        assert_eq!(verb, "project_timeline");
+        assert_eq!(
+            args,
+            json!({"project": "atlas", "limit": 20, "before": "cursor",
+                   "kinds": ["status", "review"], "since": "2026-11-01T00:00:00Z",
+                   "open_only": true})
+        );
+        assert!(timeline(vec!["decision".into()], None)
+            .unwrap_err()
+            .contains("--kind"));
+        assert!(timeline(vec![], Some(101)).unwrap_err().contains("--limit"));
+        let (_, args) = timeline(vec!["status".into(), "status".into()], None).unwrap();
+        assert_eq!(args["kinds"], json!(["status"]));
+        // A millisecond epoch is past year 9999: refused here, so the board's 400
+        // for it can never be read as "this board is too old".
+        let far = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Timeline {
+                    key: "atlas".into(),
+                    since: Some("1762819200000".into()),
+                    kinds: vec![],
+                    open: false,
+                    limit: None,
+                    before: None,
+                    json: false,
+                },
+            },
+        });
+        assert!(far.unwrap_err().contains("--since"));
 
         let err = outcome(&Commands::Issue {
             action: IssueAction::Project {
@@ -5247,6 +6266,7 @@ mod read_contract_tests {
             tool: tool.map(str::to_string),
             input: input.map(str::to_string),
             query: query.map(str::to_string),
+            connection: None,
         })
     }
 
@@ -5255,6 +6275,54 @@ mod read_contract_tests {
         match verb_for(command, None) {
             Ok((verb, _)) => panic!("`{verb}` must refuse before any request is built"),
             Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn hosted_connections_map_to_owner_platform_calls() {
+        let cases = [
+            (
+                ConnectionAction::Providers,
+                json!({"operation": "connection_providers"}),
+            ),
+            (
+                ConnectionAction::Ls,
+                json!({"operation": "connection_list"}),
+            ),
+            (
+                ConnectionAction::Revoke {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_revoke",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::Sites {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_sites",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::SelectSite {
+                    connection_id: "con_synthetic".into(),
+                    site_url: "sc-domain:example.test".into(),
+                },
+                json!({
+                    "operation": "connection_select_site",
+                    "connectionId": "con_synthetic",
+                    "body": {"siteUrl": "sc-domain:example.test"}
+                }),
+            ),
+        ];
+        for (action, expected) in cases {
+            let (verb, args) = outcome(&Commands::Connection { action }).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args, expected);
         }
     }
 
@@ -5543,6 +6611,74 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn a_large_video_artifact_is_verified_before_the_destination_is_created() {
+        let bytes = vec![0x56; 10 * 1024 * 1024 + 1];
+        let (reference, digest) = artifact_ref_for(&bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let receipt = collect_platform_artifact(&reference, &out, |offset| {
+            assert!(
+                !out.exists(),
+                "unverified video must not reach the destination"
+            );
+            let start = offset as usize;
+            let end = (start + 1024 * 1024).min(bytes.len());
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                &bytes[start..end],
+            ))
+        })
+        .expect("a verified video above the image limit is written");
+        assert_eq!(receipt["mime"], json!("video/mp4"));
+        assert_eq!(receipt["bytes"], json!(bytes.len()));
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_tampered_video_leaves_no_destination() {
+        let bytes = b"synthetic-webm";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("verified.webm");
+        let (verified, _) = run_artifact_pages(
+            &reference,
+            &good,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                bytes,
+            ))],
+        );
+        assert!(verified.is_ok());
+        assert_eq!(std::fs::read(&good).unwrap(), bytes);
+        let out = dir.path().join("video.webm");
+        let (result, _) = run_artifact_pages(
+            &reference,
+            &out,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                b"tampered-webm!",
+            ))],
+        );
+        assert!(result.is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn an_existing_destination_is_refused_before_any_page_is_fetched() {
         let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
         let (reference, digest) = artifact_ref_for(bytes);
@@ -5568,6 +6704,100 @@ mod read_contract_tests {
         assert!(error.to_string().contains("already exists"), "{error}");
         assert_eq!(served, 0, "no page may be fetched for an existing file");
         assert_eq!(std::fs::read(&out).unwrap(), b"keep me".as_slice());
+    }
+
+    #[test]
+    fn a_destination_created_during_download_is_not_replaced() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::write(&out, b"other writer").unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"other writer");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_replaced_destination_directory_is_not_reported_as_success() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("destination");
+        let moved = dir.path().join("moved-destination");
+        std::fs::create_dir(&parent).unwrap();
+        let out = parent.join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::rename(&parent, &moved).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(
+            result.is_err(),
+            "the reported path no longer names the pinned directory"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_substituted_spool_cannot_publish_unverified_bytes() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            let stage = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".cadence-media-artifact-")
+                })
+                .expect("the download is staged before fetching");
+            let is_dir = stage.is_dir();
+            std::fs::rename(&stage, dir.path().join("moved-stage")).unwrap();
+            if is_dir {
+                std::fs::create_dir(&stage).unwrap();
+                std::fs::write(stage.join("artifact"), b"substituted").unwrap();
+            } else {
+                std::fs::write(&stage, b"substituted").unwrap();
+            }
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        if result.is_ok() {
+            assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        } else {
+            assert!(!out.exists(), "a refused download must not publish a file");
+        }
     }
 
     #[test]
@@ -5724,7 +6954,11 @@ mod read_contract_tests {
 
         // A total of zero or beyond the supported bound cannot be a real
         // artifact, so it is refused before the destination is created.
-        for total in [0u64, PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1] {
+        for (total, mime) in [
+            (0u64, "image/png"),
+            (PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1, "image/png"),
+            (PLATFORM_VIDEO_ARTIFACT_MAX_BYTES + 1, "video/mp4"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("image.png");
             let (result, _) = run_artifact_pages(
@@ -5734,7 +6968,7 @@ mod read_contract_tests {
                     &reference,
                     "med_job1",
                     &digest,
-                    "image/png",
+                    mime,
                     0,
                     total,
                     &bytes[..split],

@@ -5,6 +5,12 @@
 //! AgenticOS job, poll it, complete the kickoff, and file the normal done
 //! report. There is no separate CLI command and the remote runner does not
 //! depend on the host worktree.
+//!
+//! CAD-2215: the lane is for ORDINARY jobs only. A member-private job (any
+//! `assist_requests` ledger row or durable `assist_request_queue` row naming
+//! it, or a member-assistant binding on its PM/worker alias) is refused,
+//! because this lane pushes a shared Git ref and files a shared issue report
+//! and a private result may only be published explicitly.
 
 use std::time::Duration;
 
@@ -28,6 +34,11 @@ pub const UNCERTAIN: &str = "cloud_sandbox_uncertain";
 /// An operator stop reached the poller; the remote job was stopped and the
 /// kickoff is settled as interrupted, never as a completed report.
 pub const STOPPED: &str = "cloud_sandbox_stopped";
+/// A member-private job was dispatched to the cloud lane. That lane pushes a
+/// shared Git ref and files a shared issue report with no publication grant,
+/// so the lane is unsupported for a private job — an explicit refusal, never
+/// a silent downgrade to a host dispatch and never a shared-effect attempt.
+pub const PRIVATE_JOB: &str = "cloud_sandbox_private_job";
 const COMPANY_ENV: &str = "AGENTICOS_COMPANY";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Consecutive transport errors tolerated while polling before the job is
@@ -115,6 +126,205 @@ pub fn probe_entitlement() -> Result<()> {
     crate::adapter::sandbox::require_entitlement(&api, &company)
 }
 
+/// Prove `job` is an ordinary (non-member-private) job before the cloud lane
+/// is admitted.
+///
+/// The dispatch admission calls this with the planned job and worker alias
+/// BEFORE [`probe_entitlement`], so a refused job causes no network call and
+/// no task/job/message write; [`run_dispatch`] calls it again with the
+/// kickoff's own rows before any remote or issue effect.
+///
+/// Provenance comes from durable rows, never from an id prefix or a name:
+///
+/// - any `assist_requests` ledger row for the job — including duplicate and
+///   ambiguous owners — makes it member-private;
+/// - any `assist_request_queue` row whose planned canonical job id is this
+///   job (the queue-only case where creation crashed after the job row and
+///   before the ledger bind) makes it member-private too;
+/// - a `pm_alias` or worker alias with a member-assistant binding in ANY
+///   state (bindings are archived, never deleted, so a tombstoned row is
+///   durable evidence of a private origin) makes ownership private or
+///   ambiguous;
+/// - a store read error refuses as well: unproven provenance is not
+///   ordinary.
+///
+/// Ordinary jobs are unaffected — every test is an exact indexed lookup that
+/// answers absent for them.
+pub fn refuse_private_job(store: &Store, job: &Job, worker: &str) -> Result<()> {
+    refuse_private_job_for(store, job, &[worker])
+}
+
+/// Every alias this kickoff could run as must be proven non-assistant. A
+/// redispatched task can carry a kickoff whose recipient differs from the
+/// task's current assignee, so the recovery guard passes both.
+fn refuse_private_job_for(store: &Store, job: &Job, workers: &[&str]) -> Result<()> {
+    match store.assist_job_has_request(&job.id) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(private_refusal(format!(
+                "cloud sandbox dispatch is unsupported for member-private job {} — the \
+                 cloud lane pushes a shared Git ref and files a shared issue report, and \
+                 a private job's result may only be published explicitly",
+                job.id
+            )))
+        }
+        Err(error) => {
+            return Err(private_refusal(format!(
+                "cannot prove job {} is not member-private ({error}) — the cloud sandbox \
+                 lane is refused rather than risk publishing a private result",
+                job.id
+            )))
+        }
+    }
+    let pm = ("job PM", job.pm_alias.as_str());
+    let identities = std::iter::once(pm).chain(workers.iter().map(|a| ("worker", *a)));
+    for (role, alias) in identities {
+        match store.assistant_for_alias(alias) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(private_refusal(format!(
+                    "cloud sandbox dispatch is unsupported for job {}: its {role} alias \
+                     '{alias}' has a member-assistant binding, so the job's ownership is \
+                     private or ambiguous",
+                    job.id
+                )))
+            }
+            Err(error) => {
+                return Err(private_refusal(format!(
+                    "cannot prove job {}'s {role} alias '{alias}' is not a member assistant \
+                     ({error}) — the cloud sandbox lane is refused",
+                    job.id
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn private_refusal(message: String) -> Error {
+    Error::Structured(Structured {
+        kind: "rejected",
+        code: PRIVATE_JOB.to_string(),
+        message,
+        revision: None,
+    })
+}
+
+/// The kickoff-scoped form of [`refuse_private_job`]. The kickoff message,
+/// the task and the job handed to the runner must be the same durable rows
+/// the store holds — a detached or reassigned pointer would otherwise let a
+/// private job's kickoff run under an ordinary job's provenance.
+fn kickoff_privacy_refusal(store: &Store, task: &Task, job: &Job, message: &Message) -> Result<()> {
+    let named = message.task_id.as_deref().map(str::trim).unwrap_or("");
+    if named.is_empty() || named != task.id.trim() || task.job_id != job.id {
+        return Err(private_refusal(format!(
+            "cloud sandbox kickoff {} does not name the task/job handed to the runner \
+             (kickoff task '{}', runner task '{}', runner job '{}') — the kickoff's job \
+             provenance is unproven, so a private job cannot be ruled out",
+            message.id,
+            message.task_id.as_deref().unwrap_or(""),
+            task.id,
+            job.id
+        )));
+    }
+    // Every alias this kickoff could run as, from durable rows: the task's
+    // current assignee (the consumer's worker choice) and the kickoff's own
+    // recorded recipient (what it was actually dispatched to). A task that
+    // failed, reopened or was redispatched can make those differ.
+    let assignee = task.assignee.as_deref().filter(|alias| !alias.is_empty());
+    match assignee {
+        Some(assignee) => refuse_private_job_for(store, job, &[assignee, message.alias.as_str()]),
+        None => refuse_private_job_for(store, job, &[message.alias.as_str()]),
+    }
+}
+
+/// Settle a refusal without ever claiming a remote job is gone.
+///
+/// A refusal is decided from durable rows, so it also fires on a kickoff
+/// dispatched before this guard existed. With no recorded create attempt no
+/// remote can exist: the kickoff fails with the refusal, and no shared effect
+/// was attempted. Once a create was attempted the remote job may exist and
+/// may be a writer — its state is unproven, so the kickoff is left exactly as
+/// it is: nothing is stopped, failed, completed or retried, and the refusal
+/// reports the unknown state for operator inspection.
+fn settle_private_refusal(store: &Store, message: &Message, refusal: Error) -> Error {
+    match store.cloud_create_attempted(&message.id) {
+        Ok(false) => {
+            fail_message(store, message, &refusal);
+            refusal
+        }
+        _ => Error::Structured(Structured {
+            kind: "rejected",
+            code: PRIVATE_JOB.to_string(),
+            message: format!(
+                "{refusal} — a prior remote create was already attempted for this kickoff, \
+                 so a remote job may exist: its state is unknown, the kickoff is left \
+                 unsettled, and nothing was stopped or retried; operator inspection is \
+                 required"
+            ),
+            revision: None,
+        }),
+    }
+}
+
+/// Recovery-side guard for a kickoff that is already dispatched.
+///
+/// The consumer calls this with the durable kickoff message BEFORE claiming
+/// it; the rows are resolved from the message itself, so an ordinary job
+/// cannot be substituted for the private job the kickoff actually names. A
+/// private/ambiguous kickoff is settled by [`settle_private_refusal`] and the
+/// refusal is returned, so it never reaches a remote or issue effect.
+pub fn refuse_dispatched_kickoff(store: &Store, message: &Message) -> Result<()> {
+    let Some(task_id) = message
+        .task_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Err(settle_private_refusal(
+            store,
+            message,
+            private_refusal(format!(
+                "cloud sandbox kickoff {} names no task, so its job provenance cannot be \
+                 proven — the cloud sandbox lane is refused for a private or ambiguous job",
+                message.id
+            )),
+        ));
+    };
+    let task = match store.task(task_id) {
+        Ok(task) => task,
+        Err(error) => {
+            return Err(settle_private_refusal(
+                store,
+                message,
+                private_refusal(format!(
+                    "cloud sandbox kickoff {}'s task {task_id} cannot be read ({error}) — \
+                     the cloud sandbox lane is refused rather than risk publishing a \
+                     private result",
+                    message.id
+                )),
+            ))
+        }
+    };
+    let job = match store.job(&task.job_id) {
+        Ok(job) => job,
+        Err(error) => {
+            return Err(settle_private_refusal(
+                store,
+                message,
+                private_refusal(format!(
+                    "cloud sandbox kickoff {}'s task {task_id} names job {} that cannot be \
+                     read ({error}) — the cloud sandbox lane is refused",
+                    message.id, task.job_id
+                )),
+            ))
+        }
+    };
+    match kickoff_privacy_refusal(store, &task, &job, message) {
+        Ok(()) => Ok(()),
+        Err(refusal) => Err(settle_private_refusal(store, message, refusal)),
+    }
+}
+
 /// Consume one dispatched kickoff for a sandbox agent.
 ///
 /// The caller has already run the normal dispatch transaction, so the task is
@@ -122,6 +332,10 @@ pub fn probe_entitlement() -> Result<()> {
 /// creates and drives the remote job, then finishes the same message. The
 /// normal finish path moves the task to review and routes the PM notice; the
 /// remote job is the worker.
+///
+/// A member-private job never reaches the remote: the provenance guard runs
+/// before any remote create, lane ref or issue report, so this lane can never
+/// publish a private result. An ordinary job is unchanged.
 pub fn run_dispatch(
     pm: &Pm,
     store: &Store,
@@ -131,6 +345,14 @@ pub fn run_dispatch(
     agent: &Agent,
     stop: &dyn Fn() -> bool,
 ) -> Result<()> {
+    // CAD-2215: the cloud lane pushes a shared Git ref and files a shared
+    // issue report. Prove this kickoff's actual job provenance before ANY
+    // remote or issue effect — including the issue-bound preflight below.
+    // The refusal settles an un-attempted kickoff and preserves an
+    // unproven remote state otherwise.
+    if let Err(refusal) = kickoff_privacy_refusal(store, task, job, message) {
+        return Err(settle_private_refusal(store, message, refusal));
+    }
     let issue = match job.issue_id.as_deref() {
         Some(issue) => issue,
         None => {

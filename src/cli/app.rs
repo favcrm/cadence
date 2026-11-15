@@ -259,6 +259,33 @@ pub(crate) enum AppAction {
         #[arg(long)]
         project: String,
     },
+    /// Explicit per-member read access to an installation's exact
+    /// conversations (CAD-2215). Operator only, through the daemon. The
+    /// local CLI lists and revokes; creating a grant needs the board's
+    /// authenticated session flow (a live owner plus the platform roster)
+    /// and is deliberately not offered as a CLI credential handoff.
+    Access {
+        #[command(subcommand)]
+        action: AccessAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AccessAction {
+    /// List every grant (active and revoked) and the installation's live
+    /// conversations, so an operator can see the exact conversation ids.
+    #[command(visible_alias = "list")]
+    Ls { install_id: String },
+    /// Revoke one exact grant, or every grant this member holds for the
+    /// installation when `--conversation` is omitted. Works without the
+    /// member being present and needs no member session.
+    Revoke {
+        install_id: String,
+        #[arg(long)]
+        member: String,
+        #[arg(long)]
+        conversation: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2974,6 +3001,24 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             "app_add_worker",
             json!({"project": project, "name": name, "role": role}),
         )?,
+        AppAction::Access { action } => match action {
+            AccessAction::Ls { install_id } => client::rpc(
+                state_dir,
+                "app_member_access_list",
+                json!({"install_id": install_id}),
+            )?,
+            AccessAction::Revoke {
+                install_id,
+                member,
+                conversation,
+            } => {
+                let mut body = json!({"install_id": install_id, "member_sub": member});
+                if let Some(conversation) = conversation {
+                    body["conversation_id"] = json!(conversation);
+                }
+                client::rpc(state_dir, "app_member_access_revoke", body)?
+            }
+        },
     };
     print_json(&result);
     Ok(0)

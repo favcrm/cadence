@@ -30,6 +30,7 @@ export const BUNDLED_SKILLS = [
   { name: "business-documents", line: "Document intake, templates and pricing checks" },
   { name: "company-outputs", line: "Quotes, invoices, proposals and reports" },
   { name: "website-builder", line: "Build and publish a static website" },
+  { name: "incident-response", line: "Contain and close out incidents across teams" },
 ] as const;
 
 export type HistoryFilter = "all" | "turns" | "messages" | "reports" | "memory";

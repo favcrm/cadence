@@ -38,6 +38,7 @@ mod devin;
 mod discovery;
 mod dispatch;
 mod doctor;
+mod endpoint;
 mod events;
 mod export;
 mod guidance;
@@ -129,6 +130,7 @@ use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
 pub(crate) use devin::{apply_cloud_params, insert_devin_cloud_params, split_cloud_params};
+use endpoint::EndpointAction;
 use idea::IdeaAction;
 use inbox::InboxAction;
 use intake::IntakeAction;
@@ -802,7 +804,12 @@ pub(crate) fn list_agents(
     }
     // The daemon counts before client-side group and project filters.
     // Keep the advertised capacity in the same scope as the visible rows.
-    list["live"] = json!(count_live_agents(&list));
+    // CAD-2215: a scoped read reports capacity as unavailable (`null`); a
+    // client-side filter must not turn that into a count of the rows it can
+    // see.
+    if list["live"].is_number() {
+        list["live"] = json!(count_live_agents(&list));
+    }
     Ok(list)
 }
 
@@ -818,10 +825,10 @@ pub(crate) fn retain_by_placement(view: &mut Value, want: registry::Placement) {
             ) == want
         });
     }
-    if view.get("live").is_some() {
+    if view["live"].is_number() {
         view["live"] = json!(count_live_agents(view));
     }
-    if view.get("footer").is_some() {
+    if view["footer"]["live"].is_number() {
         view["footer"]["live"] = json!(count_live_agents(view));
     }
 }

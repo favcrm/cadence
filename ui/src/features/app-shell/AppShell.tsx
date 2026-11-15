@@ -11,6 +11,7 @@ import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
+import { readReturnDrawer, withoutReturnDrawer } from "../workspace-apps/socialConnect";
 import { sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
@@ -154,9 +155,14 @@ export default function AppShell({
      *  fixed child overlay instead of promoting the primary. */
     onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean, size?: "narrow" | "wide") => void;
     presentation: "outlet" | "drawer";
-    /** CAD-1777 — the fixed overlay target the primary portals its child
+    /** The fixed overlay target the primary portals its child
      *  drawer frame into; null while the overlay is closed. */
     drawerTarget: HTMLElement | null;
+    /** A connect that left the board asked for this drawer surface to be
+     *  re-opened on return; null when the return named none. */
+    restoreDrawer: { surface: string; size?: ScreenDrawerSize } | null;
+    /** The outlet opened it (or the screen cannot mount): drop the hint. */
+    onRestoreDrawerConsumed: () => void;
     /** The screen went away: the drawer closes with it. */
     onScreenClosed: () => void;
   }) => React.ReactNode;
@@ -168,6 +174,10 @@ export default function AppShell({
   const { t } = useLocale();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
+  // A connect that left the board comes back with the drawer surface it was
+  // started from. The hint is the app page's own query, validated as a drawer
+  // surface name; anything else leaves the app screen in place.
+  const returnDrawer = useMemo(() => readReturnDrawer(href.split("?")[1] ?? ""), [href]);
   const parsedConversationLink = useMemo(() => parseConversationLink(href), [href]);
   const conversationVisit = useRef(0);
   const conversationRequestRef = useRef<{ key: string | null; request: ConversationLinkRequest | null }>({
@@ -242,6 +252,15 @@ export default function AppShell({
   }, [canDriveScreen]);
   const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
   const closeIndependentDrawer = useCallback(() => setIndependentDrawer(null), []);
+  // The return hint is single-use: once the outlet has re-opened the surface
+  // (or the screen cannot mount), the URL stops asking for a drawer, so a
+  // reload shows the operator's next state rather than a drawer they closed.
+  // Read the live location: the workspace strips the connect params itself
+  // with a direct history replace, which `href` does not observe.
+  const consumeReturnDrawer = useCallback(() => {
+    const rest = withoutReturnDrawer(window.location.search);
+    if (rest !== window.location.search) navigate(window.location.pathname + rest, { replace: true });
+  }, []);
   // A different installation or scope is a different screen: the drawer never
   // outlives the frame that opened it.
   useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
@@ -1296,7 +1315,7 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, onScreenClosed: closeScreenDrawer })
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}

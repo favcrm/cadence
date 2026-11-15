@@ -1465,16 +1465,34 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      # CAD-2288: the owned catalogue has no prerelease field and its
+      # "latest" is the newest record, so a prerelease stays on GitHub
+      # only. Same test as the publish step's classification.
+      - name: Classify the tag
+        id: classify
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=false
+          case "${TAG%%+*}" in *-*) prerelease=true ;; esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          if [ "$prerelease" = true ]; then
+            echo "$TAG is a prerelease: not uploaded to the release store or catalogue (GitHub release only)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: release-${{ github.ref_name }}-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-bundles-${{ github.ref_name }}
           path: dist/bundles
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           sparse-checkout: |
             scripts/publish-release.py
@@ -1482,6 +1500,7 @@ jobs:
           path: src
           persist-credentials: false
       - name: Publish the public-client release
+        if: steps.classify.outputs.prerelease == 'false'
         env:
           TAG: ${{ github.ref_name }}
           SOURCE_SHA: ${{ github.sha }}

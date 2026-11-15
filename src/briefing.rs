@@ -462,10 +462,18 @@ pub fn briefing_body(
         "- Each durable message arrives as one turn; your turn's final\n\
          \x20 text IS the report — no `cadence message result` call is\n\
          \x20 needed. Tool denials stay denials (they don't fail the\n\
-         \x20 turn); work around them and say so in your result.\n"
+         \x20 turn); work around them and say so in your result.\n\
+         \x20 When the turn is a ticket dispatch, file the tracker done\n\
+         \x20 report once (`cadence report file --task <ID> --kind done\n\
+         \x20 --file <f>`) and include its exact `Report: <ID>/reports/<name>`\n\
+         \x20 line and a final `SHA: <head>` in your final text; unrelated\n\
+         \x20 messages owe no tracker report.\n"
     } else {
         "- `cadence message result <id> --token <turn_id> --text '<summary>'`\n\
-         \x20 — complete the running task and report it.\n\
+         \x20 — complete the running task and report it. For a ticket\n\
+         \x20 dispatch's done report, add `--report <done-report-file>` to\n\
+         \x20 that same call (it files the report once and records the\n\
+         \x20 `Report:` link); do not also run `cadence report file`.\n\
          - `cadence message ack <id> --token <turn_id>` — acknowledge\n\
          \x20 receipt without completing.\n"
     };

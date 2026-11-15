@@ -233,12 +233,53 @@ pub struct ReadyBinding {
     pub outcome_report: String,
 }
 
+/// CAD-2215: why this record exists, recorded from a fact the daemon
+/// itself observed — never inferred from a ticket id, a current active
+/// job, a worker alias or a report file name.
+///
+/// Only [`Origin::VerifiedOrdinary`] is ordinary work. A record written
+/// before provenance existed, or adopted from a report whose exact
+/// native receipt could not be proven, is [`Origin::LegacyUnknown`]:
+/// the operator may inspect and recover it, but it is never served as
+/// ordinary delivery, never drives a shared Needs-you row, and never
+/// publishes anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Origin {
+    /// The daemon accepted this dispatch itself: `dispatch` is the
+    /// accepted message id the loop follows. A later writer can only
+    /// mutate a record whose origin names its own dispatch.
+    VerifiedOrdinary { dispatch: String },
+    /// Ambiguous history — operator recovery only.
+    #[default]
+    LegacyUnknown,
+}
+
+impl Origin {
+    /// The native dispatch receipt this record stands on, if any.
+    pub fn verified_ordinary(&self) -> Option<&str> {
+        match self {
+            Origin::VerifiedOrdinary { dispatch } => Some(dispatch),
+            Origin::LegacyUnknown => None,
+        }
+    }
+
+    pub fn is_verified_ordinary(&self) -> bool {
+        self.verified_ordinary().is_some()
+    }
+}
+
 /// A ticket's place in the loop — one per dispatched ticket.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub issue: String,
     pub project: String,
     pub worker: String,
+    /// CAD-2215: the native receipt this loop stands on. Absent in a
+    /// pre-2215 file, which deserializes as [`Origin::LegacyUnknown`] —
+    /// the safe reading, never a promotion to ordinary.
+    #[serde(default)]
+    pub origin: Origin,
     pub state: State,
     /// When `state` was entered (epoch secs) — the Needs-you age.
     pub since: i64,
@@ -332,6 +373,22 @@ pub struct Record {
     /// than trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_evidence: Option<AppEvidence>,
+    /// CAD-2215: operator-only recovery reference for a legacy candidate.
+    /// The report it was adopted from is evidence for inspection, never
+    /// provenance, and is never routed or published. Shared projections
+    /// exclude legacy records entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_recovery: Option<LegacyRecovery>,
+}
+
+/// CAD-2215: what an operator can inspect to recover an unverified
+/// candidate. Deliberately not provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyRecovery {
+    /// The report file named when the candidate was adopted.
+    pub report: String,
+    /// Always true: this reference proves nothing about origin.
+    pub unverified: bool,
 }
 
 fn not_held(held: &bool) -> bool {
@@ -344,6 +401,9 @@ impl Record {
             issue: issue.to_string(),
             project: project.to_string(),
             worker: worker.to_string(),
+            // Created without a native receipt: never ordinary until a
+            // producer proves one through [`Record::new_ordinary`].
+            origin: Origin::LegacyUnknown,
             state: State::Working,
             since: now,
             dispatched_at: now,
@@ -370,7 +430,24 @@ impl Record {
             ready_epoch: 0,
             risk: None,
             app_evidence: None,
+            legacy_recovery: None,
         }
+    }
+
+    /// CAD-2215: open a record that stands on a dispatch this daemon
+    /// accepted — the only constructor that makes ordinary work.
+    pub fn new_ordinary(
+        issue: &str,
+        project: &str,
+        worker: &str,
+        now: i64,
+        dispatch: &str,
+    ) -> Self {
+        let mut rec = Record::new(issue, project, worker, now);
+        rec.origin = Origin::VerifiedOrdinary {
+            dispatch: dispatch.to_string(),
+        };
+        rec
     }
 
     pub fn enter(&mut self, state: State, now: i64) {
@@ -582,6 +659,46 @@ pub fn path(state_dir: &Path) -> PathBuf {
 /// file reads as none.
 pub fn records(state_dir: &Path) -> BTreeMap<String, Record> {
     load(state_dir).unwrap_or_default()
+}
+
+/// CAD-2215: the records a shared reader may treat as ordinary work —
+/// only ones whose native dispatch receipt the daemon recorded. A
+/// legacy-unknown record is never promoted here by a matching ticket,
+/// job, alias or file name.
+pub fn ordinary_records(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    all.values()
+        .filter(|r| r.origin.is_verified_ordinary())
+        .collect()
+}
+
+/// CAD-2215: the records a shared reader must not see at all — written
+/// before provenance existed, or adopted without a proven receipt.
+pub fn legacy_records(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    all.values()
+        .filter(|r| !r.origin.is_verified_ordinary())
+        .collect()
+}
+
+/// The ordinary records in Needs-you order (oldest dispatch first).
+pub fn ordinary_in_order(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    let mut rows = ordinary_records(all);
+    rows.sort_by_key(|r| r.dispatched_at);
+    rows
+}
+
+/// CAD-2215: the key a legacy (unverified) candidate is stored under.
+/// Distinct from the ticket key, so an ordinary loop and a legacy
+/// candidate for the same ticket can coexist without either replacing
+/// the other. `name` only makes the key stable across passes — it is
+/// never read as evidence.
+pub fn legacy_key(issue: &str, name: &str) -> String {
+    format!("legacy:{issue}:{name}")
+}
+
+/// The legacy candidate stored for `issue`, if any.
+pub fn legacy_for_issue<'a>(all: &'a BTreeMap<String, Record>, issue: &str) -> Option<&'a Record> {
+    all.values()
+        .find(|r| r.issue == issue && !r.origin.is_verified_ordinary())
 }
 
 /// Every record, for the daemon's writes: a file that exists but does
@@ -1257,6 +1374,8 @@ fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
 }
 
 pub mod hosted_gate;
+pub mod private;
+pub mod publication;
 
 #[cfg(test)]
 mod tests {

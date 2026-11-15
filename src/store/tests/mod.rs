@@ -395,6 +395,7 @@ include!("native_nudge.rs");
 include!("plans.rs");
 include!("queue.rs");
 include!("schema.rs");
+include!("endpoint.rs");
 
 mod app_runs;
 mod cloud_dispatch_outbox;

@@ -1,7 +1,7 @@
-import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
-  type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
+  type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
@@ -42,6 +42,11 @@ export interface ScreenActions {
      *  the geometry. Absent (no shell behind this frame) the verb refuses. */
     openScreenDrawer?(surface: string): boolean;
     closeScreenDrawer?(): boolean;
+    /** The surface this frame is mounted as, host-derived; set only for a
+     *  drawer child, so a connect started there returns to that drawer. */
+    returnSurface?: string;
+    /** The width that drawer was opened with, so the return reopens it alike. */
+    returnSize?: ScreenDrawerSize;
   }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;
@@ -59,11 +64,18 @@ export interface ScreenActions {
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
   invoke?(alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope): Promise<ActionResult>;
+  /** CAD-2272: open the generic host-mediated audio capture/upload modal under
+   *  this mount's server-bound action context. Raw audio stays on the host. */
+  captureAudio?(mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  /** CAD-2281: dispatch a headless inline audio session command (`screen-audio.v2`). */
+  audioSession?(request: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  disposeAudioSession?(): void;
 }
 /** Most calls one frame may have outstanding; one more closes it. */
 export const CALL_QUEUE_MAX = 8;
 /** A reply's data is at most this many bytes of JSON. */
 const REPLY_BYTES_MAX = 64 * 1024;
+const AUDIO_REPLY_BYTES_MAX = 256 * 1024;
 const RECORD_REPLY_BYTES_MAX = 1048576;
 const RECORD_REPLY_WIRE_BYTES_MAX = RECORD_REPLY_BYTES_MAX + 1024;
 const jsonBytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
@@ -194,6 +206,11 @@ export abstract class FrameChannel {
   protected drawerCapable(): boolean | readonly ScreenDrawerVerb[] { return false; }
   /** Opaque state is ignored unless this frame kind explicitly understands it. */
   protected state(_data: string): void {}
+  /** screen.v2 unsaved-edit leave warning hint: a frame kind without it closes. */
+  protected leave(_unsaved: boolean): void { this.close(true); }
+  /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
+  protected audio(_request: AudioRequest): void { this.close(true); }
+  protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -222,6 +239,18 @@ export abstract class FrameChannel {
       if (child.op === "asset") {
         if (!this.ready) { this.close(true); return; }
         this.asset(child.ref);
+      }
+      if (child.op === "leave") {
+        if (!this.ready) { this.close(true); return; }
+        this.leave(child.unsaved);
+      }
+      if (child.op === "audio") {
+        if (!this.ready) { this.close(true); return; }
+        this.audio(child);
+      }
+      if (child.op === "audio-session") {
+        if (!this.ready) { this.close(true); return; }
+        this.audioSession(child);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -269,7 +298,7 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private records = false;
-  private crmLocale = false;
+  private wantsLocale = false;
   private wantsPresentation = false;
   private wantsSurfaces = false;
   /** CAD-1777 — the host-derived surface role of this mount. The outlet
@@ -313,21 +342,11 @@ export class ScreenChannel extends FrameChannel {
     const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}) };
     this.port.postMessage(message);
   }
-  protected state(data: string): void {
-    // Any records-contract screen may publish the hint; the payload's own
-    // `contract` field is the declaration (CAD-1543), never the app name.
-    if (!this.ready || this.closed || !this.records || data.length > 128 ||
-        new TextEncoder().encode(data).byteLength > 128) return;
-    // This closed boolean is a warning hint, never navigation/effect authority.
-    // Unknown or malformed opaque state must not clear an existing warning.
-    try {
-      const value: unknown = JSON.parse(data);
-      if (!value || typeof value !== "object" || Array.isArray(value)) return;
-      const state = value as Record<string, unknown>;
-      if (Object.keys(state).sort().join() !== "contract,unsaved" ||
-          state.contract !== "crm-leave.v1" || typeof state.unsaved !== "boolean") return;
-      this.onUnsaved?.(state.unsaved);
-    } catch { /* Ignore other opaque state, without changing the warning. */ }
+  protected leave(unsaved: boolean): void {
+    // Any screen.v2 frame may publish the boolean warning hint; it carries no
+    // navigation or effect authority, and non-v2 mounts close on v2 ops.
+    if (!this.ready || this.closed || this.shape !== "v2") { this.close(true); return; }
+    this.onUnsaved?.(unsaved);
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
@@ -400,7 +419,7 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
     // CAD-1777 / CAD-1932 — a drawer request is host-local UI, never a
     // records operation or an app action: a capable frame (records or not)
@@ -456,7 +475,7 @@ export class ScreenChannel extends FrameChannel {
 /** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_SLOT_VERBS as readonly string[]).includes(request.verb) : !(SLOT_VERBS as readonly string[]).includes(request.verb))) { this.close(true); return; }
     const csv = this.records && (request.verb === "records.csv.import" || request.verb === "records.csv.confirm");
     if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
@@ -481,7 +500,96 @@ export class ScreenChannel extends FrameChannel {
    *  frame's choice. One outstanding tool call at a time. */
   private wantsTools = false;
   private wantsMedia = false;
+  private wantsAudio = false;
+  private wantsAudioV2 = false;
   private toolBusy = false;
+  private audioBusy = false;
+  private audioRetire: AbortController | null = null;
+  private audioSessionRetire = new Set<AbortController>();
+  sendAudioSessionEvent(state: ScreenAudioSessionSnapshot): void {
+    if (this.closed || !this.ready || this.shape !== "v2" || !this.wantsAudioV2) return;
+    const parsed = parseScreenAudioSessionSnapshot(state);
+    if (!parsed || jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) return;
+    const message: AudioSessionEvent = { v: 2, op: "audio-session-event", state: parsed };
+    this.port?.postMessage(message);
+  }
+  protected audioSession(request: AudioSessionRequest): void {
+    if (this.shape !== "v2" || !this.wantsAudioV2) {
+      this.close(true); return;
+    }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const dispatchSession = this.actions?.audioSession;
+    const token = this.receipt.action_token;
+    if (!dispatchSession || !token || !this.hasBaseActions()) {
+      reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
+      return;
+    }
+    if (this.audioSessionRetire.size >= CALL_QUEUE_MAX) {
+      this.close(true); return;
+    }
+    const retire = new AbortController();
+    this.audioSessionRetire.add(retire);
+    void dispatchSession(request, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
+      .then(result => {
+        this.audioSessionRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          const safeRefusal = parseActionRefusal(result.refusal) ?? { code: "failed", text: "Audio session failed." };
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: safeRefusal });
+          return;
+        }
+        const parsed = parseScreenAudioSessionSnapshot(result.data);
+        if (!parsed) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Audio session returned an invalid state." } });
+          return;
+        }
+        if (jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That transcript is too large to return." } });
+          return;
+        }
+        reply({ v: 2, op: "audio-session-reply", id: request.id, ok: true, data: parsed });
+      });
+  }
+  protected audio(request: AudioRequest): void {
+    if (this.shape !== "v2" || !this.wantsAudio) {
+      this.close(true); return;
+    }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const capture = this.actions?.captureAudio;
+    const token = this.receipt.action_token;
+    if (!capture || !token) {
+      reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
+      return;
+    }
+    if (this.audioBusy) {
+      reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "conflict", text: "Audio capture is already open." } });
+      return;
+    }
+    this.audioBusy = true;
+    const retire = new AbortController();
+    this.audioRetire = retire;
+    void capture(request.mode, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
+      .then(result => {
+        if (this.audioRetire === retire) {
+          this.audioRetire = null;
+          this.audioBusy = false;
+        }
+        if (this.closed) return;
+        if (!result.ok) { reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: result.refusal }); return; }
+        const parsed = parseScreenAudioCapture(result.data);
+        if (!parsed) {
+          reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Audio capture returned an invalid result." } });
+          return;
+        }
+        if (jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) {
+          reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That transcript is too large to return." } });
+          return;
+        }
+        reply({ v: 2, op: "audio-reply", id: request.id, ok: true, data: parsed });
+      });
+  }
   protected tool(request: ToolRequest): void {
     const actions = this.actions;
     if (this.shape !== "v2" || !this.wantsTools || !actions?.invoke || this.toolBusy) {
@@ -518,6 +626,12 @@ export class ScreenChannel extends FrameChannel {
   close(report = false): void {
     for (const retire of this.callRetire) retire.abort();
     this.callRetire = [];
+    for (const retire of this.audioSessionRetire) retire.abort();
+    this.audioSessionRetire.clear();
+    this.actions?.disposeAudioSession?.();
+    this.audioRetire?.abort();
+    this.audioRetire = null;
+    this.audioBusy = false;
     this.slots?.close();
     super.close(report);
   }
@@ -527,9 +641,17 @@ export class ScreenChannel extends FrameChannel {
     if (!shape) return false;
     const accepts: readonly string[] = ready.accepts ?? [];
     const records = accepts.includes(SCREEN_RECORDS_V1);
+    const wantsLocale = accepts.includes(SCREEN_LOCALE_V1);
+    const wantsAudio = accepts.includes(SCREEN_AUDIO_V1);
+    const wantsAudioV2 = accepts.includes(SCREEN_AUDIO_V2);
+    if (wantsAudio && wantsAudioV2) return false;
+    if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
+    if ((wantsAudio || wantsAudioV2) && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     this.records = records;
-    this.crmLocale = records && accepts.includes(CRM_LOCALE_V1);
+    this.wantsLocale = wantsLocale;
+    this.wantsAudio = wantsAudio;
+    this.wantsAudioV2 = wantsAudioV2;
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -593,6 +715,9 @@ export class ScreenChannel extends FrameChannel {
     if (!advertised.length || !projection.actions?.length) return projection;
     return { ...projection, actions: [...projection.actions, ...advertised] };
   }
+  private hasBaseActions(): boolean {
+    return this.records ? Boolean(this.receipt.operations?.length) : Boolean(this.projection.actions?.length);
+  }
   /** Send the negotiated shape, or close when it cannot be sent within bounds. */
   protected send(): void {
     // DSN-1: `run_receipts` is a host-derived marker, never forwarded. Any
@@ -603,6 +728,7 @@ export class ScreenChannel extends FrameChannel {
     // the slot path still validates, plans and confirms natively.
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
+    const hasBaseActions = this.hasBaseActions();
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
     // CAD-1777 — the host-local presentation verbs are advertised beside
     // the receipt's records operations, and only to a frame that has both
@@ -615,7 +741,7 @@ export class ScreenChannel extends FrameChannel {
       projection.actions = [...advertised, ...drawerVerbs.filter(verb => !advertised.includes(verb))];
     }
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
-    if (!this.crmLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    if (!this.wantsLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;
@@ -625,9 +751,11 @@ export class ScreenChannel extends FrameChannel {
     delete projection.original_downloads;
     delete projection.media_previews;
     delete projection.media_chat_references;
+    delete projection.audio_capture;
     if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.read")) projection.media_previews = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.chat.attach")) projection.media_chat_references = 1;
+    if (this.shape === "v2" && ((this.wantsAudio && this.actions?.captureAudio) || (this.wantsAudioV2 && this.actions?.audioSession)) && this.receipt.action_token && hasBaseActions) projection.audio_capture = 1;
     const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
