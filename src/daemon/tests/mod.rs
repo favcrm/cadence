@@ -25,3 +25,4 @@ mod cad2310_relayed_briefing_read_refusal;
 mod pty_retry_tests;
 mod unit;
 mod unknown_fence_guidance;
+// CAD-2307 probe

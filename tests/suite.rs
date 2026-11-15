@@ -1,6 +1,7 @@
 //! The one integration suite (CAD-1970).
 //!
 //! The integration target also carries acceptance checks for changed gates.
+// CAD-2307 probe
 
 #[test]
 fn an_identifier_is_validated_before_anything_uses_it() {
