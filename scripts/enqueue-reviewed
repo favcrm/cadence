@@ -2463,11 +2463,13 @@ def self_test():
                 "sys.exit(2)\n"
             )
         os.chmod(fake_cadence, os.stat(fake_cadence).st_mode | stat.S_IXUSR)
+        old_cwd = os.getcwd()
         old_bin = os.environ.get("CADENCE_BIN")
         old_mode = os.environ.get("TEST_ORG_MODE")
         old_gate = os.environ.get("TEST_GATE")
         old_enq = os.environ.get("TEST_ENQUEUE")
         try:
+            os.chdir(tmp)
             os.environ["CADENCE_BIN"] = fake_cadence
             os.environ["TEST_ORG_MODE"] = "remote"
             os.environ["TEST_GATE"] = "pass"
@@ -2480,6 +2482,7 @@ def self_test():
             rc_brk = main(["7", "--org", "bad-org", "--repo", "favcrm/cadence", "--dry-run"])
             ok_hosted = rc_dry == 0 and rc_enq == 0 and rc_ref == 1 and rc_brk == 1
         finally:
+            os.chdir(old_cwd)
             for k, v in [("CADENCE_BIN", old_bin), ("TEST_ORG_MODE", old_mode),
                          ("TEST_GATE", old_gate), ("TEST_ENQUEUE", old_enq)]:
                 if v is None:
@@ -2712,6 +2715,12 @@ def main(argv):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
         return 2
 
+    gate_refusals = check_gate_copy(args.dry_run)
+    if gate_refusals:
+        for r in gate_refusals:
+            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
+        return 1
+
     org_mode, _, org_err = hosted_org_mode(args.org)
     if org_err:
         print(f"{ME}: refused: {shown(org_err)}", file=sys.stderr)
@@ -2732,11 +2741,6 @@ def main(argv):
     if not args.head:
         print(f"{ME}: --head is required", file=sys.stderr)
         return 2
-    gate_refusals = check_gate_copy(args.dry_run)
-    if gate_refusals:
-        for r in gate_refusals:
-            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
-        return 1
     repo = args.repo
     try:
         if not repo:
