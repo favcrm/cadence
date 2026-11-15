@@ -2,17 +2,17 @@
   "approve": {
     "status": 409,
     "code": "conflict",
-    "message": "The document changed; read it again."
+    "message": "the document changed; open it again"
   },
   "archive": {
     "status": 403,
     "code": "owner_only",
-    "message": "Only the workspace owner can archive a document."
+    "message": "only the workspace owner can archive"
   },
   "restore": {
     "status": 403,
     "code": "owner_only",
-    "message": "Only the workspace owner can restore a document."
+    "message": "only the workspace owner can restore"
   },
   "set-type": {
     "status": 409,

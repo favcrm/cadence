@@ -747,8 +747,9 @@ async function main() {
 
   // The same race with the newer opening asked for in the same turn as the
   // receipt: the opening is recorded when it is asked for, so the receipt never
-  // closes it. (A click's commit flushes its effects at once, so this passes
-  // with an effect-synced ref too; it pins the behaviour, not the mechanism.)
+  // closes it. This pins the behaviour, not the mechanism: run once with the
+  // ref synced in an effect instead (CAD-2286 review), it still passed, since a
+  // click's commit flushes its effects before the receipt's continuation runs.
   writeReply = () => new Promise<Response>((resolve) => { releaseSave = resolve; });
   await click(buttonIn(row("brief"), "Edit"));
   await fill(field("Archive after (days)"), "34");
