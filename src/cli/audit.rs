@@ -32,9 +32,9 @@ pub(crate) enum AuditAction {
         /// or the cwd.
         #[arg(long)]
         project: Option<String>,
-        /// Record a delegated approval: the daemon checks every
-        /// safeguard and records it under this pane's own agent.
-        #[arg(long, conflicts_with_all = ["issue", "id"])]
+        /// Record a delegated approval: the hosted org (or local daemon)
+        /// checks safeguards and records it under this caller's own agent.
+        #[arg(long, conflicts_with = "id")]
         delegated: bool,
         /// The scope pre-approval id a delegated approval relies on.
         #[arg(long, requires = "delegated")]
@@ -139,6 +139,9 @@ pub(crate) enum AuditAction {
         /// Tracker issue id the scope approvals name.
         #[arg(long)]
         issue: String,
+        /// The issue's project (hosted orgs; required there for project-scoped read).
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Read-only (CAD-959): the verdicts of ISSUE that name PR `--pr` and the
     /// full `--head`, plus a `skipped` list with the reason for every note of
@@ -265,21 +268,31 @@ pub(crate) enum AuditAction {
         revoke: bool,
     },
     /// List the designations in force.
-    Designations,
+    Designations {
+        /// Tracker project key (hosted orgs; optional filter).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Delegated approvals in a window (JSON), each with its revoke and
     /// revert commands. Read-only.
     Digest {
         /// 24h (default), 7d, YYYY-MM-DD or epoch.
         #[arg(long)]
         since: Option<String>,
+        /// Tracker project key (hosted orgs; optional filter).
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Withdraw an approval id. Cancelling a message never does this.
     Revoke {
         /// The approval id `audit approve` recorded.
         id: String,
-        /// Who revoked and where.
+        /// Tracker project key (hosted orgs; optional project assertion).
         #[arg(long)]
-        source: String,
+        project: Option<String>,
+        /// Who revoked and where (required in local mode; hosted uses the caller's identity).
+        #[arg(long)]
+        source: Option<String>,
         /// Why the approval no longer holds.
         #[arg(long)]
         reason: String,
@@ -366,7 +379,13 @@ pub(super) fn run(
             "audit identities reads and writes the hosted workspace's identity \
              attestations; select it with `--org <org>`. Nothing was sent",
         )),
-        Some(AuditAction::Scope { issue }) => {
+        Some(AuditAction::Scope { issue, project }) => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local scope \
+                     approvals name no project. Nothing was read"
+                )));
+            }
             let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
             Ok(code)
@@ -417,9 +436,17 @@ pub(super) fn run(
                 project,
                 issue,
                 pr,
+                delegated,
                 ..
             } = &action
             {
+                if *delegated && issue.is_some() {
+                    return Err(Error::usage(
+                        "--delegated cannot be combined with --issue in local mode; a local \
+                         delegated approval derives its issue and scope from --scope. \
+                         Nothing was recorded",
+                    ));
+                }
                 if let Some(project) = project {
                     return Err(Error::usage(format!(
                         "--project {project} binds the hosted project-scoped approval: a local \

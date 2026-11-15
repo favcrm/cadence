@@ -490,6 +490,17 @@ Do not substitute a comment or another identity for the required proof.
   gets no scope approval; a diff touching a trigger 1/3 path always needs
   the per-head approval; and every counted verdict must carry
   `Scope: in-scope <ID>`. `cadence audit revoke <id>` withdraws it.
+- On hosted workspaces (such as `fav-limited`), the board's **Approve &
+  merge** panel (`GET /api/approvals/gate`, `POST /api/approvals/merge`) evaluates
+  the merge gate server-side inside the tenant Durable Object, verifies a fresh
+  15-minute (`900`s) 6-digit Email-OTP step-up (`POST /api/approvals/step-up/{send,verify}`),
+  records an immutable `tenant_delivery_evidence` row plus `human` approval,
+  enqueues the PR for merge, and posts a `cadence-delivery-gate/v2` SSHSIG comment
+  backed by GitHub Actions OIDC (`POST /__platform/delivery-gate/verify`).
+  Use `cadence --org <org> delivery check` to inspect gate readiness and
+  `cadence --org <org> delivery enqueue` for operator CLI enqueue (no local daemon
+  required). `POST /api/approvals/:id/revoke` ("Stop merge") and
+  `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
 
 ### Merging
 
@@ -497,14 +508,19 @@ The following is the native reviewed-enqueue path, not a claim that a selected
 hosted workspace can run it. If the gate cannot run, stop and report the
 limitation; only an authorized operator can decide an exception.
 
-- Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`. It
+- Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>` (or pass
+  `--org <hosted-org> --project <key> --issue <ID>` on a hosted org so it acts as a
+  thin client delegating to `cadence delivery check` and `cadence delivery enqueue`). It
   refuses unless the PR is open at that head, every required check is
   present and green, the required verdicts are pinned to the head, a ticket
   comment lists them and, for a `human` diff, an operator approval is
-  recorded. It never records an approval. It then signs the head with the
-  operator's delivery-gate key (`~/.config/cadence/delivery-gate/`) and posts
-  the signature on the PR; the queue's required `delivery-gate` check holds
-  any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
+  recorded. It never records an approval. On native checkouts it signs the head
+  with the operator's delivery-gate key (`~/.config/cadence/delivery-gate/`) and posts
+  the signature on the PR; on hosted orgs the tenant DO signs
+  `cadence-delivery-gate/v2` SSHSIG and `scripts/delivery-gate` in `merge_group`
+  verifies both the signature and GitHub Actions OIDC via
+  `POST https://<host>/__platform/delivery-gate/verify`. The queue's required
+  `delivery-gate` check holds any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
   queue re-tests on the newest main, so you do not have to rebase first.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the
   cause is often a semantic clash with a PR that just landed. Fix it on the

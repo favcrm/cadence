@@ -2426,6 +2426,68 @@ def self_test():
           and not is_human_path("docs/guides/x.md", ["tests/**", "docs/design/**"]))
     print(f"{'ok  ' if ok else 'FAIL'} a risk-paths trigger glob makes a path human-class")
     failures += 0 if ok else 1
+
+    # CAD-1946: hosted thin-client delegation when `cadence org inspect` reports remote.
+    import stat
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="enqueue-hosted-test.") as tmp:
+        fake_cadence = os.path.join(tmp, "cadence")
+        calls_log = os.path.join(tmp, "calls.log")
+        with open(fake_cadence, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                f"log = {calls_log!r}\n"
+                "argv = sys.argv[1:]\n"
+                "with open(log, 'a', encoding='utf-8') as lf:\n"
+                "    lf.write(json.dumps(argv) + '\\n')\n"
+                "mode = os.environ.get('TEST_ORG_MODE', 'remote')\n"
+                "if argv[-2:] == ['org', 'inspect']:\n"
+                "    if mode == 'broken':\n"
+                "        sys.stderr.write('unknown org\\n')\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'org': 'fav-limited', 'selected': True, 'destination': {'mode': mode}}))\n"
+                "    sys.exit(0)\n"
+                "if 'delivery' in argv and 'check' in argv:\n"
+                "    if os.environ.get('TEST_GATE') == 'refused':\n"
+                "        print(json.dumps({'state': 'refused', 'ok': False, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'reasons': ['need 2 reviews']}))\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'state': 'pass', 'ok': True, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'delivery_class': 'human', 'approval_kind': 'per-head', 'reasons': []}))\n"
+                "    sys.exit(0)\n"
+                "if 'delivery' in argv and 'enqueue' in argv:\n"
+                "    if os.environ.get('TEST_ENQUEUE') == '409':\n"
+                "        sys.stderr.write('head_moved: PR head changed\\n')\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'state': 'enqueued', 'ok': True, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'evidence_id': 'ev_99', 'queued': True, 'auto_merge_enabled': True, 'comment_url': 'https://example/c/1'}))\n"
+                "    sys.exit(0)\n"
+                "sys.exit(2)\n"
+            )
+        os.chmod(fake_cadence, os.stat(fake_cadence).st_mode | stat.S_IXUSR)
+        old_bin = os.environ.get("CADENCE_BIN")
+        old_mode = os.environ.get("TEST_ORG_MODE")
+        old_gate = os.environ.get("TEST_GATE")
+        old_enq = os.environ.get("TEST_ENQUEUE")
+        try:
+            os.environ["CADENCE_BIN"] = fake_cadence
+            os.environ["TEST_ORG_MODE"] = "remote"
+            os.environ["TEST_GATE"] = "pass"
+            os.environ["TEST_ENQUEUE"] = "ok"
+            rc_dry = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
+            rc_enq = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--head", "a" * 40])
+            os.environ["TEST_GATE"] = "refused"
+            rc_ref = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
+            os.environ["TEST_ORG_MODE"] = "broken"
+            rc_brk = main(["7", "--org", "bad-org", "--repo", "favcrm/cadence", "--dry-run"])
+            ok_hosted = rc_dry == 0 and rc_enq == 0 and rc_ref == 1 and rc_brk == 1
+        finally:
+            for k, v in [("CADENCE_BIN", old_bin), ("TEST_ORG_MODE", old_mode),
+                         ("TEST_GATE", old_gate), ("TEST_ENQUEUE", old_enq)]:
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        print(f"{'ok  ' if ok_hosted else 'FAIL'} hosted org thin client delegates check/enqueue and fails closed")
+        failures += 0 if ok_hosted else 1
     return 0 if not failures else 1
 
 
@@ -2499,13 +2561,129 @@ def check_gate_copy(dry_run):
     return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
 
 
+def hosted_org_mode(org_arg):
+    """Detect whether the target Cadence org is remote via `cadence org inspect`."""
+    explicit_org = (org_arg or os.environ.get("CADENCE_ORG") or "").strip() or None
+    cmd = ["cadence"]
+    if explicit_org:
+        cmd += ["--org", explicit_org]
+    cmd += ["org", "inspect"]
+    rc, out, err = run(cmd)
+    if rc != 0:
+        if explicit_org:
+            detail = err.strip() or out.strip() or f"exit {rc}"
+            return "error", None, f"cannot inspect hosted org {explicit_org}: {detail}"
+        return "local", None, None
+    try:
+        doc = json.loads(out)
+    except ValueError as e:
+        if explicit_org:
+            return "error", None, f"cadence org inspect returned invalid JSON: {e}"
+        return "local", None, None
+    dest = doc.get("destination") if isinstance(doc, dict) else None
+    mode = dest.get("mode") if isinstance(dest, dict) else (doc.get("mode") if isinstance(doc, dict) else None)
+    if mode == "remote":
+        return "remote", doc, None
+    if mode == "local":
+        return "local", doc, None
+    if explicit_org:
+        return "error", None, f"cadence org inspect reported unknown mode {mode!r}"
+    return "local", doc, None
+
+
+def _run_hosted_check(args, repo):
+    cmd = ["cadence"]
+    if args.org:
+        cmd += ["--org", args.org]
+    cmd += ["delivery", "check", "--repo", repo, "--pr", str(args.pr)]
+    if args.head:
+        cmd += ["--head", args.head]
+    if args.issue:
+        cmd += ["--issue", args.issue]
+    if args.project:
+        cmd += ["--project", args.project]
+    if args.browser_qa:
+        cmd.append("--browser-qa")
+    rc, out, err = run(cmd)
+    try:
+        doc = json.loads(out) if out.strip() else None
+    except ValueError:
+        doc = None
+    return rc, out, err, doc
+
+
+def run_hosted_gate(args, repo):
+    """Thin hosted client: evaluate or approve+enqueue on the remote Cadence board."""
+    head = args.head
+    if args.dry_run or not head:
+        rc, out, err, doc = _run_hosted_check(args, repo)
+        if args.dry_run:
+            if isinstance(doc, dict):
+                checked_head = doc.get("head") or head or "?"
+                cls = doc.get("delivery_class")
+                kind = doc.get("approval_kind")
+                if rc == 0 and doc.get("ok") is True:
+                    print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {checked_head}"
+                          f" (class={cls}, approval={kind}); nothing enqueued")
+                    return 0
+                reasons = doc.get("reasons") if isinstance(doc.get("reasons"), list) else []
+                for r in reasons:
+                    print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+                if not reasons:
+                    msg = err.strip() or out.strip() or f"delivery check exited {rc}"
+                    print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+                return 1
+            msg = err.strip() or out.strip() or f"delivery check exited {rc}"
+            print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+            return rc if rc != 0 else 1
+        if rc != 0 or not isinstance(doc, dict) or not FULL_SHA.match(str(doc.get("head", ""))):
+            reasons = doc.get("reasons", []) if isinstance(doc, dict) else []
+            for r in reasons:
+                print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+            if not reasons:
+                msg = err.strip() or out.strip() or f"delivery check could not resolve PR #{args.pr} head"
+                print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+            return 1
+        head = doc["head"].lower()
+
+    cmd = ["cadence"]
+    if args.org:
+        cmd += ["--org", args.org]
+    cmd += ["delivery", "enqueue", "--repo", repo, "--pr", str(args.pr), "--head", head]
+    if args.issue:
+        cmd += ["--issue", args.issue]
+    if args.project:
+        cmd += ["--project", args.project]
+    if args.browser_qa:
+        cmd.append("--browser-qa")
+    rc, out, err = run(cmd)
+    if rc == 0:
+        try:
+            doc = json.loads(out)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and doc.get("ok") is True:
+            ev = doc.get("evidence_id") or "?"
+            url = doc.get("comment_url") or doc.get("comment_id") or "?"
+            print(f"{ME}: enqueued PR #{args.pr} at {head} (evidence {ev}, comment {url})")
+            return 0
+        print(f"{ME}: refused: delivery enqueue returned an invalid receipt", file=sys.stderr)
+        return 1
+    msg = err.strip() or out.strip() or f"delivery enqueue exited {rc}"
+    print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+    return rc
+
+
 def main(argv):
     if "--self-test" in argv:
         return self_test()
     ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
     ap.add_argument("pr", type=int)
-    ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
+    ap.add_argument("--head", help="the full 40-hex head SHA the review covered")
     ap.add_argument("--repo")
+    ap.add_argument("--org", help="hosted Cadence org selector (delegates to cadence delivery check/enqueue)")
+    ap.add_argument("--project", help="explicit project key for hosted delivery check/enqueue")
+    ap.add_argument("--issue", help="explicit tracker issue id for hosted delivery check/enqueue")
     ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
@@ -2515,12 +2693,13 @@ def main(argv):
                     help="CAD-1946: waive only the missing reviewer attestation; needs --advisory")
     ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
                     help="a separate advisory review: standards, spec-security or browser-qa")
-    ap.add_argument("--browser-qa", metavar="URL",
+    ap.add_argument("--browser-qa", nargs="?", const="required", metavar="URL",
                     help="a ui/ change on a hosted org: the PR comment recording its Browser QA")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
-    args.head = args.head.lower()
+    if args.head is not None:
+        args.head = args.head.lower()
     pairs = [a.partition("=") for a in args.advisory]
     args.advisory = {k: v for k, _, v in pairs}
     if len(args.advisory) != len(pairs) or (pairs and not args.exception):
@@ -2529,8 +2708,29 @@ def main(argv):
     if args.browser_qa and args.exception:
         print(f"{ME}: --browser-qa and --exception are separate routes", file=sys.stderr)
         return 2
-    if args.pr < 1 or not FULL_SHA.match(args.head):
+    if args.pr < 1 or (args.head is not None and not FULL_SHA.match(args.head)):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
+        return 2
+
+    org_mode, _, org_err = hosted_org_mode(args.org)
+    if org_err:
+        print(f"{ME}: refused: {shown(org_err)}", file=sys.stderr)
+        return 1
+    if org_mode == "remote" and not args.exception:
+        repo = args.repo
+        try:
+            if not repo:
+                repo = gh_json(["repo", "view", "--json", "nameWithOwner"])["nameWithOwner"]
+            if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
+                print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
+                return 2
+            return run_hosted_gate(args, repo)
+        except (RuntimeError, KeyError, TypeError) as e:
+            print(f"{ME}: refused: cannot read the PR: {shown(str(e))}", file=sys.stderr)
+            return 1
+
+    if not args.head:
+        print(f"{ME}: --head is required", file=sys.stderr)
         return 2
     gate_refusals = check_gate_copy(args.dry_run)
     if gate_refusals:

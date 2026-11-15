@@ -1653,6 +1653,577 @@ pub(crate) fn findings_answer(body: &Value, binding: &GateBinding) -> Result<Val
     })
 }
 
+// ---- CAD-1946: hosted merge gate evaluator, enqueue, scope/designate/digest/revoke & delegated ----
+
+/// `cadence delivery check` (CAD-1946): server-side read-only merge gate evaluation.
+/// Exits 0 iff `state == "pass" && ok == true`; exits 1 with structured `reasons` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn delivery_check(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+    issue: Option<&str>,
+    repo: &str,
+    pr: u64,
+    head: Option<&str>,
+    browser_qa: bool,
+) -> Result<(Value, i32)> {
+    let mut call_args = args(&[("repo", json!(repo)), ("pr", json!(pr))]);
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    if let Some(i) = issue {
+        call_args.insert("issue".into(), json!(i));
+    }
+    if let Some(h) = head {
+        call_args.insert("head".into(), json!(h));
+    }
+    if browser_qa {
+        call_args.insert("browser_qa".into(), json!(true));
+    }
+    let body = call(target, wake_timeout, "delivery_check", call_args)?;
+    delivery_check_answer(&body, repo, pr, head)
+}
+
+pub(crate) fn delivery_check_answer(
+    body: &Value,
+    repo: &str,
+    pr: u64,
+    requested_head: Option<&str>,
+) -> Result<(Value, i32)> {
+    let verb = "delivery_check";
+    let state = text(body, "state", verb)?;
+    let ok = body["ok"]
+        .as_bool()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no ok boolean")))?;
+    if !matches!(state, "pass" | "refused") || (state == "pass") != ok {
+        return Err(refuse(format!(
+            "`{verb}` answer has inconsistent state/ok: {}",
+            short(body)
+        )));
+    }
+    if !body["repo"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        || body["pr"].as_u64() != Some(pr)
+    {
+        return Err(refuse(format!("`{verb}` answer does not name {repo}#{pr}")));
+    }
+    if let Some(h) = requested_head {
+        if !body["head"]
+            .as_str()
+            .is_some_and(|got| got.eq_ignore_ascii_case(h))
+        {
+            return Err(refuse(format!(
+                "`{verb}` answer does not pin requested head {h}"
+            )));
+        }
+    }
+    let reasons = body["reasons"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no reasons array")))?;
+    if reasons.iter().any(|r| !r.is_string()) {
+        return Err(refuse(format!("`{verb}` answer carries non-string reason")));
+    }
+    Ok((body.clone(), if ok { 0 } else { 1 }))
+}
+
+/// `cadence delivery enqueue` (CAD-1946): evaluate server-side gate, record approval +
+/// `tenant_delivery_evidence`, sign `v2` SSHSIG, comment on PR and enable auto-merge.
+#[allow(clippy::too_many_arguments)]
+pub fn delivery_enqueue(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+    issue: Option<&str>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    browser_qa: bool,
+) -> Result<Value> {
+    let mut call_args = args(&[
+        ("repo", json!(repo)),
+        ("pr", json!(pr)),
+        ("head", json!(head)),
+    ]);
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    if let Some(i) = issue {
+        call_args.insert("issue".into(), json!(i));
+    }
+    if browser_qa {
+        call_args.insert("browser_qa".into(), json!(true));
+    }
+    let body = call(target, wake_timeout, "delivery_enqueue", call_args)?;
+    delivery_enqueue_answer(&body, repo, pr, head)
+}
+
+pub(crate) fn delivery_enqueue_answer(
+    body: &Value,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<Value> {
+    let verb = "delivery_enqueue";
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("enqueued") || body["ok"].as_bool() != Some(true) {
+            return Err(refuse(format!(
+                "`{verb}` did not enqueue the PR: {}",
+                short(body)
+            )));
+        }
+        if !body["repo"]
+            .as_str()
+            .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+            || body["pr"].as_u64() != Some(pr)
+            || !body["head"]
+                .as_str()
+                .is_some_and(|h| h.eq_ignore_ascii_case(head))
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name exactly {repo}#{pr} at {head}"
+            )));
+        }
+        text(body, "evidence_id", verb)?;
+        if !body["queued"].is_boolean() || !body["auto_merge_enabled"].is_boolean() {
+            return Err(refuse(format!(
+                "`{verb}` receipt missing queued/auto_merge_enabled flags"
+            )));
+        }
+        Ok(body.clone())
+    })
+}
+
+/// `cadence audit revoke` (CAD-1946): owner revokes a hosted approval (and dequeues if merging).
+pub fn revoke_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+    approval_id: &str,
+    reason: &str,
+) -> Result<Value> {
+    let mut call_args = args(&[
+        ("approval_id", json!(approval_id)),
+        ("reason", json!(reason)),
+    ]);
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    let body = call(target, wake_timeout, "audit_revoke_project", call_args)?;
+    revoke_project_answer(&body, project, approval_id)
+}
+
+pub(crate) fn revoke_project_answer(
+    body: &Value,
+    project: Option<&str>,
+    approval_id: &str,
+) -> Result<Value> {
+    let verb = "audit_revoke_project";
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("revoked") {
+            return Err(refuse(format!(
+                "`{verb}` did not revoke the approval: {}",
+                short(body)
+            )));
+        }
+        if body["approval_id"].as_str() != Some(approval_id) {
+            return Err(refuse(format!(
+                "`{verb}` receipt names another approval than {approval_id}"
+            )));
+        }
+        if let Some(p) = project {
+            if body["project"].as_str() != Some(p) {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names another project than {p}"
+                )));
+            }
+        }
+        text(body, "revoked_at", verb)?;
+        Ok(body.clone())
+    })
+}
+
+/// `cadence audit approve --action scope --issue X --project P` (CAD-1946).
+pub fn approve_scope_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    issue: &str,
+    source: &str,
+    id: Option<&str>,
+) -> Result<Value> {
+    let mut call_args = args(&[
+        ("project", json!(project)),
+        ("issue", json!(issue)),
+        ("source", json!(source)),
+    ]);
+    if let Some(id) = id {
+        call_args.insert("id".into(), json!(id));
+    }
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_approve_scope_project",
+        call_args,
+    )?;
+    approve_scope_project_answer(&body, project, issue, source, id)
+}
+
+pub(crate) fn approve_scope_project_answer(
+    body: &Value,
+    project: &str,
+    issue: &str,
+    source: &str,
+    id: Option<&str>,
+) -> Result<Value> {
+    let verb = "audit_approve_scope_project";
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded") {
+            return Err(refuse(format!(
+                "`{verb}` did not record a scope approval: {}",
+                short(body)
+            )));
+        }
+        if !body["duplicate"].is_boolean() {
+            return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        if body["project"].as_str() != Some(project)
+            || !body["issue"]
+                .as_str()
+                .is_some_and(|i| i.eq_ignore_ascii_case(issue))
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name {project}/{issue}"
+            )));
+        }
+        if body["source"].as_str() != Some(source) {
+            return Err(refuse(format!("`{verb}` receipt names another source")));
+        }
+        let recorded_id = text(body, "approval_id", verb)?;
+        if let Some(req_id) = id {
+            if recorded_id != req_id {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names approval_id {recorded_id:?}, expected {req_id:?}"
+                )));
+            }
+        }
+        text(body, "scope_digest", verb)?;
+        text(body, "recorded_via", verb)?;
+        Ok(body.clone())
+    })
+}
+
+/// `cadence audit scope --issue X --project P` (CAD-1946): project-scoped readback.
+pub fn scope_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    issue: &str,
+) -> Result<(Value, i32)> {
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_scope_project",
+        args(&[("project", json!(project)), ("issue", json!(issue))]),
+    )?;
+    scope_project_answer(&body, project, issue)
+}
+
+pub(crate) fn scope_project_answer(
+    body: &Value,
+    project: &str,
+    issue: &str,
+) -> Result<(Value, i32)> {
+    let verb = "audit_scope_project";
+    let state = text(body, "state", verb)?;
+    if state != "ok" {
+        let reason = body["reason"].as_str().unwrap_or(state);
+        return Ok((json!({"state": state, "reason": reason}), 1));
+    }
+    if body["project"].as_str() != Some(project)
+        || !body["issue"]
+            .as_str()
+            .is_some_and(|i| i.eq_ignore_ascii_case(issue))
+    {
+        return Err(refuse(format!(
+            "`{verb}` answered for another project/issue than {project}/{issue}"
+        )));
+    }
+    let rows = body["approvals"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no approvals list")))?;
+    let mut normalized = Vec::with_capacity(rows.len());
+    for row in rows {
+        let approval_id = text(row, "approval_id", verb)?;
+        let scope_digest = text(row, "scope_digest", verb)?;
+        text(row, "source", verb)?;
+        text(row, "recorded_via", verb)?;
+        let revoked = row["revoked"]
+            .as_bool()
+            .unwrap_or_else(|| !row["revoked_at"].is_null());
+        let mut obj = row
+            .as_object()
+            .cloned()
+            .ok_or_else(|| refuse(format!("`{verb}` row is not an object")))?;
+        obj.insert("approval_id".into(), json!(approval_id));
+        obj.insert("digest".into(), json!(scope_digest));
+        obj.insert("revoked".into(), json!(revoked));
+        normalized.push(Value::Object(obj));
+    }
+    let mut out = body
+        .as_object()
+        .cloned()
+        .ok_or_else(|| refuse(format!("`{verb}` answer is not an object")))?;
+    out.insert("approvals".into(), Value::Array(normalized));
+    Ok((Value::Object(out), 0))
+}
+
+/// `cadence audit designate <alias> --project P --source S [--revoke]` (CAD-1946).
+pub fn designate_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    alias: &str,
+    project: &str,
+    source: &str,
+    revoke: bool,
+) -> Result<Value> {
+    let mut call_args = args(&[
+        ("alias", json!(alias)),
+        ("project", json!(project)),
+        ("source", json!(source)),
+    ]);
+    if revoke {
+        call_args.insert("revoke".into(), json!(true));
+    }
+    let body = call(target, wake_timeout, "audit_designate_project", call_args)?;
+    designate_project_answer(&body, alias, project, revoke)
+}
+
+pub(crate) fn designate_project_answer(
+    body: &Value,
+    alias: &str,
+    project: &str,
+    revoke: bool,
+) -> Result<Value> {
+    let verb = "audit_designate_project";
+    check_receipt(verb, || {
+        if body["project"].as_str() != Some(project) {
+            return Err(refuse(format!(
+                "`{verb}` receipt names another project than {project}"
+            )));
+        }
+        if revoke {
+            if body["state"].as_str() != Some("revoked")
+                || !body["alias"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(alias))
+                || !body["revoked"].is_boolean()
+            {
+                return Err(refuse(format!(
+                    "`{verb}` revoke receipt mismatch: {}",
+                    short(body)
+                )));
+            }
+        } else {
+            let designation = body
+                .get("designation")
+                .filter(|d| d.is_object())
+                .ok_or_else(|| refuse(format!("`{verb}` receipt has no designation object")))?;
+            if body["state"].as_str() != Some("recorded")
+                || !designation["alias"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(alias))
+                || designation
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .is_some_and(|p| p != project)
+            {
+                return Err(refuse(format!(
+                    "`{verb}` receipt mismatch: {}",
+                    short(body)
+                )));
+            }
+        }
+        Ok(body.clone())
+    })
+}
+
+/// `cadence audit designations [--project P]` (CAD-1946).
+pub fn designations_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+) -> Result<Value> {
+    let mut call_args = Map::new();
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_designations_project",
+        call_args,
+    )?;
+    designations_project_answer(&body, project)
+}
+
+pub(crate) fn designations_project_answer(body: &Value, project: Option<&str>) -> Result<Value> {
+    let verb = "audit_designations_project";
+    if body["state"].as_str() != Some("ok") {
+        return Err(refuse(format!(
+            "`{verb}` did not return designations: {}",
+            short(body)
+        )));
+    }
+    if let Some(p) = project {
+        if body["project"].as_str() != Some(p) {
+            return Err(refuse(format!(
+                "`{verb}` answered for another project than {p}"
+            )));
+        }
+    }
+    if !body["designations"].is_array() {
+        return Err(refuse(format!("`{verb}` answer has no designations array")));
+    }
+    Ok(body.clone())
+}
+
+/// `cadence audit digest [--project P] [--since W]` (CAD-1946).
+pub fn digest_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+    since: Option<&str>,
+) -> Result<Value> {
+    let mut call_args = Map::new();
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    if let Some(s) = since {
+        call_args.insert("since".into(), json!(s));
+    }
+    let body = call(target, wake_timeout, "audit_digest_project", call_args)?;
+    digest_project_answer(&body, project)
+}
+
+pub(crate) fn digest_project_answer(body: &Value, project: Option<&str>) -> Result<Value> {
+    let verb = "audit_digest_project";
+    if body["state"].as_str() != Some("ok") {
+        return Err(refuse(format!(
+            "`{verb}` did not return digest: {}",
+            short(body)
+        )));
+    }
+    if let Some(p) = project {
+        if body["project"].as_str() != Some(p) {
+            return Err(refuse(format!(
+                "`{verb}` answered for another project than {p}"
+            )));
+        }
+    }
+    if !body["approvals"].is_array() {
+        return Err(refuse(format!("`{verb}` answer has no approvals array")));
+    }
+    Ok(body.clone())
+}
+
+/// `cadence audit approve --delegated --pr N --head SHA --source S` (CAD-1946):
+/// recorded by a designated agent with `cli.write`, never spending `audit.approve`.
+#[allow(clippy::too_many_arguments)]
+pub fn approve_delegated_project(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: Option<&str>,
+    issue: Option<&str>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    scope: Option<&str>,
+    source: &str,
+) -> Result<Value> {
+    let mut call_args = args(&[
+        ("repo", json!(repo)),
+        ("pr", json!(pr)),
+        ("head", json!(head)),
+        ("source", json!(source)),
+    ]);
+    if let Some(p) = project {
+        call_args.insert("project".into(), json!(p));
+    }
+    if let Some(i) = issue {
+        call_args.insert("issue".into(), json!(i));
+    }
+    if let Some(s) = scope {
+        call_args.insert("scope".into(), json!(s));
+    }
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_approve_delegated_project",
+        call_args,
+    )?;
+    approve_delegated_project_answer(&body, project, issue, repo, pr, head)
+}
+
+pub(crate) fn approve_delegated_project_answer(
+    body: &Value,
+    project: Option<&str>,
+    issue: Option<&str>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<Value> {
+    let verb = "audit_approve_delegated_project";
+    check_receipt(verb, || {
+        let state = body["state"].as_str().unwrap_or_default();
+        if !matches!(state, "recorded" | "already_approved") {
+            return Err(refuse(format!(
+                "`{verb}` did not record a delegated approval: {}",
+                short(body)
+            )));
+        }
+        if !body["duplicate"].is_boolean() {
+            return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        let approval = body
+            .get("approval")
+            .filter(|a| a.is_object())
+            .ok_or_else(|| refuse(format!("`{verb}` receipt has no approval object")))?;
+        text(approval, "approval_id", verb)?;
+        if !approval["head_sha"]
+            .as_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case(head))
+            || approval["scope"]["pr"].as_u64() != Some(pr)
+            || !approval["scope"]["repo"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name {repo}#{pr} at {head}"
+            )));
+        }
+        if let Some(p) = project {
+            if approval["project"].as_str() != Some(p) {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names another project than {p}"
+                )));
+            }
+        }
+        if let Some(i) = issue {
+            if !approval["issue"]
+                .as_str()
+                .is_some_and(|got| got.eq_ignore_ascii_case(i))
+            {
+                return Err(refuse(format!(
+                    "`{verb}` receipt names another issue than {i}"
+                )));
+            }
+        }
+        Ok(body.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2726,5 +3297,113 @@ mod tests {
         assert_eq!(kept["verdicts"][0]["identity_source"], "owner-attested");
         assert_eq!(kept["verdicts"][0]["github_login"], "alice");
         assert!(kept["verdicts"][0].get("workflow_sha").is_none());
+    }
+
+    #[test]
+    fn cad1946_hosted_gate_validators_enforce_bindings() {
+        let head = HEAD;
+        // delivery_check: pass -> 0, refused -> 1, repo/pr/head mismatch -> err
+        let pass = json!({
+            "state": "pass", "ok": true, "repo": "favcrm/cadence", "pr": 7, "head": head,
+            "reasons": []
+        });
+        assert_eq!(
+            delivery_check_answer(&pass, "favcrm/cadence", 7, Some(head))
+                .unwrap()
+                .1,
+            0
+        );
+        let refused = json!({
+            "state": "refused", "ok": false, "repo": "favcrm/cadence", "pr": 7, "head": head,
+            "reasons": ["need review"]
+        });
+        assert_eq!(
+            delivery_check_answer(&refused, "favcrm/cadence", 7, None)
+                .unwrap()
+                .1,
+            1
+        );
+        assert!(delivery_check_answer(&pass, "favcrm/other", 7, None).is_err());
+
+        // delivery_enqueue: valid receipt passes; missing evidence_id or wrong head fails as unknown
+        let enq = json!({
+            "state": "enqueued", "ok": true, "repo": "favcrm/cadence", "pr": 7, "head": head,
+            "evidence_id": "ev_1", "queued": true, "auto_merge_enabled": true
+        });
+        assert!(delivery_enqueue_answer(&enq, "favcrm/cadence", 7, head).is_ok());
+        assert!(delivery_enqueue_answer(&enq, "favcrm/cadence", 8, head).is_err());
+
+        // revoke_project
+        let rev = json!({"state": "revoked", "approval_id": "ap-1", "project": "cadence", "revoked_at": "2026-11-15T00:00:00Z"});
+        assert!(revoke_project_answer(&rev, Some("cadence"), "ap-1").is_ok());
+        assert!(revoke_project_answer(&rev, Some("other"), "ap-1").is_err());
+
+        // approve_scope_project & scope_project
+        let sc_rec = json!({
+            "state": "recorded", "duplicate": false, "approval_id": "sc-1",
+            "project": "cadence", "issue": "CAD-1946", "scope_digest": "deadbeef",
+            "source": "op", "recorded_via": "hosted-owner-login"
+        });
+        assert!(approve_scope_project_answer(&sc_rec, "cadence", "CAD-1946", "op", None).is_ok());
+        assert!(approve_scope_project_answer(&sc_rec, "other", "CAD-1946", "op", None).is_err());
+        let sc_read = json!({
+            "state": "ok", "project": "cadence", "issue": "CAD-1946", "current_digest": "deadbeef",
+            "approvals": [{
+                "approval_id": "sc-1", "scope_digest": "deadbeef", "source": "op",
+                "recorded_via": "hosted-owner-login", "revoked_at": null
+            }]
+        });
+        let (norm, code) = scope_project_answer(&sc_read, "cadence", "CAD-1946").unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(norm["approvals"][0]["digest"], "deadbeef");
+        assert_eq!(norm["approvals"][0]["revoked"], false);
+
+        // designate, designations, digest
+        let des = json!({"state": "recorded", "project": "cadence", "designation": {"alias": "bot-1", "project": "cadence"}});
+        assert!(designate_project_answer(&des, "bot-1", "cadence", false).is_ok());
+        assert!(designate_project_answer(
+            &json!({"state": "revoked", "project": "cadence", "alias": "bot-1", "revoked": true}),
+            "bot-1",
+            "cadence",
+            true
+        )
+        .is_ok());
+        assert!(designations_project_answer(
+            &json!({"state": "ok", "project": "cadence", "designations": []}),
+            Some("cadence")
+        )
+        .is_ok());
+        assert!(digest_project_answer(
+            &json!({"state": "ok", "project": "cadence", "approvals": []}),
+            Some("cadence")
+        )
+        .is_ok());
+
+        // delegated approval
+        let del = json!({
+            "state": "recorded", "duplicate": false,
+            "approval": {
+                "approval_id": "del-1", "project": "cadence", "issue": "CAD-1946",
+                "head_sha": head, "scope": {"repo": "favcrm/cadence", "pr": 7}
+            }
+        });
+        assert!(approve_delegated_project_answer(
+            &del,
+            Some("cadence"),
+            Some("CAD-1946"),
+            "favcrm/cadence",
+            7,
+            head
+        )
+        .is_ok());
+        assert!(approve_delegated_project_answer(
+            &del,
+            Some("other"),
+            None,
+            "favcrm/cadence",
+            7,
+            head
+        )
+        .is_err());
     }
 }
