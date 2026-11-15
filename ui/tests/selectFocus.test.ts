@@ -189,4 +189,31 @@ function searchField(): HTMLInputElement {
   document.body.replaceChildren();
 }
 
+// The searchable list's Escape starts in its search field, inside the portal
+// on document.body: it closes the list and still stops short of the window.
+{
+  document.body.replaceChildren();
+  const trigger = openSearchable();
+  const search = searchField();
+  const reached: boolean[] = [];
+  const onWindowKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape") reached.push(event.defaultPrevented);
+  };
+  const target = win as unknown as Window;
+  target.addEventListener("keydown", onWindowKey);
+  assert(search.closest("[role='listbox']") === null && document.body.contains(search), "the search field is in the body portal");
+  let prevented = false;
+  act(() => {
+    const event = new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    search.dispatchEvent(event);
+    prevented = event.defaultPrevented;
+  });
+  assert(document.querySelector("input[aria-label='Search options']") === null, "escape in the search field closes the list");
+  assert(prevented, "escape in the search field is cancelled");
+  assert(reached.length === 0, `escape in the search field never reaches the window (reached ${JSON.stringify(reached)})`);
+  assert(document.activeElement === trigger, "focus returns to the trigger");
+  target.removeEventListener("keydown", onWindowKey);
+  document.body.replaceChildren();
+}
+
 export {};

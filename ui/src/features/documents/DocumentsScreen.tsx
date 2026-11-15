@@ -363,13 +363,13 @@ export default function DocumentsScreen({
         isArtifactKind(row.file.kind) ? (
           <button
             type="button"
-            className="text-left text-ink-100 hover:text-accent hover:underline focus-visible:outline-2 focus-visible:outline-accent"
+            className="documents-title text-left text-ink-100 hover:text-accent hover:underline focus-visible:outline-2 focus-visible:outline-accent"
             onClick={() => open(row)}
           >
             {row.file.title}
           </button>
         ) : (
-          <span className="text-ink-100">{row.file.title}</span>
+          <span className="documents-title text-ink-100">{row.file.title}</span>
         ),
     },
     { key: "type", header: t("Document type"), cell: (row) => row.document.type },

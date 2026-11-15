@@ -155,6 +155,32 @@
         "archivedAt": null,
         "rev": 4
       }
+    },
+    {
+      "file": {
+        "id": "art-qa9",
+        "version": 1,
+        "kind": "md",
+        "title": "quarterly_report_final_v2_2026-11-15_signed.pdf",
+        "label": "qa-memo",
+        "customer": "",
+        "bytes": 1024,
+        "digest": "9d5e3f1c2b4a6d8e0f1a3c5e7b9d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d",
+        "created": "2026-11-14T09:00:00.000Z",
+        "issue": null,
+        "shared": false
+      },
+      "document": {
+        "type": "qa-memo",
+        "stage": "draft",
+        "submittedVersion": null,
+        "approvedVersion": null,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 1
+      }
     }
   ]
 }

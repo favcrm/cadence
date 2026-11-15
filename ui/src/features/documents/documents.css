@@ -1,21 +1,24 @@
 /* CAD-2286: the Documents table keeps a readable floor, as `.crm-table` and
    `.av-table` do: at a 390px viewport, or beside the open canvas, the shared
    `.stable-wrap` scrolls it internally instead of crushing the columns. The
-   floor fits the six Active columns with whole headers and chips; wider, the
-   table's 100% width rules. */
+   floor is sized for the six Active columns with whole headers and chips; the
+   Archived tab adds a seventh, and the table grows past the floor (and
+   scrolls in its wrapper) when its columns need more. Wider, the table's 100%
+   width rules. */
 .documents-table {
   min-width: 760px;
 }
 
 /* The shared cells break anywhere (`.stable td { overflow-wrap: anywhere }`),
    which split headers and stage chips mid-word ("In revie/w", "審查/中").
-   Here cells wrap only between words, headers and chips never wrap, and the
-   title alone may break a word that cannot fit on its own. */
-.documents-table td {
+   Here cells wrap only between words, and headers and chips never wrap.
+   `.stable.documents-table` outranks the shared `.stable` rules by
+   specificity, whichever stylesheet loads last. */
+.stable.documents-table td {
   overflow-wrap: normal;
 }
 
-.documents-table th {
+.stable.documents-table th {
   white-space: nowrap;
   overflow-wrap: normal;
 }
@@ -25,8 +28,18 @@
   overflow-wrap: normal;
 }
 
-.documents-table td.documents-title-cell {
-  overflow-wrap: break-word;
+/* The title may break inside a word: a filename-like title has no spaces.
+   `anywhere` (unlike `break-word`) also lowers the cell's min-content, so the
+   column does not grow to the longest word and widen the whole table. The
+   title keeps its own floor so the nowrap columns cannot squeeze it to a
+   sliver. */
+.stable.documents-table td.documents-title-cell {
+  overflow-wrap: anywhere;
+}
+
+.documents-title {
+  display: inline-block;
+  min-width: 12rem;
 }
 
 /* CAD-2286 Settings → Documents. Rows reuse the shared `.settings-row`; only

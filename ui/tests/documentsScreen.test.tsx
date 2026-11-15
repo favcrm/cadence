@@ -305,15 +305,18 @@ async function main() {
   ok(!row("art-approved")!.textContent?.includes("v1"), "a version under review shows only while in review");
   ok(host.querySelector("table.stable.documents-table"), "the table keeps a readable floor and scrolls in its wrapper at 390px");
   ok(host.querySelector(".stable-wrap table.documents-table"), "inside the shared scrolling wrapper");
-  // Browser QA: headers and stage chips break mid-word ("In revie/w") when the
-  // shared cells' `overflow-wrap: anywhere` reaches them. Only the title cell
-  // wraps, at word boundaries; the floor fits six columns.
-  ok(review.querySelector("td.documents-title-cell button"), "the title sits in the one cell that wraps");
+  // Browser QA: headers and stage chips broke mid-word ("In revie/w") where
+  // the shared cells' `overflow-wrap: anywhere` reached them. Now only the
+  // title cell may break inside a word, and its title keeps a width floor.
+  ok(review.querySelector("td.documents-title-cell button.documents-title"), "the title button sits in the one breakable cell");
+  ok(row("art-draft")!.querySelector("td.documents-title-cell span.documents-title"), "a title that opens nothing carries the same floor");
   equal(
     Array.from(review.querySelectorAll("td")).filter((td) => td.classList.contains("documents-title-cell")).length,
     1,
-    "only the title cell wraps",
+    "only the title cell may break inside a word",
   );
+  // Change detectors only: the runner stubs stylesheets, so these pin the
+  // rules' text, not the layout. Browser QA checks the rendered table.
   {
     const css: string = require("fs").readFileSync(
       require("path").resolve("src/features/documents/documents.css"),
@@ -324,13 +327,18 @@ async function main() {
       return at < 0 ? "" : css.slice(at, css.indexOf("}", at));
     };
     const floor = Number(/min-width:\s*(\d+)px/.exec(rule(".documents-table"))?.[1] ?? 0);
-    ok(floor >= 760, `the table's floor fits six columns (${floor}px)`);
-    for (const selector of [".documents-table th", ".documents-table .chip"]) {
-      ok(/white-space:\s*nowrap/.test(rule(selector)), `${selector} keeps its words whole`);
-      ok(/overflow-wrap:\s*normal/.test(rule(selector)), `${selector} never breaks inside a word`);
+    ok(floor >= 760, `the rule still sets the table floor (${floor}px)`);
+    for (const selector of [".stable.documents-table th", ".documents-table .chip"]) {
+      ok(/white-space:\s*nowrap/.test(rule(selector)), `${selector} still sets nowrap`);
+      ok(/overflow-wrap:\s*normal/.test(rule(selector)), `${selector} still sets overflow-wrap: normal`);
     }
-    ok(/overflow-wrap:\s*normal/.test(rule(".documents-table td")), "cells wrap only at word boundaries");
-    ok(/overflow-wrap:\s*break-word/.test(rule(".documents-table td.documents-title-cell")), "a title breaks a word only when it alone overflows");
+    // `.stable.documents-table` outranks the shared `.stable td` by
+    // specificity, not by which stylesheet loads last.
+    ok(/overflow-wrap:\s*normal/.test(rule(".stable.documents-table td")), "the cell rule still sets overflow-wrap: normal");
+    // `break-word` adds no break to an auto-layout table's min-content, so a
+    // long filename would widen the whole table; `anywhere` does.
+    ok(/overflow-wrap:\s*anywhere/.test(rule(".stable.documents-table td.documents-title-cell")), "the title cell rule still sets overflow-wrap: anywhere");
+    ok(/min-width:\s*12rem/.test(rule(".documents-title")), "the title rule still sets its 12rem floor");
   }
   equal([heading()?.tagName, heading()?.tabIndex, heading()?.className.includes("font-semibold")], ["H1", -1, true], "the heading can take focus");
   ok(Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Version under review"), "the column says what it counts");
