@@ -32,7 +32,7 @@ Exported by `@cadence/app-kit` (`src/index.mjs`, `src/receiver.mjs`, `src/refusa
 
 - Declare drawer widths via `size: "narrow" | "wide"` and pass `<= 1024` bytes of `context`.
 - The host owns global chrome, sidebar/screen navigation, and `HOST_DRAWER_VERBS` drawers.
-- **No nested drawers/modals:** Never open an app-owned drawer, modal, or confirmation sheet inside an active host drawer. Check the current surface/drawer mode first via `bridge.getState().surface` (`createScreenBridge`, `role: "primary" | "drawer"`) or `receiver.surfaceRole()` (`createScreenReceiver` / `onSurface(role, surface, modal)` on `screen-surfaces.v1`); note `DrawerShell` props (`modal`, `scrim`, `open`, `onClose`) configure local drawer presentation and do not expose host surface state.
+- **No nested drawers/modals:** Never open an app-owned drawer, modal, or confirmation sheet inside an active host drawer. Check the current surface/drawer mode first via `bridge.getState().surface` (`createScreenBridge`, `role: "primary" | "drawer"`) or `receiver.surfaceRole()` (`createScreenReceiver` / `onSurface(role, surface, modal)` on `screen-surfaces.v1`); note `DrawerShell` props (`modal`, `scrim`, `onClose`, `tabs`, `state`, `edit`; visibility is controlled by conditional mounting) configure local drawer presentation and do not expose host surface state.
 - Check host `screen-surfaces.v1` support before adopting newer surface controls over legacy `screen-presentation.v1`.
 
 ## 4. Routing, Unsaved Draft Guards & Sandboxed `<form>` Handling
