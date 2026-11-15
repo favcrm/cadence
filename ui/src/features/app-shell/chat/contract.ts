@@ -179,8 +179,12 @@ function parseI18nMap<T>(
     fail(path, `expected 1 to ${MAX_I18N_LOCALES} locales`);
   }
   const out: Record<string, T> = {};
+  const seenLocales = new Set<string>();
   for (const [locale, val] of entries) {
     if (!validLocaleTag(locale)) fail(path, `invalid locale tag: ${JSON.stringify(locale)}`);
+    const lowerLocale = locale.toLowerCase();
+    if (seenLocales.has(lowerLocale)) fail(path, `duplicate locale tag: ${JSON.stringify(locale)}`);
+    seenLocales.add(lowerLocale);
     const lp = `${path}.${locale}`;
     const obj = object(val, lp, allowed);
     if (Object.keys(obj).length === 0) fail(lp, "expected at least one localized field");

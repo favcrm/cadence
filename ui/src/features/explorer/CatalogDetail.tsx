@@ -84,12 +84,13 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
 
   const access = card.access ?? [];
   const cardI18n = parseAppDisplayI18n(card.i18n);
-  const locListing = pickLocaleEntry(card.i18n, locale) ?? pickLocaleEntry(card.listing?.i18n, locale);
+  const locTop = pickLocaleEntry(card.i18n as Record<string, { about?: string; can?: string[] }> | null | undefined, locale);
+  const locListing = pickLocaleEntry(card.listing?.i18n, locale);
   const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: card.listing }, locale, t);
   const tagline = localizedAppTagline({ tagline: card.tagline, i18n: cardI18n, listing: card.listing }, locale, t);
-  const can = locListing?.can ?? card.can ?? card.listing?.can ?? [];
+  const can = locTop?.can ?? locListing?.can ?? card.can ?? card.listing?.can ?? [];
   const shots = card.screenshots ?? card.listing?.screenshots ?? [];
-  const about = locListing?.about ?? card.about ?? card.listing?.about;
+  const about = locTop?.about ?? locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
 

@@ -126,21 +126,26 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   display_session_key?: string;
   install_id?: string; context_id?: string | null; digest?: string;
   remote_images?: string[] };
+const SECTION_CTRL_RE = /[\u0000-\u001f\u007f\u2028\u2029]/;
+
 function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
   const entries = Object.entries(raw as Record<string, unknown>);
   if (entries.length === 0 || entries.length > 8) return null;
-  const ctrl = /[\u0000-\u001f\u007f\u2028\u2029]/;
   const tagRe = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$/;
   const out: Record<string, ScreenSectionI18n> = {};
+  const seenLocales = new Set<string>();
   for (const [locale, entry] of entries) {
     if (locale.length < 2 || locale.length > 20 || !tagRe.test(locale)) return null;
+    const lowerLocale = locale.toLowerCase();
+    if (seenLocales.has(lowerLocale)) return null;
+    seenLocales.add(lowerLocale);
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
     const keys = Object.keys(entry as Record<string, unknown>);
     if (keys.length !== 1 || keys[0] !== "label") return null;
     const label = (entry as Record<string, unknown>).label;
-    if (typeof label !== "string" || label.trim().length === 0 || label.length > 40 || ctrl.test(label)) return null;
+    if (typeof label !== "string" || label.trim().length === 0 || label.length > 40 || SECTION_CTRL_RE.test(label)) return null;
     out[locale] = { label };
   }
   return out;
@@ -160,7 +165,7 @@ export function parseNavigation(value: unknown): ScreenNavigation | null {
     if (!keys.includes("id") || !keys.includes("label") || keys.some((k) => k !== "id" && k !== "label" && k !== "i18n")) return null;
     if (typeof s.id !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) || seen.has(s.id)) return null;
     seen.add(s.id);
-    if (typeof s.label !== "string" || s.label.trim().length === 0 || s.label.length > 40) return null;
+    if (typeof s.label !== "string" || s.label.trim().length === 0 || s.label.length > 40 || SECTION_CTRL_RE.test(s.label)) return null;
     const i18n = parseSectionI18n(s.i18n);
     if (i18n === null) return null;
     sections.push(i18n ? { id: s.id, label: s.label, i18n } : { id: s.id, label: s.label });

@@ -205,9 +205,13 @@ fn i18n_locales(
             ),
         );
     }
+    let mut seen_locales = HashSet::new();
     for (locale, entry) in map {
         if !cadence_core::app_screen_decl::valid_locale_tag(locale) {
             return fail(path, format!("invalid locale tag: {locale:?}"));
+        }
+        if !seen_locales.insert(locale.to_ascii_lowercase()) {
+            return fail(path, format!("duplicate locale tag: {locale:?}"));
         }
         let lp = format!("{path}.{locale}");
         let entry_map = object(entry, &lp, allowed)?;
@@ -588,6 +592,13 @@ mod tests {
         let mut bad = ok.clone();
         bad["subjects"][0]["i18n"] = json!({ "zh-TW": { "label": "客戶\n" } });
         assert!(check(&bad).is_err(), "control char in i18n label");
+
+        let mut bad = ok.clone();
+        bad["subjects"][0]["i18n"] = json!({
+            "zh-tw": { "label": "客戶" },
+            "zh-TW": { "label": "客戶" }
+        });
+        assert!(check(&bad).is_err(), "case-insensitive duplicate locale tag");
 
         let mut bad = ok.clone();
         let mut too_many = serde_json::Map::new();

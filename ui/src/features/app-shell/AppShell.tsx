@@ -768,7 +768,7 @@ export default function AppShell({
         kind: installation.name,
         title: installation.title || installation.name,
         navigation: effectiveNavigation,
-        i18n: parseAppDisplayI18n(installation.i18n) ?? parseAppDisplayI18n(installation.listing?.i18n),
+        i18n: parseAppDisplayI18n(installation.i18n) ?? parseAppDisplayI18n(installation.listing?.i18n, { allowListingFields: true }),
       });
     } else {
       onInstallation(null);

@@ -17,17 +17,19 @@ export type TranslateFn = (key: string) => string;
 export const MAX_I18N_LOCALES = 8;
 
 const LOCALE_TAG_RE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$/;
-const CTRL_RE = /[\u0000-\u001f\u007f\u2028\u2029]/;
+const CTRL_SINGLE_LINE_RE = /[\u0000-\u001f\u007f\u2028\u2029]/;
+const CTRL_MULTILINE_RE = /[\u0000-\u0009\u000b-\u001f\u007f\u2028\u2029]/;
 const TRADITIONAL_CHINESE_TAGS = new Set(["zh-tw", "zh-hk", "zh-mo", "zh-hant"]);
 
 export function validLocaleTag(tag: string): boolean {
   return tag.length >= 2 && tag.length <= 20 && LOCALE_TAG_RE.test(tag);
 }
 
-export function isPlainTextValue(value: unknown, max: number): value is string {
+export function isPlainTextValue(value: unknown, max: number, multiline = false): value is string {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
-  return trimmed.length > 0 && trimmed.length <= max && !CTRL_RE.test(trimmed);
+  const ctrlRe = multiline ? CTRL_MULTILINE_RE : CTRL_SINGLE_LINE_RE;
+  return trimmed.length > 0 && trimmed.length <= max && !ctrlRe.test(trimmed);
 }
 
 export function isEnglishLocale(locale: string): boolean {
@@ -85,31 +87,49 @@ export function pickLocaleEntry<T>(
   return undefined;
 }
 
-export function parseAppDisplayI18n(value: unknown): AppDisplayI18n | null {
+const DISPLAY_I18N_KEYS = new Set(["title", "summary", "tagline"]);
+const LISTING_DISPLAY_I18N_KEYS = new Set(["title", "summary", "tagline", "about", "can", "access_notes"]);
+
+export function parseAppDisplayI18n(
+  value: unknown,
+  options?: { allowListingFields?: boolean },
+): AppDisplayI18n | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const entries = Object.entries(value as Record<string, unknown>);
   if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return null;
+  const allowListingFields = options?.allowListingFields === true;
+  const allowedKeys = allowListingFields ? LISTING_DISPLAY_I18N_KEYS : DISPLAY_I18N_KEYS;
   const out: AppDisplayI18n = {};
+  const seenLocales = new Set<string>();
   for (const [tag, rawEntry] of entries) {
     if (!validLocaleTag(tag)) return null;
+    const lowerTag = tag.toLowerCase();
+    if (seenLocales.has(lowerTag)) return null;
+    seenLocales.add(lowerTag);
     if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) return null;
     const obj = rawEntry as Record<string, unknown>;
+    const objKeys = Object.keys(obj);
+    if (objKeys.length === 0 || objKeys.some((key) => !allowedKeys.has(key))) return null;
     const parsed: AppDisplayLocale = {};
     if (obj.title !== undefined) {
       if (!isPlainTextValue(obj.title, 80)) return null;
       parsed.title = obj.title.trim();
     }
     if (obj.summary !== undefined) {
-      if (!isPlainTextValue(obj.summary, 160)) return null;
+      if (!isPlainTextValue(obj.summary, 280, true)) return null;
       parsed.summary = obj.summary.trim();
     }
     if (obj.tagline !== undefined) {
       if (!isPlainTextValue(obj.tagline, 80)) return null;
       parsed.tagline = obj.tagline.trim();
     }
-    if (parsed.title !== undefined || parsed.summary !== undefined || parsed.tagline !== undefined) {
-      out[tag] = parsed;
+    const hasDisplayField =
+      parsed.title !== undefined || parsed.summary !== undefined || parsed.tagline !== undefined;
+    if (!hasDisplayField) {
+      if (!allowListingFields) return null;
+      continue;
     }
+    out[tag] = parsed;
   }
   return Object.keys(out).length > 0 ? out : null;
 }

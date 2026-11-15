@@ -605,13 +605,17 @@ impl ScreenNavigation {
         if self.sections.is_empty() || self.sections.len() > 8 {
             return Err(Error::rejected("navigation requires 1..8 sections"));
         }
+        let has_disallowed_ctrl = |s: &str| {
+            s.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        };
         let mut seen = HashSet::new();
         for section in &self.sections {
             if !valid_tag(&section.id)
                 || !seen.insert(&section.id)
-                || section.label.is_empty()
+                || section.label.trim().is_empty()
                 || section.label.encode_utf16().count() > 40
-                || section.label.chars().any(char::is_control)
+                || has_disallowed_ctrl(&section.label)
             {
                 return Err(Error::rejected("invalid or duplicate navigation section"));
             }
@@ -621,11 +625,13 @@ impl ScreenNavigation {
                         "navigation section i18n requires 1..=8 locales",
                     ));
                 }
+                let mut seen_locales = HashSet::new();
                 for (locale, entry) in i18n {
                     if !valid_locale_tag(locale)
+                        || !seen_locales.insert(locale.to_ascii_lowercase())
                         || entry.label.trim().is_empty()
                         || entry.label.encode_utf16().count() > 40
-                        || entry.label.chars().any(char::is_control)
+                        || has_disallowed_ctrl(&entry.label)
                     {
                         return Err(Error::rejected(
                             "invalid navigation section i18n locale or label",
@@ -2136,12 +2142,16 @@ mod tests {
         let i18n = nav.sections[0].i18n.as_ref().expect("i18n map");
         assert_eq!(i18n["zh-TW"].label, "客戶");
 
-        // Empty map, invalid locale tag, blank label, control char, unknown inner field all refuse.
+        // Empty map, invalid locale tag, blank label, control char, Unicode separator, unknown inner field all refuse.
         for bad_section in [
             serde_json::json!({ "id": "customers", "label": "Customers", "i18n": {} }),
             serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh_TW": { "label": "客戶" } } }),
             serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "   " } } }),
             serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶\n" } } }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶\u{2028}" } } }),
+            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-tw": { "label": "客戶" }, "zh-TW": { "label": "客戶" } } }),
+            serde_json::json!({ "id": "customers", "label": "   " }),
+            serde_json::json!({ "id": "customers", "label": "Bad\u{2029}Label" }),
             serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶", "extra": "x" } } }),
         ] {
             let manifest = base_manifest(serde_json::json!([bad_section]));

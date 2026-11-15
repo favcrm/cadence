@@ -95,36 +95,82 @@ const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
 const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
-function listingI18nOf(value: unknown): Record<string, ListingDisplayLocale> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const entries = Object.entries(value as Record<string, unknown>);
-  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return undefined;
-  const out: Record<string, ListingDisplayLocale> = {};
-  for (const [tag, raw] of entries) {
-    if (!validLocaleTag(tag) || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-    const obj = raw as Record<string, unknown>;
-    const loc: ListingDisplayLocale = {};
-    if (isPlainTextValue(obj.title, 80)) loc.title = obj.title.trim();
-    if (isPlainTextValue(obj.summary, 160)) loc.summary = obj.summary.trim();
-    if (isPlainTextValue(obj.tagline, 80)) loc.tagline = obj.tagline.trim();
-    if (isPlainTextValue(obj.about, 2000)) loc.about = obj.about.trim();
-    if (Array.isArray(obj.can)) {
-      const can = obj.can.filter((item): item is string => isPlainTextValue(item, 240)).map((item) => item.trim());
-      if (can.length > 0) loc.can = can;
-    }
-    if (obj.access_notes && typeof obj.access_notes === "object" && !Array.isArray(obj.access_notes)) {
-      const notes: Record<string, string> = {};
-      for (const [k, v] of Object.entries(obj.access_notes as Record<string, unknown>)) {
-        if (isPlainTextValue(v, 240)) notes[k] = v.trim();
-      }
-      if (Object.keys(notes).length > 0) loc.access_notes = notes;
-    }
-    if (Object.keys(loc).length > 0) out[tag] = loc;
+const FORBIDDEN_PRICE_KEYS = new Set(["cost", "price", "pricing"]);
+const LISTING_I18N_KEYS = new Set(["title", "summary", "tagline", "about", "can", "access_notes"]);
+
+function hasForbiddenPriceKey(value: unknown, depth = 0): boolean {
+  if (depth > 32 || !value || typeof value !== "object") return false;
+  if (Array.isArray(value)) {
+    return value.some((item) => hasForbiddenPriceKey(item, depth + 1));
   }
-  return Object.keys(out).length > 0 ? out : undefined;
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (FORBIDDEN_PRICE_KEYS.has(k) || hasForbiddenPriceKey(v, depth + 1)) return true;
+  }
+  return false;
 }
 
-function listingOf(value: unknown): PublicListing {
+function listingI18nOf(value: unknown): Record<string, ListingDisplayLocale> | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0 || entries.length > MAX_I18N_LOCALES) return null;
+  const out: Record<string, ListingDisplayLocale> = {};
+  const seenLocales = new Set<string>();
+  for (const [tag, raw] of entries) {
+    if (!validLocaleTag(tag)) return null;
+    const lowerTag = tag.toLowerCase();
+    if (seenLocales.has(lowerTag)) return null;
+    seenLocales.add(lowerTag);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const obj = raw as Record<string, unknown>;
+    const objKeys = Object.keys(obj);
+    if (objKeys.length === 0 || objKeys.some((k) => !LISTING_I18N_KEYS.has(k))) return null;
+    const loc: ListingDisplayLocale = {};
+    if (obj.title !== undefined) {
+      if (!isPlainTextValue(obj.title, 80)) return null;
+      loc.title = obj.title.trim();
+    }
+    if (obj.summary !== undefined) {
+      if (!isPlainTextValue(obj.summary, 280, true)) return null;
+      loc.summary = obj.summary.trim();
+    }
+    if (obj.tagline !== undefined) {
+      if (!isPlainTextValue(obj.tagline, 80)) return null;
+      loc.tagline = obj.tagline.trim();
+    }
+    if (obj.about !== undefined) {
+      if (!isPlainTextValue(obj.about, 600, true)) return null;
+      loc.about = obj.about.trim();
+    }
+    if (obj.can !== undefined) {
+      if (!Array.isArray(obj.can) || obj.can.length === 0 || obj.can.length > 5) return null;
+      const can: string[] = [];
+      for (const item of obj.can) {
+        if (!isPlainTextValue(item, 100)) return null;
+        can.push(item.trim());
+      }
+      loc.can = can;
+    }
+    if (obj.access_notes !== undefined) {
+      if (!obj.access_notes || typeof obj.access_notes !== "object" || Array.isArray(obj.access_notes)) {
+        return null;
+      }
+      const noteEntries = Object.entries(obj.access_notes as Record<string, unknown>);
+      if (noteEntries.length === 0 || noteEntries.length > 16) return null;
+      const notes: Record<string, string> = {};
+      for (const [k, v] of noteEntries) {
+        if (k.length === 0 || k.length > 64 || !isPlainTextValue(v, 140)) return null;
+        notes[k] = v.trim();
+      }
+      loc.access_notes = notes;
+    }
+    if (Object.keys(loc).length === 0) return null;
+    out[tag] = loc;
+  }
+  return out;
+}
+
+function listingOf(value: unknown): PublicListing | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const row = value as Record<string, unknown>;
   const rawList = Array.isArray(row.can) ? row.can : Array.isArray(row.highlights) ? row.highlights : undefined;
@@ -164,6 +210,7 @@ function listingOf(value: unknown): PublicListing {
     ? Object.values(accessObj).filter((item): item is string => typeof item === "string" && !!item)
     : undefined;
   const i18n = listingI18nOf(row.i18n);
+  if (i18n === null) return null;
   return {
     tagline,
     category: typeof row.category === "string" ? row.category : undefined,
@@ -187,15 +234,22 @@ export function parsePublicApp(value: unknown): PublicApp | null {
   if (typeof row.summary !== "string" || typeof row.version !== "string") return null;
   if (row.digest !== null && (typeof row.digest !== "string" || !DIGEST.test(row.digest))) return null;
   if (row.installable && row.digest === null) return null;
-  if ("price" in row || "artifact" in row || "path" in row) return null;
-  const parsedI18n = parseAppDisplayI18n(row.i18n);
+  if (hasForbiddenPriceKey(row) || "artifact" in row || "path" in row) return null;
+  let parsedI18n: AppDisplayI18n | undefined;
+  if (row.i18n !== undefined && row.i18n !== null) {
+    const parsed = parseAppDisplayI18n(row.i18n);
+    if (!parsed) return null;
+    parsedI18n = parsed;
+  }
+  const listing = listingOf(row.listing);
+  if (!listing) return null;
   return {
     id: row.id,
     app: row.app,
     title: row.title,
     summary: row.summary,
     version: row.version,
-    listing: listingOf(row.listing),
+    listing,
     ...(parsedI18n ? { i18n: parsedI18n } : {}),
     digest: row.digest as string | null,
     installable: row.installable,

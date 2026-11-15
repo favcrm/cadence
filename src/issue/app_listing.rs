@@ -479,6 +479,7 @@ fn parse_i18n_locales(
         )));
     }
     let mut out = serde_json::Map::new();
+    let mut seen_locales = std::collections::HashSet::new();
     for (k, v) in locales {
         let Some(locale) = k.as_str() else {
             return Err(Error::rejected(format!(
@@ -490,7 +491,7 @@ fn parse_i18n_locales(
                 "{what} locale key '{locale}' must be a valid BCP-47 tag"
             )));
         }
-        if out.contains_key(locale) {
+        if !seen_locales.insert(locale.to_ascii_lowercase()) {
             return Err(Error::rejected(format!(
                 "{what} locale '{locale}' is declared twice"
             )));
@@ -650,6 +651,7 @@ i18n:
         for bad in [
             "i18n: {}",
             "i18n:\n  zh_TW:\n    title: 客戶管理",
+            "i18n:\n  zh-tw:\n    title: A\n  zh-TW:\n    title: B",
             "i18n:\n  zh-TW: {}",
             "i18n:\n  zh-TW:\n    unknown: 1",
             "i18n:\n  zh-TW:\n    access_notes:\n      missing.slot: x",

@@ -10,6 +10,8 @@ import {
   validLocaleTag,
 } from "../src/features/workspace-apps/appLocale";
 import { parseNavigation } from "../src/features/workspace-apps/screen/screenLifecycle";
+import { chatContext } from "../src/features/app-shell/chatScreen";
+import { translateUiText } from "../src/lib/locale";
 import {
   APP_CHAT_CONTRACT,
   AppChatContractError,
@@ -73,18 +75,45 @@ function main() {
   assert(validLocaleTag("zh-TW"), "validLocaleTag accepts zh-TW");
   assert(!validLocaleTag("zh_TW"), "validLocaleTag rejects underscore");
   assert(isPlainTextValue("Hello", 10), "isPlainTextValue accepts trimmed text");
-  assert(!isPlainTextValue("bad\nline", 20), "isPlainTextValue rejects control characters");
+  assert(!isPlainTextValue("bad\nline", 20), "isPlainTextValue rejects newline in single-line mode");
+  assert(isPlainTextValue("good\nline", 20, true), "isPlainTextValue allows newline in multiline mode");
+  assert(!isPlainTextValue("bad\u2028line", 20, true), "isPlainTextValue rejects Unicode line separator even in multiline mode");
 
   const parsedI18n = parseAppDisplayI18n({
-    "zh-TW": { title: " 客戶管理 ", summary: "管理客戶資料", tagline: "客戶關係與分群" },
+    "zh-TW": { title: " 客戶管理 ", summary: "第一行\n第二行", tagline: "客戶關係與分群" },
   });
   equal(
     parsedI18n,
-    { "zh-TW": { title: "客戶管理", summary: "管理客戶資料", tagline: "客戶關係與分群" } },
-    "parseAppDisplayI18n trims valid entries",
+    { "zh-TW": { title: "客戶管理", summary: "第一行\n第二行", tagline: "客戶關係與分群" } },
+    "parseAppDisplayI18n trims valid entries and allows multiline summary",
   );
   equal(parseAppDisplayI18n({}), null, "parseAppDisplayI18n rejects empty map");
   equal(parseAppDisplayI18n({ zh_TW: { title: "壞" } }), null, "parseAppDisplayI18n rejects bad tag");
+  equal(
+    parseAppDisplayI18n({ "zh-tw": { title: "A" }, "zh-TW": { title: "B" } }),
+    null,
+    "parseAppDisplayI18n rejects case-insensitive duplicate locale tags",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": { title: "標題", extra: "bad" } }),
+    null,
+    "parseAppDisplayI18n rejects unknown fields",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": { title: "客戶管理", about: "說明" } }),
+    null,
+    "parseAppDisplayI18n rejects listing-only fields by default",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": { title: "客戶管理", about: "說明" } }, { allowListingFields: true }),
+    { "zh-TW": { title: "客戶管理" } },
+    "parseAppDisplayI18n accepts listing-derived display fields when allowListingFields is set",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": {}, ja: { title: "Valid" } }),
+    null,
+    "parseAppDisplayI18n fails closed on empty locale entry",
+  );
   equal(
     parseAppDisplayI18n({
       en: { title: "1" },
@@ -106,14 +135,29 @@ function main() {
     "parseAppDisplayI18n rejects control characters",
   );
   equal(
+    parseAppDisplayI18n({ "zh-TW": { title: "bad\nline" } }),
+    null,
+    "parseAppDisplayI18n rejects newline in title",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": { tagline: "bad\nline" } }),
+    null,
+    "parseAppDisplayI18n rejects newline in tagline",
+  );
+  equal(
     parseAppDisplayI18n({ "zh-TW": { title: "x".repeat(81) } }),
     null,
     "parseAppDisplayI18n rejects title > 80 chars",
   );
   equal(
-    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(161) } }),
+    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(280) } }),
+    { "zh-TW": { summary: "x".repeat(280) } },
+    "parseAppDisplayI18n accepts summary <= 280 chars",
+  );
+  equal(
+    parseAppDisplayI18n({ "zh-TW": { summary: "x".repeat(281) } }),
     null,
-    "parseAppDisplayI18n rejects summary > 160 chars",
+    "parseAppDisplayI18n rejects summary > 280 chars",
   );
   equal(
     parseAppDisplayI18n({ "zh-TW": { tagline: "x".repeat(81) } }),
@@ -222,6 +266,20 @@ function main() {
     parseNavigation(navWithI18n({ "zh-TW": { label: "聯絡人", extra: "no" } })),
     null,
     "parseNavigation rejects extra keys",
+  );
+  equal(
+    parseNavigation(navWithI18n({ "zh-tw": { label: "A" }, "zh-TW": { label: "B" } })),
+    null,
+    "parseNavigation rejects case-insensitive duplicate locale keys",
+  );
+  equal(
+    parseNavigation({
+      section_query: "section",
+      default_section: "contacts",
+      sections: [{ id: "contacts", label: "Bad\u2028Label" }],
+    }),
+    null,
+    "parseNavigation rejects Unicode line separator in base section label",
   );
 
   // 4. app-chat/v1 schema lockstep, validation bounds, and localizeAppChat.
@@ -430,6 +488,24 @@ function main() {
     },
     "unknown key in subject i18n",
   );
+  refusedChat(
+    {
+      ...validChat,
+      subjects: [
+        {
+          kind: "contact",
+          label: "Contact",
+          i18n: { "zh-tw": { label: "聯絡人" }, "zh-TW": { label: "聯絡人" } },
+        },
+      ],
+    },
+    "case-insensitive duplicate locale in subject i18n",
+  );
+
+  // 5. chatContext formats open-record badge with "{label} (open)" pattern in zh-TW.
+  const twT = (key: string) => translateUiText(key, "zh-TW");
+  const openCtx = chatContext(localizedTw, "contacts", true, twT);
+  equal(openCtx?.label, "聯絡人（已開啟）", "chatContext formats localized open record label");
 
   console.log("app locale checks passed");
 }
