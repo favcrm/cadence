@@ -360,8 +360,18 @@ themselves are retired. One narrow exception (CAD-2307): `changed-tests.yml`
 runs, on a PR, only the daemon tests (`src/daemon/tests/**`) and suite tests
 (`tests/suite.rs`) that PR adds or changes, under `--features test-seam`, in
 one build with no shards. `scripts/changed-test-filter` derives the nextest
-filter from the diff, and a PR that touches no such file skips the build and
-run. The full suite stays off PRs. Write a test only when it earns its place,
+filter from the diff. A PR that touches none of those files skips the build and
+run. It fails closed but bounded: an edit to a suite helper, `use` line or
+other code outside any test selects the whole `suite` binary (about 224 tests),
+and a `mod.rs` edit that adds no module, or a non-Rust file under
+`src/daemon/tests/`, selects all of `daemon::tests` (about 190 tests); a
+selection that matches no test fails the run. Compile coverage of every
+test-seam target is `ci.yml`'s required clippy job
+(`--all-targets --features test-seam`); this job adds running the changed
+tests, not another compile gate. On `merge_group` the job runs nothing and
+succeeds, because the PR already ran it and `ci.yml` is the queue's
+integration proof. The full suite stays off PRs. Write a test only when it
+earns its place,
 and then to these rules:
 
 - **Direct functions, not processes.** Business logic is tested by calling it.
@@ -594,8 +604,8 @@ limitation; only an authorized operator can decide an exception.
   your shell instead of inside the push. GitHub drops an SSH push whose hook
   runs for minutes (rc=141, "Connection to github.com closed by remote host").
   The hook records a `tree=clean` rc=0 receipt for the head, and only when the
-  working tree had no edits before the plan ran (`pre-push-check` refuses a
-  dirty tree). The push's own hook run returns at once only for a receipt that
+  working tree had no edits both before and after the plan ran
+  (`pre-push-check` refuses a dirty tree). The push's own hook run returns at once only for a receipt that
   says rc=0 and `tree=clean` for that exact head, on a clean tree now, with no
   `PRE_PUSH_TESTS` set. A failure, a dirty-recorded pass, a new commit or an
   edited tree runs the plan again. A lane minted before this hook change gets

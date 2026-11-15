@@ -11,15 +11,25 @@ build to the targets holding the selected tests).
 Selection, from the merge-base diff of added, copied, modified and renamed files:
 
   src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
-                               `mod.rs` selects its directory; the root
-                               `src/daemon/tests/mod.rs` selects the modules
-                               whose `mod x;` line the diff adds.
+                               A `mod.rs` that adds `mod x;` lines selects
+                               those modules; a `mod.rs` that adds none selects
+                               its whole directory (the root one is all of
+                               daemon::tests, about 190 tests). Any other file
+                               under src/daemon/tests/ (not .rs) also selects
+                               all of daemon::tests.
   tests/suite.rs               the single integration target (CAD-1727). Each
                                changed line maps to its enclosing `#[test]`
                                fn; a changed helper selects its enclosing
                                `mod`. A change outside any test fn or mod
-                               (top-level helper, `use`) cannot be bounded and
-                               is reported on stderr, not widened to the suite.
+                               (top-level helper, `use`) cannot be bounded, so
+                               it selects the whole `suite` binary (about 224
+                               tests, one binary) and says so on stderr.
+
+Fail closed, bounded: nothing under those two paths is dropped. An unbounded
+change widens to one binary or one module tree, never to the full suite, and a
+selection that matches no test fails the run (`--no-tests fail`).
+Compile coverage of every test-seam target is ci.yml's required clippy job;
+this selection decides only which tests to run.
 
 Nothing here runs a test; the workflow runs the filterset under test-seam.
 """
@@ -50,10 +60,11 @@ def daemon_prefix(path):
     return "daemon::tests::" + "".join(p + "::" for p in parts)
 
 
-def root_mod_prefixes(base, head):
-    """Modules newly declared in src/daemon/tests/mod.rs."""
-    diff = git("diff", "-U0", f"{base}...{head}", "--", DAEMON_ROOT + "mod.rs")
-    return [f"daemon::tests::{m}::" for m in re.findall(r"^\+\s*mod (\w+);", diff, re.M)]
+def mod_prefixes(base, head, path):
+    """Modules newly declared in a mod.rs under src/daemon/tests/."""
+    diff = git("diff", "-U0", f"{base}...{head}", "--", path)
+    parent = daemon_prefix(path)
+    return [f"{parent}{m}::" for m in re.findall(r"^\+\s*mod (\w+);", diff, re.M)]
 
 
 def mask(text):
@@ -206,16 +217,21 @@ def main():
                 f"{args.base}...{args.head}").splitlines()
     daemon, suite = [], []
     for p in files:
-        if p.startswith(DAEMON_ROOT) and p.endswith(".rs"):
-            if p == DAEMON_ROOT + "mod.rs":
-                daemon += root_mod_prefixes(args.base, args.head)
-            else:
-                daemon.append(daemon_prefix(p))
+        if not p.startswith(DAEMON_ROOT):
+            continue
+        if not p.endswith(".rs"):
+            daemon.append("daemon::tests::")
+        elif p.rsplit("/", 1)[-1] == "mod.rs":
+            added = mod_prefixes(args.base, args.head, p)
+            daemon += added or [daemon_prefix(p)]
+        else:
+            daemon.append(daemon_prefix(p))
     if SUITE in files:
         suite, unbounded = suite_filters(args.base, args.head)
         if unbounded:
             print(f"changed-test-filter: {SUITE} lines {unbounded[:10]} are outside any "
-                  "test fn or mod; not selected", file=sys.stderr)
+                  "test fn or mod; selecting the whole suite binary", file=sys.stderr)
+            suite = ["test(/./)"]
     cargo, clauses = [], []
     if daemon:
         cargo.append("--lib")

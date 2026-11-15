@@ -6,6 +6,13 @@
 # minute tests.yml run.
 #
 # Selection is scripts/changed-test-filter (a nextest filterset from the diff).
+# It fails closed but bounded: an unbounded suite.rs edit selects the whole
+# suite binary, a mod.rs edit that adds no module selects its directory, and an
+# empty selection fails the run. This job does not compile-check test-seam
+# modules that no changed test selects: ci.yml's required clippy job
+# (--all-targets --features test-seam) already compiles every test-seam target,
+# so a source edit that breaks one fails there. This job adds running the
+# changed tests.
 # A PR that touches no such file reports success after the cheap select step;
 # the build and run steps are skipped. On merge_group (the queue ci.yml also
 # runs on) every step is skipped and the job reports success at once: the PR
