@@ -11,6 +11,7 @@ import { useIdeaDecision } from "./IdeaCard";
 import { useMergeDecision } from "./MergeForm";
 import { usePlanDecision } from "./PlanCard";
 import { ageWords, changeSize, firstSentence, type HomeNeed } from "./needs";
+import { HostedMergeGate, useHostedMergeGate } from "./HostedMergeGate";
 
 /**
  * The Home decision panel (CAD-1216, hosted by the shared work-item detail
@@ -348,7 +349,46 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: DecisionP
   );
 }
 
-function MergeReview({ need, readOnly, hosted, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
+function HostedMergeReview(props: DecisionPanelProps) {
+  const action = props.need.action as HomeNeed["action"] & { type: "merge" };
+  const block = useWriteBlock(props.readOnly);
+  const issue = useIssue(action.issue);
+  const gate = useHostedMergeGate({
+    enabled: true,
+    pr: action.pr,
+    head: action.sha && action.sha.trim() ? action.sha : null,
+    issue: action.issue,
+    project: props.need.project,
+  });
+
+  if (gate.supported === false) {
+    return <LegacyMergeReview {...props} />;
+  }
+
+  return (
+    <HostedMergeGate
+      need={props.need}
+      gate={gate}
+      lead={firstSentence(issue?.body)}
+      block={block}
+      index={props.index}
+      total={props.total}
+      onDone={props.onDone}
+      onClose={props.onClose}
+      onAsk={props.onAsk}
+      Shell={Shell}
+      Foot={Foot}
+      waiting={waiting}
+    />
+  );
+}
+
+function MergeReview(props: DecisionPanelProps) {
+  if (props.hosted) return <HostedMergeReview {...props} />;
+  return <LegacyMergeReview {...props} />;
+}
+
+function LegacyMergeReview({ need, readOnly, hosted, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
   const action = need.action as HomeNeed["action"] & { type: "merge" };
   const block = useWriteBlock(readOnly);
   const t = useTranslate();

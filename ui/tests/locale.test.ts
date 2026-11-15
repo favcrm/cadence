@@ -105,3 +105,32 @@ for (const [source, expected] of Object.entries(approvalGateTranslations)) {
     throw new Error(`Expected zh-TW approval string "${source}" to be "${expected}", got "${translated}"`);
   }
 }
+
+const hostedMergeGateTranslations: Record<string, string> = {
+  "Checks": "檢查",
+  "Approved": "已核准",
+  "In queue": "佇列中",
+  "Merged": "已合併",
+  "Ready to merge": "可合併",
+  "Needs 1 approval": "需要 1 項核准",
+  "Needs approvals": "需要核准",
+  "In merge queue": "正在合併佇列",
+  "Updated PR commit": "PR 已有新提交",
+  "Removed from queue": "已移出佇列",
+  "Approve & merge": "核准並合併",
+  "Verify & merge": "驗證並合併",
+  "Email verification": "電子郵件驗證",
+  "Send 6-digit code": "寄送 6 位數驗證碼",
+  "6-digit verification code": "6 位數驗證碼",
+  "Stop merge": "停止合併",
+  "Confirm stop merge": "確認停止合併",
+  "Hosted merge gate": "代管合併閘道",
+  "Pull request updated — a new commit was pushed.": "拉取請求已更新 — 已推送新提交。",
+};
+
+for (const [source, expected] of Object.entries(hostedMergeGateTranslations)) {
+  const translated = translateUiText(source, "zh-TW");
+  if (translated !== expected) {
+    throw new Error(`Expected zh-TW hosted gate string "${source}" to be "${expected}", got "${translated}"`);
+  }
+}

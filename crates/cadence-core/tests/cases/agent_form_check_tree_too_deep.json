@@ -1,0 +1,96 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.check",
+    "input": {
+      "form": {
+        "version": "1.0",
+        "createSurface": {
+          "surfaceId": "s-intake",
+          "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+          "components": [
+            {
+              "id": "root",
+              "component": "Column",
+              "children": [
+                "title",
+                "a",
+                "send"
+              ]
+            },
+            {
+              "id": "title",
+              "component": "Text",
+              "text": "Quick intake"
+            },
+            {
+              "id": "name",
+              "component": "TextField",
+              "label": "Your name",
+              "variant": "shortText",
+              "value": {
+                "@path": "/name"
+              }
+            },
+            {
+              "id": "send",
+              "component": "Button",
+              "variant": "primary",
+              "child": "send_label",
+              "action": {
+                "event": {
+                  "name": "intake.answer",
+                  "context": {
+                    "name": {
+                      "@path": "/name"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "send_label",
+              "component": "Text",
+              "text": "Send answer"
+            },
+            {
+              "id": "a",
+              "component": "Row",
+              "children": [
+                "b"
+              ]
+            },
+            {
+              "id": "b",
+              "component": "Column",
+              "children": [
+                "c"
+              ]
+            },
+            {
+              "id": "c",
+              "component": "Row",
+              "children": [
+                "name"
+              ]
+            }
+          ],
+          "dataModel": {
+            "name": "",
+            "day": [
+              "mon"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.check",
+    "value": {
+      "valid": false,
+      "message": "form /createSurface/components: 'name' is nested deeper than 4"
+    }
+  }
+}

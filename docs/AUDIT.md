@@ -509,6 +509,21 @@ passes, and any same-uid process can write the SQLite file directly —
 hence `operator-claimed`, never verified, until CAD-280. The record's
 `source` is the operator's own statement of who approved and where.
 
+**Hosted delivery-gate evidence (`CAD-1946`).** On a hosted org, approvals,
+scope/delegated approvals, and `delivery enqueue` do not write local SQLite
+or git notes and need no local daemon. Instead, the tenant Durable Object evaluates
+the gate server-side, requires a fresh 15-minute (`900`s) 6-digit Email-OTP
+step-up for board `Approve & merge`, appends an immutable row to
+`tenant_delivery_evidence`, and signs the PR comment with the hosted Ed25519
+delivery-gate key (`cadence-delivery-gate/v2`). During `merge_group` CI,
+`scripts/delivery-gate` verifies the `v2` SSHSIG signature and confirms the live
+enqueue record with GitHub Actions OIDC (`id-token: write`) at
+`POST https://<host>/__platform/delivery-gate/verify`. The CLI verbs
+(`delivery check`, `delivery enqueue`, `audit scope`, `audit approve`
+`--action scope`/`--delegated`, `audit designate`, `audit designations`,
+`audit digest`, `audit revoke`) and `scripts/enqueue-reviewed --org <org>`
+all fail closed when a hosted org is unreachable or returns a refusal.
+
 What the audit **cannot** detect:
 
 - Whether the GitHub login that posted `qa-verdict` is the same human
