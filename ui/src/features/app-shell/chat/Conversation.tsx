@@ -60,6 +60,7 @@ import {
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import { useLocale } from "../../../lib/locale";
+import { isEnglishLocale } from "../../workspace-apps/appLocale";
 import { displayUiNotice, type UiNotice } from "../../../lib/uiNotice";
 import {
   conversationLabel,
@@ -667,7 +668,7 @@ function AppRow({
  * stamps the verified binding on the entry.
  */
 function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
-  const { t, formatNumber } = useLocale();
+  const { locale, t, formatNumber } = useLocale();
   const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
   const documentVisible = useDocumentVisible();
@@ -1208,29 +1209,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   }
   const canAttach = attachEnabled && attachDestination !== undefined;
   const attachReason = fileUploadLoading
-    ? "Checking this app's file-upload capability…"
+    ? t("Checking this app's file-upload capability…")
     : !fileUpload.declared
-      ? "This app has not declared the approved text-file upload capability."
+      ? t("This app has not declared the approved text-file upload capability.")
       : !fileUpload.available
-        ? "This app's text-file upload capability is currently unavailable."
+        ? t("This app's text-file upload capability is currently unavailable.")
         : capturedBinding === null
-          ? "This saved draft has no app binding; start a new app-scoped draft before attaching."
+          ? t("This saved draft has no app binding; start a new app-scoped draft before attaching.")
           : binding.error !== null
-            ? binding.error
-            : "Attach is available only in a writable, resolved app conversation.";
+            ? t(binding.error)
+            : t("Attach is available only in a writable, resolved app conversation.");
   // Why the composer is disabled — always a plain reason, never a fake reply.
   const sendBlockedReason = viewer.operator === null
     ? viewer.access === "unavailable"
-      ? "Access could not be confirmed — retry the access check"
-      : "Checking access before messaging the assistant"
+      ? t("Access could not be confirmed — retry the access check")
+      : t("Checking access before messaging the assistant")
     : viewer.operator === false
-    ? "Sign in as the operator to message the assistant"
-    : viewer.readOnly
-      ? "Read-only · Sending is unavailable"
-      : active.state === "failed"
-        ? "The conversations could not be read — retry above"
-        : "No conversation yet — start one with + New";
-  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
+      ? t("Sign in as the operator to message the assistant")
+      : viewer.readOnly
+        ? t("Read-only · Sending is unavailable")
+        : active.state === "failed"
+          ? t("The conversations could not be read — retry above")
+          : t("No conversation yet — start one with + New");
+  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
   // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
@@ -1936,7 +1937,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const subjectOf = (subject: string | null) => subject?.split(":")[0] ?? null;
   const draftKind = subjectOf(draftSubject);
-  const draftLabel = subjects.find((s) => s.kind === draftKind)?.label.toLowerCase();
+  const rawDraftLabel = subjects.find((s) => s.kind === draftKind)?.label;
+  const draftLabel = rawDraftLabel ? (isEnglishLocale(locale) ? rawDraftLabel.toLowerCase() : rawDraftLabel) : undefined;
   // The removed picker was the only place naming the open conversation.
   const selectedIndex = active.state === "ready" ? active.conversations.findIndex((c) => c.id === convId) : -1;
   const convLabel =
@@ -1944,8 +1946,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       ? null
       : draftSubject !== null
         ? draftLabel
-          ? `New ${draftLabel} conversation (unsaved)`
-          : "New conversation (unsaved)"
+          ? t("New {label} conversation (unsaved)").replace("{label}", () => draftLabel)
+          : t("New conversation (unsaved)")
         : active.selected !== null
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;

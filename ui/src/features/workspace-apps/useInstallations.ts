@@ -32,7 +32,11 @@ async function memberRows(signal: AbortSignal): Promise<Installation[]> {
     name: row.name,
     title: row.title,
     removed: row.attention?.state === "removed" ? 1 : null,
+    state: row.attention?.state === "removed" ? "removed" : undefined,
     project_link: row.project ?? "",
+    navigation: row.navigation ?? null,
+    i18n: row.i18n ?? null,
+    listing: row.listing ?? null,
   }) as unknown as Installation);
 }
 

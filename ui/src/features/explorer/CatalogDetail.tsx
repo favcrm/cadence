@@ -7,7 +7,16 @@ import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
-import { useTranslate } from "../../lib/locale";
+import { useLocale } from "../../lib/locale";
+import {
+  extractAccessNoteEntries,
+  localizedAppCategory,
+  localizedAppTagline,
+  localizedAppTitle,
+  parseAppDisplayI18n,
+  parseListingDisplayI18n,
+  pickLocaleEntry,
+} from "../workspace-apps/appLocale";
 import "./explorer.css";
 import { PublicAppDetail } from "./publicDirectory";
 
@@ -17,7 +26,7 @@ import { PublicAppDetail } from "./publicDirectory";
  * state, with no marketplace hand-off and no Install for that source.
  */
 export default function CatalogDetail({ id, viewer }: { id: string; viewer: Viewer }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const isOp = viewer.operator === true && !viewer.readOnly;
   const [card, setCard] = useState<CatalogCard | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -82,25 +91,32 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   }
 
   const access = card.access ?? [];
-  const can = card.can ?? card.listing?.can ?? [];
+  const cardI18n = parseAppDisplayI18n(card.i18n, { wire: true });
+  const listingI18n = parseListingDisplayI18n(card.listing?.i18n, { wire: true });
+  const locListing = pickLocaleEntry(listingI18n, locale);
+  const localizedListing = card.listing ? { ...card.listing, i18n: listingI18n ?? undefined } : card.listing;
+  const title = localizedAppTitle({ title: card.title, i18n: cardI18n, listing: localizedListing }, locale, t);
+  const tagline = localizedAppTagline({ tagline: card.tagline, i18n: cardI18n, listing: localizedListing }, locale, t);
+  const can = locListing?.can ?? card.can ?? card.listing?.can ?? [];
   const shots = card.screenshots ?? card.listing?.screenshots ?? [];
-  const about = card.about ?? card.listing?.about;
+  const about = locListing?.about ?? card.about ?? card.listing?.about;
   const setup = card.setup ?? card.listing?.setup ?? [];
   const data = card.data ?? card.listing?.data;
+  const accessNotes = extractAccessNoteEntries(locListing?.access_notes, card.access_notes ?? card.listing?.access_notes);
 
   return (
-    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={card.title}>
+    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={title}>
       <Link href="/apps/explore" className="text-label text-ink-400 hover:text-ink-100">{t("← Explore")}</Link>
 
       <div className="hero mt-3">
         <AppGlyph name={card.name} icon={card.listing?.icon} size="lg" />
         <div className="min-w-0">
-          <h1>{card.title}</h1>
-          <p className="tag">{card.listing?.tagline}</p>
+          <h1>{title}</h1>
+          <p className="tag">{tagline}</p>
           <div className="by">
             <TrustChip trust={card.trust} />
             <span>·</span>
-            <span>{card.listing?.category ?? "App"}</span>
+            <span>{card.listing?.category ? localizedAppCategory(card.listing.category, locale) : t("App")}</span>
             {installed && <span className="chip ok">{t("Installed")}</span>}
             {card.state === "off" && <span className="chip">{t("Access off")}</span>}
             {removed && <span className="chip">{t("Removed")}</span>}
@@ -121,11 +137,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       )}
       {removed && (
         <div className="alert warn mt-4" role="status">
-          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => card.title)}
+          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => title)}
         </div>
       )}
       {card.state === "off" && (
-        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => card.title)}</div>
+        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => title)}</div>
       )}
 
       <div className="dgrid">
@@ -171,6 +187,15 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </div>
           </div>
 
+          {accessNotes.length > 0 && (Boolean(locListing?.access_notes) || !access.some((r) => Boolean(r.note))) && (
+            <div className="blk">
+              <h2>{t("Access notes")}</h2>
+              <ul className="can">
+                {accessNotes.map(([slotKey, text]) => <li key={slotKey}><span aria-hidden>◦</span><span>{text}</span></li>)}
+              </ul>
+            </div>
+          )}
+
           {setup && setup.length > 0 && (
             <div className="blk">
               <h2>{t("Setup")}</h2>
@@ -206,20 +231,20 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
                 return href === null ? (
                   <span className="text-micro text-ink-500">{t("This install has no unique app page — see Manage.")}</span>
                 ) : (
-                  <Link className="btn btn-primary btn-lg" href={href}>Open {card.title}</Link>
+                  <Link className="btn btn-primary btn-lg" href={href}>{t("Open {title}").replace("{title}", () => title)}</Link>
                 );
               })()}
-              {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
-              {!isOp && <span className="text-micro text-ink-500">Ask an admin to manage access.</span>}
+              {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>{t("Manage")}</Link>}
+              {!isOp && <span className="text-micro text-ink-500">{t("Ask an admin to manage access.")}</span>}
             </>
           ) : removed ? (
             isOp && card.restorable ? (
               <>
-                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? "Restoring…" : "Restore"}</Button>
-                <span className="text-micro text-ink-500">Brings back {card.title} with its data.</span>
+                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? t("Restoring…") : t("Restore")}</Button>
+                <span className="text-micro text-ink-500">{t("Brings back {title} with its data.").replace("{title}", () => title)}</span>
               </>
             ) : (
-              <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
+              <span className="text-micro text-ink-500">{isOp ? t("The restore window has closed.") : t("This app was removed. Ask an admin.")}</span>
             )
           ) : retired ? (
             <span className="text-micro text-ink-500">
@@ -227,8 +252,8 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </span>
           ) : card.requested_by_me || card.state === "requested" ? (
             <>
-              <Button className="btn-lg" disabled>Asked</Button>
-              <span className="text-micro text-ink-500">Your admin will see the request.</span>
+              <Button className="btn-lg" disabled>{t("Asked")}</Button>
+              <span className="text-micro text-ink-500">{t("Your admin will see the request.")}</span>
             </>
           ) : (
             <>
@@ -237,11 +262,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             </>
           )}
           <dl className="dl mt-3">
-            <dt>Made by</dt><dd><TrustChip trust={card.trust} /></dd>
-            {card.version && <><dt>Version</dt><dd>{card.version}</dd></>}
-            {card.listing?.category && <><dt>Category</dt><dd>{card.listing.category}</dd></>}
-            {retired && <><dt>Source</dt><dd>{t("Retired built-in catalog")}</dd></>}
-            {isOp && card.digest && <><dt>Digest</dt><dd className="num break-all">{card.digest}</dd></>}
+            <dt>{t("Made by")}</dt><dd><TrustChip trust={card.trust} /></dd>
+            {card.version && <><dt>{t("Version")}</dt><dd>{card.version}</dd></>}
+            {card.listing?.category && <><dt>{t("Category")}</dt><dd>{localizedAppCategory(card.listing.category, locale)}</dd></>}
+            {retired && <><dt>{t("Source")}</dt><dd>{t("Retired built-in catalog")}</dd></>}
+            {isOp && card.digest && <><dt>{t("Digest")}</dt><dd className="num break-all">{card.digest}</dd></>}
           </dl>
         </aside>
       </div>

@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
-import { useTranslate } from "../../lib/locale";
+import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
+import { extractAccessNoteEntries, isPlainJsonObject, localizedAppCategory, localizedAppSummary, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, parseListingDisplayI18n, pickLocaleEntry, type AppDisplayI18n, type ListingDisplayLocale } from "../workspace-apps/appLocale";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -31,6 +32,7 @@ export type PublicListing = {
   stores?: string[];
   personalData?: boolean;
   accessNotes?: string[];
+  i18n?: Record<string, ListingDisplayLocale>;
 };
 
 export type PublicApp = {
@@ -40,6 +42,7 @@ export type PublicApp = {
   summary: string;
   version: string;
   listing: PublicListing;
+  i18n?: AppDisplayI18n | null;
   digest: string | null;
   installable: boolean;
 };
@@ -68,7 +71,7 @@ import { canOpenInstall, type InstallLifecycleState } from "./installAccess";
 export type InstallRef = Pick<
   Installation,
   "install_id" | "name" | "title" | "removed" | "catalogue"
-> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link">> & {
+> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link" | "i18n" | "listing">> & {
   project?: string;
   /** The tenant's lifecycle word; only an active row can open its app route. */
   state?: InstallLifecycleState;
@@ -81,9 +84,23 @@ const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
 const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
-function listingOf(value: unknown): PublicListing {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const row = value as Record<string, unknown>;
+const FORBIDDEN_PUBLIC_KEYS = new Set(["cost", "price", "pricing", "artifact", "path", "__proto__", "prototype", "constructor"]);
+const MAX_PUBLIC_SCAN_DEPTH = 32;
+const MAX_PUBLIC_SCAN_NODES = 4096;
+
+function hasUnsafePublicStructure(value: unknown, depth = 0, state = { nodes: 0 }): boolean {
+  if (depth > MAX_PUBLIC_SCAN_DEPTH) return true;
+  if (value === null || typeof value !== "object") return false;
+  if (++state.nodes > MAX_PUBLIC_SCAN_NODES) return true;
+  if (Array.isArray(value)) return value.some((item) => hasUnsafePublicStructure(item, depth + 1, state));
+  if (!isPlainJsonObject(value)) return true;
+  return Object.keys(value).some((k) => FORBIDDEN_PUBLIC_KEYS.has(k) || hasUnsafePublicStructure(value[k], depth + 1, state));
+}
+
+function listingOf(value: unknown): PublicListing | null {
+  if (value === undefined || value === null) return {};
+  if (!isPlainJsonObject(value)) return null;
+  const row = value;
   const rawList = Array.isArray(row.can) ? row.can : Array.isArray(row.highlights) ? row.highlights : undefined;
   const highlights = rawList
     ? rawList.filter((item): item is string => typeof item === "string")
@@ -91,9 +108,7 @@ function listingOf(value: unknown): PublicListing {
   const tags = Array.isArray(row.tags)
     ? row.tags.filter((item): item is string => typeof item === "string")
     : undefined;
-  const pubObj = row.publisher && typeof row.publisher === "object" && !Array.isArray(row.publisher)
-    ? (row.publisher as Record<string, unknown>).name
-    : row.publisher;
+  const pubObj = isPlainJsonObject(row.publisher) ? row.publisher.name : row.publisher;
   const publisher = typeof pubObj === "string" && pubObj ? pubObj : undefined;
   const description = typeof row.about === "string" && row.about
     ? row.about
@@ -103,23 +118,25 @@ function listingOf(value: unknown): PublicListing {
   const tagline = typeof row.tagline === "string" && row.tagline ? row.tagline : undefined;
   const setup = Array.isArray(row.setup)
     ? row.setup
-        .filter((s): s is Record<string, unknown> => !!s && typeof s === "object" && !Array.isArray(s))
+        .filter((s): s is Record<string, unknown> => isPlainJsonObject(s))
         .filter((s) => typeof s.label === "string" && typeof s.help === "string")
         .map((s) => ({ slot: typeof s.slot === "string" ? s.slot : s.label as string, label: s.label as string, help: s.help as string }))
     : undefined;
-  const dataObj = row.data && typeof row.data === "object" && !Array.isArray(row.data)
-    ? (row.data as Record<string, unknown>)
-    : null;
+  const dataObj = isPlainJsonObject(row.data) ? row.data : null;
   const stores = dataObj && Array.isArray(dataObj.stores)
     ? dataObj.stores.filter((item): item is string => typeof item === "string")
     : undefined;
   const personalData = dataObj && typeof dataObj.personal === "boolean" ? dataObj.personal : undefined;
-  const accessObj = row.access_notes && typeof row.access_notes === "object" && !Array.isArray(row.access_notes)
-    ? (row.access_notes as Record<string, unknown>)
-    : null;
+  const accessObj = isPlainJsonObject(row.access_notes) ? row.access_notes : null;
   const accessNotes = accessObj
     ? Object.values(accessObj).filter((item): item is string => typeof item === "string" && !!item)
     : undefined;
+  let i18n: Record<string, ListingDisplayLocale> | undefined;
+  if (row.i18n !== undefined && row.i18n !== null) {
+    const parsedListingI18n = parseListingDisplayI18n(row.i18n, { wire: true });
+    if (!parsedListingI18n) return null;
+    if (Object.keys(parsedListingI18n).length > 0) i18n = parsedListingI18n;
+  }
   return {
     tagline,
     category: typeof row.category === "string" ? row.category : undefined,
@@ -131,25 +148,35 @@ function listingOf(value: unknown): PublicListing {
     stores,
     personalData,
     accessNotes,
+    ...(i18n ? { i18n } : {}),
   };
 }
 
 export function parsePublicApp(value: unknown): PublicApp | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const row = value as Record<string, unknown>;
+  if (!isPlainJsonObject(value)) return null;
+  const row = value;
   if (typeof row.installable !== "boolean") return null;
   if (typeof row.id !== "string" || !CATALOG_ID.test(row.id) || row.id.startsWith(".") || row.id.includes("..") || typeof row.app !== "string" || typeof row.title !== "string") return null;
   if (typeof row.summary !== "string" || typeof row.version !== "string") return null;
   if (row.digest !== null && (typeof row.digest !== "string" || !DIGEST.test(row.digest))) return null;
   if (row.installable && row.digest === null) return null;
-  if ("price" in row || "artifact" in row || "path" in row) return null;
+  if (hasUnsafePublicStructure(row)) return null;
+  let parsedI18n: AppDisplayI18n | undefined;
+  if (row.i18n !== undefined && row.i18n !== null) {
+    const parsed = parseAppDisplayI18n(row.i18n, { wire: true });
+    if (!parsed) return null;
+    if (Object.keys(parsed).length > 0) parsedI18n = parsed;
+  }
+  const listing = listingOf(row.listing);
+  if (!listing) return null;
   return {
     id: row.id,
     app: row.app,
     title: row.title,
     summary: row.summary,
     version: row.version,
-    listing: listingOf(row.listing),
+    listing,
+    ...(parsedI18n ? { i18n: parsedI18n } : {}),
     digest: row.digest as string | null,
     installable: row.installable,
   };
@@ -303,12 +330,14 @@ function useBoardInstalls(viewer: Viewer): {
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
         removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+        i18n: row.i18n, listing: row.listing,
       }));
     const fromHome = (home: HomeInstallation[]): InstallRef[] => home
       .filter((row) => row.attention?.state !== "removed")
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         project_link: row.project ?? "", removed: null, catalogue: row.catalogue ?? null, project: row.project,
+        i18n: row.i18n, listing: row.listing,
       }));
     const once = () => operator
       ? workspaceApps.installations(signal).then(fromOperator)
@@ -353,6 +382,7 @@ function useBoardInstalls(viewer: Viewer): {
       install_id: row.install_id, name: row.name, title: row.title, version: row.version,
       digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
       removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+      i18n: row.i18n, listing: row.listing,
     };
     setRows((current) => [...(current ?? []).filter((item) => item.install_id !== row.install_id), confirmed]);
     setError(null);
@@ -386,7 +416,7 @@ function catalogDetailHref(appId: string, installId: string | null): string {
 }
 
 export function PublicDirectory({ viewer }: { viewer: Viewer }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const { apps, error, retry } = usePublicList();
   const installs = useBoardInstalls(viewer);
   const [query, setQuery] = useState("");
@@ -404,10 +434,24 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
     }
     return map;
   }, [installs.rows]);
+  const localizedById = useMemo(() => new Map(
+    (apps ?? []).map((app) => [
+      app.id,
+      {
+        title: localizedAppTitle({ title: app.title, i18n: app.i18n, listing: app.listing }, locale, t),
+        tagline:
+          localizedAppTagline({ tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing }, locale, t) ||
+          localizedAppSummary({ summary: app.summary, i18n: app.i18n, listing: app.listing }, locale, t),
+      },
+    ]),
+  ), [apps, locale, t]);
   const shown = (apps ?? []).filter((app) => {
+    const localized = localizedById.get(app.id);
     const hay = [
       app.title,
+      localized?.title,
       app.summary,
+      localized?.tagline,
       app.app,
       app.listing.tagline,
       app.listing.publisher,
@@ -442,7 +486,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
             aria-label={t("Category")}
             options={[
               { value: "all", label: t("All categories") },
-              ...categories.map((item) => ({ value: item, label: item })),
+              ...categories.map((item) => ({ value: item, label: localizedAppCategory(item, locale) })),
             ]}
           />
         </div>
@@ -464,14 +508,17 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
           const rows = installsByName.get(app.app) ?? [];
           const only = rows.length === 1 ? rows[0] : null;
           const known = installs.rows !== null && !installs.loading && !installs.error;
+          const localized = localizedById.get(app.id);
+          const displayTitle = localized?.title ?? app.title;
+          const displaySummary = localized?.tagline ?? app.listing.tagline ?? app.summary;
           return (
             <article className="pub-card" key={app.id}>
               <Link href={catalogDetailHref(app.id, only?.install_id ?? null)} className="pub-card-link" aria-labelledby={`pub-name-${app.id}`} aria-describedby={`pub-state-${app.id}`}>
-                <AppCover name={app.app} title={app.title} category={app.listing.category} />
+                <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
                 <span className="pub-card-copy">
-                  <span className="pub-card-category">{app.listing.category ?? ""}</span>
-                  <span className="pub-card-title" id={`pub-name-${app.id}`}>{app.title}</span>
-                  <span className="pub-card-summary">{app.listing.tagline ?? app.summary}</span>
+                  <span className="pub-card-category">{app.listing.category ? localizedAppCategory(app.listing.category, locale) : ""}</span>
+                  <span className="pub-card-title" id={`pub-name-${app.id}`}>{displayTitle}</span>
+                  <span className="pub-card-summary">{displaySummary}</span>
                   {app.listing.publisher && <span className="pub-card-publisher">{app.listing.publisher}</span>}
                   <span className="pub-card-footer">
                     <span>v{app.version}</span>
@@ -529,7 +576,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   installationParam: string | null;
   operator: boolean;
 }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const catalogued = (rows ?? []).filter((row) => {
     const claim = rowCatalogue(row);
     return claim.kind === "id" && claim.id === id;
@@ -548,7 +595,8 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
   const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
-  const title = install?.title ?? catalogued[0]?.title ?? id;
+  const titleSource = install ?? catalogued[0];
+  const title = titleSource ? localizedAppTitle(titleSource, locale, t) : id;
   return (
     <article className="pub-detail" aria-label={title}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
@@ -579,7 +627,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
                       replace
                       href={`/apps/catalog/${encodeURIComponent(id)}?${new URLSearchParams({ installation: row.install_id })}`}
                     >
-                      {row.title} · {row.version ?? "—"}
+                      {localizedAppTitle(row, locale, t)} · {row.version ?? "—"}
                       {row.project ? ` · ${row.project}` : ""}
                     </Link>
                   </li>
@@ -622,7 +670,7 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
 }
 
 export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer: Viewer; onResolved?: (found: boolean) => void }) {
-  const t = useTranslate();
+  const { locale, t } = useLocale();
   const [app, setApp] = useState<PublicApp | null | undefined>(undefined);
   const [appError, setAppError] = useState<string | null>(null);
   const [appTick, setAppTick] = useState(0);
@@ -750,35 +798,53 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
     navigate(`/apps/catalog/${encodeURIComponent(app.id)}?${next}`, { replace: true });
   };
 
-  const highlights = app.listing.highlights ?? [];
+  const locListing = pickLocaleEntry(app.listing.i18n, locale);
+  const displayTitle = localizedAppTitle(
+    { title: app.title, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  );
+  const displaySummary = localizedAppSummary(
+    { summary: app.summary, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  );
+  const displayIntro = localizedAppTagline(
+    { tagline: app.listing.tagline, i18n: app.i18n, listing: app.listing },
+    locale,
+    t,
+  ) || displaySummary;
+  const displayDescription = locListing?.about ?? app.listing.description ?? displaySummary;
+  const highlights = locListing?.can ?? app.listing.highlights ?? [];
+  const accessNotes = extractAccessNoteEntries(locListing?.access_notes, app.listing.accessNotes);
   return (
-    <article className="pub-detail" aria-label={app.title}>
+    <article className="pub-detail" aria-label={displayTitle}>
       <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
       <header className="pub-heading">
-        {app.listing.category && <p className="pub-category">{app.listing.category}</p>}
-        <h1 id="pub-title" tabIndex={-1}>{app.title}</h1>
-        <p className="pub-intro">{app.listing.tagline ?? app.summary}</p>
+        {app.listing.category && <p className="pub-category">{localizedAppCategory(app.listing.category, locale)}</p>}
+        <h1 id="pub-title" tabIndex={-1}>{displayTitle}</h1>
+        <p className="pub-intro">{displayIntro}</p>
         <p className="pub-publisher">
-          {app.listing.publisher ? t("By {publisher}").replace("{publisher}", app.listing.publisher) : app.app}
+          {app.listing.publisher ? t("By {publisher}").replace("{publisher}", () => app.listing.publisher!) : app.app}
           <span className="pub-unverified">{t("Publisher not verified")}</span>
         </p>
       </header>
       <div className="pub-layout">
         <div className="pub-story">
           <figure className="pub-cover">
-            <AppCover name={app.app} title={app.title} category={app.listing.category} />
+            <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
             <figcaption>{t("Illustrative app cover")}</figcaption>
           </figure>
           <section className="pub-section">
             <h2>{t("About this app")}</h2>
-            <p>{app.listing.description ?? app.summary}</p>
+            <p>{displayDescription}</p>
           </section>
           {highlights.length > 0 && (
             <section className="pub-section">
               <h2>{t("What you can do")}</h2>
               <ul className="pub-features">
-                {highlights.map((item) => (
-                  <li key={item}>
+                {highlights.map((item, idx) => (
+                  <li key={`${idx}:${item}`}>
                     <svg aria-hidden="true" viewBox="0 0 20 20"><path d="m4 10 4 4 8-9" /></svg>
                     <span>{item}</span>
                   </li>
@@ -807,10 +873,10 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
               </ul>
             </section>
           )}
-          {app.listing.accessNotes && app.listing.accessNotes.length > 0 && (
+          {accessNotes && accessNotes.length > 0 && (
             <section className="pub-section">
               <h2>{t("Access notes")}</h2>
-              <ul className="pub-plain">{app.listing.accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
+              <ul className="pub-plain">{accessNotes.map(([slotKey, item]) => <li key={slotKey}>{item}</li>)}</ul>
             </section>
           )}
         </div>

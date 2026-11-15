@@ -10,6 +10,8 @@ import {
   type MemberAccessGrant,
   type RevokeReceipt,
 } from "../explorer/memberAccess";
+import type { AppDisplayI18n, ListingDisplayLocale } from "./appLocale";
+import type { ScreenNavigation } from "./screen/screenProtocol";
 
 export type { Agent };
 
@@ -41,6 +43,11 @@ export interface Installation {
   connection_slots: string[];
   /** CAD-1543: the live bundle declares host SMTP custody (a screen lists `smtp.bind`). */
   smtp_custody?: boolean;
+  /** Declared screen navigation (`app-screens/v1|v2` single-screen package). */
+  navigation?: ScreenNavigation | null;
+  /** Display translations merged from `listing.i18n` and top-level `i18n`. */
+  i18n?: AppDisplayI18n | null;
+  listing?: Listing | null;
   /** Tenant lifecycle; absent on older/local responses, which mean active. */
   state?: "active" | "disabled" | "removed";
   disabled_at?: number | null;
@@ -528,6 +535,7 @@ export interface CatalogCard {
   never?: string;
   about?: string; can?: string[]; screenshots?: { file: string; caption?: string }[];
   setup?: SetupStep[]; data?: ListingData; access_notes?: Record<string, string>;
+  i18n?: Record<string, ListingDisplayLocale> | null;
   changes?: { version: string; notes: string[]; keeps?: string }[];
 }
 
@@ -539,6 +547,8 @@ export interface HomeInstallation {
    *  apart (the old `/apps` list's `Project:` chip). */
   project?: string;
   tagline?: string; icon?: string;
+  navigation?: ScreenNavigation | null;
+  i18n?: AppDisplayI18n | null;
   /** The readable manifest record, when the row carries one: the
    *  installed version, the bundle's own listing copy and the recorded
    *  catalogue locator (null/absent on a path or Git install). */
@@ -579,6 +589,7 @@ export interface Listing {
   setup?: SetupStep[]; access_notes?: Record<string, string>;
   changes?: { version: string; notes: string[]; keeps?: string }[];
   data?: ListingData;
+  i18n?: Record<string, ListingDisplayLocale> | null;
 }
 
 export interface InstallRequest {

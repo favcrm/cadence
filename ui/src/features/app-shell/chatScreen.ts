@@ -25,10 +25,12 @@ export function chatContext(
   descriptor: AppChat | null,
   screen: string | null,
   recordOpen: boolean,
+  t?: (key: string) => string,
 ): { label: string; prompts: string[] } | null {
   const entry = screen === null ? undefined : descriptor?.contexts.find((c) => c.id === screen);
   if (!entry) return null;
+  const openTemplate = t ? t("{label} (open)") : "{label} (open)";
   return recordOpen && entry.record
-    ? { label: `${entry.record.label} (open)`, prompts: entry.record.prompts }
+    ? { label: openTemplate.replace("{label}", () => entry.record!.label), prompts: entry.record.prompts }
     : { label: entry.label, prompts: entry.prompts };
 }
