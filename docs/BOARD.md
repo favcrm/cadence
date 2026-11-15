@@ -2639,9 +2639,9 @@ because the wire carries no author. An owner who is the approver may approve
 their own, and this session's row then says "Approved by you (self)". Archive
 and Restore are the owner's; Restore returns the stage the document had before
 it was archived. A platform operator session changes nothing. Each write asks
-for confirmation and reports a refusal by its code. A list that answers `404`
-after the probe said available means review was turned off: the screen says so
-and asks the probe again once.
+for confirmation and reports a refusal in that code's own words. A list that
+answers `404` after the probe said available means review was turned off: the
+screen says so and asks the probe again once.
 
 Settings → Documents (`/settings/documents`) is mounted when the hosted board
 names `documents` in `settings_sections`, which it does while the lifecycle is
