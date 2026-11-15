@@ -597,9 +597,9 @@ fn string(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
     if s.chars().count() > max {
         return Err(bad(path, format!("is longer than {max} characters")));
     }
-    let refused_char = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let bidi_or_line_break = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     if s.chars()
-        .any(|c| (c.is_control() && !(newline_ok && c == '\n')) || refused_char(c))
+        .any(|c| (c.is_control() && !(newline_ok && c == '\n')) || bidi_or_line_break(c))
     {
         return Err(bad(
             path,
@@ -615,7 +615,8 @@ fn string(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
 /// entry its binding names - is something that input can show, so nothing
 /// the operator cannot see rides in the answer: a CheckBox holds a boolean,
 /// a ChoicePicker only its own option values, a number field a finite
-/// number, a date or time field that format, and a text field one line
+/// number in HTML's number grammar, a date or time field a real date or
+/// time in that format, and a text field one line
 /// (a long text may break lines).
 fn defaults_fit_inputs(by_id: &[(&str, &Map<String, Value>)], data: Option<&Value>) -> Result<()> {
     for (i, (id, c)) in by_id.iter().enumerate() {
@@ -721,8 +722,9 @@ fn days_in(y: &str, m: &str) -> u32 {
     }
 }
 
-/// HTML's "valid floating-point number": `-?digits(.digits)?([eE][+-]?digits)?`.
-/// A number field shows nothing for any other string (`+5`, `.5`, `5.`),
+/// HTML's "valid floating-point number": an optional `-`, then integer
+/// digits, a `.digits` fraction or both, then an optional `[eE][+-]?digits`.
+/// A number field shows nothing for any other string (`+5`, `5.`, `.`),
 /// so a default must be one of these, and finite.
 fn html_number(s: &str) -> bool {
     let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
@@ -732,7 +734,7 @@ fn html_number(s: &str) -> bool {
         None => (body, None),
     };
     let mantissa_ok = match mantissa.split_once('.') {
-        Some((int, frac)) => digits(int) && digits(frac),
+        Some((int, frac)) => (int.is_empty() || digits(int)) && digits(frac),
         None => digits(mantissa),
     };
     let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
@@ -957,14 +959,30 @@ mod tests {
         assert!(!date_shape("2026-02-29", true, false));
         assert!(!date_shape("2026-13-45", true, false));
         assert!(date_shape("2026-11-14T09:30:15", true, true));
-        for good in ["5", "-1.25", "3e2", "1.5E-3", "0"] {
+        for good in ["5", "-1.25", "3e2", "1.5E-3", "0", ".5", "-.5"] {
             assert!(html_number(good), "{good} is a valid HTML number");
         }
-        for bad_number in ["+5", ".5", "5.", "1e", "--1", "NaN", "inf", " 5"] {
+        for bad_number in ["+5", "5.", ".", "-.", "1e", "--1", "NaN", "inf", " 5"] {
             assert!(
                 !html_number(bad_number),
                 "{bad_number} is not a valid HTML number"
             );
+        }
+        // ... and a number field's default goes through that grammar.
+        let number = |value: &str| {
+            let mut v = weekly();
+            components(&mut v)[7] = json!({"id": "closed", "component": "TextField",
+                "label": "Count", "variant": "number", "value": value});
+            v
+        };
+        for bad_number in ["+5", "5.", "."] {
+            refused(
+                &number(bad_number),
+                "must be a number for TextField 'closed'",
+            );
+        }
+        for good in ["-1.5e2", ".5"] {
+            check(&number(good)).expect("a valid HTML number is a valid default");
         }
 
         // A literal value's refusal names the component's index, like every path.
