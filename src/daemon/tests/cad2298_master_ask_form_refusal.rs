@@ -167,7 +167,9 @@ fn master_ask_form_is_refused_outside_a_live_home_turn() {
         .unwrap();
     let err = ask().expect_err("an app conversation turn must not ask a form");
     assert!(
-        err.contains("app conversation"),
+        err.contains(
+            "master ask-form is made in the master's Home conversation, not in an app conversation"
+        ),
         "not the scope guard: {err}"
     );
     assert_eq!(surface_entries(dir.path()), 1, "an app refusal wrote");
