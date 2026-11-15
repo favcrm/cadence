@@ -601,14 +601,23 @@ pub(crate) fn touches_pm_agents_dir(arg: &str, cwd: &Path, pm_dir: &Path) -> boo
     })
 }
 
+fn expand_for_state(path: &Path) -> std::result::Result<PathBuf, ()> {
+    fs::canonicalize(path)
+        .map_err(|_| ())
+        .or_else(|()| expand_path_symlinks(path))
+}
+
+fn in_state_dirs(canon: &Path, state_dirs: &[&Path]) -> bool {
+    state_dirs.iter().any(|dir| {
+        let root = state_root(dir);
+        canon == root || canon.starts_with(&root)
+    })
+}
+
 fn is_state_root(arg: &str, cwd: &Path, state_dirs: &[&Path]) -> bool {
-    let path = Path::new(arg);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
+    let Ok(canon) = expand_for_state(&probe_path(arg, cwd)) else {
+        return false;
     };
-    let canon = resolve_canonical(&abs);
     state_dirs.iter().any(|dir| canon == state_root(dir))
 }
 
@@ -655,16 +664,26 @@ fn touches_state_path(
     state_dirs: &[&Path],
     allow_master_scratch: bool,
 ) -> bool {
-    if arg.contains(".local/state/cadence") || arg.contains(".local/share/cadence") {
-        return true;
+    if !allow_master_scratch {
+        if !cwd.is_absolute() {
+            return true;
+        }
+        match expand_for_state(cwd) {
+            Ok(canon_cwd) if !in_state_dirs(&canon_cwd, state_dirs) => {}
+            _ => return true,
+        }
     }
-    let canon = resolve_canonical(&probe_path(arg, cwd));
-    if allow_master_scratch && under_master_scratch(&canon, state_dirs) {
-        return false;
-    }
-    state_dirs.iter().any(|dir| {
-        let root = state_root(dir);
-        canon == root || canon.starts_with(&root)
+    arg_path_candidates(arg).into_iter().flatten().any(|cand| {
+        if cand.contains(".local/state/cadence") || cand.contains(".local/share/cadence") {
+            return true;
+        }
+        let Ok(canon) = expand_for_state(&probe_path(cand, cwd)) else {
+            return true;
+        };
+        if allow_master_scratch && under_master_scratch(&canon, state_dirs) {
+            return false;
+        }
+        in_state_dirs(&canon, state_dirs)
     })
 }
 
@@ -674,12 +693,19 @@ fn touches_state_for(
     state_dirs: &[&Path],
     allow_master_scratch: bool,
 ) -> bool {
+    let Ok(canon_cwd) = expand_for_state(cwd) else {
+        return true;
+    };
+    let cwd_in_state = in_state_dirs(&canon_cwd, state_dirs);
+    if !allow_master_scratch && (!cwd.is_absolute() || cwd_in_state) {
+        return true;
+    }
     // The master's cwd is inside the state dir (`master/cwd`). That
     // fact is not a path the command touches — only arguments that
     // resolve into a state dir are. This daemon's own `--state-dir`
     // value, and files under `state/master/tmp` or `state/master/cwd`
     // (for the master only), are the master's tool line, not a reach into the state dir.
-    let cwd_is_root = state_dirs.iter().any(|dir| cwd == state_root(dir));
+    let cwd_is_root = state_dirs.iter().any(|dir| canon_cwd == state_root(dir));
     let mut probes = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -687,40 +713,42 @@ fn touches_state_for(
         if arg == "--state-dir" {
             if i + 1 < argv.len() {
                 let val = &argv[i + 1];
-                if !allow_master_scratch || !is_state_root(val, cwd, state_dirs) {
-                    probes.push(probe_path(val, cwd));
+                if !allow_master_scratch || !is_state_root(val, &canon_cwd, state_dirs) {
+                    probes.push(probe_path(val, &canon_cwd));
                 }
                 i += 2;
                 continue;
             }
         } else if let Some(val) = arg.strip_prefix("--state-dir=") {
-            if !allow_master_scratch || !is_state_root(val, cwd, state_dirs) {
-                probes.push(probe_path(val, cwd));
+            if !allow_master_scratch || !is_state_root(val, &canon_cwd, state_dirs) {
+                probes.push(probe_path(val, &canon_cwd));
             }
             i += 1;
             continue;
         }
-        if arg.starts_with('/')
-            || arg.starts_with('.')
-            || (!cwd_is_root && arg.split(['/', '\\']).any(|seg| seg == ".."))
-        {
-            probes.push(probe_path(arg, cwd));
-        }
-        if arg.contains(".local/state/cadence") || arg.contains(".local/share/cadence") {
-            return true;
+        for cand in arg_path_candidates(arg).into_iter().flatten() {
+            if cand.contains(".local/state/cadence") || cand.contains(".local/share/cadence") {
+                return true;
+            }
+            if !allow_master_scratch
+                || cand.starts_with('/')
+                || cand.starts_with('.')
+                || (!cwd_is_root && cand.split(['/', '\\']).any(|seg| seg == ".."))
+            {
+                probes.push(probe_path(cand, &canon_cwd));
+            }
         }
         i += 1;
     }
     for probe in probes {
-        let canon = resolve_canonical(&probe);
+        let Ok(canon) = expand_for_state(&probe) else {
+            return true;
+        };
         if allow_master_scratch && under_master_scratch(&canon, state_dirs) {
             continue;
         }
-        for dir in state_dirs {
-            let root = state_root(dir);
-            if canon == root || canon.starts_with(&root) {
-                return true;
-            }
+        if in_state_dirs(&canon, state_dirs) {
+            return true;
         }
     }
     false
@@ -2699,9 +2727,13 @@ mod tests {
     #[test]
     fn worker_evaluation_enforces_rules_deny_wins_and_never_list() {
         let dir = tmp();
+        let state = dir.path().join("state");
         let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&pm).unwrap();
-        let cwd = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let cwd = fs::canonicalize(&repo).unwrap();
         let cwd_s = cwd.to_string_lossy().into_owned();
 
         // Write an exact Allow rule, a prefix Allow rule, plus a Deny rule that overlaps
@@ -2739,7 +2771,7 @@ mod tests {
         write_rules(&pm, "w1", &[allow_exact, allow_prefix, deny_rule]).unwrap();
 
         let eval_allow = evaluate_worker(
-            dir.path(),
+            &state,
             Some(pm.as_path()),
             "w1",
             "h-allow",
@@ -2747,7 +2779,7 @@ mod tests {
             &serde_json::json!({"command": "git status"}),
             "git status",
             &cwd,
-            &[dir.path()],
+            &[state.as_path()],
             1_000,
         )
         .unwrap();
@@ -2757,7 +2789,7 @@ mod tests {
         ));
 
         let eval_prefix = evaluate_worker(
-            dir.path(),
+            &state,
             Some(pm.as_path()),
             "w1",
             "h-prefix",
@@ -2765,7 +2797,7 @@ mod tests {
             &serde_json::json!({"command": "git status src/lib.rs"}),
             "git status src/lib.rs",
             &cwd,
-            &[dir.path()],
+            &[state.as_path()],
             1_001,
         )
         .unwrap();
@@ -2775,7 +2807,7 @@ mod tests {
         ));
 
         let err_deny = evaluate_worker(
-            dir.path(),
+            &state,
             Some(pm.as_path()),
             "w1",
             "h-deny",
@@ -2783,7 +2815,7 @@ mod tests {
             &serde_json::json!({"command": "git status src/secret.rs"}),
             "git status src/secret.rs",
             &cwd,
-            &[dir.path()],
+            &[state.as_path()],
             1_002,
         )
         .unwrap_err()
@@ -2796,7 +2828,7 @@ mod tests {
             "git push --force origin feat",
         ] {
             let err = evaluate_worker(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 "w1",
                 "h-never",
@@ -2804,7 +2836,7 @@ mod tests {
                 &serde_json::json!({"command": cmd}),
                 cmd,
                 &cwd,
-                &[dir.path()],
+                &[state.as_path()],
                 1_002,
             )
             .unwrap_err()
@@ -2818,7 +2850,7 @@ mod tests {
             "agents/w1/AGENT.md",
         ] {
             let err = evaluate_worker(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 "w1",
                 "h-prot",
@@ -2826,7 +2858,7 @@ mod tests {
                 &serde_json::json!({"file_path": protected}),
                 protected,
                 &cwd,
-                &[dir.path()],
+                &[state.as_path()],
                 1_003,
             )
             .unwrap_err()
@@ -2838,12 +2870,16 @@ mod tests {
     #[test]
     fn worker_allow_once_and_rules_never_mint_or_satisfy_master_grants() {
         let dir = tmp();
+        let state = dir.path().join("state");
         let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&pm).unwrap();
-        let cwd = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let cwd = fs::canonicalize(&repo).unwrap();
 
         let eval = evaluate_worker(
-            dir.path(),
+            &state,
             Some(pm.as_path()),
             "w1",
             "req-w1",
@@ -2851,7 +2887,7 @@ mod tests {
             &serde_json::json!({"command": "cadence issue show CAD-1"}),
             "cadence issue show CAD-1",
             &cwd,
-            &[dir.path()],
+            &[state.as_path()],
             2_000,
         )
         .unwrap();
@@ -2862,9 +2898,9 @@ mod tests {
         assert_eq!(req.requested_by, "w1");
 
         // allow_once on a worker request marks it approved but mints NO Master Grant.
-        let approved = allow_once(dir.path(), &req.id, &[], &[dir.path()], 2_001).unwrap();
+        let approved = allow_once(&state, &req.id, &[], &[state.as_path()], 2_001).unwrap();
         assert_eq!(approved.status, "allowed");
-        let doc = load_doc(dir.path()).unwrap();
+        let doc = load_doc(&state).unwrap();
         assert!(
             doc.grants.is_empty(),
             "worker request minted a grant: {:?}",
@@ -2873,7 +2909,7 @@ mod tests {
 
         // Even an explicit Always rule on w1 must not satisfy Master's decide_use.
         let eval2 = evaluate_worker(
-            dir.path(),
+            &state,
             Some(pm.as_path()),
             "w1",
             "req-w1-always",
@@ -2881,7 +2917,7 @@ mod tests {
             &serde_json::json!({"command": "cadence issue show CAD-1"}),
             "cadence issue show CAD-1",
             &cwd,
-            &[dir.path()],
+            &[state.as_path()],
             2_003,
         )
         .unwrap();
@@ -2890,12 +2926,12 @@ mod tests {
             other => panic!("expected Pending, got {other:?}"),
         };
         let (_approved2, rule) = always_rule(
-            dir.path(),
+            &state,
             &req2.id,
             Scope::Exact,
             &[],
             &[],
-            &[dir.path()],
+            &[state.as_path()],
             2_004,
         )
         .unwrap();
@@ -2909,12 +2945,12 @@ mod tests {
         ];
         assert!(
             decide_use(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 &argv,
                 &cwd,
                 &[],
-                &[dir.path()],
+                &[state.as_path()],
                 2_005,
                 true,
             )
@@ -2927,6 +2963,8 @@ mod tests {
     #[test]
     fn worker_symlink_and_dangling_symlink_to_protected_files_are_never() {
         let dir = tmp();
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).unwrap();
         let pm = dir.path().join("pm");
         let w1_dir = pm.join("agents/w1");
         let w2_dir = pm.join("agents/w2");
@@ -2966,7 +3004,7 @@ mod tests {
             "live.yaml",
         ] {
             let err = evaluate_worker(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 "w1",
                 "h-sym-write",
@@ -2974,14 +3012,19 @@ mod tests {
                 &serde_json::json!({"file_path": target, "content": "x"}),
                 target,
                 &cwd,
-                &[dir.path()],
+                &[state.as_path()],
                 1_001,
             )
             .unwrap_err()
             .to_string();
             assert!(err.contains("never requestable"), "{target}: {err}");
 
-            let cls = classify(&["Write".into(), target.into()], &cwd, &[], &[dir.path()]);
+            let cls = classify(
+                &["Write".into(), target.into()],
+                &cwd,
+                &[],
+                &[state.as_path()],
+            );
             assert!(matches!(cls, Class::Never { .. }), "{target}: {cls:?}");
         }
 
@@ -2994,7 +3037,7 @@ mod tests {
             ),
         ] {
             let err = evaluate_worker(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 "w1",
                 "h-sym-bash",
@@ -3002,7 +3045,7 @@ mod tests {
                 &serde_json::json!({"command": cmd}),
                 &cmd,
                 &cwd,
-                &[dir.path()],
+                &[state.as_path()],
                 1_002,
             )
             .unwrap_err()
@@ -3031,16 +3074,16 @@ mod tests {
             decision: String::new(),
             decision_label: String::new(),
         });
-        save_doc(dir.path(), &doc).unwrap();
-        allow_once(dir.path(), "mp-sym-dangling", &[], &[dir.path()], 1_003)
+        save_doc(&state, &doc).unwrap();
+        allow_once(&state, "mp-sym-dangling", &[], &[state.as_path()], 1_003)
             .expect_err("allow_once must refuse dangling symlink to protected permissions.yaml");
         always_rule(
-            dir.path(),
+            &state,
             "mp-sym-dangling",
             Scope::Exact,
             &[],
             &[],
-            &[dir.path()],
+            &[state.as_path()],
             1_003,
         )
         .expect_err("always_rule must refuse dangling symlink to protected permissions.yaml");
@@ -3049,9 +3092,13 @@ mod tests {
     #[test]
     fn cadence_wake_timeout_and_global_flags_never_bypass_update() {
         let dir = tmp();
+        let state = dir.path().join("state");
         let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&pm).unwrap();
-        let cwd = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let cwd = fs::canonicalize(&repo).unwrap();
 
         for cmd in [
             "cadence --wake-timeout 10 update",
@@ -3061,13 +3108,13 @@ mod tests {
             let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
             assert!(
                 matches!(
-                    classify(&argv, &cwd, &[], &[dir.path()]),
+                    classify(&argv, &cwd, &[], &[state.as_path()]),
                     Class::Never { .. }
                 ),
                 "expected Class::Never for `{cmd}`"
             );
             let err = evaluate_worker(
-                dir.path(),
+                &state,
                 Some(pm.as_path()),
                 "w1",
                 "h-wake-update",
@@ -3075,7 +3122,7 @@ mod tests {
                 &serde_json::json!({"command": cmd}),
                 cmd,
                 &cwd,
-                &[dir.path()],
+                &[state.as_path()],
                 1_005,
             )
             .unwrap_err()
@@ -3089,10 +3136,171 @@ mod tests {
             .collect();
         assert!(
             !matches!(
-                classify(&allowed_argv, &cwd, &[], &[dir.path()]),
+                classify(&allowed_argv, &cwd, &[], &[state.as_path()]),
                 Class::Never { .. }
             ),
             "issue show with --wake-timeout must not be Class::Never"
         );
+    }
+
+    #[test]
+    fn worker_state_dir_cwd_rhs_symlink_and_loop_are_never() {
+        let dir = tmp();
+        let state = dir.path().join("state");
+        let master_cwd = state.join("master/cwd");
+        let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&master_cwd).unwrap();
+        fs::create_dir_all(&pm).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let state_canon = fs::canonicalize(&state).unwrap();
+        let master_cwd_canon = fs::canonicalize(&master_cwd).unwrap();
+        let repo_cwd = fs::canonicalize(&repo).unwrap();
+        fs::write(state_canon.join("cadence.sqlite3"), "sqlite").unwrap();
+        std::os::unix::fs::symlink(&state_canon, repo_cwd.join("st")).unwrap();
+        std::os::unix::fs::symlink(repo_cwd.join("loop_b"), repo_cwd.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink(repo_cwd.join("loop_a"), repo_cwd.join("loop_b")).unwrap();
+
+        let state_db = state_canon.join("cadence.sqlite3");
+        let rules = vec![
+            Rule {
+                id: "wr-state-cwd".into(),
+                effect: Effect::Allow,
+                scope: Scope::Exact,
+                argv: vec!["cat".into(), "cadence.sqlite3".into()],
+                tail: vec![],
+                cwd: state_canon.to_string_lossy().into_owned(),
+                by: "operator".into(),
+                at: 100,
+            },
+            Rule {
+                id: "wr-master-cwd".into(),
+                effect: Effect::Allow,
+                scope: Scope::Exact,
+                argv: vec!["cat".into(), "cadence.sqlite3".into()],
+                tail: vec![],
+                cwd: master_cwd_canon.to_string_lossy().into_owned(),
+                by: "operator".into(),
+                at: 101,
+            },
+            Rule {
+                id: "wr-rhs-dd".into(),
+                effect: Effect::Allow,
+                scope: Scope::Exact,
+                argv: vec![
+                    "dd".into(),
+                    format!("if={}", state_db.display()),
+                    "of=/tmp/out".into(),
+                ],
+                tail: vec![],
+                cwd: repo_cwd.to_string_lossy().into_owned(),
+                by: "operator".into(),
+                at: 102,
+            },
+            Rule {
+                id: "wr-sym-st".into(),
+                effect: Effect::Allow,
+                scope: Scope::Exact,
+                argv: vec!["cat".into(), "st/cadence.sqlite3".into()],
+                tail: vec![],
+                cwd: repo_cwd.to_string_lossy().into_owned(),
+                by: "operator".into(),
+                at: 103,
+            },
+        ];
+        write_rules(&pm, "w1", &rules).unwrap();
+        assert!(
+            live_rules(&pm, "w1", &[state_canon.as_path()])
+                .unwrap()
+                .is_empty(),
+            "worker allow rules touching state_dir via cwd, =rhs, or symlink must not be live"
+        );
+
+        for (bad_cwd, cmd) in [
+            (&state_canon, "cat cadence.sqlite3".to_string()),
+            (&master_cwd_canon, "cat cadence.sqlite3".to_string()),
+            (
+                &repo_cwd,
+                format!("dd if={} of=/tmp/out", state_db.display()),
+            ),
+            (
+                &repo_cwd,
+                format!("cadence --db={} status", state_db.display()),
+            ),
+            (&repo_cwd, "cat st/cadence.sqlite3".to_string()),
+            (&repo_cwd, "cat loop_a".to_string()),
+        ] {
+            let err = evaluate_worker(
+                &state_canon,
+                Some(pm.as_path()),
+                "w1",
+                "h-state-bash",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                &cmd,
+                bad_cwd,
+                &[state_canon.as_path()],
+                1_010,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("never requestable"),
+                "cwd={} cmd={cmd}: {err}",
+                bad_cwd.display()
+            );
+        }
+
+        for target in ["st/cadence.sqlite3", "loop_a"] {
+            let err = evaluate_worker(
+                &state_canon,
+                Some(pm.as_path()),
+                "w1",
+                "h-state-write",
+                "Write",
+                &serde_json::json!({"file_path": target, "content": "x"}),
+                target,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_011,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("never requestable"), "{target}: {err}");
+        }
+
+        let mut doc = Doc::default();
+        doc.requests.push(Request {
+            id: "mp-state-cwd".into(),
+            argv: vec!["cat".into(), "cadence.sqlite3".into()],
+            cwd: state_canon.to_string_lossy().into_owned(),
+            reason: "planted".into(),
+            requested_by: "w1".into(),
+            created: 1_000,
+            expires_at: 1_000 + TTL_SECS,
+            status: "pending".into(),
+            risk: Risk::High,
+            decision: String::new(),
+            decision_label: String::new(),
+        });
+        save_doc(&state_canon, &doc).unwrap();
+        allow_once(
+            &state_canon,
+            "mp-state-cwd",
+            &[],
+            &[state_canon.as_path()],
+            1_012,
+        )
+        .expect_err("allow_once must refuse worker request whose cwd is state_dir");
+        always_rule(
+            &state_canon,
+            "mp-state-cwd",
+            Scope::Exact,
+            &[],
+            &[],
+            &[state_canon.as_path()],
+            1_012,
+        )
+        .expect_err("always_rule must refuse worker request whose cwd is state_dir");
     }
 }

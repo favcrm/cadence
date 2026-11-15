@@ -270,6 +270,18 @@ fn request_open_bash(alias: &str, handle: &str, command: &str) -> Value {
     })
 }
 
+fn request_open_bash_in(alias: &str, handle: &str, command: &str, cwd: &Path) -> Value {
+    json!({
+        "alias": alias,
+        "kind": "approval",
+        "tool": "Bash",
+        "request": handle,
+        "input_summary": command,
+        "input": { "command": command },
+        "cwd": cwd,
+    })
+}
+
 fn request_open_write(alias: &str, handle: &str, file_path: &str, content: &str) -> Value {
     json!({
         "alias": alias,
@@ -865,6 +877,172 @@ fn worker_class_never_targets_are_refused_even_with_planted_allow_rules() {
     assert!(
         fx.pending_requests_for("w1").is_empty(),
         "refused Class::Never requests must never park pending entries"
+    );
+}
+
+#[test]
+fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
+    let fx = Fixture::new("c616bypass");
+    let w1 = fx.enroll_managed("w1", "worker", true);
+
+    // Prepare state_dir artifacts and master/cwd for Vector 1 & Vector 3.
+    let state_target = fx.state_dir.join("cadence.sqlite3");
+    fs::write(&state_target, b"sqlite-stub").unwrap();
+    let master_cwd = fx.state_dir.join("master/cwd");
+    fs::create_dir_all(&master_cwd).unwrap();
+
+    // Vector 3: relative symlink inside fx.repo_dir pointing to fx.state_dir.
+    std::os::unix::fs::symlink(Path::new("../state"), fx.repo_dir.join("st")).unwrap();
+    assert_eq!(
+        fs::canonicalize(fx.repo_dir.join("st/cadence.sqlite3")).unwrap(),
+        fs::canonicalize(&state_target).unwrap(),
+        "test fixture relative symlink st must resolve to state_dir/cadence.sqlite3"
+    );
+
+    // Vector 4: self-referential >40-hop symlink loop inside fx.repo_dir.
+    std::os::unix::fs::symlink("loop_b", fx.repo_dir.join("loop_a")).unwrap();
+    std::os::unix::fs::symlink("loop_a", fx.repo_dir.join("loop_b")).unwrap();
+
+    // Commands for Vector 2 (`=rhs` Bash arguments targeting fx.state_dir).
+    let dd_cmd = format!("dd if={} of=/tmp/out", state_target.display());
+    let dd_argv = vec![
+        "dd".into(),
+        format!("if={}", state_target.display()),
+        "of=/tmp/out".into(),
+    ];
+    let cadence_db_cmd = format!("cadence --db={} status", state_target.display());
+    let cadence_db_argv = vec![
+        "cadence".into(),
+        format!("--db={}", state_target.display()),
+        "status".into(),
+    ];
+
+    // Plant matching Exact Allow rules in agents/w1/permissions.yaml for every bypass vector.
+    let state_canon = fs::canonicalize(&fx.state_dir).unwrap();
+    let master_cwd_canon = fs::canonicalize(&master_cwd).unwrap();
+    let mut rules = vec![
+        exact_allow_rule(
+            "allow-cwd-state-dir",
+            vec!["cat".into(), "cadence.sqlite3".into()],
+            &fx.state_dir,
+        ),
+        exact_allow_rule(
+            "allow-cwd-master-cwd",
+            vec!["cat".into(), "cadence.sqlite3".into()],
+            &master_cwd,
+        ),
+        exact_allow_rule("allow-dd-eq-state", dd_argv, &fx.repo_dir),
+        exact_allow_rule("allow-cadence-db-eq-state", cadence_db_argv, &fx.repo_dir),
+        exact_allow_rule(
+            "allow-rel-symlink-state",
+            vec!["cat".into(), "st/cadence.sqlite3".into()],
+            &fx.repo_dir,
+        ),
+        exact_allow_rule(
+            "allow-loop-bash",
+            vec!["cat".into(), "./loop_a".into()],
+            &fx.repo_dir,
+        ),
+        exact_allow_rule(
+            "allow-loop-write",
+            vec!["Write".into(), "loop_a".into()],
+            &fx.repo_dir,
+        ),
+    ];
+    if state_canon != fx.state_dir {
+        rules.push(exact_allow_rule(
+            "allow-cwd-state-dir-canon",
+            vec!["cat".into(), "cadence.sqlite3".into()],
+            &state_canon,
+        ));
+    }
+    if master_cwd_canon != master_cwd {
+        rules.push(exact_allow_rule(
+            "allow-cwd-master-cwd-canon",
+            vec!["cat".into(), "cadence.sqlite3".into()],
+            &master_cwd_canon,
+        ));
+    }
+    master_perm::write_rules(&fx.pm_dir, "w1", &rules).unwrap();
+
+    // 1. Caller-supplied "cwd" inside state_dir / state_dir/master/cwd with relative Bash command.
+    for (idx, (label, cwd)) in [
+        ("state_dir", fx.state_dir.as_path()),
+        ("state_dir/master/cwd", master_cwd.as_path()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash_in(
+                "w1",
+                &format!("perm-bypass-cwd-{idx}"),
+                "cat cadence.sqlite3",
+                cwd,
+            ),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "caller-supplied cwd '{label}' must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+
+    // 2. `=rhs` Bash arguments targeting fx.state_dir from fx.repo_dir.
+    for (idx, (label, cmd)) in [
+        ("dd if=<state_dir>", dd_cmd.as_str()),
+        ("cadence --db=<state_dir>", cadence_db_cmd.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-bypass-eq-{idx}"), cmd),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "=rhs Bash vector '{label}' ({cmd}) must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+
+    // 3. Relative symlink st -> ../state inside fx.repo_dir.
+    let res_sym = fx.dispatch(
+        "request_open",
+        request_open_bash("w1", "perm-bypass-rel-sym", "cat st/cadence.sqlite3"),
+        w1.pid(),
+    );
+    assert!(
+        res_sym.is_err(),
+        "relative symlink st -> state_dir must be refused immediately even with planted allow rule, got: {res_sym:?}"
+    );
+
+    // 4. Self-referential >40-hop symlink loop (loop_a <-> loop_b) via Bash and Write.
+    let res_loop_bash = fx.dispatch(
+        "request_open",
+        request_open_bash("w1", "perm-bypass-loop-bash", "cat ./loop_a"),
+        w1.pid(),
+    );
+    assert!(
+        res_loop_bash.is_err(),
+        "symlink loop Bash 'cat ./loop_a' must fail closed immediately, got: {res_loop_bash:?}"
+    );
+
+    let res_loop_write = fx.dispatch(
+        "request_open",
+        request_open_write("w1", "perm-bypass-loop-write", "loop_a", "x"),
+        w1.pid(),
+    );
+    assert!(
+        res_loop_write.is_err(),
+        "symlink loop Write 'loop_a' must fail closed immediately, got: {res_loop_write:?}"
+    );
+
+    assert!(
+        fx.pending_requests_for("w1").is_empty(),
+        "refused bypass vectors must never park pending entries"
     );
 }
 
