@@ -9,7 +9,7 @@
  * with the ui tests' compiler options, then runs it as
  * `node validate.js <fixtures-dir> <viewer-url>`.
  */
-import { kickoffBlock, writeBlock } from "../../src/features/auth/gate";
+import { kickoffBlock, sessionAdmissible, writeBlock } from "../../src/features/auth/gate";
 import { mutatePersonalProfile, readPersonalBootstrap, readPersonalIdentity } from "../../src/features/assistant/identity";
 import { parseBrowserRead, readBrowser, stopBrowser, viewBrowser } from "../../src/features/canvas/browserClient";
 import { canApprove, canArchive, canEditTypes, canRestore, documentsViewer, typeFor } from "../../src/features/documents/documentsAccess";
@@ -61,8 +61,9 @@ export type DocumentWrite = (typeof DOCUMENT_WRITES)[number];
 
 /**
  * Who the fixture session is. `member` (the default) serves meta exactly as
- * the fixture has it. `owner` serves the roster's owner as the workspace owner
- * (`operator: true`, role `owner`), for the owner's document flows.
+ * the fixture has it. `owner` serves the roster's owner as the hosted board
+ * serves a workspace owner (`operator: true`, session role `operator`), for
+ * the owner's document flows.
  */
 export const VIEWER_PRESETS = ["member", "owner"] as const;
 export type ViewerPreset = (typeof VIEWER_PRESETS)[number];
@@ -105,8 +106,11 @@ export function boardMeta(fx: Fixtures, presets: BoardPresets): unknown {
   let out: Record<string, unknown> = meta;
   if (presets.viewer === "owner") {
     const owner = roster(fx).find((row) => row.role === "owner");
-    const user = { ...meta.session.user, sub: owner?.userId, name: owner?.name, email: owner?.email, handle: owner?.email?.split("@")[0], role: "owner" };
-    out = { ...meta, actor: owner?.name, operator: true, session: { ...meta.session, user } };
+    // As read-api.ts answers a workspace owner: the session role is `operator`
+    // (the wire has only operator and member) and the actor is `users/<handle>`.
+    const handle = owner?.email?.split("@")[0];
+    const user = { ...meta.session.user, sub: owner?.userId, name: owner?.name, email: owner?.email, handle, role: "operator" };
+    out = { ...meta, actor: `users/${handle}`, operator: true, session: { ...meta.session, user } };
   }
   if (presets.settings === "native") return out;
   const sections = HOSTED_SECTIONS[presets.viewer];
@@ -644,6 +648,8 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
         const served = boardMeta(fx, { viewer, settings, probe, refusals: [] }) as Meta;
         const named = `viewer ${viewer}, settings ${settings}, documents ${probe}`;
         if (writeBlock(served) !== null) fail("meta", `${named}: writeBlock refused it`);
+        // The shell's own admission: a hosted session's role is exactly operator or member.
+        if (served.signed_in === true && !sessionAdmissible(served.session)) fail("meta", `${named}: AuthBoundary would not admit the session`);
         // The member reads as a member (member chat stays); the owner as the operator.
         if ((kickoffBlock(served) === null) !== (viewer === "owner")) fail("meta", `${named}: kickoffBlock reads the wrong viewer`);
         const offered = settingsRedirect("documents", served) === null;

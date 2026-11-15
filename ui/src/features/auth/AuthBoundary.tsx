@@ -11,7 +11,7 @@ import ThemeToggle from "../../ui/ThemeToggle";
 import LocalLanguage from "../../ui/LocalLanguage";
 import DeviceSignIn from "./DeviceSignIn";
 import Login from "./Login";
-import { SIGN_IN_COMMAND } from "./gate";
+import { SIGN_IN_COMMAND, sessionAdmissible } from "./gate";
 import { hostedOrigin } from "./hosted";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
@@ -109,16 +109,7 @@ export default function AuthBoundary({ children }: {
       if (!current()) return false;
       const hosted = meta.hosted === true || meta.session?.origin === "public";
       const session = meta.session;
-      const sessionValid = session !== null && session !== undefined
-        && typeof session.id === "string" && session.id.trim().length > 0
-        && ["loopback", "tailnet", "public"].includes(session.origin)
-        && Number.isFinite(session.created)
-        && Number.isFinite(session.idle_expires_at)
-        && Number.isFinite(session.expires_at)
-        && (session.origin !== "public" || (
-          typeof session.user?.sub === "string" && session.user.sub.trim().length > 0
-          && (session.user.role === "operator" || session.user.role === "member")
-        ));
+      const sessionValid = sessionAdmissible(session);
       // A claimed sign-in without its verified identity is unanswered, not
       // authority. Explicit anonymous policy cannot rescue malformed identity.
       if (meta.signed_in === true && !sessionValid) {
