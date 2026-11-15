@@ -4,7 +4,7 @@
 //! its Home conversation: the turn is resolved from the proven caller
 //! exactly as `hire_propose` resolves it, and every other caller (any other
 //! agent, a stale or replayed turn, the operator CLI) is refused. The form
-//! is checked against the pilot catalog (`crate::agent_form`) before
+//! is checked against the pilot catalog (`cadence_core::agent_form`) before
 //! anything is written; then ONE inert `surface` thread entry records it,
 //! with the daemon's own fallback text. The operator's answer is an
 //! ordinary chat message - the form grants nothing.
@@ -27,7 +27,7 @@ impl Shared {
         }
         let (_alias, message) =
             self.master_live_turn("master ask-form", "asks with forms", peer_pid)?;
-        let form = crate::agent_form::check(required_field(params, "form")?)?;
+        let form = cadence_core::agent_form::check(required_field(params, "form")?)?;
         let master = self.store.agent(crate::master::ALIAS)?;
         let thread = self
             .store
