@@ -90,9 +90,21 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// tables; v60 (CAD-1085) adds the connection-dispatch ledger tables; v61
 /// (CAD-1962) adds the imported-media custody tables; v62 (CAD-2042) adds the
 /// retained-source scope columns and page index plus a migration-progress
-/// table; v63 (CAD-1857) adds `agent_endpoints`. None changes a latch or
-/// witness table, so the bound extends to 63.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 63;
+/// table; v63 (CAD-1857) adds `agent_endpoints`. v64 (CAD-2215) adds the
+/// `assist_request_queue` table and an index on `assist_requests(job)`; v65
+/// adds `app_member_grants`; v66 adds the nullable
+/// `connection_metadata.cursor_keyring_fingerprint`; v67 adds and backfills
+/// `app_member_grants.authorization_epoch`. None changes a latch or witness
+/// table or adds a trigger, so the bound extends to 67 (CAD-2310).
+///
+/// It stays a reviewed literal rather than `rollout::SCHEMA_VERSION`, so a
+/// migration that does touch a latch or witness table is never accepted
+/// unread; the assertion below fails the build when the two part.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 67;
+const _: () = assert!(
+    PROTECTED_SCHEMA_MAX == crate::rollout::SCHEMA_VERSION,
+    "review the new migrations for latch/witness tables, then raise PROTECTED_SCHEMA_MAX"
+);
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
