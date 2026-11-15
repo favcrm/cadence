@@ -54,3 +54,8 @@ boundary. The screen-ui packaging script includes that file and hashes it in
 both source provenance and the archive inventory. Consumers of older pinned
 archives should consult the source guide until they adopt a release containing
 it; adding the guide does not silently upgrade an installed package.
+
+For integrated authoring guidance combining `@cadence/app-kit`,
+`@cadence/screen-ui`, manifests, and `cadence app` validation, see the bundled
+[`cadence-app-dev`](../../skills/cadence-app-dev/SKILL.md) skill
+(`cadence skill install cadence-app-dev`).
