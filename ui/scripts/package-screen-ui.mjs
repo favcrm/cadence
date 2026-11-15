@@ -50,7 +50,12 @@ const { default: tailwind } = await import(pathToFileURL(requireTool.resolve("@t
 
 // Closed source allowlist, including type-only edges. New imports require audit here.
 const allowed = new Set([
-  "screen-ui/src/index.ts", "screen-ui/src/navigation.tsx",
+  "screen-ui/src/index.ts",
+  "screen-ui/src/navigation.tsx",
+  "screen-ui/src/StatusPill.tsx",
+  "screen-ui/src/FilterBar.tsx",
+  "screen-ui/src/StagedApprovalBanner.tsx",
+  "screen-ui/src/localeBridge.tsx",
   ...["DataTable", "Field", "Detail", "DrawerShell", "States", "ConfirmDialog"].map((name) => `src/features/app-shell/shared/${name}.tsx`),
   "src/features/app-shell/shared/useDrawerClose.ts", "src/features/app-shell/shared/hostErrors.ts",
   ...["Button", "Link", "Select", "icons"].map((name) => `src/ui/${name}.tsx`),

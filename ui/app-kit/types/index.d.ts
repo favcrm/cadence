@@ -261,6 +261,7 @@ export interface ScreenBridgeOptions<
   pushKeys?: readonly string[];
   maxInFlight?: number;
   timeoutMs?: number;
+  sandboxForms?: boolean;
   createError?: (message: string, status: number, options?: { code?: string }) => Err;
 }
 
@@ -373,6 +374,7 @@ export declare const ROUTABLE_ID: RegExp;
 export declare const ROUTE_RECORD_ID: RegExp;
 
 export declare function readRefusal(value: unknown): { code: string; text: string } | null;
+export declare function installSandboxFormActions(doc?: unknown): () => void;
 export declare function validateBoot(value: unknown, expectedTag?: string): ScreenBoot;
 export declare function readBoot(documentRef?: unknown, expectedTag?: string): ScreenBoot;
 export declare function createScreenReceiver(options: ScreenReceiverOptions): ScreenReceiver;

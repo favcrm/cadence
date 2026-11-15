@@ -220,6 +220,30 @@ protocol violation calls `onError` and closes the port.
 2. Keep `cadence app check` (not a local copy) in CI.
 3. Keep the app's build and bundler: this package does not build screens.
 
+## Forms in Sandboxed Screens
+
+`installSandboxFormActions(doc)` is idempotent per `Document` (reference-counted across installers) and handles actionless `<form>` submissions inside `<iframe sandbox="allow-scripts">` (where `allow-forms` is omitted and Chromium otherwise aborts `<button type="submit">` / `Enter` submissions before firing `"submit"`). It intercepts actionless submit-button clicks and single-line `<input>` `Enter` keydowns (respecting `disabled`, `<fieldset disabled>`, `form="..."`, `action`, `formaction`, and constraint validation), calls `preventDefault()`, and dispatches a cancelable `"submit"` event so React `onSubmit` handlers run normally, while also calling `preventDefault()` during capture-phase `"submit"` to block accidental iframe navigation in permissive hosts. Passing `sandboxForms: true` to `createScreenBridge(...)` installs it automatically and cleans it up on `retire()` or `reset()`.
+
+## React 19 Bindings (`@cadence/app-kit/react`)
+
+- `useScreenBridge(bridge)` subscribes with `useSyncExternalStore` and returns
+  the current `ScreenBridgeState`.
+- `useScreenSelector(bridge, selector, isEqual?)` memoizes selected slices per
+  `(state, selector)` and preserves reference identity when `isEqual` holds.
+- `useScreenStatus(bridge)` returns `{ status, error, ready, isLoading, isError }`
+  with shallow equality stability.
+- `createFrameNavigationAdapter(bridge, options?)` adapts `NavigationProvider`
+  link activations into `bridge.patchRoute(...)` calls.
+
+## Non-Fatal Host 403 Refusals
+
+Only mount revocation refusals (`"This app's access is no longer available."`
+or non-slot/non-`owner_required` permission errors on the initial mount push)
+transition the bridge to `"error"`. Host `403` refusals for write actions,
+slot limits, or `owner_required` gates reject the returned promise
+(`ScreenRefusalError` with `.status === 403`) while keeping the bridge mounted
+and interactive.
+
 ## Tests
 
 ```sh

@@ -9,6 +9,35 @@ export const object = (v: unknown): v is Record<string, unknown> => !!v && typeo
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
 const WRITES = new Set(["records.create", "records.update", "records.batch", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard", "campaign-work.save", "sends.cancel"]);
+const SLOTS = new Set<string>(RECORD_SLOT_VERBS);
+const MOUNT_REVOKED_CODES = new Set(["screen_access_denied", "origin_refused", "board_session_required", "unauthorized"]);
+const MOUNT_REVOKED_MESSAGES = new Set([
+  "screen service access unavailable",
+  "screen service requires live operator session",
+]);
+
+function serverErrorCode(value: unknown): string | undefined {
+  if (!object(value)) return undefined;
+  if (typeof value.code === "string" && value.code.trim()) return value.code.trim();
+  if (object(value.error) && typeof value.error.code === "string" && value.error.code.trim()) return value.error.code.trim();
+  return undefined;
+}
+
+function serverErrorText(value: unknown): string | null {
+  if (!object(value)) return null;
+  if (typeof value.error === "string" && value.error.trim()) return value.error.trim();
+  if (object(value.error) && typeof value.error.message === "string" && value.error.message.trim()) return value.error.message.trim();
+  if (typeof value.text === "string" && value.text.trim()) return value.text.trim();
+  if (typeof value.message === "string" && value.message.trim()) return value.message.trim();
+  return null;
+}
+
+function isNonFatalWriteForbidden(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): error is ApiError {
+  if (!(error instanceof ApiError) || error.status !== 403) return false;
+  if (error.code && MOUNT_REVOKED_CODES.has(error.code)) return false;
+  if (MOUNT_REVOKED_MESSAGES.has(error.message.trim().toLowerCase())) return false;
+  return error.code === "owner_required" || (operation !== undefined && (WRITES.has(operation) || SLOTS.has(operation)));
+}
 const SECRET_FIELDS = new Set(["action_token", "confirmation_token", "confirmation_nonce", "confirm_token", "csv_confirm_token", "scope_proof", "password", "credentials", "credential", "secret", "session_key", "host_command"]);
 /** Service-only DTO projection. Private CSV delegation stays in this closure. */
 function sanitized(value: unknown): unknown {
@@ -43,6 +72,11 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   if (operation?.startsWith("campaign-work.") && status === 409 && error instanceof ApiError && error.code === "stale_revision")
     return { code: "stale_revision", text: "These campaign work details changed. Reload them before saving again." };
   if (operation === "sends.approve" && error instanceof ApiError && error.code === "no_recipients") return { code: "no_recipients", text: "No one in this audience can be emailed." };
+  if (status === 403 && isNonFatalWriteForbidden(error, operation)) {
+    return error.code === "owner_required"
+      ? { code: "owner_required", text: "Only a workspace owner can perform this action." }
+      : { code: "forbidden", text: "This screen is read-only; write actions are not permitted." };
+  }
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -70,12 +104,23 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (new TextEncoder().encode(text).byteLength > 1048576) throw new ApiError("Reply exceeds budget", 502);
     let value: unknown;
     try { value = JSON.parse(text); } catch { throw new ApiError("Invalid service reply", 502); }
-    if (!response.ok) throw new ApiError("Service refused", response.status, object(value) && typeof value.code === "string" ? { code: value.code } : undefined);
+    if (!response.ok) {
+      const code = serverErrorCode(value);
+      throw new ApiError(serverErrorText(value) ?? "Service refused", response.status, code ? { code } : undefined);
+    }
     return value;
   }
   function failed(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
     csv.clear();
-    if (current() && error instanceof ApiError && [401, 403].includes(error.status)) { retired = true; purgeDisplayCache(); host.refused(); }
+    if (
+      current() &&
+      error instanceof ApiError &&
+      (error.status === 401 || (error.status === 403 && !isNonFatalWriteForbidden(error, operation)))
+    ) {
+      retired = true;
+      purgeDisplayCache();
+      host.refused();
+    }
     return refusal(error, operation);
   }
   function deliver(raw: unknown, executeCommand = true): unknown {

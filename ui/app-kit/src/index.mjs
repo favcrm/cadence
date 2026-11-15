@@ -25,3 +25,4 @@ export {
   ScreenTimeoutError,
   readRefusal,
 } from "./refusal.mjs";
+export { installSandboxFormActions } from "./forms.mjs";
