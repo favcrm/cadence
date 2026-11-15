@@ -5,11 +5,7 @@ import { subscribeMasterChanged } from "../../lib/masterChanged";
 import Link from "../../ui/Link";
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import PermissionCard, { cardFromRequest, publishPermission, subscribePermission } from "./PermissionCard";
-
-// Quotes preserve argument boundaries. Display only — never executed as shell syntax.
-const formatArgument = (value: string) => (/^[\w./:@=+*-]+$/.test(value) ? value : JSON.stringify(value));
-const formatRuleCommand = (rule: MasterPermissionRule) =>
-  [...rule.argv, ...(rule.scope === "prefix" ? rule.tail : [])].map(formatArgument).join(" ");
+import { cleanPermissionInline, formatRuleCommand } from "./permissionFormat";
 
 /**
  * Interactive `/permissions` slash card (CAD-2318): lists pending approval
@@ -88,6 +84,15 @@ export default function PermissionsSlashCard({
       })
       .catch((error: unknown) => {
         if (!alive.current) return;
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          // Clear protected data immediately when operator auth is lost; set readError
+          // since actionError only renders inside the {data !== null} block.
+          setData(null);
+          setConfirmId(null);
+          setActionError(null);
+          setReadError(error.message);
+          return;
+        }
         setActionError(error instanceof ApiError ? error.message : String(error));
       })
       .finally(() => {
@@ -125,9 +130,15 @@ export default function PermissionsSlashCard({
               >
                 <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                   <span className="chip bg-ink-800 text-ink-300 shrink-0">{t(req.risk)}</span>
-                  <code className="num text-micro text-ink-200 break-all min-w-0">{req.command}</code>
+                  <code className="num text-micro text-ink-200 break-all min-w-0">
+                    <bdi>{cleanPermissionInline(req.command)}</bdi>
+                  </code>
                 </div>
-                {req.cwd && <p className="text-micro text-ink-500 break-all">{req.cwd}</p>}
+                {req.cwd && (
+                  <p className="text-micro text-ink-500 break-all">
+                    <bdi>{cleanPermissionInline(req.cwd)}</bdi>
+                  </p>
+                )}
                 <PermissionCard
                   card={cardFromRequest(req)}
                   readOnly={blocked}
@@ -191,9 +202,11 @@ export default function PermissionsSlashCard({
                         </span>
                         <span className="text-ink-400">{scopeText}</span>
                       </div>
-                      <code className="block num text-micro text-ink-200 break-all">{formatRuleCommand(rule)}</code>
+                      <code className="block num text-micro text-ink-200 break-all">
+                        <bdi>{formatRuleCommand(rule)}</bdi>
+                      </code>
                       <p className="text-micro text-ink-500 break-all">
-                        {rule.cwd || t("Not recorded")}
+                        {rule.cwd ? <bdi>{cleanPermissionInline(rule.cwd)}</bdi> : t("Not recorded")}
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-1.5 shrink-0">

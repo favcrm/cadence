@@ -13,6 +13,7 @@ import { IconChevron, IconRefresh, IconSearch } from "../../ui/icons";
 import { useWriteBlock } from "../auth/WriteGate";
 import "./permissions.css";
 import { useTranslate } from "../../lib/locale";
+import { cleanPermissionInline, formatRuleCommand } from "../home/permissionFormat";
 
 type Viewer = {
   operator: boolean | null;
@@ -23,13 +24,6 @@ type Viewer = {
 };
 const errorText = (error: unknown) =>
   error instanceof ApiError ? error.message : String(error);
-// Quotes preserve argument boundaries. This is a display, never an executable shell command.
-const argument = (value: string) =>
-  /^[\w./:@=+*-]+$/.test(value) ? value : JSON.stringify(value);
-const command = (rule: MasterPermissionRule) =>
-  [...rule.argv, ...(rule.scope === "prefix" ? rule.tail : [])]
-    .map(argument)
-    .join(" ");
 const scopeLabel = (rule: MasterPermissionRule) =>
   rule.scope === "exact" ? "Exact command" : "Argument pattern";
 function savedDate(at: number) {
@@ -105,12 +99,12 @@ function RuleRow({
           </span>
           <span>{t(scopeLabel(rule))}</span>
         </div>
-        <code className="permission-command">{command(rule)}</code>
+        <code className="permission-command"><bdi>{formatRuleCommand(rule)}</bdi></code>
         <p className="permission-folder">
-          <span>{t("Working folder")}</span> <code>{rule.cwd || t("Not recorded")}</code>
+          <span>{t("Working folder")}</span> <code>{rule.cwd ? <bdi>{cleanPermissionInline(rule.cwd)}</bdi> : t("Not recorded")}</code>
         </p>
         <div className="permission-provenance">
-          <span>{t("Saved by {by}").replace("{by}", () => String(rule.by || t("Not recorded")))}</span>
+          <span>{t("Saved by {by}").replace("{by}", () => String(cleanPermissionInline(rule.by) || t("Not recorded")))}</span>
           {date ? (
             <time dateTime={date.toISOString()} title={date.toISOString()}>
               {date.toLocaleDateString(undefined, {
@@ -131,7 +125,7 @@ function RuleRow({
               <div>
                 <dt>{t("Rule ID")}</dt>
                 <dd>
-                  <code>{rule.id}</code>
+                  <code><bdi>{cleanPermissionInline(rule.id)}</bdi></code>
                 </dd>
               </div>
               <div>

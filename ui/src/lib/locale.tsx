@@ -2074,7 +2074,8 @@ Object.assign(zhTW, {
   "Earlier entries could not be loaded.": "無法載入更早的記錄。",
 });
 
-// CAD-2318: in-chat TUI-style permission approvals and /permissions slash card.
+// CAD-2318 & CAD-2319: in-chat TUI-style permission approvals, /permissions slash card,
+// slash command blurbs, TurnBar states, PermissionCard labels, and composer hint.
 Object.assign(zhTW, {
   "Pending permission requests and saved rules": "待審核的權限請求與已儲存的規則",
   "Reject & reply…": "拒絕並回覆…",
@@ -2086,6 +2087,29 @@ Object.assign(zhTW, {
   "low": "低",
   "medium": "中",
   "high": "高",
+  "What the / commands do": "查看各個 / 指令的用途",
+  "Session state — model, effort, session id": "工作階段狀態 — 模型、思考強度與工作階段編號",
+  "Context usage — how much of the window is in use": "脈絡用量 — 目前已使用的脈絡視窗比例",
+  "Models the provider offers": "供應商提供的模型清單",
+  "Set the model (bare: the provider's list)": "設定模型（不帶參數則列出可用模型）",
+  "Thinking levels the provider offers": "供應商提供的思考強度等級",
+  "Set the thinking level (bare: levels + current)": "設定思考強度（不帶參數則顯示可用等級與目前設定）",
+  "Compact the session context now": "立即壓縮工作階段脈絡",
+  "Start fresh — the assistant stops using the messages so far": "重新開始 — 助理不再沿用此前的對話訊息",
+  "Interrupt the running turn": "中斷正在執行的回合",
+  "act": "執行",
+  "Sending": "傳送中",
+  "last known": "最後已知狀態",
+  "paused": "已暫停",
+  "partial answer kept": "已保留部分回覆",
+  "Master says:": "主助理說明：",
+  "Master's full reason": "主助理完整說明",
+  "…more": "…展開更多",
+  "Allowed once": "僅此次允許",
+  "Always: this command": "永久允許：此指令",
+  "Always: prefix": "永久允許：前綴",
+  "Rejected — won't ask again": "已拒絕 — 不再詢問",
+  "Enter to send · Shift+Enter for a new line": "按 Enter 傳送 · Shift+Enter 換行",
 });
 
 // CAD-2268: generic unsaved-changes leave confirmation for installed app screens.

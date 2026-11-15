@@ -82,6 +82,7 @@ async function main() {
   }
   const calls: RecordedCall[] = [];
   let permGetMode: "ok" | "403" = "ok";
+  let permPostStatus: 200 | 401 | 403 = 200;
 
   const makeReq = (id = "perm-1", command = "git push origin feat", prefix: string[] | null = ["git", "push"]) => ({
     id,
@@ -148,6 +149,12 @@ async function main() {
       }
 
       if (method === "POST" && path.startsWith("/api/master/permissions/")) {
+        if (permPostStatus !== 200) {
+          return new Response(JSON.stringify({ error: "Operator auth required" }), {
+            status: permPostStatus,
+            headers: { "content-type": "application/json" },
+          });
+        }
         return new Response(JSON.stringify({ ok: true }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -163,11 +170,14 @@ async function main() {
   const { TurnBar } = require("../src/features/app-shell/chat/TurnBar") as typeof import("../src/features/app-shell/chat/TurnBar");
   const {
     default: PermissionCard,
+    PermissionEnabledContext,
     PermissionReplyContext,
+    ThreadPermission,
     appendRejectReplyDraft,
     cardFromRequest,
     publishPermission,
     rejectReplyPrompt,
+    subscribePermission,
   } = require("../src/features/home/PermissionCard") as typeof import("../src/features/home/PermissionCard");
   const PermissionsSlashCard = (
     require("../src/features/home/PermissionsSlashCard") as typeof import("../src/features/home/PermissionsSlashCard")
@@ -562,6 +572,112 @@ async function main() {
   );
   const gatedRevoke = host.querySelector<HTMLButtonElement>("[data-permission-revoke='rule-1']");
   assert(gatedRevoke !== null && gatedRevoke.disabled, "WriteGate disables Revoke button");
+
+  // ---- 6. CAD-2319: confirmRevoke POST 403 clears cached rules & confirm state ----
+  permGetMode = "ok";
+  permPostStatus = 200;
+  await render(
+    React.createElement(PermissionsSlashCard, {
+      readOnly: false,
+      permissionsHref: "/settings#master-permissions",
+    }),
+  );
+  assert(host.querySelector("[data-permission-rule='rule-1']") !== null, "rules loaded before POST 403 check");
+  await React.act(async () => { host.querySelector<HTMLButtonElement>("[data-permission-revoke='rule-1']")!.click(); });
+  assert(host.querySelector("[data-permission-confirm-revoke='rule-1']") !== null, "confirm armed before POST 403 check");
+  permPostStatus = 403;
+  await React.act(async () => { host.querySelector<HTMLButtonElement>("[data-permission-confirm-revoke='rule-1']")!.click(); });
+  await settle();
+  assert(host.querySelectorAll("[data-permission-rule]").length === 0, "confirmRevoke 403 clears cached saved rules");
+  assert(host.querySelectorAll("[data-permissions-pending]").length === 0, "confirmRevoke 403 clears cached pending items");
+  assert(host.querySelector("[data-permission-confirm-revoke]") === null, "confirmRevoke 403 clears confirmId");
+  assert(host.querySelector("[role='alert']")?.textContent?.includes("Operator auth required"), "confirmRevoke 403 keeps error alert visible");
+
+  // ---- 7. CAD-2319: TurnBar runDecision 401/403 closes menus & notifies permission listeners ----
+  permPostStatus = 200;
+  await renderTurnBar({ id: "perm-auth", readOnly: false });
+  await React.act(async () => { host.querySelector<HTMLButtonElement>("[data-turn-always-toggle]")!.click(); });
+  assert(host.querySelector("[data-turn-always-menu]") !== null, "Always menu open before 401 test");
+  let publishedOnAuthLoss = 0;
+  const offPerm = subscribePermission(() => { publishedOnAuthLoss += 1; });
+  permPostStatus = 401;
+  await React.act(async () => { host.querySelector<HTMLButtonElement>("[data-turn-always-exact]")!.click(); });
+  await settle();
+  offPerm();
+  permPostStatus = 200;
+  assert(publishedOnAuthLoss >= 1, "TurnBar POST 401 calls publishPermission immediately");
+  assert(host.querySelector("[data-turn-always-menu]") === null, "TurnBar POST 401 closes open Always menu");
+  assert(host.querySelector("[role='alert']")?.textContent?.includes("Operator auth required"), "TurnBar POST 401 shows alert");
+
+  // ---- 8. CAD-2319: <bdi> isolation + control/bidi stripping across TurnBar and PermissionCard ----
+  const dirty = "git\u202E status\u2066\x1b[31m\nfoo";
+  const cleanExpected = "git status[31m foo";
+  await render(
+    React.createElement(TurnBar, {
+      state: { kind: "approval" },
+      reconnecting: false,
+      actions: { onReview: () => undefined },
+      permission: {
+        request: makeReq("perm-bidi", dirty, ["git\u202E", "status\u2069"]),
+        readOnly: false,
+      },
+    }),
+  );
+  const cmdBdi = host.querySelector(".tb-cmd bdi");
+  assert(cmdBdi !== null && cmdBdi.textContent === cleanExpected, `TurnBar command strips bidi/control and wraps <bdi> (got ${JSON.stringify(cmdBdi?.textContent)})`);
+  await React.act(async () => { host.querySelector<HTMLButtonElement>("[data-turn-always-toggle]")!.click(); });
+  const prefixBdi = host.querySelector("[data-turn-always-prefix] bdi");
+  assert(prefixBdi !== null && prefixBdi.textContent === "git status", `TurnBar prefix strips bidi/control and wraps <bdi> (got ${JSON.stringify(prefixBdi?.textContent)})`);
+
+  await render(
+    React.createElement(PermissionCard, {
+      card: {
+        id: "perm-noncompact",
+        argv: dirty,
+        cwd: "/tmp/\u202Edir\x07",
+        reason: "ok\nline2\u202E",
+        risk: "high",
+        prefix: null,
+        status: "pending",
+        decisionLabel: "",
+      },
+      readOnly: true,
+      onDone: () => undefined,
+      compact: false,
+    }),
+  );
+  const bdiTexts = Array.from(host.querySelectorAll("bdi")).map((n) => n.textContent ?? "");
+  assert(bdiTexts.includes(cleanExpected), "non-compact PermissionCard strips control/bidi from argv inside <bdi>");
+  assert(bdiTexts.includes("/tmp/dir"), "non-compact PermissionCard strips control/bidi from cwd inside <bdi>");
+  assert(bdiTexts.some((t) => t === "ok\nline2"), "ReasonBlock keeps newline and strips bidi inside <bdi>");
+
+  const { formatRuleCommand } = require("../src/features/home/permissionFormat");
+  assert(
+    formatRuleCommand({ scope: "prefix", argv: ["git\u202E", "status foo"], tail: ["--hard\u2066"] }) === 'git "status foo" --hard',
+    "formatRuleCommand strips bidi chars and JSON-quotes spaced args",
+  );
+  assert(
+    formatRuleCommand({ scope: "exact", argv: ["echo", "a\x07\u202Eb"], tail: [] }) === 'echo "a\\u0007b"',
+    "formatRuleCommand escapes C0 controls and strips bidi chars",
+  );
+
+  // ---- 9. CAD-2319: ThreadPermission skips /api/master/permissions when disabled ----
+  calls.length = 0;
+  await render(
+    React.createElement(
+      PermissionEnabledContext.Provider,
+      { value: false },
+      React.createElement(ThreadPermission, {
+        text: "Permission requested (perm-disabled, risk high): rm -rf /tmp",
+        readOnly: true,
+      }),
+    ),
+  );
+  assert(
+    !calls.some((c) => c.path === "/api/master/permissions"),
+    "ThreadPermission under PermissionEnabledContext=false makes zero /api/master/permissions calls",
+  );
+  assert(host.querySelector("[data-permission-thread='perm-disabled']") !== null, "ThreadPermission still renders message text when disabled");
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
