@@ -88,16 +88,18 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "permissions", blurb: "Pending permission requests and saved rules", kind: "read" },
 ];
 
-/** The verbs a board can run. A hosted board says so itself in `commands`:
- *  nothing is offered there that would only fail, and `help` always is. Any
- *  other board keeps the full list, because its `commands` is the provider's
- *  partial list, not what the daemon accepts. */
+/** The verbs a board can run. `/permissions` is native-only (`hosted === false`):
+ *  unknown boards keep all other verbs while `/api/meta` resolves, and a
+ *  hosted board offers only `help` plus advertised non-`permissions` verbs. */
 export function offeredCommands(
   hosted: boolean | null | undefined,
   advertised: readonly string[] | null | undefined,
 ): SlashCommand[] {
-  if (hosted !== true) return SLASH_COMMANDS;
-  return SLASH_COMMANDS.filter((c) => c.name === "help" || (advertised ?? []).includes(c.name));
+  if (hosted === false) return SLASH_COMMANDS;
+  if (hosted !== true) return SLASH_COMMANDS.filter((c) => c.name !== "permissions");
+  return SLASH_COMMANDS.filter(
+    (c) => c.name !== "permissions" && (c.name === "help" || (advertised ?? []).includes(c.name)),
+  );
 }
 
 /** `/name` or `/name arg…` — null when the draft is not a command. */

@@ -46,10 +46,10 @@ import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
-import { appendRejectReplyDraft, PermissionReplyContext } from "./PermissionCard";
+import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
-import { TurnBar } from "../app-shell/chat/TurnBar";
+import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
 import { composerDraftState, setComposerDraft } from "../app-shell/chat/composerStore";
 import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
@@ -911,7 +911,7 @@ function MasterHome({
   const gateBlock = useContext(WriteGate);
   const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
   const block = composerBlock(writeBlock, status, hosted);
-  const effectiveReadOnly = readOnly || writeBlock !== null;
+  const effectiveReadOnly = readOnly || writeBlock !== null || operator !== true;
   const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
   const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
@@ -958,7 +958,7 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
-  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted !== true);
+  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false);
   const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
@@ -1221,10 +1221,16 @@ function MasterHome({
     if (!el) return;
     const nearNow = () => atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
     const onScrollEnd = () => {
+      const wasProgrammatic = follow.current.programmatic;
       const settled = onScrollSettled(follow.current, nearNow());
       applyFollow(settled.state);
       if (settled.state.pinned) setActivity(false);
-      if (settled.scroll === "jump") scrollPanel("jump");
+      if (
+        settled.scroll === "jump" ||
+        (wasProgrammatic && settled.state.pinned && Math.abs(el.scrollTop - tailTop(el.scrollHeight, el.clientHeight)) > 1)
+      ) {
+        scrollPanel("jump");
+      }
     };
     // Only an in-flight send glide is cancelled here. Once it has
     // settled, the position check is what stops the pin.
@@ -1508,19 +1514,9 @@ function MasterHome({
     });
   };
 
-  const focusHomeComposer = useCallback(() => {
-    const box = dockRef.current?.querySelector<HTMLTextAreaElement>(`#${HOME_COMPOSER_ID}`)
-      ?? (document.getElementById(HOME_COMPOSER_ID) as HTMLTextAreaElement | null);
-    box?.focus();
-  }, []);
+  const focusHomeComposer = useCallback(() => focusComposerById(dockRef.current, HOME_COMPOSER_ID), []);
 
-  const focusApprovalBar = useCallback(() => {
-    const bar = dockRef.current?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
-    if (!bar) return false;
-    const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
-    target.focus();
-    return true;
-  }, []);
+  const focusApprovalBar = useCallback(() => focusApprovalBarIn(dockRef.current), []);
 
   const rejectAndReplyDraft = useCallback(
     (command: string) => {
@@ -1534,6 +1530,7 @@ function MasterHome({
 
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
@@ -1656,7 +1653,7 @@ function MasterHome({
               moreBefore={moreBefore}
               loadingEarlier={loadingEarlier}
               onEarlier={onEarlier}
-              readOnly={readOnly}
+              readOnly={effectiveReadOnly}
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
@@ -1782,6 +1779,7 @@ function MasterHome({
       </section>
     </main>
     </PermissionReplyContext.Provider>
+    </PermissionEnabledContext.Provider>
     </AssistantActorProvider>
   );
 }

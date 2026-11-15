@@ -21,7 +21,7 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
-import { appendRejectReplyDraft, PermissionReplyContext } from "../../home/PermissionCard";
+import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -117,7 +117,7 @@ import type { AttachDestination } from "./attach";
 import type { ChatBinding, MediaComposerTarget } from "./types";
 import { usePendingPermissionRequest } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
-import { TurnBar } from "./TurnBar";
+import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
@@ -1951,18 +1951,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           : null;
 
   const canReplyDraft = canSend && binding.error === null;
-  const focusPaneComposer = useCallback(() => {
-    const box = paneRef.current?.querySelector<HTMLTextAreaElement>(`#${COMPOSER_ID}`)
-      ?? (document.getElementById(COMPOSER_ID) as HTMLTextAreaElement | null);
-    box?.focus();
-  }, []);
-  const focusApprovalBar = useCallback(() => {
-    const bar = paneRef.current?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
-    if (!bar) return false;
-    const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
-    target.focus();
-    return true;
-  }, []);
+  const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
   const rejectAndReplyDraft = useCallback(
     (command: string) => {
       if (!canReplyDraft) return;
@@ -1975,6 +1965,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
     <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
@@ -2519,6 +2510,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     </div>
     </ImageConversation.Provider>
     </PermissionReplyContext.Provider>
+    </PermissionEnabledContext.Provider>
     </AssistantActorProvider>
   );
 }

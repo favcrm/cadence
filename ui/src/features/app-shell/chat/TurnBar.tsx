@@ -3,7 +3,25 @@ import { api, ApiError, type MasterPermissionRequest } from "../../../lib/api";
 import { useTranslate } from "../../../lib/locale";
 import { useWriteBlock, WriteGate } from "../../auth/WriteGate";
 import { publishPermission } from "../../home/PermissionCard";
+import { cleanPermissionInline } from "../../home/permissionFormat";
 import type { TurnBarState } from "./turnBarState";
+
+/** Focuses the first actionable control inside a mounted needs-approval TurnBar. */
+export function focusApprovalBar(container: ParentNode | null | undefined): boolean {
+  const bar = container?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
+  if (!bar) return false;
+  const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
+  target.focus();
+  return true;
+}
+
+/** Focuses a composer textarea inside `container`, falling back to `document.getElementById`. */
+export function focusComposerById(container: ParentNode | null | undefined, id: string): void {
+  const box =
+    container?.querySelector<HTMLTextAreaElement>(`#${id}`) ??
+    (document.getElementById(id) as HTMLTextAreaElement | null);
+  box?.focus();
+}
 
 export interface TurnBarActions {
   /** Mutating actions are absent when the viewer cannot write. */
@@ -98,9 +116,20 @@ export function TurnBar({
         publishPermission();
         if (mountedRef.current) after?.();
       })
-      .catch((e: ApiError) => {
+      .catch((e: unknown) => {
+        const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          if (requestSeq.current === seq) {
+            setAlwaysOpen(false);
+            setRejectOpen(false);
+            setError(msg);
+          }
+          // Re-evaluate pending permission state immediately on auth loss.
+          publishPermission();
+          return;
+        }
         if (requestSeq.current !== seq) return;
-        setError(e.message ?? String(e));
+        setError(msg);
       })
       .finally(() => {
         if (requestSeq.current === seq) setBusy(false);
@@ -149,14 +178,15 @@ export function TurnBar({
       tone = "needs_approval";
       if (permission !== null) {
         const req = permission.request;
+        const cleanCmd = cleanPermissionInline(req.command);
         detailNode = (
           <span className="tb-detail tb-detail-perm">
             {reconnecting ? `${t("last known")} · ` : ""}
             <span className="chip bg-ink-800 text-ink-300 tb-risk" data-turn-risk={req.risk}>
               {t(req.risk)}
             </span>
-            <code className="tb-cmd num" title={req.command}>
-              {req.command}
+            <code className="tb-cmd num" title={cleanCmd}>
+              <bdi>{cleanCmd}</bdi>
             </code>
           </span>
         );
@@ -305,22 +335,25 @@ export function TurnBar({
           >
             {t("This exact command")} <kbd className="tb-kbd" aria-hidden="true">2</kbd>
           </button>
-          {permission.request.prefix && permission.request.prefix.length > 0 ? (
-            <button
-              type="button"
-              className="tb-btn"
-              disabled={busy}
-              data-turn-always-prefix
-              aria-label={`${t("Prefix")} ${permission.request.prefix.join(" ")}`}
-              aria-keyshortcuts="3"
-              onClick={() => {
-                const prefix = permission.request.prefix ?? [];
-                runDecision(() => api.permissionAlways(permission.request.id, "prefix", prefix));
-              }}
-            >
-              {t("Prefix")} {permission.request.prefix.join(" ")} <kbd className="tb-kbd" aria-hidden="true">3</kbd>
-            </button>
-          ) : null}
+          {permission.request.prefix && permission.request.prefix.length > 0 ? (() => {
+            const cleanPrefix = cleanPermissionInline(permission.request.prefix.join(" "));
+            return (
+              <button
+                type="button"
+                className="tb-btn"
+                disabled={busy}
+                data-turn-always-prefix
+                aria-label={`${t("Prefix")} ${cleanPrefix}`}
+                aria-keyshortcuts="3"
+                onClick={() => {
+                  const prefix = permission.request.prefix ?? [];
+                  runDecision(() => api.permissionAlways(permission.request.id, "prefix", prefix));
+                }}
+              >
+                {t("Prefix")} <bdi>{cleanPrefix}</bdi> <kbd className="tb-kbd" aria-hidden="true">3</kbd>
+              </button>
+            );
+          })() : null}
         </div>
       )}
       {canDecide && rejectOpen && permission !== null && (
