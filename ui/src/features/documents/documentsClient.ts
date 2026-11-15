@@ -15,8 +15,9 @@ import { objectField } from "../../lib/wire";
  * `invalid` answer, never an invented state. A list with one malformed row is
  * invalid as a whole: a dropped row would hide a document from its approver.
  *
- * Only an abort (the caller's signal, or the private session changing) is
- * rethrown, so a superseded read never renders as a failure.
+ * Only an abort is rethrown: the caller's signal (an AbortError, or the
+ * signal's own reason when it lands mid-request) or the private session
+ * changing, so a superseded read never renders as a failure.
  */
 
 /** The capability string the probe must answer for this client to speak to it. */
@@ -25,7 +26,11 @@ export const DOCUMENT_CAPABILITY = "cad2286.document-lifecycle.v1";
 export const DOCUMENT_STAGES = ["draft", "in_review", "approved", "delivered", "archived"] as const;
 export type DocumentStage = (typeof DOCUMENT_STAGES)[number];
 
-/** Every refusal code the hosted document routes answer. */
+/**
+ * The lifecycle's own codes; the shared gate may also answer others
+ * (board_session_required, membership_changed, tenant_placement_changed…),
+ * which are kept as unknown codes.
+ */
 export const DOCUMENT_REFUSAL_CODES = [
   "document_not_approved",
   "document_archived",
@@ -141,20 +146,28 @@ export interface StageReceipt {
  * - `failed`: no answer (network) or an error status with no code.
  */
 export type DocumentsFailure =
-  | { kind: "refused"; status: number; code: string; message: string }
+  | { kind: "refused"; status: number; code: DocumentRefusalCode | (string & {}); message: string }
   | { kind: "invalid"; status: number; message: string }
   | { kind: "failed"; status: number | null; message: string };
 
 export type DocumentsResult<T> = { ok: true; value: T } | { ok: false; failure: DocumentsFailure };
 
+/** The refusal code of a failed result, or null for a success or an uncoded failure. */
+export function refusalCode(result: DocumentsResult<unknown>): string | null {
+  return !result.ok && result.failure.kind === "refused" ? result.failure.code : null;
+}
+
 /**
- * The capability probe. `unavailable` (404, or 501 `not_implemented`) means
- * the board has no document lifecycle, so the board hides it; anything else
- * that is not a well-formed v1 answer is an `error`, never `unavailable`.
+ * The capability probe. `unavailable` means the board hides the lifecycle:
+ * - `not_served`: a 404, or a 501 `not_implemented` (flag off, older board);
+ * - `unsupported_capability`: a 200 naming a capability other than v1, which
+ *   this client does not speak (a newer contract ships a new capability).
+ * Anything else that is not a well-formed v1 answer is an `error`, never
+ * `unavailable`.
  */
 export type DocumentsProbe =
   | ({ kind: "available" } & DocumentTypes)
-  | { kind: "unavailable" }
+  | { kind: "unavailable"; reason: "not_served" | "unsupported_capability" }
   | { kind: "error"; failure: DocumentsFailure };
 
 // ---- parsing ----
@@ -232,17 +245,20 @@ function parseType(value: unknown): DocumentType {
   };
 }
 
-function parseTypes(value: unknown): DocumentTypes {
+/** The probe's body: v1 parsed strictly, or another capability left unread,
+ *  since its shape is not this client's contract. A missing capability is malformed. */
+function parseProbe(value: unknown): { supported: true; types: DocumentTypes } | { supported: false } {
   const body = record(value, "type list");
   const capability = str(body, "capability");
-  if (capability !== DOCUMENT_CAPABILITY) fail(`capability ${capability} is not ${DOCUMENT_CAPABILITY}`);
-  return { capability, baseline: parseBaseline(body.baseline), types: array(body, "types").map(parseType) };
+  if (capability !== DOCUMENT_CAPABILITY) return { supported: false };
+  return {
+    supported: true,
+    types: { capability, baseline: parseBaseline(body.baseline), types: array(body, "types").map(parseType) },
+  };
 }
 
 function parseFile(value: unknown): DocumentFile {
   const row = record(value, "file");
-  const bytes = row.bytes;
-  if (typeof bytes !== "number" || !Number.isFinite(bytes)) fail("bytes is not a number");
   return {
     id: str(row, "id"),
     version: int(row, "version"),
@@ -250,7 +266,7 @@ function parseFile(value: unknown): DocumentFile {
     title: str(row, "title"),
     label: str(row, "label"),
     customer: str(row, "customer"),
-    bytes,
+    bytes: int(row, "bytes"),
     digest: str(row, "digest"),
     created: str(row, "created"),
     issue: strOrNull(row, "issue"),
@@ -345,7 +361,9 @@ async function call<T>(
   try {
     answer = await send(path, init, signal);
   } catch (error) {
-    if (isAbort(error)) throw error;
+    // Any rejection once the caller's signal aborted is the abort, whatever its
+    // reason (`controller.abort("unmount")` rejects with that string).
+    if (signal?.aborted || isAbort(error)) throw error;
     const message = error instanceof Error ? error.message : String(error);
     return { status: null, result: { ok: false, failure: { kind: "failed", status: null, message } } };
   }
@@ -383,11 +401,15 @@ const typePath = (label: string) => `/api/document-types/${encodeURIComponent(la
 
 /** `GET /api/document-types`: whether this board has the lifecycle, and its types. */
 export async function probe(signal?: AbortSignal): Promise<DocumentsProbe> {
-  const { status, result } = await call("/api/document-types", read(), parseTypes, signal);
-  if (result.ok) return { kind: "available", ...result.value };
+  const { status, result } = await call("/api/document-types", read(), parseProbe, signal);
+  if (result.ok)
+    return result.value.supported
+      ? { kind: "available", ...result.value.types }
+      : { kind: "unavailable", reason: "unsupported_capability" };
   const { failure } = result;
-  if (status === 404) return { kind: "unavailable" };
-  if (status === 501 && failure.kind === "refused" && failure.code === "not_implemented") return { kind: "unavailable" };
+  if (status === 404) return { kind: "unavailable", reason: "not_served" };
+  if (status === 501 && failure.kind === "refused" && failure.code === "not_implemented")
+    return { kind: "unavailable", reason: "not_served" };
   return { kind: "error", failure };
 }
 
@@ -396,23 +418,31 @@ export async function list(archived: boolean, signal?: AbortSignal): Promise<Doc
   return (await call(`/api/documents?archived=${archived ? 1 : 0}`, read(), parseRows, signal)).result;
 }
 
-/** `POST /api/documents/:id/approve` for the version the approver reviewed. */
+/** `POST /api/documents/:id/approve` for the version the approver reviewed.
+ *  It can reject with AbortError if the private session pauses after the server
+ *  applied the change, so callers catch it and refresh. */
 export async function approve(id: string, version: number): Promise<DocumentsResult<ApproveReceipt>> {
   return (await call(documentPath(id, "approve"), write({ version }), parseApprove)).result;
 }
 
-/** `POST /api/documents/:id/archive`. */
+/** `POST /api/documents/:id/archive`.
+ *  It can reject with AbortError if the private session pauses after the server
+ *  applied the change, so callers catch it and refresh. */
 export async function archive(id: string): Promise<DocumentsResult<StageReceipt>> {
   return (await call(documentPath(id, "archive"), write(), parseStage)).result;
 }
 
-/** `POST /api/documents/:id/restore`. */
+/** `POST /api/documents/:id/restore`.
+ *  It can reject with AbortError if the private session pauses after the server
+ *  applied the change, so callers catch it and refresh. */
 export async function restore(id: string): Promise<DocumentsResult<StageReceipt>> {
   return (await call(documentPath(id, "restore"), write(), parseStage)).result;
 }
 
 /** `POST /api/document-types/:label`: the owner's answer is confirmed at once,
- *  a member's is pending. The body carries exactly the four preference fields. */
+ *  a member's is pending. The body carries exactly the four preference fields.
+ *  It can reject with AbortError if the private session pauses after the server
+ *  applied the change, so callers catch it and refresh. */
 export async function setType(label: string, input: DocumentTypeInput): Promise<DocumentsResult<DocumentType>> {
   const body = {
     requireApproval: input.requireApproval,
@@ -423,7 +453,9 @@ export async function setType(label: string, input: DocumentTypeInput): Promise<
   return (await call(typePath(label), write(body), parseTypeReceipt)).result;
 }
 
-/** `POST /api/document-types/:label/confirm`: the owner confirms the row at `rev`. */
+/** `POST /api/document-types/:label/confirm`: the owner confirms the row at `rev`.
+ *  It can reject with AbortError if the private session pauses after the server
+ *  applied the change, so callers catch it and refresh. */
 export async function confirmType(label: string, rev: number): Promise<DocumentsResult<DocumentType>> {
   return (await call(`${typePath(label)}/confirm`, write({ rev }), parseTypeReceipt)).result;
 }

@@ -6,7 +6,7 @@
  * are pinned to the wire.
  */
 import * as documents from "../src/features/documents/documentsClient";
-import { DOCUMENT_CAPABILITY, DOCUMENT_REFUSAL_CODES } from "../src/features/documents/documentsClient";
+import { DOCUMENT_CAPABILITY, DOCUMENT_REFUSAL_CODES, refusalCode } from "../src/features/documents/documentsClient";
 
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
@@ -16,9 +16,9 @@ function equal(actual: unknown, expected: unknown, why: string): void {
     throw new Error(`${why}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-type Seen = { url: string; method: string; headers: Record<string, string>; body: string | null };
+type Seen = { url: string; method: string; headers: Record<string, string>; body: string | null; cache: string | null };
 let seen: Seen[] = [];
-let answer: () => Response | Promise<Response> = () => new Response("{}", { status: 200 });
+let answer: (init?: RequestInit) => Response | Promise<Response> = () => new Response("{}", { status: 200 });
 
 function headersOf(init: RequestInit | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -28,14 +28,26 @@ function headersOf(init: RequestInit | undefined): Record<string, string> {
   return out;
 }
 
+// A plain-Node stand-in for the browser's storage, so `sessionHeaders()` has a key to send.
+const stored = new Map<string, string>();
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => void stored.set(key, value),
+    removeItem: (key: string) => void stored.delete(key),
+  },
+});
+
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   seen.push({
     url: String(input),
     method: init?.method ?? "GET",
     headers: headersOf(init),
     body: typeof init?.body === "string" ? init.body : null,
+    cache: init?.cache ?? null,
   });
-  return answer();
+  return answer(init);
 }) as typeof fetch;
 
 const reply = (status: number, body: unknown) => () =>
@@ -46,7 +58,7 @@ const reply = (status: number, body: unknown) => () =>
 const refusal = (status: number, code: string, message = `refused: ${code}`) =>
   reply(status, { ok: false, error: { code, message } });
 
-function reset(next: () => Response | Promise<Response>): void {
+function reset(next: (init?: RequestInit) => Response | Promise<Response>): void {
   seen = [];
   answer = next;
 }
@@ -95,6 +107,7 @@ const state = {
 };
 
 async function probeChecks(): Promise<void> {
+  localStorage.setItem("cadence.sessionKey", "test-session-key");
   equal(DOCUMENT_CAPABILITY, "cad2286.document-lifecycle.v1", "the capability this client speaks");
 
   reset(reply(200, typesBody));
@@ -102,6 +115,7 @@ async function probeChecks(): Promise<void> {
   equal(seen.length, 1, "the probe is one request");
   equal(seen[0]!.url, "/api/document-types", "the probe reads the type list");
   equal(seen[0]!.method, "GET", "the probe is a read");
+  equal(seen[0]!.cache, "no-store", "the probe is never served from the HTTP cache");
   assert(available.kind === "available", "200 with the capability is available");
   equal(available.capability, "cad2286.document-lifecycle.v1", "capability kept");
   equal(available.baseline, baseline, "baseline parsed");
@@ -114,14 +128,23 @@ async function probeChecks(): Promise<void> {
   equal(additive.types[0]!.label, "quote", "row still read");
   assert(!("later" in additive.types[0]!), "unknown fields are not carried into the typed row");
 
+  const notServed = { kind: "unavailable", reason: "not_served" };
   reset(refusal(404, "not_found", "Not found."));
-  equal((await documents.probe()).kind, "unavailable", "404 (flag off or older board) is unavailable");
+  equal(await documents.probe(), notServed, "404 (flag off or older board) is unavailable");
   reset(reply(404, "<html>no</html>"));
-  equal((await documents.probe()).kind, "unavailable", "a 404 with any body is unavailable");
+  equal(await documents.probe(), notServed, "a 404 with any body is unavailable");
   reset(refusal(501, "not_implemented"));
-  equal((await documents.probe()).kind, "unavailable", "501 not_implemented is unavailable");
+  equal(await documents.probe(), notServed, "501 not_implemented is unavailable");
   reset(reply(501, { code: "not_implemented" }));
-  equal((await documents.probe()).kind, "unavailable", "a top-level not_implemented code is read too");
+  equal(await documents.probe(), notServed, "a top-level not_implemented code is read too");
+
+  // Forward compatibility: a newer contract ships a new capability, and this
+  // client hides the feature rather than reading a shape it does not know.
+  const unsupported = { kind: "unavailable", reason: "unsupported_capability" };
+  reset(reply(200, { ...typesBody, capability: "cad2286.document-lifecycle.v2" }));
+  equal(await documents.probe(), unsupported, "another capability is unavailable, not an error");
+  reset(reply(200, { capability: "cad2286.document-lifecycle.v2", somethingElse: true }));
+  equal(await documents.probe(), unsupported, "and its body is not read as v1");
 
   for (const [why, next] of [
     ["501 with another code", refusal(501, "internal")],
@@ -131,7 +154,7 @@ async function probeChecks(): Promise<void> {
     ["502 without JSON", reply(502, "bad gateway")],
     ["200 with malformed JSON", reply(200, "{not json")],
     ["200 with no capability", reply(200, { baseline, types: [] })],
-    ["200 with another capability", reply(200, { ...typesBody, capability: "cad2286.document-lifecycle.v2" })],
+    ["200 with a numeric capability", reply(200, { ...typesBody, capability: 1 })],
     ["200 with a malformed baseline", reply(200, { ...typesBody, baseline: { ...baseline, requireApproval: "yes" } })],
     ["200 with a malformed type row", reply(200, { ...typesBody, types: [typeRow, { ...typeRow, state: "maybe" }] })],
     ["200 with a type row missing rev", reply(200, { ...typesBody, types: [{ ...typeRow, rev: undefined }] })],
@@ -158,6 +181,7 @@ async function listChecks(): Promise<void> {
   const active = await documents.list(false);
   equal(seen[0]!.url, "/api/documents?archived=0", "active list");
   equal(seen[0]!.method, "GET", "list is a read");
+  equal(seen[0]!.cache, "no-store", "list is never served from the HTTP cache");
   assert(active.ok, "a well-formed list is read");
   equal(active.value, [{ file, document: state }], "rows parsed");
   equal(typeof active.value[0]!.document.deliveredAt, "number", "deliveredAt is epoch milliseconds");
@@ -181,6 +205,7 @@ async function listChecks(): Promise<void> {
     ["a missing type", { file, document: { ...state, type: undefined } }],
     ["selfApproved not boolean", { file, document: { ...state, selfApproved: 0 } }],
     ["a fractional version", { file, document: { ...state, submittedVersion: 1.5 } }],
+    ["fractional bytes", { file: { ...file, bytes: 1.5 }, document: state }],
     ["a file without an id", { file: { ...file, id: undefined }, document: state }],
     ["a file with a numeric created", { file: { ...file, created: 1 }, document: state }],
     ["a file with shared missing", { file: { ...file, shared: undefined }, document: state }],
@@ -208,6 +233,7 @@ function expectWrite(why: string, url: string, body: unknown): void {
   equal(request.method, "POST", `${why}: method`);
   equal(request.headers["content-type"], "application/json", `${why}: exact content type`);
   equal(request.headers["x-cadence-board"], "1", `${why}: board header`);
+  equal(request.headers["x-cadence-session"], "test-session-key", `${why}: session header`);
   if (body === undefined) return;
   assert(request.body !== null, `${why}: has a body`);
   equal(JSON.parse(request.body), body, `${why}: body`);
@@ -308,6 +334,7 @@ async function refusalChecks(): Promise<void> {
       const out = await call();
       assert(!out.ok, `${name} ${code}: a refusal is a failure`);
       equal(out.failure, { kind: "refused", status: 409, code, message: `msg ${code}` }, `${name} surfaces ${code}`);
+      equal(refusalCode(out), code, `${name} refusalCode ${code}`);
     }
   }
   reset(refusal(409, "some_future_code", "later"));
@@ -320,6 +347,57 @@ async function refusalChecks(): Promise<void> {
   assert(!opaque.ok, "a non-JSON error is a failure");
   equal(opaque.failure.kind, "failed", "with no code to surface");
   equal(opaque.failure.status, 500, "and its status");
+  equal(refusalCode(opaque), null, "an uncoded failure has no refusal code");
+  reset(reply(200, { stage: "archived" }));
+  equal(refusalCode(await documents.archive("art_01")), null, "a success has no refusal code");
+}
+
+/** Resolves to what `run` rejected with; throws if it resolved. */
+async function rejection(run: () => Promise<unknown>, why: string): Promise<unknown> {
+  let value: unknown;
+  try {
+    value = await run();
+  } catch (error) {
+    return error;
+  }
+  throw new Error(`${why}: resolved ${JSON.stringify(value)} instead of rejecting`);
+}
+
+const isAbortError = (error: unknown) => error instanceof Error && error.name === "AbortError";
+
+async function abortChecks(): Promise<void> {
+  // An already-aborted signal: no request, and a rejection, never `failed`.
+  for (const reason of [undefined, "unmount"]) {
+    const controller = new AbortController();
+    controller.abort(reason);
+    reset(reply(200, typesBody));
+    const probed = await rejection(() => documents.probe(controller.signal), `probe pre-aborted (${reason})`);
+    assert(isAbortError(probed) || probed === reason, `probe pre-aborted (${reason}) rejects with the abort: ${String(probed)}`);
+    reset(reply(200, { documents: [] }));
+    const listed = await rejection(() => documents.list(false, controller.signal), `list pre-aborted (${reason})`);
+    assert(isAbortError(listed) || listed === reason, `list pre-aborted (${reason}) rejects with the abort: ${String(listed)}`);
+  }
+
+  // Aborted mid-request with a custom reason: the fetch rejects with that
+  // reason (not an AbortError), and it still rejects rather than resolving.
+  const hang = (init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
+      const signal = init?.signal;
+      assert(signal, "the request carries a signal");
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  for (const [name, run] of [
+    ["probe", (signal: AbortSignal) => documents.probe(signal)],
+    ["list", (signal: AbortSignal) => documents.list(true, signal)],
+  ] as const) {
+    const controller = new AbortController();
+    reset(hang);
+    const pending = rejection(() => run(controller.signal), `${name} aborted in flight`);
+    await Promise.resolve();
+    controller.abort("unmount");
+    const error = await pending;
+    assert(isAbortError(error) || error === "unmount", `${name} in flight rejects with the abort: ${String(error)}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -327,6 +405,7 @@ async function main(): Promise<void> {
   await listChecks();
   await writeChecks();
   await refusalChecks();
+  await abortChecks();
   console.log("documentsClient checks passed");
 }
 
