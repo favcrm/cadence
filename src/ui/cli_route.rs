@@ -386,20 +386,6 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
     Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))
 }
 
-/// The project-policy spelling of the verified caller, or `None` when its
-/// principal kind and actor prefix disagree (CAD-2321, operator decision of
-/// 2026-11-15). Only a `users/` actor keys on the verified `sub`; each kind
-/// is admitted with its own prefix alone, and any other pair names no caller.
-fn policy_actor(actor: &CliActor) -> Option<String> {
-    let prefix = actor.actor.split_once('/').map(|(prefix, _)| prefix);
-    match (actor.principal_kind.as_str(), prefix) {
-        ("user", None) if actor.actor == "operator" => Some(actor.actor.clone()),
-        ("user", Some("users")) => Some(crate::project_policy::policy_user_actor(&actor.sub)),
-        ("agent", Some("agents")) | ("service", Some("service")) => Some(actor.policy_spelling()),
-        _ => None,
-    }
-}
-
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
@@ -407,7 +393,7 @@ fn policy_actor(actor: &CliActor) -> Option<String> {
 /// verb's own unknown-project answer; an unreadable tracker refuses, and
 /// so does a caller whose principal kind and actor disagree.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
-    let refused = match policy_actor(actor) {
+    let refused = match actor.policy_actor() {
         Some(spelling) => super::project_policy::refused(pm, key, &spelling),
         None => true,
     };
@@ -433,7 +419,8 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
 /// so a listing contributes no row, count or placeholder for a project
 /// the caller may not see.
 fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<String> {
-    policy_actor(actor)
+    actor
+        .policy_actor()
         .map(|spelling| super::project_policy::readable(pm, &spelling))
         .unwrap_or_default()
 }
@@ -476,7 +463,7 @@ fn dispatch(
                     "My work identity is not unambiguously bound",
                 );
             }
-            let Some(policy_actor) = policy_actor(actor) else {
+            let Some(policy_actor) = actor.policy_actor() else {
                 return cli_fail(
                     403,
                     "identity_unresolved",
