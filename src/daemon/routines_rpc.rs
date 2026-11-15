@@ -246,10 +246,10 @@ impl Shared {
                 .or_else(|_| path.strip_prefix(&pm_canon))
             {
                 ensure_no_symlinks_under(&pm.dir, rel)?
-            } else if let Ok(rel) = path.strip_prefix(&scripts_dir).or_else(|_| {
+            } else if let Ok(rel) = path.strip_prefix(&scripts_dir).or_else(|err| {
                 scripts_canon
                     .as_deref()
-                    .ok_or(path.strip_prefix(&scripts_dir).unwrap_err())
+                    .ok_or(err)
                     .and_then(|sc| path.strip_prefix(sc))
             }) {
                 ensure_no_symlinks_under(&scripts_dir, rel)?
@@ -297,12 +297,17 @@ impl Shared {
         due_instant: i64,
         verified_bytes: &[u8],
     ) -> std::result::Result<(Vec<u8>, bool), String> {
-        let exec_dir = self.state_dir.join("routine-exec");
-        if let Err(e) = std::fs::create_dir_all(&exec_dir) {
+        let exec_root = self.state_dir.join("routine-exec");
+        if let Err(e) = std::fs::create_dir_all(&exec_root) {
             return Err(format!("failed to create routine-exec dir: {e}"));
         }
-        let _ = std::fs::set_permissions(&exec_dir, std::fs::Permissions::from_mode(0o700));
-        let tmp_script = exec_dir.join(format!("run-{}.bin", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::set_permissions(&exec_root, std::fs::Permissions::from_mode(0o700));
+        let run_dir = exec_root.join(format!("run-{}", uuid::Uuid::new_v4().simple()));
+        if let Err(e) = std::fs::create_dir(&run_dir) {
+            return Err(format!("failed to create per-run routine-exec dir: {e}"));
+        }
+        let _ = std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700));
+        let tmp_script = run_dir.join("script.bin");
         {
             use std::io::Write;
             let mut file = match std::fs::OpenOptions::new()
@@ -312,13 +317,16 @@ impl Shared {
                 .open(&tmp_script)
             {
                 Ok(f) => f,
-                Err(e) => return Err(format!("failed to stage verified script: {e}")),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&run_dir);
+                    return Err(format!("failed to stage verified script: {e}"));
+                }
             };
             if let Err(e) = file
                 .write_all(verified_bytes)
                 .and_then(|()| file.sync_all())
             {
-                let _ = std::fs::remove_file(&tmp_script);
+                let _ = std::fs::remove_dir_all(&run_dir);
                 return Err(format!("failed to write verified script: {e}"));
             }
         }
@@ -345,14 +353,14 @@ impl Shared {
             .env("PATH", safe_path)
             .env("LANG", "C.UTF-8")
             .env("TZ", "UTC")
-            .env("HOME", &exec_dir)
-            .env("TMPDIR", &exec_dir)
+            .env("HOME", &run_dir)
+            .env("TMPDIR", &run_dir)
             .env("CADENCE_ROUTINE_ID", routine_id)
             .env("CADENCE_ROUTINE_DUE", due_instant.to_string());
 
         let outcome =
             crate::proc::run_bounded_limited(&mut cmd, SCRIPT_TIMEOUT, MAX_SCRIPT_OUTPUT_BYTES);
-        let _ = std::fs::remove_file(&tmp_script);
+        let _ = std::fs::remove_dir_all(&run_dir);
 
         match outcome {
             Ok((output, _bounds)) => {
@@ -1608,7 +1616,7 @@ impl Shared {
             && cred
                 .custody
                 .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
-            && !super::credential_entry_rpc::credential_request_ready(self, &request)
+            && !self.protected_credential_request_ready(&request)
         {
             return Err(Error::rejected(
                 "custody_not_ready: credential custody key is locked or protected context changed",
@@ -1653,11 +1661,7 @@ impl Shared {
             "Connection '{}' ({} / {}) is ready. Continue your paused reply.",
             request.provider, cred.account, chosen_connection_id
         );
-        let conv = request
-            .conversation_id
-            .as_deref()
-            .filter(|c| self.store.destination_thread_live(Some(c)).unwrap_or(false))
-            .or(request.conversation_id.as_deref());
+        let conv = request.conversation_id.as_deref();
         self.store.enqueue_steered_for_with_conversation(
             &target_agent.alias,
             Some(&target_agent.uid),
@@ -1709,5 +1713,21 @@ impl Shared {
             };
             let _ = self.execute_routine_gated(&routine.id, slot, now_epoch, "schedule");
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn protected_credential_request_ready(
+        &self,
+        request: &crate::store::credential_requests::CredentialRequest,
+    ) -> bool {
+        super::credential_entry_rpc::credential_request_ready(self, request)
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    fn protected_credential_request_ready(
+        &self,
+        _request: &crate::store::credential_requests::CredentialRequest,
+    ) -> bool {
+        false
     }
 }
