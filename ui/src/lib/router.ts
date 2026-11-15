@@ -495,13 +495,71 @@ function scopedRoute(route: Route, project: string): Route {
   return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
-/** Query parameters only the mounted app route owns. `install` is the
+/** Query parameters only a mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
  *  the ctx/conversation/record selectors were minted for. `drawer` and
  *  `drawer_size` are the host's return hint for the drawer surface an app
  *  asked to open (a connect that leaves the board and comes back); they are
  *  the app page's alone and never follow the operator elsewhere. */
-const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install", "drawer", "drawer_size"] as const;
+const APP_ROUTE_PARAMS = ["crm", "record", "ctx", "appview", "segment", "conversation", "install", "drawer", "drawer_size"] as const;
+
+/** Query keys owned by host screens so an app key matching one is never stripped as app state. */
+const HOST_QUERY_KEYS = new Set<string>([
+  "tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page",
+  "recruit", "ask", "h", "dm", "chat", "file", "mode", "q",
+  "c", "kind", "agent", "system",
+  "item", "outbox_q", "outbox_project",
+  ...MY_WORK_URL_KEYS,
+]);
+
+/** Global cross-route host query keys preserved even if explicitly passed as a section query. */
+const GLOBAL_HOST_QUERY_KEYS = new Set<string>(["project", "issue"]);
+
+export type SectionQueryInput = string | readonly (string | null | undefined)[] | null | undefined;
+
+function deleteSectionQueries(q: URLSearchParams, queries: SectionQueryInput): void {
+  if (!queries) return;
+  const list = typeof queries === "string" ? [queries] : queries;
+  for (const key of list) {
+    if (key && !GLOBAL_HOST_QUERY_KEYS.has(key)) q.delete(key);
+  }
+}
+
+export function isAppRoute(route: Route): boolean {
+  return route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
+}
+
+export function sameAppRoute(a: Route | null, b: Route): boolean {
+  if (a === null) return false;
+  if (a.screen === "workspaceApp" && b.screen === "workspaceApp") return a.installId === b.installId;
+  if (a.screen === "workspaceAppKey" && b.screen === "workspaceAppKey") return a.appKey === b.appKey;
+  return false;
+}
+
+/** Strip parameters owned by a mounted app when leaving it or switching to another app. */
+export function appNavigationSearch(
+  from: Route,
+  to: Route,
+  search: string,
+  activeSectionQuery?: SectionQueryInput,
+): string {
+  if (!isAppRoute(from) || sameAppRoute(from, to)) return search;
+  const q = new URLSearchParams(search);
+  for (const key of APP_ROUTE_PARAMS) q.delete(key);
+  if (from.screen === "workspaceAppKey" && !HOST_QUERY_KEYS.has(from.appKey)) {
+    q.delete(from.appKey);
+  }
+  deleteSectionQueries(q, activeSectionQuery);
+  return q.toString();
+}
+
+/** Strip app-owned query parameters unconditionally before entering another app. */
+export function stripAppRouteParams(search: string, extraSectionQuery?: SectionQueryInput): string {
+  const q = new URLSearchParams(search);
+  for (const key of APP_ROUTE_PARAMS) q.delete(key);
+  deleteSectionQueries(q, extraSectionQuery);
+  return q.toString();
+}
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = "", from: Route | null = null): string {
@@ -524,8 +582,14 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   const route = scopedRoute(loc.route, loc.project);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
   // `workspaceApp` compat route) own these; they stay on the app's own
-  // route and never follow the user to /settings and the like.
-  if (route.screen !== "workspaceApp" && route.screen !== "workspaceAppKey") for (const key of CRM_APP_PARAMS) q.delete(key);
+  // route and never follow the user to /settings, /threads, or another app.
+  const leavingApp = !isAppRoute(route) || (from !== null && isAppRoute(from) && !sameAppRoute(from, route));
+  if (leavingApp) {
+    for (const key of APP_ROUTE_PARAMS) q.delete(key);
+    if (from?.screen === "workspaceAppKey" && !HOST_QUERY_KEYS.has(from.appKey)) {
+      q.delete(from.appKey);
+    }
+  }
   if (route.screen === "issue") {
     if (route.tab !== "overview") q.set("tab", route.tab);
     const issueSearch = q.toString();

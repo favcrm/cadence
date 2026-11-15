@@ -50,6 +50,7 @@ const mk = (id: string, name: string, title: string) => ({
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 let installationsFixture: Record<string, unknown>[] = [mk("install-crm", "crm", "CRM"), mk("install-soc", "social-content", "Social Content")];
 let listCalls = 0;
+let pendingList: Promise<Response> | null = null;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
@@ -61,9 +62,10 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
-  if (path === "/api/app-installations") { listCalls++; return json(installationsFixture); }
+  if (path === "/api/app-installations") { listCalls++; return pendingList ? await pendingList : json(installationsFixture); }
   if (path === "/api/app-installations/install-crm") return json(installationsFixture.find((row) => row.install_id === "install-crm") ?? mk("install-crm", "crm", "CRM"));
-  if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [] });
+  if (path === "/api/app-installations/install-hr") return json({ error: "receipt unavailable" }, 500);
+  if (path === "/api/app-installations/install-crm/contexts" || path === "/api/app-installations/install-hr/contexts") return json({ contexts: [] });
   if (path.startsWith("/api/app-installations/install-forged")) return json({ error: "unknown installation" }, 404);
   if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
   if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });
@@ -181,6 +183,39 @@ await remount(async () => {
   await settle(() => assert(sections("客戶關係 區段").find((s) => s.textContent?.trim() === "分眾")?.getAttribute("aria-current") === "page", "crm active"));
   equal(appLink("社群內容", "主要導覽")!.getAttribute("href"), "/apps/social-content?keep=1", "cross-app link strips source and target section_query while preserving unrelated params");
 });
+
+// Unified section_query stripping for host links (hrefFor) even when AppShell receipt fails (500)
+// and on Frame 0 before /api/app-installations resolves via persisted LastApp metadata.
+win.localStorage.clear();
+installationsFixture = [
+  {
+    ...mk("install-hr", "hr", "HR"),
+    navigation: { section_query: "hr_tab", default_section: "overview", sections: [secDef("overview", "Overview", "總覽"), secDef("leave", "Leave", "請假")] },
+  },
+  mk("install-soc", "social-content", "Social Content"),
+];
+const navLink = (text: string) =>
+  Array.from(host.querySelectorAll('aside nav[aria-label="Primary"] a')).find((a) => a.textContent?.trim() === text) as HTMLAnchorElement | undefined;
+await remount(async () => {
+  await settle(() => assert(appLink("HR"), "hr app listed"));
+  await go("/apps/hr?hr_tab=leave&record=r1&keep=1");
+  await settle(() => assert(navLink("Home")?.getAttribute("href") === "/?keep=1", "Home href strips hr_tab and record while keeping unrelated params even when receipt fails"));
+  equal(navLink("Projects")?.getAttribute("href"), "/projects?keep=1", "Projects href strips hr_tab and record while preserving keep=1");
+  equal(navLink("Settings")?.getAttribute("href"), "/settings?keep=1", "Settings href strips hr_tab and record while preserving keep=1");
+  equal(appLink("Social Content")?.getAttribute("href"), "/apps/social-content?keep=1", "Cross-app link strips hr_tab while preserving keep=1");
+});
+let releaseList!: (resp: Response) => void;
+pendingList = new Promise<Response>((resolve) => { releaseList = resolve; });
+const deepRoot = createRoot(host);
+history.pushState(null, "", "/apps/hr?hr_tab=leave&record=r1&keep=1");
+await React.act(async () => { deepRoot.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
+await settle(() => assert(navLink("Home"), "Primary nav mounted before installations list resolves"));
+equal(navLink("Home")?.getAttribute("href"), "/?keep=1", "Frame-0 deep-link Home href strips remembered hr_tab before /api/app-installations resolves");
+equal(navLink("Projects")?.getAttribute("href"), "/projects?keep=1", "Frame-0 deep-link Projects href strips remembered hr_tab before /api/app-installations resolves");
+pendingList = null;
+releaseList(json(installationsFixture));
+await flush();
+await React.act(async () => { deepRoot.unmount(); });
 
 console.log("app nav persistence checks passed");
 }

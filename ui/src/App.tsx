@@ -112,6 +112,7 @@ import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/res
 import { agentRowForEvent } from "./lib/agentOn";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
+  appNavigationSearch,
   goTo,
   locationHref,
   matchRoute,
@@ -119,10 +120,12 @@ import {
   projectScope,
   readLocation,
   showProjectChoices,
+  stripAppRouteParams,
   withProject,
   type AppLocation,
   type Route,
   type Screen,
+  type SectionQueryInput,
 } from "./lib/router";
 import { humanThreadsAvailable } from "./lib/humanThreads";
 import { navigate, useHref } from "./lib/useLocation";
@@ -141,11 +144,28 @@ function currentLocation(): AppLocation {
   return readLocation(location.pathname, location.search, browserStoredProjectView());
 }
 
+/** Active section query keys reported by the mounted workspace app or installed menu apps, cleared on exit or reset. */
+let mountedAppSectionQueries: readonly string[] = [];
+
+function navigationSearch(
+  from: Route,
+  to: Route,
+  rawSearch: string,
+  sectionQueries?: SectionQueryInput,
+): string {
+  return appNavigationSearch(
+    from,
+    to,
+    contextNavigationSearch(from, to, rawSearch),
+    sectionQueries ?? mountedAppSectionQueries,
+  );
+}
+
 /** Move to a new location built from the current one. */
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
   const current = currentLocation();
   const next = fn(current);
-  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search), current.route), opts);
+  navigate(locationHref(next, navigationSearch(current.route, next.route, location.search), current.route), opts);
 }
 
 const settingsHomeRoute: Route = { screen: "settings", section: "models" };
@@ -231,8 +251,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const fullHeight = screen === "home" || screen === "agents" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
-  /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search), route);
+  const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
+  const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -302,7 +322,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   personalWanted.current = screen === "myWork" && myWorkOn;
   const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
   const [, notifyPersonalDrafts] = useState(0);
-  useEffect(() => onPrivateSessionReset(() => personalDrafts.clear()), [personalDrafts]);
+  useEffect(() => onPrivateSessionReset(() => {
+    personalDrafts.clear();
+    mountedAppSectionQueries = [];
+  }), [personalDrafts]);
   useEffect(() => onIssueUnavailable((id) => {
     const suffix = `:${id}`;
     let changed = false;
@@ -349,7 +372,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
   useEffect(() => {
-    if (settingsTarget) navigate(hrefFor({ screen: "settings", section: settingsTarget }), { replace: true });
+    if (settingsTarget) {
+      const targetRoute: Route = { screen: "settings", section: settingsTarget };
+      navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
+    }
   }, [settingsTarget]);
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
@@ -877,16 +903,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     };
   }, []);
 
-  // The sidebar and the phone menu open a project page. The chip row
-  // and the memory picker filter the screen, and only a screen that has one.
-  const projectHref = (key: string) => {
-    const next = openProject(loc, key);
-    return locationHref(next, contextNavigationSearch(route, next.route, search));
-  };
-  const filterHref = (key: string) => {
-    const next = withProject(loc, key);
-    return locationHref(next, contextNavigationSearch(route, next.route, search));
-  };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
   // Board-level Apps menu (CAD-784, CAD-1116): the installed apps come
@@ -894,7 +910,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // open one), never from the bare route, so a forged installId in the
   // URL produces no entry. The active or last-used app also lists its
   // sections, and that stays on every screen.
-  const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
   const reportInstallation = useCallback((info: ActiveInstallation | null) => {
     setActiveApp((prev) => {
       if (prev === null && info === null) return prev;
@@ -961,7 +976,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     (installId: string) => installationAppHref(installations.list, installId),
     [installations.list],
   );
-  const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps = receipt === null ? installed
     : installed.some((a) => a.installId === receipt.installId)
@@ -991,18 +1005,73 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
+  const rememberedSectionQuery = onAppScreen && last?.sectionQuery && (
+    (route.screen === "workspaceApp" && last.installId === route.installId) ||
+    (route.screen === "workspaceAppKey" && last.appKey === route.appKey)
+  ) ? last.sectionQuery : null;
+  const keyMatchedSectionQuery = route.screen === "workspaceAppKey"
+    ? installed.find((app) => app.kind === route.appKey)?.navigation?.section_query ?? null
+    : null;
+  const currentSectionQuery = onAppScreen
+    ? (selectedMenuApp?.navigation?.section_query ??
+        receipt?.navigation?.section_query ??
+        keyMatchedSectionQuery ??
+        rememberedSectionQuery)
+    : null;
+  const activeSectionQueries = useMemo(() => {
+    if (!onAppScreen) return [];
+    const set = new Set<string>();
+    if (currentSectionQuery) set.add(currentSectionQuery);
+    for (const app of menuApps) {
+      if (app.navigation?.section_query) set.add(app.navigation.section_query);
+    }
+    return Array.from(set);
+  }, [onAppScreen, currentSectionQuery, menuApps]);
+  useEffect(() => {
+    mountedAppSectionQueries = activeSectionQueries;
+    return () => {
+      mountedAppSectionQueries = [];
+    };
+  }, [activeSectionQueries]);
+  const activeAppKey = selectedMenuApp?.kind ?? receipt?.kind ?? (route.screen === "workspaceAppKey" ? route.appKey : null);
+  const activeDeclaredSectionQuery = selectedMenuApp?.navigation?.section_query ?? receipt?.navigation?.section_query ?? null;
   const activeSection = selectedMenuApp ? sectionFromSearch(search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {
-      if (prev !== null && prev.installId === activeId && prev.section === activeSection) return prev;
-      const next = { installId: activeId, section: activeSection };
+      if (
+        prev !== null &&
+        prev.installId === activeId &&
+        prev.section === activeSection &&
+        (prev.appKey ?? null) === activeAppKey &&
+        (prev.sectionQuery ?? null) === activeDeclaredSectionQuery
+      ) {
+        return prev;
+      }
+      const next: LastApp = {
+        installId: activeId,
+        section: activeSection,
+        ...(activeAppKey ? { appKey: activeAppKey } : {}),
+        ...(activeDeclaredSectionQuery ? { sectionQuery: activeDeclaredSectionQuery } : {}),
+      };
       writeLastApp(next);
       return next;
     });
-  }, [activeId, activeSection]);
+  }, [activeId, activeSection, activeAppKey, activeDeclaredSectionQuery]);
   // CAD-1692: the sidebar unfolds Apps on entering an app, judged from the route.
   useEffect(() => { noteAppScreen(onAppScreen, activeId); }, [onAppScreen, activeId]);
+  /** The href of a route, carrying the scope and drawer like `goTo`. */
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), navigationSearch(route, r, search, activeSectionQueries), route);
+  // The sidebar and the phone menu open a project page. The chip row
+  // and the memory picker filter the screen, and only a screen that has one.
+  const projectHref = (key: string) => {
+    const next = openProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
+  const filterHref = (key: string) => {
+    const next = withProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
   const appMenu = {
     ...buildAppNav({
       apps: menuApps,
@@ -1022,16 +1091,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         // `installationAppHref` returns the encoded path; the route stores
         // the decoded key, and valid keys carry no encodable characters.
         const next: Route = { screen: "workspaceAppKey", appKey: decodeURIComponent(href2.slice("/apps/".length)) };
-        const targetSearch = new URLSearchParams(search);
-        if (installId !== activeId) {
-          for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation", "install"]) targetSearch.delete(key);
-          const currentSectionQuery = selectedMenuApp?.navigation?.section_query;
-          if (currentSectionQuery) targetSearch.delete(currentSectionQuery);
-          const targetSectionQuery = menuApps.find((app) => app.installId === installId)?.navigation?.section_query;
-          if (targetSectionQuery) targetSearch.delete(targetSectionQuery);
+        if (installId === activeId) {
+          return locationHref(goTo(loc, next), contextNavigationSearch(route, next, search), next);
         }
-        const nextSearch = targetSearch.toString();
-        return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));
+        const targetSectionQuery = menuApps.find((app) => app.installId === installId)?.navigation?.section_query ?? null;
+        return locationHref(
+          goTo(loc, next),
+          stripAppRouteParams(navigationSearch(route, next, search, activeSectionQueries), targetSectionQuery),
+          route,
+        );
       },
     }),
     notice: installations.retrying
@@ -1081,6 +1149,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         projects={projects}
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
+        hosted={meta?.hosted === true}
         signedIn={meta?.signed_in ?? null}
         accountOpen={accountOpen}
         account={<AccountMenu
@@ -1188,6 +1257,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projects={projects}
                 issues={issuesState}
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
+                hosted={meta?.hosted === true}
                 onNavigate={closeMenu}
               />
             </div>

@@ -90,6 +90,8 @@ export function sectionFromSearch(search: string, navigation?: ScreenNavigation 
 export interface LastApp {
   installId: string;
   section: string | null;
+  appKey?: string | null;
+  sectionQuery?: string | null;
 }
 
 const LAST_APP_KEY = "cadence.apps.last";
@@ -107,7 +109,17 @@ export function readLastApp(storage: Pick<Storage, "getItem"> | null = safeStora
     if (!raw) return null;
     const v = JSON.parse(raw) as Partial<LastApp>;
     if (typeof v.installId !== "string" || v.installId === "") return null;
-    return { installId: v.installId, section: typeof v.section === "string" ? v.section : null };
+    const appKey = typeof v.appKey === "string" && v.appKey !== "" ? v.appKey : undefined;
+    const sectionQuery =
+      typeof v.sectionQuery === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(v.sectionQuery)
+        ? v.sectionQuery
+        : undefined;
+    return {
+      installId: v.installId,
+      section: typeof v.section === "string" ? v.section : null,
+      ...(appKey ? { appKey } : {}),
+      ...(sectionQuery ? { sectionQuery } : {}),
+    };
   } catch {
     return null;
   }
