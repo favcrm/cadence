@@ -1762,7 +1762,6 @@ Object.assign(zhTW, {
   "text not retained": "未保留內文",
   "This board cannot serve this file’s historical bytes.": "此看板無法提供此檔案的歷史位元組。",
   "No page matched every word — these results match some of them.": "沒有頁面符合所有字詞 — 以下結果符合其中部分字詞。",
-  "The root lists folders — open a folder to add pages or uploads.": "根目錄列出資料夾 — 請開啟資料夾以新增頁面或上傳。",
   "nothing here yet — you can read this folder, but not add to it.": "此處尚無內容 — 您可以讀取此資料夾，但無法新增內容。",
   "A folder cannot move inside itself": "資料夾不能移入自身。",
   "Use a name without folders. Use Move to change the location.": "請使用不含資料夾的名稱。若要變更位置，請使用「移動」。",
@@ -1785,8 +1784,6 @@ Object.assign(zhTW, {
   "Trash landings loaded.": "已載入垃圾桶存放區。",
   "Landing": "存放區",
   "Operator-only · landings under .trash/": "僅限操作員 · 存放區位於 .trash/ 之下",
-  "Deleting moves a page or folder into one landing, which references any stored attachments. Restoring moves the landing back; the board checks attachment storage before the move.":
-    "刪除會把頁面或資料夾移入一個存放區，並保留對已儲存附件的參照。還原會移回該存放區；看板會在移動前檢查附件儲存狀態。",
   "reading the trash…": "正在讀取垃圾桶…",
   "The board refused this listing before any write.": "看板在任何寫入之前就拒絕了此清單。",
   "Trash browsing isn’t available on this board": "此看板不提供垃圾桶瀏覽",

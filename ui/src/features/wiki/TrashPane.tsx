@@ -217,10 +217,6 @@ function TrashBrowser({ navHref, readOnly, readOnlyReason, onToast, onRefresh }:
             <span className="wk-meta">{t("Operator-only · landings under .trash/")}</span>
           </div>
 
-          {status === "ready" && <Note>
-            {t("Deleting moves a page or folder into one landing, which references any stored attachments. Restoring moves the landing back; the board checks attachment storage before the move.")}
-          </Note>}
-
           <p className="sr-only" role="status">{announce}</p>
 
           {status === "loading" && <Loading what="reading the trash…" />}

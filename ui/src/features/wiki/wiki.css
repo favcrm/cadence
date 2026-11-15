@@ -72,12 +72,14 @@
   color: inherit;
 }
 
-.wk-trow.dir > .wk-tname {
+.wk-trow.dir > .wk-tname,
+.wk-trash-row > .wk-tname {
   color: var(--color-ink-200);
   font-weight: 500;
 }
 
-.wk-trow.on.dir > .wk-tname {
+.wk-trow.on.dir > .wk-tname,
+.wk-trash-row.on > .wk-tname {
   color: var(--color-accent);
 }
 
@@ -1249,13 +1251,19 @@
 
 /* The Trash entry sits below the folder tree, separated from the store. */
 .wk-trash-row {
+  position: relative;
   margin-top: 8px;
-  border-top: 1px solid var(--color-ink-800);
-  border-radius: 0 0 4px 4px;
-  padding-top: 8px;
 }
 
-.wk-trash-row .wk-tkind { color: var(--color-warn); }
+.wk-trash-row::before {
+  content: "";
+  position: absolute;
+  top: -4px;
+  left: 0;
+  right: 0;
+  border-top: 1px solid var(--color-ink-800);
+  pointer-events: none;
+}
 
 .wk-trash-tablewrap {
   overflow-x: auto;
