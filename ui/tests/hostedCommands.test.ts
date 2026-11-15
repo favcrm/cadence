@@ -125,6 +125,13 @@ async function main() {
   assert(card?.textContent?.includes("not available"), "the card says it is not available");
   assert(!card?.textContent?.includes("failed"), "an unavailable command did not fail");
 
+  requests.length = 0;
+  await type("/permissions");
+  await enter();
+  assert(!requests.some((r) => r.startsWith("POST") || r.includes("/api/master/permissions")), `hosted /permissions sends and reads nothing (got ${requests.join(", ")})`);
+  const permCard = host.querySelector('[data-cmd="permissions"]');
+  assert(permCard?.textContent?.includes("not available"), "hosted /permissions says it is not available");
+
   // No such verb: the words may be a message, and they must not be lost.
   const prose = "/tmp is full and the nightly backup stopped";
   requests.length = 0;
@@ -152,7 +159,7 @@ async function main() {
   await enter();
   assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
-  assert(!help.includes("/compact") && !help.includes("/model"), "help lists only what this board can run");
+  assert(!help.includes("/compact") && !help.includes("/model") && !help.includes("/permissions"), "help lists only what this board can run");
   assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
 
   // A board that advertises a verb gets it in the menu and sends it.
@@ -249,7 +256,8 @@ async function main() {
   requests.length = 0;
   await mount(false);
   await type("/");
-  assert(menu().length === 10, `a native menu keeps every verb (got ${menu().length})`);
+  assert(menu().length === 11, `a native menu keeps every verb (got ${menu().length})`);
+  assert(menu().some((row) => row.includes("/permissions")), "native menu includes /permissions");
   assert(host.querySelector<HTMLButtonElement>(".master-chips .chip-btn")?.disabled === false, "a native model chip stays a picker");
 
   await React.act(async () => { root.unmount(); });

@@ -1,5 +1,5 @@
-import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -45,10 +45,13 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
+import PermissionsSlashCard from "./PermissionsSlashCard";
+import { appendRejectReplyDraft, PermissionReplyContext } from "./PermissionCard";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
 import { TurnBar } from "../app-shell/chat/TurnBar";
-import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
+import { composerDraftState, setComposerDraft } from "../app-shell/chat/composerStore";
+import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
@@ -369,6 +372,8 @@ function WorkingRow({
 /** A `/` command's answer card (CAD-551), kept client-side — a read's
  * result, a mutation's ack (the durable system line also lands via the
  * stream), or the failure the daemon returned. */
+const HOME_COMPOSER_ID = "cadence-home-composer";
+
 interface CmdResult {
   id: number;
   name: string;
@@ -376,6 +381,8 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
+  /** Composer-local rich slash cards handled completely in client state. */
+  kind?: "permissions";
   /** This board cannot run the command: nothing was sent, and nothing failed. */
   unavailable?: boolean;
   /** The verb exists, but what was typed was not a use of it: nothing was sent. */
@@ -420,7 +427,17 @@ function CmdJson({ value }: { value: unknown }) {
   );
 }
 
-function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
+function CmdCard({
+  cmd,
+  onOpenIssue,
+  readOnly,
+  permissionsHref,
+}: {
+  cmd: CmdResult;
+  onOpenIssue: (id: string) => void;
+  readOnly: boolean;
+  permissionsHref: string;
+}) {
   const t = useTranslate();
   return (
     <div className="cmdcard card px-3 py-2 ml-8 min-w-0" data-cmd={cmd.name}>
@@ -441,7 +458,9 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
-      {cmd.value !== undefined ? (
+      {cmd.kind === "permissions" ? (
+        <PermissionsSlashCard readOnly={readOnly} permissionsHref={permissionsHref} />
+      ) : cmd.value !== undefined ? (
         <CmdJson value={cmd.value} />
       ) : (
         cmd.text && (
@@ -889,8 +908,10 @@ function MasterHome({
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
-  const writeBlock = useWriteBlock(readOnly);
+  const gateBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
   const block = composerBlock(writeBlock, status, hosted);
+  const effectiveReadOnly = readOnly || writeBlock !== null;
   const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
   const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
@@ -937,7 +958,8 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
-  const permissionPending = usePendingPermission(threadEntries);
+  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted !== true);
+  const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
   // A first connection in progress is not an outage, so it shows no notice.
@@ -1406,6 +1428,10 @@ function MasterHome({
         ]);
         return false;
       }
+      if (name === "permissions") {
+        setCmds((c) => [...c, { id, name, ok: true, kind: "permissions" }]);
+        return;
+      }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api
         .masterCommand(name, arg || undefined)
@@ -1482,8 +1508,33 @@ function MasterHome({
     });
   };
 
+  const focusHomeComposer = useCallback(() => {
+    const box = dockRef.current?.querySelector<HTMLTextAreaElement>(`#${HOME_COMPOSER_ID}`)
+      ?? (document.getElementById(HOME_COMPOSER_ID) as HTMLTextAreaElement | null);
+    box?.focus();
+  }, []);
+
+  const focusApprovalBar = useCallback(() => {
+    const bar = dockRef.current?.querySelector<HTMLElement>("[data-turn-bar][data-state='needs_approval']");
+    if (!bar) return false;
+    const target = bar.querySelector<HTMLElement>("button:not(:disabled)") ?? bar;
+    target.focus();
+    return true;
+  }, []);
+
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (effectiveReadOnly) return;
+      const existing = composerDraftState("home").text;
+      setComposerDraft("home", appendRejectReplyDraft(existing, command));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1615,7 +1666,13 @@ function MasterHome({
             />
             </ImageConversation.Provider>
             {cmds.map((c) => (
-              <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
+              <CmdCard
+                key={c.id}
+                cmd={c}
+                onOpenIssue={onOpenIssue}
+                readOnly={effectiveReadOnly}
+                permissionsHref={permissionsHref}
+              />
             ))}
           </div>
 
@@ -1682,6 +1739,16 @@ function MasterHome({
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
                 },
               }}
+              permission={
+                pendingPermission !== null
+                  ? {
+                      request: pendingPermission,
+                      readOnly: effectiveReadOnly,
+                      onRejectAndReply: (req) => rejectAndReplyDraft(req.command),
+                      onFocusComposer: focusHomeComposer,
+                    }
+                  : null
+              }
             />
             {/* Another conversation's turn (an app's), with its link: Home's
                 own turn is the turn bar above. */}
@@ -1700,6 +1767,8 @@ function MasterHome({
               commands={offered}
               onSent={engage}
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
+              textareaId={HOME_COMPOSER_ID}
+              onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
@@ -1712,6 +1781,7 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </PermissionReplyContext.Provider>
     </AssistantActorProvider>
   );
 }

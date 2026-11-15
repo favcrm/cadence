@@ -2074,6 +2074,20 @@ Object.assign(zhTW, {
   "Earlier entries could not be loaded.": "無法載入更早的記錄。",
 });
 
+// CAD-2318: in-chat TUI-style permission approvals and /permissions slash card.
+Object.assign(zhTW, {
+  "Pending permission requests and saved rules": "待審核的權限請求與已儲存的規則",
+  "Reject & reply…": "拒絕並回覆…",
+  "Reading permissions…": "正在讀取權限…",
+  "Saved rules": "已儲存的規則",
+  "Open full permissions": "開啟完整權限設定",
+  "No saved rules yet. Choose Always or Don't ask again on a request to save one.": "尚無已儲存的規則。在請求上選擇「永久」或「不再詢問」即可儲存。",
+  "Needs your approval": "需要你的核准",
+  "low": "低",
+  "medium": "中",
+  "high": "高",
+});
+
 // CAD-2268: generic unsaved-changes leave confirmation for installed app screens.
 Object.assign(zhTW, {
   "You have unsaved changes. Leave this page and discard your local edits?": "你有未儲存的變更。要離開此頁面並捨棄本機編輯內容嗎？",
