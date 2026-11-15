@@ -1,0 +1,27 @@
+{
+  "approve": {
+    "status": 409,
+    "code": "conflict",
+    "message": "The document changed; read it again."
+  },
+  "archive": {
+    "status": 403,
+    "code": "owner_only",
+    "message": "Only the workspace owner can archive a document."
+  },
+  "restore": {
+    "status": 403,
+    "code": "owner_only",
+    "message": "Only the workspace owner can restore a document."
+  },
+  "set-type": {
+    "status": 409,
+    "code": "approver_unavailable",
+    "message": "This type's approver is no longer a member; the owner must update it."
+  },
+  "confirm-type": {
+    "status": 409,
+    "code": "conflict",
+    "message": "The type changed; read it again."
+  }
+}

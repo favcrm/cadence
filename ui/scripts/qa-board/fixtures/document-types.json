@@ -1,0 +1,45 @@
+{
+  "capability": "cad2286.document-lifecycle.v1",
+  "baseline": {
+    "stages": [
+      "draft",
+      "in_review",
+      "approved",
+      "delivered",
+      "archived"
+    ],
+    "requireApproval": true,
+    "approver": null,
+    "archiveAfterDays": 30,
+    "recipientNote": ""
+  },
+  "types": [
+    {
+      "label": "qa-brief",
+      "requireApproval": true,
+      "approver": "usr_qa_member",
+      "recipientNote": "QA fixture note: synthetic text only.",
+      "archiveAfterDays": 14,
+      "state": "confirmed",
+      "rev": 2
+    },
+    {
+      "label": "qa-memo",
+      "requireApproval": true,
+      "approver": "usr_qa_reviewer",
+      "recipientNote": "",
+      "archiveAfterDays": 60,
+      "state": "confirmed",
+      "rev": 3
+    },
+    {
+      "label": "qa-proposal",
+      "requireApproval": true,
+      "approver": "usr_qa_member",
+      "recipientNote": "",
+      "archiveAfterDays": 30,
+      "state": "pending",
+      "rev": 1
+    }
+  ]
+}

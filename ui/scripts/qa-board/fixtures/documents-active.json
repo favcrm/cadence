@@ -1,0 +1,134 @@
+{
+  "documents": [
+    {
+      "file": {
+        "id": "art-qa1",
+        "version": 2,
+        "kind": "md",
+        "title": "QA fixture: brief awaiting your approval",
+        "label": "qa-brief",
+        "customer": "",
+        "bytes": 1237,
+        "digest": "a5c77cc2f239e3e1421cdea8186a713cec710f72c2b5e8930c5787efcd2c4dd0",
+        "created": "2026-11-12T10:00:00.000Z",
+        "issue": null,
+        "shared": false
+      },
+      "document": {
+        "type": "qa-brief",
+        "stage": "in_review",
+        "submittedVersion": 2,
+        "approvedVersion": null,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 3
+      }
+    },
+    {
+      "file": {
+        "id": "art-qa2",
+        "version": 1,
+        "kind": "md",
+        "title": "QA fixture: proposal waiting for the owner",
+        "label": "qa-proposal",
+        "customer": "",
+        "bytes": 1274,
+        "digest": "bde4ae3c47262b4af17532efc8ae2b228c6f08273956a75605b40da25098b93d",
+        "created": "2026-11-12T11:30:00.000Z",
+        "issue": null,
+        "shared": false
+      },
+      "document": {
+        "type": "qa-proposal",
+        "stage": "in_review",
+        "submittedVersion": 1,
+        "approvedVersion": null,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 2
+      }
+    },
+    {
+      "file": {
+        "id": "art-qa3",
+        "version": 1,
+        "kind": "md",
+        "title": "QA fixture: memo in draft",
+        "label": "qa-memo",
+        "customer": "",
+        "bytes": 1311,
+        "digest": "c5d80ea33c4b4667fd453e30e112d690b8c2bc6325f3de8d195c203942cd59de",
+        "created": "2026-11-13T08:15:00.000Z",
+        "issue": null,
+        "shared": false
+      },
+      "document": {
+        "type": "qa-memo",
+        "stage": "draft",
+        "submittedVersion": null,
+        "approvedVersion": null,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 1
+      }
+    },
+    {
+      "file": {
+        "id": "art-qa4",
+        "version": 1,
+        "kind": "md",
+        "title": "QA fixture: approved brief",
+        "label": "qa-brief",
+        "customer": "",
+        "bytes": 1348,
+        "digest": "2389486dec626adfe89097fecb8661e8b6c1795a37b1b3c3c98b292bf1637fc2",
+        "created": "2026-11-11T14:00:00.000Z",
+        "issue": null,
+        "shared": false
+      },
+      "document": {
+        "type": "qa-brief",
+        "stage": "approved",
+        "submittedVersion": 1,
+        "approvedVersion": 1,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 3
+      }
+    },
+    {
+      "file": {
+        "id": "art-qa5",
+        "version": 1,
+        "kind": "html",
+        "title": "QA fixture: delivered memo",
+        "label": "qa-memo",
+        "customer": "",
+        "bytes": 1385,
+        "digest": "70a21ae4a2f7605e80baa83ed36e777c83e334565377af5e7fb45d0cf5678153",
+        "created": "2026-11-09T16:45:00.000Z",
+        "issue": null,
+        "shared": true
+      },
+      "document": {
+        "type": "qa-memo",
+        "stage": "delivered",
+        "submittedVersion": 1,
+        "approvedVersion": 1,
+        "selfApproved": false,
+        "deliveredVersion": 1,
+        "deliveredAt": 1794427200000,
+        "archivedAt": null,
+        "rev": 4
+      }
+    }
+  ]
+}

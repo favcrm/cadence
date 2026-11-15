@@ -29,6 +29,7 @@
     },
     "user_agent": "qa-board"
   },
+  "settings_sections": ["preferences", "members", "documents"],
   "signed_in": true,
   "tab_signed_out": false,
   "tailnet_url": null,
