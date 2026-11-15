@@ -35,6 +35,8 @@ import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
 import Members from "./features/settings/Members";
 import { documentsNavHidden, documentsProbe } from "./features/documents/documentsProbe";
+import DocumentsScreen from "./features/documents/DocumentsScreen";
+import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
@@ -350,10 +352,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
-  // Probe on a hosted board when it mounts and when the session identity
-  // changes; the routine `refresh` below asks again too. A latched
-  // `unavailable` answer makes no request for the rest of the session.
+  // The routine `refresh` below probes on mount and on every recheck; this
+  // asks again only when the session identity changes afterwards, so a mount
+  // probes once. A latched `unavailable` answer makes no request for the rest
+  // of the session.
+  const probedIdentity = useRef(personalIdentity);
   useEffect(() => {
+    if (probedIdentity.current === personalIdentity) return;
+    probedIdentity.current = personalIdentity;
     if (documentsHosted) void documentsProbe.revalidate();
   }, [documentsHosted, personalIdentity]);
 
@@ -1025,7 +1031,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation", "install"]) targetSearch.delete(key);
         }
         const nextSearch = targetSearch.toString();
-        return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));
+        // `route` as the origin: leaving Documents drops its `archived`/`stage`.
+        return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch), route);
       },
     }),
     notice: installations.retrying
@@ -1586,6 +1593,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CredentialAuthorize key={route.requestId} requestId={route.requestId} />
         )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
+        {/* CAD-2286: hosted only. A native board, or a hosted one whose probe is
+            not available, gets the screen's unavailable state, never a blank body. */}
+        {route.screen === "documents" && (
+          <DocumentsScreen
+            hosted={documentsHosted}
+            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
+            archived={route.archived}
+            stage={route.stage}
+            hrefFor={hrefFor}
+          />
+        )}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}

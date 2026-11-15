@@ -553,8 +553,10 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
   // CAD-2286: Documents owns `archived` and `stage` and drops them elsewhere,
-  // except on a mounted app route, whose own query may use either name.
-  if (route.screen !== "workspaceApp" && route.screen !== "workspaceAppKey") for (const key of DOCUMENTS_PARAMS) q.delete(key);
+  // except on a mounted app route, whose own query may use either name. Leaving
+  // Documents for an app route drops them too: there they are still Documents'.
+  const appRoute = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
+  if (!appRoute || from?.screen === "documents") for (const key of DOCUMENTS_PARAMS) q.delete(key);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
   // `workspaceApp` compat route) own these; they stay on the app's own
   // route and never follow the user to /settings and the like.

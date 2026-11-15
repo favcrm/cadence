@@ -375,4 +375,10 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
   const legacyApp = readLocation("/app-installations/install-a", appQuery);
   equal(locationHref(legacyApp, appQuery), "/app-installations/install-a?stage=lead&archived=1&keep=1", "the compat app route keeps them too");
   equal(locationHref(goTo(app, { screen: "home" }), appQuery), "/?keep=1", "leaving the app drops them");
+  // Leaving Documents for an app route drops Documents' own params: they were
+  // the screen's, not the app's.
+  const crm: Route = { screen: "workspaceAppKey", appKey: "crm" };
+  equal(locationHref(goTo(loc, crm), both, loc.route), "/apps/crm?keep=1", "documents → app drops the stage");
+  equal(locationHref(goTo(archived, crm), "?archived=1&keep=1", archived.route), "/apps/crm?keep=1", "documents → app drops the tab");
+  equal(locationHref(goTo(archived, { screen: "workspaceApp", installId: "install-a" }), "?archived=1", archived.route), "/app-installations/install-a", "documents → compat app route drops them too");
 }
