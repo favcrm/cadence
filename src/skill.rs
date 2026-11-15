@@ -951,7 +951,7 @@ mod tests {
         match show("cadence-app-dev", Some("SKILL.md")).unwrap() {
             ShowOutput::File(text) => {
                 assert!(text.contains("createScreenBridge"));
-                assert!(text.contains("installSandboxFormActions"));
+                assert!(text.contains("preventDefault"));
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }

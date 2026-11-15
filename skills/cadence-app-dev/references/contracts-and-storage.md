@@ -7,7 +7,7 @@ Always inspect the target repository's existing manifests and pinned contract ve
 Detached app repositories expose a `cadence` object in root `package.json` for local dev and verification (`cadence app dev --package .`):
 
 - Required/standard fields: `cadence.app` (app identifier), `cadence.dev` (local dev command), `cadence.check` (verification command).
-- **Command grammar rule:** Commands in `cadence.dev` and `cadence.check` must **not** contain shell metacharacters (`;`, `&&`, `||`, `|`, `<`, `>`, backticks, or `$()`). Point to a single binary or script file instead of chaining shell commands.
+- **Command grammar rule:** Commands in `cadence.dev` must be a single command and must **not** contain shell metacharacters (`;`, `&&`, `||`, `|`, `<`, `>`, backticks, or `$()`); put multiple steps in a script file. `cadence.check` runs via `sh -c`.
 - `cadence app dev --package .` injects a scrubbed environment (`CADENCE_APP_ROOT`, `CADENCE_APP_NAME`, `CADENCE_APP_PORT`, `CADENCE_APP_HOST`, `CADENCE_APP_CONTRACT`) bound to `127.0.0.1` ports `3110..=3199`.
 
 ## 2. `app/app.md` & Explorer `listing:` Metadata
@@ -25,7 +25,7 @@ Each mounted screen declares a manifest under `app/screens/<tag>/screens.json`:
 
 - Bundle bounds: `MAX_SCREENS = 8`, `MAX_ASSETS = 32`, `MAX_MANIFEST_BYTES = 32_768` (`32 KiB`), aggregate bundle size cap `2 MiB`.
 - `navigation` block (validated strictly by host):
-  - `section_query`: app-owned URL query parameter (`1..=32` chars matching `^[a-z][a-z0-9_-]{0,31}$`). Cannot reuse host-reserved keys (`app`, `install`, `install_id`, `context`, `context_id`, `actor`, `identity`, `auth`, `token`, `key`, `session`, `session_key`, `origin`, `project`, `workspace`, `conversation`, `thread`, `message`, `view`, `appview`, `record`, `record_id`, `segment`, `segment_id`, `screen`, `contract-preview`, `nonce`, `proof`).
+  - `section_query`: app-owned URL query parameter (`1..=32` chars matching `^[a-z][a-z0-9_-]{0,31}$`). Cannot reuse host-reserved keys (`app`, `install`, `install_id`, `context`, `context_id`, `ctx`, `actor`, `identity`, `auth`, `token`, `key`, `session`, `session_key`, `origin`, `project`, `workspace`, `conversation`, `thread`, `message`, `view`, `appview`, `record`, `record_id`, `segment`, `segment_id`, `screen`, `contract-preview`, `nonce`, `proof`, `generation`, `digest`).
   - `sections`: `1..=8` `{ id, label }` objects (unique valid tags for `id`; non-empty `label` <= 40 UTF-16 code units with no control characters).
   - `default_section`: must match one of the declared `sections[].id`.
 
@@ -46,7 +46,7 @@ Apps that persist structured relational records declare `app/app-storage.json`, 
   - `add_column` (`table`, `column`; **non-null additive columns require a `default`**)
   - `create_index` (`table`, `name`, `columns`, `unique`)
   - `backfill` (`table`, `column`, `value`, `only_null`)
-- **Hard limits (`APP_STORAGE_LIMITS`):**
+- **Runtime limits (enforced by the hosted target `app-storage/v1` runtime):**
   - `descriptorBytes`: `32 KiB`, `migrationBytes`: `64 KiB`, `migrationTotalBytes`: `256 KiB`
   - `migrations`: `128`, `tables`: `64`, `columns`: `64`, `indexes`: `32`, `migrationOperations`: `128`, `operations`: `512`
   - `defaultRecordBytes`: `16 KiB`, `recordBytes`: `256 KiB`, `records`: `100,000`, `page`: `100`
@@ -60,7 +60,7 @@ Apps that persist structured relational records declare `app/app-storage.json`, 
 Data-only descriptor telling the trusted host `Conversation` frame how to integrate assistant chat:
 
 - Top-level keys (`additionalProperties: false`): `contract: "app-chat/v1"`, `app`, optional `contexts` (`<= 12`, max 3 quick prompts each), `attachments` (`<= 4`), `directives` (`<= 8`, unique `match`, each carrying either a declared text `card` with `<= 2` buttons or `render: "screen:<tag>"`), `subjects` (`<= 8`), and `presentation` (`{ showContext?: boolean }`).
-- **Bounds & Forbidden Keys:** whole file `<= 16 KiB`, `<= 1024` JSON nodes, nesting depth `<= 12`; rejects forbidden code/injection keys (`__proto__`, `prototype`, `constructor`, `script`, `scripts`, `code`, `html`, `innerHTML`, `css`, `style`, `javascript`, `eval`, `import`, `module`, `url`, `uri`, `href`, `src`, `link`, `action`).
+- **Bounds & Forbidden Keys:** whole file `<= 16 KiB`, `<= 1024` JSON nodes, nesting depth `<= 12`; rejects 53 forbidden code/injection/callback/URL keys defined in `contracts/app-chat/v1/app-chat.schema.json` `$defs.safeObject` (such as `__proto__`, `prototype`, `constructor`, `script`, `scripts`, `code`, `html`, `innerHTML`, `css`, `style`, `javascript`, `eval`, `import`, `module`, `url`, `uri`, `href`, `src`, `link`, `action`).
 
 ## 6. Bundled `app/skills/<tag>/` Packages
 
