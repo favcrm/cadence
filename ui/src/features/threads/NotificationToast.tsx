@@ -11,11 +11,12 @@ interface Alert {
   title: string;
   href: string;
   note: string;
+  translateNote: boolean;
 }
 
 export interface ToastApi {
   /** Announce a new message for `room` (a Threads room unless `target.href` says where Open goes). Deduplicated per room by the caller's seq. */
-  show: (title: string, room: string, target?: { href: string; note: string }) => void;
+  show: (title: string, room: string, target?: { href: string; note: string; translateNote?: boolean }) => void;
   /** Drop one room's alert after it is seen, or every alert on identity change. */
   clear: (room?: string) => void;
 }
@@ -61,17 +62,18 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
   }, [dropTimers]);
 
   const show = useCallback(
-    (title: string, room: string, target?: { href: string; note: string }) => {
+    (title: string, room: string, target?: { href: string; note: string; translateNote?: boolean }) => {
       if (retired.current || !privateReadsAllowed()) return;
       const existing = pending.current.get(room);
       const id = ++seq.current;
       pending.current.set(room, id);
       const href = target?.href ?? `/threads?h=${encodeURIComponent(room)}`;
       const note = target?.note ?? "Unread until you open it.";
+      const translateNote = target === undefined ? true : target.translateNote === true;
       setAlerts((cur) => {
         if (retired.current || !privateReadsAllowed()) return cur;
         const rest = cur.filter((a) => !(a.href === href && a.id === existing));
-        return [...rest, { id, title, href, note }].slice(-3);
+        return [...rest, { id, title, href, note, translateNote }].slice(-3);
       });
       const timer = window.setTimeout(() => {
         timers.current.delete(id);
@@ -108,8 +110,8 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
         {alerts.map((a) => (
           <div key={a.id} className="notification-toast" role="status">
             <div>
-              <strong>{a.title}</strong>
-              <p>{t(a.note)}</p>
+              <strong>{a.title === "Assistant replied" ? t("Assistant replied") : a.title}</strong>
+              <p>{a.translateNote ? t(a.note) : a.note}</p>
               <button type="button" className="lnk" onClick={() => { dismiss(a.id); navigate(a.href); }}>{t("Open")}</button>
             </div>
             <Button variant="ghost" size="sm" aria-label={t("Dismiss notification")} icon={<IconClose />} onClick={() => dismiss(a.id)} />

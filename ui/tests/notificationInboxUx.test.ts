@@ -158,6 +158,90 @@ async function main(): Promise<void> {
     await React.act(async () => { zhAllTab.click(); });
     assert(popover().textContent?.includes("尚無對話通知。"), "zh-TW All tab empty state localized");
 
+    // NotificationToast translates fixed "Assistant replied" & "Home" without translating user room/thread labels.
+    const { useNotificationToast } = require<typeof ToastModule>("../src/features/threads/NotificationToast");
+    let toastApi: ToastModule.ToastApi | null = null;
+    function ToastHarness() {
+      toastApi = useNotificationToast();
+      return null;
+    }
+    await React.act(async () => {
+      root?.render(
+        React.createElement(
+          LocaleTextProvider,
+          { value: (english: string) => translateUiText(english, "zh-TW") },
+          React.createElement(
+            NotificationToastProvider,
+            null,
+            React.createElement(React.Fragment, null, React.createElement(NotificationInbox, { key: "zh-2", authEpoch: "ux-zh-2" }), React.createElement(ToastHarness)),
+          ),
+        ),
+      );
+    });
+    await settle(() => toastApi !== null && host.querySelector("button.bell-button") !== null, "zh-2 inbox and toast mount");
+    await React.act(async () => {
+      toastApi?.show("Assistant replied", "assistant:home", { href: "/", note: "Home", translateNote: true });
+      toastApi?.show("Assistant replied", "assistant:room-1", { href: "/app-installations/i1?conversation=c1", note: "Open" });
+    });
+    const toasts = Array.from(host.querySelectorAll('[role="status"].notification-toast'));
+    assert(toasts.length === 2, "two assistant toasts mounted");
+    assert(toasts[0]?.textContent?.includes("助理已回覆") && toasts[0]?.textContent?.includes("首頁"), "zh-TW home toast translated");
+    assert(toasts[1]?.textContent?.includes("助理已回覆") && toasts[1]?.textContent?.includes("Open"), "user thread label is not accidentally dictionary-translated");
+
+    // Escape is ignored when another modal dialog is open or event.defaultPrevented is set.
+    await React.act(async () => { bell().click(); });
+    assert(popover().open, "popover opens before modal Escape check");
+    const externalModal = document.createElement("div");
+    externalModal.setAttribute("aria-modal", "true");
+    document.body.append(externalModal);
+    let docEscDefaultPrevented = false;
+    const obsKey = (e: KeyboardEvent) => { docEscDefaultPrevented = e.defaultPrevented; };
+    document.addEventListener("keydown", obsKey);
+    await React.act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    document.removeEventListener("keydown", obsKey);
+    externalModal.remove();
+    assert(popover().open && !docEscDefaultPrevented, "popover ignores Escape when an external modal dialog is open");
+    const prevented = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    prevented.preventDefault();
+    await React.act(async () => { document.dispatchEvent(prevented); });
+    assert(popover().open, "popover ignores Escape when defaultPrevented is already true");
+
+    // 401/403/404 clears inbox AND resets popoverOpen so document Escape listeners do not intercept keys afterward.
+    let fail401 = false;
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const path = new URL(input instanceof Request ? input.url : String(input), "http://localhost").pathname;
+      if (path === "/api/human-threads/notifications") {
+        if (fail401) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify(emptyFeed), { headers: { "Content-Type": "application/json" } });
+      }
+      throw new Error(`Unexpected request ${path}`);
+    };
+    await React.act(async () => {
+      root?.render(
+        React.createElement(NotificationToastProvider, null, React.createElement(NotificationInbox, { key: "auth-reset", authEpoch: "ux-auth-1" })),
+      );
+    });
+    await settle(() => host.querySelector("button.bell-button") !== null, "auth-reset mounts");
+    await React.act(async () => { bell().click(); });
+    assert(popover().open, "popover open before 401 auth change");
+    fail401 = true;
+    await React.act(async () => {
+      root?.render(
+        React.createElement(NotificationToastProvider, null, React.createElement(NotificationInbox, { key: "auth-reset", authEpoch: "ux-auth-2" })),
+      );
+    });
+    await settle(() => host.querySelector("button.bell-button") === null, "401 hides inbox");
+    let after401Prevented = false;
+    const after401Obs = (e: KeyboardEvent) => { after401Prevented = e.defaultPrevented; };
+    document.addEventListener("keydown", after401Obs);
+    await React.act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    document.removeEventListener("keydown", after401Obs);
+    assert(!after401Prevented, "401 detaches popover Escape handler immediately");
+
     console.log("notification inbox ux checks passed");
   } finally {
     const mounted = root;

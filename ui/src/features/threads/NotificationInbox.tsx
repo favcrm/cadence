@@ -193,6 +193,10 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             // threads at all (CAD-1704): clear everything and stop. The next
             // auth epoch retries.
             stop();
+            setSettingsOpen(false);
+            setPopoverOpen(false);
+            popover.current?.close();
+            settings.current?.close();
             if (known.current !== null) releaseDevice();
             known.current = null;
             setInbox(null);
@@ -241,7 +245,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   useEffect(() => {
     if (!popoverOpen || settingsOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || settings.current?.open) return;
+      if (event.key !== "Escape" || event.defaultPrevented || settings.current?.open) return;
+      const openModal = document.querySelector("dialog:modal, [aria-modal='true']");
+      if (openModal && !popover.current?.contains(openModal)) return;
       event.preventDefault();
       event.stopPropagation();
       popover.current?.close();

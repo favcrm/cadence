@@ -2686,6 +2686,7 @@ Object.assign(zhTW, {
   "22:00 to 08:00": "22:00 至 08:00",
   "New direct message in {title}": "{title} 有新的私人訊息",
   "New mention in {title}": "{title} 提及了你",
+  "Assistant replied": "助理已回覆",
   "Unread until you open it.": "開啟前會維持未讀狀態。",
   "Dismiss notification": "關閉通知提示",
   "Could not sync browser alerts. Your threads still load.": "無法同步瀏覽器提示，但對話串仍可正常載入。",
