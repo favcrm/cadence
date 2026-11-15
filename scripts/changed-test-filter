@@ -8,7 +8,8 @@ test) and notices on stderr. With --github-output it also writes `selected=`
 (true/false), `filter=` and `cargo_args=` (the cargo flags that narrow the
 build to the targets holding the selected tests).
 
-Selection, from the merge-base diff of added, copied, modified and renamed files:
+Selection, from the merge-base diff (renames as a deletion plus an addition, so a
+file moved out of these trees still counts; type changes and deletions included):
 
   src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
                                A `mod.rs` selects the modules whose
@@ -42,6 +43,9 @@ and unquoted (`-z`, `core.quotePath=false`) and include type changes.
 Fail closed, bounded: nothing under those two paths is dropped. An unbounded
 change widens to one binary or one module tree, never to the full suite, and a
 selection that matches no test fails the run (`--no-tests fail`).
+Known limit: a helper is assumed to serve only the module it lives in. Today no
+test module in either tree uses another sibling module's helpers; if one ever
+does, put the helper in a mod.rs (which widens) rather than a test file.
 Compile coverage of every test-seam target is ci.yml's required clippy job;
 this selection decides only which tests to run.
 
@@ -283,13 +287,13 @@ def main():
     args = ap.parse_args()
     # NUL-separated and unquoted: git's default quoting would hide a path with
     # a non-ASCII, control, quote or backslash byte from the prefix checks.
-    files = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z",
+    files = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames",
                             "--diff-filter=ACMRT",
                             f"{args.base}...{args.head}").split("\0") if f]
     # Deleted data files: a test may read one at run time, and nothing fails
     # to compile when it goes. A deleted .rs file under src/daemon/tests/
     # leaves its `mod` line behind, which clippy catches.
-    deleted = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z",
+    deleted = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames",
                               "--diff-filter=D",
                               f"{args.base}...{args.head}").split("\0") if f]
     daemon, suite = [], []

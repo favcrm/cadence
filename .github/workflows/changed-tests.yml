@@ -1,6 +1,6 @@
 # CAD-2307: a narrow, written exception to CAD-1970 (AGENTS.md "Testing
 # principles"). The full suite stays off pull requests; this job runs ONLY the
-# daemon tests (src/daemon/tests/**) and suite tests (tests/suite.rs) that the
+# daemon tests (src/daemon/tests/**) and suite tests (tests/**) that the
 # PR adds or changes, under the test-seam feature, in one build with no shards.
 # A setup panic in a new test then shows on the PR instead of after a 25-40
 # minute tests.yml run.
@@ -8,8 +8,9 @@
 # Selection is scripts/changed-test-filter (a nextest filterset from the diff).
 # It fails closed but bounded: an unbounded suite.rs edit selects the whole
 # suite binary, a mod.rs edit other than an added `mod x;` widens to its
-# directory (the exact rules are in the script header), and an empty selection
-# fails the run. This job does not compile-check test-seam
+# directory, a fixture under tests/ selects the suite binary and all of
+# daemon::tests (the exact rules are in the script header), and an empty
+# selection fails the run. This job does not compile-check test-seam
 # modules that no changed test selects: ci.yml's required clippy job
 # (--all-targets --features test-seam) already compiles every test-seam target,
 # so a source edit that breaks one fails there. This job adds running the
