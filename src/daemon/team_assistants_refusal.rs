@@ -7177,6 +7177,13 @@ mod master_home_acceptance {
                 .recv_timeout(wait)
                 .expect("home worker emitted no promotion outcome");
             if id == request_id {
+                // "pending" is the sweep's retry signal: the tracker write
+                // lock was busy with another writer (the PM checkup's
+                // blocked sweep and backlog groom run at daemon start), so
+                // the next sweep retries. Any other non-created outcome is a failure.
+                if outcome == "pending" {
+                    continue;
+                }
                 assert_eq!(outcome, "created", "home job promotion failed");
                 break;
             }

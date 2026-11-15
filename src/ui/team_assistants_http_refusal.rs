@@ -524,6 +524,12 @@ fn start_with_history_fault(
             assist_request_sweep_observer: observer,
             stop: Some(stop.clone()),
             member_history_page_fault,
+            // The PM checkup runs at daemon start and writes the tracker
+            // (blocked sweep, backlog groom), each write under the tracker
+            // write lock. That timing-dependent background writer is not
+            // part of any refusal under test, and it raced the "no effect"
+            // snapshots; the fixture runs without it.
+            checkup: Some(0),
             ..ServeOptions::default()
         };
         opts.provider_env
@@ -872,7 +878,20 @@ fn promote_http_fixture_and_restore_service(
 }
 
 /// A whole-store byte snapshot — the "no effect" probe for refused HTTP calls.
+///
+/// Every tracker write holds `.write.lock` for its duration, so an
+/// unsynchronised read can land mid-commit and see that marker or a
+/// half-written tree. The snapshot takes the tracker write lock itself and
+/// reads the tree under it: no writer can be mid-commit, and a write that
+/// finished earlier is already in the snapshot, so a real effect still
+/// differs. The only entry excluded is the `.write.lock` marker this
+/// snapshot's own guard wrote — never one a writer left behind, because
+/// holding the lock proves there is none.
 fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let pm = crate::issue::Pm::at(root).unwrap();
+    let guard = pm
+        .lock_for(Duration::from_secs(30))
+        .expect("tracker write lock never quiesced for the no-effect snapshot");
     fn walk(
         base: &std::path::Path,
         dir: &std::path::Path,
@@ -894,6 +913,9 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     }
     let mut out = std::collections::BTreeMap::new();
     walk(root, root, &mut out);
+    // Our own guard's marker: held, so it is ours alone.
+    out.remove(".write.lock");
+    drop(guard);
     out
 }
 
