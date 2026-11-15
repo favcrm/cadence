@@ -18,9 +18,9 @@ Selection, from the merge-base diff of added, copied, modified and renamed files
                                helper, `use`) also selects its whole directory,
                                as does a mod.rs diff that adds no module (the
                                root one is all of daemon::tests, about 190
-                               tests). Any other file
-                               under src/daemon/tests/ (not .rs) also selects
-                               all of daemon::tests.
+                               tests). Any other file under src/daemon/tests/
+                               (not .rs), added, changed or deleted, also
+                               selects all of daemon::tests.
   tests/suite.rs               the single integration target (CAD-1727). Each
                                changed line maps to its enclosing `#[test]`
                                fn; a changed helper selects its enclosing
@@ -29,8 +29,10 @@ Selection, from the merge-base diff of added, copied, modified and renamed files
                                (top-level helper, `use`) cannot be bounded, so
                                it selects the whole `suite` binary (about 224
                                tests, one binary) and says so on stderr.
-  tests/<anything else>        fixtures the suite reads (include_str! and
-                               friends) select the whole `suite` binary too.
+  tests/<anything else>        fixtures (read via include_str! or at run time,
+                               by the suite and by daemon tests) select the
+                               whole `suite` binary and all of daemon::tests,
+                               deletions included.
 
 A path under src/daemon/tests/ whose components are not plain identifiers
 (non-ASCII, quotes, backslashes, spaces) selects all of daemon::tests; such a
@@ -98,6 +100,11 @@ def classify_mod_diff(diff, parent):
             continue
         raw = line[1:].strip()
         if not raw:
+            continue
+        if raw.startswith("#[path"):
+            # A module whose file is named elsewhere: its later edits would not
+            # map back to it, so treat the directory as changed.
+            widen = True
             continue
         if line[0] == "-":
             widen = True
@@ -279,8 +286,20 @@ def main():
     files = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z",
                             "--diff-filter=ACMRT",
                             f"{args.base}...{args.head}").split("\0") if f]
+    # Deleted data files: a test may read one at run time, and nothing fails
+    # to compile when it goes. A deleted .rs file under src/daemon/tests/
+    # leaves its `mod` line behind, which clippy catches.
+    deleted = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z",
+                              "--diff-filter=D",
+                              f"{args.base}...{args.head}").split("\0") if f]
     daemon, suite = [], []
     whole_suite = False
+    for p in deleted:
+        if p.startswith(DAEMON_ROOT) and not p.endswith(".rs"):
+            daemon.append("daemon::tests::")
+        elif p.startswith("tests/") and p != SUITE:
+            whole_suite = True
+            daemon.append("daemon::tests::")
     for p in files:
         if p.startswith(DAEMON_ROOT):
             rel = p[len(DAEMON_ROOT):]
@@ -294,9 +313,17 @@ def main():
             else:
                 daemon.append(daemon_prefix(p))
         elif p.startswith("tests/") and p != SUITE:
-            whole_suite = True  # fixtures the suite target reads via include_str!
+            # Fixtures: the suite reads them (include_str! and at run time), and
+            # so do daemon tests (e.g. tests/fixtures/apps via
+            # CARGO_MANIFEST_DIR). Both bounded trees run.
+            whole_suite = True
+            daemon.append("daemon::tests::")
     if SUITE in files:
         suite, unbounded = suite_filters(args.base, args.head)
+        if not suite and not unbounded:
+            # The file changed but no line mapped (a binary-marked diff, say):
+            # never select nothing for a changed suite.
+            unbounded = ["?"]
         if unbounded:
             print(f"changed-test-filter: {SUITE} lines {unbounded[:10]} are outside any "
                   "test fn or mod; selecting the whole suite binary", file=sys.stderr)

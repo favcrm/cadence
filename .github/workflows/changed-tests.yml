@@ -7,8 +7,9 @@
 #
 # Selection is scripts/changed-test-filter (a nextest filterset from the diff).
 # It fails closed but bounded: an unbounded suite.rs edit selects the whole
-# suite binary, a mod.rs edit that adds no module selects its directory, and an
-# empty selection fails the run. This job does not compile-check test-seam
+# suite binary, a mod.rs edit other than an added `mod x;` widens to its
+# directory (the exact rules are in the script header), and an empty selection
+# fails the run. This job does not compile-check test-seam
 # modules that no changed test selects: ci.yml's required clippy job
 # (--all-targets --features test-seam) already compiles every test-seam target,
 # so a source edit that breaks one fails there. This job adds running the
@@ -34,9 +35,11 @@ concurrency:
 permissions:
   contents: read
 
-# rust-cache and sccache hash these into their keys; they match tests.yml and
-# ci.yml so the shared restore keys line up. (save-if is false: this job only
-# restores, as tests.yml does.)
+# rust-cache and sccache hash these into their keys; they match ci.yml. The
+# gate-test-ld2 key restored below has had no saver since CAD-1970 dropped
+# cache-warm's test leg, so the restore is a no-op kept in step with tests.yml
+# (save-if is false: this job never writes it); the read-only sccache is what
+# warms the build.
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings

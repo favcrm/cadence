@@ -358,17 +358,16 @@ a red test finds its owner instead of blocking an unrelated push. Per-module
 acceptance suites, integration targets and contract tests for the CI scripts
 themselves are retired. One narrow exception (CAD-2307): `changed-tests.yml`
 runs, on a PR, only the daemon and suite tests that PR adds or changes
-(`src/daemon/tests/**`, `tests/suite.rs`), under `--features test-seam`, in one
+(`src/daemon/tests/**`, `tests/**`), under `--features test-seam`, in one
 build with no shards; a PR touching none skips the build and run. Selection
 fails closed but bounded: an edit it cannot map to a test widens to one module
-tree or the one `suite` binary, never to the full suite, and an empty selection
-fails the run. The exact rules are in the header of
+tree, the one `suite` binary, or both (a fixture), never to the full suite, and
+an empty selection fails the run. The exact rules are in the header of
 `scripts/changed-test-filter`. Compile coverage of every test-seam target is
 `ci.yml`'s required clippy job; this job adds running the changed tests. On
 `merge_group` it runs nothing and succeeds, because the PR already ran it and
 `ci.yml` is the queue's integration proof. The full suite stays off PRs. Write
-a test only when it earns its place,
-and then to these rules:
+a test only when it earns its place, and then to these rules:
 
 - **Direct functions, not processes.** Business logic is tested by calling it.
   If a test needs a daemon, a board, a socket or a spawned CLI to reach the
