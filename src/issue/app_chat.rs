@@ -526,10 +526,11 @@ mod tests {
         let mut ok = good();
         ok["contexts"][0]["i18n"] = json!({"zh-TW":{"label":"客","prompts":["列"]}});
         ok["contexts"][0]["record"] =
-            json!({"label":"R","i18n":{"zh-TW":{"label":"客","prompts":["摘"]}}});
-        ok["attachments"] = json!([{"id":"csv","label":"Imp","i18n":{"zh-TW":{"label":"匯"}}}]);
+            json!({"label":"R","prompts":["R0"],"i18n":{"zh-TW":{"label":"客","prompts":["摘"]}}});
+        ok["attachments"] =
+            json!([{"id":"csv-import","label":"Imp","i18n":{"zh-TW":{"label":"匯"}}}]);
         ok["subjects"] = json!([{"kind":"c","label":"C","i18n":{"zh-TW":{"label":"客"}}}]);
-        ok["directives"] = json!([{"match":"m","card":{"title":"T","text":"D","i18n":{"zh-TW":{"title":"匯","text":"完"}},"fields":[{"label":"R","from":"r","i18n":{"zh-TW":{"label":"筆"}}}],"buttons":[{"label":"O","run":"open-view","view":"v","i18n":{"zh-TW":{"label":"開"}}}]}}]);
+        ok["directives"] = json!([{"match":"cadence_m","card":{"title":"T","text":"D","i18n":{"zh-TW":{"title":"匯","text":"完"}},"fields":[{"label":"R","from":"r","i18n":{"zh-TW":{"label":"筆"}}}],"buttons":[{"label":"O","run":"open-view","view":"v","i18n":{"zh-TW":{"label":"開"}}}]}}]);
         validate(&ok.to_string(), "demo").unwrap();
 
         for (k, v) in [
