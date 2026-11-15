@@ -243,6 +243,10 @@ async function main() {
   equal(validateTypeDraft(draft({ label: "a\u007fb" }), true, [], t), { label: "Remove line breaks and other control characters." }, "DEL in the name");
   equal(validateTypeDraft(draft({ label: " BRIEF " }), true, ["brief"], t), { label: "This type already exists. Edit it from the list instead." }, "an existing key, in any case");
   equal(validateTypeDraft(draft({ label: "" }), false, ["brief"], t), {}, "an edit does not check the name");
+  // A key of "." or ".." is a dot segment in the URL path, even percent-encoded.
+  for (const label of [".", "..", " .. "])
+    equal(validateTypeDraft(draft({ label }), true, [], t), { label: "Use a name other than “.” or “..”." }, `${JSON.stringify(label)} is refused`);
+  equal(validateTypeDraft(draft({ label: "..." }), true, [], t), {}, "three dots is an ordinary name");
   equal(validateTypeDraft(draft({ recipientNote: "n".repeat(200) }), true, [], t), {}, "a 200-character note");
   equal(validateTypeDraft(draft({ recipientNote: "n".repeat(201) }), true, [], t), { recipientNote: "Use 200 characters or fewer." }, "a 201-character note");
   equal(validateTypeDraft(draft({ recipientNote: "a\nb" }), true, [], t), { recipientNote: "Remove line breaks and other control characters." }, "a note is one line");
@@ -322,7 +326,7 @@ async function main() {
   const baseline = host.querySelector("[data-baseline]");
   ok(text().includes("Default for new types"), "the baseline is the default for new types");
   equal(
-    [value(baseline, "Approval"), value(baseline, "Approver"), value(baseline, "Archived"), value(baseline, "Recipient note")],
+    [value(baseline, "Approval"), value(baseline, "Approver"), value(baseline, "Archive after"), value(baseline, "Recipient note")],
     ["Required before sharing", "Workspace owner", "30 days after delivery", "None"],
     "the baseline's values, as the board sent them",
   );
@@ -336,7 +340,7 @@ async function main() {
   await settle(() => equal(value(row("brief"), "Approver"), "Ann Lee", "the approver's name comes from the roster"), "roster names");
   equal(gets("/api/team/members"), 1, "the roster is read once");
   equal(
-    [value(row("brief"), "Approval"), value(row("brief"), "Archived"), value(row("brief"), "Recipient note")],
+    [value(row("brief"), "Approval"), value(row("brief"), "Archive after"), value(row("brief"), "Recipient note")],
     ["Required before sharing", "14 days after delivery", NOTE],
     "a confirmed type's values",
   );
@@ -345,11 +349,11 @@ async function main() {
   ok(!row("brief")!.querySelector("b + b, strong"), "markup in a note is never rendered");
   equal(row("brief")!.querySelector("[data-recipient-note]")?.innerHTML.includes("&lt;b&gt;"), true, "the note's angle brackets are escaped");
   equal(
-    [value(row("contract"), "Approval"), value(row("contract"), "Approver"), value(row("contract"), "Archived")],
+    [value(row("contract"), "Approval"), value(row("contract"), "Approver"), value(row("contract"), "Archive after")],
     ["Not required", "Workspace owner", "90 days after delivery"],
     "a pending type's values",
   );
-  equal(value(row("memo"), "Archived"), "1 day after delivery", "one day reads in the singular");
+  equal(value(row("memo"), "Archive after"), "1 day after delivery", "one day reads in the singular");
   ok(row("contract")!.textContent?.includes("Needs your confirmation"), "a pending row asks the owner to confirm");
   ok(!row("brief")!.textContent?.includes("Needs your confirmation"), "a confirmed row has no badge");
   equal(value(row("memo"), "Approver"), "No longer a member", "an approver the roster lacks");
@@ -363,6 +367,13 @@ async function main() {
   for (const label of ["brief", "contract", "memo"]) ok(buttonIn(row(label), "Edit"), `the owner can edit ${label}`);
   equal(buttonIn(row("contract"), "Confirm")?.getAttribute("aria-label"), "Confirm contract", "Confirm names its type");
   equal(buttonIn(row("brief"), "Edit")?.getAttribute("aria-label"), "Edit brief", "Edit names its type");
+  ok(!buttonIn(row("contract"), "Confirm")!.className.includes("btn-primary"), "a row's Confirm is not the page's primary action");
+  // Tab walks the page's actions in reading order, through each row's actions.
+  const tabbable = () =>
+    Array.from(host.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, [tabindex]"))
+      .filter((element) => element.tabIndex >= 0 && !(element as HTMLButtonElement).disabled)
+      .map((element) => element.getAttribute("aria-label") ?? element.textContent?.trim());
+  equal(tabbable(), ["Add type", "Edit brief", "Confirm contract", "Edit contract", "Edit memo"], "the Tab order through the rows' actions");
   ok(!text().includes("The workspace owner manages document types."), "the owner has no read-only note");
 
   // A name falls back to the email.
@@ -372,20 +383,41 @@ async function main() {
 
   // ---- read-only viewers ----
 
-  for (const [who, viewer, sub] of [
-    ["a member", MEMBER, "u-ann"],
-    ["a read-only board", READ_ONLY_OWNER, "u-owner"],
-    ["an operator session", OWNER, "operator-token:ops"],
+  for (const [who, viewer, sub, note] of [
+    ["a member", MEMBER, "u-ann", "The workspace owner manages document types."],
+    ["a read-only board", READ_ONLY_OWNER, "u-owner", "This board is read-only, so document types can’t be changed here."],
+    ["an operator session", OWNER, "operator-token:ops", "The workspace owner manages document types."],
   ] as const) {
-    await fresh({ viewer, sub });
+    const operator = sub.startsWith("operator-token:");
+    await fresh({ viewer, sub }, false);
+    // The real roster refuses a platform session: it has no membership row.
+    if (operator) rosterReply = () => refusal(403, "membership_changed");
+    await React.act(async () => { await documentsProbe.revalidate(); });
     await listed();
-    ok(text().includes("The workspace owner manages document types."), `${who} is told the owner manages types`);
+    ok(text().includes(note), `${who} is told why the page is read-only`);
+    for (const other of ["The workspace owner manages document types.", "This board is read-only, so document types can’t be changed here."])
+      if (other !== note) ok(!text().includes(other), `${who} is not told “${other}”`);
     equal(host.querySelectorAll("li[data-type-label] button").length, 0, `${who} gets no row control`);
     ok(!buttonIn(host, "Add type"), `${who} cannot add a type`);
     ok(row("contract")!.textContent?.includes("Waiting for the owner"), `${who} sees the pending row as waiting for the owner`);
     ok(!text().includes("Needs your confirmation"), `${who} is not asked to confirm`);
     ok(!text().includes("nobody can approve this type"), `${who} is not told to update the type`);
-    await settle(() => equal(value(row("brief"), "Approver"), "Ann Lee", `${who} reads approver names`), `${who} names`);
+    if (!operator) {
+      await settle(() => equal(value(row("brief"), "Approver"), "Ann Lee", `${who} reads approver names`), `${who} names`);
+      continue;
+    }
+    // A platform session never asks the roster, so it never fails: approvers
+    // show as the owner role or their id, with a quiet note and no retry.
+    for (let i = 0; i < 5; i++) await flush();
+    equal(gets("/api/team/members"), 0, "an operator session does not read the roster");
+    equal(
+      [value(row("brief"), "Approver"), value(row("contract"), "Approver"), value(row("memo"), "Approver")],
+      ["u-ann", "Workspace owner", "u-gone"],
+      "an operator session sees the owner role or the approver's id",
+    );
+    ok(text().includes("Member names aren’t shown to platform sessions."), "an operator session is told why names are missing");
+    ok(!text().includes("Couldn’t read the member list") && !text().includes("Couldn’t refresh the member list"), "an operator session sees no roster failure");
+    ok(!buttonIn(host, "Retry"), "an operator session gets no roster retry");
   }
 
   // ---- confirming a pending type ----
@@ -395,7 +427,7 @@ async function main() {
   await click(buttonIn(row("contract"), "Confirm"));
   ok(dialog(), "Confirm opens a dialog");
   ok(dialog()!.textContent?.includes("Confirm “contract”? These preferences then apply to every document of this type."), "the dialog names the type");
-  equal(value(dialog(), "Archived"), "90 days after delivery", "the dialog lists the values being confirmed");
+  equal(value(dialog(), "Archive after"), "90 days after delivery", "the dialog lists the values being confirmed");
   equal(posts().length, 0, "opening the dialog writes nothing");
   // Escape closes it and returns focus to the trigger.
   await React.act(async () => {
@@ -408,8 +440,15 @@ async function main() {
   writeReply = (path) =>
     path === "/api/document-types/contract/confirm" ? json({ type: { ...CONTRACT, state: "confirmed", rev: 2 } }) : refusal(500, "internal");
   probeReply = () => json(probeBody([BRIEF, { ...CONTRACT, state: "confirmed", rev: 2 }, MEMO]));
+  // A row-like element outside the page must never take the focus.
+  const decoy = document.createElement("div");
+  decoy.setAttribute("data-record-id", "contract");
+  decoy.innerHTML = '<span class="document-type-actions"><button type="button">decoy</button></span>';
+  document.body.prepend(decoy);
   await click(buttonIn(row("contract"), "Confirm"));
+  ok(buttonIn(dialog(), "Confirm")!.className.includes("btn-primary"), "the dialog's Confirm is primary");
   const probesBeforeConfirm = gets("/api/document-types");
+  const rosterBeforeConfirm = gets("/api/team/members");
   await click(buttonIn(dialog(), "Confirm"));
   await settle(() => ok(status().includes("Document type confirmed."), "confirming says so"), "confirmed");
   equal(posts().map((call) => [call.path, call.body]), [["/api/document-types/contract/confirm", { rev: 1 }]], "Confirm sends exactly the row's rev");
@@ -418,6 +457,26 @@ async function main() {
   ok(!buttonIn(row("contract"), "Confirm"), "the confirmed row has no Confirm");
   await settle(() => equal(gets("/api/document-types"), probesBeforeConfirm + 1, "the types are read again"), "reread after confirm");
   await settle(() => focused(buttonIn(row("contract"), "Edit"), "focus lands on the row's Edit"), "focus after confirm");
+  decoy.remove();
+  await settle(() => equal(gets("/api/team/members"), rosterBeforeConfirm + 1, "a write reads the roster again"), "roster after confirm");
+
+  // A roster that fails to refresh keeps the last good one, and says so.
+  await fresh();
+  await listed();
+  await settle(() => equal(value(row("brief"), "Approver"), "Ann Lee", "names"), "roster before refresh");
+  rosterReply = () => refusal(500, "internal");
+  writeReply = () => json({ type: { ...CONTRACT, state: "confirmed", rev: 2 } });
+  await click(buttonIn(row("contract"), "Confirm"));
+  await click(buttonIn(dialog(), "Confirm"));
+  await settle(() => ok(text().includes("Couldn’t refresh the member list, so approver names may be out of date."), "a failed refresh says so"), "roster refresh failed");
+  equal(value(row("brief"), "Approver"), "Ann Lee", "the last good roster still names the approver");
+  ok(!text().includes("approvers are shown by their id"), "a kept roster is not described as ids");
+  await click(buttonIn(host, "Retry"));
+  await settle(() => ok(text().includes("Couldn’t refresh the member list"), "a failed retry still says so"), "retry fails");
+  equal(value(row("brief"), "Approver"), "Ann Lee", "a failed retry keeps the last good roster");
+  rosterReply = () => json({ members: ROSTER });
+  await click(buttonIn(host, "Retry"));
+  await settle(() => ok(!text().includes("Couldn’t refresh the member list"), "a good retry clears the notice"), "retry ok");
 
   // A conflict reads the types again and shows the current row.
   const confirmRefusals: [number, string, string][] = [
@@ -452,7 +511,7 @@ async function main() {
     ok(!dialog(), `${code} closes the dialog`);
     await settle(() => equal(gets("/api/document-types"), before + 1, `${code} reads the types again`), `${code} reread`);
     if (code === "conflict")
-      await settle(() => equal(value(row("contract"), "Archived"), "60 days after delivery", "a conflict shows the current row"), "conflict row");
+      await settle(() => equal(value(row("contract"), "Archive after"), "60 days after delivery", "a conflict shows the current row"), "conflict row");
     if (code === "not_found") await settle(() => equal(rowLabels(), ["brief", "memo"], "a missing row leaves the list"), "404 row");
     if (code === "approver_unavailable")
       await settle(() => equal(gets("/api/team/members"), rosterBefore + 1, "approver_unavailable reads the roster again"), "roster reread");
@@ -548,15 +607,22 @@ async function main() {
     "the form starts from the row",
   );
   ok(!buttonIn(drawer(), "Save"), "an unchanged form offers no Save");
+  ok(!drawer()!.textContent?.includes("The member list couldn’t be read"), "a readable roster needs no hint");
+  // An untouched form follows the row when it is read again.
+  probeReply = () => json(probeBody([{ ...BRIEF, archiveAfterDays: 9, rev: 3 }, CONTRACT, MEMO]));
+  await React.act(async () => { await documentsProbe.refresh(); });
+  await settle(() => equal(field("Archive after (days)")?.value, "9", "an untouched form takes the re-read row"), "reseed");
+  ok(!drawer()!.textContent?.includes("This type changed after you opened it."), "an untouched form needs no changed notice");
+  ok(!buttonIn(drawer(), "Save"), "a re-seeded form is still unchanged");
   await fill(field("Archive after (days)"), "21");
   await chooseApprover("Workspace owner");
   ok(buttonIn(drawer(), "Save"), "a changed form offers Save");
 
   // A draft survives a re-read, even when the row moved on underneath it.
   await fill(field("Recipient note"), "Draft note");
-  probeReply = () => json(probeBody([{ ...BRIEF, archiveAfterDays: 7, rev: 3 }, CONTRACT, MEMO]));
+  probeReply = () => json(probeBody([{ ...BRIEF, archiveAfterDays: 7, rev: 4 }, CONTRACT, MEMO]));
   await React.act(async () => { await documentsProbe.refresh(); });
-  await settle(() => equal(value(row("brief"), "Archived"), "7 days after delivery", "the list shows the re-read row"), "reread under draft");
+  await settle(() => equal(value(row("brief"), "Archive after"), "7 days after delivery", "the list shows the re-read row"), "reread under draft");
   ok(drawer(), "the form stays open across a re-read");
   equal(
     [field("Recipient note")?.value, field("Archive after (days)")?.value, approverTrigger()?.textContent],
@@ -589,8 +655,8 @@ async function main() {
   equal(editPosts[0]!.path, "/api/document-types/brief", "an edit writes the row's own key");
   equal(editPosts[0]!.body, { requireApproval: true, approver: null, recipientNote: "Draft note", archiveAfterDays: 21 }, "an edit sends exactly the four fields, the owner role as null");
 
-  writeReply = (_path, body) => json({ type: { ...BRIEF, ...(body as object), rev: 4 } });
-  probeReply = () => json(probeBody([{ ...BRIEF, approver: null, recipientNote: "Draft note", archiveAfterDays: 21, rev: 4 }, CONTRACT, MEMO]));
+  writeReply = (_path, body) => json({ type: { ...BRIEF, ...(body as object), rev: 5 } });
+  probeReply = () => json(probeBody([{ ...BRIEF, approver: null, recipientNote: "Draft note", archiveAfterDays: 21, rev: 5 }, CONTRACT, MEMO]));
   await save();
   await settle(() => ok(status().includes("Document type saved."), "an edit saves"), "edited");
   ok(!drawer(), "a saved edit closes");
@@ -626,6 +692,31 @@ async function main() {
   await settle(() => ok(!drawer(), "Escape closes the form"), "escape form");
   await settle(() => focused(buttonIn(row("brief"), "Edit"), "focus returns to Edit"), "escape focus");
 
+  // A save that answers after its drawer closed never closes the drawer open now.
+  let releaseSave: (response: Response) => void = () => {};
+  writeReply = () => new Promise<Response>((resolve) => { releaseSave = resolve; });
+  await click(buttonIn(row("brief"), "Edit"));
+  await fill(field("Archive after (days)"), "33");
+  await save();
+  await React.act(async () => {
+    window.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  await closed();
+  await settle(() => ok(!drawer(), "Escape closes the saving form"), "escape saving");
+  await click(buttonIn(row("contract"), "Edit"));
+  await fill(field("Recipient note"), "Second draft");
+  const lateRow = { ...BRIEF, approver: null, recipientNote: "Draft note", archiveAfterDays: 33, rev: 6 };
+  probeReply = () => json(probeBody([lateRow, CONTRACT, MEMO]));
+  await React.act(async () => { releaseSave(json({ type: lateRow })); });
+  await settle(() => equal(value(row("brief"), "Archive after"), "33 days after delivery", "the late receipt still applies"), "late receipt");
+  ok(drawer(), "the drawer open now stays open");
+  equal(drawer()!.getAttribute("aria-label"), "contract", "it is still the second row's drawer");
+  equal(field("Recipient note")?.value, "Second draft", "its draft is kept");
+  ok(drawer()!.contains(document.activeElement), "focus stays in the open drawer");
+  await click(drawer()!.querySelector('button[aria-label^="Close"]'));
+  await closed();
+  await settle(() => ok(!drawer(), "the second form closes"), "close second");
+
   // An approver who has left stays in the form, marked, rather than changing unseen.
   await click(buttonIn(row("memo"), "Edit"));
   equal(approverTrigger()?.textContent, "u-gone (not a current member)", "a departed approver stays selected and is marked");
@@ -650,6 +741,7 @@ async function main() {
     ok(!text().includes("nobody can approve this type"), `${why} is never a missing approver`);
     await click(buttonIn(row("brief"), "Edit"));
     equal(approverTrigger()?.textContent, "u-ann", `${why}: the form keeps the approver by id`);
+    ok(drawer()!.textContent?.includes("The member list couldn’t be read, so only the workspace owner and the current approver are offered."), `${why}: the form says why the list is short`);
     await click(approverTrigger());
     equal(choices(), ["Workspace owner", "u-ann"], `${why}: only the owner role and the current approver are offered`);
     await React.act(async () => {
@@ -666,6 +758,23 @@ async function main() {
   ok(!text().includes("Couldn’t read the member list"), "the notice goes once the roster reads");
   ok(heading(), "the page keeps its heading");
 
+  // ---- the lifecycle turned off under an open form ----
+
+  await fresh();
+  await listed();
+  await click(buttonIn(row("brief"), "Edit"));
+  await fill(field("Archive after (days)"), "40");
+  writeReply = () => refusal(404, "not_found");
+  probeReply = () => refusal(404, "not_found");
+  await save();
+  await settle(() => ok(text().includes("Document review isn’t available on this workspace any more."), "a save answered not_found says review is gone"), "save 404");
+  await settle(() => ok(text().includes("Document types aren’t available here"), "the probe is read again and latches unavailable"), "save 404 latch");
+  ok(!drawer(), "the form goes with the lifecycle");
+  await settle(() => focused(host.querySelector(".page-state-title"), "focus lands on the unavailable state's title"), "save 404 focus");
+  const latched = gets("/api/document-types");
+  await React.act(async () => { await documentsProbe.revalidate(); });
+  equal(gets("/api/document-types"), latched, "the unavailable answer is latched");
+
   // ---- zh-TW, rendered ----
 
   // The page and its refusal copy render through t(): a zh-TW viewer reads
@@ -674,7 +783,7 @@ async function main() {
   await fresh();
   await listed();
   await settle(() => equal(value(row("brief"), "核准者"), "Ann Lee", "zh-TW labels the approver"), "zh-TW names");
-  equal(value(row("contract"), "已封存"), "交付後 90 天", "zh-TW reads the archive delay");
+  equal(value(row("contract"), "封存時間"), "交付後 90 天", "zh-TW reads the archive delay");
   ok(row("contract")!.textContent?.includes("需要你確認"), "zh-TW asks the owner to confirm");
   writeReply = () => refusal(409, "conflict");
   await click(buttonIn(row("contract"), "確認"));
@@ -709,7 +818,13 @@ async function main() {
     "Add type",
     "The workspace owner manages document types.",
     "Document type saved.",
-    "Saved. It waits for the owner’s confirmation.",
+    "This board is read-only, so document types can’t be changed here.",
+    "Member names aren’t shown to platform sessions.",
+    "Couldn’t refresh the member list, so approver names may be out of date.",
+    "The member list couldn’t be read, so only the workspace owner and the current approver are offered.",
+    "Use a name other than “.” or “..”.",
+    "Document review isn’t available on this workspace any more.",
+    "Archive after",
     "Couldn’t confirm the save, so the list was read again.",
     "Confirm document type?",
     "Confirm “{label}”? These preferences then apply to every document of this type.",

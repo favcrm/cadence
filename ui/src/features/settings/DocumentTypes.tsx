@@ -86,6 +86,9 @@ export function validateTypeDraft(
     if (hasControl(draft.label)) errors.label = t("Remove line breaks and other control characters.");
     else if (label.length === 0) errors.label = t("Enter a name for this type.");
     else if (label.length > LABEL_MAX) errors.label = t("Use 40 characters or fewer.");
+    // The key travels as a URL path segment, where "." and ".." are dot
+    // segments even percent-encoded (WHATWG URL reads %2E as a dot).
+    else if (label === "." || label === "..") errors.label = t("Use a name other than “.” or “..”.");
     else if (existing.some((key) => typeKey(key) === typeKey(label)))
       errors.label = t("This type already exists. Edit it from the list instead.");
   }
@@ -127,9 +130,12 @@ function confirmFailure(code: string | null, t: Translate): string {
   return sharedFailure(code, t) ?? t("Couldn’t confirm this type. Try again.");
 }
 
+/** A type write answered `not_found`: the board no longer serves the lifecycle. */
+const LIFECYCLE_GONE = "Document review isn’t available on this workspace any more.";
+
 function saveFailure(code: string | null, t: Translate): string {
   if (code === "invalid_request") return t("The board refused these values. Check each field and try again.");
-  if (code === "not_found") return t("This type no longer exists.");
+  if (code === "not_found") return t(LIFECYCLE_GONE);
   return sharedFailure(code, t) ?? t("Couldn’t save this type. Try again.");
 }
 
@@ -166,7 +172,7 @@ function Values({ values, roster }: { values: DocumentBaseline | DocumentType; r
         <dd data-approver>{approverText(values.approver, roster, t)}</dd>
       </div>
       <div>
-        <dt>{t("Archived")}</dt>
+        <dt>{t("Archive after")}</dt>
         <dd>{daysText(values.archiveAfterDays, t)}</dd>
       </div>
       <div>
@@ -175,6 +181,17 @@ function Values({ values, roster }: { values: DocumentBaseline | DocumentType; r
       </div>
     </dl>
   );
+}
+
+/** A form's fields from a type, or from the baseline for a new one. */
+function seed(from: DocumentType | DocumentBaseline, label: string): TypeDraft {
+  return {
+    label,
+    requireApproval: from.requireApproval,
+    approver: from.approver ?? "",
+    recipientNote: from.recipientNote,
+    archiveAfterDays: String(from.archiveAfterDays),
+  };
 }
 
 /** One drawer at a time; the token names this opening, as `Members.tsx` does. */
@@ -203,11 +220,26 @@ export default function DocumentTypes({
   const [rosterAttempt, setRosterAttempt] = useState(0);
   const [open, setOpen] = useState<OpenDrawer | null>(null);
   const openSeq = useRef(0);
+  // The opening that is live now, readable from a save that started earlier.
+  const openRef = useRef<OpenDrawer | null>(null);
+  useEffect(() => {
+    openRef.current = open;
+  }, [open]);
+  /** Close the drawer only if `token` is still the opening on screen: a save
+   *  that answers late must not close (or steal focus from) a newer drawer. */
+  const settleDrawer = (token: number, label: string | null) => {
+    if (openRef.current?.token !== token) return;
+    openRef.current = null;
+    setOpen(null);
+    focusSoon(label);
+  };
   const [confirming, setConfirming] = useState<DocumentType | null>(null);
   const [writing, setWriting] = useState(false);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const toastTimer = useRef(0);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
+  /** The page itself: focus lookups never reach outside it. */
+  const pageRef = useRef<HTMLElement | null>(null);
   /** Where focus lands once a write settles: the row's Edit button when it is
    *  still there, else the heading. Set after the commit that removes the
    *  dialog or drawer, so it wins over their own return of focus. */
@@ -217,7 +249,7 @@ export default function DocumentTypes({
     const row =
       focusAfter.label === null
         ? null
-        : Array.from(document.querySelectorAll<HTMLElement>("[data-record-id]")).find(
+        : Array.from(pageRef.current?.querySelectorAll<HTMLElement>("[data-record-id]") ?? []).find(
             (element) => element.getAttribute("data-record-id") === focusAfter.label,
           );
     // Edit is the row's last action.
@@ -243,9 +275,11 @@ export default function DocumentTypes({
 
   // The roster names approvers and lists who may be chosen. Read once the
   // lifecycle is available; any failure (a refusal, a 503, a malformed row)
-  // leaves it unknown.
+  // leaves it unknown. A platform operator's session has no membership row, so
+  // the hosted roster refuses it (`membership_changed`): it is never asked.
+  const platform = access.isOperatorSession;
   useEffect(() => {
-    if (!available) return;
+    if (!available || platform) return;
     const controller = new AbortController();
     readTeamMembers(controller.signal)
       .then((members) => {
@@ -254,12 +288,13 @@ export default function DocumentTypes({
         setRosterFailed(false);
       })
       .catch(() => {
+        // A failed re-read keeps the last good roster, if there was one; the
+        // notice says it may be out of date.
         if (controller.signal.aborted) return;
-        setRoster(null);
         setRosterFailed(true);
       });
     return () => controller.abort();
-  }, [available, rosterAttempt]);
+  }, [available, platform, rosterAttempt]);
   const rereadRoster = () => setRosterAttempt((count) => count + 1);
 
   /** A write's receipt replaces its row in the shared probe; the probe is then asked again. */
@@ -271,6 +306,25 @@ export default function DocumentTypes({
     });
   };
   const reread = () => void documentsProbe.refresh();
+
+  // The lifecycle went away under the page (a latched `unavailable`): close
+  // any form, and if focus fell with it, give it the unavailable state's title.
+  const gone = !hosted || answer?.kind === "unavailable";
+  const seenAvailable = useRef(false);
+  useEffect(() => {
+    if (available) seenAvailable.current = true;
+  }, [available]);
+  useEffect(() => {
+    if (!gone || !seenAvailable.current) return;
+    setOpen(null);
+    setConfirming(null);
+    const at = document.activeElement;
+    if (at instanceof HTMLElement && at !== document.body && at.isConnected) return;
+    const title = pageRef.current?.querySelector<HTMLElement>(".page-state-title");
+    if (!title) return;
+    title.tabIndex = -1;
+    title.focus();
+  }, [gone]);
 
   const runConfirm = async (row: DocumentType) => {
     setWriting(true);
@@ -293,6 +347,7 @@ export default function DocumentTypes({
       applyReceipt(result.value);
       say("ok", t("Document type confirmed."));
       reread();
+      rereadRoster();
       return;
     }
     const code = refusalCode(result);
@@ -303,15 +358,16 @@ export default function DocumentTypes({
     reread();
   };
 
-  if (!hosted || answer?.kind === "unavailable") {
+  if (gone) {
     const newer = answer?.kind === "unavailable" && answer.reason === "unsupported_capability";
     return (
-      <section className="document-types-page px-4 lg:px-8 py-5 min-w-0 max-w-3xl">
+      <section ref={pageRef} className="document-types-page px-4 lg:px-8 py-5 min-w-0 max-w-3xl">
         <PageState title={t("Document types aren’t available here")}>
           {newer
             ? t("This workspace uses a newer version of document review than this page supports. Reload the page to update it.")
             : t("This workspace doesn’t have document review turned on.")}
         </PageState>
+        <Toast msg={toast} />
       </section>
     );
   }
@@ -356,9 +412,12 @@ export default function DocumentTypes({
   } else {
     body = (
       <>
+        {platform && <p className="text-label text-ink-500">{t("Member names aren’t shown to platform sessions.")}</p>}
         {rosterFailed && (
           <Notice state="roster-unavailable" onRetry={rereadRoster} retryLabel={t("Retry")}>
-            {t("Couldn’t read the member list, so approvers are shown by their id.")}
+            {roster === null
+              ? t("Couldn’t read the member list, so approvers are shown by their id.")
+              : t("Couldn’t refresh the member list, so approver names may be out of date.")}
           </Notice>
         )}
         <section className="document-types-group" aria-labelledby="document-types-list">
@@ -398,7 +457,6 @@ export default function DocumentTypes({
                           {pending && (
                             <Button
                               size="sm"
-                              variant="primary"
                               aria-label={t("Confirm {label}").replace("{label}", () => row.label)}
                               onClick={() => setConfirming(row)}
                             >
@@ -440,6 +498,7 @@ export default function DocumentTypes({
 
   return (
     <section
+      ref={pageRef}
       className="document-types-page px-4 lg:px-8 py-5 min-w-0 max-w-3xl"
       aria-labelledby="document-types-title"
       aria-busy={probeState?.inFlight || undefined}
@@ -460,7 +519,11 @@ export default function DocumentTypes({
         )}
       </header>
       {available && !canEdit && (
-        <Notice state="read-only">{t("The workspace owner manages document types.")}</Notice>
+        <Notice state="read-only">
+          {viewer.readOnly
+            ? t("This board is read-only, so document types can’t be changed here.")
+            : t("The workspace owner manages document types.")}
+        </Notice>
       )}
       {body}
 
@@ -473,19 +536,22 @@ export default function DocumentTypes({
           roster={roster}
           onClose={() => setOpen(null)}
           onSaved={(type) => {
-            setOpen(null);
+            settleDrawer(open.token, type.label);
             applyReceipt(type);
-            focusSoon(type.label);
-            say("ok", type.state === "confirmed" ? t("Document type saved.") : t("Saved. It waits for the owner’s confirmation."));
+            say("ok", t("Document type saved."));
             reread();
+            rereadRoster();
           }}
           onUnsettled={(quiet) => {
-            setOpen(null);
-            focusSoon(openRow?.label ?? null);
+            settleDrawer(open.token, openRow?.label ?? null);
             if (!quiet) say("warn", t("Couldn’t confirm the save, so the list was read again."));
             reread();
           }}
           onRosterChanged={rereadRoster}
+          onGone={() => {
+            say("err", t(LIFECYCLE_GONE));
+            reread();
+          }}
         />
       )}
 
@@ -520,9 +586,9 @@ export default function DocumentTypes({
 
 /**
  * The owner's form for one type. The draft is taken from the row (or the
- * baseline, for a new type) once, when the drawer opens, and lives here: a
- * re-read of the types replaces `row` but never the draft, so typing survives
- * a refresh. If the row changed meanwhile, the form says so.
+ * baseline, for a new type) when the drawer opens, and lives here. A re-read
+ * that changes the row re-seeds an untouched form; once the owner has typed,
+ * the draft survives the refresh and the form says the row changed.
  */
 function TypeDrawer({
   row,
@@ -533,6 +599,7 @@ function TypeDrawer({
   onSaved,
   onUnsettled,
   onRosterChanged,
+  onGone,
 }: {
   /** The type being edited, as the probe holds it now; null when adding. */
   row: DocumentType | null;
@@ -545,28 +612,33 @@ function TypeDrawer({
    *  abort, which reports nothing, as the Documents screen does. */
   onUnsettled: (quiet: boolean) => void;
   onRosterChanged: () => void;
+  /** The save answered `not_found`: the lifecycle is off, so the probe is asked again. */
+  onGone: () => void;
 }) {
   const t = useTranslate();
   const fieldId = useId();
   const adding = row === null;
-  const source = row ?? baseline;
-  const [initial] = useState<TypeDraft>(() => ({
-    label: row?.label ?? "",
-    requireApproval: source.requireApproval,
-    approver: source.approver ?? "",
-    recipientNote: source.recipientNote,
-    archiveAfterDays: String(source.archiveAfterDays),
+  /** The draft this form started from, and the row's rev it came from. */
+  const [base, setBase] = useState<{ draft: TypeDraft; rev: number | null }>(() => ({
+    draft: seed(row ?? baseline, row?.label ?? ""),
+    rev: row?.rev ?? null,
   }));
-  const [openedRev] = useState(row?.rev ?? null);
-  const [draft, setDraft] = useState<TypeDraft>(initial);
+  const [draft, setDraft] = useState<TypeDraft>(base.draft);
   const [errors, setErrors] = useState<TypeDraftErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const labelRef = useRef<HTMLInputElement | null>(null);
   const noteRef = useRef<HTMLInputElement | null>(null);
   const daysRef = useRef<HTMLInputElement | null>(null);
-  const dirty = (Object.keys(initial) as (keyof TypeDraft)[]).some((key) => initial[key] !== draft[key]);
-  const changed = row !== null && openedRev !== null && row.rev !== openedRev;
+  const dirty = (Object.keys(base.draft) as (keyof TypeDraft)[]).some((key) => base.draft[key] !== draft[key]);
+  // A row read again under an untouched form re-seeds it; a touched form keeps
+  // its draft and says the row changed.
+  if (row !== null && base.rev !== null && row.rev !== base.rev && !dirty) {
+    const next = { draft: seed(row, row.label), rev: row.rev };
+    setBase(next);
+    setDraft(next.draft);
+  }
+  const changed = row !== null && base.rev !== null && row.rev !== base.rev;
 
   useEffect(() => {
     if (!adding) return;
@@ -622,6 +694,7 @@ function TypeDrawer({
       return;
     }
     setFormError(saveFailure(code, t));
+    if (code === "not_found") onGone();
   };
 
   const options: SelectOption[] = [
@@ -688,7 +761,16 @@ function TypeDrawer({
         />
         <span>{t("Require approval before a document of this type is shared")}</span>
       </label>
-      <Field label={t("Approver")} hint={t("Who approves documents of this type.")} error={errors.approver} disabled={busy}>
+      <Field
+        label={t("Approver")}
+        hint={
+          roster === null
+            ? t("The member list couldn’t be read, so only the workspace owner and the current approver are offered.")
+            : t("Who approves documents of this type.")
+        }
+        error={errors.approver}
+        disabled={busy}
+      >
         {(control) => (
           <Select
             id={control.id}
