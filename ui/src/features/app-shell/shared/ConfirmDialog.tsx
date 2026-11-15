@@ -14,6 +14,7 @@ export default function ConfirmDialog({
   match,
   inputLabel,
   confirmLabel,
+  confirmVariant = "danger",
   pending,
   error,
   onConfirm,
@@ -27,6 +28,9 @@ export default function ConfirmDialog({
   match?: string;
   inputLabel?: string;
   confirmLabel: string;
+  /** The confirm button's weight: `danger` (the default) for a destructive
+   *  action, `primary` for one that is not, such as an approval. */
+  confirmVariant?: "danger" | "primary";
   pending: boolean;
   error: string | null;
   onConfirm: () => void;
@@ -133,7 +137,7 @@ export default function ConfirmDialog({
           </Button>
           <Button
             size="sm"
-            variant="danger"
+            variant={confirmVariant}
             loading={pending}
             disabled={pending || !gated}
             onClick={onConfirm}

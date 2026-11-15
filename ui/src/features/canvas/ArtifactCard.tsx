@@ -45,7 +45,7 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
       <span className="arttext">
         <b>{ref.title}</b>
         <span className="artmeta">
-          v{ref.version} · {sizeLabel(ref.bytes)}
+          v{ref.version}{ref.bytes === undefined ? "" : ` · ${sizeLabel(ref.bytes)}`}
         </span>
       </span>
       {inCanvas ? (

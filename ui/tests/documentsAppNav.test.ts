@@ -118,7 +118,7 @@ async function main() {
   await flush();
   equal(probes(), 1, "the mount probes once");
   await go("/documents");
-  await settle(() => assert(host.textContent?.includes("No documents yet"), "the screen mounts on /documents"), "hosted screen");
+  await settle(() => assert(host.textContent?.includes("No documents to show"), "the screen mounts on /documents"), "hosted screen");
   assert(requests.includes("/api/documents?archived=0"), "the screen lists active documents");
   equal(probes(), 1, "opening the screen does not probe again");
   await React.act(async () => { root.unmount(); });

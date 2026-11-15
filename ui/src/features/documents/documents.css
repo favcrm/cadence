@@ -1,0 +1,7 @@
+/* CAD-2286: the Documents table keeps a readable floor, as `.crm-table` and
+   `.av-table` do: at a 390px viewport the shared `.stable-wrap` scrolls it
+   internally instead of crushing the columns. At desktop widths the table's
+   100% width rules and this is a no-op. */
+.documents-table {
+  min-width: 640px;
+}

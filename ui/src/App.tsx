@@ -352,16 +352,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
-  // The routine `refresh` below probes on mount and on every recheck; this
-  // asks again only when the session identity changes afterwards, so a mount
-  // probes once. A latched `unavailable` answer makes no request for the rest
-  // of the session.
-  const probedIdentity = useRef(personalIdentity);
-  useEffect(() => {
-    if (probedIdentity.current === personalIdentity) return;
-    probedIdentity.current = personalIdentity;
-    if (documentsHosted) void documentsProbe.revalidate();
-  }, [documentsHosted, personalIdentity]);
+  // The routine `refresh` below is the only probe: it runs on mount and on
+  // every recheck, so a mount probes once. A latched `unavailable` answer
+  // makes no request for the rest of the session.
 
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;

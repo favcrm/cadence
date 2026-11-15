@@ -54,7 +54,7 @@ async function main() {
   const { documentsViewer } = require("../src/features/documents/documentsAccess") as typeof import("../src/features/documents/documentsAccess");
   const { documentsProbe } = require("../src/features/documents/documentsProbe") as typeof import("../src/features/documents/documentsProbe");
   const { canvasSnapshot, resetCanvas } = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
-  const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  const { allowPrivateReads, pausePrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
   const { goTo, locationHref, readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
   const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
   const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
@@ -108,7 +108,9 @@ async function main() {
   const DELIVERED_AT = Date.UTC(2026, 10, 12, 12);
   const ARCHIVED_AT = Date.UTC(2026, 9, 1, 12);
   const ACTIVE = [
-    { file: file("art-review", "Quarterly proposal", 2), document: doc("in_review", { submittedVersion: 2 }) },
+    // A version 3 was saved after version 2 went to review (I1): the approver
+    // opens version 2, whose size and digest the list does not carry.
+    { file: file("art-review", "Quarterly proposal", 3), document: doc("in_review", { submittedVersion: 2 }) },
     { file: file("art-brief", "Launch brief", 1), document: doc("in_review", { type: "brief", submittedVersion: 1 }) },
     { file: file("art-approved", "Signed scope", 1), document: doc("approved", { submittedVersion: 1, approvedVersion: 1 }) },
     { file: file("art-delivered", "Delivered deck", 3), document: doc("delivered", { approvedVersion: 3, deliveredVersion: 3, deliveredAt: DELIVERED_AT }) },
@@ -116,6 +118,7 @@ async function main() {
   ];
   const ARCHIVED = [
     { file: file("art-old", "Old contract", 1), document: doc("archived", { archivedAt: ARCHIVED_AT, deliveredAt: DELIVERED_AT }) },
+    { file: file("art-memo", "Older memo", 1), document: doc("archived", { archivedAt: ARCHIVED_AT }) },
   ];
 
   // ---- mounting ----
@@ -193,6 +196,8 @@ async function main() {
     await flush();
   }
   const listed = () => settle(() => ok(row("art-review"), "the list rendered"), "list");
+  const heading = () => host.querySelector("#documents-title") as HTMLElement | null;
+  const headingFocused = () => document.activeElement !== null && document.activeElement === heading();
 
   // ---- unavailable ----
 
@@ -201,6 +206,7 @@ async function main() {
   await fresh({ hosted: false }, false);
   await settle(() => ok(text().includes("Documents aren’t available here"), "native board shows unavailable"), "native");
   equal(calls.length, 0, "a native board makes no document request");
+  ok(!host.querySelector("[aria-labelledby]"), "the unavailable state names no missing heading");
 
   // A hosted board whose probe says 404 is unavailable too, and lists nothing.
   await fresh({}, false);
@@ -258,13 +264,24 @@ async function main() {
   await React.act(async () => { await documentsProbe.revalidate(); });
   await settle(() => ok(text().includes("Documents aren’t available here"), "a 404 list shows unavailable"), "list 404");
   ok(!text().includes("Couldn’t load documents."), "a 404 list is not an error");
+  // The screen asks the shared probe once; its answer may list once more, and then it stops.
+  await settle(() => equal(gets("/api/documents"), 2, "the probe's answer lists once more"), "list 404 settles");
+  for (let i = 0; i < 5; i++) await flush();
+  equal([gets("/api/documents"), gets("/api/document-types")], [2, 2], "a lasting 404 does not loop");
+  ok(text().includes("Documents aren’t available here"), "a lasting 404 stays unavailable");
+  // A later probe answering available again clears it (10).
+  listReply = (archived) => json({ documents: archived ? ARCHIVED : ACTIVE });
+  await React.act(async () => { await documentsProbe.refresh(); });
+  await listed();
+  ok(!text().includes("Documents aren’t available here"), "an available probe clears the unavailable state");
 
   // ---- empty ----
 
   await fresh({}, false);
   listReply = () => json({ documents: [] });
   await React.act(async () => { await documentsProbe.revalidate(); });
-  await settle(() => ok(text().includes("No documents yet"), "an empty Active tab"), "empty active");
+  await settle(() => ok(text().includes("No documents to show"), "an empty Active tab"), "empty active");
+  ok(text().includes("Only the most recent files are listed, so older documents may not appear here."), "the empty Active tab does not overclaim");
 
   await fresh({ archived: true }, false);
   listReply = () => json({ documents: [] });
@@ -284,6 +301,11 @@ async function main() {
   ok(!Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Archived"), "the Active tab has no archived column");
   ok(review.textContent?.includes("In review"), "the stage");
   ok(review.textContent?.includes("v2"), "the version under review");
+  ok(!row("art-approved")!.textContent?.includes("v1"), "a version under review shows only while in review");
+  ok(host.querySelector("table.stable.documents-table"), "the table keeps a readable floor and scrolls in its wrapper at 390px");
+  ok(host.querySelector(".stable-wrap table.documents-table"), "inside the shared scrolling wrapper");
+  equal([heading()?.tagName, heading()?.tabIndex, heading()?.className.includes("font-semibold")], ["H1", -1, true], "the heading can take focus");
+  ok(Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Version under review"), "the column says what it counts");
   ok(review.querySelector(".chip")?.textContent?.includes("In review"), "the stage is a chip");
   ok(row("art-delivered")!.textContent?.includes("2026"), "the delivered date");
   ok(!text().includes("Share"), "the screen never offers sharing");
@@ -327,6 +349,8 @@ async function main() {
   listReply = () => json({ documents: [ACTIVE[0]] });
   await React.act(async () => { await documentsProbe.revalidate(); });
   await settle(() => ok(text().includes("No documents at this stage"), "an empty filter"), "empty filter");
+  const back = Array.from(host.querySelectorAll('[data-empty="documents-filtered"] a')) as HTMLAnchorElement[];
+  equal(back.map((a) => [a.textContent, a.getAttribute("href")]), [["Show all stages", "/documents"]], "an empty filter links back to All");
 
   // ---- opening a document ----
 
@@ -341,8 +365,26 @@ async function main() {
     [DOCUMENTS_CONVERSATION, null, true, "art-review", 2],
     "a row opens its file in the canvas drawer, bound to the sentinel conversation without Ask to change",
   );
+  const reviewed = canvas.tabs.find((tab) => tab.id === "art-review")!;
+  equal([reviewed.bytes, reviewed.versions[2]], [undefined, {}], "version 2 shows neither version 3's size nor its digest");
+  await click(buttonIn(row("art-approved"), "Signed scope"));
+  const latest = canvasSnapshot().tabs.find((tab) => tab.id === "art-approved")!;
+  equal([latest.selected, latest.bytes, latest.versions[1]], [1, 121, { bytes: 121, digest: "digest-art-approved" }], "the listed version keeps its own size and digest");
   ok(!buttonIn(row("art-draft"), "Early draft"), "a file the canvas cannot show is not a button");
   ok(row("art-draft")!.textContent?.includes("Early draft"), "it still shows its title");
+  await React.act(async () => { root.unmount(); });
+  root = createRoot(host);
+  equal(canvasSnapshot().conversation, null, "leaving the screen closes its canvas");
+  await fresh();
+  await listed();
+  await click(buttonIn(row("art-review"), "Quarterly proposal"));
+  pausePrivateReads();
+  await React.act(async () => { root.unmount(); });
+  root = createRoot(host);
+  equal(canvasSnapshot().conversation, DOCUMENTS_CONVERSATION, "a paused session leaves the canvas to the session reset");
+  allowPrivateReads();
+  await fresh();
+  await listed();
 
   // ---- who sees which action ----
 
@@ -383,6 +425,7 @@ async function main() {
   ok(dialog(), "Approve asks first");
   ok(dialog()!.textContent?.includes("Quarterly proposal"), "the dialog names the document");
   ok(dialog()!.textContent?.includes("version 2"), "the dialog names the version shown");
+  ok(confirmButton("Approve")!.classList.contains("btn-primary") && !confirmButton("Approve")!.classList.contains("btn-danger"), "Approve confirms with the primary button");
   // Escape closes it and returns focus to the trigger.
   await React.act(async () => {
     dialog()!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -406,6 +449,7 @@ async function main() {
   ok(!buttonIn(row("art-review"), "Approve"), "an approved row has no Approve");
   ok(calls.slice(calls.indexOf(post)).some((call) => call.path === "/api/documents?archived=0"), "the list is read again");
   ok(!dialog(), "the dialog closes");
+  ok(headingFocused(), "after a write focus moves to the heading");
 
   // Each refusal is told in the screen's own words, and the list and the
   // types are read again, so a stale button goes away.
@@ -436,6 +480,7 @@ async function main() {
       ok(after.some((call) => call.path === "/api/documents?archived=0"), `${code} reads the list again`);
     }, `${code} re-read`);
     ok(!dialog(), `${code} closes the dialog`);
+    ok(headingFocused(), `after ${code} focus moves to the heading`);
   }
   // A refusal without a code is the generic message, not the server's words.
   writeReply = () => new Response("gateway down", { status: 502 });
@@ -456,6 +501,26 @@ async function main() {
   ok(!host.querySelector('[role="alert"]'), "an aborted approve shows no error");
   ok(!text().includes("Couldn’t approve"), "an aborted approve is not reported as a failure");
 
+  // The real path: the session pauses while the write is in flight. The client
+  // rejects with an AbortError, and the screen does not list into a paused
+  // session (that read would fail and read as an error).
+  await fresh();
+  await listed();
+  writeReply = () => {
+    pausePrivateReads();
+    return json({ stage: "approved", version: 2, selfApproved: false });
+  };
+  await click(buttonIn(row("art-review"), "Approve"));
+  const beforePause = calls.length;
+  await click(confirmButton("Approve"));
+  await settle(() => ok(!dialog(), "a paused write closes the dialog"), "paused write");
+  for (let i = 0; i < 5; i++) await flush();
+  equal(calls.slice(beforePause).map((call) => call.method), ["POST"], "nothing is read into a paused session");
+  ok(!host.querySelector('[role="alert"]'), "a paused write shows no error");
+  ok(!text().includes("Couldn’t refresh this list"), "a paused write does not report a failed refresh");
+  ok(row("art-review"), "the rows stay");
+  allowPrivateReads();
+
   // ---- archive and restore ----
 
   await fresh();
@@ -463,8 +528,17 @@ async function main() {
   writeReply = () => json({ stage: "archived" });
   await click(buttonIn(row("art-delivered"), "Archive"));
   ok(dialog()?.textContent?.includes("Delivered deck"), "Archive asks first, naming the document");
+  ok(confirmButton("Archive")!.classList.contains("btn-danger"), "Archive confirms with the danger button");
+  // Hold the re-read, so the row leaving is the screen's doing, not the server's.
+  let releaseArchive: () => void = () => {};
+  listReply = (archived) => new Promise<Response>((resolve) => { releaseArchive = () => resolve(json({ documents: archived ? ARCHIVED : ACTIVE.filter((entry) => entry.file.id !== "art-delivered") })); });
   await click(confirmButton("Archive"));
   await settle(() => ok(text().includes("Document archived."), "archive succeeds"), "archive");
+  ok(!row("art-delivered"), "an archived row leaves the Active tab at once");
+  ok(headingFocused(), "after archiving focus moves to the heading");
+  await React.act(async () => { releaseArchive(); });
+  await flush();
+  listReply = (archived) => json({ documents: archived ? ARCHIVED : ACTIVE.filter((entry) => entry.file.id !== "art-delivered") });
   equal(calls.filter((call) => call.method === "POST").map((call) => call.path), ["/api/documents/art-delivered/archive"], "archive posts once");
 
   const archiveRefusals: [number, string, string][] = [
@@ -474,7 +548,7 @@ async function main() {
   ];
   for (const [status, code, copy] of archiveRefusals) {
     writeReply = () => refusal(status, code);
-    await click(buttonIn(row("art-delivered"), "Archive"));
+    await click(buttonIn(row("art-draft"), "Archive"));
     await click(confirmButton("Archive"));
     await settle(() => ok(text().includes(copy), `archive ${code} is told as “${copy}”`), `archive ${code}`);
   }
@@ -487,23 +561,31 @@ async function main() {
   await click(restore);
   ok(dialog()?.textContent?.includes("Old contract"), "Restore asks first, naming the document");
   ok(dialog()?.textContent?.includes("Nothing is re-run."), "Restore says nothing is re-run");
+  ok(confirmButton("Restore")!.classList.contains("btn-primary"), "Restore confirms with the primary button");
   await React.act(async () => {
     dialog()!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   });
   await flush();
   equal([dialog(), document.activeElement === restore], [null, true], "Escape closes Restore and returns focus");
   await click(restore);
+  let releaseRestore: () => void = () => {};
+  listReply = (archived) => new Promise<Response>((resolve) => { releaseRestore = () => resolve(json({ documents: archived ? ARCHIVED.filter((entry) => entry.file.id !== "art-old") : ACTIVE })); });
   await click(confirmButton("Restore"));
   await settle(() => ok(text().includes("Document restored."), "restore succeeds"), "restore");
+  ok(!row("art-old"), "a restored row leaves the Archived tab at once");
+  ok(headingFocused(), "after restoring focus moves to the heading");
+  await React.act(async () => { releaseRestore(); });
+  await flush();
+  listReply = (archived) => json({ documents: archived ? ARCHIVED.filter((entry) => entry.file.id !== "art-old") : ACTIVE });
   equal(calls.filter((call) => call.method === "POST").map((call) => call.path), ["/api/documents/art-old/restore"], "restore posts once");
 
   writeReply = () => refusal(403, "owner_only");
-  await click(buttonIn(row("art-old"), "Restore"));
+  await click(buttonIn(row("art-memo"), "Restore"));
   await click(confirmButton("Restore"));
   await settle(() => ok(text().includes("Only the workspace owner can restore documents."), "restore owner_only"), "restore refusal");
 
   writeReply = () => { throw Object.assign(new Error("aborted"), { name: "AbortError" }); };
-  await click(buttonIn(row("art-old"), "Restore"));
+  await click(buttonIn(row("art-memo"), "Restore"));
   const beforeRestoreAbort = calls.length;
   await click(confirmButton("Restore"));
   await settle(() => ok(calls.slice(beforeRestoreAbort).some((call) => call.path === "/api/documents?archived=1"), "an aborted restore reads the list again"), "restore abort");
@@ -517,7 +599,32 @@ async function main() {
     "Couldn’t check whether documents are available.",
     "Loading documents…",
     "Couldn’t load documents.",
-    "No documents yet",
+    "No documents to show",
+    "Only the most recent files are listed, so older documents may not appear here.",
+    "Show all stages",
+    "This workspace doesn’t have document review turned on.",
+    "Document",
+    "Document type",
+    "Stage",
+    "Version under review",
+    "Filter by stage",
+    "Active documents",
+    "Archived documents",
+    "Approved by you",
+    "Approve {title}",
+    "Archive {title}",
+    "Restore {title}",
+    "Approve document?",
+    "Archive document?",
+    "Restore document?",
+    "Approve version {version} of “{title}”? A later version needs its own approval.",
+    "Archive “{title}”? It moves to the Archived tab, and the owner can restore it.",
+    "Restore “{title}”? It returns to the stage it had before it was archived. Nothing is re-run.",
+    "Document approved.",
+    "Couldn’t refresh this list, so it may be out of date.",
+    "Retry",
+    "Home",
+    "Actions",
     "Nothing archived",
     "No documents at this stage",
     "Active",
@@ -539,6 +646,8 @@ async function main() {
     ...approveRefusals.map(([, , copy]) => copy),
   ];
   for (const english of strings) ok(translateUiText(english, "zh-TW") !== english, `zh-TW has “${english}”`);
+  // The tab and the region it labels read the same word (15).
+  ok(translateUiText("Active documents", "zh-TW").startsWith(translateUiText("Active", "zh-TW")), "Active reads the same in the tab and the table label");
 
   await React.act(async () => { root.unmount(); });
   console.log("documents screen checks passed");
