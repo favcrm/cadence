@@ -1903,39 +1903,23 @@ mod data_access_rows {
 /// Shared row projection for `rpc_app_home` across removed and active installs.
 fn app_home_row(install_id: &str, desc: &Value, attention: Value, include_project: bool) -> Value {
     let listing = desc["listing"].clone();
+    let mut row = json!({
+        "install_id": install_id,
+        "name": desc["name"],
+        "title": desc["title"],
+        "tagline": listing["tagline"],
+        "icon": listing["icon"],
+        "version": desc["version"],
+        "listing": listing,
+        "i18n": desc["i18n"],
+        "navigation": desc["navigation"],
+        "catalogue": desc["catalogue"],
+        "attention": attention,
+    });
     if include_project {
-        json!({
-            "install_id": install_id,
-            "name": desc["name"],
-            "title": desc["title"],
-            // The legacy project association — two same-name
-            // installs keep it so a reader can tell them apart
-            // (the old `/apps` list's `Project:` chip).
-            "project": desc["project"],
-            "tagline": listing["tagline"],
-            "icon": listing["icon"],
-            "version": desc["version"],
-            "listing": listing,
-            "i18n": desc["i18n"],
-            "navigation": desc["navigation"],
-            "catalogue": desc["catalogue"],
-            "attention": attention,
-        })
-    } else {
-        json!({
-            "install_id": install_id,
-            "name": desc["name"],
-            "title": desc["title"],
-            "tagline": listing["tagline"],
-            "icon": listing["icon"],
-            "version": desc["version"],
-            "listing": listing,
-            "i18n": desc["i18n"],
-            "navigation": desc["navigation"],
-            "catalogue": desc["catalogue"],
-            "attention": attention,
-        })
+        row["project"] = desc["project"].clone();
     }
+    row
 }
 
 #[cfg(test)]
@@ -1945,32 +1929,21 @@ mod app_home_projection_tests {
     #[test]
     fn app_home_row_forwards_i18n_and_navigation() {
         let desc = json!({
-            "name": "crm",
-            "title": "CRM",
-            "project": "default",
-            "version": "0.2.2",
-            "listing": { "tagline": "Track customers cleanly.", "icon": null },
-            "i18n": { "zh-TW": { "title": "客戶管理", "tagline": "輕鬆管理客戶關係" } },
-            "navigation": {
-                "section_query": "section",
-                "default_section": "customers",
-                "sections": [{
-                    "id": "customers",
-                    "label": "Customers",
-                    "i18n": { "zh-TW": { "label": "客戶" } }
-                }]
-            },
+            "name": "crm", "title": "CRM", "project": "default", "version": "0.2.2",
+            "listing": {"tagline": "Track.", "icon": null},
+            "i18n": {"zh-TW": {"title": "客戶管理"}},
+            "navigation": {"section_query": "section", "default_section": "c", "sections": [{"id": "c", "label": "Customers", "i18n": {"zh-TW": {"label": "客戶"}}}]},
             "catalogue": null
         });
-        let attention = json!({"state":"ok","message":null,"action":null,"count":0});
-        let active = app_home_row("inst_1", &desc, attention.clone(), true);
+        let att = json!({"state": "ok", "message": null, "action": null, "count": 0});
+        let active = app_home_row("inst_1", &desc, att.clone(), true);
         assert_eq!(active["project"], "default");
         assert_eq!(active["i18n"]["zh-TW"]["title"], "客戶管理");
         assert_eq!(
             active["navigation"]["sections"][0]["i18n"]["zh-TW"]["label"],
             "客戶"
         );
-        let removed = app_home_row("inst_1", &desc, attention, false);
+        let removed = app_home_row("inst_1", &desc, att, false);
         assert!(removed.get("project").is_none());
         assert_eq!(removed["i18n"], desc["i18n"]);
         assert_eq!(removed["navigation"], desc["navigation"]);

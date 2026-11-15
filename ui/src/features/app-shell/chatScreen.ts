@@ -31,6 +31,6 @@ export function chatContext(
   if (!entry) return null;
   const openTemplate = t ? t("{label} (open)") : "{label} (open)";
   return recordOpen && entry.record
-    ? { label: openTemplate.replace("{label}", entry.record.label), prompts: entry.record.prompts }
+    ? { label: openTemplate.replace("{label}", () => entry.record!.label), prompts: entry.record.prompts }
     : { label: entry.label, prompts: entry.prompts };
 }

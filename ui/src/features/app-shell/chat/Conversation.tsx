@@ -1944,8 +1944,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       ? null
       : draftSubject !== null
         ? draftLabel
-          ? `New ${draftLabel} conversation (unsaved)`
-          : "New conversation (unsaved)"
+          ? t("New {label} conversation (unsaved)").replace("{label}", () => draftLabel)
+          : t("New conversation (unsaved)")
         : active.selected !== null
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;

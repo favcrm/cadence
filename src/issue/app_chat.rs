@@ -523,92 +523,42 @@ mod tests {
 
     #[test]
     fn validates_i18n_at_each_display_surface_and_refuses_violations() {
-        let check = |v: &Value| validate(&v.to_string(), "demo");
-
         let mut ok = good();
-        ok["contexts"][0]["i18n"] = json!({
-            "zh-TW": { "label": "客戶", "prompts": ["列出上週新增的客戶"] }
-        });
-        ok["contexts"][0]["record"] = json!({
-            "label": "Customer",
-            "i18n": { "zh-TW": { "label": "客戶", "prompts": ["摘要最近互動"] } }
-        });
-        ok["attachments"] = json!([{
-            "id": "csv-import",
-            "label": "Import a customer list",
-            "i18n": { "zh-TW": { "label": "匯入客戶名單" } }
-        }]);
-        ok["subjects"] = json!([{
-            "kind": "customer",
-            "label": "Customer",
-            "i18n": { "zh-TW": { "label": "客戶" } }
-        }]);
-        ok["directives"] = json!([{
-            "match": "cadence_crm_import",
-            "card": {
-                "title": "Customer import",
-                "text": "You confirmed the reviewed rows. The assistant applies them.",
-                "i18n": {
-                    "zh-TW": {
-                        "title": "客戶匯入",
-                        "text": "您已確認檢視過的資料列，助理正在套用。"
-                    }
-                },
-                "fields": [{
-                    "label": "Rows",
-                    "from": "rows",
-                    "i18n": { "zh-TW": { "label": "筆數" } }
-                }],
-                "buttons": [{
-                    "label": "Open Customers",
-                    "run": "open-view",
-                    "view": "customers",
-                    "i18n": { "zh-TW": { "label": "開啟客戶列表" } }
-                }]
+        ok["contexts"][0]["i18n"] = json!({"zh-TW":{"label":"客","prompts":["列"]}});
+        ok["contexts"][0]["record"] =
+            json!({"label":"R","i18n":{"zh-TW":{"label":"客","prompts":["摘"]}}});
+        ok["attachments"] = json!([{"id":"csv","label":"Imp","i18n":{"zh-TW":{"label":"匯"}}}]);
+        ok["subjects"] = json!([{"kind":"c","label":"C","i18n":{"zh-TW":{"label":"客"}}}]);
+        ok["directives"] = json!([{"match":"m","card":{"title":"T","text":"D","i18n":{"zh-TW":{"title":"匯","text":"完"}},"fields":[{"label":"R","from":"r","i18n":{"zh-TW":{"label":"筆"}}}],"buttons":[{"label":"O","run":"open-view","view":"v","i18n":{"zh-TW":{"label":"開"}}}]}}]);
+        validate(&ok.to_string(), "demo").unwrap();
+
+        for (k, v) in [
+            ("ctx", json!({})),
+            ("ctx", json!({"zh_TW":{"label":"客"}})),
+            ("ctx", json!({"zh-TW":{}})),
+            ("att", json!({"zh-TW":{"title":"x"}})),
+            ("card", json!({"zh-TW":{"label":"x"}})),
+            ("sub", json!({"zh-TW":{"label":"客\n"}})),
+            (
+                "sub",
+                json!({"zh-tw":{"label":"客"},"zh-TW":{"label":"客"}}),
+            ),
+        ] {
+            let mut b = ok.clone();
+            match k {
+                "ctx" => b["contexts"][0]["i18n"] = v,
+                "att" => b["attachments"][0]["i18n"] = v,
+                "card" => b["directives"][0]["card"]["i18n"] = v,
+                _ => b["subjects"][0]["i18n"] = v,
             }
-        }]);
-        check(&ok).unwrap();
-
-        let mut bad = ok.clone();
-        bad["contexts"][0]["i18n"] = json!({});
-        assert!(check(&bad).is_err(), "empty i18n map");
-
-        let mut bad = ok.clone();
-        bad["contexts"][0]["i18n"] = json!({ "zh_TW": { "label": "客戶" } });
-        assert!(check(&bad).is_err(), "invalid locale tag");
-
-        let mut bad = ok.clone();
-        bad["contexts"][0]["i18n"] = json!({ "zh-TW": {} });
-        assert!(check(&bad).is_err(), "empty locale entry");
-
-        let mut bad = ok.clone();
-        bad["attachments"][0]["i18n"] = json!({ "zh-TW": { "title": "x" } });
-        assert!(check(&bad).is_err(), "unknown key on label i18n");
-
-        let mut bad = ok.clone();
-        bad["directives"][0]["card"]["i18n"] = json!({ "zh-TW": { "label": "x" } });
-        assert!(check(&bad).is_err(), "unknown key on card i18n");
-
-        let mut bad = ok.clone();
-        bad["subjects"][0]["i18n"] = json!({ "zh-TW": { "label": "客戶\n" } });
-        assert!(check(&bad).is_err(), "control char in i18n label");
-
-        let mut bad = ok.clone();
-        bad["subjects"][0]["i18n"] = json!({
-            "zh-tw": { "label": "客戶" },
-            "zh-TW": { "label": "客戶" }
-        });
-        assert!(
-            check(&bad).is_err(),
-            "case-insensitive duplicate locale tag"
-        );
-
-        let mut bad = ok.clone();
-        let mut too_many = serde_json::Map::new();
-        for i in 0..9 {
-            too_many.insert(format!("en-x{i}"), json!({ "label": "X" }));
+            assert!(validate(&b.to_string(), "demo").is_err(), "{k}");
         }
-        bad["subjects"][0]["i18n"] = Value::Object(too_many);
-        assert!(check(&bad).is_err(), "more than 8 locales");
+        let mut b = ok.clone();
+        b["subjects"][0]["i18n"] = Value::Object(
+            (0..9)
+                .map(|i| (format!("en-x{i}"), json!({"label":"X"})))
+                .collect(),
+        );
+        assert!(validate(&b.to_string(), "demo").is_err());
     }
 }

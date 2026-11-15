@@ -6,6 +6,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
+import { isPlainJsonObject, MAX_I18N_LOCALES, validLocaleTag } from "../appLocale";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
  *  when it cannot be loaded now. Supplied by the board; never by the frame. */
@@ -130,23 +131,29 @@ const SECTION_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "object" || Array.isArray(raw)) return null;
-  const entries = Object.entries(raw as Record<string, unknown>);
-  if (entries.length === 0 || entries.length > 8) return null;
-  const tagRe = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$/;
+  if (!isPlainJsonObject(raw)) return null;
+  const entries = Object.entries(raw);
+  // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
+  if (entries.length === 0) return undefined;
+  if (entries.length > MAX_I18N_LOCALES) return null;
   const out: Record<string, ScreenSectionI18n> = {};
   const seenLocales = new Set<string>();
   for (const [locale, entry] of entries) {
-    if (locale.length < 2 || locale.length > 20 || !tagRe.test(locale)) return null;
+    if (!validLocaleTag(locale)) return null;
     const lowerLocale = locale.toLowerCase();
     if (seenLocales.has(lowerLocale)) return null;
     seenLocales.add(lowerLocale);
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
-    const keys = Object.keys(entry as Record<string, unknown>);
+    if (!isPlainJsonObject(entry)) return null;
+    const keys = Object.keys(entry);
     if (keys.length !== 1 || keys[0] !== "label") return null;
-    const label = (entry as Record<string, unknown>).label;
+    const label = entry.label;
     if (typeof label !== "string" || label.trim().length === 0 || label.length > 40 || SECTION_CTRL_RE.test(label)) return null;
-    out[locale] = { label };
+    Object.defineProperty(out, locale, {
+      value: { label },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return out;
 }

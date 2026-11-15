@@ -220,48 +220,31 @@ async function main() {
   try { await directory.loadPublicApp(app.id, new AbortController().signal); } catch { refused = true; }
   assert(refused, "a detail response for another identity is not the requested app");
 
-  // CAD-2314: parsePublicApp rejects nested price/cost/pricing/artifact/path/deep/non-plain inputs and invalid i18n fail-closed.
-  const validI18nApp = {
-    ...app,
-    i18n: { "zh-TW": { title: "範例筆記", summary: "一行摘要", tagline: "輕量筆記" } },
-    listing: {
-      i18n: {
-        "zh-TW": {
-          title: "範例筆記",
-          summary: "一行摘要",
-          about: "說明第一段\n說明第二段",
-          can: ["建立筆記", "整理摘要"],
-          access_notes: { "notes.read": "讀取筆記內容" },
-        },
-      },
-    },
-  };
-  const parsedValidI18nApp = directory.parsePublicApp(validI18nApp);
-  assert(
-    parsedValidI18nApp !== null && parsedValidI18nApp.listing.i18n?.["zh-TW"]?.can?.length === 2,
-    "parsePublicApp accepts valid single-line summary and bounded multiline about",
-  );
-  let deeplyNested: Record<string, unknown> = { ok: true };
-  for (let i = 0; i < 35; i++) deeplyNested = { child: deeplyNested };
-  const protoInjectedListing = JSON.parse('{"__proto__":{"polluted":true}}');
-  const getterObj = Object.defineProperty({}, "safe", { enumerable: true, get: () => "x" });
-  for (const [why, badRow] of [
-    ["nested pricing key in listing", { ...app, listing: { details: { pricing: { monthly: 10 } } } }],
-    ["nested cost key in array", { ...app, listing: { items: [{ cost: 5 }] } }],
-    ["nested artifact key in listing", { ...app, listing: { nested: { artifact: "foo.tar.zst" } } }],
-    ["nested path key in listing", { ...app, listing: { nested: { path: "/etc/passwd" } } }],
-    ["depth > 32 fails closed", { ...app, listing: deeplyNested }],
-    ["non-object listing", { ...app, listing: "bad" }],
-    ["__proto__ own key in listing", { ...app, listing: protoInjectedListing }],
-    ["getter descriptor object", { ...app, listing: getterObj }],
-    ["invalid row.i18n duplicate locale", { ...app, i18n: { "zh-tw": { title: "A" }, "zh-TW": { title: "B" } } }],
-    ["newline in listing.i18n summary", { ...app, listing: { i18n: { "zh-TW": { summary: "line1\nline2" } } } }],
-    ["invalid listing.i18n unknown key", { ...app, listing: { i18n: { "zh-TW": { extra: "bad" } } } }],
-    ["listing.i18n can > 5 items", { ...app, listing: { i18n: { "zh-TW": { can: ["1", "2", "3", "4", "5", "6"] } } } }],
-    ["listing.i18n summary > 160 chars", { ...app, listing: { i18n: { "zh-TW": { summary: "x".repeat(161) } } } }],
-  ] as const) {
-    assert(directory.parsePublicApp(badRow) === null, `parsePublicApp rejects ${why}`);
-  }
+  const maxSummary = `${"說".repeat(70)}\n${"附".repeat(69)}${"x".repeat(140)}`;
+  const validI18n = directory.parsePublicApp({
+    ...app, i18n: { "zh-TW": { title: "範例", summary: maxSummary, tagline: "輕" } },
+    listing: { i18n: { "zh-TW": { title: "範例", summary: maxSummary, about: "一\n二", can: ["a", "b"], access_notes: { "notes.read": "r" } } } },
+  });
+  assert(validI18n?.listing.i18n?.["zh-TW"]?.can?.length === 2 && validI18n.i18n?.["zh-TW"]?.summary === maxSummary, "280-char summary");
+  const emptyParsed = directory.parsePublicList({ ok: true, data: { apps: [{ ...app, i18n: {}, listing: { i18n: {} } }] } });
+  assert(emptyParsed.length === 1 && !emptyParsed[0].i18n && !emptyParsed[0].listing.i18n, "{} i18n");
+  let deep: Record<string, unknown> = { ok: true };
+  for (let i = 0; i < 35; i++) deep = { child: deep };
+  const badPatches: [string, Record<string, unknown>][] = [
+    ["pricing", { listing: { details: { pricing: { m: 10 } } } }],
+    ["cost", { listing: { items: [{ cost: 5 }] } }],
+    ["artifact", { listing: { nested: { artifact: "f" } } }],
+    ["path", { listing: { nested: { path: "/etc/passwd" } } }],
+    ["depth>32", { listing: deep }], ["non-obj", { listing: "bad" }],
+    ["__proto__", { listing: JSON.parse('{"__proto__":{"p":1}}') }],
+    ["getter", { listing: Object.defineProperty({}, "safe", { enumerable: true, get: () => "x" }) }],
+    ["dup", { i18n: { "zh-tw": { title: "A" }, "zh-TW": { title: "B" } } }],
+    ["row>280", { i18n: { "zh-TW": { summary: "x".repeat(281) } } }],
+    ["extra", { listing: { i18n: { "zh-TW": { extra: "bad" } } } }],
+    ["can>5", { listing: { i18n: { "zh-TW": { can: ["1", "2", "3", "4", "5", "6"] } } } }],
+    ["list>280", { listing: { i18n: { "zh-TW": { summary: "x".repeat(281) } } } }],
+  ];
+  for (const [why, patch] of badPatches) assert(directory.parsePublicApp({ ...app, ...patch }) === null, why);
 
   console.log("public directory boundary checks passed");
 }

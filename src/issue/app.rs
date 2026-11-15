@@ -1251,57 +1251,51 @@ impl Manifest {
     /// from `listing.i18n` overlaid with top-level `i18n` (top-level wins per field).
     pub fn display_i18n(&self) -> serde_json::Value {
         use serde_json::{Map, Value};
-
-        fn overlay_source(
-            src: Option<&Value>,
-            out: &mut Map<String, Value>,
-            prefer_incoming_key: bool,
-        ) {
+        fn overlay(src: Option<&Value>, out: &mut Map<String, Value>, top: bool) {
             let Some(Value::Object(locales)) = src else {
                 return;
             };
             for (locale, entry) in locales {
-                let Some(Value::Object(fields)) = Some(entry) else {
+                let Value::Object(fields) = entry else {
                     continue;
                 };
-                let existing_key = out.keys().find(|k| k.eq_ignore_ascii_case(locale)).cloned();
-                if existing_key.is_none()
+                let prev_key = out.keys().find(|k| k.eq_ignore_ascii_case(locale)).cloned();
+                if prev_key.is_none()
                     && out.len() >= cadence_core::app_screen_decl::MAX_I18N_LOCALES
                 {
                     continue;
                 }
-                let mut merged = match existing_key.as_deref().and_then(|k| out.get(k)) {
-                    Some(Value::Object(prev)) => prev.clone(),
-                    _ => Map::new(),
-                };
-                for key in ["title", "summary", "tagline"] {
-                    if let Some(val @ Value::String(_)) = fields.get(key) {
-                        merged.insert(key.to_string(), val.clone());
+                let mut merged = prev_key
+                    .as_deref()
+                    .and_then(|k| out.get(k))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for k in ["title", "summary", "tagline"] {
+                    if let Some(v @ Value::String(_)) = fields.get(k) {
+                        merged.insert(k.to_string(), v.clone());
                     }
                 }
                 if !merged.is_empty() {
-                    let target_key = if prefer_incoming_key {
-                        if let Some(prev) = existing_key {
-                            if prev != *locale {
-                                out.remove(&prev);
-                            }
+                    let key = if top {
+                        if let Some(p) = prev_key.filter(|p| p != locale) {
+                            out.remove(&p);
                         }
                         locale.clone()
                     } else {
-                        existing_key.unwrap_or_else(|| locale.clone())
+                        prev_key.unwrap_or_else(|| locale.clone())
                     };
-                    out.insert(target_key, Value::Object(merged));
+                    out.insert(key, Value::Object(merged));
                 }
             }
         }
-
         let mut merged = Map::new();
-        overlay_source(
+        overlay(
             self.listing.as_ref().and_then(|l| l.value.get("i18n")),
             &mut merged,
             false,
         );
-        overlay_source(self.i18n.as_ref(), &mut merged, true);
+        overlay(self.i18n.as_ref(), &mut merged, true);
         if merged.is_empty() {
             Value::Null
         } else {
@@ -1779,15 +1773,15 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         Some(value) => Some(crate::issue::app_listing::parse_manifest_i18n(value)?),
     };
     let mut combined_locales = HashSet::new();
-    if let Some(listing_i18n) = listing
-        .as_ref()
-        .and_then(|l| l.value.get("i18n"))
-        .and_then(|v| v.as_object())
+    for map in [
+        listing.as_ref().and_then(|l| l.value.get("i18n")),
+        i18n.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_object())
     {
-        combined_locales.extend(listing_i18n.keys().map(|k| k.to_ascii_lowercase()));
-    }
-    if let Some(top_i18n) = i18n.as_ref().and_then(|v| v.as_object()) {
-        combined_locales.extend(top_i18n.keys().map(|k| k.to_ascii_lowercase()));
+        combined_locales.extend(map.keys().map(|k| k.to_ascii_lowercase()));
     }
     if combined_locales.len() > cadence_core::app_screen_decl::MAX_I18N_LOCALES {
         return Err(Error::rejected(format!(
@@ -4933,41 +4927,56 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
 
     #[test]
     fn manifest_display_i18n_merges_listing_and_top_level() {
+        let mk = |extra: &str| {
+            format!("---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\nneeds:\n  connections: []\n{extra}\n---\n\nGuide\n")
+        };
         let none = parse_manifest(APP_MD).unwrap();
-        assert_eq!(none.i18n, None);
-        assert!(none.display_i18n().is_null());
+        assert!(none.i18n.is_none() && none.display_i18n().is_null());
 
-        let md = "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\n\
-needs:\n  connections: []\n\
-listing:\n  tagline: Track customers cleanly.\n  i18n:\n    zh-TW:\n      title: CRM 舊標題\n      tagline: 輕鬆管理客戶關係與商機\n      about: 詳細介紹\n    zh-HK:\n      title: 客戶管理\n\
-i18n:\n  zh-TW:\n    title: 客戶管理\n    summary: 管理客戶與分眾名單\n---\n\nGuide\n";
-        let m = parse_manifest(md).unwrap();
-        let disp = m.display_i18n();
-        assert_eq!(disp["zh-TW"]["title"], "客戶管理");
-        assert_eq!(disp["zh-TW"]["summary"], "管理客戶與分眾名單");
-        assert_eq!(disp["zh-TW"]["tagline"], "輕鬆管理客戶關係與商機");
-        assert!(disp["zh-TW"].get("about").is_none());
-        assert_eq!(disp["zh-HK"]["title"], "客戶管理");
-
-        // Case-insensitive merge: top-level canonical spelling & fields win without duplication.
-        let md_ci = "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\n\
-needs:\n  connections: []\n\
-listing:\n  i18n:\n    zh-tw:\n      title: CRM 舊標題\n      tagline: 保留標籤\n    en:\n      title: EN\n    fr:\n      title: FR\n    de:\n      title: DE\n    es:\n      title: ES\n    ja:\n      title: JA\n    ko:\n      title: KO\n    pt:\n      title: PT\n\
-i18n:\n  zh-TW:\n    title: 客戶管理\n---\n\nGuide\n";
-        let merged_ci = parse_manifest(md_ci).unwrap();
-        let disp_ci = merged_ci.display_i18n();
-        let disp_obj = disp_ci.as_object().unwrap();
-        assert_eq!(disp_obj.len(), 8);
-        assert!(disp_obj.contains_key("zh-TW") && !disp_obj.contains_key("zh-tw"));
-        assert_eq!(disp_ci["zh-TW"]["title"], "客戶管理");
-        assert_eq!(disp_ci["zh-TW"]["tagline"], "保留標籤");
-
-        // Exceeding 8 distinct case-insensitive locales across listing.i18n + i18n refuses.
-        let md_too_many = "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\n\
-needs:\n  connections: []\n\
-listing:\n  i18n:\n    en: { title: EN }\n    fr: { title: FR }\n    de: { title: DE }\n    es: { title: ES }\n    ja: { title: JA }\n\
-i18n:\n  ko: { title: KO }\n  pt: { title: PT }\n  it: { title: IT }\n  nl: { title: NL }\n---\n\nGuide\n";
-        assert!(parse_manifest(md_too_many).is_err());
+        let d = parse_manifest(&mk(
+            "listing:\n  tagline: T\n  i18n: { zh-TW: { title: A, tagline: L, about: B }, zh-HK: { title: C } }\n\
+             i18n: { zh-TW: { title: 客戶管理, summary: 管理 } }",
+        ))
+        .unwrap()
+        .display_i18n();
+        let z = &d["zh-TW"];
+        assert_eq!(
+            (
+                z["title"].as_str(),
+                z["summary"].as_str(),
+                z["tagline"].as_str(),
+                d["zh-HK"]["title"].as_str()
+            ),
+            (Some("客戶管理"), Some("管理"), Some("L"), Some("C"))
+        );
+        assert!(z.get("about").is_none());
+        let locs = |a: u8, b: u8| {
+            (a..b)
+                .map(|i| format!("en-x{i}: {{ title: T }}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ci = parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ zh-tw: {{ title: A, tagline: K }}, {} }} }}\ni18n: {{ zh-TW: {{ title: 客戶 }} }}",
+            locs(0, 7)
+        )))
+        .unwrap()
+        .display_i18n();
+        let obj = ci.as_object().unwrap();
+        assert!(obj.len() == 8 && obj.contains_key("zh-TW") && !obj.contains_key("zh-tw"));
+        assert_eq!(
+            (
+                ci["zh-TW"]["title"].as_str(),
+                ci["zh-TW"]["tagline"].as_str()
+            ),
+            (Some("客戶"), Some("K"))
+        );
+        assert!(parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ {} }} }}\ni18n: {{ {} }}",
+            locs(0, 5),
+            locs(5, 9)
+        )))
+        .is_err());
     }
 
     /// CAD-864: declaration and descriptor file pair up in the

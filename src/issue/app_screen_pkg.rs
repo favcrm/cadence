@@ -649,24 +649,22 @@ mod tests {
         let js = "console.log(1);";
         let mut with_nav: serde_json::Value =
             serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
-        with_nav["navigation"] = json!({
-            "section_query": "section",
-            "default_section": "customers",
-            "sections": [{
-                "id": "customers",
-                "label": "Customers",
-                "i18n": { "zh-TW": { "label": "客戶" } }
-            }]
-        });
+        with_nav["navigation"] = json!({"section_query":"section","default_section":"customers","sections":[{"id":"customers","label":"Customers","i18n":{"zh-TW":{"label":"客戶"}}}]});
         let files = bundle_with("main", &with_nav.to_string(), &[("client.js", js)]);
         let projected = single_screen_navigation(&files, "crm");
-        assert_eq!(projected["default_section"], "customers");
-        assert_eq!(projected["sections"][0]["i18n"]["zh-TW"]["label"], "客戶");
+        assert_eq!(
+            (
+                &projected["default_section"],
+                &projected["sections"][0]["i18n"]["zh-TW"]["label"]
+            ),
+            (&json!("customers"), &json!("客戶"))
+        );
         assert!(single_screen_navigation(&files, "other").is_null());
-
-        let no_nav = bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]);
-        assert!(single_screen_navigation(&no_nav, "crm").is_null());
-
+        assert!(single_screen_navigation(
+            &bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]),
+            "crm"
+        )
+        .is_null());
         let mut two = files.clone();
         two.insert(
             "screens/second/screens.json".to_string(),

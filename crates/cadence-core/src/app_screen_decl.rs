@@ -1685,19 +1685,19 @@ fn check_assets<S: Supplied>(assets: &[RawAsset], supplied: &S) -> Result<()> {
     Ok(())
 }
 
-/// A string→string map that refuses a repeated key. serde's map decoding keeps
-/// the last value for a repeated key, so a declaration could otherwise hide a
-/// shadowed tool slot behind one. Every other object in a declaration is a
-/// closed struct, whose derived decode already refuses a repeated field.
-fn unique_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+fn unique_btreemap<'de, D, V>(
+    deserializer: D,
+    kind: &'static str,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
 where
     D: Deserializer<'de>,
+    V: Deserialize<'de>,
 {
-    struct UniqueMap;
-    impl<'de> Visitor<'de> for UniqueMap {
-        type Value = BTreeMap<String, String>;
+    struct UniqueMap<V>(std::marker::PhantomData<V>, &'static str);
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMap<V> {
+        type Value = BTreeMap<String, V>;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("a map of string values without a repeated key")
+            f.write_str("a map without a repeated key")
         }
         fn visit_map<A: MapAccess<'de>>(
             self,
@@ -1707,15 +1707,27 @@ where
             while let Some(key) = map.next_key::<String>()? {
                 if out.contains_key(&key) {
                     return Err(serde::de::Error::custom(format!(
-                        "tool alias {key:?} is declared twice"
+                        "{} {key:?} is declared twice",
+                        self.1
                     )));
                 }
-                out.insert(key, map.next_value::<String>()?);
+                out.insert(key, map.next_value::<V>()?);
             }
             Ok(out)
         }
     }
-    deserializer.deserialize_map(UniqueMap)
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData, kind))
+}
+
+/// A string→string map that refuses a repeated key. serde's map decoding keeps
+/// the last value for a repeated key, so a declaration could otherwise hide a
+/// shadowed tool slot behind one. Every other object in a declaration is a
+/// closed struct, whose derived decode already refuses a repeated field.
+fn unique_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    unique_btreemap(deserializer, "tool alias")
 }
 
 fn unique_opt_section_i18n<'de, D>(
@@ -1724,48 +1736,13 @@ fn unique_opt_section_i18n<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    struct UniqueOptMap;
-    impl<'de> Visitor<'de> for UniqueOptMap {
-        type Value = Option<BTreeMap<String, ScreenSectionI18n>>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an optional locale map without repeated keys")
-        }
-        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_some<D2>(self, deserializer: D2) -> std::result::Result<Self::Value, D2::Error>
-        where
-            D2: Deserializer<'de>,
-        {
-            struct UniqueLocaleMap;
-            impl<'de> Visitor<'de> for UniqueLocaleMap {
-                type Value = BTreeMap<String, ScreenSectionI18n>;
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("a map of locale tags without repeated keys")
-                }
-                fn visit_map<A: MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> std::result::Result<Self::Value, A::Error> {
-                    let mut out = BTreeMap::new();
-                    while let Some(key) = map.next_key::<String>()? {
-                        if out.contains_key(&key) {
-                            return Err(serde::de::Error::custom(format!(
-                                "i18n locale {key:?} is declared twice"
-                            )));
-                        }
-                        out.insert(key, map.next_value::<ScreenSectionI18n>()?);
-                    }
-                    Ok(out)
-                }
-            }
-            deserializer.deserialize_map(UniqueLocaleMap).map(Some)
+    struct W(BTreeMap<String, ScreenSectionI18n>);
+    impl<'de> Deserialize<'de> for W {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> std::result::Result<Self, D2::Error> {
+            unique_btreemap(d, "i18n locale").map(Self)
         }
     }
-    deserializer.deserialize_option(UniqueOptMap)
+    Option::<W>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
 }
 
 #[cfg(test)]
@@ -2101,86 +2078,61 @@ mod tests {
 
     #[test]
     fn navigation_section_i18n_validates_bounds_and_rejects_bad_inputs() {
-        let base_manifest = |sections: Value| {
-            serde_json::json!({
-                "contract": "app-screens/v2",
-                "app": "crm",
-                "entry": "client.js",
-                "assets": [{
-                    "name": "client.js",
-                    "media_type": "text/javascript",
-                    "size": BODY.len(),
-                    "sha256": digest(BODY),
-                }],
-                "provenance": {
-                    "source_digest": digest("source"),
-                    "sdk_digest": digest("sdk"),
-                    "toolchain_digest": digest("toolchain"),
-                },
-                "host_contract": "screen-records.v1",
-                "may": [],
-                "navigation": {
-                    "section_query": "section",
-                    "default_section": "customers",
-                    "sections": sections,
-                }
-            })
-            .to_string()
+        let base_manifest = |sections: &str| {
+            format!(
+                r#"{{"contract":"app-screens/v2","app":"crm","entry":"client.js","assets":[{{"name":"client.js","media_type":"text/javascript","size":{},"sha256":"{}"}}],"provenance":{{"source_digest":"{}","sdk_digest":"{}","toolchain_digest":"{}"}},"host_contract":"screen-records.v1","may":[],"navigation":{{"section_query":"section","default_section":"customers","sections":{sections}}}}}"#,
+                BODY.len(),
+                digest(BODY),
+                digest("source"),
+                digest("sdk"),
+                digest("toolchain"),
+            )
         };
         let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
-
-        let valid = base_manifest(serde_json::json!([{
-            "id": "customers",
-            "label": "Customers",
-            "i18n": {
-                "zh-TW": { "label": "客戶" },
-                "zh-HK": { "label": "客戶" }
-            }
-        }]));
-        let parsed = validate_map(&valid, &bodies).expect("valid section i18n must pass");
-        let nav = parsed.navigation().expect("navigation must be present");
-        let i18n = nav.sections[0].i18n.as_ref().expect("i18n map");
-        assert_eq!(i18n["zh-TW"].label, "客戶");
-
-        // Empty map, invalid locale tag, blank label, control char, Unicode separator, unknown inner field all refuse.
-        for bad_section in [
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": {} }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh_TW": { "label": "客戶" } } }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "   " } } }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶\n" } } }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶\u{2028}" } } }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-tw": { "label": "客戶" }, "zh-TW": { "label": "客戶" } } }),
-            serde_json::json!({ "id": "customers", "label": "   " }),
-            serde_json::json!({ "id": "customers", "label": "Bad\u{2029}Label" }),
-            serde_json::json!({ "id": "customers", "label": "Customers", "i18n": { "zh-TW": { "label": "客戶", "extra": "x" } } }),
-        ] {
-            let manifest = base_manifest(serde_json::json!([bad_section]));
-            assert!(validate_map(&manifest, &bodies).is_err());
-        }
-
-        // More than MAX_I18N_LOCALES refuses.
-        let mut too_many = serde_json::Map::new();
-        for i in 0..=MAX_I18N_LOCALES {
-            too_many.insert(format!("en-x{i}"), serde_json::json!({ "label": "S" }));
-        }
-        let manifest = base_manifest(serde_json::json!([{
-            "id": "customers",
-            "label": "Customers",
-            "i18n": too_many,
-        }]));
-        assert!(validate_map(&manifest, &bodies).is_err());
-
-        // Duplicate locale key in raw JSON refuses.
-        let dup_json = valid.replace(
-            r#""zh-TW":{"label":"客戶"},"zh-HK":{"label":"客戶"}"#,
-            r#""zh-TW":{"label":"客戶"},"zh-TW":{"label":"客戶"}"#,
+        let nav = validate_map(
+            &base_manifest(r#"[{"id":"customers","label":"Customers","i18n":{"zh-TW":{"label":"客戶"},"zh-HK":{"label":"客戶"}}}]"#),
+            &bodies,
+        )
+        .unwrap()
+        .navigation()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            nav.sections[0].i18n.as_ref().unwrap()["zh-TW"].label,
+            "客戶"
         );
-        // Handle pretty/compact spacing from serde_json::Value::to_string()
-        let dup_json = if dup_json == valid {
-            valid.replace("\"zh-HK\"", "\"zh-TW\"")
-        } else {
-            dup_json
-        };
-        assert!(validate_map(&dup_json, &bodies).is_err());
+
+        for bad_i18n in [
+            "{}",
+            r#"{"zh_TW":{"label":"客"}}"#,
+            r#"{"zh-TW":{"label":"   "}}"#,
+            r#"{"zh-TW":{"label":"客\n"}}"#,
+            r#"{"zh-TW":{"label":"客\u2028"}}"#,
+            r#"{"zh-tw":{"label":"客"},"zh-TW":{"label":"客"}}"#,
+            r#"{"zh-TW":{"label":"客","extra":"x"}}"#,
+            r#"{"zh-TW":{"label":"客"},"zh-TW":{"label":"客"}}"#,
+        ] {
+            let m = base_manifest(&format!(r#"[{{"id":"c","label":"C","i18n":{bad_i18n}}}]"#));
+            assert!(validate_map(&m, &bodies).is_err(), "{bad_i18n}");
+        }
+        for bad_lbl in [r#""   ""#, r#""Bad\u2029Label""#] {
+            assert!(validate_map(
+                &base_manifest(&format!(r#"[{{"id":"c","label":{bad_lbl}}}]"#)),
+                &bodies
+            )
+            .is_err());
+        }
+
+        let many = (0..=MAX_I18N_LOCALES)
+            .map(|i| format!(r#""en-x{i}":{{"label":"S"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_map(
+            &base_manifest(&format!(
+                r#"[{{"id":"customers","label":"C","i18n":{{{many}}}}}]"#
+            )),
+            &bodies
+        )
+        .is_err());
     }
 }

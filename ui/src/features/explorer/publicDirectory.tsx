@@ -5,18 +5,7 @@ import Select from "../../ui/Select";
 import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
-import {
-  isPlainJsonObject,
-  localizedAppCategory,
-  localizedAppSummary,
-  localizedAppTagline,
-  localizedAppTitle,
-  parseAppDisplayI18n,
-  parseListingDisplayI18n,
-  pickLocaleEntry,
-  type AppDisplayI18n,
-  type ListingDisplayLocale,
-} from "../workspace-apps/appLocale";
+import { isPlainJsonObject, localizedAppCategory, localizedAppSummary, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, parseListingDisplayI18n, pickLocaleEntry, type AppDisplayI18n, type ListingDisplayLocale } from "../workspace-apps/appLocale";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -95,36 +84,17 @@ const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
 const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
-const FORBIDDEN_PUBLIC_KEYS = new Set([
-  "cost",
-  "price",
-  "pricing",
-  "artifact",
-  "path",
-  "__proto__",
-  "prototype",
-  "constructor",
-]);
+const FORBIDDEN_PUBLIC_KEYS = new Set(["cost", "price", "pricing", "artifact", "path", "__proto__", "prototype", "constructor"]);
 const MAX_PUBLIC_SCAN_DEPTH = 32;
 const MAX_PUBLIC_SCAN_NODES = 4096;
 
-function hasUnsafePublicStructure(
-  value: unknown,
-  depth = 0,
-  state = { nodes: 0 },
-): boolean {
+function hasUnsafePublicStructure(value: unknown, depth = 0, state = { nodes: 0 }): boolean {
   if (depth > MAX_PUBLIC_SCAN_DEPTH) return true;
   if (value === null || typeof value !== "object") return false;
   if (++state.nodes > MAX_PUBLIC_SCAN_NODES) return true;
-  if (Array.isArray(value)) {
-    return value.some((item) => hasUnsafePublicStructure(item, depth + 1, state));
-  }
+  if (Array.isArray(value)) return value.some((item) => hasUnsafePublicStructure(item, depth + 1, state));
   if (!isPlainJsonObject(value)) return true;
-  for (const k of Object.keys(value)) {
-    if (FORBIDDEN_PUBLIC_KEYS.has(k)) return true;
-    if (hasUnsafePublicStructure(value[k], depth + 1, state)) return true;
-  }
-  return false;
+  return Object.keys(value).some((k) => FORBIDDEN_PUBLIC_KEYS.has(k) || hasUnsafePublicStructure(value[k], depth + 1, state));
 }
 
 function listingOf(value: unknown): PublicListing | null {
@@ -163,9 +133,13 @@ function listingOf(value: unknown): PublicListing | null {
     : undefined;
   let i18n: Record<string, ListingDisplayLocale> | undefined;
   if (row.i18n !== undefined && row.i18n !== null) {
-    const parsedListingI18n = parseListingDisplayI18n(row.i18n);
-    if (!parsedListingI18n) return null;
-    i18n = parsedListingI18n;
+    if (isPlainJsonObject(row.i18n) && Object.keys(row.i18n).length === 0) {
+      // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
+    } else {
+      const parsedListingI18n = parseListingDisplayI18n(row.i18n);
+      if (!parsedListingI18n) return null;
+      i18n = parsedListingI18n;
+    }
   }
   return {
     tagline,
@@ -193,9 +167,13 @@ export function parsePublicApp(value: unknown): PublicApp | null {
   if (hasUnsafePublicStructure(row)) return null;
   let parsedI18n: AppDisplayI18n | undefined;
   if (row.i18n !== undefined && row.i18n !== null) {
-    const parsed = parseAppDisplayI18n(row.i18n);
-    if (!parsed) return null;
-    parsedI18n = parsed;
+    if (isPlainJsonObject(row.i18n) && Object.keys(row.i18n).length === 0) {
+      // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
+    } else {
+      const parsed = parseAppDisplayI18n(row.i18n);
+      if (!parsed) return null;
+      parsedI18n = parsed;
+    }
   }
   const listing = listingOf(row.listing);
   if (!listing) return null;

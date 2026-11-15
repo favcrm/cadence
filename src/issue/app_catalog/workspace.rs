@@ -3052,58 +3052,25 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
 
     #[test]
     fn describe_id_projects_navigation_and_i18n_without_changing_generation() {
-        let pm_dir = tempfile::tempdir().unwrap();
-        let state_dir = tempfile::tempdir().unwrap();
-        let sources = tempfile::tempdir().unwrap();
-        let pm = Pm::init(pm_dir.path()).unwrap();
-        let src = sources.path().join("crm-bundle");
-        bundle(
-            &src,
-            "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\n\
-needs:\n  connections: []\n  requires:\n    contracts: {app-screens: [1], screen-records: [1]}\n\
-listing:\n  tagline: Track customers cleanly.\n  i18n:\n    zh-TW:\n      tagline: 輕鬆管理客戶關係\n\
-i18n:\n  zh-TW:\n    title: 客戶管理\n---\n\nGuide.\n",
-        );
+        let td = || tempfile::tempdir().unwrap();
+        let (pm_dir, state_dir, sources) = (td(), td(), td());
+        let (pm, src) = (Pm::init(pm_dir.path()).unwrap(), sources.path().join("crm"));
+        bundle(&src, "---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage\nneeds: {connections: [], requires: {contracts: {app-screens: [1], screen-records: [1]}}}\nlisting: {tagline: Track., i18n: {zh-TW: {tagline: 輕鬆}}}\ni18n: {zh-TW: {title: 客戶管理}}\n---\n\nGuide.\n");
         let js = "console.log(1);\n";
-        let digest = {
+        let sha = {
             use sha2::{Digest, Sha256};
             format!("sha256:{:x}", Sha256::digest(js.as_bytes()))
         };
-        let screen_json = serde_json::json!({
-            "contract": "app-screens/v2",
-            "app": "crm",
-            "entry": "client.js",
-            "assets": [{
-                "name": "client.js",
-                "media_type": "text/javascript",
-                "sha256": digest,
-                "size": js.len()
-            }],
-            "provenance": {
-                "source_digest": format!("sha256:{}", "a".repeat(64)),
-                "sdk_digest": format!("sha256:{}", "b".repeat(64)),
-                "toolchain_digest": format!("sha256:{}", "c".repeat(64)),
-            },
-            "host_contract": "screen-records.v1",
-            "may": [],
-            "navigation": {
-                "section_query": "section",
-                "default_section": "customers",
-                "sections": [{
-                    "id": "customers",
-                    "label": "Customers",
-                    "i18n": { "zh-TW": { "label": "客戶" } }
-                }]
-            }
+        let screen = serde_json::json!({
+            "contract": "app-screens/v2", "app": "crm", "entry": "client.js",
+            "assets": [{"name": "client.js", "media_type": "text/javascript", "sha256": sha, "size": js.len()}],
+            "provenance": {"source_digest": format!("sha256:{}", "a".repeat(64)), "sdk_digest": format!("sha256:{}", "b".repeat(64)), "toolchain_digest": format!("sha256:{}", "c".repeat(64))},
+            "host_contract": "screen-records.v1", "may": [],
+            "navigation": {"section_query": "section", "default_section": "c", "sections": [{"id": "c", "label": "Customers", "i18n": {"zh-TW": {"label": "客戶"}}}]}
         });
         std::fs::create_dir_all(src.join("screens/main")).unwrap();
         std::fs::write(src.join("screens/main/client.js"), js).unwrap();
-        std::fs::write(
-            src.join("screens/main/screens.json"),
-            screen_json.to_string(),
-        )
-        .unwrap();
-
+        std::fs::write(src.join("screens/main/screens.json"), screen.to_string()).unwrap();
         let out = install(
             &pm,
             state_dir.path(),
@@ -3113,15 +3080,20 @@ i18n:\n  zh-TW:\n    title: 客戶管理\n---\n\nGuide.\n",
         )
         .unwrap();
         let catalog = Catalog::load(&pm.dir).unwrap();
-        let expected_gen = hash(&yaml(&catalog).unwrap());
-        let id = InstallationId::parse(out["install_id"].as_str().unwrap()).unwrap();
-        let desc = describe_id(&pm, &catalog, &id).unwrap();
-        assert_eq!(desc["catalog_generation"], expected_gen);
-        assert_eq!(desc["i18n"]["zh-TW"]["title"], "客戶管理");
-        assert_eq!(desc["i18n"]["zh-TW"]["tagline"], "輕鬆管理客戶關係");
+        let desc = describe_id(
+            &pm,
+            &catalog,
+            &InstallationId::parse(out["install_id"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desc["catalog_generation"], hash(&yaml(&catalog).unwrap()));
         assert_eq!(
-            desc["navigation"]["sections"][0]["i18n"]["zh-TW"]["label"],
-            "客戶"
+            (
+                &desc["i18n"]["zh-TW"]["title"],
+                &desc["i18n"]["zh-TW"]["tagline"],
+                &desc["navigation"]["sections"][0]["i18n"]["zh-TW"]["label"]
+            ),
+            (&json!("客戶管理"), &json!("輕鬆"), &json!("客戶"))
         );
     }
 }

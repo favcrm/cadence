@@ -565,7 +565,7 @@ fn parse_listing_i18n(value: &serde_yaml::Value, slots: &[String]) -> Result<Val
             &[
                 ("title", "i18n.title", 80, false),
                 ("tagline", "i18n.tagline", 80, false),
-                ("summary", "i18n.summary", 160, false),
+                ("summary", "i18n.summary", 280, true),
                 ("about", "i18n.about", 600, true),
             ],
             &mut obj,
@@ -626,7 +626,7 @@ pub(crate) fn parse_manifest_i18n(value: &serde_yaml::Value) -> Result<Value> {
                 entry,
                 &[
                     ("title", "i18n.title", 80, false),
-                    ("summary", "i18n.summary", 160, false),
+                    ("summary", "i18n.summary", 280, true),
                     ("tagline", "i18n.tagline", 80, false),
                 ],
                 &mut obj,
@@ -643,98 +643,81 @@ mod tests {
     #[test]
     fn parses_listing_i18n_and_refuses_invalid_entries() {
         let slots = vec!["crm.read".to_string()];
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
-            r#"
-tagline: Track customers cleanly.
-i18n:
-  zh-TW:
-    title: 客戶管理
-    tagline: 輕鬆管理客戶關係與商機
-    summary: 一站式管理客戶、分眾名單與行銷活動
-    about: 為中小企業打造的客戶關係工具
-    can:
-      - 建立與維護客戶檔案
-    access_notes:
-      crm.read: 讀取工作區客戶資料
-  zh-HK:
-    title: 客戶管理
-"#,
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        let p = parse(
+            &y("{tagline: T., i18n: {zh-TW: {title: 客, tagline: 輕, summary: 總, about: 介, can: [維], access_notes: {crm.read: 讀}}, zh-HK: {title: 客}}}"),
+            512,
+            &slots,
         )
         .unwrap();
-        let parsed = parse(&yaml, 512, &slots).unwrap();
-        assert_eq!(parsed.value["i18n"]["zh-TW"]["title"], "客戶管理");
-        assert_eq!(
-            parsed.value["i18n"]["zh-TW"]["access_notes"]["crm.read"],
-            "讀取工作區客戶資料"
-        );
-        assert_eq!(parsed.value["i18n"]["zh-HK"]["title"], "客戶管理");
+        assert_eq!(p.value["i18n"]["zh-TW"]["title"], "客");
+        assert_eq!(p.value["i18n"]["zh-TW"]["access_notes"]["crm.read"], "讀");
+        assert_eq!(p.value["i18n"]["zh-HK"]["title"], "客");
 
         for bad in [
-            "i18n: {}",
-            "i18n:\n  zh_TW:\n    title: 客戶管理",
-            "i18n:\n  zh-tw:\n    title: A\n  zh-TW:\n    title: B",
-            "i18n:\n  zh-TW: {}",
-            "i18n:\n  zh-TW:\n    unknown: 1",
-            "i18n:\n  zh-TW:\n    access_notes:\n      missing.slot: x",
-            "i18n:\n  zh-TW:\n    title: \"line1\\nline2\"",
-            "i18n:\n  zh-TW:\n    summary: \"line1\\nline2\"",
-            "i18n:\n  zh-TW:\n    title: \"bad\\u2028line\"",
+            "{}",
+            "{zh_TW: {title: A}}",
+            "{zh-tw: {title: A}, zh-TW: {title: B}}",
+            "{zh-TW: {}}",
+            "{zh-TW: {unknown: 1}}",
+            "{zh-TW: {access_notes: {missing.slot: x}}}",
+            "{zh-TW: {title: \"a\\nb\"}}",
+            "{zh-TW: {title: \"a\\u2028b\"}}",
         ] {
-            let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
-            assert!(parse(&v, 256, &slots).is_err(), "{bad}");
+            assert!(
+                parse(&y(&format!("{{i18n: {bad}}}")), 256, &slots).is_err(),
+                "{bad}"
+            );
         }
 
-        let long_summary = format!("i18n:\n  zh-TW:\n    summary: {}", "x".repeat(161));
-        let v: serde_yaml::Value = serde_yaml::from_str(&long_summary).unwrap();
-        assert!(parse(&v, 512, &slots).is_err(), "summary > 160");
-
-        let ok_multiline_about = "i18n:\n  zh-TW:\n    about: \"第一段\\n第二段\"";
-        let v: serde_yaml::Value = serde_yaml::from_str(ok_multiline_about).unwrap();
+        let ml = parse(
+            &y("{i18n: {zh-TW: {summary: \"a\\nb\", about: \"c\\nd\"}}}"),
+            512,
+            &slots,
+        )
+        .unwrap();
         assert_eq!(
-            parse(&v, 512, &slots).unwrap().value["i18n"]["zh-TW"]["about"],
-            "第一段\n第二段"
+            (
+                &ml.value["i18n"]["zh-TW"]["summary"],
+                &ml.value["i18n"]["zh-TW"]["about"]
+            ),
+            (&json!("a\nb"), &json!("c\nd"))
         );
 
-        let emoji_ok = format!("i18n:\n  zh-TW:\n    title: {}", "😀".repeat(40));
-        let v: serde_yaml::Value = serde_yaml::from_str(&emoji_ok).unwrap();
-        assert!(
-            parse(&v, 512, &slots).is_ok(),
-            "40 astral emoji = 80 UTF-16 units"
-        );
-        let emoji_over = format!("i18n:\n  zh-TW:\n    title: {}", "😀".repeat(41));
-        let v: serde_yaml::Value = serde_yaml::from_str(&emoji_over).unwrap();
-        assert!(
-            parse(&v, 512, &slots).is_err(),
-            "41 astral emoji = 82 UTF-16 units > 80"
-        );
-
-        let mut too_many = String::from("i18n:\n");
-        for i in 0..9 {
-            too_many.push_str(&format!("  en-x{i}:\n    title: T{i}\n"));
+        for (k, ch, n, ok) in [
+            ("summary", "x", 280, true),
+            ("summary", "x", 281, false),
+            ("title", "😀", 40, true),
+            ("title", "😀", 41, false),
+        ] {
+            assert_eq!(
+                parse(
+                    &y(&format!("{{i18n: {{zh-TW: {{{k}: {}}}}}}}", ch.repeat(n))),
+                    512,
+                    &slots
+                )
+                .is_ok(),
+                ok,
+                "{k}:{n}"
+            );
         }
-        let v: serde_yaml::Value = serde_yaml::from_str(&too_many).unwrap();
-        assert!(parse(&v, 512, &slots).is_err());
+
+        let nine: String = (0..9)
+            .map(|i| format!("en-x{i}: {{title: T{i}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(parse(&y(&format!("{{i18n: {{{nine}}}}}")), 512, &slots).is_err());
     }
 
     #[test]
     fn parses_manifest_top_level_i18n() {
-        let v: serde_yaml::Value = serde_yaml::from_str(
-            r#"
-zh-TW:
-  title: 會議紀錄
-  summary: 自動整理重點與待辦事項
-"#,
-        )
-        .unwrap();
-        let parsed = parse_manifest_i18n(&v).unwrap();
-        assert_eq!(parsed["zh-TW"]["title"], "會議紀錄");
-
-        for bad in [
-            "zh-TW:\n  about: Not allowed on top-level i18n",
-            "zh-TW:\n  title: '<b>bad</b>'",
-        ] {
-            let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
-            assert!(parse_manifest_i18n(&v).is_err(), "{bad}");
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        assert_eq!(
+            parse_manifest_i18n(&y("{zh-TW: {title: 客, summary: 總}}")).unwrap()["zh-TW"]["title"],
+            "客"
+        );
+        for bad in ["{zh-TW: {about: x}}", "{zh-TW: {title: '<b>bad</b>'}}"] {
+            assert!(parse_manifest_i18n(&y(bad)).is_err(), "{bad}");
         }
     }
 }
