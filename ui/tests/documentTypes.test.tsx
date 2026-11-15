@@ -478,6 +478,34 @@ async function main() {
   await click(buttonIn(host, "Retry"));
   await settle(() => ok(!text().includes("Couldn’t refresh the member list"), "a good retry clears the notice"), "retry ok");
 
+  // `approver_unavailable` proves the kept roster is out of date. If reading it
+  // again fails, the old roster is dropped and approvers show by id, so one who
+  // has left is never shown as a member.
+  for (const via of ["confirm", "save"] as const) {
+    await fresh();
+    await listed();
+    await settle(() => equal(value(row("brief"), "Approver"), "Ann Lee", "names"), `${via}: roster before`);
+    writeReply = () => refusal(409, "approver_unavailable");
+    rosterReply = () => refusal(500, "internal");
+    const rosterBefore = gets("/api/team/members");
+    if (via === "confirm") {
+      await click(buttonIn(row("contract"), "Confirm"));
+      await click(buttonIn(dialog(), "Confirm"));
+    } else {
+      await click(buttonIn(row("brief"), "Edit"));
+      await fill(field("Archive after (days)"), "15");
+      await save();
+    }
+    await settle(() => equal(gets("/api/team/members"), rosterBefore + 1, `${via}: the roster is read again`), `${via}: roster reread`);
+    await settle(
+      () => ok(text().includes("Couldn’t read the member list, so approvers are shown by their id."), `${via}: the dropped roster says so`),
+      `${via}: roster dropped`,
+    );
+    equal(value(row("brief"), "Approver"), "u-ann", `${via}: the approver shows by id, not from the stale roster`);
+    equal(value(row("memo"), "Approver"), "u-gone", `${via}: an unknown roster never says the approver left`);
+    ok(!text().includes("approver names may be out of date"), `${via}: a dropped roster is not described as kept`);
+  }
+
   // A conflict reads the types again and shows the current row.
   const confirmRefusals: [number, string, string][] = [
     [409, "conflict", "This type changed since you read it. Review the current values, then confirm."],
@@ -716,6 +744,29 @@ async function main() {
   await click(drawer()!.querySelector('button[aria-label^="Close"]'));
   await closed();
   await settle(() => ok(!drawer(), "the second form closes"), "close second");
+
+  // The same race with the newer opening asked for in the same turn as the
+  // receipt: the opening is recorded when it is asked for, so the receipt never
+  // closes it. (A click's commit flushes its effects at once, so this passes
+  // with an effect-synced ref too; it pins the behaviour, not the mechanism.)
+  writeReply = () => new Promise<Response>((resolve) => { releaseSave = resolve; });
+  await click(buttonIn(row("brief"), "Edit"));
+  await fill(field("Archive after (days)"), "34");
+  await save();
+  const racedRow = { ...lateRow, archiveAfterDays: 34, rev: 7 };
+  probeReply = () => json(probeBody([racedRow, CONTRACT, MEMO]));
+  await React.act(async () => {
+    buttonIn(row("contract"), "Edit")!.click();
+    releaseSave(json({ type: racedRow }));
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  await flush();
+  await settle(() => equal(value(row("brief"), "Archive after"), "34 days after delivery", "the raced receipt still applies"), "raced receipt");
+  ok(drawer(), "the drawer opened before the commit stays open");
+  equal(drawer()!.getAttribute("aria-label"), "contract", "it is the newer opening's drawer");
+  await click(drawer()!.querySelector('button[aria-label^="Close"]'));
+  await closed();
+  await settle(() => ok(!drawer(), "the raced form closes"), "close raced");
 
   // An approver who has left stays in the form, marked, rather than changing unseen.
   await click(buttonIn(row("memo"), "Edit"));

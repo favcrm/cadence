@@ -218,18 +218,23 @@ export default function DocumentTypes({
   const [roster, setRoster] = useState<Roster>(null);
   const [rosterFailed, setRosterFailed] = useState(false);
   const [rosterAttempt, setRosterAttempt] = useState(0);
-  const [open, setOpen] = useState<OpenDrawer | null>(null);
+  /** The board answered `approver_unavailable`, so the roster held now is known
+   *  to be out of date: until a read succeeds, a failed one drops it. */
+  const rosterStale = useRef(false);
+  const [open, setOpenState] = useState<OpenDrawer | null>(null);
   const openSeq = useRef(0);
   // The opening that is live now, readable from a save that started earlier.
+  // It is set with the state, never after the commit, so a save answering in
+  // between still sees the opening that replaced its own.
   const openRef = useRef<OpenDrawer | null>(null);
-  useEffect(() => {
-    openRef.current = open;
-  }, [open]);
+  const setOpen = useCallback((next: OpenDrawer | null) => {
+    openRef.current = next;
+    setOpenState(next);
+  }, []);
   /** Close the drawer only if `token` is still the opening on screen: a save
    *  that answers late must not close (or steal focus from) a newer drawer. */
   const settleDrawer = (token: number, label: string | null) => {
     if (openRef.current?.token !== token) return;
-    openRef.current = null;
     setOpen(null);
     focusSoon(label);
   };
@@ -266,6 +271,7 @@ export default function DocumentTypes({
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   useEffect(() => onPrivateSessionReset(() => {
+    rosterStale.current = false;
     setRoster(null);
     setRosterFailed(false);
     setOpen(null);
@@ -284,18 +290,27 @@ export default function DocumentTypes({
     readTeamMembers(controller.signal)
       .then((members) => {
         if (controller.signal.aborted) return;
+        rosterStale.current = false;
         setRoster({ members });
         setRosterFailed(false);
       })
       .catch(() => {
         // A failed re-read keeps the last good roster, if there was one; the
-        // notice says it may be out of date.
+        // notice says it may be out of date. One the board has just contradicted
+        // is dropped instead, so approvers show by id and one who has left is
+        // never named as present.
         if (controller.signal.aborted) return;
+        if (rosterStale.current) setRoster(null);
         setRosterFailed(true);
       });
     return () => controller.abort();
   }, [available, platform, rosterAttempt]);
   const rereadRoster = () => setRosterAttempt((count) => count + 1);
+  /** `approver_unavailable`: read the roster again, and drop it if that fails. */
+  const distrustRoster = () => {
+    rosterStale.current = true;
+    rereadRoster();
+  };
 
   /** A write's receipt replaces its row in the shared probe; the probe is then asked again. */
   const applyReceipt = (type: DocumentType) => {
@@ -352,7 +367,7 @@ export default function DocumentTypes({
     }
     const code = refusalCode(result);
     say("err", confirmFailure(code, t));
-    if (code === "approver_unavailable") rereadRoster();
+    if (code === "approver_unavailable") distrustRoster();
     // A conflict or a missing row means the list is out of date; any other
     // refusal may mean it is too. The page shows what the board holds now.
     reread();
@@ -547,7 +562,7 @@ export default function DocumentTypes({
             if (!quiet) say("warn", t("Couldn’t confirm the save, so the list was read again."));
             reread();
           }}
-          onRosterChanged={rereadRoster}
+          onRosterChanged={distrustRoster}
           onGone={() => {
             say("err", t(LIFECYCLE_GONE));
             reread();
