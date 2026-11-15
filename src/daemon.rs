@@ -4011,21 +4011,28 @@ impl Shared {
                 }
                 // CAD-2310: the briefing read (`briefing::briefing_read`) by
                 // the agent itself or its group root keeps what the briefing
-                // is built from past the scoped filter below. Only when the
-                // reader is the connection: the caller rule judges the
-                // connection, and a relayed reader is someone else.
+                // is built from past the scoped filter below. Allowed only
+                // when the caller rule admits an AGENT connection: every
+                // relayed read rides an operator-proven connection, so its
+                // reader is never the caller the rule judged.
                 let owner_read = scope.is_some()
                     && (include_profile_instructions || include_catalogue_instructions)
-                    && identity::reader_is_connection(params)
-                    && self
-                        .authorize_agent_mutation(
-                            params,
-                            peer_pid,
-                            "agent show",
-                            &agent,
-                            crate::peer::AgentMutation::SelfService,
-                        )
-                        .is_ok();
+                    && match self.authorize_agent_mutation(
+                        params,
+                        peer_pid,
+                        "agent show",
+                        &agent,
+                        crate::peer::AgentMutation::SelfService,
+                    ) {
+                        Ok(crate::peer::AgentCaller::Agent(_)) => true,
+                        Ok(crate::peer::AgentCaller::Operator) | Err(Error::Rejected(_)) => false,
+                        Err(error) => {
+                            eprintln!(
+                                "agent show: briefing fields withheld for '{alias}': {error}"
+                            );
+                            false
+                        }
+                    };
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.

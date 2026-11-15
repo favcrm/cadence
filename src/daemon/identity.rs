@@ -143,16 +143,6 @@ pub(super) fn retain_scoped_agent_fields(
     }
 }
 
-/// Whether [`Shared::agent_read_scope`] takes this read's reader from the
-/// connection itself (CAD-2310). A relayed read (`public_session`,
-/// `cli_envelope`, `read_as`) names another reader, so a caller rule that
-/// judged the connection says nothing about it.
-pub(super) fn reader_is_connection(params: &Value) -> bool {
-    ["public_session", "cli_envelope", "read_as"]
-        .iter()
-        .all(|key| params.get(key).is_none())
-}
-
 fn project_keys_for(
     pm: &crate::issue::Pm,
     caller: &AgentCaller,
