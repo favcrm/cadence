@@ -8,7 +8,7 @@ import { navMatches } from "../features/issues/model";
 import { navItems, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
-import { IconAgents, IconApps, IconCaret, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
+import { IconAgents, IconApps, IconCaret, IconDocuments, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
 
@@ -17,6 +17,7 @@ const NAV_ICONS: Record<string, ReactNode> = {
   myWork: <IconMyWork size={16} />,
   projects: <IconProjects size={16} />,
   wiki: <IconWiki size={16} />,
+  documents: <IconDocuments size={16} />,
   apps: <IconApps size={16} />,
   agents: <IconAgents size={16} />,
   threads: <IconThreads size={16} />,

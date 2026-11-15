@@ -328,3 +328,43 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
   equal(locationHref(settings, crm), "/settings/memory?keep=1", "settings drops CRM params, keeps unrelated ones");
   equal(locationHref(goTo(app, { screen: "home" }), crm), "/?keep=1", "home drops CRM params");
 }
+
+// CAD-2286: the Documents screen and the Settings → Documents section. The
+// screen's tab (`?archived=1`) and stage filter (`?stage=`) live in its URL,
+// as My work's `?tab=` does, and never follow a navigation elsewhere.
+{
+  equal(matchRoute("/documents"), { screen: "documents", archived: false }, "match /documents");
+  equal(routePath({ screen: "documents", archived: false }), "/documents", "print /documents");
+  equal(matchRoute("/settings/documents"), { screen: "settings", section: "documents" }, "match /settings/documents");
+  equal(routePath({ screen: "settings", section: "documents" }), "/settings/documents", "print /settings/documents");
+  for (const dead of ["/documents/x", "/documents/x/y", "/settings/documents/extra"]) {
+    equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
+  }
+
+  const active = readLocation("/documents", "");
+  equal(active.route, { screen: "documents", archived: false }, "/documents is the Active tab");
+  equal(locationHref(active, ""), "/documents", "the Active tab has a bare URL");
+
+  const archived = readLocation("/documents", "?archived=1");
+  equal(archived.route, { screen: "documents", archived: true }, "?archived=1 is the Archived tab");
+  equal(locationHref(archived, "?archived=1"), "/documents?archived=1", "the Archived tab round-trips");
+
+  const staged = readLocation("/documents", "?stage=in_review");
+  equal(staged.route, { screen: "documents", archived: false, stage: "in_review" }, "?stage= filters the Active tab");
+  equal(locationHref(staged, "?stage=in_review"), "/documents?stage=in_review", "the stage filter round-trips");
+  for (const stage of ["draft", "in_review", "approved", "delivered"]) {
+    equal(readLocation("/documents", `?stage=${stage}`).route, { screen: "documents", archived: false, stage }, `stage ${stage} is a filter`);
+  }
+
+  equal(readLocation("/documents", "?archived=yes&stage=bogus").route, { screen: "documents", archived: false }, "malformed values fall back to the default");
+  equal(readLocation("/documents", "?stage=archived").route, { screen: "documents", archived: false }, "archived is a tab, not a stage filter");
+  equal(readLocation("/documents", "?archived=1&stage=approved").route, { screen: "documents", archived: true }, "the Archived tab has no stage filter");
+  equal(locationHref({ ...archived, route: { screen: "documents", archived: true, stage: "approved" } }, ""), "/documents?archived=1", "the Archived tab never writes a stage");
+
+  const both = "?stage=approved&keep=1";
+  const loc = readLocation("/documents", both);
+  equal(locationHref(goTo(loc, { screen: "threads" }), both), "/threads?keep=1", "the stage stays on Documents");
+  equal(locationHref(goTo(archived, { screen: "home" }), "?archived=1"), "/", "the tab stays on Documents");
+  equal(locationHref(goTo(loc, { screen: "documents", archived: true }), both), "/documents?keep=1&archived=1", "switching tabs drops the Active tab's stage");
+  equal(projectScope(loc.route), "none", "Documents has no project scope");
+}

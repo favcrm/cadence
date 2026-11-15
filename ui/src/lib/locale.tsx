@@ -1438,6 +1438,8 @@ Object.assign(zhTW, {
   "Manage team": "管理團隊",
   "My work": "我的工作",
   "my work": "我的工作",
+  "Documents": "文件",
+  "documents": "文件",
   "Your assigned issues. Inspect for a quick snapshot, or open Details for the full issue.": "指派給你的議題。開啟快速預覽查看摘要，或選擇「詳細資料」檢視完整議題。",
   "Loading your work": "正在載入你的工作",
   "My work unavailable": "目前無法載入你的工作",

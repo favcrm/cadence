@@ -34,6 +34,7 @@ import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
 import Members from "./features/settings/Members";
+import { documentsNavHidden, documentsProbe } from "./features/documents/documentsProbe";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
@@ -162,6 +163,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   threads: "threads",
   myWork: "my work",
   wiki: "wiki",
+  documents: "documents",
   outbox: "outbox",
   setup: "setup",
   settings: "settings",
@@ -288,9 +290,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const humanThreadsOn = boardSupports(meta, "human_threads");
   const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
+  // probed; the nav shows Documents once the probe answers `available`.
+  const documentsHosted = meta?.hosted === true;
+  const documentsProbeState = useMaybeResource(documentsHosted ? documentsProbe : null);
   const hiddenScreens: Screen[] = [
     ...(!myWorkOn ? ["myWork" as const] : []),
     ...(!workConversationsOn && !humanThreadsOn ? ["threads" as const] : []),
+    ...(documentsNavHidden(documentsHosted, documentsProbeState?.data) ? ["documents" as const] : []),
   ];
 
   const personalState = useMaybeResource(screen === "myWork" && myWorkOn ? resources.myWork : null);
@@ -343,6 +350,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
+  // The probe store latches an `unavailable` answer for the private session,
+  // so this asks the board again only after an error, an `available` answer
+  // or a new session.
+  useEffect(() => {
+    if (documentsHosted) void documentsProbe.revalidate();
+  }, [documentsHosted, personalIdentity]);
 
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
