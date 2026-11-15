@@ -225,6 +225,17 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_reviewers_project_set",
     "audit_identities",
     "audit_identities_set",
+    // CAD-1946: hosted merge gate evaluator, enqueue, scope/designate/digest/
+    // revoke and agent delegated approvals.
+    "delivery_check",
+    "delivery_enqueue",
+    "audit_revoke_project",
+    "audit_approve_scope_project",
+    "audit_scope_project",
+    "audit_designate_project",
+    "audit_designations_project",
+    "audit_digest_project",
+    "audit_approve_delegated_project",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -244,6 +255,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
+        | "delivery_check"
+        | "audit_scope_project"
+        | "audit_designations_project"
+        | "audit_digest_project"
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_profile_show"
@@ -252,7 +267,11 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "project_timeline" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
-        "audit_verdict" | "audit_verdict_project" => &["cli.write"],
+        // A delegated approval is the designated agent's own act (`cli.write`),
+        // never spending the owner's `audit.approve` token.
+        "audit_verdict" | "audit_verdict_project" | "audit_approve_delegated_project" => {
+            &["cli.write"]
+        }
         // CAD-1999: creating a project is a workspace-structure write; the
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
@@ -267,7 +286,11 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_reviewers_set"
         | "audit_reviewers_project_set"
         | "audit_identities_set"
-        | "delivery_policy_set" => &["cli.write", "audit.approve"],
+        | "delivery_policy_set"
+        | "delivery_enqueue"
+        | "audit_revoke_project"
+        | "audit_approve_scope_project"
+        | "audit_designate_project" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         // Asking for one scope makes a login without it a refusal at mint, which
         // can be named. Asking for both would mint a narrower envelope, and the
@@ -350,6 +373,11 @@ const RECONCILE_AUDIT_VERDICT: &str = "the verdict may or may not have been reco
 const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it";
 const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
 const RECONCILE_AUDIT_IDENTITIES: &str = "the identity attestations may or may not have been recorded — read `audit identities` before repeating it";
+const RECONCILE_DELIVERY_ENQUEUE: &str = "the PR may or may not have been approved and enqueued — run `delivery check` for the same repo, PR and head before repeating it";
+const RECONCILE_AUDIT_REVOKE_PROJECT: &str = "the revocation may or may not have been recorded — read `audit digest` (or `audit approval`) for the same project before repeating it";
+const RECONCILE_AUDIT_SCOPE_PROJECT: &str = "the scope pre-approval may or may not have been recorded — read `audit scope` for the same project and issue before repeating it";
+const RECONCILE_AUDIT_DESIGNATE_PROJECT: &str = "the designation may or may not have been updated — read `audit designations` for the same project before repeating it";
+const RECONCILE_AUDIT_APPROVE_DELEGATED: &str = "the delegated approval may or may not have been recorded — read `audit approval` for the same project, issue, repo and head before repeating it";
 const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
 const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
 const RECONCILE_UNKNOWN: &str =
@@ -399,6 +427,10 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
+        | "delivery_check"
+        | "audit_scope_project"
+        | "audit_designations_project"
+        | "audit_digest_project"
         | "project_ls"
         | "project_timeline" => Effect::Read,
         // cli.write: every one of these can change durable state.
@@ -426,6 +458,11 @@ fn cli_effect(verb: &str) -> Effect {
         "audit_reviewers_set" => mutation(RECONCILE_AUDIT_REVIEWERS),
         "audit_reviewers_project_set" => mutation(RECONCILE_AUDIT_REVIEWERS_PROJECT),
         "audit_identities_set" => mutation(RECONCILE_AUDIT_IDENTITIES),
+        "delivery_enqueue" => mutation(RECONCILE_DELIVERY_ENQUEUE),
+        "audit_revoke_project" => mutation(RECONCILE_AUDIT_REVOKE_PROJECT),
+        "audit_approve_scope_project" => mutation(RECONCILE_AUDIT_SCOPE_PROJECT),
+        "audit_designate_project" => mutation(RECONCILE_AUDIT_DESIGNATE_PROJECT),
+        "audit_approve_delegated_project" => mutation(RECONCILE_AUDIT_APPROVE_DELEGATED),
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
             mutation(RECONCILE_TEAM)
         }
@@ -2093,6 +2130,24 @@ pub const PROJECT_SCOPED_GATE_VERBS: &[&str] = &[
     "audit_identities_set",
 ];
 
+/// CAD-1946: hosted merge gate evaluator, enqueue, scope/designate/digest/
+/// revoke and delegated-approval verbs. Unlike [`PROJECT_SCOPED_GATE_VERBS`],
+/// these can return real domain `409` refusals (`gate_refused`, `head_moved`,
+/// `already_revoked`, `approval_id_conflict`, `not_delegable`,
+/// `scope_approval_required`, `approval_revoked`, `project_archived`), so
+/// only `409 container_required` counts as "tenant cannot serve this verb".
+pub const HOSTED_MERGE_GATE_VERBS: &[&str] = &[
+    "delivery_check",
+    "delivery_enqueue",
+    "audit_revoke_project",
+    "audit_approve_scope_project",
+    "audit_scope_project",
+    "audit_designate_project",
+    "audit_designations_project",
+    "audit_digest_project",
+    "audit_approve_delegated_project",
+];
+
 /// Why a project-scoped verb could not be served, when the answer means "this
 /// tenant cannot serve that call". Two shapes say it:
 ///
@@ -2127,11 +2182,18 @@ fn tenant_cannot_serve(verb: &str, status: u16, body: Option<&Value>) -> Option<
              before it ran — the owner records the project's policy first. {nothing}"
         ));
     }
+    let is_v2_gate = HOSTED_MERGE_GATE_VERBS.contains(&verb);
     let cannot_serve = match status {
         501 => true,
         400 => matches!(code, Some("invalid_request" | "unknown_verb")),
         404 => matches!(code, Some("unknown_verb" | "not_implemented")),
-        409 => true,
+        409 => {
+            if is_v2_gate {
+                code == Some("container_required")
+            } else {
+                true
+            }
+        }
         // A tenant that predates the verb answers 503 for a capability it does
         // not have. For a *mutation* the same code is not proof the verb never
         // ran: the tenant wraps a hub RPC that threw *after* the write in
@@ -6212,7 +6274,7 @@ fn call_verb_until_retry(
                 "the board does not know `limit` for `issue ls`",
             ));
         }
-        if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
+        if PROJECT_SCOPED_GATE_VERBS.contains(&verb) || HOSTED_MERGE_GATE_VERBS.contains(&verb) {
             let checked_conflict = body.as_ref().is_some_and(|b| {
                 b.get("conflict").is_some()
                     || b.pointer("/error/code").and_then(Value::as_str) == Some("revision_conflict")

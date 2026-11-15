@@ -3615,6 +3615,64 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             hosted_gate::requirements(target, wake_timeout, issue, pr, head)?,
             0,
         )),
+        Commands::Delivery {
+            action:
+                DeliveryAction::Check {
+                    project,
+                    issue,
+                    repo,
+                    pr,
+                    head,
+                    browser_qa,
+                },
+        } => {
+            let repo = repo_or_origin(repo)?;
+            let head = head.as_deref().map(super::audit::full_head).transpose()?;
+            printed(hosted_gate::delivery_check(
+                target,
+                wake_timeout,
+                project.as_deref(),
+                issue.as_deref().map(str::trim),
+                &repo,
+                *pr,
+                head.as_deref(),
+                *browser_qa,
+            )?)
+        }
+        Commands::Delivery {
+            action:
+                DeliveryAction::Enqueue {
+                    project,
+                    issue,
+                    repo,
+                    pr,
+                    head,
+                    browser_qa,
+                },
+        } => {
+            refuse_managed(target, "delivery enqueue")?;
+            let repo = repo_or_origin(repo)?;
+            let head = super::audit::full_head(head)?;
+            let receipt = hosted_gate::delivery_enqueue(
+                target,
+                wake_timeout,
+                project.as_deref(),
+                issue.as_deref().map(str::trim),
+                &repo,
+                *pr,
+                &head,
+                *browser_qa,
+            )
+            .map_err(|error| {
+                scope_hint(
+                    error,
+                    &cadence_agent::remote_cli::saved_capabilities(target),
+                    "audit.approve",
+                    "cadence login --audit-approve",
+                )
+            })?;
+            printed((receipt, 0))
+        }
         Commands::Audit {
             action:
                 Some(AuditAction::Approval {
@@ -3778,9 +3836,17 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             }
         },
         Commands::Audit {
-            action: Some(AuditAction::Scope { issue }),
+            action: Some(AuditAction::Scope { issue, project }),
             ..
-        } => printed(hosted_gate::scope(target, wake_timeout, issue.trim())?),
+        } => match project {
+            Some(project) => printed(hosted_gate::scope_project(
+                target,
+                wake_timeout,
+                project,
+                issue.trim(),
+            )?),
+            None => printed(hosted_gate::scope(target, wake_timeout, issue.trim())?),
+        },
         Commands::Audit {
             action:
                 Some(AuditAction::Approve {
@@ -3797,21 +3863,104 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 }),
             ..
         } => {
-            refuse_managed(target, "audit approve")?;
-            if *delegated || scope.is_some() || id.is_some() || action != "merge" {
-                return Err(Error::usage(
-                    "remote `audit approve` records a merge approval only: --delegated, \
-                     --scope and --id are not available on a hosted org. Nothing was sent.",
-                ));
+            if action == "scope" {
+                refuse_managed(target, "audit approve --action scope")?;
+                if *delegated || scope.is_some() || pr.is_some() || head.is_some() {
+                    return Err(Error::usage(
+                        "remote `audit approve --action scope` names `--issue <ID> --project <KEY>` \
+                         and never `--pr`, `--head`, `--delegated` or `--scope`. Nothing was sent.",
+                    ));
+                }
+                let project = project_arg(project)?;
+                let issue = issue_arg(issue)?.trim();
+                let receipt = hosted_gate::approve_scope_project(
+                    target,
+                    wake_timeout,
+                    project,
+                    issue,
+                    source,
+                    id.as_deref(),
+                )
+                .map_err(|error| {
+                    scope_hint(
+                        error,
+                        &cadence_agent::remote_cli::saved_capabilities(target),
+                        "audit.approve",
+                        "cadence login --audit-approve",
+                    )
+                })?;
+                printed((receipt, 0))
+            } else if *delegated {
+                // CAD-1946: designated agents record delegated approvals using their own
+                // `cli.write` identity; never refuse managed callers or require `audit.approve`.
+                if action != "merge" || id.is_some() {
+                    return Err(Error::usage(
+                        "remote `audit approve --delegated` approves a merge and does not take \
+                         `--id` or non-`merge` `--action`. Nothing was sent.",
+                    ));
+                }
+                let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
+                let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
+                let repo = repo_or_origin(repo)?;
+                let receipt = hosted_gate::approve_delegated_project(
+                    target,
+                    wake_timeout,
+                    project.as_deref(),
+                    issue.as_deref().map(str::trim),
+                    &repo,
+                    pr,
+                    &head,
+                    scope.as_deref(),
+                    source,
+                )?;
+                printed((receipt, 0))
+            } else {
+                refuse_managed(target, "audit approve")?;
+                if scope.is_some() || id.is_some() || action != "merge" {
+                    return Err(Error::usage(
+                        "remote `audit approve` records a merge approval (`--action merge` or \
+                         `--action scope`) only; `--scope` requires `--delegated` and `--id` \
+                         is only accepted for `--action scope`. Nothing was sent.",
+                    ));
+                }
+                let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
+                let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
+                let repo = repo_or_origin(repo)?;
+                let receipt = hosted_gate::approve(
+                    target,
+                    wake_timeout,
+                    &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
+                    source,
+                )
+                .map_err(|error| {
+                    scope_hint(
+                        error,
+                        &cadence_agent::remote_cli::saved_capabilities(target),
+                        "audit.approve",
+                        "cadence login --audit-approve",
+                    )
+                })?;
+                printed((receipt, 0))
             }
-            let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
-            let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
-            let repo = repo_or_origin(repo)?;
-            let receipt = hosted_gate::approve(
+        }
+        Commands::Audit {
+            action:
+                Some(AuditAction::Designate {
+                    alias,
+                    project,
+                    source,
+                    revoke,
+                }),
+            ..
+        } => {
+            refuse_managed(target, "audit designate")?;
+            let receipt = hosted_gate::designate_project(
                 target,
                 wake_timeout,
-                &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
+                alias,
+                project,
                 source,
+                *revoke,
             )
             .map_err(|error| {
                 scope_hint(
@@ -3821,6 +3970,53 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     "cadence login --audit-approve",
                 )
             })?;
+            printed((receipt, 0))
+        }
+        Commands::Audit {
+            action: Some(AuditAction::Designations { project }),
+            ..
+        } => {
+            let doc = hosted_gate::designations_project(target, wake_timeout, project.as_deref())?;
+            printed((doc, 0))
+        }
+        Commands::Audit {
+            action: Some(AuditAction::Digest { since, project }),
+            ..
+        } => {
+            let doc = hosted_gate::digest_project(
+                target,
+                wake_timeout,
+                project.as_deref(),
+                since.as_deref(),
+            )?;
+            printed((doc, 0))
+        }
+        Commands::Audit {
+            action:
+                Some(AuditAction::Revoke {
+                    id,
+                    project,
+                    source,
+                    reason,
+                }),
+            ..
+        } => {
+            refuse_managed(target, "audit revoke")?;
+            if source.is_some() {
+                return Err(cadence_agent::Error::rejected(
+                    "`--source` is not supported on a hosted org; the authenticated owner session is recorded automatically.",
+                ));
+            }
+            let receipt =
+                hosted_gate::revoke_project(target, wake_timeout, project.as_deref(), id, reason)
+                    .map_err(|error| {
+                    scope_hint(
+                        error,
+                        &cadence_agent::remote_cli::saved_capabilities(target),
+                        "audit.approve",
+                        "cadence login --audit-approve",
+                    )
+                })?;
             printed((receipt, 0))
         }
         Commands::Audit {
@@ -4174,6 +4370,8 @@ pub(super) fn remote_failure(error: Error) -> Result<i32> {
     }
 }
 
+#[cfg(test)]
+mod cad1946_hosted_gate_refusal_tests;
 #[cfg(test)]
 mod hosted_finish_acceptance;
 
