@@ -397,7 +397,7 @@ fn master_leaf_text(path: &str) -> cadence_agent::error::Result<String> {
     if let Some(limits) = master_leaf_limits(path) {
         out.push_str(&format!("\nLimits for you: {limits}\n"));
     }
-    // CAD-2309: the detail AGENT.md points here for.
+    // CAD-2309: the detail the master's AGENT.md points to.
     if let Some(guide) = cadence_agent::master::help_guide(path) {
         out.push_str(&format!("\nHow to use it:\n{guide}\n"));
     }
@@ -532,8 +532,8 @@ mod tests {
         assert!(plan.contains("### Acceptance"), "{plan}");
         let wiki = master_leaf_text("wiki search").unwrap();
         assert!(wiki.contains("at most 3 query variants"), "{wiki}");
-        let status = master_leaf_text("overview").unwrap();
-        assert!(!status.contains("How to use it:"), "{status}");
+        let overview = master_leaf_text("overview").unwrap();
+        assert!(!overview.contains("How to use it:"), "{overview}");
     }
 
     #[test]
