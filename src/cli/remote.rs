@@ -4728,17 +4728,24 @@ mod read_contract_tests {
 
     #[test]
     fn hosted_connection_actions_outside_owner_enrollment_stay_unavailable() {
-        // Only the three owner-enrollment acts are routed. Local credential
-        // custody, rotation, revocation and SMTP keep refusing instead of
-        // being half-mapped to a hosted operation that does not exist.
+        // Local credential custody, rotation and SMTP keep refusing instead
+        // of being half-mapped to a hosted operation that does not exist.
+        // CAD-2233 routed revocation to the hosted `connection_revoke`
+        // operation on purpose; its managed-caller owner gate is CAD-2320.
+        let (verb, args) = outcome(&connection(ConnectionAction::Revoke {
+            connection_id: "con_synthetic".into(),
+        }))
+        .expect("CAD-2233 maps revoke to its hosted operation");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(
+            args,
+            json!({"operation": "connection_revoke", "connectionId": "con_synthetic"})
+        );
         for action in [
             ConnectionAction::Show {
                 connection_id: "con_synthetic".into(),
             },
             ConnectionAction::Check {
-                connection_id: "con_synthetic".into(),
-            },
-            ConnectionAction::Revoke {
                 connection_id: "con_synthetic".into(),
             },
             ConnectionAction::Manage { no_open: true },

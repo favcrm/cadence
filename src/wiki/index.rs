@@ -1147,8 +1147,9 @@ mod tests {
     use super::*;
 
     /// CAD-2187: a private project's pages are not in a caller's results, and
-    /// the filter is a literal project prefix rather than a pattern — a key
-    /// containing `_` must not admit `axb` when the caller may read `a_b`.
+    /// the filter is a literal project prefix rather than a pattern — a
+    /// readable `a-b` must not admit the resembling `axb`. (CAD-2215 refuses a
+    /// tracker holding a key outside `[a-z0-9-]`, so `a_b` is no longer a key.)
     #[test]
     fn search_returns_only_the_projects_the_caller_may_read() {
         let root = tempfile::TempDir::new().unwrap();
@@ -1159,7 +1160,7 @@ mod tests {
                 "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
             ),
             (
-                "a_b",
+                "a-b",
                 "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/rob\n",
             ),
             (
@@ -1171,13 +1172,16 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("project.yaml"),
-                format!("key: {key}\nprefix: {}\n{policy}", key.to_uppercase()),
+                format!(
+                    "key: {key}\nprefix: {}\n{policy}",
+                    key.replace('-', "").to_uppercase()
+                ),
             )
             .unwrap();
         }
         for path in [
             "projects/secret/theodolite.md",
-            "projects/a_b/theodolite.md",
+            "projects/a-b/theodolite.md",
             "projects/axb/theodolite.md",
             "global/theodolite.md",
         ] {
@@ -1209,12 +1213,12 @@ mod tests {
             "{theirs:?}"
         );
         assert!(
-            !theirs.iter().any(|p| p.starts_with("projects/a_b/")),
+            !theirs.iter().any(|p| p.starts_with("projects/a-b/")),
             "{theirs:?}"
         );
         let mine = paths(&rob);
         assert!(
-            mine.iter().any(|p| p.starts_with("projects/a_b/")),
+            mine.iter().any(|p| p.starts_with("projects/a-b/")),
             "{mine:?}"
         );
         assert!(
