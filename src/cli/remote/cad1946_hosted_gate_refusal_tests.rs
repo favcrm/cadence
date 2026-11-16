@@ -367,6 +367,7 @@ fn cmd_delivery_enqueue() -> Commands {
             pr: TEST_PR,
             head: HEAD_A.into(),
             browser_qa: false,
+            approve: None,
         },
     }
 }
@@ -796,6 +797,7 @@ fn forged_http_200_receipts_for_delivery_enqueue_are_rejected_as_unknown() {
             TEST_PR,
             HEAD_A,
             false,
+            None,
         )
         .map(|_| ())
     })
@@ -878,6 +880,7 @@ fn forged_http_200_receipts_for_delivery_enqueue_are_rejected_as_unknown() {
                 TEST_PR,
                 HEAD_A,
                 false,
+                None,
             )
             .map(|_| ())
         })
@@ -1287,6 +1290,7 @@ fn domain_409_codes_preserve_domain_refusal_instead_of_container_required() {
                 TEST_PR,
                 HEAD_A,
                 false,
+                None,
             )
             .map(|_| ())
         }),
@@ -1300,6 +1304,7 @@ fn domain_409_codes_preserve_domain_refusal_instead_of_container_required() {
                 TEST_PR,
                 HEAD_A,
                 false,
+                None,
             )
             .map(|_| ())
         }),
@@ -1377,6 +1382,7 @@ fn domain_409_codes_preserve_domain_refusal_instead_of_container_required() {
         TEST_PR,
         HEAD_A,
         false,
+        None,
     )
     .unwrap_err();
     let msg = err.to_string();
@@ -1779,4 +1785,95 @@ fn unreachable_and_503_fail_closed_without_local_sqlite_or_notes_fallback() {
         !has_local_store_artifacts(&env.home_dir()),
         "no local SQLite/socket/notes store may be created in HOME"
     );
+}
+
+/// CAD-2047: `delivery enqueue --approve <source>` sends `approve_source` on the
+/// one enqueue call (and only when asked), and a receipt that does not say
+/// whether the approval was recorded is an unknown outcome, not a success.
+#[test]
+fn delivery_enqueue_approve_source_travels_and_needs_its_receipt_flag() {
+    let receipt = |recorded: Option<bool>| {
+        let mut v = json!({
+            "state": "enqueued",
+            "ok": true,
+            "project": TEST_PROJECT,
+            "issue": TEST_ISSUE,
+            "repo": TEST_REPO,
+            "pr": TEST_PR,
+            "head": HEAD_A,
+            "evidence_id": "ev_2047",
+            "queued": true,
+            "auto_merge_enabled": true,
+        });
+        if let Some(flag) = recorded {
+            v["approval_recorded"] = json!(flag);
+        }
+        v
+    };
+    let run_enqueue = |reply: Value, approve: Option<&'static str>| {
+        let env = ScopedEnv::new();
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let payload = Arc::new(reply);
+        let server = StubRelayServer::start(
+            None,
+            Arc::new(move |verb, args| {
+                log.lock().unwrap().push((verb.to_string(), args.clone()));
+                HttpReply::json(200, (*payload).clone())
+            }),
+        );
+        let endpoint = server.endpoint();
+        env.write_credential(
+            &endpoint,
+            TEST_SUBJECT,
+            TEST_ISSUER,
+            &["cli.read", "cli.write", "audit.approve"],
+        );
+        let target = target_with(&endpoint, None);
+        let result = delivery_enqueue(
+            &target,
+            5,
+            Some(TEST_PROJECT),
+            Some(TEST_ISSUE),
+            TEST_REPO,
+            TEST_PR,
+            HEAD_A,
+            false,
+            approve,
+        )
+        .map(|_| ());
+        let calls = seen.lock().unwrap().clone();
+        (result, calls)
+    };
+    let enqueue_args = |calls: &[(String, Value)]| -> Value {
+        calls
+            .iter()
+            .find(|(verb, _)| verb == "delivery_enqueue")
+            .map(|(_, args)| args.clone())
+            .expect("delivery_enqueue was called")
+    };
+
+    // With --approve: the source travels and a receipt with the flag passes.
+    let (ok, calls) = run_enqueue(
+        receipt(Some(true)),
+        Some("operator 2026-11-16 after reviews"),
+    );
+    ok.expect("receipt naming approval_recorded must pass");
+    assert_eq!(
+        enqueue_args(&calls)["approve_source"],
+        json!("operator 2026-11-16 after reviews")
+    );
+
+    // With --approve, a receipt without the flag (an older board) is unknown.
+    let (err, _) = run_enqueue(receipt(None), Some("operator ok"));
+    let err = err.expect_err("a receipt silent on the approval must not pass");
+    assert!(
+        err.to_string().contains("approval was recorded"),
+        "unexpected error: {err}"
+    );
+
+    // Without --approve: nothing extra is sent and the old receipt still passes.
+    let (ok, calls) = run_enqueue(receipt(None), None);
+    ok.expect("plain enqueue receipt must still pass");
+    assert!(enqueue_args(&calls).get("approve_source").is_none());
 }
