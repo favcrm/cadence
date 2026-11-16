@@ -23,6 +23,7 @@ interface QuoteReply {
   available: boolean;
   max_duration_seconds: number;
   unavailable_reason: string | null;
+  session_binding?: string;
 }
 
 interface TranscribeReply {
@@ -190,7 +191,7 @@ export function createScreenAudioSession({
   const t = (english: string) => translateUiText(english, getLocale());
 
   let disposed = false;
-  let quoteVerified = false;
+  let sessionBinding: string | null = null;
   let sessionId = "";
   let mode: ScreenAudioMode = "record";
   let phase: ScreenAudioSessionPhase = "idle";
@@ -293,8 +294,10 @@ export function createScreenAudioSession({
     mountSignal.addEventListener("abort", dispose, { once: true });
   }
 
-  const ensureQuote = async (activeSignal: AbortSignal): Promise<ActionRefusal | null> => {
-    if (quoteVerified) return null;
+  const ensureQuote = async (
+    activeSignal: AbortSignal,
+    activeSessionId: string,
+  ): Promise<ActionRefusal | null> => {
     let op: PrivateOperation | null = null;
     try {
       op = beginPrivateOperation(activeSignal);
@@ -314,7 +317,7 @@ export function createScreenAudioSession({
           "X-Cadence-Board": "1",
           ...sessionHeaders(),
         },
-        body: JSON.stringify({ action_token: actionToken }),
+        body: JSON.stringify({ action_token: actionToken, session_request_id: activeSessionId }),
       });
       const body = (await res.json().catch(() => null)) as QuoteReply | Record<string, unknown> | null;
       if (!res.ok) {
@@ -332,7 +335,19 @@ export function createScreenAudioSession({
         const reason = normalizeRefusalCode(quote.unavailable_reason, "unavailable");
         return { code: reason, text: unavailableMessage(reason, 200, t) };
       }
-      quoteVerified = true;
+      if (
+        typeof quote.session_binding !== "string" ||
+        !/^[a-f0-9]{64}$/.test(quote.session_binding)
+      ) {
+        return {
+          code: "unavailable",
+          text: t("Audio transcription is currently unavailable. Try again shortly."),
+        };
+      }
+      if (activeSignal.aborted || sessionId !== activeSessionId) {
+        return { code: "cancelled", text: "Audio capture was cancelled." };
+      }
+      sessionBinding = quote.session_binding;
       return null;
     } catch {
       return {
@@ -353,6 +368,19 @@ export function createScreenAudioSession({
     }
     const activeSessionId = sessionId;
     const activeAbort = sessionAbort;
+    const activeBinding = sessionBinding;
+    if (!activeBinding) {
+      for (const item of segments) {
+        if (item.status === "queued") {
+          item.status = "failed";
+          item.errorCode = "unavailable";
+        }
+      }
+      lastError = { code: "unavailable", text: transcribeFailureMessage("unavailable", t) };
+      emit();
+      notifyDrainIfIdle();
+      return;
+    }
     if (!activeAbort || activeAbort.signal.aborted) {
       notifyDrainIfIdle();
       return;
@@ -379,6 +407,7 @@ export function createScreenAudioSession({
           body: JSON.stringify({
             action_token: actionToken,
             request_id: next.requestId,
+            session_binding: activeBinding,
             audio_base64: next.chunk.base64,
             ...(language ? { language } : {}),
           }),
@@ -448,6 +477,7 @@ export function createScreenAudioSession({
     language?: ScreenAudioLanguage;
   }) => {
     sessionId = next.id;
+    sessionBinding = null;
     mode = next.mode;
     phase = next.phase;
     heldAt = next.heldAt;
@@ -503,7 +533,7 @@ export function createScreenAudioSession({
       emit();
 
       try {
-        const quoteRefusal = await ensureQuote(ctrl.signal);
+        const quoteRefusal = await ensureQuote(ctrl.signal, currentSession);
         if (disposed || ctrl.signal.aborted || sessionId !== currentSession) {
           return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
         }
@@ -685,7 +715,7 @@ export function createScreenAudioSession({
       emit();
 
       try {
-        const quoteRefusal = await ensureQuote(ctrl.signal);
+        const quoteRefusal = await ensureQuote(ctrl.signal, currentSession);
         if (disposed || ctrl.signal.aborted || sessionId !== currentSession) {
           return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
         }

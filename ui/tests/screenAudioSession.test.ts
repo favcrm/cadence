@@ -34,6 +34,7 @@ void (async () => {
   try {
     const fetchCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
     let quoteAttempt = 0;
+    let legacyQuote = false;
     let transcribeMode: "ok" | "fail_once" = "ok";
     let failOnceConsumed = false;
 
@@ -51,7 +52,12 @@ void (async () => {
           });
         }
         return new Response(
-          JSON.stringify({ available: true, max_duration_seconds: 60, unavailable_reason: null }),
+          JSON.stringify({
+            available: true,
+            max_duration_seconds: 60,
+            unavailable_reason: null,
+            ...(legacyQuote ? {} : { session_binding: quoteAttempt.toString(16).padStart(64, "0") }),
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -177,6 +183,9 @@ void (async () => {
 
     const firstLiveTranscribe = fetchCalls.find((c) => c.url === "/api/app-screen-audio/transcribe");
     check(firstLiveTranscribe?.body.language === "zh", "language hint forwarded to transcribe endpoint");
+    const liveQuote = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/quote").at(-1);
+    check(liveQuote?.body.session_request_id === stopSnap.session_id, "recording obtains its own binding");
+    check(firstLiveTranscribe?.body.session_binding === "2".padStart(64, "0"), "recording carries the broker binding");
 
     // 3. Inline upload with last_modified + retry preserving idempotent request_id.
     transcribeMode = "fail_once";
@@ -206,6 +215,9 @@ void (async () => {
     const uploadCallsBeforeRetry = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/transcribe");
     const uploadReqId = uploadCallsBeforeRetry.at(-1)?.body.request_id;
     check(typeof uploadReqId === "string" && /^aud_[a-f0-9]{24}_0$/.test(uploadReqId), "upload request_id matches grammar");
+    const uploadQuote = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/quote").at(-1);
+    check(uploadQuote?.body.session_request_id === failedSnap.session_id, "upload obtains a fresh binding");
+    check(uploadCallsBeforeRetry.at(-1)?.body.session_binding === "3".padStart(64, "0"), "upload uses its own binding");
 
     const retried = await session.dispatch(
       { v: 2, op: "audio-session", id: "u2", action: "retry" },
@@ -221,6 +233,7 @@ void (async () => {
     );
     const uploadCallsAfterRetry = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/transcribe");
     check(uploadCallsAfterRetry.at(-1)?.body.request_id === uploadReqId, "retry reuses exact request_id");
+    check(uploadCallsAfterRetry.at(-1)?.body.session_binding === "3".padStart(64, "0"), "retry retains the upload binding");
 
     // 0. Refusal code normalization & UTF-8 transcript byte bound.
     check(normalizeRefusalCode("SPEECH-UNAVAILABLE") === "speech_unavailable", "hyphenated uppercase code normalizes");
@@ -231,6 +244,15 @@ void (async () => {
     const cjkHeavy = "會".repeat(90_000); // 270,000 UTF-8 bytes (> 240 KiB)
     const clampedCjk = clampTranscriptUtf8(cjkHeavy);
     check(new TextEncoder().encode(clampedCjk).length <= 240 * 1024, "clampTranscriptUtf8 enforces 240 KiB UTF-8 bound");
+    // An old board cannot promise a stable recording binding: do not start capture.
+    legacyQuote = true;
+    const oldBoard = await session.dispatch(
+      { v: 2, op: "audio-session", id: "old-board", action: "start" },
+      callAbort.signal,
+    );
+    check(!oldBoard.ok && oldBoard.refusal.code === "unavailable", "unbound old-server quote fails closed");
+    legacyQuote = false;
+
 
     // 4. Mount abort during active live recording stops hardware mic track immediately.
     const live2 = await session.dispatch(

@@ -143,6 +143,13 @@ a wall-clock RPC timeout unless `timeoutMs` is passed explicitly, and refusals
 (`cancelled`, `owner_required`, `conflict`, `unavailable`, `mic_unavailable`)
 leave the open screen bridge intact.
 
+For hosted speech, both audio channels obtain one opaque broker-issued binding
+per recording or upload and reuse it for each segment and retry. The app never
+chooses the model or price. An older host that cannot issue a binding is
+unavailable rather than silently changing models mid-recording. The binding
+admits new segments only while the board session that started it remains valid;
+an accepted receipt may still be replayed after that session expires.
+
 A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
 host then sends the records projection, which the app validates in `onPush` (or
 delegates to `createScreenBridge`). Records CSV calls are larger than the
