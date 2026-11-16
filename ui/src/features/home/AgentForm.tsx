@@ -100,7 +100,7 @@ const asText = (v: unknown): string => (typeof v === "string" ? v : typeof v ===
 const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : typeof v === "string" && v ? [v] : []);
 
 /** The pilot checks: required, length, numeric, email. A failed rule yields its message. */
-export function failedCheck(c: Comp, data: Data): string | null {
+function failedCheck(c: Comp, data: Data): string | null {
   const rules = Array.isArray(c["@checks"]) ? (c["@checks"] as Record<string, unknown>[]) : [];
   for (const rule of rules) {
     const cond = rule?.condition as Record<string, unknown> | undefined;
@@ -129,8 +129,7 @@ export function failedCheck(c: Comp, data: Data): string | null {
           break;
         }
         case "email":
-          // An empty value is `required`'s to refuse, so an optional email can be left blank.
-          ok = asText(value) === "" || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(asText(value));
+          ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(asText(value));
           break;
       }
     }
