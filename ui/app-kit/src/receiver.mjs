@@ -1349,7 +1349,9 @@ export function createScreenBridge(options = {}) {
             status === 403 &&
             !accessRevoked &&
             (kind === "slot" || writeVerbSet.has(verb) || mapped.code === "owner_required" || extra.keepAliveOnForbidden === true);
-          if (status === 401 || status === 502 || status === 504 || (status === 403 && !keepOnForbidden)) retire(mapped);
+          const keepOnTimeout = status === 504 &&
+            (verb === "catalog.call" || verb === "catalog.confirm" || verb === "catalog.status");
+          if (status === 401 || status === 502 || (status === 504 && !keepOnTimeout) || (status === 403 && !keepOnForbidden)) retire(mapped);
           throw mapped;
         },
       );

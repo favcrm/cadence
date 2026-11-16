@@ -214,4 +214,41 @@ if ! grep -F 'app-kit archive bytes differ from source: src/receiver.mjs' "$work
   cat "$work/receiver-tamper.out" >&2
   exit 1
 fi
+# Each example-group attack starts from the original clean archive, not the
+# receiver-tampered fixture or the previous group's repack. The modified
+# checklist JSON remains parseable: only an insignificant newline is added.
+for group in template checklist; do
+  case "$group" in
+    template) relative='src/main.js' ;;
+    checklist) relative='app/storage/001-tasks.json' ;;
+  esac
+  example_repacked="$work/repacked-$group"
+  mkdir "$example_repacked"
+  tar -xzf "$archive" -C "$example_repacked"
+  printf '\n' >> "$example_repacked/$group/$relative"
+  tar -czf "$fixture/dist/$asset" -C "$example_repacked" \
+    LICENSE README.md frame-kit/frame.html frame-kit/kit.css frame-kit/metadata.json \
+    package.json bun.lock toolchain.json \
+    app-kit/README.md app-kit/package.json app-kit/src/forms.mjs app-kit/src/index.mjs \
+    app-kit/src/react.mjs app-kit/src/receiver.mjs app-kit/src/refusal.mjs \
+    app-kit/types/index.d.ts app-kit/types/react.d.ts \
+    "${template_files[@]/#/template/}" "${checklist_files[@]/#/checklist/}"
+  (
+    cd "$fixture/dist"
+    sha256sum "$asset" > "$asset.sha256"
+    sha256sum -c "$asset.sha256"
+  )
+  if (
+    cd "$fixture/dist"
+    TAG="$tag" SOURCE_SHA="$source_sha" bash "$work/publisher-guard.sh"
+  ) >"$work/$group-tamper.out" 2>&1; then
+    echo "production publisher guard accepted modified $group/$relative with a valid sidecar" >&2
+    exit 1
+  fi
+  if ! grep -Fx -- "$group archive bytes differ from source: $relative" "$work/$group-tamper.out" >/dev/null; then
+    echo "publisher guard failed for a reason other than the $group/$relative source mismatch:" >&2
+    cat "$work/$group-tamper.out" >&2
+    exit 1
+  fi
+done
 printf '%s\n' 'CAD-1272 app-toolchain acceptance passed: package, clean consumer, checksum and receiver-byte guard refusals.'

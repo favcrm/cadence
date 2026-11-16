@@ -1580,11 +1580,21 @@ test("catalogue uncertainty and network refusal never automatically retry or ope
   }
 });
 
-test("catalogue timeout never automatically retries or opens a slot", async () => {
-  const { bridge, scope, inbox } = await catalogFixture(20);
+test("catalogue timeout permits status recovery without repeating the call", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture(20);
   await assert.rejects(bridge.catalog(scope, "lookup", catalogInput, "request-timeout-1"));
+  const original = inbox.find((message) => message.op === "call" && message.verb === "catalog.call");
+  assert.ok(original);
+  const pending = bridge.catalogStatus(scope, "lookup", catalogInput, "request-timeout-1");
+  const status = await waitFor(() => inbox.find((message) => message.op === "call" && message.verb === "catalog.status"), "recovery status");
+  assert.deepEqual(status.args, original.args);
+  host.postMessage({ v: 2, op: "reply", id: status.id, ok: true, data: { state: "uncertain" } });
+  assert.deepEqual(await pending, { state: "uncertain" });
+  host.postMessage({ v: 2, op: "reply", id: original.id, ok: true, data: catalogReceiptFixture });
   await tick();
-  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(bridge.getState().status, "ready");
+  assert.equal(inbox.filter((message) => message.op === "call" && message.verb === "catalog.call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "call" && message.verb === "catalog.status").length, 1);
   assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
 });
 
