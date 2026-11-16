@@ -1306,6 +1306,31 @@ fn qr_term(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// Keep SIGCHLD from waking the client's socket reads in the real HTTP board
+/// rigs (`cad2018_wiki_http_acceptance`, `cad2317_routine_connection_guard_acceptance`,
+/// `team_assistants_http_refusal` and its children). The daemon and board
+/// threads a rig starts spawn `git`. A child that exits while its parent
+/// thread has signals blocked (as `Command::spawn` does across the fork) has
+/// the SIGCHLD queued on the process instead of dropped as ignored, and the
+/// kernel then wakes any thread that does not block it. When that is the thread
+/// in a timed `recv`, the call fails with EINTR: a socket with a receive
+/// timeout is never restarted, whatever the signal's disposition, and ureq 3.4.2
+/// does not retry it. Blocking it on the test thread is inherited by every
+/// thread the rig spawns; `wait`/`waitpid` do not need it delivered.
+#[cfg(all(test, feature = "test-seam"))]
+fn block_sigchld() {
+    // SAFETY: a local signal set and a mask change on the calling thread.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+            0
+        );
+    }
+}
+
 #[cfg(test)]
 #[path = "ui/cad1283_pid_startup_refusal_tests.rs"]
 mod cad1283_pid_startup_refusal_tests;
