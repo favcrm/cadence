@@ -2909,3 +2909,10 @@ Object.assign(zhTW, {
   "Today": "今天",
   "Yesterday": "昨天",
 });
+
+// CAD-2362: the operator's own message (inline Markdown, folded pastes).
+Object.assign(zhTW, {
+  "Show all": "顯示全部",
+  "lines": "行",
+  "Copy message": "複製訊息",
+});

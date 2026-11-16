@@ -11940,8 +11940,8 @@ if (mode === 'keys') {
             "const AXIS",
             "//",
         ];
-        let strip = |w: &Wf| -> Vec<String> {
-            let lines: Vec<&str> = w.raw.lines().collect();
+        let strip = |w: &Wf, raw: &str| -> Vec<String> {
+            let lines: Vec<&str> = raw.lines().collect();
             let on = lines
                 .iter()
                 .position(|l| *l == "on:")
@@ -11969,7 +11969,60 @@ if (mode === 'keys') {
             }
             out
         };
-        let (sa, sb) = (strip(&a), strip(&b));
+        // Bind each CAD-2359 fragment to its original shared-code neighbors.
+        assert!(b.raw.contains(concat!(
+            "            let text = '', stop = null, buf = '', failed = false, big = false, refused = false;\n",
+            "            let nonStringContent = false;\n",
+            "            const dec = new TextDecoder();\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "                  if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }\n",
+            "                  else if (c.delta?.content != null) nonStringContent = true;\n",
+            "                  if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "            }\n",
+            "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+            "          }\n",
+            "          let res = null;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "          let parsed;\n",
+            "          try { parsed = JSON.parse(res.text); } catch {\n",
+            "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+            "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+            "            die('model output is not JSON; nothing filed');\n",
+            "          }\n",
+            "          fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });\n",
+        )));
+        let mut spec = b.raw.clone();
+        for (from, to) in [
+            ("            let nonStringContent = false;\n", ""),
+            ("                  else if (c.delta?.content != null) nonStringContent = true;\n", ""),
+            (
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };\n",
+            ),
+            (
+                concat!(
+                    "          try { parsed = JSON.parse(res.text); } catch {\n",
+                    "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+                    "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+                    "            die('model output is not JSON; nothing filed');\n",
+                    "          }\n",
+                ),
+                "          try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }\n",
+            ),
+        ] {
+            assert_eq!(
+                spec.matches(from).count(),
+                1,
+                "{}: expected exactly one occurrence of the CAD-2359 diagnostic fragment",
+                b.file
+            );
+            spec = spec.replacen(from, to, 1);
+        }
+        let (sa, sb) = (strip(&a, &a.raw), strip(&b, &spec));
         assert_eq!(
             sa.len(),
             sb.len(),

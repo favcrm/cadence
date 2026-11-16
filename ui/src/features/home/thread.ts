@@ -1,4 +1,5 @@
 import type { SseEvent } from "../../lib/sse";
+import { answeredData, parse, walk } from "./formModel";
 
 /**
  * The master's thread as the Home screen holds it (CAD-328): the stored
@@ -334,9 +335,26 @@ export function discardPending(state: ThreadState | null, message: string): Thre
   return { ...base, pending: base.pending.filter((p) => p.message !== message) };
 }
 
+/** CAD-2362: whether an operator message answers a form whose card reads
+ *  the answer (`answeredData(...).known`) — the one condition under which
+ *  the card shows the values the message would otherwise repeat. */
+function formAnswerShown(entry: ThreadEntry, surfaces: Map<string, ThreadEntry>): boolean {
+  const refs = entry.payload?.refs;
+  if (!Array.isArray(refs)) return false;
+  for (const ref of refs) {
+    if (!ref || typeof ref !== "object" || (ref as { kind?: unknown }).kind !== "surface") continue;
+    const form = surfaces.get(String((ref as { id?: unknown }).id));
+    const surface = form ? parse(form) : null;
+    if (surface && answeredData(walk(surface.comps), surface.data, entry.text).known) return true;
+  }
+  return false;
+}
+
 /** What the thread view renders, in order. */
 export type ThreadItem =
-  | { type: "operator"; key: string; entry: ThreadEntry }
+  /** `formShown` (CAD-2362): this message answers a form whose card can show
+   *  the answered values, so the message reads as a one-line receipt. */
+  | { type: "operator"; key: string; entry: ThreadEntry; formShown?: boolean }
   | { type: "system"; key: string; entry: ThreadEntry }
   | { type: "thinking"; key: string; entry: ThreadEntry }
   | { type: "commentary"; key: string; entry: ThreadEntry }
@@ -401,9 +419,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     items.push(...held);
     held = [];
   };
+  const surfaces = new Map<string, ThreadEntry>();
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
     const card = cardType(entry.kind);
+    if (entry.kind === "surface") surfaces.set(String(entry.seq), entry);
     // CAD-2285: the form is written inside its `ask-form` tool call, so it
     // waits for the run to end like any other card.
     const form: ThreadItem | null =
@@ -450,7 +470,7 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       // A generated video's block: a job id and a shape, never the video.
       items.push({ type: "video", key, entry });
     } else if (entry.role === "operator") {
-      items.push({ type: "operator", key, entry });
+      items.push(formAnswerShown(entry, surfaces) ? { type: "operator", key, entry, formShown: true } : { type: "operator", key, entry });
     } else {
       items.push({ type: "system", key, entry });
     }

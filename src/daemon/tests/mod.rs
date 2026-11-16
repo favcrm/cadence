@@ -22,6 +22,10 @@ mod cad2298_master_ask_form_refusal;
 mod cad2310_member_briefing_read;
 #[cfg(feature = "test-seam")]
 mod cad2310_relayed_briefing_read_refusal;
+#[cfg(feature = "test-seam")]
+mod cad2323_owner_fields_refusal;
+#[cfg(feature = "test-seam")]
+mod cad2323_pm_run_join_and_roster;
 mod pty_retry_tests;
 mod unit;
 mod unknown_fence_guidance;
