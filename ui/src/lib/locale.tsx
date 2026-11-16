@@ -3298,6 +3298,13 @@ Object.assign(zhTW, {
   "Use a name that isn’t only dots.": "請使用不只由「.」組成的名稱。",
   "Use a name without “/” or “\\”.": "請使用不含「/」或「\\」的名稱。",
   "Document review isn’t available on this workspace any more.": "此工作區已無法再使用文件審查。",
+  "Your assistant": "你的助理",
+  "My assistant": "我的助理",
+  "Chats on Home": "在首頁對話",
+  "Open {name}, your assistant": "開啟你的助理 {name}",
+  "Master · company, owners only": "主助理 · 公司，僅限擁有者",
+  "Chat with the company Master is for owners. Your assistant is on Home.": "與公司主助理對話僅限擁有者。你的助理在首頁。",
+  "Your assistant’s instructions are not edited here yet.": "此處暫時無法編輯你的助理的指示。",
 });
 
 // CAD-2363: assistant turns — tool labels, the elapsed clock, raw calls and ID tokens.

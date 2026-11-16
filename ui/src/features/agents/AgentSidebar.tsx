@@ -1,10 +1,11 @@
 import type { KeyboardEvent, ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
-import type { Agent, HiredProfile } from "../../lib/types";
+import type { Agent, HiredProfile, PersonalAssistantRow } from "../../lib/types";
 import { IconSearch } from "../../ui/icons";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { seatStatus } from "./SeatCard";
 import { agentCategory, agentOrder, liveClaimState } from "./agentView";
+import { MASTER_LABEL, PERSONAL_ALIAS } from "./personalAssistant";
 
 /** The list's groups, in the order they read. Stopped and Mailboxes fold. */
 const GROUPS: { id: string; label: string; folded?: boolean }[] = [
@@ -31,6 +32,8 @@ function groupOf(a: Agent): string {
 export default function AgentSidebar({
   agents,
   profiles,
+  personal,
+  companyMaster,
   profileStatus,
   open,
   query,
@@ -41,6 +44,10 @@ export default function AgentSidebar({
 }: {
   agents: Agent[];
   profiles: HiredProfile[];
+  /** CAD-2353: the caller's own assistant, listed first when the roster has one. */
+  personal: PersonalAssistantRow | null;
+  /** The company Master's row, labelled; `null` keeps the row as it was. */
+  companyMaster: Agent | null;
   /** A profile's one status line, as its card reads it. */
   profileStatus: (profile: HiredProfile) => string;
   open: string | null;
@@ -51,17 +58,17 @@ export default function AgentSidebar({
   onRecruit: () => void;
 }) {
   const t = useTranslate();
-  const row = (alias: string, face: ReactNode, status: string) => (
+  const row = (alias: string, face: ReactNode, status: string, title?: string, current = open === alias) => (
     <button
       key={alias}
       type="button"
       className="ag-side-row"
-      aria-current={open === alias ? "page" : undefined}
+      aria-current={current ? "page" : undefined}
       onClick={() => onOpen(alias)}
     >
       {face}
       <span className="min-w-0">
-        <span className="t">{alias}</span>
+        <span className="t">{title ?? alias}</span>
         <span className="s" title={status}>
           {status}
         </span>
@@ -82,13 +89,21 @@ export default function AgentSidebar({
                 size={28}
                 still
               />,
-              seatStatus(a, t).text,
+              a === companyMaster ? t(MASTER_LABEL) : seatStatus(a, t).text,
+              a === companyMaster ? (a.name ?? undefined) : undefined,
             ),
           ),
         ...profiles
           .filter((p) => profileGroup(p) === group.id)
           .map((p) =>
-            row(p.alias, <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />, profileStatus(p)),
+            row(
+              p.alias,
+              <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />,
+              profileStatus(p),
+              undefined,
+              // The personal row owns `/agents/assistant`, so a hired `assistant` is not the open page.
+              open === p.alias && !(personal && p.alias === PERSONAL_ALIAS),
+            ),
           ),
       ];
     return { ...group, rows };
@@ -128,6 +143,22 @@ export default function AgentSidebar({
         >
           <span className="t">{t("Overview")}</span>
         </button>
+        {personal && (
+          <button
+            type="button"
+            className="ag-side-row"
+            aria-current={open === PERSONAL_ALIAS ? "page" : undefined}
+            onClick={() => onOpen(PERSONAL_ALIAS)}
+          >
+            <AgentAvatar slug={agentLook(PERSONAL_ALIAS, { look: personal.look })} size={28} still />
+            <span className="min-w-0">
+              <span className="t">
+                {personal.name} · {t("Your assistant")}
+              </span>
+              <span className="s">{t("Chats on Home")}</span>
+            </span>
+          </button>
+        )}
         {groups.map((group) =>
           group.folded ? (
             <details key={group.id} open={query.trim() !== "" || group.rows.some((r) => r.key === open)}>

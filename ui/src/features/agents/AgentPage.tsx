@@ -82,6 +82,7 @@ export default function AgentPage({
   operator,
   onRetryAccess,
   hostedBoard,
+  companyMaster,
   hiredWork,
   onToast,
 }: {
@@ -105,6 +106,8 @@ export default function AgentPage({
   operator: boolean | null;
   onRetryAccess: () => void;
   hostedBoard: boolean;
+  /** CAD-2353: this is the company Master. It has no chat yet, so an owner's page for it is the page. */
+  companyMaster: boolean;
   /** What a runtime-less profile's card names, if anything. */
   hiredWork: ProfileWork | null;
   onToast: (kind: ToastMsg["kind"], text: string) => void;
@@ -120,8 +123,9 @@ export default function AgentPage({
   // The gear opens over the current section; `?tab=settings` opens over Instructions.
   const [gear, setGear] = useState(false);
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
-  const chat = tab === "overview";
-  const leave = chat ? onBack : () => onTab("overview");
+  const masterPage = companyMaster && operator === true;
+  const chat = tab === "overview" && !masterPage;
+  const leave = chat || masterPage ? onBack : () => onTab("overview");
   // Leaving for the chat closes the gear, so coming back doesn't reopen it.
   useEffect(() => {
     if (chat) setGear(false);
@@ -399,11 +403,17 @@ export default function AgentPage({
           }
       : !operator
         ? boardIsHosted
-          ? {
-              title: t("Your assistant is on Home"),
-              body: t("Conversations with agents here are for the workspace operator."),
-              extra: <Button href="/">{t("Open Home")}</Button>,
-            }
+          ? alias === MASTER
+            ? {
+                title: t("Chat with the company Master is for owners. Your assistant is on Home."),
+                body: "",
+                extra: <Button href="/">{t("Open Home")}</Button>,
+              }
+            : {
+                title: t("Your assistant is on Home"),
+                body: t("Conversations with agents here are for the workspace operator."),
+                extra: <Button href="/">{t("Open Home")}</Button>,
+              }
           : {
               title: boardBlock ?? t("Conversations with agents are for the operator"),
               body: t("You can still see what this agent is working on."),
@@ -505,11 +515,11 @@ export default function AgentPage({
     : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
         .filter(Boolean)
         .join(" · ");
-  const section = tab === "settings" ? "instructions" : tab;
+  const section = tab === "settings" || tab === "overview" ? "instructions" : tab;
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <button type="button" className="rc-back" onClick={leave}>
-        ← {t("Chat")}
+        ← {masterPage ? t("Agents") : t("Chat")}
       </button>
       <header className="ap-hero">
         <AgentAvatar

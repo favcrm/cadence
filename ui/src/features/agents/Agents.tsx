@@ -9,7 +9,9 @@ import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
-import SeatCard from "./SeatCard";
+import SeatCard, { PersonalSeat } from "./SeatCard";
+import MyAssistantPage from "./MyAssistantPage";
+import { isCompanyMaster, masterShownTo, MASTER_LABEL, PERSONAL_ALIAS, personalOf } from "./personalAssistant";
 import { MASTER } from "../home/master";
 import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
@@ -44,7 +46,15 @@ import type { Agent, HiredProfile, AgentRole, AgentsPayload, IssueCard } from ".
 
 /** "Accountant · this computer": the catalogue title, else "Master", else the
  *  team role's label (never the raw id or the provider), then where it runs. */
-function roleLine(a: Agent, roleTitle: string | undefined, hosted: boolean, t: (s: string) => string): string {
+function roleLine(
+  a: Agent,
+  roleTitle: string | undefined,
+  hosted: boolean,
+  t: (s: string) => string,
+  company = false,
+): string {
+  // CAD-2353: the company Master says who may use it, not where it runs.
+  if (company) return t(MASTER_LABEL);
   const label = (id: string | null | undefined) => ROLES.find(([key]) => key === id)?.[1];
   const title =
     roleTitle ?? (a.alias === MASTER ? t("Master") : (label(a.team_role) ?? label(a.role) ?? t("Agent")));
@@ -84,7 +94,8 @@ export default function Agents({
   recruit: boolean;
   ask: boolean;
   onAsk: () => void;
-  onOpenAgent: (alias: string | null) => void;
+  /** `tab` lands on a section instead of the chat (the company Master has no chat yet). */
+  onOpenAgent: (alias: string | null, tab?: AgentTab) => void;
   onTab: (tab: AgentTab) => void;
   onToast: (kind: ToastMsg["kind"], text: string) => void;
   onRecruit: (on: boolean) => void;
@@ -102,7 +113,15 @@ export default function Agents({
   const payload = state.data;
   const issueIndexed = issueIndex(issuesState.data ?? []);
   // Agents belong to the team, not a project: the roster lists them all.
-  const allAgents = payload?.agents ?? [];
+  // CAD-2353: the company Master is for owners; a hosted roster that names the
+  // personal assistant does not list it to anyone else.
+  const allAgents = (payload?.agents ?? []).filter((a) => masterShownTo(a, payload, hostedBoard, operator));
+  const personal = personalOf(payload);
+  const companyMaster = allAgents.find((a) => isCompanyMaster(a, payload)) ?? null;
+  const personalMatches =
+    personal !== null &&
+    (query.trim() === "" ||
+      `${personal.name} ${PERSONAL_ALIAS}`.toLowerCase().includes(query.trim().toLowerCase()));
   const profiles = payload?.profiles ?? [];
   const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
   // The cards are the current team; a search reaches everyone. Stopped agents
@@ -136,6 +155,18 @@ export default function Agents({
   const groups = allAgents.filter((a) => a.role === "pm").map((a) => a.alias);
   const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.alias)];
   const askMaster = onAsk;
+  // Until the company Master chat exists, its row opens its page, not a chat.
+  const openAgent = (alias: string) =>
+    alias === MASTER && companyMaster && operator === true ? setOpen(alias, "instructions") : setOpen(alias);
+  const seat = (a: Agent) => (
+    <SeatCard
+      key={a.alias}
+      agent={a}
+      title={a === companyMaster ? (a.name ?? undefined) : undefined}
+      roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t, a === companyMaster)}
+      onOpen={() => openAgent(a.alias)}
+    />
+  );
   const profileTitle = (profile: HiredProfile) =>
     roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role;
   const issueCards = issuesState.data ?? [];
@@ -170,6 +201,8 @@ export default function Agents({
       <AgentSidebar
         agents={sidebarAgents}
         profiles={sidebarProfiles}
+        personal={personalMatches ? personal : null}
+        companyMaster={companyMaster}
         profileStatus={(p) => {
           const work = profileWork(p, issueCards);
           return work ? workText(work, t) : t("Idle · no runtime");
@@ -177,7 +210,7 @@ export default function Agents({
         open={open}
         query={query}
         onQuery={setQuery}
-        onOpen={setOpen}
+        onOpen={openAgent}
         onOverview={() => setOpen(null)}
         onRecruit={() => onRecruit(true)}
       />
@@ -185,6 +218,9 @@ export default function Agents({
     </div>
   );
 
+  if (open === PERSONAL_ALIAS && personal) {
+    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} />);
+  }
   if (open) {
     return shell(
       <AgentPage
@@ -206,6 +242,7 @@ export default function Agents({
         operator={operator}
         onRetryAccess={onRetryAccess}
         hostedBoard={hostedBoard}
+        companyMaster={open === MASTER && companyMaster !== null}
         hiredWork={openHired ? profileWork(openHired, issueCards) : null}
         onToast={onToast}
       />
@@ -303,14 +340,8 @@ export default function Agents({
             </label>
           </div>
           <div className="rc-seats">
-            {agents.map((a) => (
-              <SeatCard
-                key={a.alias}
-                agent={a}
-                roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t)}
-                onOpen={() => setOpen(a.alias)}
-              />
-            ))}
+            {personalMatches && personal && <PersonalSeat row={personal} onOpen={() => setOpen(PERSONAL_ALIAS)} />}
+            {agents.map(seat)}
             {shownProfiles.map((profile) => (
               <ProfileSeat
                 key={`profile-${profile.id}`}
@@ -328,18 +359,11 @@ export default function Agents({
                 {t("Stopped and mailboxes")} <span className="num">{folded.length}</span>
               </summary>
               <div className="rc-seats">
-                {folded.map((a) => (
-                  <SeatCard
-                    key={a.alias}
-                    agent={a}
-                    roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t)}
-                    onOpen={() => setOpen(a.alias)}
-                  />
-                ))}
+                {folded.map(seat)}
               </div>
             </details>
           )}
-          {agents.length + shownProfiles.length === 0 && (
+          {agents.length + shownProfiles.length === 0 && !personalMatches && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
             </p>

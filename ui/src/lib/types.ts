@@ -787,10 +787,32 @@ export type Agent = Omit<
   usage_limit?: UsageLimit | null;
   /** Daemon messages use epoch seconds; older observations may use ISO text. */
   last_activity?: string | number | null;
+  /** CAD-2353: hosted only. The `master` row says `"workspace"` (the company
+   *  Master); absent on an older API and on native boards. */
+  scope?: "workspace";
+  /** The workspace's own name for the company Master, when it has one. */
+  name?: string | null;
 };
 
+/** CAD-2353: the caller's own assistant, beside the roster (hosted `GET
+ *  /api/agents`). Absent on an older API and on native boards. `name` already
+ *  carries the "Assistant" fallback; `conversation_id` is null until Home has
+ *  been opened once. */
+export interface PersonalAssistantRow {
+  scope: "personal";
+  opens: "home";
+  name: string;
+  look?: string | null;
+  bootstrap_state?: string | null;
+  conversation_id?: string | null;
+}
+
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
-export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & {
+  agents: Agent[];
+  /** CAD-2353: the caller's own assistant; hosted only, absent on an older API. */
+  personal_assistant?: PersonalAssistantRow | null;
+};
 
 /** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
  *  aliases of the runtimes registered against it. */

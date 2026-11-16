@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
+import type { AgentTab } from "./features/agents/agentTabModel";
 import "./features/agents/recruit.css";
 import Apps from "./features/apps/Apps";
 import { installationAppHref } from "./features/apps/appViewModel";
@@ -903,7 +904,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     else openWorkItem(id, "home", outcome.next);
   }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
-    (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
+    (alias: string | null, tab?: AgentTab) =>
+      update((c) => ({ ...c, route: { screen: "agents", alias, ...(alias && tab && tab !== "overview" ? { tab } : {}) } })),
     [],
   );
   // CAD-561: the draining banner. Cheap (the daemon's own view), polled
