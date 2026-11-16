@@ -12211,10 +12211,10 @@ if (mode === 'keys') {
             ),
             ("missing final newline", json!(no_newline), 1, "incomplete"),
             (
-                "over 2.5 MB",
-                json!(format!("{one}+{}\n", "x".repeat(2_500_000))),
+                "over 300 KB",
+                json!(format!("{one}+{}\n", "x".repeat(300_000))),
                 1,
-                "2.5 MB",
+                "300 KB",
             ),
         ];
         for wf in all() {
@@ -12235,7 +12235,7 @@ if (mode === 'keys') {
                     wf.file
                 );
                 // The file job applies the same walk to the diff it was handed.
-                if *name != "over 2.5 MB" {
+                if *name != "over 300 KB" {
                     let mut input = file_input(&world(&wf));
                     input["diff"] = diff.clone();
                     let f = run_file(
