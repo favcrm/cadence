@@ -122,7 +122,10 @@ fn member_gets_the_same_answer_for_a_private_issue_id_as_for_a_missing_one() {
         let (private_status, private_body) = call(&rig, "member", verb, private.clone());
         let (absent_status, absent_body) = call(&rig, "member", verb, absent);
         let (visible_status, visible_body) = call(&rig, "member", verb, absent_visible);
-        assert_eq!(private_status, 404, "member {verb} {private}: {private_body}");
+        assert_eq!(
+            private_status, 404,
+            "member {verb} {private}: {private_body}"
+        );
         assert_eq!(
             (absent_status, absent_body.as_str()),
             (private_status, private_body.as_str()),

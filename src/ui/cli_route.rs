@@ -666,9 +666,7 @@ fn dispatch(
                                 }
                                 match history::log(&pm.dir, &issue, limit.max(1)) {
                                     Ok(h) => json_ok(json!({"id": id, "history": h})),
-                                    Err(e) => {
-                                        cli_fail(503, "tracker_unavailable", &e.to_string())
-                                    }
+                                    Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
                                 }
                             }
                             Err(e) => cli_fail(404, "not_found", &e.to_string()),
