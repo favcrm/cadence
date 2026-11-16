@@ -101,6 +101,33 @@ for (const broken of ["Day: Friday", `x${ACTION_MARK}{not json`, `x${ACTION_MARK
 const partial = answeredData(order, surface.data, `x${ACTION_MARK}${JSON.stringify({ action: { context: { name: "Only name" } } })}`);
 check(partial.known && partial.data.name === "Only name" && JSON.stringify(partial.data.day) === "[]", "a missing key stays blank");
 
+// With two buttons, the one that sent the answer names the bindings.
+const two = parse(agent(7, "surface", "Pick", "m1", {
+  a2ui: {
+    version: "1.0",
+    createSurface: {
+      surfaceId: "pick",
+      components: [
+        { id: "root", component: "Column", children: ["a", "b", "yes", "no"] },
+        { id: "a", component: "TextField", label: "A", value: { "@path": "/a" } },
+        { id: "b", component: "TextField", label: "B", value: { "@path": "/b" } },
+        { id: "yes", component: "Button", child: "t", action: { event: { name: "yes", context: { v: { "@path": "/a" } } } } },
+        { id: "no", component: "Button", child: "t", action: { event: { name: "no", context: { v: { "@path": "/b" } } } } },
+      ],
+      dataModel: { a: "", b: "" },
+    },
+  },
+  digest: "d",
+}))!;
+const viaNo = answeredData(walk(two.comps), two.data, `x${ACTION_MARK}${JSON.stringify({ action: { sourceComponentId: "no", context: { v: "picked" } } })}`);
+check(viaNo.data.b === "picked" && viaNo.data.a === "", "the sending button's bindings place the value");
+for (const source of ["gone", "t"]) {
+  const unread = answeredData(walk(two.comps), two.data, `x${ACTION_MARK}${JSON.stringify({ action: { sourceComponentId: source, context: { v: "picked" } } })}`);
+  check(!unread.known && unread.data.a === "" && unread.data.b === "", `an answer naming button '${source}' without a context is not read`);
+}
+const unnamed = answeredData(walk(two.comps), two.data, `x${ACTION_MARK}${JSON.stringify({ action: { context: { v: "picked" } } })}`);
+check(unnamed.known && unnamed.data.a === "picked", "an answer that names no button falls back to the first");
+
 // CAD-2346: an optional blank email passes; only `required` refuses a blank.
 const email = (required: boolean): Comp => ({
   id: "field_mail",

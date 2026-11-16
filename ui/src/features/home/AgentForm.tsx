@@ -11,6 +11,7 @@ import {
   INPUTS,
   MAX_DEPTH,
   answeredData,
+  asList,
   asText,
   binding,
   displayed,
@@ -18,12 +19,10 @@ import {
   parse,
   resolve,
   setAt,
-  asList,
   walk,
   type Comp,
   type Data,
 } from "./formModel";
-
 
 /**
  * CAD-2285: the master's A2UI form, drawn from the pilot catalog only.
@@ -63,7 +62,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   const block = useWriteBlock(false);
   const surface = useMemo(() => parse(entry), [entry]);
   const open = status.state === "open" || status.state === "failed";
-  const [local, setData] = useState<Data>(() => (surface ? { ...surface.data, ...(open ? readDraft(entry.seq) ?? {} : {}) } : {}));
+  const [local, setLocal] = useState<Data>(() => (surface ? { ...surface.data, ...(open ? readDraft(entry.seq) ?? {} : {}) } : {}));
   const answer = status.state === "sent" ? status.answer : null;
   // A sent form shows its answer, also after a reload or an answer from another device.
   const answered = useMemo(
@@ -96,7 +95,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   const update = (path: string | null, value: unknown) => {
     if (path === null || disabled) return;
     const next = setAt(data, path, value);
-    setData(next);
+    setLocal(next);
     writeDraft(entry.seq, next);
     setErrors({});
   };

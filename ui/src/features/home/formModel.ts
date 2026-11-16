@@ -36,7 +36,7 @@ export function parse(entry: ThreadEntry): { id: string; comps: Map<string, Comp
 export const binding = (v: unknown): string | null =>
   v && typeof v === "object" && typeof (v as { "@path"?: unknown })["@path"] === "string" ? (v as { "@path": string })["@path"] : null;
 
-export function getAt(data: Data, path: string): unknown {
+function getAt(data: Data, path: string): unknown {
   let cur: unknown = data;
   for (const key of path.split("/").slice(1)) {
     if (!cur || typeof cur !== "object") return undefined;
@@ -148,13 +148,19 @@ export function answeredData(order: Comp[], base: Data, answer: string): { data:
     data = setAt(data, path, c.component === "CheckBox" ? false : c.component === "ChoicePicker" ? [] : "");
   }
   const at = answer.lastIndexOf(ACTION_MARK);
-  let context: unknown = null;
+  let sent: { context?: unknown; sourceComponentId?: unknown } | undefined;
   try {
-    context = at < 0 ? null : (JSON.parse(answer.slice(at + ACTION_MARK.length)) as { action?: { context?: unknown } }).action?.context;
+    sent = at < 0 ? undefined : (JSON.parse(answer.slice(at + ACTION_MARK.length)) as { action?: typeof sent }).action;
   } catch {
-    context = null;
+    sent = undefined;
   }
-  const button = order.find((c) => c.component === "Button" && (c.action as { event?: { context?: unknown } } | undefined)?.event?.context);
+  const context = sent?.context;
+  // The button that sent the answer names its own bindings. Only an answer
+  // that does not say which button sent it falls back to the first Button
+  // with a context; one naming a button that has none is not read.
+  const buttons = order.filter((c) => c.component === "Button" && (c.action as { event?: { context?: unknown } } | undefined)?.event?.context);
+  const source = sent?.sourceComponentId;
+  const button = source === undefined ? buttons[0] : buttons.find((c) => c.id === source);
   const bound = (button?.action as { event: { context: unknown } } | undefined)?.event.context;
   if (!context || typeof context !== "object" || Array.isArray(context) || !bound || typeof bound !== "object") return { data, known: false };
   for (const [key, ref] of Object.entries(bound as Data)) {
