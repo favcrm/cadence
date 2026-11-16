@@ -239,6 +239,22 @@ incident reports to external preview hosts:
   `--issue <ID>` increments the ticket's artifact count and surfaces the latest
   version directly on the ticket's `Evidence` tab while keeping full version
   history discoverable via `artifact find`.
+- **Document review, hosted only (`artifact types`, `artifact submit <id>`):**
+  for a file a person must approve before it goes out. Save it with
+  `artifact put --label <type>` (for example `quotation`), then run
+  `cadence --org <org> artifact submit <art-id>`; it prints the stage, the type
+  and, for a type the owner has not confirmed, the baseline rules. `artifact
+  types` lists each type's approver, approval rule and archive delay. Only the
+  file's creator submits. The type's approver (a confirmed type's named member,
+  otherwise the workspace owner) approves that exact version on the board's
+  Documents screen; there is no approve command. A member cannot approve a
+  version they wrote, and a later version needs its own approval. The owner
+  then shares the approved version, which delivers it; where the type requires
+  approval, sharing any other version is refused (`document_not_approved`). A
+  delivered document moves to Archived after its type's archive delay.
+  `document_lifecycle_unavailable` means the workspace has no document review:
+  report it, do not retry. Refusals and their meaning: Cadence's
+  `docs/guides/hosted-workspace.md`.
 - **Workspace wiki (`wiki write` / `wiki upload`, up to 15 MiB):**
   best for durable shared knowledge — project guardrails (`projects/<key>/index.md`),
   SOPs, brand guidelines and runbooks, not one-off ticket review drafts.

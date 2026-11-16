@@ -890,7 +890,11 @@ renewal is another mint, and the file goes when the assignment ends.
 
 Stays on the member's login: claim, daemon reports and `agent report`; every
 wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
-`audit_verdict_project`). Not available to a managed agent session at all:
+`audit_verdict_project`). `artifact types` and `artifact submit` (CAD-2286)
+ride the agent credential like the other verbs. The credential carries the
+member's own subject, so the board's creator check still admits the member's
+files, and a reader or reviewer assignment's submit is refused by the board's
+read-only guard. Not available to a managed agent session at all:
 `settings agents`, `master status` and `master resume`. They always refuse —
 owner-class settings authority is never delegated — and the refusal names the
 operator's plain shell and the grant-bound local path.
@@ -938,6 +942,38 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
   the others. The messages themselves stay readable with `--after`.
 - `from` is a label. `sender_subject` is verified, and it is the member, not the
   session. A message approves nothing and changes nothing on the ticket.
+
+### Submitting a document for review (CAD-2286)
+
+```sh
+cadence --org acme artifact types
+cadence --org acme artifact submit <art-id>
+```
+
+- `artifact types` (`cli.read`) prints the document types and the baseline a
+  type follows until the owner confirms it. `artifact submit` (`cli.write`)
+  puts a file you created into review, under its label as the type. It prints
+  `stage`, `type`, `typeConfirmed` and, for an unconfirmed type, `baseline`.
+  The review flow is in the cadence skill ("Deliverables and review handoff");
+  the board side is in `docs/BOARD.md`.
+- Submitting again answers the current stage and does not submit twice, so
+  after a lost answer (exit 1) repeat the same command.
+- `document_lifecycle_unavailable` (exit 3) means the workspace has no document
+  review, and nothing was read or submitted. Only the type list decides it, and
+  `submit` reads that first. The message names the cause:
+  - "the workspace's server is older than this command": a `501`, or an older
+    relay's `400 invalid_request` or `unknown_verb`. Update the tenant server.
+  - "document review is turned off on this workspace": a `404 not_found`. It is
+    not an outage, and retrying does not help.
+- A submit refusal keeps the board's code and exits 3, with nothing submitted:
+  `not_found` (no file you can see: on `submit` a `404` is the file, not the
+  lifecycle), `not_creator`, `unlabelled`, `already_shared` (save a new version
+  to submit it) and `document_archived`. If review is turned off between the
+  type read and the submit, the submit reads as `not_found`; running it again
+  names the unavailable lifecycle.
+- `not_implemented` on `submit` is a server that lists types but predates the
+  submit: update the tenant server first, then this client.
+- A native board refuses both as usage errors (exit 2); they are hosted only.
 
 ### Reviewing software changes
 
