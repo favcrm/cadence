@@ -1,7 +1,7 @@
 import { useTranslate } from "../../lib/locale";
 import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
-import { useBrowserTab } from "./browserStore";
+import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
 import type { ThreadEntry } from "../home/thread";
 
 export const KIND_LABEL: Record<string, string> = { md: "MD", pdf: "PDF", html: "HTML", image: "IMG", csv: "CSV" };
@@ -23,7 +23,7 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
   if (!ref) return <p className="text-micro text-ink-500">· {t("Artifact unavailable")}</p>;
   const tab = canvas.open ? canvas.tabs.find((x) => x.id === canvas.active) : undefined;
   // The Browser tab, when in front, is what the canvas shows.
-  const inCanvas = !browser.focused && tab?.id === ref.id && tab.selected === ref.version;
+  const inCanvas = !isBrowserPanelShown(canvas, browser) && tab?.id === ref.id && tab.selected === ref.version;
   return (
     <div
       className="artcard"

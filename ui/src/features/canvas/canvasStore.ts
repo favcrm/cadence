@@ -265,7 +265,7 @@ export function openArtifact(ref: ArtifactRef): void {
 
 export function focusTab(id: string): void {
   if (!state.tabs.some((t) => t.id === id)) return;
-  if (state.active !== id) set({ ...state, active: id });
+  if (state.active !== id || !state.open) set({ ...state, active: id, open: true });
   artifactFocused("user");
 }
 
