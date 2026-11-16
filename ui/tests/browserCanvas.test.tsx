@@ -51,7 +51,7 @@ let timerSeq = 0;
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
-const SharedComposer = require("../src/features/app-shell/chat/Composer").default;
+const HomeComposer = require("../src/features/home/Composer").default as typeof import("../src/features/home/Composer").default;
 const { BrowserCard } = require("../src/features/canvas/BrowserPanel") as typeof import("../src/features/canvas/BrowserPanel");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
@@ -1341,12 +1341,14 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
 // ===== closing the last artifact with no session hands focus to the composer =====
 {
   const m = await start({ state: "none" });
+  const { composerDraftState, setComposerContent } = require("../src/features/app-shell/chat/composerStore") as typeof import("../src/features/app-shell/chat/composerStore");
+  const savedDraft = composerDraftState("home");
   const composerHost = document.createElement("div");
   document.body.append(composerHost);
   const composerRoot = createRoot(composerHost);
   await React.act(async () => {
-    composerRoot.render(React.createElement(LocaleProvider, null, React.createElement(SharedComposer, {
-      density: "full", block: null, storeKey: "home", onSend: () => { throw new Error("Focus must not send"); },
+    composerRoot.render(React.createElement(LocaleProvider, null, React.createElement(HomeComposer, {
+      block: null, seed: { text: "", n: 0 }, onCommand: () => undefined, onSent: () => { throw new Error("Focus must not send"); },
     })));
   });
   const composer = composerHost.querySelector("textarea")!;
@@ -1365,6 +1367,19 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await click(el(m.host, '[aria-label="Close canvas"]')!);
   await raf();
   assert(document.activeElement === composer, "the header close too");
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(composer, "Keep this Home draft");
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 });
+  });
+  await settle();
+  const ask = Array.from(m.host.querySelectorAll<HTMLButtonElement>(".cv-tools button")).find((button) => button.textContent === "Ask to change");
+  assert(ask && !ask.disabled, "Home's document offers an edit request");
+  await click(ask);
+  await raf();
+  assert(document.activeElement === composer, "Ask to change focuses the actual Home composer");
+  equal(composer.value, "Keep this Home draft", "Home's existing draft survives the edit request");
+  await React.act(async () => { setComposerContent("home", savedDraft.text, savedDraft.refs); });
   await React.act(async () => { composerRoot.unmount(); });
   composerHost.remove();
   await m.unmount();

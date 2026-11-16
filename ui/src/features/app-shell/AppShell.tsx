@@ -1025,7 +1025,7 @@ export default function AppShell({
       throw new Error("Return to this draft's original app context before attaching an image.");
     const request = beginLibraryImagePin(target.composerKey);
     if (request === null) throw new Error("Wait for the current message to finish before attaching an image.");
-    setChatCollapsed(false);
+    collapseChat(false);
     try {
       const out = await workspaceApps.mediaChatAttach({
         action_token: actionToken,
@@ -1068,7 +1068,7 @@ export default function AppShell({
       if (command.conversation_id) selectConversation(installId, command.conversation_id);
       else setDraftSubject(installId, campaignSubject(campaign));
       if (command.operation === "chat.campaign.brief") void conversationList(installId).refresh();
-      setChatCollapsed(false);
+      collapseChat(false);
     }
     if (command.operation === "chat.whatsapp.open" || command.operation === "chat.whatsapp.brief") {
       // CAD-1636: the subject chat of one WhatsApp conversation; same selection-only rule.
@@ -1077,7 +1077,7 @@ export default function AppShell({
       if (command.conversation_id) selectConversation(installId, command.conversation_id);
       else setDraftSubject(installId, whatsappSubject(conversation));
       if (command.operation === "chat.whatsapp.brief") void conversationList(installId).refresh();
-      setChatCollapsed(false);
+      collapseChat(false);
     }
   };
   const title = installation

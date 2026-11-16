@@ -2804,6 +2804,7 @@ Pending approvals stay installation-scoped across cached app switches and
 override the untouched collapsed default; an explicit choice
 still wins. Canvas edit requests reveal the current composer; editable inputs
 receive focus without sending or replacing the draft.
+App-to-chat requests also clear a temporary narrow workspace selection.
 Non-modal app canvases start below the board header and end before the assistant.
 Expansion is disabled when it cannot add width.
 
