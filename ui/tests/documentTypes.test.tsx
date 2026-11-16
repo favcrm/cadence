@@ -225,6 +225,25 @@ async function main() {
     await flush();
   }
   const listed = () => settle(() => ok(row("brief"), "the types rendered"), "types");
+  /** After a refused or failed save the drawer stays open and focus stays in it
+   *  (Browser QA): on the Approver for `approver_unavailable`, which is marked
+   *  invalid and described by its error; on the form's error otherwise. */
+  function expectSaveFocus(why: string, copy: string, atApprover: boolean) {
+    const trigger = approverTrigger();
+    ok(trigger, `${why}: the drawer is still open`);
+    ok(drawer()!.contains(document.activeElement), `${why}: focus stays in the drawer (it is on ${document.activeElement?.tagName})`);
+    if (atApprover) {
+      focused(trigger, `${why} moves focus to the Approver`);
+      equal(trigger.getAttribute("aria-invalid"), "true", `${why} marks the Approver invalid`);
+      const described = (trigger.getAttribute("aria-describedby") ?? "").split(" ").map((id) => document.getElementById(id)?.textContent);
+      ok(described.includes(copy), `${why}: the Approver is described by its error (${JSON.stringify(described)})`);
+    } else {
+      const error = drawer()!.querySelector<HTMLElement>("[data-form-error]");
+      ok(error?.textContent?.includes(copy), `${why}: the form's error holds the copy`);
+      focused(error, `${why} moves focus to the form's error`);
+      equal(trigger.getAttribute("aria-invalid"), null, `${why} does not mark the Approver invalid`);
+    }
+  }
   const heading = () => host.querySelector("#document-types-title") as HTMLElement | null;
 
   // ---- the form's checks mirror the server's validTypeInput ----
@@ -692,7 +711,13 @@ async function main() {
     equal(field("Recipient note")?.value, "Draft note", `${code} keeps the draft`);
     if (code === "approver_unavailable")
       await settle(() => equal(gets("/api/team/members"), rosterBefore + 1, "approver_unavailable reads the roster again"), "save roster reread");
+    expectSaveFocus(code, copy, at !== null);
   }
+  // A save that got no answer at all keeps the drawer too, with focus on its error.
+  writeReply = () => { throw new TypeError("network down"); };
+  await save();
+  await settle(() => ok(drawer()?.textContent?.includes("Couldn’t save this type. Try again."), "a failed save says so"), "save failed");
+  expectSaveFocus("a failed save", "Couldn’t save this type. Try again.", false);
   const editPosts = posts();
   equal(editPosts[0]!.path, "/api/document-types/brief", "an edit writes the row's own key");
   equal(editPosts[0]!.body, { requireApproval: true, approver: null, recipientNote: "Draft note", archiveAfterDays: 21 }, "an edit sends exactly the four fields, the owner role as null");

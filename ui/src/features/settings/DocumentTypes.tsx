@@ -632,6 +632,7 @@ function TypeDrawer({
 }) {
   const t = useTranslate();
   const fieldId = useId();
+  const approverId = `${fieldId}-approver`;
   const adding = row === null;
   /** The draft this form started from, and the row's rev it came from. */
   const [base, setBase] = useState<{ draft: TypeDraft; rev: number | null }>(() => ({
@@ -645,6 +646,17 @@ function TypeDrawer({
   const labelRef = useRef<HTMLInputElement | null>(null);
   const noteRef = useRef<HTMLInputElement | null>(null);
   const daysRef = useRef<HTMLInputElement | null>(null);
+  const formErrorRef = useRef<HTMLDivElement | null>(null);
+  /** Where focus goes once a refused or failed save has re-enabled the form.
+   *  Save was focused and disabled while busy, so the browser dropped focus;
+   *  like the validation path, focus moves to the problem, inside the drawer. */
+  const [refocus, setRefocus] = useState<{ to: "approver" | "error"; n: number }>({ to: "error", n: 0 });
+  useEffect(() => {
+    if (refocus.n === 0) return;
+    if (refocus.to === "approver") document.getElementById(approverId)?.focus();
+    else formErrorRef.current?.focus();
+  }, [refocus]);
+  const refocusOn = (to: "approver" | "error") => setRefocus((current) => ({ to, n: current.n + 1 }));
   const dirty = (Object.keys(base.draft) as (keyof TypeDraft)[]).some((key) => base.draft[key] !== draft[key]);
   // A row read again under an untouched form re-seeds it; a touched form keeps
   // its draft and says the row changed.
@@ -705,10 +717,12 @@ function TypeDrawer({
     const code = refusalCode(result);
     if (code === "approver_unavailable") {
       setErrors({ approver: t("That approver is no longer a member. Choose another approver.") });
+      refocusOn("approver");
       onRosterChanged();
       return;
     }
     setFormError(saveFailure(code, t));
+    refocusOn("error");
     if (code === "not_found") onGone();
   };
 
@@ -777,6 +791,7 @@ function TypeDrawer({
         <span>{t("Require approval before a document of this type is shared")}</span>
       </label>
       <Field
+        id={approverId}
         label={t("Approver")}
         hint={
           roster === null
@@ -791,6 +806,8 @@ function TypeDrawer({
             id={control.id}
             full
             aria-label={t("Approver")}
+            aria-invalid={control["aria-invalid"]}
+            aria-describedby={control["aria-describedby"]}
             value={draft.approver}
             disabled={busy}
             options={options}
@@ -836,7 +853,11 @@ function TypeDrawer({
           />
         )}
       </Field>
-      {formError && <ErrorNotice bare>{formError}</ErrorNotice>}
+      {formError && (
+        <div ref={formErrorRef} tabIndex={-1} data-form-error className="focus:outline-none">
+          <ErrorNotice bare>{formError}</ErrorNotice>
+        </div>
+      )}
     </form>
   );
 
