@@ -1,5 +1,7 @@
-//! CAD-616 independent negative security acceptance tests, authored from the
-//! ticket BEFORE production code lands (`AGENTS.md` "Gates and security work").
+//! CAD-616 negative security acceptance tests, authored and maintained
+//! exclusively by a separate fresh-session acceptance author subagent from
+//! ticket `CAD-616` (`AGENTS.md` "Review standard, CAD-1946" and "Gates and
+//! security work") without implementer edits.
 //!
 //! Drives the real `Shared::dispatch`, `wiki`, `master_perm`, `/proc`
 //! enrollment identity (`slot_identity` + `operator_evidence`), and loopback
@@ -566,15 +568,33 @@ fn wiki_write_and_rm_refuse_per_agent_permissions_yaml_for_agent_and_operator() 
     }
 
     // SOUL.md and AGENT.md across worker aliases are also protected from wiki writes.
-    for path in [
-        "agents/w1/profile/SOUL.md",
-        "agents/w1/profile/AGENT.md",
-        "agents/w1/SOUL.md",
-        "agents/w1/AGENT.md",
+    for (path, expected_msg) in [
+        (
+            "agents/w1/profile/SOUL.md",
+            "profiles are a read-only view of the agent's files",
+        ),
+        (
+            "agents/w1/profile/AGENT.md",
+            "profiles are a read-only view of the agent's files",
+        ),
+        (
+            "agents/w1/SOUL.md",
+            "agents/<a>/ holds profile/, knowledge/ and memory/ — not 'SOUL.md/'",
+        ),
+        (
+            "agents/w1/AGENT.md",
+            "agents/<a>/ holds profile/, knowledge/ and memory/ — not 'AGENT.md/'",
+        ),
     ] {
         for (who, pid) in [("w1", w1.pid()), ("operator", op_pid)] {
-            fx.dispatch("wiki_write", json!({"path": path, "text": "tampered"}), pid)
+            let err = fx
+                .dispatch("wiki_write", json!({"path": path, "text": "tampered"}), pid)
                 .expect_err(&format!("{who} must be refused wiki_write on {path}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_msg),
+                "{who} wiki_write on {path} refused with unexpected reason: {msg}"
+            );
             assert!(!fx.pm_dir.join(path).exists(), "{who} wrote {path}");
         }
     }
@@ -601,9 +621,10 @@ fn reviewer_role_is_refused_approval_requests_even_when_brokered_with_allow_rule
             rev.pid(),
         )
         .expect_err("role == reviewer must be unconditionally refused request_open(approval)");
+    let msg = err.to_string();
     assert!(
-        !err.to_string().is_empty(),
-        "reviewer refusal returned an empty error"
+        msg.contains("reviewer") && msg.contains("read-only"),
+        "expected reviewer read-only refusal, got: {msg}"
     );
     assert!(
         fx.pending_requests_for("rev1").is_empty(),
@@ -634,22 +655,34 @@ fn foreign_worker_and_master_permission_use_confinement() {
 
     // 1. Foreign worker w2 cannot open a permission request claiming alias w1.
     let w1_cmd = format!("ls {}", fx.repo_dir.display());
-    fx.dispatch(
-        "request_open",
-        request_open_bash("w1", "perm-spoof-1", &w1_cmd),
-        w2.pid(),
-    )
-    .expect_err("foreign worker w2 must be refused request_open for w1");
+    let err = fx
+        .dispatch(
+            "request_open",
+            request_open_bash("w1", "perm-spoof-1", &w1_cmd),
+            w2.pid(),
+        )
+        .expect_err("foreign worker w2 must be refused request_open for w1");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot act on 'w1'") && msg.contains("brokered requests"),
+        "expected foreign request_open confinement refusal, got: {msg}"
+    );
     assert!(fx.pending_requests_for("w1").is_empty());
 
     // 2. Worker w1 cannot call master_permission_use directly.
     let worker_argv = vec!["ls".into(), fx.repo_dir.to_string_lossy().into_owned()];
-    fx.dispatch(
-        "master_permission_use",
-        json!({"argv": worker_argv, "cwd": fx.repo_dir}),
-        w1.pid(),
-    )
-    .expect_err("worker w1 must be refused master_permission_use");
+    let err = fx
+        .dispatch(
+            "master_permission_use",
+            json!({"argv": worker_argv, "cwd": fx.repo_dir}),
+            w1.pid(),
+        )
+        .expect_err("worker w1 must be refused master_permission_use");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("master permission use is the master's") && msg.contains("'w1'"),
+        "expected master_permission_use caller boundary refusal, got: {msg}"
+    );
 
     // 3. Even when master calls master_permission_use, it cannot redeem:
     //    - a grant tied to a worker request (`requested_by: "w1"`)
@@ -742,53 +775,60 @@ fn foreign_worker_and_master_permission_use_confinement() {
     );
 
     // Worker-owned request's grant must NOT be redeemed by master.
-    let res_worker = fx.dispatch(
-        "master_permission_use",
-        json!({"argv": worker_argv, "cwd": fx.repo_dir}),
-        master.pid(),
-    );
-    assert!(
-        res_worker.is_err()
-            || res_worker
-                .as_ref()
-                .is_ok_and(|v| v["applied"] == json!(false)),
-        "master_permission_use must not redeem a grant belonging to worker w1, got: {res_worker:?}"
+    let val_worker = fx
+        .dispatch(
+            "master_permission_use",
+            json!({"argv": worker_argv, "cwd": fx.repo_dir}),
+            master.pid(),
+        )
+        .expect("master_permission_use on unredeemed worker grant should return applied=false");
+    assert_eq!(
+        val_worker["applied"],
+        json!(false),
+        "master_permission_use must not redeem a grant belonging to worker w1, got: {val_worker:?}"
     );
 
     // Forged orphan grant with no matching master request must NOT be redeemed.
-    let res_forged = fx.dispatch(
-        "master_permission_use",
-        json!({"argv": forged_argv, "cwd": fx.repo_dir}),
-        master.pid(),
-    );
-    assert!(
-        res_forged.is_err()
-            || res_forged
-                .as_ref()
-                .is_ok_and(|v| v["applied"] == json!(false)),
-        "master_permission_use must not redeem a forged orphan grant, got: {res_forged:?}"
+    let val_forged = fx
+        .dispatch(
+            "master_permission_use",
+            json!({"argv": forged_argv, "cwd": fx.repo_dir}),
+            master.pid(),
+        )
+        .expect("master_permission_use on forged orphan grant should return applied=false");
+    assert_eq!(
+        val_forged["applied"],
+        json!(false),
+        "master_permission_use must not redeem a forged orphan grant, got: {val_forged:?}"
     );
 
     // Non-master / Class::Never command must be refused even with a matching grant.
-    fx.dispatch(
-        "master_permission_use",
-        json!({"argv": merge_argv, "cwd": fx.repo_dir}),
-        master.pid(),
-    )
-    .expect_err("Class::Never non-master command must be refused even with planted grant");
+    let err = fx
+        .dispatch(
+            "master_permission_use",
+            json!({"argv": merge_argv, "cwd": fx.repo_dir}),
+            master.pid(),
+        )
+        .expect_err("Class::Never non-master command must be refused even with planted grant");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("merge is never requestable")
+            && msg.contains("a grant or a rule cannot allow it"),
+        "expected merge Class::Never refusal on master_permission_use, got: {msg}"
+    );
 
     // Worker's permissions.yaml allow rule must NOT apply to master_permission_use.
-    let res_w_rule = fx.dispatch(
-        "master_permission_use",
-        json!({"argv": worker_rule_argv, "cwd": fx.repo_dir}),
-        master.pid(),
-    );
-    assert!(
-        res_w_rule.is_err()
-            || res_w_rule
-                .as_ref()
-                .is_ok_and(|v| v["applied"] == json!(false)),
-        "master_permission_use must not consume worker w1 allow rules, got: {res_w_rule:?}"
+    let val_w_rule = fx
+        .dispatch(
+            "master_permission_use",
+            json!({"argv": worker_rule_argv, "cwd": fx.repo_dir}),
+            master.pid(),
+        )
+        .expect("master_permission_use with only worker rule should return applied=false");
+    assert_eq!(
+        val_w_rule["applied"],
+        json!(false),
+        "master_permission_use must not consume worker w1 allow rules, got: {val_w_rule:?}"
     );
 
     // Confirm the unredeemed worker grant was not consumed in master-permissions.json.
@@ -924,35 +964,82 @@ fn worker_class_never_targets_are_refused_even_with_planted_allow_rules() {
 
     for (idx, (label, argv)) in bash_cmds.iter().enumerate() {
         let cmd = argv.join(" ");
-        fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-never-bash-{idx}"), &cmd),
-            w1.pid(),
-        )
-        .expect_err(&format!(
-            "Class::Never Bash target '{label}' ({cmd}) must be refused on request_open even with planted allow rule"
-        ));
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-never-bash-{idx}"), &cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "Class::Never Bash target '{label}' ({cmd}) must be refused on request_open even with planted allow rule"
+            ));
+        let expected_why = if *label == "cadence audit approve" {
+            "audit approve and audit designate are never requestable"
+        } else if *label == "gh pr merge" {
+            "merge is never requestable"
+        } else if *label == "cat state_dir sqlite" || *label == "ls state_dir" {
+            "the daemon state dir is never requestable"
+        } else {
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable"
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_why)
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "Class::Never Bash target '{label}' ({cmd}) returned unexpected refusal: {msg}"
+        );
     }
 
     let write_targets = [
-        "agents/w1/permissions.yaml".to_string(),
-        pm_w1_perm.to_string_lossy().into_owned(),
-        "agents/w1/sub/../SOUL.md".to_string(),
-        pm_w1_soul.to_string_lossy().into_owned(),
-        pm_w1_agent.to_string_lossy().into_owned(),
-        "agents/master/permissions.yaml".to_string(),
-        pm_master_perm.to_string_lossy().into_owned(),
-        fx.state_dir.join("evil.txt").to_string_lossy().into_owned(),
+        (
+            "agents/w1/permissions.yaml".to_string(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            pm_w1_perm.to_string_lossy().into_owned(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            "agents/w1/sub/../SOUL.md".to_string(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            pm_w1_soul.to_string_lossy().into_owned(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            pm_w1_agent.to_string_lossy().into_owned(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            "agents/master/permissions.yaml".to_string(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            pm_master_perm.to_string_lossy().into_owned(),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
+        (
+            fx.state_dir.join("evil.txt").to_string_lossy().into_owned(),
+            "the daemon state dir is never requestable",
+        ),
     ];
-    for (idx, target) in write_targets.iter().enumerate() {
-        fx.dispatch(
-            "request_open",
-            request_open_write("w1", &format!("perm-never-write-{idx}"), target, "tampered"),
-            w1.pid(),
-        )
-        .expect_err(&format!(
-            "Class::Never Write target '{target}' must be refused on request_open even with planted allow rule"
-        ));
+    for (idx, (target, expected_why)) in write_targets.iter().enumerate() {
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_write("w1", &format!("perm-never-write-{idx}"), target, "tampered"),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "Class::Never Write target '{target}' must be refused on request_open even with planted allow rule"
+            ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_why)
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "Class::Never Write target '{target}' returned unexpected refusal: {msg}"
+        );
     }
 
     assert!(
@@ -1138,19 +1225,24 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
     .into_iter()
     .enumerate()
     {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash_in(
-                "w1",
-                &format!("perm-bypass-cwd-{idx}"),
-                "cat cadence.sqlite3",
-                cwd,
-            ),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash_in(
+                    "w1",
+                    &format!("perm-bypass-cwd-{idx}"),
+                    "cat cadence.sqlite3",
+                    cwd,
+                ),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "caller-supplied cwd '{label}' must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "caller-supplied cwd '{label}' must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains("cwd is derived from the registered agent"),
+            "caller-supplied cwd '{label}' refused with unexpected reason: {msg}"
         );
     }
 
@@ -1162,47 +1254,65 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
     .into_iter()
     .enumerate()
     {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-bypass-eq-{idx}"), cmd),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-bypass-eq-{idx}"), cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "=rhs Bash vector '{label}' ({cmd}) must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "=rhs Bash vector '{label}' ({cmd}) must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains("the daemon state dir is never requestable")
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "=rhs Bash vector '{label}' ({cmd}) refused with unexpected reason: {msg}"
         );
     }
 
     // 3. Relative symlink st -> ../state inside fx.repo_dir.
-    let res_sym = fx.dispatch(
-        "request_open",
-        request_open_bash("w1", "perm-bypass-rel-sym", "cat st/cadence.sqlite3"),
-        w1.pid(),
-    );
+    let err_sym = fx
+        .dispatch(
+            "request_open",
+            request_open_bash("w1", "perm-bypass-rel-sym", "cat st/cadence.sqlite3"),
+            w1.pid(),
+        )
+        .expect_err("relative symlink st -> state_dir must be refused immediately even with planted allow rule");
+    let msg_sym = err_sym.to_string();
     assert!(
-        res_sym.is_err(),
-        "relative symlink st -> state_dir must be refused immediately even with planted allow rule, got: {res_sym:?}"
+        msg_sym.contains("the daemon state dir is never requestable")
+            && msg_sym.contains("cannot be approved and no permission rule can cover it"),
+        "relative symlink st -> state_dir refused with unexpected reason: {msg_sym}"
     );
 
     // 4. Self-referential >40-hop symlink loop (loop_a <-> loop_b) via Bash and Write.
-    let res_loop_bash = fx.dispatch(
-        "request_open",
-        request_open_bash("w1", "perm-bypass-loop-bash", "cat ./loop_a"),
-        w1.pid(),
-    );
+    let err_loop_bash = fx
+        .dispatch(
+            "request_open",
+            request_open_bash("w1", "perm-bypass-loop-bash", "cat ./loop_a"),
+            w1.pid(),
+        )
+        .expect_err("symlink loop Bash 'cat ./loop_a' must fail closed immediately");
+    let msg_loop_bash = err_loop_bash.to_string();
     assert!(
-        res_loop_bash.is_err(),
-        "symlink loop Bash 'cat ./loop_a' must fail closed immediately, got: {res_loop_bash:?}"
+        msg_loop_bash.contains("never requestable")
+            && msg_loop_bash.contains("cannot be approved and no permission rule can cover it"),
+        "symlink loop Bash 'cat ./loop_a' refused with unexpected reason: {msg_loop_bash}"
     );
 
-    let res_loop_write = fx.dispatch(
-        "request_open",
-        request_open_write("w1", "perm-bypass-loop-write", "loop_a", "x"),
-        w1.pid(),
-    );
+    let err_loop_write = fx
+        .dispatch(
+            "request_open",
+            request_open_write("w1", "perm-bypass-loop-write", "loop_a", "x"),
+            w1.pid(),
+        )
+        .expect_err("symlink loop Write 'loop_a' must fail closed immediately");
+    let msg_loop_write = err_loop_write.to_string();
     assert!(
-        res_loop_write.is_err(),
-        "symlink loop Write 'loop_a' must fail closed immediately, got: {res_loop_write:?}"
+        msg_loop_write.contains("never requestable")
+            && msg_loop_write.contains("cannot be approved and no permission rule can cover it"),
+        "symlink loop Write 'loop_a' refused with unexpected reason: {msg_loop_write}"
     );
 
     // 5a. `+refspec` force-pushes via Bash.
@@ -1210,24 +1320,39 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
         .into_iter()
         .enumerate()
     {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-bypass-refspec-{idx}"), cmd),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-bypass-refspec-{idx}"), cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "+refspec force-push '{cmd}' must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "+refspec force-push '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains("git force-push is never requestable")
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "+refspec force-push '{cmd}' refused with unexpected reason: {msg}"
         );
     }
 
     // 5b. Non-`Bash` tool smuggling via `request_open`.
-    for (idx, (tool, input)) in [
-        ("bash", json!({"command": "git push --force origin main"})),
-        ("git", json!({"command": "push --force origin main"})),
+    for (idx, (tool, input, expected_msg)) in [
+        (
+            "bash",
+            json!({"command": "git push --force origin main"}),
+            "is not an allowed non-Bash worker tool",
+        ),
+        (
+            "git",
+            json!({"command": "push --force origin main"}),
+            "is not an allowed non-Bash worker tool",
+        ),
         (
             "/usr/bin/git",
             json!({"command": "push --force origin main"}),
+            "is not an allowed non-Bash worker tool",
         ),
         (
             "Write",
@@ -1236,95 +1361,126 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
                 "content": "x",
                 "command": "git push --force origin main",
             }),
+            "non-Bash tool request cannot carry a command field",
         ),
     ]
     .into_iter()
     .enumerate()
     {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_tool("w1", &format!("perm-bypass-smuggle-{idx}"), tool, input),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_tool("w1", &format!("perm-bypass-smuggle-{idx}"), tool, input),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "non-Bash tool smuggling with tool '{tool}' must be refused immediately"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "non-Bash tool smuggling with tool '{tool}' must be refused immediately, got: {res:?}"
+            msg.contains(expected_msg),
+            "non-Bash tool smuggling with tool '{tool}' refused with unexpected reason: {msg}"
         );
     }
 
     // 5c. Deeper subtrees under `<pm_dir>/agents/**` (including symlinked prof/).
     for (idx, target) in agent_subtree_targets.iter().enumerate() {
         let cat_cmd = format!("cat {target}");
-        let res_cat = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-bypass-subtree-cat-{idx}"), &cat_cmd),
-            w1.pid(),
-        );
+        let err_cat = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-bypass-subtree-cat-{idx}"), &cat_cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "subtree Bash target '{target}' must be refused immediately even with planted allow rule"
+            ));
+        let msg_cat = err_cat.to_string();
         assert!(
-            res_cat.is_err(),
-            "subtree Bash target '{target}' must be refused immediately even with planted allow rule, got: {res_cat:?}"
+            msg_cat.contains(
+                "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable"
+            ) && msg_cat.contains("cannot be approved and no permission rule can cover it"),
+            "subtree Bash target '{target}' refused with unexpected reason: {msg_cat}"
         );
 
-        let res_write = fx.dispatch(
-            "request_open",
-            request_open_write(
-                "w1",
-                &format!("perm-bypass-subtree-write-{idx}"),
-                target,
-                "tampered",
-            ),
-            w1.pid(),
-        );
+        let err_write = fx
+            .dispatch(
+                "request_open",
+                request_open_write(
+                    "w1",
+                    &format!("perm-bypass-subtree-write-{idx}"),
+                    target,
+                    "tampered",
+                ),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "subtree Write target '{target}' must be refused immediately even with planted allow rule"
+            ));
+        let msg_write = err_write.to_string();
         assert!(
-            res_write.is_err(),
-            "subtree Write target '{target}' must be refused immediately even with planted allow rule, got: {res_write:?}"
+            msg_write.contains(
+                "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable"
+            ) && msg_write.contains("cannot be approved and no permission rule can cover it"),
+            "subtree Write target '{target}' refused with unexpected reason: {msg_write}"
         );
     }
 
     // 6a. Foreign caller-supplied "cwd" attempting to select other_dir's Allow rule
     //     or bypass fx.repo_dir's Deny rule for `ls -la`.
-    let res_foreign_cwd = fx.dispatch(
-        "request_open",
-        request_open_bash_in("w1", "perm-bypass-foreign-cwd", "ls -la", &other_dir),
-        w1.pid(),
-    );
+    let err_foreign_cwd = fx
+        .dispatch(
+            "request_open",
+            request_open_bash_in("w1", "perm-bypass-foreign-cwd", "ls -la", &other_dir),
+            w1.pid(),
+        )
+        .expect_err(
+            "caller-supplied foreign cwd must be refused immediately (not select other_dir Allow or bypass repo_dir Deny)",
+        );
+    let msg_foreign_cwd = err_foreign_cwd.to_string();
     assert!(
-        res_foreign_cwd.is_err(),
-        "caller-supplied foreign cwd must be refused immediately (not select other_dir Allow or bypass repo_dir Deny), got: {res_foreign_cwd:?}"
+        msg_foreign_cwd.contains("cwd is derived from the registered agent"),
+        "caller-supplied foreign cwd refused with unexpected reason: {msg_foreign_cwd}"
     );
     if other_canon != other_dir {
-        let res_foreign_canon = fx.dispatch(
-            "request_open",
-            request_open_bash_in(
-                "w1",
-                "perm-bypass-foreign-cwd-canon",
-                "ls -la",
-                &other_canon,
-            ),
-            w1.pid(),
-        );
+        let err_foreign_canon = fx
+            .dispatch(
+                "request_open",
+                request_open_bash_in(
+                    "w1",
+                    "perm-bypass-foreign-cwd-canon",
+                    "ls -la",
+                    &other_canon,
+                ),
+                w1.pid(),
+            )
+            .expect_err("caller-supplied canonical foreign cwd must be refused immediately");
+        let msg_foreign_canon = err_foreign_canon.to_string();
         assert!(
-            res_foreign_canon.is_err(),
-            "caller-supplied canonical foreign cwd must be refused immediately, got: {res_foreign_canon:?}"
+            msg_foreign_canon.contains("cwd is derived from the registered agent"),
+            "caller-supplied canonical foreign cwd refused with unexpected reason: {msg_foreign_canon}"
         );
     }
 
     // 6b. Unsupported request_open `kind` (anything other than "approval").
-    let res_bad_kind = fx.dispatch(
-        "request_open",
-        json!({
-            "alias": "w1",
-            "kind": "custom",
-            "tool": "Bash",
-            "request": "perm-bad-kind-1",
-            "input_summary": "ls",
-            "input": { "command": "ls" },
-        }),
-        w1.pid(),
-    );
+    let err_bad_kind = fx
+        .dispatch(
+            "request_open",
+            json!({
+                "alias": "w1",
+                "kind": "custom",
+                "tool": "Bash",
+                "request": "perm-bad-kind-1",
+                "input_summary": "ls",
+                "input": { "command": "ls" },
+            }),
+            w1.pid(),
+        )
+        .expect_err("unsupported request_open kind 'custom' must be refused immediately");
+    let msg_bad_kind = err_bad_kind.to_string();
     assert!(
-        res_bad_kind.is_err(),
-        "unsupported request_open kind 'custom' must be refused immediately, got: {res_bad_kind:?}"
+        msg_bad_kind.contains("unsupported brokered request kind 'custom'"),
+        "unsupported request_open kind 'custom' refused with unexpected reason: {msg_bad_kind}"
     );
 
     assert!(
@@ -1339,11 +1495,26 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
     let w1 = fx.enroll_managed("w1", "worker", true);
 
     let interleaved_cadence_cmds = [
-        "cadence audit --org fav-limited approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
-        "cadence audit --wake-timeout 10 approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
-        "cadence master --wake-timeout 10 allow-once perm-1",
-        "cadence daemon --wake-timeout 10 restart",
-        "cadence master edit --file rep.md SOUL.md",
+        (
+            "cadence audit --org fav-limited approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+            "audit approve and audit designate are never requestable",
+        ),
+        (
+            "cadence audit --wake-timeout 10 approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+            "audit approve and audit designate are never requestable",
+        ),
+        (
+            "cadence master --wake-timeout 10 allow-once perm-1",
+            "daemon restart and permission decisions are never requestable",
+        ),
+        (
+            "cadence daemon --wake-timeout 10 restart",
+            "daemon restart and permission decisions are never requestable",
+        ),
+        (
+            "cadence master edit --file rep.md SOUL.md",
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
+        ),
     ];
 
     let tilde_bash_cmds = [
@@ -1353,11 +1524,26 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
     let tilde_write_path = "~/pm/agents/w1/profile/secret.md";
 
     let wrapper_cmds = [
-        "env git push --force origin main",
-        "timeout 30 git push origin +main",
-        "nice -n 5 gh pr merge 123",
-        "rtk proxy cadence update",
-        "unknownwrap git push --force origin main",
+        (
+            "env git push --force origin main",
+            "wrapper and subshell commands are never requestable",
+        ),
+        (
+            "timeout 30 git push origin +main",
+            "wrapper and subshell commands are never requestable",
+        ),
+        (
+            "nice -n 5 gh pr merge 123",
+            "wrapper and subshell commands are never requestable",
+        ),
+        (
+            "rtk proxy cadence update",
+            "wrapper and subshell commands are never requestable",
+        ),
+        (
+            "unknownwrap git push --force origin main",
+            "git force-push is never requestable",
+        ),
     ];
 
     let checkouts = [fx.repo_dir.clone()];
@@ -1365,12 +1551,12 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
 
     // Plant Exact Allow rules in agents/w1/permissions.yaml for every command/write below.
     let mut rules: Vec<Rule> = Vec::new();
-    for (idx, cmd) in interleaved_cadence_cmds.iter().enumerate() {
+    for (idx, (cmd, expected_why)) in interleaved_cadence_cmds.iter().enumerate() {
         let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         let cls = master_perm::classify(&argv, &fx.pm_dir, &checkouts, &states);
         assert!(
-            matches!(cls, Class::Never { .. }),
-            "master_perm::classify must mark interleaved command '{cmd}' as Class::Never, got {cls:?}"
+            matches!(cls, Class::Never { why } if why == *expected_why),
+            "master_perm::classify must mark interleaved command '{cmd}' as Class::Never({expected_why}), got {cls:?}"
         );
         rules.push(exact_allow_rule(
             &format!("allow-interleaved-{idx}"),
@@ -1391,7 +1577,7 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
         vec!["Write".into(), tilde_write_path.into()],
         &fx.repo_dir,
     ));
-    for (idx, cmd) in wrapper_cmds.iter().enumerate() {
+    for (idx, (cmd, _)) in wrapper_cmds.iter().enumerate() {
         let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         rules.push(exact_allow_rule(
             &format!("allow-wrapper-{idx}"),
@@ -1402,80 +1588,112 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
     master_perm::write_rules(&fx.pm_dir, "w1", &rules).unwrap();
 
     // 2. Interleaved global/named flags on Class::Never cadence commands.
-    for (idx, cmd) in interleaved_cadence_cmds.iter().enumerate() {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-r5-cadence-{idx}"), cmd),
-            w1.pid(),
-        );
+    for (idx, (cmd, expected_why)) in interleaved_cadence_cmds.iter().enumerate() {
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-r5-cadence-{idx}"), cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "interleaved Class::Never command '{cmd}' must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "interleaved Class::Never command '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains(expected_why)
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "interleaved Class::Never command '{cmd}' refused with unexpected reason: {msg}"
         );
     }
 
     // 3a. Tilde (~) paths via Bash and Write.
     for (idx, cmd) in tilde_bash_cmds.iter().enumerate() {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-r5-tilde-bash-{idx}"), cmd),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-r5-tilde-bash-{idx}"), cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "tilde Bash path '{cmd}' must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "tilde Bash path '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains("rule-safe characters"),
+            "tilde Bash path '{cmd}' refused with unexpected reason: {msg}"
         );
     }
-    let res_tilde_write = fx.dispatch(
-        "request_open",
-        request_open_write("w1", "perm-r5-tilde-write", tilde_write_path, "x"),
-        w1.pid(),
-    );
+    let err_tilde_write = fx
+        .dispatch(
+            "request_open",
+            request_open_write("w1", "perm-r5-tilde-write", tilde_write_path, "x"),
+            w1.pid(),
+        )
+        .expect_err(&format!(
+            "tilde Write path '{tilde_write_path}' must be refused immediately even with planted allow rule"
+        ));
+    let msg_tilde_write = err_tilde_write.to_string();
     assert!(
-        res_tilde_write.is_err(),
-        "tilde Write path '{tilde_write_path}' must be refused immediately even with planted allow rule, got: {res_tilde_write:?}"
+        msg_tilde_write
+            .contains("agent SOUL.md, AGENT.md and permissions.yaml files are never requestable")
+            && msg_tilde_write.contains("cannot be approved and no permission rule can cover it"),
+        "tilde Write path '{tilde_write_path}' refused with unexpected reason: {msg_tilde_write}"
     );
 
     // 3b. Shell wrapper prefixes via Bash.
-    for (idx, cmd) in wrapper_cmds.iter().enumerate() {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_bash("w1", &format!("perm-r5-wrap-{idx}"), cmd),
-            w1.pid(),
-        );
+    for (idx, (cmd, expected_why)) in wrapper_cmds.iter().enumerate() {
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", &format!("perm-r5-wrap-{idx}"), cmd),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "wrapper-prefixed command '{cmd}' must be refused immediately even with planted allow rule"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "wrapper-prefixed command '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+            msg.contains(expected_why)
+                && msg.contains("cannot be approved and no permission rule can cover it"),
+            "wrapper-prefixed command '{cmd}' refused with unexpected reason: {msg}"
         );
     }
 
     // 3c. Nested/array tool inputs on mcp__fs__batch.
-    for (idx, (label, input)) in [
+    for (idx, (label, input, expected_msg)) in [
         (
             "array path SOUL.md",
             json!({"paths": ["agents/w1/SOUL.md"]}),
+            "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
         ),
+        // `has_command_field` fails closed at depth > 5 before `collect_input_paths`.
         (
             "depth >5 nested input",
             json!({"a": {"b": {"c": {"d": {"e": {"f": "ok.md"}}}}}}),
+            "non-Bash tool request cannot carry a command field",
         ),
     ]
     .into_iter()
     .enumerate()
     {
-        let res = fx.dispatch(
-            "request_open",
-            request_open_tool(
-                "w1",
-                &format!("perm-r5-batch-{idx}"),
-                "mcp__fs__batch",
-                input,
-            ),
-            w1.pid(),
-        );
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_tool(
+                    "w1",
+                    &format!("perm-r5-batch-{idx}"),
+                    "mcp__fs__batch",
+                    input,
+                ),
+                w1.pid(),
+            )
+            .expect_err(&format!(
+                "mcp__fs__batch ({label}) must be refused immediately"
+            ));
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "mcp__fs__batch ({label}) must be refused immediately, got: {res:?}"
+            msg.contains(expected_msg),
+            "mcp__fs__batch ({label}) refused with unexpected reason: {msg}"
         );
     }
 
@@ -1506,24 +1724,37 @@ fn malformed_or_symlinked_worker_permissions_yaml_fails_closed() {
     let w1_perm = w1_dir.join("permissions.yaml");
     std::os::unix::fs::symlink(&outside, &w1_perm).unwrap();
 
-    fx.dispatch(
-        "request_open",
-        request_open_bash("w1", "perm-sym-1", &benign_cmd),
-        w1.pid(),
-    )
-    .expect_err("symlinked agents/w1/permissions.yaml must fail closed on request_open");
+    let err_sym = fx
+        .dispatch(
+            "request_open",
+            request_open_bash("w1", "perm-sym-1", &benign_cmd),
+            w1.pid(),
+        )
+        .expect_err("symlinked agents/w1/permissions.yaml must fail closed on request_open");
+    let msg_sym = err_sym.to_string();
+    assert!(
+        msg_sym.contains("agents/w1/permissions.yaml is or traverses a symlink"),
+        "expected symlink refusal on agents/w1/permissions.yaml, got: {msg_sym}"
+    );
     assert!(fx.pending_requests_for("w1").is_empty());
 
     // Case B: agents/w1/permissions.yaml is a regular file with malformed YAML.
     fs::remove_file(&w1_perm).unwrap();
     fs::write(&w1_perm, "rules: [\n  unclosed: : :\n").unwrap();
 
-    fx.dispatch(
-        "request_open",
-        request_open_bash("w1", "perm-bad-yaml-1", &benign_cmd),
-        w1.pid(),
-    )
-    .expect_err("malformed agents/w1/permissions.yaml must fail closed on request_open");
+    let err_bad = fx
+        .dispatch(
+            "request_open",
+            request_open_bash("w1", "perm-bad-yaml-1", &benign_cmd),
+            w1.pid(),
+        )
+        .expect_err("malformed agents/w1/permissions.yaml must fail closed on request_open");
+    let msg_bad = err_bad.to_string();
+    assert!(
+        msg_bad.contains("agents/w1/permissions.yaml is unreadable")
+            && msg_bad.contains("refusing to guess"),
+        "expected malformed YAML refusal on agents/w1/permissions.yaml, got: {msg_bad}"
+    );
     assert!(fx.pending_requests_for("w1").is_empty());
 }
 
