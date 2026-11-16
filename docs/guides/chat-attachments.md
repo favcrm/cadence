@@ -370,13 +370,17 @@ shown, when one exists. A PDF is served `inline` with no sandbox policy so the
 browser's own viewer opens it in a new tab; every other kind carries `nosniff`,
 `Content-Security-Policy: sandbox; default-src 'none'` and `private, no-store`.
 
-For a PDF, the client sends the session ID from its latest verified hosted
-metadata in `X-Cadence-Expected-Session` and opens the fetched blob only when
-`X-Cadence-Verified-Session` matches. A missing or mismatched proof, including
-an older server without this protocol, closes the blank tab without opening the
-PDF; deploy server support first. The ID is a consistency check, not a
-credential. This does not yet pin image or video element reads, stop a stream
-already started, or detect a switch in another tab after the final server check.
+For a PDF or raster, the client sends the session ID from its latest verified
+hosted metadata in `X-Cadence-Expected-Session` and uses the fetched blob only
+when `X-Cadence-Verified-Session` matches. A missing or mismatched proof,
+including an older server without this protocol, leaves the preview unopened;
+deploy server support first. Raster thumbnails load near the viewport; the
+lightbox and download reuse the verified blob. Pausing private reads revokes
+its object URL. Any CSP applied to the hosted shell must allow `blob:` in
+`img-src`; `'self'` alone does not cover it in all browsers. The session ID is a
+consistency check, not a credential. This does not yet pin video element reads,
+stop a stream already started, or detect a switch in another tab after the
+final server check.
 
 Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
 10 MiB). A video is stored and played, never decoded: the model still receives

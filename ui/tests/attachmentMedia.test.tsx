@@ -57,7 +57,7 @@ const markup = renderToStaticMarkup(
   React.createElement(AttachmentMedia, { files: [IMAGE, CLIP, PDF], conversation: CONV, hosted: true }),
 );
 ok(markup.includes("data-entry-media"), "the media row renders");
-ok(markup.includes(`src="${attachmentHref(IMAGE.id, CONV)}"`), "the thumbnail names the scoped route");
+ok(!markup.includes(`src="${attachmentHref(IMAGE.id, CONV)}"`), "the thumbnail never exposes an unpinned route");
 ok(markup.includes('alt="shot.png"'), "the thumbnail carries the file name");
 ok(markup.includes('loading="lazy"'), "the thumbnail loads lazily");
 ok(markup.includes("<video"), "a clip renders a player");
@@ -91,38 +91,6 @@ equal(
   "the href encodes the conversation",
 );
 
-// ---- mounted: the thumbnail opens a lightbox, Escape closes it ----
-const container = document.createElement("div");
-document.body.appendChild(container);
-const root = createRoot(container);
-React.act(() => {
-  root.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: CONV, hosted: true }));
-});
-const thumb = container.querySelector(".sentthumb");
-ok(thumb, "the thumbnail is a button");
-React.act(() => {
-  thumb!.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
-});
-const dialog = document.querySelector(".sentlight");
-ok(dialog, "clicking the thumbnail opens the lightbox");
-equal(dialog!.getAttribute("role"), "dialog", "the lightbox is a dialog");
-ok(document.querySelector(".sentlight-inner img"), "the lightbox shows the picture");
-ok(document.querySelector(".sentlight-bar a[download]"), "the lightbox offers a download");
-React.act(() => {
-  document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape" }));
-});
-ok(!document.querySelector(".sentlight"), "Escape closes the lightbox");
-
-// ---- a failed load leaves the chip alone ----
-const picture = container.querySelector(".sentthumb img");
-ok(picture, "the thumbnail paints an image");
-React.act(() => {
-  picture!.dispatchEvent(new win.Event("error"));
-});
-ok(!container.querySelector(".sentthumb"), "a failed load removes the picture");
-React.act(() => {
-  root.unmount();
-});
 
 // ---- a refused clip falls back the same way (no bare player) ----
 const clips = document.createElement("div");
@@ -141,8 +109,202 @@ React.act(() => {
   clipRoot.unmount();
 });
 
-// ---- a PDF opens through a fetched object URL, never the bare route ----
+// ---- image previews remain lazy and scoped to the verified session ----
+async function imagePinChecks(): Promise<void> {
+  const { allowPrivateReads, pausePrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  const sessionId = "bsi_11111111-1111-4111-8111-111111111111";
+  const realFetch = globalThis.fetch;
+  const realObserver = globalThis.IntersectionObserver;
+  const realRevoke = URL.revokeObjectURL;
+  const revoked: string[] = [];
+  URL.revokeObjectURL = (url) => { revoked.push(url); realRevoke.call(URL, url); };
+  let notify: IntersectionObserverCallback | undefined;
+  let requested: string | null = null;
+  let requests = 0;
+  class Observer {
+    constructor(callback: IntersectionObserverCallback) { notify = callback; }
+    observe() {}
+    disconnect() {}
+  }
+  globalThis.IntersectionObserver = Observer as unknown as typeof IntersectionObserver;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requests++;
+    requested = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+    return new Response(new Uint8Array([137, 80, 78, 71]), {
+      headers: { "Content-Type": "image/png", "X-Cadence-Verified-Session": sessionId },
+    });
+  }) as typeof fetch;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const imageRoot = createRoot(host);
+  try {
+    resetPrivateSession();
+    allowPrivateReads(sessionId);
+    await React.act(async () => {
+      imageRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: CONV, hosted: true }));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    equal(requests, 0, "an offscreen image does not fetch");
+    ok(notify, "an image observes visibility before fetching");
+    await React.act(async () => {
+      notify!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    equal(requested, sessionId, "an image read pins the verified hosted session");
+    const thumb = host.querySelector<HTMLButtonElement>(".sentthumb");
+    const image = thumb?.querySelector("img");
+    ok(image?.getAttribute("src")?.startsWith("blob:"), "matching proof paints an object URL");
+    const verifiedSource = image!.getAttribute("src")!;
+    await React.act(async () => { thumb!.click(); });
+    const download = document.querySelector<HTMLAnchorElement>(".sentlight a[download]");
+    equal(download?.getAttribute("href"), image?.getAttribute("src"), "the lightbox download reuses the verified image");
+    equal(document.querySelector(".sentlight")?.getAttribute("role"), "dialog", "the lightbox is a dialog");
+    await React.act(async () => { document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape" })); });
+    ok(!document.querySelector(".sentlight"), "Escape closes the lightbox");
+    await React.act(async () => { thumb!.click(); });
+    await React.act(async () => { pausePrivateReads(); });
+    ok(!host.querySelector("img[src^='blob:']") && !document.querySelector(".sentlight a[href^='blob:']"), "pausing private reads removes image access");
+    ok(revoked.includes(verifiedSource), "pausing private reads revokes the image URL");
+    await React.act(async () => { image!.dispatchEvent(new win.Event("error")); });
+    ok(host.querySelector(".sentthumb"), "a pause-induced image error does not discard the preview");
+  } finally {
+    await React.act(async () => { imageRoot.unmount(); });
+    host.remove();
+    globalThis.fetch = realFetch;
+    globalThis.IntersectionObserver = realObserver;
+    URL.revokeObjectURL = realRevoke;
+    resetPrivateSession();
+  }
+}
+
+async function imageRefusalChecks(): Promise<void> {
+  const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  const sessionId = "bsi_11111111-1111-4111-8111-111111111111";
+  const otherSession = "bsi_22222222-2222-4222-8222-222222222222";
+  const realFetch = globalThis.fetch;
+  try {
+    for (const proof of [null, otherSession]) {
+      let requestSession: string | null = null;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestSession = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+        return new Response("synthetic image", {
+          headers: proof ? { "X-Cadence-Verified-Session": proof } : {},
+        });
+      }) as typeof fetch;
+      const host = document.createElement("div");
+      document.body.append(host);
+      const imageRoot = createRoot(host);
+      try {
+        resetPrivateSession();
+        allowPrivateReads(sessionId);
+        await React.act(async () => {
+          imageRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: CONV, hosted: true }));
+          for (let i = 0; i < 30; i++) await Promise.resolve();
+        });
+        equal(requestSession, sessionId, "the image request uses the admitted identity");
+        ok(!host.querySelector("img[src^='blob:']") && !host.querySelector(".sentthumb"), "a missing or mismatched proof leaves no image");
+      } finally {
+        await React.act(async () => { imageRoot.unmount(); });
+        host.remove();
+      }
+    }
+
+    const secondImage = { ...IMAGE, id: `chf-${"d".repeat(32)}`, name: "second.png" };
+    globalThis.fetch = (async () => new Response("synthetic image", {
+      headers: { "X-Cadence-Verified-Session": sessionId },
+    })) as typeof fetch;
+    const galleryHost = document.createElement("div");
+    document.body.append(galleryHost);
+    const galleryRoot = createRoot(galleryHost);
+    try {
+      resetPrivateSession();
+      allowPrivateReads(sessionId);
+      await React.act(async () => {
+        galleryRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE, secondImage], conversation: CONV, hosted: true }));
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      await React.act(async () => { galleryHost.querySelector<HTMLButtonElement>(".sentthumb")!.click(); });
+      await React.act(async () => { document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "ArrowRight" })); });
+      equal(document.querySelector(".sentlight img")?.getAttribute("alt"), "second.png", "arrow navigation opens the next verified image");
+      ok(document.querySelector(".sentlight a[href^='blob:']"), "gallery download stays on a verified blob");
+      await React.act(async () => { galleryHost.querySelector("img")!.dispatchEvent(new win.Event("error")); });
+      equal(galleryHost.querySelectorAll(".sentthumb").length, 1, "a genuine image error removes only the failed preview");
+    } finally {
+      await React.act(async () => { galleryRoot.unmount(); });
+      galleryHost.remove();
+    }
+
+    let deliverNext!: (response: Response) => void;
+    let reads = 0;
+    globalThis.fetch = (async () => {
+      if (++reads === 1)
+        return new Response("first image", { headers: { "X-Cadence-Verified-Session": sessionId } });
+      return new Promise<Response>((resolve) => { deliverNext = resolve; });
+    }) as typeof fetch;
+    const switchedHost = document.createElement("div");
+    document.body.append(switchedHost);
+    const switchedRoot = createRoot(switchedHost);
+    try {
+      resetPrivateSession();
+      allowPrivateReads(sessionId);
+      await React.act(async () => {
+        switchedRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: CONV, hosted: true }));
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      const originalSource = switchedHost.querySelector("img")?.getAttribute("src");
+      ok(originalSource?.startsWith("blob:"), "the first conversation has an image");
+      await React.act(async () => { switchedHost.querySelector<HTMLButtonElement>(".sentthumb")!.click(); });
+      await React.act(async () => {
+        switchedRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: "tc_next", hosted: true }));
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+      ok(switchedHost.querySelector("img")?.getAttribute("src") !== originalSource, "a new conversation cannot inherit the old image");
+      ok(!document.querySelector(".sentlight"), "changing conversations closes the old lightbox");
+      ok(typeof deliverNext === "function", "the new conversation has its own pending read");
+      await React.act(async () => {
+        deliverNext(new Response("second image", { headers: { "X-Cadence-Verified-Session": sessionId } }));
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      ok(switchedHost.querySelector("img")?.getAttribute("src")?.startsWith("blob:"), "the new conversation can load its own image");
+    } finally {
+      await React.act(async () => { switchedRoot.unmount(); });
+      switchedHost.remove();
+    }
+
+    let finishBody!: (body: Blob) => void;
+    const response = new Response(null, { headers: { "X-Cadence-Verified-Session": sessionId } });
+    response.blob = () => new Promise<Blob>((resolve) => { finishBody = resolve; });
+    globalThis.fetch = (async () => response) as typeof fetch;
+    const host = document.createElement("div");
+    document.body.append(host);
+    const imageRoot = createRoot(host);
+    try {
+      resetPrivateSession();
+      allowPrivateReads(sessionId);
+      await React.act(async () => {
+        imageRoot.render(React.createElement(AttachmentMedia, { files: [IMAGE], conversation: CONV, hosted: true }));
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      ok(typeof finishBody === "function", "the image body read has started");
+      await React.act(async () => {
+        resetPrivateSession();
+        allowPrivateReads(otherSession);
+        finishBody(new Blob(["old image"]));
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      ok(!host.querySelector("img[src^='blob:']"), "an old image body cannot appear after identity reset");
+    } finally {
+      await React.act(async () => { imageRoot.unmount(); });
+      host.remove();
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    resetPrivateSession();
+  }
+}
+
 declare const process: { exitCode: number };
+// ---- a PDF opens through a fetched object URL, never the bare route ----
 async function pdfCheck(): Promise<void> {
   const { openAttachmentInTab } = AttachmentMediaModule;
   const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
@@ -257,7 +419,7 @@ async function pdfCheck(): Promise<void> {
   win.setTimeout = realSetTimeout;
   console.log("attachment media passed");
 }
-void pdfCheck().catch((error: unknown) => {
+void imagePinChecks().then(imageRefusalChecks).then(pdfCheck).catch((error: unknown) => {
   console.error(error);
   process.exitCode = 1;
 });

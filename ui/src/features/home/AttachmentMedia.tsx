@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
-import { verifiedHostedSessionId, withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateReadsPaused, privateReadsAllowed, verifiedHostedSessionId, withPrivateOperation } from "../../lib/privateSession";
 import { attachMeta } from "../app-shell/chat/attach";
+import { useNear } from "../canvas/ImageBlock";
 
 /**
  * CAD-2219: the operator's own attachment, shown as what it is.
@@ -31,6 +32,10 @@ export type AttachmentFile = { id: string; name: string; size: number; mime: str
 /** The board read for one attachment, scoped to the conversation in view. */
 export function attachmentHref(id: string, conversation: string): string {
   return `/api/chat/attachments/${encodeURIComponent(id)}?conversation=${encodeURIComponent(conversation)}`;
+}
+
+function attachmentSourceKey(conversation: string, id: string): string {
+  return JSON.stringify([conversation, id]);
 }
 
 export function attachmentPreviewKind(mime: string): "image" | "video" | null {
@@ -83,64 +88,148 @@ export default function AttachmentMedia({
   /** Only a hosted board serves the attachment read; a local board keeps chips. */
   hosted: boolean;
 }) {
-  const t = useTranslate();
   const [openId, setOpenId] = useState<string | null>(null);
   const [failed, setFailed] = useState<Record<string, true>>({});
+  const [sources, setSources] = useState<Record<string, string>>({});
+  const onSource = useCallback((id: string, source: string | null) => {
+    setSources((current) => {
+      if (source !== null) return current[id] === source ? current : { ...current, [id]: source };
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }, []);
+  const onFailed = useCallback((id: string) => {
+    setFailed((state) => ({ ...state, [id]: true }));
+  }, []);
   const shown =
     hosted && conversation !== null
       ? files.flatMap((file) => {
           const kind = attachmentPreviewKind(file.mime);
-          return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
+          if (kind === null) return [];
+          const key = attachmentSourceKey(conversation, file.id);
+          return failed[key] === true ? [] : [{ file, kind, key }];
         })
       : [];
-  const images = shown.flatMap((entry) => (entry.kind === "image" ? [entry.file] : []));
-  const openIndex = openId === null ? -1 : images.findIndex((image) => image.id === openId);
+  const images = shown.filter((entry) => entry.kind === "image");
+  const openIndex = openId === null ? -1 : images.findIndex((image) => image.key === openId);
   useEffect(() => {
     if (openId !== null && openIndex < 0) setOpenId(null);
   }, [openId, openIndex]);
   if (!hosted || conversation === null || shown.length === 0) return null;
   return (
     <div className="sentmedia" data-entry-media>
-      {shown.map(({ file, kind }) =>
+      {shown.map(({ file, kind, key }) =>
         kind === "video" ? (
-          <figure key={file.id} className="sentclip">
+          <figure key={key} className="sentclip">
             <video
               className="sentvideo"
               src={attachmentHref(file.id, conversation)}
               controls
               playsInline
               preload="metadata"
-              onError={() => setFailed((state) => ({ ...state, [file.id]: true }))}
+              onError={() => onFailed(key)}
             />
           </figure>
         ) : (
-          <button
-            key={file.id}
-            type="button"
-            className="sentthumb"
-            aria-label={`${t("Open")} ${file.name}`}
-            onClick={() => setOpenId(file.id)}
-          >
-            <img
-              src={attachmentHref(file.id, conversation)}
-              alt={file.name}
-              loading="lazy"
-              decoding="async"
-              onError={() => setFailed((state) => ({ ...state, [file.id]: true }))}
-            />
-          </button>
+          <PinnedImage
+            key={key}
+            file={file}
+            conversation={conversation}
+            sourceKey={key}
+            source={sources[key]}
+            selected={openId === key}
+            onSource={onSource}
+            onFailed={onFailed}
+            onOpen={setOpenId}
+          />
         ),
       )}
       {openIndex >= 0 && (
         <AttachmentLightbox
           images={images}
           index={openIndex}
-          conversation={conversation}
+          sources={sources}
           onSelect={setOpenId}
           onClose={() => setOpenId(null)}
         />
       )}
     </div>
+  );
+}
+
+/** Fetch only near the viewport (or when selected), under this tab's verified session. */
+function PinnedImage({
+  file,
+  conversation,
+  sourceKey,
+  source,
+  selected,
+  onSource,
+  onFailed,
+  onOpen,
+}: {
+  file: AttachmentFile;
+  conversation: string;
+  sourceKey: string;
+  source: string | undefined;
+  selected: boolean;
+  onSource: (id: string, source: string | null) => void;
+  onFailed: (id: string) => void;
+  onOpen: (id: string) => void;
+}) {
+  const t = useTranslate();
+  const ref = useRef<HTMLButtonElement | null>(null);
+  const shouldLoad = useNear(ref) || selected;
+  useEffect(() => {
+    if (!shouldLoad) return;
+    const abort = new AbortController();
+    let objectUrl: string | null = null;
+    const clear = () => {
+      if (objectUrl === null) return;
+      URL.revokeObjectURL(objectUrl);
+      objectUrl = null;
+      onSource(sourceKey, null);
+    };
+    const stopPause = onPrivateReadsPaused(() => { abort.abort(); clear(); });
+    void withPrivateOperation(async (operation) => {
+      const expectedSession = verifiedHostedSessionId();
+      if (!expectedSession) throw new Error("A verified hosted session is required");
+      const response = await operation.fetch(attachmentHref(file.id, conversation), {
+        credentials: "same-origin",
+        headers: { "X-Cadence-Expected-Session": expectedSession },
+      });
+      if (!response.ok || response.headers.get("X-Cadence-Verified-Session") !== expectedSession)
+        throw new Error("Attachment session verification failed");
+      const body = await response.blob();
+      operation.assertCurrent();
+      if (verifiedHostedSessionId() !== expectedSession)
+        throw new Error("The hosted session changed during the attachment read");
+      objectUrl = URL.createObjectURL(body);
+      onSource(sourceKey, objectUrl);
+    }, abort.signal).catch(() => {
+      if (!abort.signal.aborted) onFailed(sourceKey);
+    });
+    return () => { stopPause(); abort.abort(); clear(); };
+  }, [shouldLoad, sourceKey, file.id, conversation, onSource, onFailed]);
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className="sentthumb"
+      aria-label={`${t("Open")} ${file.name}`}
+      disabled={!source}
+      onClick={() => onOpen(sourceKey)}
+    >
+      <img
+        src={source}
+        alt={file.name}
+        loading="lazy"
+        decoding="async"
+        onError={() => { if (source && privateReadsAllowed()) onFailed(sourceKey); }}
+      />
+    </button>
   );
 }
 
@@ -150,13 +239,13 @@ export default function AttachmentMedia({
 function AttachmentLightbox({
   images,
   index,
-  conversation,
+  sources,
   onSelect,
   onClose,
 }: {
-  images: AttachmentFile[];
+  images: { file: AttachmentFile; key: string }[];
   index: number;
-  conversation: string;
+  sources: Record<string, string>;
   onSelect: (id: string) => void;
   onClose: () => void;
 }) {
@@ -187,7 +276,7 @@ function AttachmentLightbox({
         const count = nav.current.images.length;
         const delta = event.key === "ArrowLeft" ? -1 : 1;
         const next = nav.current.images[(nav.current.index + delta + count) % count];
-        if (next) nav.current.onSelect(next.id);
+        if (next) nav.current.onSelect(next.key);
         return;
       }
       if (event.key !== "Tab") return;
@@ -211,8 +300,8 @@ function AttachmentLightbox({
       if (returnTo instanceof HTMLElement && returnTo.isConnected) returnTo.focus();
     };
   }, []);
-  const file = images[index];
-  const src = attachmentHref(file.id, conversation);
+  const { file, key } = images[index];
+  const src = sources[key];
   const multi = images.length > 1;
   useEffect(() => {
     const active = document.activeElement;
@@ -222,7 +311,7 @@ function AttachmentLightbox({
   }, [multi]);
   const step = (delta: -1 | 1) => {
     const next = images[(index + delta + images.length) % images.length];
-    if (next) onSelect(next.id);
+    if (next) onSelect(next.key);
   };
   return createPortal(
     <div
@@ -259,9 +348,11 @@ function AttachmentLightbox({
               </button>
             </>
           )}
-          <a className="lnk" href={src} download={file.name}>
-            {t("Download")}
-          </a>
+          {src && (
+            <a className="lnk" href={src} download={file.name}>
+              {t("Download")}
+            </a>
+          )}
           <button ref={closeRef} type="button" className="lnk" onClick={() => dismiss.current()}>
             {t("Close")}
           </button>
