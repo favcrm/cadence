@@ -242,6 +242,8 @@ export interface ScreenBridgeOptions<
   tag: string;
   appName?: string;
   records?: boolean;
+  /** Enable the hosted private-app catalogue bridge on a records screen. */
+  catalog?: boolean;
   actions?: boolean;
   media?: boolean;
   surfaces?: boolean;
@@ -265,6 +267,15 @@ export interface ScreenBridgeOptions<
   sandboxForms?: boolean;
   createError?: (message: string, status: number, options?: { code?: string }) => Err;
 }
+
+export type ScreenCatalogInput = { query?: Record<string, string | number | boolean>; body?: unknown; units?: number };
+export type ScreenCatalogReceipt<T = unknown> = {
+  slug: string; effect: "read" | "draft"; price: { currency: "USD"; scale: 6; amount: string }; result: T;
+};
+export type ScreenCatalogStatus<T = unknown> =
+  | { state: "not_started" | "review_required" | "uncertain" }
+  | { state: "settled"; result_available: false }
+  | { state: "settled"; result_available: true; receipt: ScreenCatalogReceipt<T> };
 
 export interface ScreenBridge<
   Section extends string = string,
@@ -293,6 +304,19 @@ export interface ScreenBridge<
     anchor?: SlotAnchor,
     options?: ScreenBridgeCallOptions,
   ): Promise<T>;
+  catalog<T = unknown>(
+    scope: ScreenScope,
+    slot: string,
+    input: ScreenCatalogInput,
+    requestId: string,
+    anchor?: SlotAnchor,
+  ): Promise<ScreenCatalogReceipt<T>>;
+  catalogStatus<T = unknown>(
+    scope: ScreenScope,
+    slot: string,
+    input: ScreenCatalogInput,
+    requestId: string,
+  ): Promise<ScreenCatalogStatus<T>>;
   tool<T = unknown>(
     scope: ScreenScope,
     alias: string,

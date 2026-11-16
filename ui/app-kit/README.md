@@ -60,6 +60,59 @@ export const bridge = createScreenBridge({
 });
 ```
 
+### Private apps and platform tools
+
+The hosted workspace can grant a private app a catalogue **read** or **draft**
+tool. Declare the slot in `app.md`:
+
+```yaml
+needs:
+  capabilities:
+    lookup: { schema: 1, capability: catalog.tool, version: 1, action: invoke, resource_kind: connection_account, effect: read }
+```
+
+In the app toolchain's `package.json`, add `catalog.call`, `catalog.status` and
+`catalog.confirm` to `cadence.screen.operations`, and both `records.call` and
+`records.slot` to `cadence.screen.may`; keep the screen's
+`host_contract: "screen-records.v1"` and `tools: {}`. Document which catalogue
+tool and input shape the app expects: the workspace owner chooses the actual
+tool and, for a connected read, an eligible account. A grant never gives the
+app a provider credential or an unrestricted tool slug.
+
+```js
+const bridge = createScreenBridge({ tag: "main", records: true, catalog: true });
+
+async function search(scope, requestId, query) {
+  const receipt = await bridge.catalog(scope, "lookup", { body: { query } }, requestId);
+  return receipt.result;
+}
+```
+
+Use the current `bridge.getSnapshot().scope`. Give each logical action a unique
+`requestId` and retain it across retries and sign-ins for the same workspace
+member. The workspace checks the live session and grant each time; another
+member cannot read the original result. Free reads can run for members, while
+draft calls and paid confirmations require an owner. A free call can run
+directly; a paid call opens a host-owned confirmation showing the tool, input,
+account where applicable, and current price. If the price changes, the owner must
+review again. A lost or uncertain outcome is **not** retried automatically.
+Call `bridge.catalogStatus(scope, "lookup", input, requestId)` with the same
+input and request ID before starting a new action. It returns `not_started`,
+`review_required`, `uncertain`, or `settled`. A settled outcome can have
+`result_available: false` when the platform recorded settlement but the
+original result was lost. An unrecorded platform lookup stays uncertain; it
+does not prove the provider did nothing. An app update or removal revokes
+its grants. Sends and publishing remain on their existing approval paths.
+
+Connected reads put the provider's reviewed arguments in `input.body`; the
+host supplies the bound `connection_id`. Do not put connection IDs, secrets,
+or charge ceilings in app input. Availability and compatible input schemas
+depend on the workspace's enabled catalogue. First-party text generation and
+audio transcription are not supported by this bridge; their legacy funded
+billing path needs a separate uncapped integration. This hosted contract also
+requires an updated host and app-inspection CLI. The native host refuses
+execution rather than pretending to run the tool.
+
 ## Presentation and the board-wide drawer
 
 A screen opts into the host's `screen-presentation.v1` contract by naming it in

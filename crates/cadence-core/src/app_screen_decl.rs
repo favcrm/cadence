@@ -200,6 +200,13 @@ pub enum ScreenOperation {
     RecordsBatch,
     #[serde(rename = "records.aggregate")]
     RecordsAggregate,
+    // Hosted platform catalogue access; native execution remains unavailable.
+    #[serde(rename = "catalog.call")]
+    CatalogCall,
+    #[serde(rename = "catalog.status")]
+    CatalogStatus,
+    #[serde(rename = "catalog.confirm")]
+    CatalogConfirm,
     #[serde(rename = "records.csv.import")]
     RecordsCsvImport,
     #[serde(rename = "records.csv.confirm")]
@@ -401,6 +408,7 @@ impl ScreenOperation {
             self,
             Self::RecordsCsvImport
                 | Self::RecordsCsvConfirm
+                | Self::CatalogConfirm
                 | Self::ContentApprove
                 | Self::SendsApprove
                 | Self::SendsResolve
@@ -461,6 +469,7 @@ impl ScreenOperation {
         matches!(
             self,
             Self::RecordsList
+                | Self::CatalogStatus
                 | Self::RecordsShow
                 | Self::SegmentsList
                 | Self::SegmentsShow

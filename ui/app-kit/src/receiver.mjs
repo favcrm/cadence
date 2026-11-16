@@ -1027,14 +1027,20 @@ export function createScreenReceiver(options = {}) {
 export function createScreenBridge(options = {}) {
   const {
     tag, appName, records = false, actions = false, media = false, surfaces = false,
-    presentation = false, locale = false, audio = false, calls = {}, slots = {}, argBytes = ACTION_ARGS_BYTES,
+    presentation = false, locale = false, audio = false, calls: suppliedCalls = {}, slots: suppliedSlots = {}, catalog = false, argBytes = ACTION_ARGS_BYTES,
     singleFlight = [], writeVerbs = [], route: routeConfig, observations: observationVerbs = [],
     pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, sandboxForms = false, createError,
   } = options;
   if (typeof tag !== "string" || !TAG.test(tag)) fail("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   if (appName !== undefined && (typeof appName !== "string" || appName.length === 0)) fail("appName must be a non-empty string when provided");
   if (typeof sandboxForms !== "boolean") fail("sandboxForms must be a boolean");
-  if (!isPlain(calls) || !isPlain(slots)) fail("calls and slots must be plain verb -> field-list maps");
+  if (!isPlain(suppliedCalls) || !isPlain(suppliedSlots)) fail("calls and slots must be plain verb -> field-list maps");
+  if (typeof catalog !== "boolean" || (catalog && (!records || actions))) fail("catalog needs a records screen without screen-actions");
+  if (catalog && (Object.hasOwn(suppliedCalls, "catalog.call") || Object.hasOwn(suppliedCalls, "catalog.status") || Object.hasOwn(suppliedSlots, "catalog.confirm")))
+    fail("catalog verbs are configured by the catalog option");
+  const catalogFields = ["slot", "request_id", "input"];
+  const calls = catalog ? { ...suppliedCalls, "catalog.call": catalogFields, "catalog.status": catalogFields } : suppliedCalls;
+  const slots = catalog ? { ...suppliedSlots, "catalog.confirm": catalogFields } : suppliedSlots;
   if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1) fail("maxInFlight must be a positive safe integer");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail("timeoutMs must be positive");
   if (createError !== undefined && typeof createError !== "function") fail("createError must be a function when provided");
@@ -1351,6 +1357,24 @@ export function createScreenBridge(options = {}) {
       return Promise.reject(syncError);
     }
   };
+  function catalogArgs(slot, input, requestId) {
+    if (typeof slot !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$/.test(slot) ||
+        !isPlain(input) || typeof requestId !== "string" || !/^[A-Za-z0-9_.:-]{8,160}$/.test(requestId))
+      throw makeError("Invalid app tool request", 400, { code: "invalid" });
+    return { slot, input, request_id: requestId };
+  }
+  function catalogReceipt(value) {
+    const price = isPlain(value) && isPlain(value.price) ? value.price : null;
+    if (!isPlain(value) || typeof value.slug !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(value.slug) ||
+        (value.effect !== "read" && value.effect !== "draft") || !price || price.currency !== "USD" ||
+        price.scale !== 6 || typeof price.amount !== "string" ||
+        !/^(0|[1-9]\d{0,9})\.\d{6}$/.test(price.amount) || !Object.hasOwn(value, "result")) {
+      const error = invalidBridge("The app tool returned an invalid receipt");
+      retire(error);
+      throw error;
+    }
+    return value;
+  }
 
   return Object.freeze({
     tag,
@@ -1402,6 +1426,33 @@ export function createScreenBridge(options = {}) {
     },
     call: (scope, verb, args = {}, callOptions = {}) => dispatch("call", scope, verb, args, callOptions),
     slot: (scope, verb, args = {}, anchor = "footer", slotOptions = {}) => dispatch("slot", scope, verb, args, { ...slotOptions, anchor }),
+    /** Stable request IDs prevent a retry from silently repeating a paid call. */
+    catalog(scope, slot, input, requestId, anchor = "footer") {
+      let args;
+      try { args = catalogArgs(slot, input, requestId); }
+      catch (error) { return Promise.reject(error); }
+      return dispatch("call", scope, "catalog.call", args).catch((error) => {
+        if (error?.code !== "confirmation_required") throw error;
+        return dispatch("slot", scope, "catalog.confirm", args, { anchor });
+      }).then(catalogReceipt);
+    },
+    catalogStatus(scope, slot, input, requestId) {
+      let args;
+      try { args = catalogArgs(slot, input, requestId); }
+      catch (error) { return Promise.reject(error); }
+      return dispatch("call", scope, "catalog.status", args).then((value) => {
+        if (isPlain(value) && ["not_started", "review_required", "uncertain"].includes(value.state) &&
+            Object.keys(value).length === 1) return value;
+        if (isPlain(value) && value.state === "settled" && typeof value.result_available === "boolean" &&
+            (value.result_available ? Object.keys(value).length === 3 : Object.keys(value).length === 2)) {
+          if (value.result_available) catalogReceipt(value.receipt);
+          return value;
+        }
+        const error = invalidBridge("The app tool returned an invalid status");
+        retire(error);
+        throw error;
+      });
+    },
     tool(scope, alias, input = {}, requestId, generationScope) {
       const live = receiver;
       if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));

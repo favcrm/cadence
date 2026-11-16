@@ -1516,3 +1516,124 @@ test("createScreenBridge keeps mount alive on write/owner_required/slot 403 and 
   await assert.rejects(revoked, (err) => err instanceof ScreenBridgeError && err.status === 403);
   assert.equal(bridge.getState().status, "error");
 });
+
+// The host below is the transferred MessageChannel port, not a bridge mock.
+const catalogInput = { body: { query: "synthetic" } };
+const catalogReceiptFixture = {
+  slug: "synthetic-read",
+  effect: "read",
+  price: { currency: "USD", scale: 6, amount: "0.000000" },
+  result: { message: "synthetic result" },
+};
+async function catalogFixture(timeoutMs = 100) {
+  const bridge = createScreenBridge({ tag: "notes", appName: "notes", records: true, catalog: true, timeoutMs });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["catalog.call", "catalog.confirm", "catalog.status"] }));
+  await waitFor(() => bridge.getState().status === "ready", "catalog bridge ready");
+  return { bridge, scope: bridge.getSnapshot().scope, host, inbox };
+}
+
+test("catalogue direct free receipt goes through one call and no host slot", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const pending = bridge.catalog(scope, "lookup", catalogInput, "request-free-1");
+  const sent = await waitFor(() => inbox.find((message) => message.op === "call" && message.verb === "catalog.call"), "catalog call");
+  assert.deepEqual(sent.args, { slot: "lookup", input: catalogInput, request_id: "request-free-1" });
+  host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: catalogReceiptFixture });
+  assert.deepEqual(await pending, catalogReceiptFixture);
+  await tick();
+  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue paid confirmation uses one host-owned slot and never sends a token into the app", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const pending = bridge.catalog(scope, "lookup", catalogInput, "request-paid-1");
+  const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "initial call");
+  host.postMessage({ v: 2, op: "reply", id: sent.id, ok: false,
+    refusal: { code: "confirmation_required", text: "Review this paid tool." } });
+  const slot = await waitFor(() => inbox.find((message) => message.op === "slot"), "host confirmation slot");
+  assert.equal(slot.verb, "catalog.confirm");
+  assert.deepEqual(slot.args, { slot: "lookup", input: catalogInput, request_id: "request-paid-1" });
+  assert.equal(slot.anchor, "footer");
+  // The token is host-private: the app receives only the final receipt.
+  const hostOnlyToken = "synthetic-host-secret-confirmation-token";
+  const paid = { ...catalogReceiptFixture, price: { currency: "USD", scale: 6, amount: "0.001500" } };
+  host.postMessage({ v: 2, op: "slot-state", id: slot.id, state: "done", data: paid });
+  const receipt = await pending;
+  assert.deepEqual(receipt, paid);
+  assert.ok(!JSON.stringify(receipt).includes(hostOnlyToken));
+  assert.ok(!JSON.stringify(inbox).includes(hostOnlyToken));
+  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 1);
+});
+
+test("catalogue uncertainty and network refusal never automatically retry or open a slot", async () => {
+  for (const code of ["uncertain", "unavailable"]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalog(scope, "lookup", catalogInput, `request-${code}-1`);
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), `${code} call`);
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: false, refusal: { code, text: "Synthetic failure" } });
+    await assert.rejects(pending);
+    await tick();
+    assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+    assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+  }
+});
+
+test("catalogue timeout never automatically retries or opens a slot", async () => {
+  const { bridge, scope, inbox } = await catalogFixture(20);
+  await assert.rejects(bridge.catalog(scope, "lookup", catalogInput, "request-timeout-1"));
+  await tick();
+  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue status admits each genuine status including settlement without a result", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const statuses = [
+    { state: "not_started" }, { state: "review_required" }, { state: "uncertain" },
+    { state: "settled", result_available: false },
+    { state: "settled", result_available: true, receipt: catalogReceiptFixture },
+  ];
+  for (const [index, expected] of statuses.entries()) {
+    const pending = bridge.catalogStatus(scope, "lookup", catalogInput, `request-status-${index}`);
+    const sent = await waitFor(() => inbox.filter((message) => message.op === "call" && message.verb === "catalog.status")[index], "status request");
+    assert.deepEqual(sent.args, { slot: "lookup", input: catalogInput, request_id: `request-status-${index}` });
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: expected });
+    assert.deepEqual(await pending, expected);
+  }
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue receipt validation fails closed for malformed and secret-bearing replies", async () => {
+  for (const data of [
+    { ...catalogReceiptFixture, effect: "send" },
+    { ...catalogReceiptFixture, price: { currency: "USD", scale: 6, amount: "NaN" } },
+    { ...catalogReceiptFixture, result: { confirmation_token: "synthetic-secret" } },
+  ]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalog(scope, "lookup", catalogInput, "request-invalid-1");
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "invalid receipt call");
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data });
+    await assert.rejects(pending);
+    assert.equal(bridge.getState().status, "error");
+    assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+  }
+});
+
+test("catalogue status rejects invalid and invented settlement shapes", async () => {
+  for (const data of [
+    { state: "settled" },
+    { state: "settled", result_available: true },
+    { state: "settled", result_available: false, receipt: catalogReceiptFixture },
+    { state: "uncertain", receipt: catalogReceiptFixture },
+    { state: "settled", result_available: true, receipt: { ...catalogReceiptFixture, effect: "send" } },
+  ]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalogStatus(scope, "lookup", catalogInput, "request-invalid-status-1");
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "invalid status call");
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data });
+    await assert.rejects(pending);
+    assert.equal(bridge.getState().status, "error");
+  }
+});

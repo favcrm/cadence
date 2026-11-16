@@ -158,6 +158,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
               {review.structural && <section className="text-label"><h4 className="font-medium text-ink-100">{t("Package changes")}</h4>
                 {(["added", "changed", "removed"] as const).map((kind) => <p key={kind}>{t(kind === "added" ? "Added" : kind === "changed" ? "Changed" : "Removed")}: {review.structural![kind].join(", ") || t("None")}</p>)}
               </section>}
+              {installation && review.digest !== installation.digest && <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>}
               <p className="alert warn">{t("This check does not scan for secrets or review app behavior.")}</p>
               {review.warnings && <p className="alert fail" role="alert">{t("The package reported warnings. Resolve them before installing.")}</p>}
               <label className="flex items-start gap-2 text-label"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.currentTarget.checked)} disabled={busy !== null} /><span>{t("I reviewed this version and its requested access.")}</span></label>
