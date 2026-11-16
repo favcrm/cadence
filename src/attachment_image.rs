@@ -139,8 +139,7 @@ fn decode_raster(bytes: &[u8], mime: &str) -> Result<image::DynamicImage> {
 /// the delivery bound. The caller passes bytes whose size and digest it
 /// already checked; this never opens a path.
 pub fn validate_raster(bytes: &[u8], mime: &str) -> Result<()> {
-    cadence_image::validate_native(bytes, mime)
-        .map_err(|error| Error::rejected(error.to_string()))
+    cadence_image::validate_native(bytes, mime).map_err(|error| Error::rejected(error.to_string()))
 }
 
 /// The most nodes one document may decode into. A source small enough to
