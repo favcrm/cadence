@@ -38,6 +38,14 @@ import {
 } from "../../home/scrollFollow";
 import { ThreadTurn, ThreadItemView, type Density } from "../../home/ThreadView";
 import { DayDivider, dayKey, itemCreated } from "../../home/DayDivider";
+
+/** CAD-2363: when a turn started — the stamp of the row just before its first
+ *  item (its send, or the turn it was queued behind). Null at the top of a
+ *  window, where the turn falls back to its own first entry. */
+function turnStart(list: ThreadItem[], first: ThreadItem | undefined): number | null {
+  const at = first === undefined ? -1 : list.indexOf(first);
+  return at > 0 ? itemCreated(list[at - 1]) : null;
+}
 import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
@@ -445,6 +453,7 @@ function HomeList({
           <li className={`min-w-0 space-y-4${live && !turnKey.has(run.key) ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
+              startedAt={turnStart(items, run.items[0])}
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
@@ -2242,6 +2251,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                           >
               <ThreadTurn
                 items={safe}
+                startedAt={turnStart(shown, view.run.items[0])}
                 density={density}
                 head={view.head}
                 continued={view.continued}

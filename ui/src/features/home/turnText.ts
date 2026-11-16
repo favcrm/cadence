@@ -1,0 +1,152 @@
+/**
+ * CAD-2363: the pure text of an assistant turn — its elapsed time in the
+ * reader's language, readable names for the hosted assistant's tools, the
+ * subject a step acted on, and long hex identifiers as short tokens. No
+ * React, so the UI tests load it directly.
+ */
+
+/** `8s`, `1m 5s`, `1h 3m` — templates the locale catalogue translates
+ *  (written Chinese: `8 秒`, `1 分 5 秒`, `1 小時 3 分`). */
+export function formatElapsed(secs: number, t: (english: string) => string = (e) => e): string {
+  const s = Math.max(0, Math.floor(secs));
+  const m = Math.floor(s / 60);
+  const fill = (template: string, values: Record<string, number>) =>
+    t(template).replace(/\{(\w)\}/g, (_, k: string) => String(values[k] ?? ""));
+  if (s < 60) return fill("{s}s", { s });
+  if (m < 60) return fill("{m}m {s}s", { m, s: s % 60 });
+  return fill("{h}h {m}m", { h: Math.floor(m / 60), m: m % 60 });
+}
+
+/** Whole seconds between two instants (ms), or null when they do not measure. */
+export function elapsedSecs(fromMs: number | null, toMs: number | null): number | null {
+  if (fromMs === null || toMs === null || !Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return null;
+  const secs = Math.round((toMs - fromMs) / 1000);
+  return secs < 1 ? null : secs;
+}
+
+/**
+ * The hosted assistant's tools (agenticos-v2 `tenant-board`) by what they do
+ * for the reader. English keys; the locale catalogue translates them. A tool
+ * not listed keeps its own name.
+ */
+const TOOL_LABELS: Record<string, string> = {
+  account_usage: "Check account usage",
+  activate_skill: "Load a skill",
+  app_skill: "Load a skill",
+  read_skill_resource: "Load a skill",
+  app_call: "Use an app",
+  app_describe: "Read app details",
+  artifact_find: "Find artifacts",
+  artifact_put: "Save an artifact",
+  artifact_read: "Read an artifact",
+  artifact_share: "Share an artifact",
+  artifact_show: "Show on the canvas",
+  ask_form: "Ask with a form",
+  assistant_profile: "Read the assistant profile",
+  board_create_issue: "Create a ticket",
+  board_get_review_draft: "Read a review draft",
+  board_list_issues: "List tickets",
+  board_pending_actions: "Check pending approvals",
+  board_read: "Read the board",
+  board_read_issue: "Read a ticket",
+  board_review_draft: "Draft a review",
+  browser_control: "Use the browser",
+  catalog_call: "Run a tool",
+  catalog_describe: "Read tool details",
+  catalog_result_read: "Read a tool result",
+  catalog_search: "Search tools",
+  chat_attachment_read: "Read an attachment",
+  document_render: "Render a document",
+  document_submit: "Submit for approval",
+  document_type_propose: "Propose a document type",
+  document_types: "Read document types",
+  job_status: "Check a job",
+  mail_list: "List mail",
+  mail_read: "Read mail",
+  mcp_call_read: "Read from a connector",
+  mcp_list_tools: "List connector tools",
+  media_generate: "Generate media",
+  propose_ticket: "Propose a ticket",
+  ticket_attach: "Attach to a ticket",
+  ticket_comment: "Comment on a ticket",
+  ticket_review: "Send a ticket to review",
+  web_read: "Read a web page",
+  web_search: "Search the web",
+  wiki_list: "List wiki pages",
+  wiki_read: "Read the wiki",
+  wiki_search: "Search the wiki",
+};
+
+/** The tool name a step's summary starts with (`app_call {…}`, `web_search: q`). */
+export function toolKey(summary: string): string {
+  return summary.trim().split(/[\s:{(]/, 1)[0].toLowerCase();
+}
+
+/** The readable label (an English catalogue key) for a known tool, else null. */
+export function toolLabel(summary: string): string | null {
+  return TOOL_LABELS[toolKey(summary)] ?? null;
+}
+
+/** Argument fields that name what a call acted on, most specific first. */
+const SUBJECT_KEYS = ["title", "name", "q", "query", "url", "path", "label", "op", "operation", "id"];
+const SUBJECT_MAX = 60;
+
+/**
+ * What a known tool call acted on, for the step row: the first naming field
+ * of a JSON argument (`{"op":"contacts.search","q":"Gia"}` → `Gia`), or the
+ * plain argument, cut to one short line. Empty when there is none.
+ */
+export function toolSubject(summary: string): string {
+  const rest = summary.trim().slice(toolKey(summary).length).replace(/^[\s:]+/, "").trim();
+  if (rest === "") return "";
+  let subject = rest;
+  if (rest.startsWith("{")) {
+    try {
+      const args = JSON.parse(rest) as Record<string, unknown>;
+      const key = SUBJECT_KEYS.find((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
+      subject = key ? (args[key] as string) : "";
+    } catch {
+      // A truncated JSON summary still reads better than nothing: its first quoted value.
+      const quoted = rest.match(/"[^"]+"\s*:\s*"([^"]+)"/);
+      subject = quoted ? quoted[1] : "";
+    }
+  }
+  subject = subject.replace(/\s+/g, " ").trim();
+  return subject.length > SUBJECT_MAX ? `${subject.slice(0, SUBJECT_MAX - 1)}…` : subject;
+}
+
+/**
+ * A long hex identifier, optionally behind a short lowercase prefix
+ * (`art-…`, `msg_…`): sixteen or more hex digits, at least one a–f, with no
+ * letter, digit or hyphen run on either side. A pure number (an order or
+ * card number) is never shortened.
+ */
+export const ID_TOKEN = /(?<![\w-])(?:[a-z]{2,8}[-_])?(?=[0-9]*[a-f])[0-9a-f]{16,}(?![\w-])/gi;
+
+/** True when the whole string is one identifier. */
+export function isIdToken(text: string): boolean {
+  ID_TOKEN.lastIndex = 0;
+  const m = ID_TOKEN.exec(text);
+  ID_TOKEN.lastIndex = 0;
+  return m !== null && m.index === 0 && m[0].length === text.length;
+}
+
+/** `art-5f3a90c1…c3c9`: the prefix, the first and last four hex digits. */
+export function shortId(id: string): string {
+  const m = id.match(/^((?:[a-z]{2,8}[-_])?)([0-9a-f]+)$/i);
+  if (!m || m[2].length <= 12) return id;
+  return `${m[1]}${m[2].slice(0, 4)}…${m[2].slice(-4)}`;
+}
+
+/** Plain text split into text and identifier parts, in order. */
+export function splitIds(text: string): { id: boolean; text: string }[] {
+  const out: { id: boolean; text: string }[] = [];
+  let at = 0;
+  for (const m of text.matchAll(ID_TOKEN)) {
+    if (m.index > at) out.push({ id: false, text: text.slice(at, m.index) });
+    out.push({ id: true, text: m[0] });
+    at = m.index + m[0].length;
+  }
+  if (at < text.length) out.push({ id: false, text: text.slice(at) });
+  return out;
+}

@@ -5,6 +5,8 @@ import { citationSpans, isWikiRevisionHref, wikiLinkHref, wikiRevisionHref } fro
 import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
+import IdToken from "./IdToken";
+import { isIdToken, splitIds } from "../features/home/turnText";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
 // only, so code blocks, inline code, existing links and autolinked URLs
@@ -172,6 +174,25 @@ function linkifyCitations(node: MdNode): void {
 
 const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
 
+// CAD-2363: in an assistant answer, a long hex identifier in running text
+// becomes an inline-code node, which the `code` component paints as a short
+// copyable token. Links keep their text; code is never rewritten.
+function markIds(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      markIds(kid);
+      out.push(kid);
+      continue;
+    }
+    for (const part of splitIds(kid.value)) out.push(part.id ? { type: "inlineCode", value: part.text } : { type: "text", value: part.text });
+  }
+  node.children = out;
+}
+const remarkIdTokens = () => (tree: MdNode) => markIds(tree);
+
 // CAD-1915: a wiki page's `<!-- … -->` notes are source annotations, not
 // content. Only html nodes that are nothing but comments are dropped; a
 // comment inside a code fence is a `code` node and stays visible.
@@ -279,6 +300,9 @@ function CalloutBlockquote({
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
+// CAD-2363: the same caches for answers that show identifiers as tokens.
+const idHandlerComponents = new WeakMap<object, Components>();
+let idComponents: Components | null = null;
 // CAD-1915: the set for the wiki page being read, so its own links open in
 // place. One slot: the view shows one page at a time, and a new page remounts.
 let pageComponents: { page: string; components: Components } | null = null;
@@ -286,8 +310,20 @@ let pageComponents: { page: string; components: Components } | null = null;
 /** The renderer set is cached per issue handler. Recreating these component
  *  types on every thread update would make React unmount and reinsert old
  *  code, links and images, which a live log would announce as new content. */
-function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Components {
+function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false): Components {
   return {
+    ...(ids
+      ? {
+          // Only inline code that is exactly one identifier; block code keeps
+          // its `<code>` (CodeBlock reads these same props).
+          code: ({ className, children }) =>
+            !className && typeof children === "string" && isIdToken(children) ? (
+              <IdToken id={children} />
+            ) : (
+              <code className={className}>{children}</code>
+            ),
+        }
+      : {}),
     table: ({ children }) => (
       <div className="md-table-wrap">
         <table>{children}</table>
@@ -351,7 +387,15 @@ function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Comp
   };
 }
 
-function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Components {
+function componentsFor(onOpen?: (id: string) => void, wikiPage?: string, ids = false): Components {
+  if (ids) {
+    if (!onOpen) return (idComponents ??= buildComponents(undefined, undefined, true));
+    const cachedIds = idHandlerComponents.get(onOpen);
+    if (cachedIds) return cachedIds;
+    const builtIds = buildComponents(onOpen, undefined, true);
+    idHandlerComponents.set(onOpen, builtIds);
+    return builtIds;
+  }
   if (wikiPage !== undefined) {
     if (pageComponents?.page !== wikiPage) pageComponents = { page: wikiPage, components: buildComponents(undefined, wikiPage) };
     return pageComponents.components;
@@ -366,26 +410,30 @@ function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Compon
 
 const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
+const ID_PLUGINS = [...PLUGINS, remarkIdTokens];
 
 export default function Md({
   text,
   onOpen,
   wikiPage,
+  idTokens = false,
 }: {
   text: string;
   onOpen?: (id: string) => void;
   /** CAD-1915: set only by the wiki page view — its links resolve against this path. */
   wikiPage?: string;
+  /** CAD-2363: an assistant answer shows long hex identifiers as short copyable tokens. */
+  idTokens?: boolean;
 }) {
   return (
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={wikiPage === undefined ? PLUGINS : PAGE_PLUGINS}
+      remarkPlugins={wikiPage !== undefined ? PAGE_PLUGINS : idTokens ? ID_PLUGINS : PLUGINS}
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={componentsFor(onOpen, wikiPage)}
+      components={componentsFor(onOpen, wikiPage, idTokens && wikiPage === undefined)}
     >
       {text}
     </Markdown>

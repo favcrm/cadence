@@ -539,7 +539,8 @@ pre {
    pulse dot + Working + elapsed, accent, mono — beside the row's own
    name and timestamp, which the bubble keeps rendering. */
 .chat-live {
-  margin-left: auto;
+  /* CAD-2363: beside the name, not across the row. */
+  margin-left: .375rem;
   display: inline-flex;
   align-items: center;
   color: var(--color-accent);
@@ -919,10 +920,8 @@ pre {
   gap: .625rem;
   margin: .25rem 0;
   color: var(--color-ink-500);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: .65625rem;
-  letter-spacing: .06em;
-  text-transform: uppercase;
+  /* CAD-2363: a date in the board's language, set as text, not a mono label. */
+  font-size: .6875rem;
 }
 .day-sep::before,
 .day-sep::after {
@@ -2678,4 +2677,77 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   .ps-grant-add > .btn {
     width: 100%;
   }
+}
+
+/* CAD-2363: assistant turns. The running turn's one clock sits beside the
+   name in tabular figures; a known tool reads as what it did, its subject
+   quieter; long identifiers are short copyable tokens; answer emphasis is
+   600, tables are framed, and a rule
+   never doubles a section heading's own line. Styles only: the Markdown
+   renderer is not forked. */
+.turn-clock {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  color: var(--color-accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.turn-clock .workdot {
+  width: .4rem;
+  height: .4rem;
+}
+.chat-live,
+.chat-live .text-ink-500 {
+  font-variant-numeric: tabular-nums;
+}
+.step-what {
+  color: var(--color-ink-300);
+}
+.step-subject {
+  color: var(--color-ink-500);
+}
+.turntrace-raw {
+  display: inline-block;
+  margin-top: .375rem;
+  font-size: var(--text-micro);
+}
+.idtok {
+  display: inline;
+  padding: .05rem .35rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-700) 35%, transparent);
+  color: var(--color-ink-300);
+  font: .85em "IBM Plex Mono", monospace;
+  cursor: copy;
+  vertical-align: baseline;
+}
+.idtok:hover {
+  border-color: var(--color-ink-600);
+  color: var(--color-ink-100);
+}
+.idtok:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.answer .issue-reader strong {
+  font-weight: 600;
+  color: var(--color-ink-100);
+}
+/* A section heading right after a rule already has its line: no second one. */
+.answer .issue-reader > hr + :is(h1, h2, h3, h4, h5, h6, p:has(> strong:only-child)):not(:first-child),
+.chat-bubble.issue-reader > hr + :is(h1, h2, h3, h4, h5, h6, p:has(> strong:only-child)):not(:first-child) {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.answer .issue-reader .md-table-wrap {
+  margin: .25rem 0 .85rem;
+  padding: .15rem .75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+}
+.answer .issue-reader .md-table-wrap table {
+  margin: 0;
 }

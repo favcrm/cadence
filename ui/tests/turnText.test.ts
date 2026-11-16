@@ -1,0 +1,125 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import type * as ThreadViewModule from "../src/features/home/ThreadView";
+import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { dayText } from "../src/features/home/DayDivider";
+import {
+  elapsedSecs,
+  formatElapsed,
+  isIdToken,
+  shortId,
+  splitIds,
+  toolKey,
+  toolLabel,
+  toolSubject,
+} from "../src/features/home/turnText";
+declare function require(name: string): any;
+
+// The same Node seam threadView.test.ts uses to load the shared identity UI.
+const loader = require("module"), originalRequire = loader.prototype.require;
+loader.prototype.require = function (this: unknown, id: string) {
+  if (id.endsWith(".css")) return {};
+  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+  return originalRequire.apply(this, arguments);
+};
+const { ThreadTurn } = require("../src/features/home/ThreadView") as typeof ThreadViewModule;
+loader.prototype.require = originalRequire;
+
+function check(condition: boolean, message: string): void {
+  if (!condition) throw new Error(`turnText: ${message}`);
+}
+
+// CAD-2363: elapsed time, in English and through the zh catalogue's templates.
+const zh: Record<string, string> = { "{s}s": "{s} 秒", "{m}m {s}s": "{m} 分 {s} 秒", "{h}h {m}m": "{h} 小時 {m} 分" };
+const tZh = (english: string) => zh[english] ?? english;
+check(formatElapsed(8) === "8s" && formatElapsed(65) === "1m 5s" && formatElapsed(3780) === "1h 3m", "English units");
+check(formatElapsed(8, tZh) === "8 秒" && formatElapsed(65, tZh) === "1 分 5 秒" && formatElapsed(3780, tZh) === "1 小時 3 分", "written Chinese units");
+check(formatElapsed(-3) === "0s" && formatElapsed(59.9) === "59s", "never negative, whole seconds");
+check(elapsedSecs(1000, 10_000) === 9 && elapsedSecs(10_000, 1000) === null && elapsedSecs(null, 1) === null && elapsedSecs(0, 300) === null, "elapsedSecs measures forward whole seconds only");
+
+// Tool labels and subjects.
+check(toolKey('app_call {"q":"Gia"}') === "app_call" && toolKey("web_search: cafes") === "web_search", "tool key");
+check(toolLabel('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Use an app", "a known tool has a label");
+check(toolLabel("bash: cadence board read") === null && toolLabel("master ask-form") === null, "an unknown tool has none");
+check(toolSubject('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Gia", "the naming field of a JSON argument");
+check(toolSubject('artifact_show {"id":"art-5f3a","version":1}') === "art-5f3a", "an id when nothing names it better");
+check(toolSubject("web_search: cafés in Central") === "cafés in Central", "a plain argument");
+check(toolSubject('artifact_show {"title":"Q3 report","id":"x"') === "Q3 report", "a truncated JSON still yields its first value");
+check(toolSubject("board_read") === "" && toolSubject('app_call {"version":1}') === "", "no subject when there is none");
+check(toolSubject(`web_read: ${"x".repeat(200)}`).length === 60, "a long subject is cut to one line");
+
+// Identifier tokens.
+check(isIdToken("7d2e4c1a9b3f40e8a6c5d2b1f0e9a873") && isIdToken("art-5f3a90c1e2d84b7a9c6e01f2ab47d3c9"), "hex ids, with or without a prefix");
+check(!isIdToken("1234567890123456789") && !isIdToken("deadbeef") && !isIdToken("see 7d2e4c1a9b3f40e8a6c5d2b1f0e9a873"), "not a number, not short, not a sentence");
+check(shortId("7d2e4c1a9b3f40e8a6c5d2b1f0e9a873") === "7d2e…a873" && shortId("art-5f3a90c1e2d84b7a9c6e01f2ab47d3c9") === "art-5f3a…d3c9", "middle truncation keeps the prefix");
+check(
+  JSON.stringify(splitIds("deny 828c10186233aefed7dabd65ed0a758a, not order 4111111111111111 or CAD-2362")) ===
+    JSON.stringify([
+      { id: false, text: "deny " },
+      { id: true, text: "828c10186233aefed7dabd65ed0a758a" },
+      { id: false, text: ", not order 4111111111111111 or CAD-2362" },
+    ]),
+  "ids split out of prose; numbers and issue ids stay",
+);
+check(splitIds("x-7d2e4c1a9b3f40e8a6c5d2b1f0e9a873y").every((p) => !p.id), "no token inside a longer word");
+
+// The day divider uses the board's language and names the weekday.
+{
+  const now = Date.parse("2026-11-16T12:00:00");
+  const earlier = Date.parse("2026-11-08T12:00:00");
+  const en = dayText(earlier, now, (k) => k, "en");
+  const zhTw = dayText(earlier, now, (k) => k, "zh-TW");
+  check(/Sun/.test(en) && /Nov/.test(en), `English date with weekday: ${en}`);
+  check(/11月8日/.test(zhTw) && /週日|星期日/.test(zhTw), `written Chinese date with weekday: ${zhTw}`);
+  check(dayText(now, now, (k) => k, "zh-TW") === "Today", "today stays the catalogue word");
+}
+
+// Rendered turns.
+const at = (sec: number) => `2026-10-02T10:00:${String(sec).padStart(2, "0")}Z`;
+const agent = (seq: number, kind: string, text: string, sec: number, payload: Record<string, unknown> | null = null): ThreadEntry => ({
+  seq,
+  role: "agent",
+  kind,
+  text,
+  payload,
+  message: "m1",
+  created: at(sec),
+});
+const items = (entries: ThreadEntry[]) => threadItems({ exists: true, entries, pending: [] } as ThreadState);
+const turn = (entries: ThreadEntry[], props: Record<string, unknown> = {}) =>
+  renderToStaticMarkup(createElement(ThreadTurn, { items: items(entries), onOpenIssue: () => undefined, ...props }));
+
+const entries = [
+  agent(1, "thinking", "Look the contact up.", 3),
+  agent(2, "tool_call", 'app_call {"app":"accounting","op":"contacts.search","q":"Gia"}', 4, { tool_use_id: "t1" }),
+  agent(3, "tool_result", '{"rows":[]}', 5, { tool_use_id: "t1" }),
+  agent(4, "turn_result", "Staged action `7d2e4c1a9b3f40e8a6c5d2b1f0e9a873`; also deny 828c10186233aefed7dabd65ed0a758a.\n\n```\n7d2e4c1a9b3f40e8a6c5d2b1f0e9a873\n```\n\nOrder 4111111111111111.", 9),
+];
+const started = Date.parse(at(0));
+
+// One clock: the finished turn measures from the same start the live clock counts from.
+const done = turn(entries, { startedAt: started });
+check(done.includes(">Thought for 9s<"), "finished turn measures from its start (the send), not its first entry");
+check(turn(entries).includes(">Thought for 6s<"), "without a start it measures from its first entry, as before");
+const live = turn(entries.slice(0, 3), { startedAt: started, running: true });
+check(live.includes("data-turn-clock") && !live.includes(">now<"), "a running turn shows its clock beside the name, not 'now'");
+check((live.match(/data-turn-clock/g) ?? []).length === 1, "exactly one clock");
+check(turn(entries.slice(0, 3), { running: true }).includes("data-turn-clock"), "a running turn without a start counts from its first entry");
+
+// Readable steps, raw behind the toggle.
+check(done.includes("Use an app") && done.includes("· Gia"), "a known tool reads as what it did and its subject");
+check(done.includes('title="app_call {&quot;app&quot;'), "the raw call stays in the row's title");
+check(done.includes("Show raw calls") && done.includes('aria-pressed="false"'), "a raw toggle sits in the trace");
+check(done.includes("turntrace-summary") && /· Use an app/.test(done), "the closed trace names the tool readably");
+const unknown = turn([agent(1, "tool_call", "bash: cadence board read", 1, { tool_use_id: "b" }), agent(2, "tool_result", "ok", 2, { tool_use_id: "b" }), agent(3, "turn_result", "Done.", 3)]);
+check(unknown.includes("Bash") && unknown.includes("bash: cadence board read"), "an unknown tool keeps its own name and raw row");
+
+// Identifier tokens in the answer; code blocks and numbers untouched.
+check((done.match(/data-id-token/g) ?? []).length === 2, "both ids in prose become tokens");
+check(done.includes(">7d2e…a873<") && done.includes(">828c…758a<"), "tokens are middle-truncated");
+check(done.includes('title="7d2e4c1a9b3f40e8a6c5d2b1f0e9a873"'), "the full id is the title");
+check(/<pre[^>]*>[\s\S]*7d2e4c1a9b3f40e8a6c5d2b1f0e9a873[\s\S]*<\/pre>/.test(done), "a fenced block keeps the full id");
+check(done.includes("4111111111111111"), "a number is never a token");
+
+console.log("turnText: ok");
