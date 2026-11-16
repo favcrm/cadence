@@ -821,10 +821,10 @@ fn dispatch(
                     return resp;
                 }
                 // A linked id is an issue id the caller names too: one it
-                // may not read answers as an absent one (CAD-2357), and is
-                // never linked.
+                // may not read, or a malformed one, answers as an absent one
+                // (CAD-2357) and is never linked.
                 let linked = req.parent.iter().chain(req.blocked_by.iter().flatten());
-                for id in linked.filter(|id| model::check_id(id).is_ok()) {
+                for id in linked {
                     if let Some(resp) = restricted_issue(&pm, id, actor) {
                         return resp;
                     }

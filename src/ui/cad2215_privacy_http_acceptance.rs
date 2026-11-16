@@ -29,8 +29,6 @@ mod cad2212_apps_workflows_privacy_http_acceptance;
 
 #[path = "cad2357_independent_refusal_acceptance.rs"]
 mod cad2357_independent_refusal_acceptance;
-#[path = "cad2357_issue_id_privacy_http_acceptance.rs"]
-mod cad2357_issue_id_privacy_http_acceptance;
 
 #[path = "cad2215_assist_job_binding_http_acceptance.rs"]
 mod cad2215_assist_job_binding_http_acceptance;
