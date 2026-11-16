@@ -2897,6 +2897,7 @@ Object.assign(zhTW, {
   "Hide raw calls": "隱藏原始呼叫",
   "Copy ID": "複製 ID",
   "{n} results": "{n} 筆結果",
+  "1 result": "1 筆結果",
   "Today": "今天",
   "Yesterday": "昨天",
 });

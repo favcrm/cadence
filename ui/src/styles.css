@@ -2252,17 +2252,18 @@ button.refchip:hover {
 
 /* CAD-2363: while the jump-to-latest pill floats over the thread (scrolled
    up), the fade rises to end just under the pill, so it never sits on
-   opaque text. The pill is ~2.2rem tall, .6rem above the dock. */
+   opaque text. The pill is up to 2.75rem tall (touch), .6–.75rem above the dock, and
+   below the rail breakpoint also above the Needs-you band (--need-clear). */
 .chat-scroll[data-jump-pill] {
   -webkit-mask-image: linear-gradient(
     to bottom,
-    #000 calc(100% - var(--dock-h, 7rem) - 4.25rem),
-    transparent calc(100% - var(--dock-h, 7rem) - 2.75rem)
+    #000 calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 5.1rem),
+    transparent calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 3.6rem)
   );
   mask-image: linear-gradient(
     to bottom,
-    #000 calc(100% - var(--dock-h, 7rem) - 4.25rem),
-    transparent calc(100% - var(--dock-h, 7rem) - 2.75rem)
+    #000 calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 5.1rem),
+    transparent calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 3.6rem)
   );
 }
 

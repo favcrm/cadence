@@ -17,7 +17,7 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
-import { elapsedSecs, formatElapsed, resultCount, toolLabel, toolSubject } from "./turnText";
+import { elapsedSecs, errorReason, formatElapsed, resultCount, toolLabel, toolSubject } from "./turnText";
 import {
   isArtifactPutCall,
   isCardItem,
@@ -103,13 +103,13 @@ function ToolRows({ entries, newestFirst = false, raw = false }: { entries: Thre
             if (count !== null) {
               return (
                 <span className="num shrink-0 text-ink-500" title={s.result.text}>
-                  {t("{n} results").replace("{n}", String(count))}
+                  {count === 1 ? t("1 result") : t("{n} results").replace("{n}", String(count))}
                 </span>
               );
             }
             return (
             <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
-              {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
+              {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary((s.error ? errorReason(s.result.text) : null) ?? s.result.text)}
             </span>
             );
           })()}

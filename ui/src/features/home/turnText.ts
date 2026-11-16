@@ -124,6 +124,19 @@ export function toolSubject(text: string): string {
   return subject.length > SUBJECT_MAX ? `${subject.slice(0, SUBJECT_MAX - 1)}…` : subject;
 }
 
+/** A failed tool's reason from its JSON result (`message`, else `error`),
+ *  or null when the result is not such an object. */
+export function errorReason(text: string): string | null {
+  try {
+    const value = JSON.parse(text) as Record<string, unknown> | null;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    for (const k of ["message", "error"]) if (typeof value[k] === "string" && (value[k] as string).trim() !== "") return value[k] as string;
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
 /** How many results a JSON tool result holds: an array's length, or the
  *  length of its `rows` / `items` / `results` / `data` list. Null otherwise. */
 export function resultCount(text: string): number | null {

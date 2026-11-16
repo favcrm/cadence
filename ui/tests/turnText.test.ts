@@ -162,6 +162,7 @@ check(done.includes(">0 results<"), "a known tool's JSON result reads as a count
     agent(3, "turn_result", "Could not search.", 3),
   ]);
   check(failed.includes("rate limited, retry later"), "a known tool's error keeps its reason in the row");
+  check(failed.includes(">rate limited, retry later<"), "the reason reads as text, not raw JSON; the raw result stays in the title");
 }
 check(done.includes('title="app_call {&quot;app&quot;'), "the raw call stays in the row's title");
 check(done.includes("Show raw calls") && done.includes('aria-pressed="false"'), "a raw toggle sits in the trace");
