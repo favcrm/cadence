@@ -436,6 +436,7 @@ jobs:
             });
             if (!r.ok) return { status: r.status };
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
+            let nonStringContent = false;
             let sawMetadata = false, sawDone = false;
             const dec = new TextDecoder();
             for await (const chunk of r.body) {
@@ -482,7 +483,7 @@ jobs:
               }
             }
             if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;
-            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };
+            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };
           }
           let res = null;
           for (let i = 1; i <= 2; i++) {
