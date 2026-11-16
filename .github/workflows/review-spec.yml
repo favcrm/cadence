@@ -404,6 +404,7 @@ jobs:
             });
             if (!r.ok) return { status: r.status };
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
+            let nonStringContent = false;
             const dec = new TextDecoder();
             for await (const chunk of r.body) {
               buf += dec.decode(chunk, { stream: true });
@@ -419,12 +420,13 @@ jobs:
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
                   if (c.index !== 0) { failed = true; continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
+                  else if (c.delta?.content != null) nonStringContent = true;
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
                   if (typeof c.finish_reason === 'string') { if (stop === null) stop = c.finish_reason; else if (stop !== c.finish_reason) failed = true; }
                 }
               }
             }
-            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };
+            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };
           }
           let res = null;
           for (let i = 1; i <= 2; i++) {
@@ -438,7 +440,11 @@ jobs:
           if (Buffer.byteLength(res.text) > 60000) die('model output is too large to file; nothing filed');
           if (res.stop !== 'stop') die(['refusal', 'content_filter', 'length'].includes(res.stop) ? `model stopped with ${res.stop}; nothing filed` : 'model stopped early; nothing filed');
           let parsed;
-          try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }
+          try { parsed = JSON.parse(res.text); } catch {
+            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);
+            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);
+            die('model output is not JSON; nothing filed');
+          }
           fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });
           // The output may quote the ticket, so it is sealed like the ticket.
           let sealedOut;
