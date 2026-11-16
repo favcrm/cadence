@@ -411,6 +411,8 @@ Object.assign(zhTW, {
   "Session ended": "工作階段已結束",
   "Sign in to continue.": "請登入以繼續。",
   "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.": "你的工作階段已過期，此檢視中的工作區內容已清除。請重新登入以繼續工作。",
+  "Your session ended. Reload to sign in; unsent changes may be lost.": "你的工作階段已結束。請重新載入以登入；未送出的更改可能會遺失。",
+  "We couldn't reach the workspace. Your session may still be active. Check your connection and try again.": "無法連接工作區。你的工作階段可能仍然有效，請檢查網絡連線並重試。",
   "Your session ended. Unsent changes may not have been saved. Continue with AgenticOS to reopen your workspace.": "你的工作階段已結束，未送出的更改可能尚未儲存。繼續使用 AgenticOS，重新開啟你的工作區。",
   "Hosted workspace": "託管工作區",
   "Local board": "本機看板",
