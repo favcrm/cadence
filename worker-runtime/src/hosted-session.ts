@@ -23,6 +23,7 @@ import type {
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
+  OperationSettlement,
   PendingOperation,
   ThreadContext,
   ThreadEntry,
@@ -43,6 +44,7 @@ import {
   readHeldSubmission,
   readSubmissionEntry,
   readSubmissionRequestId,
+  readSubmissionSettlement,
   type HeldSubmission,
   type TaskSql,
 } from "./identity.ts";
@@ -66,6 +68,7 @@ import {
   OperationScopes,
   parseEntryAppScope,
   parseEntryOperationId,
+  requireOperationId,
   type EngineEvidence,
   type OperationEnvelope,
   type OperationScopeSql,
@@ -968,6 +971,29 @@ export class HostedSession<
         ? COMPACTION_FAILURE_TEXT
         : null,
     };
+  }
+
+  /**
+   * Inspect durable settlement without opening the engine or waking work.
+   * Absence is evidence only; the host must separately fence admission.
+   */
+  async settledOperation(operationId: string): Promise<OperationSettlement> {
+    const id = requireOperationId(operationId);
+    const conversation = String(ROOT_CONVERSATION_ID);
+    const settlement = readSubmissionSettlement(
+      this.ctx.storage.sql as unknown as TaskSql,
+      ROOT_CONVERSATION_ID,
+      id,
+    );
+    if (settlement.state === "settled")
+      return {
+        state: "settled",
+        operationId: id,
+        conversation,
+        submission: String(settlement.submission),
+        status: settlement.status,
+      };
+    return { state: settlement.state, operationId: id, conversation };
   }
 
   /**

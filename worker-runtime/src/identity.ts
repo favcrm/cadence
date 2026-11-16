@@ -344,6 +344,96 @@ export function readHeldSubmission(
   return { id, type, status, text: entryText(entry.model), entry };
 }
 
+type SubmissionSettlement =
+  | { readonly state: "settled"; readonly submission: number; readonly status: "done" | "unanswered" }
+  | { readonly state: "absent" | "unknown" };
+
+function isEntryId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * Prove one submission's terminal state without opening the engine. Both
+ * positive and absent evidence require every conversation and task to be at
+ * rest. Inconsistent indexes or records cannot prove either result.
+ */
+export function readSubmissionSettlement(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): SubmissionSettlement {
+  const schema = sql.exec(
+    `SELECT name, type FROM sqlite_master
+      WHERE name IN ('pi_submissions','pi_tasks')
+         OR (type='table' AND name GLOB 'pi_*')`,
+  ).toArray();
+  const submissions = schema.find((row) => row.name === "pi_submissions");
+  const tasks = schema.find((row) => row.name === "pi_tasks");
+  if (submissions === undefined && tasks === undefined)
+    return { state: schema.length === 0 ? "absent" : "unknown" };
+  if (submissions?.type !== "table" || tasks?.type !== "table")
+    return { state: "unknown" };
+
+  // Check every task, including nested conversations and background work.
+  if (
+    sql.exec(
+      `SELECT 1 FROM pi_tasks WHERE
+        status IS NULL OR status <> 'terminal'
+        OR json_extract(record,'$.id') IS NOT id
+        OR json_extract(record,'$.conversationId') IS NOT conversation_id
+        OR json_extract(record,'$.state.status') IS NOT status
+        LIMIT 1`,
+    ).toArray().length > 0
+  )
+    return { state: "unknown" };
+
+  // The indexed request id and its JSON body must agree, even on other rows:
+  // an inconsistent index must not turn a held id into apparent absence.
+  // Parse bounded pages in JavaScript so lone surrogates survive unchanged.
+  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
+  let after: number | undefined;
+  let settled: Extract<SubmissionSettlement, { state: "settled" }> | undefined;
+  for (;;) {
+    const rows = after === undefined
+      ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray()
+      : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (
+        !Number.isSafeInteger(id) || id <= 0 ||
+        !Number.isSafeInteger(conversation) || conversation <= 0 ||
+        record === null || record.id !== id ||
+        record.conversationId !== conversation ||
+        record.status !== row.status ||
+        (record.status !== "done" && record.status !== "unanswered") ||
+        (record.requestId === undefined
+          ? row.request_id !== null
+          : typeof record.requestId !== "string" ||
+            row.request_id !== JSON.stringify(record.requestId))
+      )
+        return { state: "unknown" };
+      if (conversation === conversationId && record.requestId === operationId) {
+        if (settled !== undefined || record.type !== "input") return { state: "unknown" };
+        if (record.status === "done") {
+          if (!isEntryId(record.entry) || !isEntryId(record.answer) ||
+              record.reason !== undefined || record.detail !== undefined)
+            return { state: "unknown" };
+        } else if (
+          (record.entry !== undefined && !isEntryId(record.entry)) ||
+          record.answer !== undefined || typeof record.reason !== "string"
+        )
+          return { state: "unknown" };
+        settled = { state: "settled", submission: id, status: record.status };
+      }
+      after = id;
+    }
+    if (rows.length < 500) break;
+  }
+  return settled ?? { state: "absent" };
+}
+
 /** Whether the engine's submissions table exists; without it, none is held. */
 function hasSubmissions(sql: TaskSql): boolean {
   const table = sql

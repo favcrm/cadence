@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AppScope, AskResult, HostedSessionOptions, HostedState, PendingOperation, ThreadEntry } from "./contract.js";
+import type { AppScope, AskResult, HostedSessionOptions, HostedState, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
 /**
  * One agent conversation, one Durable Object.
  *
@@ -195,6 +195,11 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * call resolves the platform default.
      */
     state(): Promise<HostedState>;
+    /**
+     * Inspect durable settlement without opening the engine or waking work.
+     * Absence is evidence only; the host must separately fence admission.
+     */
+    settledOperation(operationId: string): Promise<OperationSettlement>;
     /**
      * Stop the turn with this id. The id is required: the engine reads a missing
      * one as "abort this session" even when nothing has been asked to stop.

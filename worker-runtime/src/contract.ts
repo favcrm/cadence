@@ -362,6 +362,25 @@ export interface PendingOperation {
   readonly status: "queued" | "running" | "parked";
 }
 
+/**
+ * Read-only evidence from the engine's durable records. A settled or absent
+ * result also requires the entire session to be at rest. Absence is not a
+ * dispatch fence; callers must separately prevent or await admission.
+ */
+export type OperationSettlement =
+  | {
+      readonly state: "settled";
+      readonly operationId: string;
+      readonly conversation: string;
+      readonly submission: string;
+      readonly status: "done" | "unanswered";
+    }
+  | {
+      readonly state: "absent" | "unknown";
+      readonly operationId: string;
+      readonly conversation: string;
+    };
+
 /** Cheap header state for a conversation. */
 export interface HostedState {
   readonly running: boolean;

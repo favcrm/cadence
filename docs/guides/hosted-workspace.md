@@ -129,6 +129,14 @@ cannot read that upgraded state: before deploying, stop writes and take a
 consistent, restorable backup. Roll forward or restore the backup rather than
 starting 1.4 against upgraded data.
 
+`HostedSession.settledOperation(id)` inspects durable records without opening or
+waking the engine. It returns `settled`, `absent` or `unknown`; positive
+evidence requires all conversations and background tasks to be at rest.
+Malformed or inconsistent records return `unknown`, and failed reads throw.
+Absence is not a fence: the host must separately prevent or await admission
+before relying on it. The result is a point-in-time proof, not evidence of
+external effects or of another deployment's state.
+
 A gateway refuses image input for a model that cannot take it with a JSON error
 whose `error.code` is `image_input_unavailable`. A turn whose newest message holds
 the image fails with that named reason. A later request whose images are all older

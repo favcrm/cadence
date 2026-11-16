@@ -54641,6 +54641,54 @@ function readHeldSubmission(sql, conversationId, operationId) {
     throw new Error(`Operation "${operationId}" has an engine submission whose entry is unavailable.`);
   return { id, type, status, text: entryText(entry.model), entry };
 }
+function isEntryId(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function readSubmissionSettlement(sql, conversationId, operationId) {
+  const schema = sql.exec(`SELECT name, type FROM sqlite_master
+      WHERE name IN ('pi_submissions','pi_tasks')
+         OR (type='table' AND name GLOB 'pi_*')`).toArray();
+  const submissions = schema.find((row) => row.name === "pi_submissions");
+  const tasks = schema.find((row) => row.name === "pi_tasks");
+  if (submissions === undefined && tasks === undefined)
+    return { state: schema.length === 0 ? "absent" : "unknown" };
+  if (submissions?.type !== "table" || tasks?.type !== "table")
+    return { state: "unknown" };
+  if (sql.exec(`SELECT 1 FROM pi_tasks WHERE
+        status IS NULL OR status <> 'terminal'
+        OR json_extract(record,'$.id') IS NOT id
+        OR json_extract(record,'$.conversationId') IS NOT conversation_id
+        OR json_extract(record,'$.state.status') IS NOT status
+        LIMIT 1`).toArray().length > 0)
+    return { state: "unknown" };
+  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
+  let after;
+  let settled;
+  for (;; ) {
+    const rows = after === undefined ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray() : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(conversation) || conversation <= 0 || record === null || record.id !== id || record.conversationId !== conversation || record.status !== row.status || record.status !== "done" && record.status !== "unanswered" || (record.requestId === undefined ? row.request_id !== null : typeof record.requestId !== "string" || row.request_id !== JSON.stringify(record.requestId)))
+        return { state: "unknown" };
+      if (conversation === conversationId && record.requestId === operationId) {
+        if (settled !== undefined || record.type !== "input")
+          return { state: "unknown" };
+        if (record.status === "done") {
+          if (!isEntryId(record.entry) || !isEntryId(record.answer) || record.reason !== undefined || record.detail !== undefined)
+            return { state: "unknown" };
+        } else if (record.entry !== undefined && !isEntryId(record.entry) || record.answer !== undefined || typeof record.reason !== "string")
+          return { state: "unknown" };
+        settled = { state: "settled", submission: id, status: record.status };
+      }
+      after = id;
+    }
+    if (rows.length < 500)
+      break;
+  }
+  return settled ?? { state: "absent" };
+}
 function hasSubmissions(sql) {
   const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
   return table !== undefined;
@@ -56957,6 +57005,20 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
       model,
       compactionFailure: readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)) ? COMPACTION_FAILURE_TEXT : null
     };
+  }
+  async settledOperation(operationId) {
+    const id = requireOperationId(operationId);
+    const conversation = String(ROOT_CONVERSATION_ID);
+    const settlement = readSubmissionSettlement(this.ctx.storage.sql, ROOT_CONVERSATION_ID, id);
+    if (settlement.state === "settled")
+      return {
+        state: "settled",
+        operationId: id,
+        conversation,
+        submission: String(settlement.submission),
+        status: settlement.status
+      };
+    return { state: settlement.state, operationId: id, conversation };
   }
   async stopOperation(operationId) {
     if (!operationId)
