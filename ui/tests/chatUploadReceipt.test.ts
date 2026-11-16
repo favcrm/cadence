@@ -67,6 +67,8 @@ for (const key of ["scope", "context_id", "uploader", "user_id", "thread_id", "l
   refuses(`hosted mixed with native ${key}`, { ...hosted, [key]: native[key as keyof typeof native] });
 for (const key of Object.keys(native)) refuses(`native missing ${key}`, without(native, key));
 refuses("native bad user", { ...native, user_id: "u1" });
+refuses("native null model input", { ...native, model_input: null });
+refuses("native contradictory model input", { ...native, model_input: { kind: "text", converted: true } });
 refuses("not an object", "x");
 refuses("null", null);
 refuses("array", [hosted]);

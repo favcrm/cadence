@@ -10,6 +10,7 @@ mod jpeg;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
+use std::borrow::Cow;
 use std::io::Cursor;
 
 use geometry::Mapping;
@@ -85,6 +86,7 @@ struct Decoded {
     channels: usize,
     mapping: Mapping,
     source_end: usize,
+    clean_source: Option<Vec<u8>>,
     unchanged: bool,
     icc: Option<Vec<u8>>,
 }
@@ -161,6 +163,7 @@ fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Re
         channels: 3,
         mapping,
         source_end: layout.end,
+        clean_source: None,
         unchanged: layout.orientation == 1 && !scaled,
         icc,
     })
@@ -308,6 +311,7 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
         channels,
         mapping,
         source_end: bytes.len(),
+        clean_source: None,
         unchanged: false,
         icc,
     })
@@ -354,6 +358,10 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
                 channels,
                 mapping: Mapping::new(width, height),
                 source_end: bytes.len(),
+                clean_source: match clean {
+                    Cow::Borrowed(_) => None,
+                    Cow::Owned(bytes) => Some(bytes),
+                },
                 unchanged: true,
                 icc: None,
             })
@@ -369,6 +377,7 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
                 channels,
                 mapping: Mapping::new(width, height),
                 source_end: bytes.len(),
+                clean_source: None,
                 unchanged: true,
                 icc: None,
             })
@@ -376,11 +385,16 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
     }
 }
 
-/// Validate a native retained image under native prompt limits. A suffix is
-/// not delivered to a native model as if it were part of a checked JPEG.
-pub fn validate_native(bytes: &[u8], mime: &str) -> Result<()> {
+/// Validate an image under native prompt limits and return the bytes that may
+/// be delivered. PNG metadata not checked by the decoder is removed; callers
+/// must use the returned bytes rather than assuming the retained source is safe.
+pub fn validate_native<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>> {
     let format = Format::from_mime(mime).ok_or(ImageError::Unsupported)?;
-    decode(bytes, format, true).map(|_| ())
+    let decoded = decode(bytes, format, true)?;
+    Ok(match decoded.clean_source {
+        Some(clean) => Cow::Owned(clean),
+        None => Cow::Borrowed(bytes),
+    })
 }
 
 fn png_encode(pixels: &[u8], width: u32, height: u32, channels: usize) -> Result<Vec<u8>> {
@@ -432,17 +446,23 @@ fn jpeg_encode(
 /// upload separately and must still enforce the whole-turn image budget.
 pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
     let decoded = decode(bytes, format, false)?;
-    let source = &bytes[..decoded.source_end];
+    let source_len = decoded
+        .clean_source
+        .as_ref()
+        .map_or(decoded.source_end, Vec::len);
     if decoded.unchanged
-        && source.len() <= MODEL_IMAGE_MAX
+        && source_len <= MODEL_IMAGE_MAX
         && u64::from(decoded.mapping.width) * u64::from(decoded.mapping.height) <= OTHER_MAX_PIXELS
     {
+        let converted = decoded.clean_source.is_some() || decoded.source_end != bytes.len();
         return Ok(PreparedImage {
-            bytes: source.to_vec(),
+            bytes: decoded
+                .clean_source
+                .unwrap_or_else(|| bytes[..decoded.source_end].to_vec()),
             format,
             width: decoded.mapping.width,
             height: decoded.mapping.height,
-            converted: source.len() != bytes.len(),
+            converted,
         });
     }
     let longest = decoded.mapping.width.max(decoded.mapping.height);

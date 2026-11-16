@@ -19,11 +19,11 @@
 //!   under a Landlock ruleset built before fork, RLIMIT_CPU/AS/FSIZE/CORE/
 //!   NOFILE/NPROC and a process-group deadline.
 //!
-//! Neither function mutates custody. They answer "may this be delivered
-//! as visual input?" for the exact bytes the caller already digest-
-//! checked. A rasterized SVG is a derived turn image; the retained
-//! source stays the original attachment.
+//! Neither function mutates custody. Callers prove the retained source's
+//! digest and use the returned visual bytes: PNG metadata not checked by the
+//! decoder is removed, and an SVG render is a separate turn image.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -135,11 +135,18 @@ fn decode_raster(bytes: &[u8], mime: &str) -> Result<image::DynamicImage> {
     Ok(decoded)
 }
 
-/// Prove raster bytes are exactly their declared kind and decode within
-/// the delivery bound. The caller passes bytes whose size and digest it
-/// already checked; this never opens a path.
-pub fn validate_raster(bytes: &[u8], mime: &str) -> Result<()> {
+/// Prove a raster's kind and bounds, returning the bytes safe to deliver.
+/// The retained source was already size- and digest-checked by the caller.
+pub fn validate_raster<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>> {
     cadence_image::validate_native(bytes, mime).map_err(|error| Error::rejected(error.to_string()))
+}
+
+/// Keep the original allocation when validation did not need a derivative.
+pub fn prepare_raster(bytes: Vec<u8>, mime: &str) -> Result<Vec<u8>> {
+    match validate_raster(&bytes, mime)? {
+        Cow::Borrowed(_) => Ok(bytes),
+        Cow::Owned(clean) => Ok(clean),
+    }
 }
 
 /// The most nodes one document may decode into. A source small enough to
@@ -467,7 +474,7 @@ pub fn rasterize_svg(source: &[u8]) -> Result<(&'static str, Vec<u8>)> {
     // re-encoded, not silently accepted or truncated, so the byte cap
     // applies to the delivered bytes rather than the intermediate.
     if png.len() <= IMAGE_MAX_BYTES {
-        validate_raster(&png, "image/png")
+        let png = prepare_raster(png, "image/png")
             .map_err(|e| Error::rejected(format!("the rasterized SVG is unusable: {e}")))?;
         return Ok(("image/png", png));
     }
@@ -492,8 +499,7 @@ fn shrink_to_prompt_bound(png: &[u8]) -> Result<Vec<u8>> {
             out.len()
         )));
     }
-    validate_raster(&out, "image/jpeg")?;
-    Ok(out)
+    prepare_raster(out, "image/jpeg")
 }
 
 fn converter_missing() -> String {

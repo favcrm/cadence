@@ -179,10 +179,11 @@ impl Shared {
             .ok_or_else(|| {
                 Error::rejected("pinned library image no longer matches the retained bytes")
             })?;
-        crate::attachment_image::validate_raster(&image.bytes, image.media_type).map_err(|e| {
-            Error::rejected(format!("pinned library image was refused before send: {e}"))
-        })?;
-        Ok(image.bytes.len() as u64)
+        let prepared = crate::attachment_image::validate_raster(&image.bytes, image.media_type)
+            .map_err(|e| {
+                Error::rejected(format!("pinned library image was refused before send: {e}"))
+            })?;
+        Ok(prepared.len() as u64)
     }
 
     /// `agent_send` without a connection to attribute (unit tests):

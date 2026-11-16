@@ -110,6 +110,7 @@ pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
                 ended = true;
                 true
             }
+            b"acTL" | b"fcTL" | b"fdAT" => return Err(ImageError::Unsupported),
             _ if kind[0].is_ascii_uppercase() => return Err(ImageError::Unsupported),
             _ => false,
         };

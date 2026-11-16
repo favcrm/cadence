@@ -572,6 +572,7 @@ fn checked_attachment_body(name: &str, mime: &str, bytes: &[u8]) -> Result<()> {
     }
     if crate::attachment_image::raster_mime(mime) {
         return crate::attachment_image::validate_raster(bytes, mime)
+            .map(|_| ())
             .map_err(|e| Error::rejected(format!("chat_file_upload refused '{name}': {e}")));
     }
     Err(Error::rejected(format!(

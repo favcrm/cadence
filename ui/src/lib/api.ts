@@ -217,6 +217,9 @@ export function decodeChatFileRow(value: unknown): ChatFileRow {
   // carries. A row naming it is held to the hosted shape alone and may not
   // also carry native identity fields; neither shape borrows the other's.
   if ("conversation" in row) return decodeHostedReceipt(row);
+  // `model_input` is a hosted-only assertion, not part of the native row.
+  if ("model_input" in row)
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
   if (
     typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
     typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||

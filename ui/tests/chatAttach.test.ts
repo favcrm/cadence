@@ -76,6 +76,18 @@ equal(
   "無法處理此相片，請重試或選擇另一張圖片",
   "an unknown conversion failure gives actionable Chinese guidance",
 );
+for (const [reason, chinese] of [
+  ["the image is malformed or incomplete — try another image", "圖片格式有誤或不完整，請選擇另一張圖片"],
+  ["the image exceeds the supported size — choose a smaller image", "圖片超出支援大小，請選擇較小的圖片"],
+  ["this image encoding is not supported — export it as JPEG or PNG", "不支援此圖片編碼，請匯出為 JPEG 或 PNG"],
+  ["the image could not be reduced under the model image budget", "無法將圖片縮小至模型的圖片大小限制內"],
+]) {
+  equal(
+    displayAttachError(userUploadError(`chat upload refused: ${reason}`), (text) => translateUiText(text, "zh-TW")),
+    chinese,
+    "hosted photo refusals are actionable in Chinese",
+  );
+}
 equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
 equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");
 equal(isPermanentUploadFailure(413), true, "an oversize refusal is permanent");

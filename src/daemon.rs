@@ -1887,7 +1887,7 @@ impl Shared {
                 None => app_media_rpc::OriginalAuthority::Imported,
             };
             let media_type = image.media_type;
-            let bytes = image.bytes;
+            let bytes = crate::attachment_image::prepare_raster(image.bytes, media_type)?;
             images =
                 self.with_turn_image_current(&message.alias, &message.id, authority, || {
                     if self.store.app_media_revision(asset_id)? != revision {
@@ -2057,6 +2057,7 @@ impl Shared {
         }
         let media_type = crate::attachment_image::static_visual_mime(&file.mime)
             .ok_or_else(|| Error::rejected(format!("attachment '{id}' is not a visual kind")))?;
+        let bytes = crate::attachment_image::prepare_raster(bytes, media_type)?;
         Ok(crate::adapter::TurnImage { media_type, bytes })
     }
 
