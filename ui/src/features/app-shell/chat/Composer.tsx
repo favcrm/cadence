@@ -421,6 +421,7 @@ export default function Composer({
   const cell = useSyncExternalStore(subscribeDraftCell, readDraftCell);
   const draft = cell.text;
   const refs = cell.refs;
+  const hasArtifactRef = citesArtifact(refs);
   const libraryImage = cell.libraryImage;
   const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
   const setDraft = (next: string) => setComposerDraft(key, next);
@@ -479,15 +480,29 @@ export default function Composer({
       if (!block) box.current?.focus();
     }
   }, [seed]);
-  // The textarea grows with its content (auto-height), capped by the
-  // CSS max-height — past it the box scrolls. `resize:none` is the
-  // mock's rule: no bottom-right grip in either density.
+  // The box can mount while its pane is hidden. Size it once visible and
+  // whenever its available width changes, as well as when its text changes.
+  const resizeBox = useCallback(() => {
+    const el = box.current;
+    if (!el || el.clientWidth === 0) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
+  useEffect(() => {
+    resizeBox();
+  }, [draft, block, blockedPlaceholder, placeholder, compact, t, hasArtifactRef, resizeBox]);
   useEffect(() => {
     const el = box.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      resizeBox();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [compact, resizeBox]);
 
   // Slash completion is a full-density extra (Home's commands); compact
   // mode routes slash verbs through onCommand without sending them
@@ -709,7 +724,7 @@ export default function Composer({
       onKeyDown={onKey}
       rows={compact ? 1 : 2}
       disabled={!!block}
-      placeholder={t(block ? blockedPlaceholder : citesArtifact(refs) ? "Say what to change…" : (placeholder ?? ""))}
+      placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
       aria-expanded={matches.length > 0 || undefined}
       className={

@@ -304,6 +304,7 @@ await React.act(async () => {
 });
 await flush(); await flush(); await flush();
 assert(host.querySelector('nav[aria-label="Breadcrumb"]')?.textContent?.includes("Reports"), "verified app identity appears in the shared header");
+equal((text().match(/0\.1\.0/g) ?? []).length, 1, "the app version appears once, in the shared header");
 assert(text().includes("This app's screen is unavailable."), "an app without its own screen shows the one unavailable state");
 assert(!text().includes("No records yet") && !text().includes("CAD-781"), "core draws no records UI of its own");
 assert(text().includes("Master answer stays connected"), "the assistant shows the real master thread");

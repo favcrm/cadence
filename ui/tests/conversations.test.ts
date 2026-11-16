@@ -345,6 +345,21 @@ await pick("Spring launch");
     await resources.masterState.refresh();
   });
   equal(disclosure.getAttribute("aria-expanded"), "false", "resolving the request preserves the explicit choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen"); });
+  equal(disclosure.getAttribute("aria-expanded"), "true", "a conversation link reveals the assistant despite a saved collapse");
+  equal(readChatCollapsedChoice("install-native-approval"), true, "opening a conversation link does not overwrite the saved preference");
+  for (const width of [390, 1440]) {
+    await React.act(async () => { root.render(null); });
+    history.pushState(null, "", "/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: width, configurable: true, writable: true });
+      win.dispatchEvent(new win.PopStateEvent("popstate"));
+      root.render(React.createElement(AppShell, { installId: "install-native-approval", viewer: { operator: true, readOnly: false } }));
+    });
+    await settle();
+    equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "true", `a direct conversation link opens the assistant at ${width}px`);
+    equal(readChatCollapsedChoice("install-native-approval"), true, "a direct conversation link preserves the saved collapse");
+  }
   await React.act(async () => {
     Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
     win.dispatchEvent(new Event("resize"));

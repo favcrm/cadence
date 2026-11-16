@@ -517,13 +517,13 @@ export default function AppShell({
   // Explicit choices persist; content navigation only selects the narrow pane.
   const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
   const [narrow, setNarrow] = useState(() => window.innerWidth < 1024);
-  const [narrowWorkspace, setNarrowWorkspace] = useState<string | null>(null);
+  const [navigationPane, setNavigationPane] = useState<{ installId: string; pane: "workspace" | "chat" } | null>(null);
   const initialAppNavigation = useRef<string | null>(installId);
   useEffect(() => {
     const resize = () => {
       const next = window.innerWidth < 1024;
       setNarrow(next);
-      if (!next) setNarrowWorkspace(null);
+      if (!next) setNavigationPane((current) => current?.pane === "workspace" ? null : current);
     };
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
@@ -535,15 +535,16 @@ export default function AppShell({
     setPendingDecision({ installId, pending });
   }, [installId]);
   const pendingForInstall = pendingDecision.installId === installId && pendingDecision.pending;
-  const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingForInstall) ||
-    (narrow && narrowWorkspace === installId);
+  const selectedPane = navigationPane?.installId === installId ? navigationPane.pane : null;
+  const chatCollapsed = selectedPane === "chat" ? false :
+    (narrow && selectedPane === "workspace") || resolveChatCollapsed(chatChoice, installId, pendingForInstall);
   useEffect(() => {
-    if (pendingForInstall) setNarrowWorkspace(null);
+    if (pendingForInstall) setNavigationPane((current) => current?.pane === "workspace" ? null : current);
   }, [installId, pendingForInstall]);
   const chatToggleRef = useRef<HTMLButtonElement | null>(null);
   const collapseChat = useCallback((collapsed: boolean) => {
     initialAppNavigation.current = null;
-    setNarrowWorkspace(null);
+    setNavigationPane(null);
     setChatCollapsed(collapsed);
     if (collapsed) chatToggleRef.current?.focus({ preventScroll: true });
   }, [setChatCollapsed]);
@@ -780,12 +781,11 @@ export default function AppShell({
     () => screenNavigation ?? parseNavigation(installation?.navigation),
     [installation?.navigation, screenNavigation],
   );
-  // A fresh app shell can be mounted for a section link while its saved
-  // assistant preference is open. Show that destination without persisting
-  // a collapse; a conversation link or an explicit toggle still wins.
+  // A direct link reveals its destination without changing the saved chat
+  // preference; an explicit toggle after navigation still wins.
   useEffect(() => {
     if (initialAppNavigation.current === null) return;
-    if (!narrow || initialAppNavigation.current !== installId) {
+    if (initialAppNavigation.current !== installId) {
       initialAppNavigation.current = null;
       return;
     }
@@ -793,37 +793,46 @@ export default function AppShell({
     const params = new URLSearchParams(search);
     if (params.has("conversation")) {
       initialAppNavigation.current = null;
+      setNavigationPane({ installId, pane: "chat" });
+      return;
+    }
+    if (!narrow) {
+      initialAppNavigation.current = null;
       return;
     }
     if (params.has("record") || params.get("appview") === "new" ||
       (effectiveNavigation !== null && sectionFromSearch(search, effectiveNavigation) !== effectiveNavigation.default_section)) {
       initialAppNavigation.current = null;
-      setNarrowWorkspace(installId);
+      setNavigationPane({ installId, pane: "workspace" });
     } else if (effectiveNavigation !== null) {
       initialAppNavigation.current = null;
     }
   }, [effectiveNavigation, href, installId, narrow]);
-  // Content navigation reveals the narrow workspace; context/chat-only URL writes do not.
+  // Explicit content or conversation navigation reveals its destination.
   const previousAppNavigation = useRef({ installId, href });
   useEffect(() => {
     const previous = previousAppNavigation.current;
     previousAppNavigation.current = { installId, href };
-    if (window.innerWidth >= 1024 || (previous.installId === installId && previous.href === href)) return;
+    if (previous.installId === installId && previous.href === href) return;
     const previousSearch = previous.href.split("?")[1] ?? "";
     const currentSearch = href.split("?")[1] ?? "";
     const before = new URLSearchParams(previousSearch);
     const after = new URLSearchParams(currentSearch);
     if (before.get("conversation") !== after.get("conversation")) {
       initialAppNavigation.current = null;
-      setNarrowWorkspace(null);
-      return;
+      if (after.has("conversation")) {
+        setNavigationPane({ installId, pane: "chat" });
+        return;
+      }
+      setNavigationPane(null);
     }
+    if (window.innerWidth >= 1024) return;
     const sectionChanged = effectiveNavigation !== null &&
       sectionFromSearch(previousSearch, effectiveNavigation) !== sectionFromSearch(currentSearch, effectiveNavigation);
     if (previous.installId !== installId || sectionChanged ||
       before.get("record") !== after.get("record") ||
       (before.get("appview") === "new") !== (after.get("appview") === "new")) {
-      setNarrowWorkspace(installId);
+      setNavigationPane({ installId, pane: "workspace" });
     }
   }, [effectiveNavigation, href, installId]);
 
@@ -1121,11 +1130,6 @@ export default function AppShell({
       ) || t("App")
     : t("App");
   const isSocial = isSocialContent(installation);
-  // An app whose approved, executable package declares one screen mounts
-  // that screen (presentation only; authorization stays in the
-  // session/epoch/digest gates). Social keeps its legacy outlet.
-  const hasPortableScreen = installation !== null && screenTag(installation) !== null;
-  const screenOutlet = isSocial || hasPortableScreen;
   const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
     ? readWorkspaceAppSnapshot(installId)
     : null;
@@ -1378,13 +1382,6 @@ export default function AppShell({
                 </Notice>
               )
             ) : <>
-              {screenOutlet ? (
-                // The private-screen frame owns its own chrome — the
-                // shell shows no installId/version/context subtitle.
-                null
-              ) : (
-                <p className="num text-micro text-ink-500">{installation.version}</p>
-              )}
               {linkNotice && (
                 <p className="self-start rounded border border-warn/40 px-3 py-1.5 text-label text-warn" role="alert" data-link-notice>
                   {linkNotice}
@@ -1397,15 +1394,8 @@ export default function AppShell({
                 />
               ) : isSocial && children && contextAdoptionReady ? (
                 // Social keeps its legacy native workspace (and its
-                // `?screen=native` back door). Every other app mounts the
-                // screen its own package ships, through
-                // InstalledScreenOutlet below — which is exactly what
-                // `hasPortableScreen` detects. `screenOutlet` is the union
-                // of the two and only drives the chrome above, so keying
-                // this branch on it sent any other screen-shipping app to
-                // the social-only workspace, which then rendered its
-                // "no supported board workspace" guide instead of the
-                // screen the package declared.
+                // `?screen=native` back door). Other apps mount the
+                // screen their package declares.
                 children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}

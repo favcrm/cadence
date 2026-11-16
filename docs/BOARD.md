@@ -2794,8 +2794,8 @@ parameters while clearing record and segment selection. The aligned
 **Assistant** button controls the right-hand chat pane without remounting the
 conversation or app frame. A collapsed chat leaves no rail; on narrow screens
 the workspace and assistant share one pane. App-content navigation temporarily
-selects the workspace without changing the saved Assistant preference.
-Context-only URL writes do not select a pane.
+selects the narrow workspace; a conversation link reveals the assistant. Neither
+changes the saved Assistant preference. Context-only URL writes do not select a pane.
 Workflow launchers and developer
 tools live in the header's **More actions** menu. Narrow layouts keep account,
 board status, update, language and theme controls in the existing mobile navigation.
