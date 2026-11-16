@@ -17,6 +17,7 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
+import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
 import {
   isArtifactPutCall,
   isCardItem,
@@ -128,15 +129,22 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
   );
 }
 
-/** CAD-1168 (approved mock): "You 09:32" / "Assistant 09:33" label above
- *  the body, no avatars. Home and the app panes share it; density only
- *  changes the body text size. */
+/** CAD-1168 (approved mock): "Assistant 09:33" label above the body, no
+ *  avatars. Home, the app panes, agent chats and Threads share it; density
+ *  only changes the body text size. CAD-2362 (operator decision): the
+ *  operator's own bubble carries no "You" row — its side and tint say who
+ *  sent it — and its time sits under the bubble, shown on hover or focus
+ *  (always on touch). `showName` keeps the row for an outgoing message that
+ *  another person sent (a shared thread). `atAlways` keeps a delivery state
+ *  ("sending…", "not sent") visible: it is information, not a timestamp. */
 export function Bubble({
   who,
   at,
   children,
   me,
   live,
+  showName,
+  atAlways,
 }: {
   who: string;
   at?: string;
@@ -146,7 +154,22 @@ export function Bubble({
    *  mock's `.who .live`) — the working indicator for the turn this
    *  row belongs to. */
   live?: ReactNode;
+  showName?: boolean;
+  atAlways?: boolean;
 }) {
+  if (me && !showName) {
+    return (
+      <div className="min-w-0 ml-6 text-right chat-me" data-chat-message="user">
+        <span className="sr-only">{who}</span>
+        <div className="min-w-0">{children}</div>
+        {at ? (
+          <div className="chat-me-at num" data-always={atAlways ? "" : undefined}>
+            {at}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
   return (
     <div className={`min-w-0 ${me ? "ml-6 text-right" : ""}`} data-chat-message={me ? "user" : "assistant"}>
       <div className={`flex items-baseline gap-2 text-micro text-ink-500 mb-1.5 ${me ? "justify-end" : ""}`}>
@@ -155,6 +178,83 @@ export function Bubble({
         {live ? <span className="chat-live num">{live}</span> : null}
       </div>
       <div className="min-w-0">{children}</div>
+    </div>
+  );
+}
+
+/** One inline token as React text — never markup (CAD-2362). */
+function InlineToken({ token }: { token: Inline }) {
+  switch (token.kind) {
+    case "code":
+      return <code className="op-code">{token.text}</code>;
+    case "strong":
+      return <strong>{token.text}</strong>;
+    case "em":
+      return <em>{token.text}</em>;
+    case "link":
+      return (
+        <a className="lnk" href={token.href} target="_blank" rel="noopener noreferrer">
+          {token.text}
+        </a>
+      );
+    default:
+      return <>{token.text}</>;
+  }
+}
+
+/** Operator prose with its inline marks, line breaks as typed. */
+function OperatorInline({ text }: { text: string }) {
+  const tokens = useMemo(() => inlineTokens(text), [text]);
+  return (
+    <span className="whitespace-pre-wrap">
+      {tokens.map((tok, i) => (
+        <InlineToken key={i} token={tok} />
+      ))}
+    </span>
+  );
+}
+
+/**
+ * CAD-2362: the operator's own message on every chat surface — inline
+ * Markdown, a pasted payload or fenced block as a code block, and a long
+ * message folded after `FOLD_LINES` lines with its line count, Show all and
+ * Copy. Copy takes the text as written (a form answer's readable lines).
+ */
+export function OperatorText({ text }: { text: string }) {
+  const t = useTranslate();
+  const parts = useMemo(() => segments(text), [text]);
+  const fold = useMemo(() => foldable(parts), [parts]);
+  const [open, setOpen] = useState(false);
+  const bodyId = useId();
+  const body = parts.map((s, i) =>
+    s.kind === "code" ? (
+      <pre key={i} className="op-pre num" data-lang={s.lang ?? undefined}>
+        {s.text}
+      </pre>
+    ) : (
+      <OperatorInline key={i} text={s.text} />
+    ),
+  );
+  if (!fold) return <>{body}</>;
+  const lines = lineCount(parts);
+  return (
+    <div className="op-fold" data-open={open ? "" : undefined}>
+      {/* Focus landing on a clipped link opens the message, so it is never invisible. */}
+      <div className="op-fold-body" id={bodyId} onFocus={() => setOpen(true)}>
+        {body}
+      </div>
+      <div className="op-fold-foot">
+        <span className="num">
+          {parts.some((s) => s.kind === "code" && s.lang === "json") ? "JSON · " : ""}
+          {lines} {t("lines")}
+        </span>
+        <span className="op-fold-actions">
+          <button type="button" className="lnk" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen((o) => !o)}>
+            {open ? t("Show less") : t("Show all")}
+          </button>
+          <CopyControl text={text} label={t("Copy message")} />
+        </span>
+      </div>
     </div>
   );
 }
@@ -191,17 +291,40 @@ export function ThreadItemView({
   const compact = density === "compact";
   const bodyText = compact ? "text-secondary" : "text-body";
   switch (item.type) {
-    case "operator":
+    case "operator": {
+      const refs = entryRefs(item.entry.payload);
+      const files = entryAttachments(item.entry.payload);
+      // CAD-2362: an answer the form card shows (threadItems checked the card
+      // reads it) is one receipt line; the stored text (the model's copy) is
+      // unchanged. Any other answer keeps its bubble and the caption.
+      const receipt = item.formShown ? formReceipt(item.entry.text) : null;
+      if (receipt) {
+        const at = time(item.entry.created);
+        return (
+          <div className="min-w-0 text-right" data-chat-message="user" data-form-receipt>
+            <span className="form-receipt">
+              <span className="sr-only">{t("You")}: </span>
+              <span aria-hidden>↳ </span>
+              {t("Answered with the form")}
+              {receipt.map((line, i) => (
+                <span key={i} className="form-receipt-line"> · {line}</span>
+              ))}
+              {at ? <span className="num text-ink-500"> · {at}</span> : null}
+            </span>
+          </div>
+        );
+      }
       return (
         <Bubble who={t("You")} at={time(item.entry.created)} me>
-          <div className={`chat-bubble ${bodyText} text-ink-100 whitespace-pre-wrap`}>
-            <span>{formAnswerText(item.entry.text, entryRefs(item.entry.payload))}</span>
-            <AttachmentRows files={entryAttachments(item.entry.payload)} />
+          <div className={`chat-bubble ${bodyText} text-ink-100`}>
+            <OperatorText text={formAnswerText(item.entry.text, refs)} />
+            <AttachmentRows files={files} />
           </div>
-          {isFormAnswer(entryRefs(item.entry.payload)) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
-          <RefChips refs={entryRefs(item.entry.payload)} onOpenIssue={onOpenIssue} />
+          {isFormAnswer(refs) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
+          <RefChips refs={refs} onOpenIssue={onOpenIssue} />
         </Bubble>
       );
+    }
     case "pending": {
       // CAD-1485 round 3 (member surface only): a `delivery:
       // "unconfirmed"` pending row opted into the honest unknown-
@@ -221,14 +344,15 @@ export function ThreadItemView({
           who={t("You")}
           at={pendingAt}
           me
+          atAlways
         >
           <div
-            className={`chat-bubble ${bodyText} whitespace-pre-wrap ${
+            className={`chat-bubble ${bodyText} ${
               item.pending.state === "failed" ? "text-ink-200" : "text-ink-300"
             }`}
             data-pending={item.pending.state}
           >
-            {formAnswerText(item.pending.text, item.pending.refs ?? [])}
+            <OperatorText text={formAnswerText(item.pending.text, item.pending.refs ?? [])} />
             <AttachmentRows files={pendingAttachments(item.pending.attachments)} />
           </div>
           <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
@@ -799,15 +923,16 @@ function TurnTrace({
 }
 
 /** The one Copy affordance for an answer, hover/focus-revealed in the turn
- *  head so it never sits on top of the answer text. */
-function CopyControl({ text }: { text: string }) {
+ *  head so it never sits on top of the answer text. With a `label` it is a
+ *  plain always-visible link (a folded operator message's foot). */
+function CopyControl({ text, label }: { text: string; label?: string }) {
   const t = useTranslate();
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
-      className="lnk turn-copy"
-      aria-label={t("Copy answer")}
+      className={label ? "lnk" : "lnk turn-copy"}
+      aria-label={label ?? t("Copy answer")}
       onClick={() => {
         void navigator.clipboard
           ?.writeText(text)
