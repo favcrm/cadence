@@ -461,10 +461,12 @@ jobs:
                 if (largeInput && (sawMetadata || sawDone)) { failed = true; continue; }
                 let d; try { d = JSON.parse(data); } catch { failed = true; continue; }
                 // A provider error inside a 200 stream is a chunk with a top-level error.
-                if (d === null || typeof d !== 'object' || d.error !== undefined) { failed = true; continue; }
+                if (d === null || typeof d !== 'object' || Array.isArray(d) || d.error !== undefined ||
+                    (d.choices !== undefined && !Array.isArray(d.choices))) { failed = true; continue; }
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
                   if (stop !== null) { failed = true; continue; }
                   if (c.index !== 0) { failed = true; continue; }
+                  if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
                   else if (c.delta?.content != null) nonStringContent = true;
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
