@@ -358,7 +358,8 @@ export type FormStatus =
   | { state: "open" }
   | { state: "sending" }
   | { state: "failed"; pending: PendingMessage }
-  | { state: "sent"; at: string | null }
+  /** `answer` is the citing message's text, which carries the A2UI action. */
+  | { state: "sent"; at: string | null; answer: string }
   | { state: "closed" };
 
 const answers = (refs: unknown, seq: number): boolean =>
@@ -369,7 +370,7 @@ export function formStatus(seq: number, entries: ThreadEntry[], pending: Pending
   let closed = false;
   for (const e of entries) {
     if (e.seq <= seq || e.role !== "operator") continue;
-    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null };
+    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null, answer: e.text };
     closed = true;
   }
   const own = pending.find((p) => answers(p.refs, seq));
