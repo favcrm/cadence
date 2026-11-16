@@ -8,8 +8,8 @@ export {};
  *   blank body or an error.
  * - A hosted board probes once when it mounts (App's effect and its routine
  *   refresh share the one answer), shows the nav item once the probe answers
- *   `available`, mounts the screen on `/documents` from that same answer,
- *   and lists Documents in the settings menu.
+ *   `available`, and mounts the screen on `/documents` and the type
+ *   preferences on `/settings/documents` from that same answer.
  */
 declare function require(name: string): any;
 
@@ -126,11 +126,12 @@ async function main() {
   await settle(() => assert(host.textContent?.includes("No documents to show"), "the screen mounts on /documents"), "hosted screen");
   assert(requests.includes("/api/documents?archived=0"), "the screen lists active documents");
   equal(probes(), 1, "opening the screen does not probe again");
-  // The settings menu lists Documents while the board names the section; its
-  // page (the type preferences) lands in a later CAD-2286 PR.
+  // Settings → Documents mounts where the other sections are, from the same probe.
   await go("/settings/documents");
-  await settle(() => assert(host.querySelector('a[href="/settings/documents"]'), "the settings menu lists Documents"), "settings documents");
-  equal(probes(), 1, "the settings route reads the shared probe, not a second one");
+  await settle(() => assert(host.textContent?.includes("Default for new types"), "Settings → Documents mounts the type preferences"), "settings documents");
+  assert(host.querySelector('a[href="/settings/documents"]'), "the settings menu lists Documents");
+  assert(requests.includes("/api/team/members"), "the page reads the roster for approver names");
+  equal(probes(), 1, "the settings page reads the shared probe, not a second one");
   await React.act(async () => { root.unmount(); });
 
   console.log("documents app nav checks passed");
