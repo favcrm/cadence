@@ -42,6 +42,14 @@
 #    same junit plus expected-targets.txt but skips the zero-target
 #    coverage guard — the CI aggregate re-runs that check over the
 #    merged shard reports, so coverage can never shrink between shards.
+#  - CAD-1970: isolation is default-on. Build/list outside the sandbox, then
+#    reuse the built metadata (no Cargo build during execution). sudo -n
+#    unshare -n brings up only lo, and setpriv restores the invoking uid/gid
+#    with no supplementary groups before proofs or tests. Refuse if setup,
+#    identity restoration or either TCP proof fails; never fall back.
+#    --allow-egress explicitly disables this guard for separate qualification.
+#    Non-loopback access is prevented, not audited: a test may swallow the
+#    connect error, so an attempted connect is not itself a suite failure.
 set -euo pipefail
 caller_cwd=$PWD
 real_home=${HOME:-}
@@ -54,11 +62,12 @@ jobs=2
 runner_args=("$@")
 partition_seen=0
 jobs_seen=0
+allow_egress=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --manifest-path|--test-selection|--partition|--jobs)
       if [ "$#" -lt 2 ]; then
-        echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N]" >&2
+        echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N] [--allow-egress]" >&2
         exit 2
       fi
       case $1 in
@@ -73,8 +82,11 @@ while [ "$#" -gt 0 ]; do
           jobs_seen=1; jobs=$2 ;;
       esac
       shift 2 ;;
+    --allow-egress)
+      allow_egress=1
+      shift ;;
     *)
-      echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N]" >&2
+      echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N] [--allow-egress]" >&2
       exit 2 ;;
   esac
 done
@@ -407,15 +419,10 @@ mkdir -p "$(dirname "$junit_report")"
 rm -f "$junit_report" "$inventory_report"
 printf '%s\n' "${integration_targets[@]}" > "$targets_report"
 
-# One pinned nextest invocation replaces 56 serial cargo test invocations.
-# Its JUnit report is checked against the exact target list afterward so a
-# missing or zero-test target cannot silently shrink the required CI scope.
-# A --partition run checks only that its own junit is well-formed; the CI
-# aggregate job re-runs the same full-coverage check over every shard's
-# merged report. cargo-nextest honors CARGO for its Cargo subprocess while
-# preserving PATH for test processes. Under an admitted lane run this
-# selects the compiler symlink directly; tests retain the lane shim first
-# on PATH but receive no slot identity.
+# Build before entering the network namespace. Reuse metadata for both the
+# inventory and execution, so no Cargo invocation runs inside the sandbox.
+# A --partition run checks its own exact inventory; the aggregate checks
+# complete coverage over the union. The pinned profile and lock still apply.
 partition_args=()
 if [ -n "$partition" ]; then
   partition_args=(--partition "hash:$part_k/$part_n")
@@ -424,28 +431,124 @@ cargo_env=("PATH=$lib_path" "CADENCE_SUITE_LOCK_WAIT_SECS=$SUITE_LOCK_WAIT_SECS"
 if [ "$slot_admitted" -eq 1 ]; then
   cargo_env+=("CARGO=$compiler_dir/cargo")
 fi
-if ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" --locked --features test-seam \
+metadata_report=$scratch/cargo-metadata.json
+binaries_report=$scratch/binaries-metadata.json
+if ! env "${cargo_env[@]}" "$compiler_dir/cargo" metadata --locked \
+    --features test-seam "${manifest_args[@]}" --format-version 1 > "$metadata_report" ||
+   ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" list \
+    --locked --features test-seam \
     "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
-    "${partition_args[@]}" \
-    -j "$jobs" 2>&1 | tee "$scratch/nextest.log"; then
+    --list-type binaries-only --message-format json > "$binaries_report"; then
+  echo "::error::nextest dependency preparation or test binary build failed; refusing execution" >&2
+  exit 1
+fi
+reuse_args=(--cargo-metadata "$metadata_report" --binaries-metadata "$binaries_report")
+if ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" list \
+    "${reuse_args[@]}" "${partition_args[@]}" \
+    --message-format json > "$inventory_report"; then
+  echo "::error::nextest did not produce the inventory its JUnit is checked against" >&2
+  exit 1
+fi
+
+run_selected_tests() {
+  if [ "$allow_egress" -eq 1 ]; then
+    echo "::warning::egress isolation OFF: --allow-egress explicitly permits non-loopback access" >&2
+    env "${cargo_env[@]}" "$root/scripts/cadence-nextest" \
+      "${reuse_args[@]}" "${partition_args[@]}" -j "$jobs"
+    return
+  fi
+  # sudo + a network namespace avoids the Ubuntu user-namespace restrictions
+  # on unshare -rn. Never change host firewall rules or execute tests as root.
+  for tool in sudo unshare ip setpriv; do
+    if ! PATH="$lib_path" command -v "$tool" >/dev/null 2>&1; then
+      echo "::error::egress isolation (sudo unshare -n) unavailable: missing $tool; refusing execution" >&2
+      return 1
+    fi
+  done
+  caller_uid=$(id -u)
+  caller_gid=$(id -g)
+  if [ "$caller_uid" -eq 0 ]; then
+    echo "::error::egress isolation refuses a root caller; tests must retain a non-root invoking identity" >&2
+    return 1
+  fi
+  # sudo scrubs the environment. Restore the already isolated test environment
+  # only AFTER dropping privilege; never feed it to a privileged interpreter.
+  env "${cargo_env[@]}" python3 -c 'import json, os, sys
+with open(sys.argv[1], "w") as output:
+    json.dump(dict(os.environ), output)
+' "$scratch/test-environment.json" || {
+    echo "::error::could not save the isolated test environment; refusing execution" >&2
+    return 1
+  }
+  if ! cat > "$scratch/egress-proof.py" <<'PY'
+import json
+import os
+import socket
+import sys
+
+environment, ready, expected_uid, expected_gid, *command = sys.argv[1:]
+if os.getuid() != int(expected_uid) or os.getgid() != int(expected_gid) or os.getuid() == 0:
+    raise SystemExit("::error::egress isolation did not restore the invoking uid/gid; refusing")
+with open(environment) as source:
+    original_environment = json.load(source)
+os.environ.clear()
+os.environ.update(original_environment)
+print("egress isolation: sudo unshare -n, only lo enabled, invoking uid/gid restored", flush=True)
+try:
+    with socket.create_connection(("1.1.1.1", 443), timeout=1):
+        pass
+except OSError as error:
+    print(f"egress proof: non-loopback TCP 1.1.1.1:443 FAIL (expected: {error})", flush=True)
+else:
+    raise SystemExit("::error::egress proof: non-loopback TCP SUCCEEDED; refusing execution")
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.settimeout(1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        with socket.create_connection(listener.getsockname(), timeout=1):
+            connection, _ = listener.accept()
+            connection.close()
+except OSError as error:
+    raise SystemExit(f"::error::egress proof: loopback TCP FAIL ({error}); refusing execution")
+print("egress proof: loopback TCP 127.0.0.1 SUCCEED (expected)", flush=True)
+with open(ready, "w") as output:
+    output.write("proved\n")
+os.execvpe(command[0], command, os.environ)
+PY
+  then
+    echo "::error::could not write the egress self-proof; refusing execution" >&2
+    return 1
+  fi
+  # Only these fixed setup commands run privileged. /bin/sh and setpriv exec
+  # preserve the suite's exit status; all fixture files stay caller-owned.
+  if PATH="$lib_path" sudo -n -- "$(PATH="$lib_path" command -v unshare)" -n /bin/sh -c '
+    set -eu
+    ip=$1; setpriv=$2; uid=$3; gid=$4
+    shift 4
+    "$ip" link set lo up
+    exec "$setpriv" --reuid="$uid" --regid="$gid" --clear-groups -- "$@"
+  ' sh "$(PATH="$lib_path" command -v ip)" "$(PATH="$lib_path" command -v setpriv)" \
+      "$caller_uid" "$caller_gid" \
+      /usr/bin/python3 "$scratch/egress-proof.py" "$scratch/test-environment.json" \
+      "$scratch/egress-ready" "$caller_uid" "$caller_gid" \
+      "$root/scripts/cadence-nextest" "${reuse_args[@]}" "${partition_args[@]}" -j "$jobs"; then
+    return 0
+  else
+    run_status=$?
+    if [ ! -f "$scratch/egress-ready" ]; then
+      echo "::error::egress isolation (sudo unshare -n) could not be established or proven; refusing execution" >&2
+    fi
+    return "$run_status"
+  fi
+}
+if ! run_selected_tests 2>&1 | tee "$scratch/nextest.log"; then
   status=1
   printf '::error::integration target selection or test run failed: %s\n' \
     "${integration_targets[*]}" >&2
 fi
-
 if [ ! -f "$junit_report" ]; then
   echo "::error::nextest did not produce its required JUnit report: $junit_report" >&2
-  status=1
-fi
-# Read the same selection back out of the built binaries. A failure here is
-# fatal: without an inventory the junit cannot be checked, and an unchecked
-# junit is what let a case disappear unnoticed.
-if [ -f "$junit_report" ] && ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" list \
-    --locked --features test-seam \
-    "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
-    "${partition_args[@]}" \
-    --message-format json > "$inventory_report"; then
-  echo "::error::nextest did not produce the inventory its JUnit is checked against" >&2
   status=1
 fi
 if [ -f "$junit_report" ] && [ -n "$partition" ]; then
