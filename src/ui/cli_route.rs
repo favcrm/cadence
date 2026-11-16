@@ -432,6 +432,9 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
             };
             restricted(pm, &issue.project, actor)
         }
+        // An id that is not well formed is never joined into a path: it
+        // could climb out of a readable project and test for a private one.
+        Some(_) if model::check_id(id).is_err() => Some(hidden()),
         Some(spelling) => {
             let found = super::project_policy::readable(pm, &spelling)
                 .iter()
@@ -924,6 +927,9 @@ fn dispatch(
                     }
                     Err(resp) => return resp,
                 };
+                if model::check_id(&ids[0]).is_err() {
+                    return cli_fail(400, "invalid_request", "bad issue id");
+                }
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
                     Ok(pm) => {

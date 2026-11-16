@@ -149,6 +149,31 @@ fn member_gets_the_same_answer_for_a_private_issue_id_as_for_a_missing_one() {
         );
     }
 
+    // An id that climbs out of a readable project answers the same whether
+    // the private issue or project it names exists or not.
+    let traversal = |id: &str| {
+        call(
+            &rig,
+            "member",
+            "issue_set",
+            json!({"ids": [id], "set": ["priority=P1"], "if_rev": "cad2357-probe"}),
+        )
+    };
+    let refused = traversal("../secret/SEC-1");
+    for id in [
+        "../secret/SEC-404",
+        "../secret/../visible/VIS-1",
+        "../nokey/../visible/VIS-1",
+    ] {
+        assert_eq!(traversal(id), refused, "member issue_set {id}");
+    }
+    assert_ne!(refused.0, 200, "a traversal id was admitted: {}", refused.1);
+    assert_eq!(
+        projects_state(&rig),
+        before,
+        "a traversal id changed the tracker"
+    );
+
     // The Owner keeps the verbs' own answers: the private issue is served,
     // and an absent id still gets the verb's own not-found text.
     let (status, body) = call(&rig, "owner", "issue_show", json!({"id": "SEC-1"}));
