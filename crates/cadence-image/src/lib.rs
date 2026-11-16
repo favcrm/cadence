@@ -219,10 +219,11 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
     let id = context.meta.primary;
     let props = context.props(id).map_err(|_| ImageError::Invalid)?;
     if props.nclx.is_some_and(|color| {
-        matches!(
-            color.matrix,
-            heic_rs::props::colr::MatrixCoefficients::Other(_)
-        )
+        matches!(color.transfer, 16 | 18)
+            || matches!(
+                color.matrix,
+                heic_rs::props::colr::MatrixCoefficients::Other(_)
+            )
     }) {
         return Err(ImageError::Unsupported);
     }
