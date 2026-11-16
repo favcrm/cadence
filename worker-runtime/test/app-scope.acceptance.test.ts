@@ -294,6 +294,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
     async run(sql: string, ...params: SqliteValue[]) {
       database.prepare(sql).run(...(params as never[]));
     },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       // The portable facade answers `undefined` for no row; Bun's `get`
       // answers `null`. The engine branches on `undefined`, so translate.

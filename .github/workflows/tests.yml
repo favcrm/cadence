@@ -92,3 +92,6 @@ jobs:
         run: |
           bun install --frozen-lockfile --ignore-scripts
           bun run test
+      - name: Protected observer refusal
+        working-directory: worker-runtime
+        run: bun test ../infra/native-protected-runtime/observer/observer.test.mjs

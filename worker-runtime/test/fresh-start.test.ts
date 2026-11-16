@@ -235,14 +235,14 @@ describe("fresh start", () => {
           pending: async () => [],
           session: () => ({
             id: "1",
-            // The engine's own snapshot: the narrowed active context.
-            events: async () => {
-              const closed = Promise.withResolvers<{ reason: "session_closed" }>();
-              const { entries } = await conversation.context(BACKGROUND_CONTEXT);
+            // Read the actual engine view, then close this one-shot watch.
+            watch: async () => {
+              const watch = await conversation.watch(BACKGROUND_CONTEXT);
+              const closed = Promise.withResolvers<{ kind: "ended" }>();
               return {
-                snapshot: { type: "snapshot", entries, tools: [] },
-                start: () => closed.resolve({ reason: "session_closed" }),
-                stop: async () => ({ reason: "cancelled" }),
+                value: watch.value,
+                start: () => void watch.stop().then(() => closed.resolve({ kind: "ended" })),
+                stop: () => watch.stop(),
                 closed: closed.promise,
               };
             },

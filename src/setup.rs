@@ -697,11 +697,10 @@ pub const PROVIDERS: &[Provider] = &[
         login: "devin auth login",
         signin: SignIn::FilePresent("XDG_DATA_HOME", ".local/share", "devin/credentials.toml"),
     },
-    // CAD-322: the pinned, scoped package the master is tested against
-    // (host may run a different one — setup installs exactly this).
+    // Pin the installation hint; the Pi already on a host's PATH may differ.
     Provider {
         bin: "pi",
-        install: "npm install -g @earendil-works/pi-coding-agent@0.87.1",
+        install: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.5.2",
         login: "pi  # then type /login",
         signin: SignIn::FilePresent("PI_CODING_AGENT_DIR", ".pi/agent", "auth.json"),
     },

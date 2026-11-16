@@ -1,7 +1,6 @@
 import type { Extension } from "@earendil-works/pi-durable";
-import type { SkillManifest, SkillSource } from "agents/skills";
-import { OPERATIONAL_SKILL_VERSION } from "./contract.ts";
-import { COMPANY_OUTPUTS_FINGERPRINT, COMPANY_OUTPUTS_SKILL } from "./company-outputs.generated.ts";
+import { manifest as createSkillSource, type SkillManifest } from "agents/skills";
+import { COMPANY_OUTPUTS_SKILL } from "./company-outputs.generated.ts";
 
 /**
  * The runtime's bundled prompt and skill profile.
@@ -23,11 +22,9 @@ export const runtimeProfile: Extension = {
 /** Reviewed, bundled procedures. Sources never execute scripts or change tool authority. */
 const manifest: SkillManifest = {
   id: "tenant-operations",
-  fingerprint: OPERATIONAL_SKILL_VERSION,
   skills: [
     {
       name: "board-review",
-      version: "1",
       description:
         "Use for a workspace health review, backlog review or evidence-based board briefing.",
       body: `# Board review
@@ -60,7 +57,6 @@ Identify the human decision, its supporting issue and what remains unknown.`,
     },
     {
       name: "issue-triage",
-      version: "1",
       description:
         "Use to investigate a specific issue, clarify its blocker or prepare a proposed next-step handoff.",
       body: `# Issue triage
@@ -74,52 +70,20 @@ Identify the human decision, its supporting issue and what remains unknown.`,
   ],
 };
 
-// The public SkillSource boundary avoids loading the optional AI SDK, shell and
-// code-execution runtimes exported by agents/skills. The engine owns
-// activation/read tools.
-function skillSource(pack: SkillManifest): SkillSource {
-  return {
-    id: pack.id,
-    fingerprint: pack.fingerprint,
-    async list() {
-      return pack.skills.map((skill) => ({
-        name: skill.name,
-        description: skill.description,
-        sourceId: pack.id,
-        version: skill.version ?? pack.fingerprint,
-      }));
-    },
-    async load(name) {
-      const skill = pack.skills.find((entry) => entry.name === name);
-      return skill ? { ...skill, sourceId: pack.id } : null;
-    },
-    async readResource(name, path) {
-      return (
-        pack.skills
-          .find((entry) => entry.name === name)
-          ?.resources?.find((resource) => resource.path === path) ?? null
-      );
-    },
-  };
-}
+export const operationalSkills = createSkillSource(manifest);
 
-export const operationalSkills = skillSource(manifest);
-
-/** Independently versioned, and generated from the one `skills/company-outputs` source. */
-export const companyOutputSkills = skillSource({
+/** Generated from the one `skills/company-outputs` source. */
+export const companyOutputSkills = createSkillSource({
   id: "tenant-company-outputs",
-  fingerprint: COMPANY_OUTPUTS_FINGERPRINT,
   skills: [COMPANY_OUTPUTS_SKILL],
 });
 
-/** Independently versioned: existing review drafts retain their original board-skill catalog stamp. */
-export const runtimeHealthSkills = skillSource({
+/** Runtime health guidance does not change the application draft stamp. */
+export const runtimeHealthSkills = createSkillSource({
   id: "tenant-runtime-health",
-  fingerprint: "tenant-runtime-health-1",
   skills: [
     {
       name: "runtime-health",
-      version: "1",
       description:
         "Use to inspect this workspace's runtime availability, recorded failures or recent lifecycle history.",
       body: `# Runtime health

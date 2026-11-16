@@ -407,6 +407,11 @@ impl LocalProfile {
             control_socket: PathBuf::from("/nonexistent/run/control.sock"),
         }
     }
+
+    pub(crate) fn with_test_registry_digest(mut self, digest: String) -> Self {
+        self.registry.registry_digest = digest;
+        self
+    }
 }
 
 fn parse_profile(path: &Path, raw: Vec<u8>, value: &serde_json::Value) -> Result<LocalProfile> {

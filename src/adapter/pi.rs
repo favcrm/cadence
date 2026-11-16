@@ -1707,6 +1707,16 @@ impl ProviderAdapter for PiAdapter {
             }
             return Err(self.command_error("prompt", &resp));
         }
+        if !self.shared.omp.load(Ordering::SeqCst)
+            && resp.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
+        {
+            // An extension may have performed work without starting a model turn.
+            // Its effects are uncertain; fence rather than report success or replay.
+            self.shared.turn_images.lock().unwrap().clear();
+            return Err(Error::unknown(
+                "Pi handled the prompt without confirming a model turn; reconcile before retry",
+            ));
+        }
         *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
         on_started(&turn_id);
         let start = Instant::now();
@@ -2452,6 +2462,9 @@ for raw in sys.stdin:
     record(req)
     kind = req.get("type")
     if kind == "prompt":
+        if mode == "handled":
+            emit({{"id": req.get("id"), "type": "response", "command": "prompt", "success": True, "data": {{"disposition": "handled"}}}})
+            continue
         respond(req)
         if mode == "cancel":
             continue
@@ -2537,6 +2550,25 @@ for raw in sys.stdin:
             .iter()
             .filter(|frame| frame.get("type").and_then(Value::as_str) == Some(kind))
             .count()
+    }
+
+    #[test]
+    fn handled_prompt_without_agent_is_unknown_and_not_replayed() {
+        let (stop, log, _) = launch("handled", "", true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        *adapter.shared.idle_window.lock().unwrap() = Duration::from_secs(1);
+        let started = std::cell::Cell::new(false);
+
+        let error = adapter
+            .run_turn(USER, "m1", &|_| started.set(true))
+            .err()
+            .expect("a handled prompt without an agent must not complete the turn");
+        assert_eq!(error.kind(), "unknown");
+        assert!(!started.get(), "the adapter reported a turn started");
+
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "new_session"), 0);
     }
 
     #[test]

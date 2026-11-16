@@ -27,7 +27,7 @@
 //! - [`measure`] — post-start measurement of the actual guest: namespaces,
 //!   uid/gid, capabilities, `NoNewPrivs`, seccomp, core limit, post-exec
 //!   non-dumpability, argv/env, exe digest, image digest and cgroup.
-//! - [`registry`] + [`attestation`] — the pinned Pi 1.4.0 observer's
+//! - [`registry`] + [`attestation`] — the pinned Pi 1.5.2 observer's
 //!   HMAC-authenticated `cadence.runtime.registry/1` channel, bound to the
 //!   enrolled Node PID/starttime measured by the root owner, and compared with
 //!   the immutable installed material.

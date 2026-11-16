@@ -1,10 +1,18 @@
-import type { AgentEventStream } from "@earendil-works/pi-durable";
+import type { WatchCall, WatchEnd, WatchHandle } from "@earendil-works/chord/watch";
+import type { ConversationView } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
 import { sessionEventResponse } from "../src/session-stream.ts";
 
+type WatchListener = Parameters<WatchHandle<ConversationView>["start"]>[0];
+const viewChange: WatchCall<ConversationView> = {
+  kind: "value",
+  value: {} as ConversationView,
+  ops: [],
+  retired: false,
+};
+
 function watchFixture() {
-  const completion =
-    Promise.withResolvers<Awaited<AgentEventStream["closed"]>>();
+  const completion = Promise.withResolvers<WatchEnd>();
   let stopped = false;
   return {
     completion,
@@ -14,7 +22,7 @@ function watchFixture() {
       closed: completion.promise,
       async stop() {
         stopped = true;
-        const end = { reason: "cancelled" as const };
+        const end = { kind: "stopped" as const };
         completion.resolve(end);
         return end;
       },
@@ -24,7 +32,7 @@ function watchFixture() {
 
 const format = {
   snapshot: (emit: (frame: string) => void) => emit(": connected\n\n"),
-  events: async () => {},
+  change: async () => {},
 };
 
 describe("session stream lifecycle", () => {
@@ -37,12 +45,12 @@ describe("session stream lifecycle", () => {
     expect(new TextDecoder().decode((await reader.read()).value)).toBe(
       ": connected\n\n",
     );
-    fixture.completion.resolve({ reason: "session_closed" });
+    fixture.completion.resolve({ kind: "ended" });
     expect((await reader.read()).done).toBe(true);
   });
 
-  for (const reason of ["session_failed", "listener_error"] as const) {
-    it(`fails the HTTP body when the engine resolves a ${reason} termination`, async () => {
+  for (const kind of ["failed", "listener_error"] as const) {
+    it(`fails the HTTP body when the engine resolves a ${kind} termination`, async () => {
       const fixture = watchFixture();
       const reader = sessionEventResponse(
         fixture.watch,
@@ -50,7 +58,7 @@ describe("session stream lifecycle", () => {
       ).body!.getReader();
       await reader.read();
       fixture.completion.resolve({
-        reason,
+        kind,
         error: new Error("session storage unavailable"),
       });
       await expect(reader.read()).rejects.toThrow(
@@ -84,7 +92,7 @@ describe("session stream lifecycle", () => {
 
   it("closes a slow thread stream when non-cursor updates fill its queue", async () => {
     const fixture = watchFixture();
-    let listener: Parameters<AgentEventStream["start"]>[0] | undefined;
+    let listener: WatchListener | undefined;
     const response = sessionEventResponse(
       {
         ...fixture.watch,
@@ -96,15 +104,15 @@ describe("session stream lifecycle", () => {
         snapshot: (emit) => {
           emit("event: master\ndata: {}\n\n");
         },
-        events: async (_events, emit) => {
+        change: async (_change, emit) => {
           emit(`event: master\ndata: ${JSON.stringify("x".repeat(160_000))}\n\n`);
         },
       },
       { overflow: "after-cursor" },
     );
     if (!listener) throw new Error("watch did not start");
-    await listener([], {} as never);
-    await listener([], {} as never);
+    await listener(viewChange, {} as never);
+    await listener(viewChange, {} as never);
     const reader = response.body!.getReader();
     try {
       await reader.read();
@@ -130,7 +138,7 @@ describe("session stream lifecycle", () => {
           emit(`event: master\ndata: ${JSON.stringify("x".repeat(280_000))}\n\n`);
           emit('id: 7\nevent: entry\ndata: {"seq":7}\n\n');
         },
-        events: async () => {},
+        change: async () => {},
       },
       { overflow: "after-cursor" },
     );
@@ -139,7 +147,7 @@ describe("session stream lifecycle", () => {
 
   it("continues the diagnostic stream after an oversized snapshot is read", async () => {
     const fixture = watchFixture();
-    let listener: Parameters<AgentEventStream["start"]>[0] | undefined;
+    let listener: WatchListener | undefined;
     const response = sessionEventResponse(
       {
         ...fixture.watch,
@@ -151,19 +159,19 @@ describe("session stream lifecycle", () => {
         snapshot: (emit) => {
           emit(`data: ${JSON.stringify("x".repeat(280_000))}\n\n`);
         },
-        events: async (_events, emit) => {
-          emit('data: {"type":"run_start"}\n\n');
+        change: async (_change, emit) => {
+          emit('data: {"type":"view"}\n\n');
         },
       },
     );
     if (!listener) throw new Error("oversized snapshot closed the watch");
-    const next = listener([], {} as never);
+    const next = listener(viewChange, {} as never);
     const reader = response.body!.getReader();
     try {
       expect(new TextDecoder().decode((await reader.read()).value)).toContain("x".repeat(100));
       await next;
       expect(new TextDecoder().decode((await reader.read()).value)).toBe(
-        'data: {"type":"run_start"}\n\n',
+        'data: {"type":"view"}\n\n',
       );
     } finally {
       await reader.cancel();
@@ -172,7 +180,7 @@ describe("session stream lifecycle", () => {
 
   it("releases a paused diagnostic watch when the reader disconnects", async () => {
     const fixture = watchFixture();
-    let listener: Parameters<AgentEventStream["start"]>[0] | undefined;
+    let listener: WatchListener | undefined;
     const response = sessionEventResponse(
       {
         ...fixture.watch,
@@ -184,13 +192,13 @@ describe("session stream lifecycle", () => {
         snapshot: (emit) => {
           emit(`data: ${JSON.stringify("x".repeat(280_000))}\n\n`);
         },
-        events: async (_events, emit) => {
-          emit('data: {"type":"run_start"}\n\n');
+        change: async (_change, emit) => {
+          emit('data: {"type":"view"}\n\n');
         },
       },
     );
     if (!listener) throw new Error("oversized snapshot closed the watch");
-    const next = listener([], {} as never);
+    const next = listener(viewChange, {} as never);
     await response.body!.cancel();
     await next;
     expect(fixture.stopped()).toBe(true);

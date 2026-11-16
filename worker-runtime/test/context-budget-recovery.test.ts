@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
-import { Harness, watchEvents } from "@earendil-works/pi-durable";
+import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { BOARD_MESSAGE_KIND, COMPACTION_FAILURE_TEXT, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
 import { CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel } from "../src/model.ts";
@@ -20,6 +20,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
   const executor: SqliteExecutor = {
     async exec(sql) { database.exec(sql); },
     async run(sql, ...params) { database.prepare(sql).run(...(params as never[])); },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       return (database.prepare(sql).get(...(params as never[])) as T | null | undefined) ?? undefined;
     },
@@ -151,7 +154,7 @@ async function session(
     agent: { model: { provider: defaultModel("default").provider, modelId: "default" } },
   });
   wired.harness = {
-    session: () => ({ id: conversation.id, events: () => watchEvents(harness, conversation.id, BACKGROUND_CONTEXT) }),
+    session: () => ({ id: conversation.id, watch: () => conversation.watch(BACKGROUND_CONTEXT) }),
     conversation: async () => conversation,
     pending: async () => [],
   };

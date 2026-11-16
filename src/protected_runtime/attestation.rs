@@ -1,4 +1,4 @@
-//! The per-runtime attestation channel and the pinned Pi 1.4.0 observer.
+//! The per-runtime attestation channel and the pinned Pi 1.5.2 observer.
 //!
 //! The attestation socket is *separate* from the root control socket and from
 //! the operations socket. Only the actual enrolled Node process — its PID and

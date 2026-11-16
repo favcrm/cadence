@@ -1,24 +1,12 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type {
-  AgentEvent,
-  MessageChange,
-  SnapshotEvent,
-} from "@earendil-works/pi-durable";
-
-/**
- * The engine's committed assistant entry kind. A compaction summary is
- * assistant-shaped too, so only this kind's `message_end` retires the live
- * preview; a compaction committing under a running request must not.
- */
-const ASSISTANT_ENTRY_KIND = "pi.assistant";
 
 /**
  * Upper bound on the transient text one connection retains and may send.
  *
  * The committed transcript carries the whole answer, so a preview only needs
  * its beginning. A bound keeps the projector and every queued frame small
- * even when a model streams for a long time: the per-block state stops
- * growing once the budget is spent, and the joined preview is capped again.
+ * even when a model streams for a long time: retained text stops growing once
+ * the budget is spent.
  */
 export const MAX_PREVIEW_CHARS = 8192;
 
@@ -42,17 +30,6 @@ const SENSITIVE_KEYS = [
   { key: "request_id", pattern: /request_id/i },
 ] as const;
 
-/**
- * One text block of the in-flight assistant message. Eligibility is decided
- * over the whole message text (see `text`), never per block: a safe prose
- * prefix and a token-bearing JSON suffix can share one message.
- */
-type TextBlock = { readonly kind: "text"; text: string };
-
-/** A block a preview never projects: thinking, tool calls, images. */
-type OtherBlock = { readonly kind: "other" };
-
-type BlockState = TextBlock | OtherBlock;
 
 /**
  * Cap a preview without leaving half of a surrogate pair at the end.
@@ -60,41 +37,18 @@ type BlockState = TextBlock | OtherBlock;
  * expand a control-heavy preview by a small constant factor.
  */
 function capPreview(text: string): string {
-  if (text.length <= MAX_PREVIEW_CHARS) return text;
-  const cut = text.slice(0, MAX_PREVIEW_CHARS);
+  const cut = text.length <= MAX_PREVIEW_CHARS ? text : text.slice(0, MAX_PREVIEW_CHARS);
   const last = cut.charCodeAt(cut.length - 1);
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
-/** What one batch of engine events did to the preview. */
-export interface PreviewBatch {
-  /** The preview after the batch; `null` when no eligible text is in flight. */
-  readonly current: string | null;
-  /** The last eligible preview observed while applying the batch. */
-  readonly latest: string | null;
-}
-
 /**
- * The transient projection of the in-flight assistant message.
- *
- * It is a pure function of the engine's events: the attached `snapshot`'s
- * generation partial seeds it, `message_start` replaces it, `message_update`
- * changes apply to it, and a committed assistant entry, a retry, a deferred
- * poll, a failed generation or a replacement snapshot retires it. Only genuine
- * assistant text is eligible; thinking, tool calls, arguments, provider
- * errors and raw event objects never contribute. Every emitted character
- * comes from the engine's own partial text, never from a synthesized value.
+ * Project only text from an in-flight assistant message. Quarantine is sticky
+ * for the generation, even when later view updates replace earlier content.
  */
 export class ThreadPreview {
-  private blocks = new Map<number, BlockState>();
-  /**
-   * Text budget left: `MAX_PREVIEW_CHARS - sum(retained text lengths)`.
-   * Replacing or removing a text block returns its retained length here.
-   */
-  private remaining = MAX_PREVIEW_CHARS;
-  /** The message the current blocks were seeded from, for a defensive retire. */
-  private seeded: object | null = null;
-  /** Set when the block bound was exceeded; no further preview until a seed. */
+  private joined = "";
+  /** Set when the block bound was exceeded; no further preview until reset. */
   private overflowed = false;
   /** Set when the message revealed a `{` or a sensitive key. Sticky. */
   private quarantined = false;
@@ -115,13 +69,8 @@ export class ThreadPreview {
   get text(): string | null {
     if (this.overflowed) return null;
     if (this.quarantined) return this.frozen;
-    let joined = "";
-    // Content blocks concatenate directly: a token split across two blocks
-    // must be seen as one string, not separated by presentation newlines.
-    for (const index of [...this.blocks.keys()].sort((a, b) => a - b)) {
-      const block = this.blocks.get(index);
-      if (block !== undefined && block.kind === "text") joined += block.text;
-    }
+    // Blocks concatenate directly, so a key split across them is still seen.
+    const joined = this.joined;
     if (joined.length === 0) return null;
     let stop = joined.length;
     let unsafe = false;
@@ -164,234 +113,32 @@ export class ThreadPreview {
 
   /** Forget the current message. A reconnection starts from its snapshot. */
   reset(): void {
-    this.blocks.clear();
-    this.remaining = MAX_PREVIEW_CHARS;
-    this.seeded = null;
+    this.joined = "";
     this.overflowed = false;
     this.quarantined = false;
     this.frozen = null;
   }
 
-  /**
-   * Stop previewing this message when the tracked-block bound is exceeded: a
-   * partial projection would be misleading, while the committed entry will
-   * arrive in full.
-   */
-  private failClosed(): void {
-    this.overflowed = true;
-    this.blocks.clear();
-    this.remaining = 0;
-    this.seeded = null;
-    this.quarantined = false;
-    this.frozen = null;
-  }
-
-  /**
-   * Replace the preview with the in-flight partial of an attached snapshot.
-   * The snapshot is authoritative: it is what a reconnection and an overflow
-   * delivery both get, so an older incremental state never survives it.
-   */
-  applySnapshot(snapshot: SnapshotEvent): void {
-    this.reset();
-    const message = snapshot.generation?.message;
-    if (message !== undefined) this.seed(message);
-  }
-
-  /**
-   * Apply one batch of engine events and report what happened.
-   *
-   * `latest` is the last eligible text seen while applying the batch. A batch
-   * that streams the final chunk and commits the message in one commit still
-   * lets its caller show that text before the committed entry; nothing here
-   * manufactures a frame when no eligible text existed.
-   */
-  apply(events: readonly AgentEvent[]): PreviewBatch {
-    // A non-streamed message is emitted as `message_start` and `message_end`
-    // for the same record in one batch. That record is committed history, not
-    // in-flight text, so it must neither seed the preview nor be shown as a
-    // transient message.
-    const committed = new Set<object>();
-    for (const event of events) {
-      if (event.type !== "message_end") continue;
-      const message = event.entry.model?.[0];
-      if (message !== undefined && message.role === "assistant")
-        committed.add(message);
+  /** Replace the retained text with the latest engine-owned partial. */
+  update(message: AssistantMessage | undefined): string | null {
+    if (message === undefined) {
+      this.reset();
+      return null;
     }
-    let latest: string | null = null;
-    for (const event of events) {
-      if (!this.applyEvent(event, committed)) continue;
-      const text = this.text;
-      if (text !== null) latest = text;
-    }
-    return { current: this.text, latest };
-  }
-
-  private applyEvent(
-    event: AgentEvent,
-    committed: ReadonlySet<object>,
-  ): boolean {
-    switch (event.type) {
-      case "snapshot":
-        this.applySnapshot(event);
-        return true;
-      case "message_start":
-        if (
-          event.message.role === "assistant" &&
-          !committed.has(event.message)
-        ) {
-          this.seed(event.message);
-          return true;
-        }
-        return false;
-      case "message_update": {
-        let touched = false;
-        for (const change of event.changes)
-          touched = this.applyChange(change) || touched;
-        return touched;
-      }
-      case "message_end": {
-        const message = event.entry.model?.[0];
-        if (
-          message !== undefined &&
-          (message === this.seeded ||
-            event.entry.kind === ASSISTANT_ENTRY_KIND)
-        ) {
-          this.reset();
-          return true;
-        }
-        return false;
-      }
-      // A retry waits for a fresh attempt and a deferred response has no
-      // streaming body: neither has in-flight text any more.
-      case "auto_retry_start":
-      case "deferred_poll":
-        this.reset();
-        return true;
-      case "task_failed":
-        if (event.kind === "pi.generation") {
-          this.reset();
-          return true;
-        }
-        return false;
-      default:
-        // Committed entries (message_end above), tool progress, usage, inbox
-        // and agent state changes never carry preview text.
-        return false;
-    }
-  }
-
-  private applyChange(change: MessageChange): boolean {
-    switch (change.type) {
-      case "text_start":
-        if (change.block.type === "text")
-          this.startText(change.contentIndex, change.block.text);
-        else this.markOther(change.contentIndex);
-        return true;
-      case "text_delta":
-        this.appendText(change.contentIndex, change.delta);
-        return true;
-      case "block":
-        this.replaceBlock(change.contentIndex, change.block);
-        return true;
-      case "message":
-        this.seed(change.message);
-        return true;
-      case "thinking_start":
-      case "toolcall_start":
-        // A non-text block never previews; replacing an index removes any
-        // text it supersedes.
-        this.markOther(change.contentIndex);
-        return true;
-      case "thinking_delta":
-      case "toolcall_delta":
-        // Thinking and tool arguments stay private, even as they stream.
-        return false;
-      default:
-        return false;
-    }
-  }
-
-  /** Replace the whole preview with one assistant message's text blocks. */
-  private seed(message: AssistantMessage): void {
-    this.reset();
+    if (this.overflowed || this.quarantined) return this.text;
     if (message.content.length > MAX_PREVIEW_BLOCKS) {
-      this.failClosed();
-      return;
+      this.joined = "";
+      this.overflowed = true;
+      return null;
     }
-    this.seeded = message;
-    for (const [index, block] of message.content.entries()) {
-      if (block.type === "text") this.startText(index, block.text);
-      else this.markOther(index);
+    let joined = "";
+    for (const block of message.content) {
+      if (block.type !== "text") continue;
+      const room = MAX_PREVIEW_CHARS - joined.length;
+      if (room <= 0) break;
+      joined += block.text.length <= room ? block.text : block.text.slice(0, room);
     }
-  }
-
-  /**
-   * Track a non-text block. It never contributes text, and the map's size is
-   * bounded so arbitrarily many thinking/tool blocks cannot grow the state.
-   */
-  private markOther(index: number): void {
-    if (this.overflowed || this.quarantined) return;
-    const existing = this.blocks.get(index);
-    if (existing === undefined && this.blocks.size >= MAX_PREVIEW_BLOCKS) {
-      this.failClosed();
-      return;
-    }
-    // A text block is about to disappear: return its retained length so the
-    // budget invariant holds and later blocks can still use it.
-    if (existing?.kind === "text")
-      this.remaining = Math.min(
-        MAX_PREVIEW_CHARS,
-        this.remaining + existing.text.length,
-      );
-    this.blocks.set(index, { kind: "other" });
-  }
-
-  /** Start (or replace) one text block at `index` with its known text. */
-  private startText(index: number, text: string): void {
-    if (this.overflowed || this.quarantined) return;
-    const existing = this.blocks.get(index);
-    if (existing === undefined && this.blocks.size >= MAX_PREVIEW_BLOCKS) {
-      this.failClosed();
-      return;
-    }
-    // A `block` change re-reports the whole block. Return the text it already
-    // retained before appending the replacement, or a full-length streamed
-    // block followed by its block change would spend the budget twice and lose
-    // the preview before the final entry.
-    if (existing?.kind === "text")
-      this.remaining = Math.min(
-        MAX_PREVIEW_CHARS,
-        this.remaining + existing.text.length,
-      );
-    this.blocks.set(index, { kind: "text", text: "" });
-    this.appendText(index, text);
-  }
-
-  /** Replace one block wholesale, as a `block` change reports it. */
-  private replaceBlock(
-    index: number,
-    block: AssistantMessage["content"][number],
-  ): void {
-    if (block.type === "text") this.startText(index, block.text);
-    else this.markOther(index);
-  }
-
-  /**
-   * Append text to one block while keeping the size bound. The whole-message
-   * guard lives in `text`; this only accumulates, and stops once the message
-   * is quarantined.
-   */
-  private appendText(index: number, delta: string): void {
-    // Only a verified text block can take text. A delta for an unknown index
-    // or for a thinking/tool block is ignored: a withheld block must never be
-    // turned into visible text by a stray delta.
-    const block = this.blocks.get(index);
-    if (block === undefined || block.kind !== "text") return;
-    if (this.quarantined || delta.length === 0) return;
-    const room = this.remaining;
-    if (room <= 0) return;
-    const addition = delta.length <= room ? delta : delta.slice(0, room);
-    block.text += addition;
-    this.remaining -= addition.length;
+    this.joined = joined;
+    return this.text;
   }
 }

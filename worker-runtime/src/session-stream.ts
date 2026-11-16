@@ -1,4 +1,5 @@
-import type { AgentEvent, AgentEventStream } from "@earendil-works/pi-durable";
+import type { WatchCall, WatchHandle } from "@earendil-works/chord/watch";
+import type { ConversationView } from "@earendil-works/pi-durable";
 
 /** `true` when the frame was accepted; `false` once this response is ending. */
 export type Emit = (frame: string) => boolean;
@@ -19,9 +20,8 @@ export type PreviewEmit = (text: string | null) => boolean;
 const MAX_QUEUED_BYTES = 256 * 1024;
 
 /**
- * The owner-only diagnostic stream carries engine snapshots and events, not
- * the board projection. Keep the image marker but never serialize image bytes
- * into that browser-facing stream.
+ * The owner-only diagnostic stream carries engine views, not the board
+ * projection. Keep image markers but never serialize their bytes.
  */
 export function rawSessionFrame(event: unknown): string {
   const json = JSON.stringify(event, (_key, value: unknown) => {
@@ -40,11 +40,11 @@ export function rawSessionFrame(event: unknown): string {
   return `data: ${json}\n\n`;
 }
 
-/** One connection's projection of engine batches. */
+/** One connection's projection of engine views. */
 export interface SessionStreamFormat {
   snapshot(emit: Emit, preview: PreviewEmit): void;
-  events(
-    events: readonly AgentEvent[],
+  change(
+    change: Extract<WatchCall<ConversationView>, { kind: "value" }>,
     emit: Emit,
     preview: PreviewEmit,
   ): Promise<void>;
@@ -86,7 +86,7 @@ export interface SessionStreamOptions {
  * coalesced preview ahead of the entry it belongs to without a timer.
  */
 export function sessionEventResponse(
-  watch: Pick<AgentEventStream, "start" | "stop" | "closed">,
+  watch: Pick<WatchHandle<ConversationView>, "start" | "stop" | "closed">,
   format: SessionStreamFormat,
   options?: SessionStreamOptions,
 ): Response {
@@ -175,8 +175,8 @@ export function sessionEventResponse(
         // that was already closed when its snapshot was obtained.
         void watch.closed.then((end) => {
           if (
-            end.reason === "session_failed" ||
-            end.reason === "listener_error"
+            end.kind === "failed" ||
+            end.kind === "listener_error"
           ) {
             fail(end.error);
             return;
@@ -204,9 +204,11 @@ export function sessionEventResponse(
             initialDrain = drain.promise;
             releaseInitialDrain = drain.resolve;
           }
-          watch.start(async (events) => {
+          watch.start(async (change) => {
             if (initialDrain !== null) await initialDrain;
-            if (!closed) await format.events(events, emit, preview);
+            if (change.kind === "failed") throw change.error;
+            if (change.retired) throw new Error("Conversation view retired");
+            if (!closed) await format.change(change, emit, preview);
           });
         } catch (error) {
           fail(error);

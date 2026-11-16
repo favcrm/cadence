@@ -115,6 +115,20 @@ parts with an explicit notice to the model. The count defaults to one; a host
 may set `maxImagesPerRequest` from one to four only when every model its alias
 may resolve to permits that many. The private durable history is not changed.
 
+The owner-only diagnostic route `/api/assist/events` (forwarded to the
+runtime's `/events`) sends SSE data frames containing
+`{"type":"snapshot","version":1,"view":...}` followed by
+`{"type":"view","version":1,"view":...}`. Each view replaces the previous
+one; these are not the individual engine events sent by the older protocol.
+The host must authorize the owner on every connection. Views may contain
+private conversation, reasoning and tool data even though image bytes are
+redacted; they are not a member-facing feed.
+
+Pi Durable 1.5 upgrades stored conversation and task formats. A 1.4 runtime
+cannot read that upgraded state: before deploying, stop writes and take a
+consistent, restorable backup. Roll forward or restore the backup rather than
+starting 1.4 against upgraded data.
+
 A gateway refuses image input for a model that cannot take it with a JSON error
 whose `error.code` is `image_input_unavailable`. A turn whose newest message holds
 the image fails with that named reason. A later request whose images are all older

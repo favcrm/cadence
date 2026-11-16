@@ -9,7 +9,7 @@ read from the staged tree or generated fresh into a new isolated directory.
 Staged image contract (all under --image-root, root-owned):
   opt/cadence/node/bin/node                  pinned Node binary
   opt/cadence/node/observer.mjs              pinned observer extension
-  opt/cadence/node/pi.mjs                    pinned Pi 1.4.0 CLI entry
+  opt/cadence/node/pi.mjs                    pinned Pi 1.5.2 CLI entry
   opt/cadence/node/cadence_seal.node         reviewed NAPI seal addon, staged by
                                              --stage-seal BEFORE image construction
   opt/cadence/material/**                    pinned material graph (Pi install, policy)
@@ -437,7 +437,7 @@ def main() -> None:
     ]
     registry_pin = registry_digest({
         "v": 1,
-        "pi_version": "1.4.0",
+        "pi_version": "1.5.2",
         "tools": projection_tools,
     })
 

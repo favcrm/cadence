@@ -389,9 +389,8 @@ export const COMPACTION_FAILURE_TEXT =
 export const BOARD_MESSAGE_KIND = "tenant.board.message";
 
 /**
- * Version of the bundled operational skill catalog. An application stamps its
- * domain drafts with it; the runtime's skill manifest uses the same value as
- * its fingerprint.
+ * Version of the bundled operational skill catalog that applications stamp
+ * onto domain drafts. The engine fingerprints its rendered catalog separately.
  */
 export const OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 

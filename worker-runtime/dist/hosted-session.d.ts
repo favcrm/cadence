@@ -35,9 +35,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     private resolvedModel;
     constructor(ctx: DurableObjectState, env: Env, options: HostedSessionOptions);
     /**
-     * SSE for this conversation: the engine's snapshot, then one batch per
-     * committed change. The stream lives in memory, so a client that reconnects
-     * gets a fresh snapshot rather than a cursor.
+     * Board transcript SSE and owner-only diagnostic views. Diagnostic reconnects
+     * get a fresh full view; board reconnects resume from a transcript cursor.
      */
     fetch(request: Request): Promise<Response>;
     /**
