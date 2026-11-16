@@ -2490,11 +2490,15 @@ button.refchip:hover {
   .app-header[data-installed-app] .header-breadcrumb { order: 0; flex: 1 1 0%; gap: .375rem; }
   .app-header[data-installed-app] .app-header-utilities { display: none; }
   .app-header-location-target, .app-header-location { gap: .375rem; }
-  .app-header-version { display: none; }
 }
 @media (width < 640px) {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
   .header-breadcrumb { order: 1; flex: 0 0 100%; }
+}
+@media (width < 420px) {
+  .app-header[data-installed-app] { flex-wrap: wrap; row-gap: .125rem; }
+  .app-header[data-installed-app] .header-breadcrumb { order: 1; flex: 0 0 100%; padding-bottom: .25rem; }
+  .app-header[data-installed-app] .app-header-app-actions { margin-left: auto; }
 }
 /* CAD-1312: the configured organisation name truncates inside a bounded
    span so a long configured name never pushes the status controls out. */

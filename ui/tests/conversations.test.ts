@@ -322,6 +322,9 @@ await pick("Spring launch");
     await conversationThread("native-gen").refresh();
   });
   equal(disclosure.getAttribute("aria-expanded"), "true", "a native permission request reveals its approval controls");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a"); });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "content navigation reveals the narrow workspace even with a pending decision");
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation does not persist a collapse over the pending decision");
   threads["native-other-gen"].push({
     ...ent(1, "system", "message", "Permission requested (permission-native-other, risk low): echo other", null),
     payload: { source: "permission" },

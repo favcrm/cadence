@@ -715,6 +715,17 @@ for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-soci
     equal(assistant.getAttribute("aria-expanded"), "false", "section-only navigation reveals the narrow workspace");
     equal(readChatCollapsedChoice(installId), false, "section-only navigation does not persist a collapse");
     await React.act(async () => { cold.unmount(); });
+    history.pushState(null, "", `/app-installations/${installId}?tab=insights&hr=leave&accounting=reports`);
+    const destination = createRoot(surface);
+    await React.act(async () => {
+      destination.render(React.createElement(AppShell, { installId, viewer: { operator: true, readOnly: false } }));
+    });
+    await settle(() => {
+      equal(header().querySelector('[aria-current="page"]')?.textContent, expected, "the new app shell resolves the requested section");
+      equal(surface.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "false", "a section link reveals the workspace after the app shell remounts");
+    });
+    equal(readChatCollapsedChoice(installId), false, "opening a section leaves the expanded preference intact");
+    await React.act(async () => { destination.unmount(); });
     surface.remove();
   }
 }

@@ -518,6 +518,7 @@ export default function AppShell({
   const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
   const [narrow, setNarrow] = useState(() => window.innerWidth < 1024);
   const [narrowWorkspace, setNarrowWorkspace] = useState<string | null>(null);
+  const initialAppNavigation = useRef<string | null>(installId);
   useEffect(() => {
     const resize = () => {
       const next = window.innerWidth < 1024;
@@ -535,9 +536,13 @@ export default function AppShell({
   }, [installId]);
   const pendingForInstall = pendingDecision.installId === installId && pendingDecision.pending;
   const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingForInstall) ||
-    (narrow && narrowWorkspace === installId && !pendingForInstall);
+    (narrow && narrowWorkspace === installId);
+  useEffect(() => {
+    if (pendingForInstall) setNarrowWorkspace(null);
+  }, [installId, pendingForInstall]);
   const chatToggleRef = useRef<HTMLButtonElement | null>(null);
   const collapseChat = useCallback((collapsed: boolean) => {
+    initialAppNavigation.current = null;
     setNarrowWorkspace(null);
     setChatCollapsed(collapsed);
     if (collapsed) chatToggleRef.current?.focus({ preventScroll: true });
@@ -775,6 +780,29 @@ export default function AppShell({
     () => screenNavigation ?? parseNavigation(installation?.navigation),
     [installation?.navigation, screenNavigation],
   );
+  // A fresh app shell can be mounted for a section link while its saved
+  // assistant preference is open. Show that destination without persisting
+  // a collapse; a conversation link or an explicit toggle still wins.
+  useEffect(() => {
+    if (initialAppNavigation.current === null) return;
+    if (!narrow || initialAppNavigation.current !== installId) {
+      initialAppNavigation.current = null;
+      return;
+    }
+    const search = href.split("?")[1] ?? "";
+    const params = new URLSearchParams(search);
+    if (params.has("conversation")) {
+      initialAppNavigation.current = null;
+      return;
+    }
+    if (params.has("record") || params.get("appview") === "new" ||
+      (effectiveNavigation !== null && sectionFromSearch(search, effectiveNavigation) !== effectiveNavigation.default_section)) {
+      initialAppNavigation.current = null;
+      setNarrowWorkspace(installId);
+    } else if (effectiveNavigation !== null) {
+      initialAppNavigation.current = null;
+    }
+  }, [effectiveNavigation, href, installId, narrow]);
   // Content navigation reveals the narrow workspace; context/chat-only URL writes do not.
   const previousAppNavigation = useRef({ installId, href });
   useEffect(() => {
@@ -786,6 +814,7 @@ export default function AppShell({
     const before = new URLSearchParams(previousSearch);
     const after = new URLSearchParams(currentSearch);
     if (before.get("conversation") !== after.get("conversation")) {
+      initialAppNavigation.current = null;
       setNarrowWorkspace(null);
       return;
     }
