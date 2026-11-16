@@ -362,6 +362,7 @@ for (const [code, reason] of [
   ["app_version_changed", "the app changed after the request was staged"],
   ["app_version_unverified", "the reviewed app version cannot be verified"],
   ["batch_unconfirmed", "the earlier batch result cannot be verified"],
+  ["record_exists", "a record with that id already exists"],
 ] as const) {
   actions = [customer("a1", { title: "Synthetic {reason} {guidance}" })];
   onDecide = (id) => {

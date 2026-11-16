@@ -267,6 +267,7 @@ const UNCONFIRMED_RESULTS: Record<string, true> = {
   app_version_changed: true,
   app_version_unverified: true,
   batch_unconfirmed: true,
+  record_exists: true,
 };
 export const UNCONFIRMED_WRITE_GUIDANCE = "Check the app's records and audit history before submitting a new request.";
 
