@@ -530,6 +530,33 @@ verbs (`delivery check`, `delivery enqueue`, `audit scope`, `audit approve`
 `audit digest`, `audit revoke`) and `scripts/enqueue-reviewed --org <org>`
 all fail closed when a hosted org is unreachable or returns a refusal.
 
+*Hosted approval channel step-up policy (`CAD-2332`).* Hosted merge
+approvals intentionally split by credential channel rather than forcing
+browser Email-OTP onto CLI invocations:
+- **Browser board approvals** (`POST /api/approvals/approve` and
+  `POST /api/approvals/merge`) rely on ambient browser cookie sessions
+  (`hosted_board_sessions`) and therefore require a 15-minute (`900`s)
+  Email-OTP freshness window (`hosted_board_sessions.authenticated_at`). Signing
+  in at `POST /__platform/session` persists `authenticated_at` from the active
+  Email-OTP platform session (`operator-token:`, logins older than `900`s, and
+  pre-migration rows do not satisfy freshness, and sliding `expires_at` renewal
+  never advances `authenticated_at`); when missing or stale,
+  `POST /api/approvals/step-up/send` + `POST /api/approvals/step-up/verify`
+  stamps `authenticated_at` inline (6-digit code, 10-minute challenge TTL, 5
+  attempts, 60s cooldown).
+- **Hosted CLI approvals** (`cadence --org <slug> audit approve`,
+  `audit_approve_project`, `audit_accept_revise_project`) do **not** require
+  browser Email-OTP step-up: they never accept `hosted_board_sessions`
+  cookies, authenticate via the owner's dedicated `0600` `cli-<slug>.json`
+  credential file (`hct_` bearer + optional renewable `cli_session`, minted
+  via `cadence login --audit-approve`) with `audit.approve` scope exchanged for
+  a signed `hosted-cadence-cli.v1` envelope at `/__platform/cli/authorize`,
+  refuse `CADENCE_ALIAS` / agent credentials and non-owners, revalidate live
+  owner + `audit.approve` authority (`revalidateProjectWrite`) immediately
+  before insert, and record `recorded_via: "hosted-owner-login"` (treated as
+  `board_revocable: false` by `GET /api/approvals/state` and
+  `POST /api/approvals/:id/revoke`).
+
 What the audit **cannot** detect:
 
 - Whether the GitHub login that posted `qa-verdict` is the same human

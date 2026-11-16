@@ -527,6 +527,58 @@ function LegacyMergeReview({ need, readOnly, hosted, index, total, onDone, onClo
               )}
             </>
           )}
+          {a.stepUpOpen && !a.approved && !a.revoked && !a.member && (
+            <div className="rv-gate-otp" aria-label={t("Email verification")}>
+              <h4 className="rv-h mt-0">{t("Email verification")}</h4>
+              {!a.challenge ? (
+                <p className="rv-note m-0">
+                  {t("Verify with a 6-digit email code before approving this version.")}
+                </p>
+              ) : (
+                <>
+                  <p className="rv-note m-0">
+                    {a.challenge.email_hint
+                      ? `${t("Verification code sent to")} ${a.challenge.email_hint}`
+                      : t("Verification code sent to your owner email.")}
+                  </p>
+                  <div className="rv-gate-otp-row">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={6}
+                      pattern="[0-9]{6}"
+                      className="field rv-gate-otp-input num"
+                      aria-label={t("6-digit verification code")}
+                      placeholder="000000"
+                      disabled={a.busy !== null || !!block}
+                      value={a.otpCode}
+                      onChange={(e) => a.setOtpCode(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === "Enter" &&
+                          a.otpCode.length === 6 &&
+                          a.busy === null &&
+                          !block
+                        ) {
+                          e.preventDefault();
+                          void a.verifyAndApprove();
+                        }
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={a.busy !== null || !!block}
+                      onClick={() => void a.sendStepUpCode()}
+                    >
+                      {t("Resend code")}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           {a.revoked && <p className="rv-note">{t("Your approval was taken back. A new version needs a fresh approval.")}</p>}
           {a.member && <p className="rv-note">{t("Only the board's owner can approve or publish.")}</p>}
           {errors.map((text) => (
@@ -561,15 +613,26 @@ function LegacyMergeReview({ need, readOnly, hosted, index, total, onDone, onClo
               ) : (
                 <Button
                   variant="primary"
-                  disabled={!!block || !a.available || a.revoked || a.member || a.busy !== null}
-                  loading={a.busy === "approve"}
+                  disabled={
+                    !!block ||
+                    !a.available ||
+                    a.revoked ||
+                    a.member ||
+                    a.busy !== null ||
+                    (a.stepUpOpen && Boolean(a.challenge) && a.otpCode.length !== 6)
+                  }
+                  loading={a.busy === "approve" || a.busy === "send_code" || a.busy === "verify_approve"}
                   title={block ? t(READ_ONLY_COPY) : undefined}
                   onClick={() => {
                     a.clearError();
-                    a.approve();
+                    void (a.stepUpOpen ? a.verifyAndApprove() : a.approve());
                   }}
                 >
-                  {t("Approve this version")}
+                  {a.stepUpOpen
+                    ? a.challenge
+                      ? t("Verify & approve")
+                      : t("Send 6-digit code")
+                    : t("Approve this version")}
                 </Button>
               )
             }
@@ -601,12 +664,25 @@ function LegacyMergeReview({ need, readOnly, hosted, index, total, onDone, onClo
               <>
                 {a.available && !a.approved && !a.revoked && (
                   <Button
-                    disabled={!!block || a.member || a.busy !== null || m.busy !== null}
-                    loading={a.busy === "approve"}
+                    disabled={
+                      !!block ||
+                      a.member ||
+                      a.busy !== null ||
+                      m.busy !== null ||
+                      (a.stepUpOpen && Boolean(a.challenge) && a.otpCode.length !== 6)
+                    }
+                    loading={a.busy === "approve" || a.busy === "send_code" || a.busy === "verify_approve"}
                     title={block ? t(READ_ONLY_COPY) : undefined}
-                    onClick={() => { m.clearError(); a.approve(); }}
+                    onClick={() => {
+                      m.clearError();
+                      void (a.stepUpOpen ? a.verifyAndApprove() : a.approve());
+                    }}
                   >
-                    {t("Approve this version")}
+                    {a.stepUpOpen
+                      ? a.challenge
+                        ? t("Verify & approve")
+                        : t("Send 6-digit code")
+                      : t("Approve this version")}
                   </Button>
                 )}
                 <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>
