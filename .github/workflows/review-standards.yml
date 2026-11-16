@@ -443,8 +443,15 @@ jobs:
               let i;
               while ((i = buf.indexOf('\n\n')) >= 0) {
                 const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-                const fields = ev.split('\n').filter((l) => l === 'data' || l.startsWith('data:'));
-                if (!fields.length) continue; // keep-alive comments carry no data
+                const lines = ev.split('\n');
+                const fields = lines.filter((l) => l === 'data' || l.startsWith('data:'));
+                if (largeInput && lines.some((l) => l && !l.startsWith(':') && l !== 'data' &&
+                    !['data:', 'event:', 'id:', 'retry:'].some((p) => l.startsWith(p)))) failed = true;
+                if (largeInput && lines.some((l) => l.startsWith('event:') && l.slice(6).trim() === 'error')) failed = true;
+                if (!fields.length) {
+                  if (largeInput && lines.some((l) => l && !l.startsWith(':'))) failed = true;
+                  continue; // comment-only keep-alives carry no data
+                }
                 const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
                 if (data === '[DONE]') {
                   if (largeInput && (!sawMetadata || sawDone)) failed = true;
