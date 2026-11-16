@@ -18,8 +18,13 @@
 //! directly; a non-native host (the hosted runtime) reaches the same
 //! function through `evaluate`'s `agent.form.check`, so the two gates
 //! cannot drift.
+//!
+//! CAD-2345: [`compile`] builds that envelope from a flat field list (the
+//! agent's `FormSpec`), so a model describes fields and never writes A2UI;
+//! the result still goes through [`check`], which refuses an input whose
+//! `value` is not a `{"@path"}` binding.
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -241,6 +246,339 @@ pub fn check(envelope: &Value) -> Result<Form> {
     })
 }
 
+const FIELD_TYPES: &[&str] = &[
+    "text",
+    "longtext",
+    "number",
+    "email",
+    "date",
+    "time",
+    "datetime",
+    "choice",
+    "multichoice",
+    "checkbox",
+];
+const MAX_FIELDS: usize = 12;
+/// A field id is the component id `field_<id>`, which must fit `MAX_ID`.
+const MAX_FIELD_ID: usize = MAX_ID - "field_".len();
+/// Room left in a check message for the label ("{label} is required", "{label} must be an email address").
+const REQUIRED_SUFFIX: usize = " is required".len();
+const EMAIL_SUFFIX: usize = " must be an email address".len();
+const MAX_SUBMIT: usize = 60;
+const DEFAULT_SUBMIT: &str = "Send answer";
+
+fn refuse(path: &str, why: impl std::fmt::Display) -> Error {
+    Error::rejected(format!("spec {path}: {why}"))
+}
+
+/// A spec string: the same rule as a form string, worded for the spec.
+fn spec_text(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
+    one_line(v, max, newline_ok).map_err(|why| refuse(path, why))
+}
+
+/// Compile a flat field list (the agent's `FormSpec`) into the A2UI envelope
+/// and run it through [`check`], which stays the backstop. The envelope is
+/// deterministic, so the same spec always gives the same bytes and digest.
+pub fn compile(spec: &Value) -> Result<Form> {
+    let top = spec
+        .as_object()
+        .ok_or_else(|| refuse("/", "must be an object"))?;
+    if let Some(k) = top
+        .keys()
+        .find(|k| !["id", "title", "intro", "fields", "submit"].contains(&k.as_str()))
+    {
+        return Err(refuse(&format!("/{k}"), "is not accepted"));
+    }
+    let surface = match top.get("id") {
+        Some(id) if ident_ok(id) => id.clone(),
+        Some(_) => return Err(refuse("/id", "must be an id of 1-64 [A-Za-z0-9_-]")),
+        None => Value::from("form"),
+    };
+    let title = top.get("title");
+    if let Some(t) = title {
+        spec_text(t, "/title", MAX_LABEL, false)?;
+    }
+    let intro = top.get("intro");
+    if let Some(t) = intro {
+        spec_text(t, "/intro", MAX_TEXT, true)?;
+    }
+    let submit = match top.get("submit") {
+        Some(t) => {
+            spec_text(t, "/submit", MAX_SUBMIT, false)?;
+            t.clone()
+        }
+        None => Value::from(DEFAULT_SUBMIT),
+    };
+    let list = top
+        .get("fields")
+        .ok_or_else(|| refuse("/fields", "is required"))?
+        .as_array()
+        .ok_or_else(|| refuse("/fields", "must be a list"))?;
+    if list.is_empty() || list.len() > MAX_FIELDS {
+        return Err(refuse("/fields", format!("takes 1-{MAX_FIELDS} entries")));
+    }
+
+    let mut data = Map::new();
+    let mut inputs: Vec<Value> = Vec::with_capacity(list.len());
+    let mut ids: Vec<&str> = Vec::with_capacity(list.len());
+    let mut context = Map::new();
+    for (i, f) in list.iter().enumerate() {
+        let at = format!("/fields/{i}");
+        let (id, input, initial) = compile_field(f, &at, &ids)?;
+        ids.push(id);
+        context.insert(id.to_string(), json!({"@path": format!("/{id}")}));
+        data.insert(id.to_string(), initial);
+        inputs.push(input);
+    }
+
+    let mut children: Vec<Value> = Vec::new();
+    let mut components: Vec<Value> = vec![
+        json!({"id": "root", "component": "Card", "child": "body"}),
+        Value::Null, // body, filled once its children are known
+    ];
+    if let Some(t) = title {
+        children.push("title".into());
+        components.push(json!({"id": "title", "component": "Text", "text": t}));
+    }
+    if let Some(t) = intro {
+        children.push("intro".into());
+        components.push(json!({"id": "intro", "component": "Text", "variant": "body", "text": t}));
+    }
+    children.extend(ids.iter().map(|id| Value::from(format!("field_{id}"))));
+    children.push("submit".into());
+    components[1] = json!({"id": "body", "component": "Column", "children": children});
+    components.extend(inputs);
+    components.push(json!({
+        "id": "submit", "component": "Button", "variant": "primary",
+        "child": "submit_label",
+        "action": {"event": {"name": "answer", "context": context}},
+    }));
+    components.push(json!({"id": "submit_label", "component": "Text", "text": submit}));
+
+    check(&json!({"version": "1.0", "createSurface": {
+        "surfaceId": surface, "catalogId": BASIC_CATALOG,
+        "dataModel": data, "components": components,
+    }}))
+}
+
+/// One field: its id, its input component and its starting data value.
+fn compile_field<'a>(f: &'a Value, at: &str, seen: &[&str]) -> Result<(&'a str, Value, Value)> {
+    let obj = f
+        .as_object()
+        .ok_or_else(|| refuse(at, "must be an object"))?;
+    if let Some(k) = obj.keys().find(|k| {
+        ![
+            "id",
+            "label",
+            "type",
+            "options",
+            "default",
+            "required",
+            "placeholder",
+        ]
+        .contains(&k.as_str())
+    }) {
+        return Err(refuse(&format!("{at}/{k}"), "is not accepted"));
+    }
+    let need = |k: &str| {
+        obj.get(k)
+            .ok_or_else(|| refuse(&format!("{at}/{k}"), "is required"))
+    };
+    let idv = need("id")?;
+    let id = idv.as_str().unwrap_or_default();
+    if !ident_ok(idv) || id.len() > MAX_FIELD_ID {
+        return Err(refuse(
+            &format!("{at}/id"),
+            format!("must be an id of 1-{MAX_FIELD_ID} [A-Za-z0-9_-]"),
+        ));
+    }
+    if RESERVED.contains(&id) {
+        return Err(refuse(&format!("{at}/id"), format!("'{id}' is reserved")));
+    }
+    if seen.contains(&id) {
+        return Err(refuse(&format!("{at}/id"), format!("'{id}' is used twice")));
+    }
+    let label = need("label")?;
+    spec_text(label, &format!("{at}/label"), MAX_LABEL, false)?;
+    let ty = need("type")?.as_str().unwrap_or_default();
+    if !FIELD_TYPES.contains(&ty) {
+        return Err(refuse(
+            &format!("{at}/type"),
+            format!("must be one of {}", FIELD_TYPES.join(", ")),
+        ));
+    }
+    let picks = matches!(ty, "choice" | "multichoice");
+    let options = match (obj.get("options"), picks) {
+        (Some(_), false) => {
+            return Err(refuse(
+                &format!("{at}/options"),
+                "is only allowed for choice and multichoice fields",
+            ));
+        }
+        (None, true) => {
+            return Err(refuse(
+                &format!("{at}/options"),
+                "is required for choice and multichoice fields",
+            ));
+        }
+        (Some(o), true) => Some(compile_options(o, &format!("{at}/options"))?),
+        (None, false) => None,
+    };
+    let placeholder = obj.get("placeholder");
+    if let Some(p) = placeholder {
+        if !matches!(ty, "text" | "longtext" | "number" | "email") {
+            return Err(refuse(
+                &format!("{at}/placeholder"),
+                "is only allowed for text, longtext, number and email fields",
+            ));
+        }
+        spec_text(p, &format!("{at}/placeholder"), MAX_LABEL, false)?;
+    }
+    let required = match obj.get("required") {
+        None => false,
+        Some(r) => r
+            .as_bool()
+            .ok_or_else(|| refuse(&format!("{at}/required"), "must be true or false"))?,
+    };
+
+    if required && ty == "checkbox" {
+        return Err(refuse(
+            &format!("{at}/required"),
+            "is not allowed for a checkbox field",
+        ));
+    }
+    let suffix = match (ty, required) {
+        ("email", _) => EMAIL_SUFFIX,
+        (_, true) => REQUIRED_SUFFIX,
+        _ => 0,
+    };
+    if suffix > 0 && text_of(label).chars().count() > MAX_LABEL - suffix {
+        return Err(refuse(
+            &format!("{at}/label"),
+            format!(
+                "is too long for its check message (at most {} characters)",
+                MAX_LABEL - suffix
+            ),
+        ));
+    }
+
+    let initial = match (obj.get("default"), ty) {
+        (None, "checkbox") => Value::Bool(false),
+        (None, "choice" | "multichoice") => json!([]),
+        (None, _) => Value::from(""),
+        (Some(d), _) => {
+            let wrong = |what: &str| {
+                refuse(
+                    &format!("{at}/default"),
+                    format!("must be {what} for a {ty} field"),
+                )
+            };
+            match ty {
+                "checkbox" if d.is_boolean() => d.clone(),
+                "checkbox" => return Err(wrong("true or false")),
+                "number" if d.is_number() => Value::from(d.to_string()),
+                "number" => return Err(wrong("a number")),
+                "choice" if d.is_string() => json!([d]),
+                "choice" => return Err(wrong("one option value")),
+                "multichoice" if d.as_array().is_some_and(|a| a.iter().all(Value::is_string)) => {
+                    d.clone()
+                }
+                "multichoice" => return Err(wrong("a list of option values")),
+                _ if d.is_string() => d.clone(),
+                _ => return Err(wrong("a string")),
+            }
+        }
+    };
+
+    let mut c = Map::new();
+    c.insert("id".into(), format!("field_{id}").into());
+    c.insert("label".into(), label.clone());
+    c.insert("value".into(), json!({"@path": format!("/{id}")}));
+    let (component, variant) = match ty {
+        "text" | "email" => ("TextField", Some("shortText")),
+        "longtext" => ("TextField", Some("longText")),
+        "number" => ("TextField", Some("number")),
+        "choice" => ("ChoicePicker", Some("mutuallyExclusive")),
+        "multichoice" => ("ChoicePicker", Some("multipleSelection")),
+        "checkbox" => ("CheckBox", None),
+        _ => ("DateTimeInput", None),
+    };
+    c.insert("component".into(), component.into());
+    if let Some(v) = variant {
+        c.insert("variant".into(), v.into());
+    }
+    if component == "DateTimeInput" {
+        c.insert("enableDate".into(), (ty != "time").into());
+        c.insert("enableTime".into(), (ty != "date").into());
+    }
+    if let Some(o) = options {
+        c.insert("options".into(), o);
+    }
+    if let Some(p) = placeholder {
+        c.insert("placeholder".into(), p.clone());
+    }
+    let bound = json!({"@path": format!("/{id}")});
+    let rule = |call: &str, message: String| json!({"condition": {"@call": call, "args": {"value": bound}}, "message": message});
+    let mut checks = Vec::new();
+    if required {
+        checks.push(rule("required", format!("{} is required", text_of(label))));
+    }
+    if ty == "email" {
+        checks.push(rule(
+            "email",
+            format!("{} must be an email address", text_of(label)),
+        ));
+    }
+    if !checks.is_empty() {
+        c.insert("@checks".into(), checks.into());
+    }
+    Ok((id, Value::Object(c), initial))
+}
+
+fn text_of(v: &Value) -> &str {
+    v.as_str().unwrap_or_default()
+}
+
+/// 1-12 `{value, label}` entries with unique values, copied as `{label, value}`.
+fn compile_options(v: &Value, at: &str) -> Result<Value> {
+    let list = v.as_array().ok_or_else(|| refuse(at, "must be a list"))?;
+    if list.is_empty() || list.len() > MAX_OPTIONS {
+        return Err(refuse(at, format!("takes 1-{MAX_OPTIONS} entries")));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    let mut seen: Vec<&str> = Vec::with_capacity(list.len());
+    for (i, o) in list.iter().enumerate() {
+        let p = format!("{at}/{i}");
+        let obj = o
+            .as_object()
+            .ok_or_else(|| refuse(&p, "must be an object"))?;
+        if let Some(k) = obj
+            .keys()
+            .find(|k| !["value", "label"].contains(&k.as_str()))
+        {
+            return Err(refuse(&format!("{p}/{k}"), "is not accepted"));
+        }
+        let get = |k: &str| -> Result<&Value> {
+            let x = obj
+                .get(k)
+                .ok_or_else(|| refuse(&format!("{p}/{k}"), "is required"))?;
+            spec_text(x, &format!("{p}/{k}"), MAX_LABEL, false)?;
+            Ok(x)
+        };
+        let (value, label) = (get("value")?, get("label")?);
+        let name = text_of(value);
+        if seen.contains(&name) {
+            return Err(refuse(
+                &format!("{p}/value"),
+                format!("'{name}' is used twice"),
+            ));
+        }
+        seen.push(name);
+        out.push(json!({"label": label, "value": value}));
+    }
+    Ok(Value::Array(out))
+}
+
 fn kind(c: &Map<String, Value>) -> &str {
     c.get("component")
         .and_then(Value::as_str)
@@ -282,6 +620,14 @@ fn component<'a>(v: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
     for &(field, ty, needed) in spec {
         let at = format!("{path}/{field}");
         match obj.get(field) {
+            // An input shows what its binding names; a literal would start
+            // the field at a value the answer never reads back (CAD-2345).
+            Some(v) if field == "value" && !v.is_object() => {
+                return Err(bad(
+                    &at,
+                    "must be a {\"@path\"} binding; put the default in dataModel",
+                ));
+            }
             Some(v) => value(ty, v, &at)?,
             None if needed => return Err(bad(&at, "is required")),
             None => {}
@@ -397,9 +743,21 @@ fn literal<'a>(c: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 fn fallback(order: &[&Map<String, Value>]) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut titled = false;
+    // A Button's label is not content, so it is never the title line.
+    let button_labels: Vec<&str> = order
+        .iter()
+        .filter(|c| kind(c) == "Button")
+        .filter_map(|c| c.get("child").and_then(Value::as_str))
+        .collect();
     for &c in order {
         match kind(c) {
             "Text" if !titled => {
+                if c.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| button_labels.contains(&id))
+                {
+                    continue;
+                }
                 if let Some(t) = literal(c, "text").filter(|t| !t.is_empty()) {
                     lines.push(t.to_string());
                     titled = true;
@@ -578,12 +936,17 @@ fn fields(obj: &Map<String, Value>, path: &str, allowed: &[&str]) -> Result<()> 
 }
 
 fn ident(v: &Value, path: &str) -> Result<()> {
+    if ident_ok(v) {
+        Ok(())
+    } else {
+        Err(bad(path, "must be an id of 1-64 [A-Za-z0-9_-]"))
+    }
+}
+
+fn ident_ok(v: &Value) -> bool {
     let s = v.as_str().unwrap_or_default();
     let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
-    if s.is_empty() || s.len() > MAX_ID || !s.chars().all(ok) {
-        return Err(bad(path, "must be an id of 1-64 [A-Za-z0-9_-]"));
-    }
-    Ok(())
+    !s.is_empty() && s.len() <= MAX_ID && s.chars().all(ok)
 }
 
 /// A one-line string of at most `max` characters: no control, bidi or
@@ -599,18 +962,22 @@ fn body(v: &Value, path: &str, max: usize) -> Result<()> {
 }
 
 fn string(v: &Value, path: &str, max: usize, newline_ok: bool) -> Result<()> {
-    let s = v.as_str().ok_or_else(|| bad(path, "must be a string"))?;
+    one_line(v, max, newline_ok).map_err(|why| bad(path, why))
+}
+
+/// The string rule, as the reason it fails (so a spec can word its own path).
+fn one_line(v: &Value, max: usize, newline_ok: bool) -> std::result::Result<(), String> {
+    let s = v.as_str().ok_or("must be a string")?;
     if s.chars().count() > max {
-        return Err(bad(path, format!("is longer than {max} characters")));
+        return Err(format!("is longer than {max} characters"));
     }
     let bidi_or_line_break = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     if s.chars()
         .any(|c| (c.is_control() && !(newline_ok && c == '\n')) || bidi_or_line_break(c))
     {
-        return Err(bad(
-            path,
-            "must not carry control, bidi or (outside body text) newline characters",
-        ));
+        return Err(
+            "must not carry control, bidi or (outside body text) newline characters".to_string(),
+        );
     }
     Ok(())
 }
@@ -940,8 +1307,7 @@ mod tests {
         refused(&v, "/dataModel/time: must be the date or time shape");
 
         let mut v = weekly();
-        components(&mut v)[3]["value"] = json!(["Operator approves"]);
-        components(&mut v)[8]["action"]["event"]["context"] = json!({});
+        v["createSurface"]["dataModel"]["projects"] = json!(["Operator approves"]);
         refused(
             &v,
             "must be a list of its option values for ChoicePicker 'projects'",
@@ -978,7 +1344,8 @@ mod tests {
         let number = |value: &str| {
             let mut v = weekly();
             components(&mut v)[7] = json!({"id": "closed", "component": "TextField",
-                "label": "Count", "variant": "number", "value": value});
+                "label": "Count", "variant": "number", "value": {"@path": "/count"}});
+            v["createSurface"]["dataModel"]["count"] = json!(value);
             v
         };
         for bad_number in ["+5", "5.", "."] {
@@ -991,11 +1358,14 @@ mod tests {
             check(&number(good)).expect("a valid HTML number is a valid default");
         }
 
-        // A literal value's refusal names the component's index, like every path.
+        // A literal value is refused at the component's index, like every path.
         let mut v = weekly();
         components(&mut v)[3]["value"] = json!(["Operator approves"]);
         components(&mut v)[8]["action"]["event"]["context"] = json!({});
-        refused(&v, "/createSurface/components/3/value:");
+        refused(
+            &v,
+            "/createSurface/components/3/value: must be a {\"@path\"} binding",
+        );
 
         let mut v = weekly();
         v["createSurface"]["catalogId"] = json!("https://example.com/catalog.json");
@@ -1053,5 +1423,130 @@ mod tests {
         components(&mut v).retain(|c| c["id"] != "send" && c["id"] != "send_label");
         components(&mut v)[1]["children"] = json!(["title", "projects", "when", "closed"]);
         refused(&v, "needs a Button");
+    }
+
+    fn spec() -> Value {
+        json!({"title": "Intake", "fields": [
+            {"id": "name", "label": "Name", "type": "text", "required": true},
+            {"id": "size", "label": "Size", "type": "choice", "default": "l",
+             "options": [{"value": "s", "label": "Small"}, {"value": "l", "label": "Large"}]},
+            {"id": "age", "label": "Age", "type": "number", "default": 42}
+        ]})
+    }
+
+    fn spec_refused(v: &Value, message: &str) {
+        let err = compile(v)
+            .expect_err("the spec must be refused")
+            .to_string();
+        assert_eq!(err, message);
+    }
+
+    #[test]
+    fn compile_builds_a_deterministic_bound_form() {
+        let a = compile(&spec()).unwrap();
+        assert_eq!(a.digest, compile(&spec()).unwrap().digest);
+        let c = &a.envelope["createSurface"];
+        assert_eq!(c["surfaceId"], "form");
+        assert_eq!(
+            c["dataModel"],
+            json!({"name": "", "size": ["l"], "age": "42"})
+        );
+        let list = c["components"].as_array().unwrap();
+        assert_eq!(
+            list[1]["children"],
+            json!(["title", "field_name", "field_size", "field_age", "submit"])
+        );
+        assert_eq!(list[3]["value"], json!({"@path": "/name"}));
+        assert_eq!(list[3]["@checks"][0]["message"], "Name is required");
+        assert_eq!(list[list.len() - 1]["text"], "Send answer");
+    }
+
+    #[test]
+    fn compile_refuses_a_bad_spec_naming_the_pointer() {
+        let mut v = spec();
+        v["fields"][1]["options"][1]["value"] = json!("s");
+        spec_refused(&v, "spec /fields/1/options/1/value: 's' is used twice");
+        let mut v = spec();
+        v["fields"][0]["placeholder"] = json!("x\ny");
+        spec_refused(&v, "spec /fields/0/placeholder: must not carry control, bidi or (outside body text) newline characters");
+        let mut v = spec();
+        v["fields"][2]["type"] = json!("slider");
+        assert!(compile(&v)
+            .unwrap_err()
+            .to_string()
+            .starts_with("spec /fields/2/type: must be one of"));
+        let mut v = spec();
+        v["title"] = json!("a\nb");
+        assert!(compile(&v)
+            .unwrap_err()
+            .to_string()
+            .starts_with("spec /title:"));
+        spec_refused(&json!({"fields": []}), "spec /fields: takes 1-12 entries");
+        spec_refused(&json!({}), "spec /fields: is required");
+    }
+
+    #[test]
+    fn compile_refuses_what_the_form_cannot_show_through_check() {
+        let mut v = spec();
+        v["fields"][1]["default"] = json!("xl");
+        let err = compile(&v).unwrap_err().to_string();
+        assert!(
+            err.starts_with("form /createSurface/dataModel/size:"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compile_caps_ids_and_labels_so_generated_parts_fit() {
+        let mut v = spec();
+        v["fields"][0]["id"] = json!("a".repeat(MAX_FIELD_ID));
+        compile(&v).expect("the longest field id compiles");
+        v["fields"][0]["id"] = json!("a".repeat(MAX_FIELD_ID + 1));
+        spec_refused(&v, "spec /fields/0/id: must be an id of 1-58 [A-Za-z0-9_-]");
+
+        // "<label> is required" and "<label> must be an email address" fit 200.
+        let mut v = spec();
+        v["fields"][0]["label"] = json!("l".repeat(188));
+        compile(&v).expect("188 characters fit 'is required'");
+        v["fields"][0]["label"] = json!("l".repeat(189));
+        spec_refused(
+            &v,
+            "spec /fields/0/label: is too long for its check message (at most 188 characters)",
+        );
+        let mut v = json!({"fields": [{"id": "e", "label": "l".repeat(175), "type": "email"}]});
+        compile(&v).expect("175 characters fit the email message");
+        v["fields"][0]["label"] = json!("l".repeat(176));
+        spec_refused(
+            &v,
+            "spec /fields/0/label: is too long for its check message (at most 175 characters)",
+        );
+        // A label with no generated message keeps the full 200.
+        let v = json!({"fields": [{"id": "e", "label": "l".repeat(200), "type": "text"}]});
+        compile(&v).expect("an unchecked label may use 200");
+    }
+
+    #[test]
+    fn compile_refuses_required_on_a_checkbox() {
+        let v =
+            json!({"fields": [{"id": "ok", "label": "OK", "type": "checkbox", "required": true}]});
+        spec_refused(
+            &v,
+            "spec /fields/0/required: is not allowed for a checkbox field",
+        );
+    }
+
+    #[test]
+    fn fallback_never_takes_the_button_label_as_the_title() {
+        let form =
+            compile(&json!({"fields": [{"id": "n", "label": "Name", "type": "text"}]})).unwrap();
+        assert_eq!(
+            form.fallback,
+            "- Name\nAnswer the form in the board, or reply here."
+        );
+        let form = compile(
+            &json!({"title": "Hi", "fields": [{"id": "n", "label": "Name", "type": "text"}]}),
+        )
+        .unwrap();
+        assert!(form.fallback.starts_with("Hi\n- Name"));
     }
 }

@@ -147,6 +147,23 @@
         "op",
         "input"
       ]
+    },
+    {
+      "description": "Compile an agent's flat field list into the A2UI envelope and check it\n(CAD-2345). The same answer shape as `agent.form.check`, plus `form`.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FormCompileInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "agent.form.compile"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
     }
   ],
   "required": [
@@ -359,6 +376,19 @@
       "additionalProperties": false,
       "required": [
         "form"
+      ]
+    },
+    "FormCompileInput": {
+      "description": "Input of `agent.form.compile`.",
+      "type": "object",
+      "properties": {
+        "spec": {
+          "description": "The agent's `FormSpec`: optional `id`, `title`, `intro` and `submit`,\nand 1-12 `fields`. Unknown keys are refused."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "spec"
       ]
     },
     "ManifestPreflightInput": {
