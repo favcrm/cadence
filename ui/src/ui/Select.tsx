@@ -43,6 +43,10 @@ export type SelectProps = {
   className?: string;
   title?: string;
   "aria-label"?: string;
+  /** Forwarded to the trigger, so a labelled field can mark it invalid
+   *  (`Field`'s control props) and point it at its hint and error. */
+  "aria-invalid"?: boolean;
+  "aria-describedby"?: string;
 };
 
 /**
@@ -66,6 +70,8 @@ export function Select({
 }: SelectProps) {
   const t = useTranslate();
   const ariaLabel = rest["aria-label"];
+  const ariaInvalid = rest["aria-invalid"];
+  const ariaDescribedBy = rest["aria-describedby"];
   const reactId = useId();
   const base = id ?? reactId;
   const listId = `${base}-listbox`;
@@ -276,6 +282,8 @@ export function Select({
         aria-controls={listId}
         aria-activedescendant={activeId}
         aria-label={ariaLabel}
+        aria-invalid={ariaInvalid || undefined}
+        aria-describedby={ariaDescribedBy}
         title={title}
         disabled={disabled}
         onClick={() => {

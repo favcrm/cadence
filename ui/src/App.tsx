@@ -36,6 +36,7 @@ import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
 import Members from "./features/settings/Members";
+import DocumentTypes from "./features/settings/DocumentTypes";
 import { documentsNavHidden, documentsProbe } from "./features/documents/documentsProbe";
 import DocumentsScreen from "./features/documents/DocumentsScreen";
 import { documentsViewer } from "./features/documents/documentsAccess";
@@ -1715,6 +1716,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 `settingsRedirect` has already moved the URL off. */}
             {route.section === "members" && meta?.settings_sections?.includes("members") && (
               <Members viewer={viewer} />
+            )}
+            {/* CAD-2286: hosted only, offered while the board names `documents`
+                in `settings_sections`. The page reads the shared probe and
+                says when the lifecycle is unavailable or unsupported. */}
+            {route.section === "documents" && meta?.settings_sections?.includes("documents") && (
+              <DocumentTypes hosted={documentsHosted} viewer={viewer} viewerSub={viewerSub} />
             )}
             {route.section === "connections" && (
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
