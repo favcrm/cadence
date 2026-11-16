@@ -107,34 +107,58 @@ fn jpeg_error(error: libjpeg_turbo_rs::JpegError) -> ImageError {
     }
 }
 
-fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> {
+fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Result<Decoded> {
     let layout = jpeg::inspect(bytes)?;
     dimensions(layout.width, layout.height, max_side, max_pixels)?;
+    let scaled = cfg!(target_arch = "wasm32")
+        && !native
+        && u64::from(layout.width) * u64::from(layout.height) > OTHER_MAX_PIXELS;
+    // The decoder's estimate assumes unscaled full-size planes even when DCT
+    // scaling is enabled. The Worker module has an independent 96 MiB hard cap.
     let limits = libjpeg_turbo_rs::common::types::DecodeLimits {
         max_width: max_side as usize,
         max_height: max_side as usize,
         max_pixels,
         max_scans: 128,
-        max_memory: Some(DECODE_MEMORY),
+        max_memory: Some(if scaled {
+            192 * 1024 * 1024
+        } else {
+            DECODE_MEMORY
+        }),
     };
-    let decoder = libjpeg_turbo_rs::Decoder::new_with_limits(&bytes[..layout.end], limits)
+    let mut decoder = libjpeg_turbo_rs::Decoder::new_with_limits(&bytes[..layout.end], limits)
         .map_err(jpeg_error)?
         .with_stop_on_warning(true)
         .with_output_format(libjpeg_turbo_rs::PixelFormat::Rgb);
+    if scaled {
+        decoder = decoder.with_scale(
+            libjpeg_turbo_rs::ScalingFactor::try_new(1, 2).map_err(|_| ImageError::Invalid)?,
+        );
+    }
     let icc = decoder.icc_profile().map_err(jpeg_error)?;
     let image = decoder.decode_image().map_err(jpeg_error)?;
-    if image.width != layout.width as usize || image.height != layout.height as usize {
+    let width = if scaled {
+        layout.width.div_ceil(2)
+    } else {
+        layout.width
+    };
+    let height = if scaled {
+        layout.height.div_ceil(2)
+    } else {
+        layout.height
+    };
+    if image.width != width as usize || image.height != height as usize {
         return Err(ImageError::Invalid);
     }
-    let mut mapping = Mapping::new(layout.width, layout.height);
+    let mut mapping = Mapping::new(width, height);
     mapping.exif(layout.orientation)?;
     Ok(Decoded {
         pixels: image.into_vec(),
-        width: layout.width,
+        width,
         channels: 3,
         mapping,
         source_end: layout.end,
-        unchanged: layout.orientation == 1,
+        unchanged: layout.orientation == 1 && !scaled,
         icc,
     })
 }
@@ -309,7 +333,7 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
         OTHER_MAX_PIXELS
     };
     match format {
-        Format::Jpeg => decode_jpeg(bytes, max_side, max_pixels),
+        Format::Jpeg => decode_jpeg(bytes, max_side, max_pixels, native),
         Format::Heic if !native => decode_heic(bytes, max_side, max_pixels),
         Format::Heic => Err(ImageError::Unsupported),
         Format::Png => {
