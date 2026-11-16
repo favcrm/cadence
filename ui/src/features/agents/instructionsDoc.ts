@@ -1,5 +1,5 @@
 import { ApiError } from "../../lib/apiError";
-import type { StoredAgentProfile } from "../../lib/types";
+import type { AvatarLook, StoredAgentProfile } from "../../lib/types";
 import { appliesText } from "./agentRoles";
 
 /**
@@ -20,7 +20,36 @@ export const HOSTED_MAX_UNITS = 8000;
 /** Native counts UTF-8 bytes (`MAX_INSTRUCTIONS_BYTES`). */
 export const NATIVE_MAX_BYTES = 32_000;
 
-export type DocKind = "hosted" | "native";
+/** CAD-2354: `workspace` is the company Master's text (owners), `personal` is
+ *  the member's own assistant's (that member only). Both are fenced by a
+ *  revision like a hosted profile, but live on their own routes. */
+export type DocKind = "hosted" | "native" | "workspace" | "personal";
+export type OwnKind = "workspace" | "personal";
+
+export const isOwnKind = (kind: DocKind | null): kind is OwnKind => kind === "workspace" || kind === "personal";
+
+/** The Master's or the member's instructions as one board read them. The
+ *  workspace revision is a decimal string and the personal one a number; both
+ *  stay as served and are only ever compared for equality. `identity` is the
+ *  Master's current name, tone and look, which its write sends back whole. */
+export interface OwnDoc {
+  text: string;
+  revision: string | number;
+  identity?: { name: string | null; tone: string | null; look: AvatarLook };
+}
+
+/** The calls behind those two kinds. A board without the routes answers
+ *  404/405/501, which `ownUnsupported` recognises. */
+export interface OwnDeps {
+  read: (kind: OwnKind) => Promise<OwnDoc>;
+  /** Writes `text` over `base` and answers the committed document. */
+  write: (kind: OwnKind, base: OwnDoc, text: string) => Promise<OwnDoc>;
+}
+
+/** An older board: the routes are not there, so nothing is editable. */
+export function ownUnsupported(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501);
+}
 
 export interface DocDeps {
   readProfile: (id: string) => Promise<StoredAgentProfile>;
@@ -32,14 +61,14 @@ export interface DocDeps {
 
 /** What a save, or a check after a dropped one, came to. */
 export type DocOutcome =
-  | { kind: "saved"; text: string; profile: StoredAgentProfile | null; applies: string | null }
+  | { kind: "saved"; text: string; profile: StoredAgentProfile | null; applies: string | null; own?: OwnDoc }
   /** Someone else's revision is stored. `profile` is theirs, when it was read. */
-  | { kind: "conflict"; profile: StoredAgentProfile | null }
+  | { kind: "conflict"; profile: StoredAgentProfile | null; own?: OwnDoc | null }
   /** The answer never arrived: the write may or may not have happened. */
   | { kind: "unconfirmed" }
   /** A check found the write did not happen. */
   /** `text` is what a native check read, so a different one can be shown. */
-  | { kind: "not_saved"; profile: StoredAgentProfile | null; text?: string | null }
+  | { kind: "not_saved"; profile: StoredAgentProfile | null; text?: string | null; own?: OwnDoc }
   /** The board said no, so nothing was written. */
   | { kind: "refused"; message: string };
 
@@ -56,7 +85,8 @@ export function textProblem(kind: DocKind, text: string): string | null {
     return bytes > NATIVE_MAX_BYTES ? `Too long: ${bytes.toLocaleString("en")} of ${NATIVE_MAX_BYTES.toLocaleString("en")} bytes.` : null;
   }
   const trimmed = text.trim();
-  if (trimmed.length === 0) return "Write something to save. The board does not keep an empty document.";
+  // Whitespace-only clears the Master's or the member's text; a profile cannot be empty.
+  if (trimmed.length === 0 && !isOwnKind(kind)) return "Write something to save. The board does not keep an empty document.";
   if (trimmed.length > HOSTED_MAX_UNITS) return `Too long: ${trimmed.length.toLocaleString("en")} of ${HOSTED_MAX_UNITS.toLocaleString("en")} characters.`;
   if (CONTROL.test(trimmed)) return "Contains a control character the board refuses.";
   return null;
@@ -65,13 +95,13 @@ export function textProblem(kind: DocKind, text: string): string | null {
 /** A size line for the save bar; only near the limit, or over it. */
 export function sizeNote(kind: DocKind, text: string): string | null {
   const [used, max, unit] =
-    kind === "hosted" ? [text.trim().length, HOSTED_MAX_UNITS, "characters"] : [byteLength(text), NATIVE_MAX_BYTES, "bytes"];
+    kind !== "native" ? [text.trim().length, HOSTED_MAX_UNITS, "characters"] : [byteLength(text), NATIVE_MAX_BYTES, "bytes"];
   return used >= max * 0.9 ? `${used.toLocaleString("en")} of ${max.toLocaleString("en")} ${unit}` : null;
 }
 
 /** What the board would store for this draft. The hosted board trims. */
 export function stored(kind: DocKind, draft: string): string {
-  return kind === "hosted" ? draft.trim() : draft;
+  return kind !== "native" ? draft.trim() : draft;
 }
 
 /** Whether saving this draft would change anything. */
@@ -110,7 +140,7 @@ export function profileBody(
 export function classifyFailure(error: unknown, kind: DocKind): "conflict" | "unconfirmed" | "refused" {
   if (!(error instanceof ApiError)) return "unconfirmed";
   if (error.status === 409) {
-    return kind === "hosted" && (error.code === undefined || error.code === "revision_conflict") ? "conflict" : "refused";
+    return kind !== "native" && (error.code === undefined || error.code === "revision_conflict") ? "conflict" : "refused";
   }
   if (error.status >= 500 || error.status === 0 || error.status === 408) return "unconfirmed";
   return "refused";
@@ -138,6 +168,38 @@ export async function saveHosted(deps: DocDeps, base: StoredAgentProfile, text: 
     } catch {
       return out;
     }
+  }
+}
+
+/** Save the Master's or the member's text at the revision `base` was read at.
+ *  On a 409 the board's current document is read and returned, so "Save mine"
+ *  writes at THAT revision and a newer one is refused again, not overwritten. */
+export async function saveOwn(deps: OwnDeps, kind: OwnKind, base: OwnDoc, text: string): Promise<DocOutcome> {
+  try {
+    const own = await deps.write(kind, base, text);
+    return { kind: "saved", text: own.text, profile: null, applies: null, own };
+  } catch (error) {
+    const out = failure(error, kind);
+    if (out.kind !== "conflict") return out;
+    try {
+      return { kind: "conflict", profile: null, own: await deps.read(kind) };
+    } catch {
+      return out;
+    }
+  }
+}
+
+/** After a dropped save: read what is stored and say whether it is ours. A
+ *  revision different from the one we wrote at, holding our text, is our save. */
+export async function checkOwn(deps: OwnDeps, kind: OwnKind, base: OwnDoc, text: string): Promise<DocOutcome> {
+  try {
+    const latest = await deps.read(kind);
+    if (latest.revision === undefined || typeof latest.text !== "string") throw new Error("unusable read");
+    if (String(latest.revision) === String(base.revision)) return { kind: "not_saved", profile: null, own: latest };
+    if (latest.text === text.trim()) return { kind: "saved", text: latest.text, profile: null, applies: null, own: latest };
+    return { kind: "conflict", profile: null, own: latest };
+  } catch {
+    return { kind: "unconfirmed" };
   }
 }
 
@@ -187,6 +249,8 @@ export async function checkNative(deps: DocDeps, alias: string, text: string): P
 export function savedText(kind: DocKind, applies: string | null, checked: boolean, t: (english: string) => string): string {
   const lead = t(checked ? "It did save." : "Saved.");
   if (kind === "hosted") return `${lead} ${t("It applies when a session next loads this profile.")} ${t("A running turn isn’t changed.")}`;
+  // The board does not say whether its runtime renders these yet, so no promise of when.
+  if (isOwnKind(kind)) return `${lead} ${t("A running turn isn’t changed.")}`;
   if (applies === null) return `${lead} ${t("The board did not say when it applies.")}`;
   const when = t(appliesText(applies));
   return applies === "next_turn" || applies === "next_launch"
@@ -203,7 +267,11 @@ export function instructionsKind(a: {
   served: string | null;
   master: boolean;
   profileBound: boolean;
+  /** CAD-2354: the hosted page this is, when it is the Master's (owner) or the
+   *  member's own assistant's. */
+  own?: OwnKind | null;
 }): DocKind | null {
+  if (a.own) return a.hostedBoard ? a.own : null;
   if (a.hired) return a.hostedBoard ? "hosted" : null;
   return a.served !== null && !a.master && !a.profileBound ? "native" : null;
 }
@@ -238,6 +306,17 @@ export function contextOf(text: string, kind: DocKind | null, applies: string | 
     { name: "Skill names and descriptions", size: "Not counted" },
     { name: "Tool definitions", size: "Not counted" },
   ];
+  if (isOwnKind(kind)) {
+    // Built-in text is never shown, so it is named and not counted.
+    return {
+      heading: "Made up of",
+      lines: [
+        { name: "Built-in instructions", size: "Not counted" },
+        { name: kind === "workspace" ? "Owner-managed instructions" : "Your instructions", size: "About {n} tokens (estimate)", count: estimateTokens(text) },
+        ...rest,
+      ],
+    };
+  }
   if (kind === "native" && applies === "not_delivered") return { heading: "Loaded at session start", lines: rest };
   const own: ContextLine = { name: "Instructions", size: "About {n} tokens (estimate)", count: estimateTokens(text) };
   return {

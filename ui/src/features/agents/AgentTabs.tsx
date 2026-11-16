@@ -26,7 +26,7 @@ import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
 import InstructionsEditor from "./InstructionsEditor";
-import { contextOf, nativeChange } from "./instructionsDoc";
+import { contextOf, isOwnKind, nativeChange } from "./instructionsDoc";
 import type { InstructionsDoc } from "./useInstructionsDoc";
 import {
   BUNDLED_SKILLS,
@@ -515,6 +515,12 @@ function Instructions({ c }: { c: TabContext }) {
       />
     </div>
   );
+  if (isOwnKind(doc.kind)) {
+    if (doc.read === "failed") return <Failed text="The instructions could not be read." onRetry={doc.retry} />;
+    if (doc.read === "unsupported") return <Note>{t("The master’s instructions are not edited here.")}</Note>;
+    if (doc.read !== "ready") return <Note>{t("Loading instructions…")}</Note>;
+    return editor();
+  }
   if (c.hired) {
     if (doc.kind === "hosted") {
       if (doc.read === "failed") return <Failed text="The instructions could not be read." onRetry={doc.retry} />;

@@ -219,7 +219,7 @@ export default function Agents({
   );
 
   if (open === PERSONAL_ALIAS && personal) {
-    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} />);
+    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
   }
   if (open) {
     return shell(

@@ -238,6 +238,8 @@ export default function AgentPage({
     served,
     master: alias === MASTER,
     profileBound: params?.profile !== undefined,
+    // CAD-2354: an owner on the company Master's page edits its text.
+    own: masterPage ? "workspace" : null,
   });
   const doc = useInstructionsDoc({
     alias,

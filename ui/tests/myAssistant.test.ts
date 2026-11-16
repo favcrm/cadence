@@ -87,6 +87,8 @@ globalThis.fetch = async (input) => {
     memberStateReads += 1;
     return json({ assistant: { alias: "assistant-1", identity: { name: "Nova", tone: null, look: "robot", revision: 1 } }, conversation_id: "c1" });
   }
+  // CAD-2354: an API that predates the instructions routes.
+  if (path === "/api/member-assistant/instructions" || path === "/api/master/instructions") return json({ error: "not found" }, 404);
   if (path.startsWith("/api/threads/")) {
     threadReads.push(path);
     return json({ entries: [], cursor: 0, more_before: false });
