@@ -2069,6 +2069,7 @@ for (const next of ["ended", "none"] as const) {
   const artifactExpand = () => m.host.querySelector<HTMLButtonElement>('.cv-pane [aria-label="Expand canvas"]');
   const browserExpand = () => m.host.querySelector<HTMLButtonElement>('.bz-head [aria-label="Expand canvas"]');
   assert(artifactExpand()?.disabled && browserExpand()?.disabled, "both canvas headers disable expansion when the workspace is full");
+  assert(Number.parseFloat(drawer(m)!.style.top) >= workspace.getBoundingClientRect().top, "app cover mode leaves the board header above the canvas");
   await React.act(async () => {
     room = 1100;
     Object.defineProperty(win, "innerWidth", { value: 2000, configurable: true, writable: true });

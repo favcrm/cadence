@@ -514,19 +514,31 @@ export default function AppShell({
     mediaTarget.current = target;
     return () => { if (mediaTarget.current === target) mediaTarget.current = null; };
   }, []);
-  // One per-install choice controls both desktop and narrow layouts.
+  // Explicit choices persist; content navigation only selects the narrow pane.
   const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
+  const [narrow, setNarrow] = useState(() => window.innerWidth < 1024);
+  const [narrowWorkspace, setNarrowWorkspace] = useState<string | null>(null);
+  useEffect(() => {
+    const resize = () => {
+      const next = window.innerWidth < 1024;
+      setNarrow(next);
+      if (!next) setNarrowWorkspace(null);
+    };
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
   const [pendingDecision, setPendingDecision] = useState({ installId, pending: false });
   const [waitingReply, setWaitingReply] = useState(false);
   // Re-key the reporter so cached permissions replay when the installation changes.
   const reportPendingDecision = useCallback((pending: boolean) => {
     setPendingDecision({ installId, pending });
   }, [installId]);
-  const chatCollapsed = resolveChatCollapsed(
-    chatChoice, installId, pendingDecision.installId === installId && pendingDecision.pending,
-  );
+  const pendingForInstall = pendingDecision.installId === installId && pendingDecision.pending;
+  const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingForInstall) ||
+    (narrow && narrowWorkspace === installId && !pendingForInstall);
   const chatToggleRef = useRef<HTMLButtonElement | null>(null);
   const collapseChat = useCallback((collapsed: boolean) => {
+    setNarrowWorkspace(null);
     setChatCollapsed(collapsed);
     if (collapsed) chatToggleRef.current?.focus({ preventScroll: true });
   }, [setChatCollapsed]);
@@ -773,14 +785,18 @@ export default function AppShell({
     const currentSearch = href.split("?")[1] ?? "";
     const before = new URLSearchParams(previousSearch);
     const after = new URLSearchParams(currentSearch);
+    if (before.get("conversation") !== after.get("conversation")) {
+      setNarrowWorkspace(null);
+      return;
+    }
     const sectionChanged = effectiveNavigation !== null &&
       sectionFromSearch(previousSearch, effectiveNavigation) !== sectionFromSearch(currentSearch, effectiveNavigation);
     if (previous.installId !== installId || sectionChanged ||
       before.get("record") !== after.get("record") ||
       (before.get("appview") === "new") !== (after.get("appview") === "new")) {
-      setChatCollapsed(true);
+      setNarrowWorkspace(installId);
     }
-  }, [effectiveNavigation, href, installId, setChatCollapsed]);
+  }, [effectiveNavigation, href, installId]);
 
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)

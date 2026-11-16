@@ -52,10 +52,10 @@ function useViewport(): number {
 }
 
 /** The stable app workspace box; the assistant lives beyond its right edge. */
-function appWorkspaceBounds(): { left: number; right: number } | null {
+function appWorkspaceBounds(): { left: number; right: number; top: number } | null {
   const pane = document.querySelector<HTMLElement>("#app-shell-workspace");
   const bounds = pane?.getBoundingClientRect();
-  return bounds && bounds.width > 0 ? { left: bounds.left, right: bounds.right } : null;
+  return bounds && bounds.width > 0 ? { left: bounds.left, right: bounds.right, top: bounds.top } : null;
 }
 
 /** The passage the operator selected inside the document, or "". */
@@ -289,6 +289,7 @@ export default function CanvasDrawer() {
   }, [handFocusOn]);
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
+  const [canvasTop, setCanvasTop] = useState(0);
   const [, measureWorkspace] = useState(0);
 
   // A chat toggle changes the available workspace without remounting it.
@@ -308,6 +309,7 @@ export default function CanvasDrawer() {
     const workspace = surface === "app" ? appWorkspaceBounds() : null;
     const next = drawerLayout(viewport, want, surface, workspace, expanded);
     setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right ? cur : next));
+    setCanvasTop(surface === "app" && next.mode === "cover" && workspace !== null ? Math.max(0, workspace.top) : 0);
     setCanExpand(expanded || drawerLayout(viewport, want, surface, workspace, true).width > next.width);
   });
 
@@ -406,7 +408,7 @@ export default function CanvasDrawer() {
       data-surface={canvas.surface}
       aria-label={t("Canvas")}
       tabIndex={-1}
-      style={sheet ? undefined : { width: layout.width, right: layout.right ?? 0 }}
+      style={sheet ? undefined : { width: layout.width, right: layout.right ?? 0, top: canvasTop }}
     >
       {!sheet && !expanded ? (
         <div

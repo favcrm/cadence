@@ -55,7 +55,8 @@ const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
         React.createElement(CanvasDrawer)) }));
 };
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList, readChatCollapsedChoice } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
@@ -301,10 +302,17 @@ await pick("Spring launch");
 
 // A native request opens an untouched default; explicit choices remain authoritative.
 {
+  const previousViewport = win.innerWidth;
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
   await mount("install-native-approval");
   await React.act(async () => { await resources.masterState.refresh(); });
   const disclosure = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
   equal(disclosure.getAttribute("aria-expanded"), "false", "a fresh app starts with the default collapsed choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&appview=new"); });
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation leaves the default collapse choice untouched");
   await React.act(async () => {
     nativePermissionPending = true;
     threads["native-gen"].push({
@@ -334,6 +342,10 @@ await pick("Spring launch");
     await resources.masterState.refresh();
   });
   equal(disclosure.getAttribute("aria-expanded"), "false", "resolving the request preserves the explicit choice");
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
   await mount("install-crm");
   await pick("Spring launch");
 }

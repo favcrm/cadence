@@ -148,6 +148,7 @@ const entryApp = AppShellModule.entryApp;
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { readChatCollapsedChoice } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 // Only a daemon-stamped binding renders: browser claims never do.
 // The stamp trims to ids — revision/digest stay server-side.
 equal(
@@ -698,10 +699,21 @@ for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-soci
     await click(parent);
     await settle(() => assert(!header().querySelector(".app-header-section"), "the default section adds no duplicate leaf"));
     equal(assistant.getAttribute("aria-expanded"), "false", "parent navigation reveals the narrow workspace");
-    await click(assistant);
+    equal(readChatCollapsedChoice(installId), false, "narrow navigation preserves the explicitly expanded preference");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: 1440, configurable: true, writable: true });
+      win.dispatchEvent(new Event("resize"));
+    });
+    equal(assistant.getAttribute("aria-expanded"), "true", "desktop restores the expanded preference after narrow navigation");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+      win.dispatchEvent(new Event("resize"));
+    });
+    equal(assistant.getAttribute("aria-expanded"), "true", "returning to narrow layout honors the expanded preference");
     await React.act(async () => { navigate(`/app-installations/${installId}?tab=insights&hr=leave&accounting=reports`); });
     await settle(() => equal(header().querySelector('[aria-current="page"]')?.textContent, expected, "section-only navigation reaches the selected page"));
     equal(assistant.getAttribute("aria-expanded"), "false", "section-only navigation reveals the narrow workspace");
+    equal(readChatCollapsedChoice(installId), false, "section-only navigation does not persist a collapse");
     await React.act(async () => { cold.unmount(); });
     surface.remove();
   }

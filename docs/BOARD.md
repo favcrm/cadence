@@ -2793,8 +2793,9 @@ Parent navigation retains installation/context pins and unrelated query
 parameters while clearing record and segment selection. The aligned
 **Assistant** button controls the right-hand chat pane without remounting the
 conversation or app frame. A collapsed chat leaves no rail; on narrow screens
-the workspace and assistant share one pane. App-content navigation reveals the
-workspace; context/chat-only URL changes leave the visible pane unchanged.
+the workspace and assistant share one pane. App-content navigation temporarily
+selects the workspace without changing the saved Assistant preference.
+Context-only URL writes do not select a pane.
 Workflow launchers and developer
 tools live in the header's **More actions** menu. Narrow layouts keep account,
 board status, update, language and theme controls in the existing mobile navigation.
@@ -2803,8 +2804,8 @@ Pending approvals stay installation-scoped across cached app switches and
 override the untouched collapsed default; an explicit choice
 still wins. Canvas edit requests reveal the current composer; editable inputs
 receive focus without sending or replacing the draft.
-Canvas expansion stays inside the app workspace and is disabled when it
-cannot add width.
+Non-modal app canvases start below the board header and end before the assistant.
+Expansion is disabled when it cannot add width.
 
 Every setup or Browser QA handover states these separately:
 
