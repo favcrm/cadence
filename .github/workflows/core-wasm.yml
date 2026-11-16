@@ -56,7 +56,9 @@ jobs:
           set -eu
           cargo build -p cadence-image --target wasm32-unknown-unknown --release --locked
           cp target/wasm32-unknown-unknown/release/cadence_image.wasm dist/cadence-image.wasm
+          node crates/cadence-image/notices.mjs > dist/cadence-image.NOTICE.txt
           (cd dist && sha256sum cadence-image.wasm > cadence-image.wasm.sha256)
+          (cd dist && sha256sum cadence-image.NOTICE.txt > cadence-image.NOTICE.txt.sha256)
       # CAD-1085: the custody envelope primitive is a SEPARATE artifact built
       # from the same source with the optional feature. The ordinary core.wasm
       # must not contain any core_custody_* export.
@@ -123,5 +125,6 @@ jobs:
           fi
           gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 \
             dist/cadence-image.wasm dist/cadence-image.wasm.sha256 \
+            dist/cadence-image.NOTICE.txt dist/cadence-image.NOTICE.txt.sha256 \
             dist/custody-core.wasm dist/custody-core.wasm.sha256 dist/*.schema.json
           gh release edit "$TAG" --draft=false --latest=false
