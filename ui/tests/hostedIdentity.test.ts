@@ -160,6 +160,14 @@ async function boundaryChecks() {
     response = () => json(hostedSession);
     await focus();
     await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    const beforeUpgrade = privateSessionGeneration();
+    response = () => json({ error: { code: "sign_in_upgrade_required", message: "Updating" } }, 503);
+    await focus();
+    assert(host.querySelector("[data-auth-state='updating'] h1")?.textContent === "Sign-in verification is updating.", "upgrade explains why verification is unavailable");
+    assert(privateSessionGeneration() === beforeUpgrade, "an upgrade retains the current in-memory session");
+    response = () => json(hostedSession);
+    await retry();
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session recovery after an upgrade retains the in-memory draft");
     const beforeRenewal = privateSessionGeneration();
     response = () => json({ ...hostedSession, session: { ...hostedSession.session, expires_at: 4102473600, idle_expires_at: 4102473600 } });
     await focus();

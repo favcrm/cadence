@@ -1850,8 +1850,12 @@ cookie and the browser's saved key; they do not mint a new session or extend
 its absolute expiry. Clearing the browser's storage needs a fresh link.
 Hosted cookies retain their existing host-only lifetime.
 An unanswered verification conceals the admitted workspace and stops its
-effects, preserving same-session drafts and credentials for Retry. A
-confirmed sign-out, expiry or identity change clears private observations
+effects, preserving same-session drafts and credentials for Retry. When a hosted
+verifier reports `sign_in_upgrade_required`, the gate names the
+upgrade and offers Retry instead of describing a connection outage or asking
+the user to switch accounts. The hidden in-memory workspace resumes only after
+the same session is verified again.
+A confirmed sign-out, expiry or identity change clears private observations
 and rejects stale in-flight responses. A session-required `401` supersedes
 older pending verification; a feature's ordinary role-based `403` does not
 sign the board session out. Signed-in members pass the read boundary without

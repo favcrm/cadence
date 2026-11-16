@@ -53,9 +53,10 @@ const AuthBoundary = namedExport(require("../src/features/auth/AuthBoundary"), "
 const delay = (ms: number): Promise<void> => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 
 // A verification failure, after enough delay for the checking state to paint.
+let failureCode = "capability_unavailable";
 globalThis.fetch = (async () => {
   await delay(40);
-  return new Response(JSON.stringify({ ok: false, error: { code: "capability_unavailable", message: "unavailable" } }), {
+  return new Response(JSON.stringify({ ok: false, error: { code: failureCode, message: "unavailable" } }), {
     status: 503,
     headers: { "Content-Type": "application/json" },
   });
@@ -90,6 +91,19 @@ assert(!settled.includes("Private board"), "failed verification must not fall ba
 assert(!settled.includes("Browser-bound Cadence session"), "no local session footer on a hosted board");
 assert(!settled.includes("cadence ui login"), "no CLI instruction on a hosted board");
 assert(!(host.textContent ?? "").includes("PRIVATE WORKSPACE"), "no workspace content before admission");
+
+// An older session object needs an upgrade, not account switching or a
+// misleading connection diagnosis.
+failureCode = "sign_in_upgrade_required";
+const retry = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retry verification");
+assert(retry, "the outage state offers a retry");
+await React.act(async () => { retry.click(); await delay(120); });
+await flush();
+const updating = host.textContent ?? "";
+assert(updating.includes("Sign-in verification is updating."), "the upgrade has a specific explanation");
+assert(updating.includes("Retry verification"), "the upgrade offers verification retry");
+assert(!updating.includes("The connection may be interrupted."), "the upgrade is not presented as a connection outage");
+assert(!updating.includes("Use another account"), "account switching is not suggested for an upgrade");
 await React.act(async () => { root.unmount(); });
 console.log("hosted gate failure checks passed");
 }
