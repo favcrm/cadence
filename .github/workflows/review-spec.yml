@@ -468,6 +468,7 @@ jobs:
                   if (stop !== null) { failed = true; continue; }
                   if (c.index !== 0) { failed = true; continue; }
                   if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
+                  if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { failed = true; continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
                   else if (c.delta?.content != null) nonStringContent = true;
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
