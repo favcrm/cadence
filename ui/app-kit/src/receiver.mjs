@@ -1336,7 +1336,10 @@ export function createScreenBridge(options = {}) {
         (value) => {
           release();
           let guarded;
-          try { guarded = guardData(value); } catch (err) { const mapped = mapError(err); retire(mapped); throw mapped; }
+          try {
+            guarded = guardData(value);
+            if (kind === "call" && verb === "catalog.status") guarded = catalogStatusValue(guarded);
+          } catch (err) { const mapped = mapError(err); retire(mapped); throw mapped; }
           if (writeVerbSet.has(verb) && !extra.quiet) notifyWritten();
           return guarded;
         },
@@ -1376,6 +1379,16 @@ export function createScreenBridge(options = {}) {
       throw error;
     }
     return value;
+  }
+  function catalogStatusValue(value) {
+    if (isPlain(value) && ["not_started", "review_required", "uncertain"].includes(value.state) &&
+        Object.keys(value).length === 1) return { state: "uncertain" };
+    if (isPlain(value) && value.state === "settled" && typeof value.result_available === "boolean" &&
+        (value.result_available ? Object.keys(value).length === 3 : Object.keys(value).length === 2)) {
+      if (value.result_available) catalogReceipt(value.receipt);
+      return value;
+    }
+    throw invalidBridge("The app tool returned an invalid status");
   }
 
   return Object.freeze({
@@ -1442,18 +1455,7 @@ export function createScreenBridge(options = {}) {
       let args;
       try { args = catalogArgs(slot, input, requestId); }
       catch (error) { return Promise.reject(error); }
-      return dispatch("call", scope, "catalog.status", args).then((value) => {
-        if (isPlain(value) && ["not_started", "review_required", "uncertain"].includes(value.state) &&
-            Object.keys(value).length === 1) return value;
-        if (isPlain(value) && value.state === "settled" && typeof value.result_available === "boolean" &&
-            (value.result_available ? Object.keys(value).length === 3 : Object.keys(value).length === 2)) {
-          if (value.result_available) catalogReceipt(value.receipt);
-          return value;
-        }
-        const error = invalidBridge("The app tool returned an invalid status");
-        retire(error);
-        throw error;
-      });
+      return dispatch("call", scope, "catalog.status", args);
     },
     tool(scope, alias, input = {}, requestId, generationScope) {
       const live = receiver;

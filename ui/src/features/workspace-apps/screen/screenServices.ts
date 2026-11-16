@@ -199,7 +199,11 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           ? await post(operation === "catalog.status" ? "status" : "call", catalogArgs(args), true)
           : await post("call", { operation, args });
         const stalePreview = !!previewId && ((operation === "screen.preview.show" && (latestShow?.id !== previewId || latestShow.revision !== revision)) || (operation === "screen.preview.clear" && latestShow?.id === previewId && latestShow.revision > revision));
-        const data = deliver(raw, !stalePreview);
+        let data = deliver(raw, !stalePreview);
+        if (operation === "catalog.status" && object(data) && (data.state === "not_started" || data.state === "review_required")) {
+          if (!exact(data, ["state"])) throw new ApiError("Invalid app tool status", 502);
+          data = { state: "uncertain" };
+        }
         if (WRITES.has(operation)) invalidateDisplay(domain);
         else if (operation !== "catalog.status" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };

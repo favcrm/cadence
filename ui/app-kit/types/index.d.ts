@@ -273,7 +273,7 @@ export type ScreenCatalogReceipt<T = unknown> = {
   slug: string; effect: "read" | "draft"; price: { currency: "USD"; scale: 6; amount: string }; result: T;
 };
 export type ScreenCatalogStatus<T = unknown> =
-  | { state: "not_started" | "review_required" | "uncertain" }
+  | { state: "uncertain" }
   | { state: "settled"; result_available: false }
   | { state: "settled"; result_available: true; receipt: ScreenCatalogReceipt<T> };
 

@@ -97,13 +97,15 @@ directly; a paid call opens a host-owned confirmation showing the tool, input,
 account where applicable, and current price. If the price changes, the owner must
 review again. A lost or uncertain outcome is **not** retried automatically.
 Call `bridge.catalogStatus(scope, "lookup", input, requestId)` with the same
-input and request ID before starting a new action. It returns `not_started`,
-`review_required`, `uncertain`, or `settled`. A settled outcome can have
-`result_available: false` when the platform recorded settlement but the
-original result was lost. An unrecorded platform lookup stays uncertain; it
-does not prove the provider did nothing. An app update or removal revokes
-its grants; status then refuses rather than exposing the prior app's result.
-Sends and publishing remain on their existing approval paths.
+input and request ID before starting a new action. It returns `uncertain` or
+`settled`. An absent or previously refused claim is still uncertain: an earlier
+request may be preparing and could yet run. Keep the same request ID for that
+logical action; do not use a new ID to retry an unresolved outcome. A settled
+outcome can have `result_available: false` when the platform recorded settlement
+but the original result was lost. An unrecorded platform lookup stays uncertain;
+it does not prove the provider did nothing. An app update or removal revokes its
+grants; status then refuses rather than exposing the prior app's result. Sends
+and publishing remain on their existing approval paths.
 
 Connected reads put the provider's reviewed arguments in `input.body`; the
 host supplies the bound `connection_id`. Do not put connection IDs, secrets,

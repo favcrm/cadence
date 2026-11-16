@@ -1598,19 +1598,30 @@ test("catalogue timeout permits status recovery without repeating the call", asy
   assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
 });
 
-test("catalogue status admits each genuine status including settlement without a result", async () => {
+test("catalogue status normalizes legacy refusals for both bridge entry points", async () => {
   const { bridge, scope, host, inbox } = await catalogFixture();
   const statuses = [
-    { state: "not_started" }, { state: "review_required" }, { state: "uncertain" },
-    { state: "settled", result_available: false },
-    { state: "settled", result_available: true, receipt: catalogReceiptFixture },
+    { wire: { state: "not_started" }, expected: { state: "uncertain" } },
+    { wire: { state: "review_required" }, expected: { state: "uncertain" } },
+    { wire: { state: "uncertain" }, expected: { state: "uncertain" } },
+    { wire: { state: "settled", result_available: false }, expected: { state: "settled", result_available: false } },
+    { wire: { state: "settled", result_available: true, receipt: catalogReceiptFixture },
+      expected: { state: "settled", result_available: true, receipt: catalogReceiptFixture } },
   ];
-  for (const [index, expected] of statuses.entries()) {
-    const pending = bridge.catalogStatus(scope, "lookup", catalogInput, `request-status-${index}`);
-    const sent = await waitFor(() => inbox.filter((message) => message.op === "call" && message.verb === "catalog.status")[index], "status request");
-    assert.deepEqual(sent.args, { slot: "lookup", input: catalogInput, request_id: `request-status-${index}` });
-    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: expected });
-    assert.deepEqual(await pending, expected);
+  let sentCount = 0;
+  for (const [index, { wire, expected }] of statuses.entries()) {
+    for (const generic of [false, true]) {
+      const requestId = `request-status-${index}-${generic}`;
+      const args = { slot: "lookup", input: catalogInput, request_id: requestId };
+      const pending = generic
+        ? bridge.call(scope, "catalog.status", args)
+        : bridge.catalogStatus(scope, "lookup", catalogInput, requestId);
+      const sent = await waitFor(() => inbox.filter((message) => message.op === "call" && message.verb === "catalog.status")[sentCount], "status request");
+      sentCount++;
+      assert.deepEqual(sent.args, args);
+      host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: wire });
+      assert.deepEqual(await pending, expected);
+    }
   }
   assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
 });
