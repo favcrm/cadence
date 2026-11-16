@@ -33,6 +33,8 @@ export interface Installation {
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
   /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
   catalogue?: CatalogueLocator | null;
+  /** Explicit private-upload provenance; absent or null means unknown. */
+  source_kind?: "private" | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
   /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
   removed?: number | null; restore_after?: number | null;

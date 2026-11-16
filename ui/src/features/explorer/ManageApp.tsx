@@ -12,6 +12,7 @@ import {
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
+import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import MemberAccessPanel from "./MemberAccessPanel";
@@ -44,6 +45,7 @@ export default function ManageApp({
   const [preview, setPreview] = useState<RemovePreview | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [privateOpen, setPrivateOpen] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -369,10 +371,18 @@ export default function ManageApp({
           Manage. It re-reads the daemon's list itself and refuses every
           write it cannot prove from that answer. */}
       <MemberAccessPanel installId={installId} operator={isOp} />
+      {privateOpen && <PrivateAppDialog installation={inst} onClose={() => setPrivateOpen(false)} onInstalled={() => setReread((n) => n + 1)} />}
 
       <div className="mgrid mt-5">
         <div className="card mcard">
           <h3>{t("App package")}</h3>
+          {inst.source_kind === "private" ? (
+            <>
+              <p className="mt-2">{t("This private app is installed only in this workspace.")}</p>
+              <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+              <Button className="btn-sm mt-3" disabled={removed || inst.state === "removed"} onClick={() => setPrivateOpen(true)}>{t("Update private app")}</Button>
+            </>
+          ) : <>
           <div className="swrow">
             <div>
               <p>{t("Automatic updates")}</p>
@@ -423,6 +433,7 @@ export default function ManageApp({
             {automatic && releaseChangesReach(upgradeProposal.receipt.access_diff) && <p className="hint mt-2">{t("This release changes what {title} can reach.").replace("{title}", () => inst.title)}</p>}
             <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={() => applyKnown(upgradeProposal, "manual")}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
           </div>}
+          </>}
         </div>
 
         <div className="card mcard">
