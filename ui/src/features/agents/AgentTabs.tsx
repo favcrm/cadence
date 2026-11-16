@@ -65,6 +65,8 @@ export interface TabContext {
   operator: boolean;
   /** This viewer may save, and the board can take the write now. */
   writable: boolean;
+  /** Why the page is read-only for this viewer right now; null when it is writable. */
+  readOnlyReason: string | null;
   toast: (kind: ToastMsg["kind"], text: string) => void;
   /** Label and value of the agent's figures; "—" is not recorded. */
   stats: [string, string][];
@@ -505,7 +507,7 @@ function Instructions({ c }: { c: TabContext }) {
     if (doc.kind === "hosted") {
       if (doc.read === "failed") return <Failed text="The instructions could not be read." onRetry={doc.retry} />;
       if (doc.read !== "ready") return <Note>{t("Loading instructions…")}</Note>;
-      return editor();
+      return editor(c.writable ? undefined : (c.readOnlyReason ?? undefined));
     }
     return c.hired.job ? (
       <p className="rc-profile-job">{c.hired.job}</p>
@@ -536,7 +538,9 @@ function Instructions({ c }: { c: TabContext }) {
       ? c.alias === MASTER
         ? "The master’s instructions are not edited here."
         : "This agent’s job comes from its settings profile, which this board cannot edit."
-      : undefined,
+      : c.writable
+        ? undefined
+        : (c.readOnlyReason ?? undefined),
   );
 }
 

@@ -1,16 +1,14 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/localeText";
 import Button from "../../ui/Button";
-import Md from "../../ui/Md";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import { isDirty, sizeNote, textProblem, type ContextLine } from "./instructionsDoc";
 import type { InstructionsDoc } from "./useInstructionsDoc";
 
 /**
- * The Instructions tab: one Markdown document that fills the page. Edit and
- * Preview show the same draft. The textarea stays mounted behind Preview so the
- * browser keeps its caret, selection and scroll, and the position is also kept
- * on the page so a tab trip gives it back.
+ * The Instructions tab: one Markdown document that fills the page, edited as
+ * plain text. A reader sees the same textarea, read-only. The caret, selection
+ * and scroll are kept on the page so a tab trip gives them back.
  */
 export default function InstructionsEditor({
   doc,
@@ -31,7 +29,6 @@ export default function InstructionsEditor({
 }) {
   const t = useTranslate();
   const kind = doc.kind ?? "native";
-  const [mode, setMode] = useState<"edit" | "preview">("edit");
   const [context, setContext] = useState(false);
   const area = useRef<HTMLTextAreaElement>(null);
   const served = doc.served ?? "";
@@ -46,7 +43,6 @@ export default function InstructionsEditor({
   const unsaved = dirty || pending;
   // Whatever is unsaved stays on screen, even while the board can't take a
   // write: a missing Save must never read as "saved".
-  const view = mode;
   const hint = !writable
     ? doc.phase === "unconfirmed"
       ? "Not confirmed. The board isn’t answering; check once it does."
@@ -61,44 +57,18 @@ export default function InstructionsEditor({
     const el = area.current;
     if (el) doc.selection.current = { start: el.selectionStart, end: el.selectionEnd, top: el.scrollTop };
   };
-  // Back on Edit, or back on the tab: give the caret and scroll back. A
-  // textarea that stayed mounted already has them; a new one gets them here.
+  // Back on the tab: give the caret and scroll back to the new textarea.
   useLayoutEffect(() => {
     const el = area.current;
-    if (!el || mode !== "edit") return;
+    if (!el) return;
     const { start, end, top } = doc.selection.current;
     if (el.selectionStart !== start || el.selectionEnd !== end) el.setSelectionRange(start, end);
     el.scrollTop = top;
-  }, [mode, doc.selection]);
-
-  const toPreview = () => {
-    remember();
-    setMode("preview");
-  };
-  const toEdit = () => {
-    setMode("edit");
-    requestAnimationFrame(() => area.current?.focus({ preventScroll: true }));
-  };
+  }, [doc.selection]);
 
   return (
     <div className="ap-doc">
       <div className="ap-doc-bar">
-        {/* A reader has nothing to edit, so only Edit is left out: Preview stays. */}
-        <div className="rc-cats" role="group" aria-label={t("Instructions view")}>
-          {(writable || unsaved) && (
-            <button type="button" className="rc-cat" aria-pressed={mode === "edit"} onClick={toEdit}>
-              {t("Edit")}
-            </button>
-          )}
-          <button
-            type="button"
-            className="rc-cat"
-            aria-pressed={mode === "preview"}
-            onClick={mode === "preview" && !(writable || unsaved) ? toEdit : toPreview}
-          >
-            {t("Preview")}
-          </button>
-        </div>
         <span className="ap-doc-spacer" />
         {editable && resetTo !== null && text !== resetTo && (
           <button type="button" className="ap-link" onClick={() => doc.setDraft(resetTo)}>
@@ -113,7 +83,6 @@ export default function InstructionsEditor({
         ref={area}
         className="field rc-text ap-doc-text"
         aria-label={t("Instructions")}
-        hidden={view !== "edit"}
         spellCheck
         value={text}
         readOnly={!editable}
@@ -122,11 +91,6 @@ export default function InstructionsEditor({
         onSelect={remember}
         onScroll={remember}
       />
-      {view === "preview" && (
-        <div className="ap-doc-preview issue-reader text-secondary text-ink-300" tabIndex={0} aria-label={t("Instructions preview")}>
-          {text.trim() ? <Md text={text} /> : <p className="rc-note">{t("Nothing written yet.")}</p>}
-        </div>
-      )}
       {unsaved && (
         <div className="ap-doc-save">
           <small className="ap-doc-hint" role={hint ? "alert" : undefined}>
