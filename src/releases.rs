@@ -1059,9 +1059,9 @@ impl ReleaseSource for HttpGh {
         })
     }
 
-    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Vec<String>> {
-        // The snapshot carries no PR titles; `--check` reports none.
-        Ok(Vec::new())
+    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Option<Vec<String>>> {
+        // The signed snapshot does not contain PR titles.
+        Ok(None)
     }
 
     /// `SCHEMA_VERSION` at `sha` when the signed facts name it — the

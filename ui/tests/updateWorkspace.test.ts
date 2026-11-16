@@ -53,6 +53,7 @@ const sample = (): Status => ({
     target: "new",
     target_version: "0.2.0",
     up_to_date: false,
+    changes_available: true,
     changes: ["Clearer navigation"],
     change_count: 1,
     schema: { current: 1, target: 1, migration: false },
@@ -63,8 +64,9 @@ const sample = (): Status => ({
   checked_at: 1700000000,
   checking: false,
   update_available: true,
+  changes_available: true,
   change_count: 1,
-  changes: [],
+  changes: ["Clearer navigation"],
   migration: false,
   blockers: [],
   running: false,
@@ -158,6 +160,27 @@ async function main() {
   );
   assert(text().includes("Loading"), "Initial read communicates loading");
   gets[0].resolve(json(status));
+  await flush();
+  const unavailable = sample();
+  unavailable.check_with_unavailable_summary = {
+    ...unavailable.check!,
+    changes_available: false,
+    changes: null,
+    change_count: null,
+  };
+  unavailable.check = null;
+  unavailable.changes_available = false;
+  unavailable.changes = null;
+  unavailable.change_count = null;
+  await fresh(unavailable);
+  assert(
+    text().includes("Update available") && text().includes("Unavailable") && !text().includes("0 changes"),
+    "An unavailable summary keeps the real check without inventing zero changes",
+  );
+  assert(!button("Update")?.disabled, "A missing summary must not disable an otherwise available update");
+  await click(button("Update"));
+  assert(posts[0]?.path === "/api/update", "The update action remains usable without a summary");
+  posts[0].resolve(json({ started: true }));
   await flush();
   await fresh(sample(), true, true);
   assert(

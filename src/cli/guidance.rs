@@ -26,6 +26,19 @@ pub(super) fn readonly(home: &Path) -> Value {
         "daemon_restarted_for_skills": false,
     })
 }
+fn annotate_daemon_after_update(report: &RunReport, mut daemon: Value) -> Value {
+    if !report.rolled_back
+        && report.health["ok"].as_bool() == Some(true)
+        && report.health["build"].as_str() == Some(report.check.target.as_str())
+        && report.restart["sha"].as_str() == Some(report.check.target.as_str())
+        && daemon["build"].as_str() == Some(report.check.target.as_str())
+        && report.check.current.as_deref() == daemon["cli_build"].as_str()
+        && daemon["build_differs_from_cli"].as_bool() == Some(true)
+    {
+        daemon["expected_after_switch"] = json!(true);
+    }
+    daemon
+}
 
 pub(super) fn after_update(
     state_dir: &Path,
@@ -33,7 +46,7 @@ pub(super) fn after_update(
     report: &RunReport,
     home: &Path,
 ) -> Value {
-    let daemon = daemon_scope(state_dir, home);
+    let daemon = annotate_daemon_after_update(report, daemon_scope(state_dir, home));
     if cadence_agent::sandbox::profile().is_some() {
         return json!({
             "guidance": "not-checked",
@@ -205,8 +218,22 @@ pub(super) fn lines(guidance: &Value) -> Vec<String> {
         if let Some(reason) = daemon.get("reason").and_then(Value::as_str) {
             out.push(format!("guidance: {reason}"));
         }
-        if daemon.get("build_differs_from_cli") == Some(&Value::Bool(true)) {
-            out.push("guidance: daemon build differs from this command".to_string());
+        if daemon.get("build").is_some_and(Value::is_null) {
+            out.push("guidance: local daemon build was not reported".to_string());
+        } else if daemon.get("cli_build").is_some_and(Value::is_null) {
+            out.push(
+                "guidance: updater build was not reported; cannot compare the local daemon"
+                    .to_string(),
+            );
+        } else if daemon.get("build_differs_from_cli") == Some(&Value::Bool(true)) {
+            if daemon.get("expected_after_switch") == Some(&Value::Bool(true)) {
+                out.push(
+                    "guidance: this updater is on the previous build; the local daemon is on the new build (expected after switch)"
+                        .to_string(),
+                );
+            } else {
+                out.push("guidance: daemon build differs from this command".to_string());
+            }
         }
         if let Some(home) = daemon.get("home").and_then(Value::as_str) {
             if home != "same-as-cli" {
@@ -232,12 +259,18 @@ fn daemon_scope(state_dir: &Path, cli_home: &Path) -> Value {
             });
         }
     };
-    let build = info.get("build_commit").cloned().unwrap_or(Value::Null);
+    let known_build = |value: &str| !value.trim().is_empty() && value.trim() != "unknown";
+    let build = info
+        .get("build_commit")
+        .and_then(Value::as_str)
+        .filter(|value| known_build(value));
+    let cli_build = cadence_agent::overview::BUILD_COMMIT;
+    let cli_build = known_build(cli_build).then_some(cli_build);
     let mut out = json!({
         "build": build,
-        "cli_build": cadence_agent::overview::BUILD_COMMIT,
+        "cli_build": cli_build,
         "guidance": "not-checked",
-        "build_differs_from_cli": build.as_str() != Some(cadence_agent::overview::BUILD_COMMIT),
+        "build_differs_from_cli": build.zip(cli_build).map(|(daemon, cli)| daemon != cli),
     });
     let Some(pid) = info["pid"].as_u64() else {
         out["reason"] = json!("daemon pid was not reported; its home was not modified");
@@ -328,7 +361,7 @@ mod tests {
             target: target.to_string(),
             target_version: None,
             up_to_date,
-            changes: Vec::new(),
+            changes: Some(Vec::new()),
             schema_current: None,
             schema_target: None,
             migration: false,
@@ -359,6 +392,81 @@ mod tests {
             pruned: Vec::new(),
             lines: Vec::new(),
         }
+    }
+
+    #[test]
+    fn switched_daemon_is_expected_only_with_a_matching_healthy_receipt() {
+        let old = "1111111111111111111111111111111111111111";
+        let new = "2222222222222222222222222222222222222222";
+        let mut healthy = report(
+            new,
+            false,
+            false,
+            json!({"ok": true, "build": new}),
+            json!({"sha": new}),
+        );
+        healthy.check.current = Some(old.into());
+        let observed = json!({"build": new, "cli_build": old, "build_differs_from_cli": true});
+        let render = |report: &RunReport, daemon: Value| {
+            lines(&json!({"daemon": annotate_daemon_after_update(report, daemon)}))
+        };
+        let expected = render(&healthy, observed.clone());
+        assert!(expected
+            .iter()
+            .any(|line| line.contains("expected after switch")));
+        assert!(!expected
+            .iter()
+            .any(|line| line == "guidance: daemon build differs from this command"));
+
+        let mut unhealthy = healthy.clone();
+        unhealthy.health["ok"] = json!(false);
+        let mut rolled_back = healthy.clone();
+        rolled_back.rolled_back = true;
+        let mut missing_restart = healthy.clone();
+        missing_restart.restart = Value::Null;
+        for receipt in [&unhealthy, &rolled_back, &missing_restart] {
+            let warning = render(receipt, observed.clone());
+            assert!(warning
+                .iter()
+                .any(|line| line == "guidance: daemon build differs from this command"));
+            assert!(!warning
+                .iter()
+                .any(|line| line.contains("expected after switch")));
+        }
+
+        let unexpected = render(
+            &healthy,
+            json!({"build": "3333333333333333333333333333333333333333",
+                   "cli_build": old, "build_differs_from_cli": true}),
+        );
+        assert!(unexpected
+            .iter()
+            .any(|line| line == "guidance: daemon build differs from this command"));
+        assert!(!unexpected
+            .iter()
+            .any(|line| line.contains("expected after switch")));
+
+        let unknown = render(
+            &healthy,
+            json!({"build": null, "cli_build": old, "build_differs_from_cli": null}),
+        );
+        assert!(unknown
+            .iter()
+            .any(|line| line.contains("build was not reported")));
+        assert!(!unknown
+            .iter()
+            .any(|line| line.contains("expected after switch")));
+
+        let unknown_updater = render(
+            &healthy,
+            json!({"build": new, "cli_build": null, "build_differs_from_cli": null}),
+        );
+        assert!(unknown_updater
+            .iter()
+            .any(|line| line.contains("cannot compare the local daemon")));
+        assert!(!unknown_updater
+            .iter()
+            .any(|line| line.contains("expected after switch")));
     }
 
     fn layout(root: &Path) -> Layout {
