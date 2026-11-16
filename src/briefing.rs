@@ -77,7 +77,7 @@ pub(crate) fn briefing_read(alias: &str) -> Value {
 /// The `agent_show` request a launch or `join` polls the new agent with
 /// until its endpoint opens (CAD-2323).
 pub fn launch_poll_read(alias: &str) -> Value {
-    json!({"alias": alias})
+    json!({"alias": alias, "include_launch_state": true})
 }
 
 /// Whether a launched agent's endpoint reports open, which gates its
@@ -95,7 +95,7 @@ pub fn endpoint_opened(agent: &Value, attachable: bool) -> bool {
 /// The `agent_list` request the briefing's group roster is read with
 /// (CAD-2323).
 pub(crate) fn roster_read() -> Value {
-    json!({})
+    json!({"include_group": true})
 }
 
 /// The briefing's "Group at write time" lines: the root and every agent
