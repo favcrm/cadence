@@ -4,7 +4,7 @@ import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, hasUnconfirmedResult, isolate, outcomeOf, UNCONFIRMED_WRITE_GUIDANCE, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
@@ -483,7 +483,7 @@ export default function NeedsRail({
       <button aria-pressed={tab === "updates"} onClick={() => showTab("updates")}>
         {t("Updates")}
         {staged.failedUnseen && tab !== "updates" && (
-          <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
+          <span className="dx-dot" role="img" aria-label={t("An approved write needs attention")} />
         )}
       </button>
       <span className="todo-tools">
@@ -589,15 +589,17 @@ function DecidedLine({ write }: { write: StagedWrite }) {
   const [raw, setRaw] = useState(false);
   const outcome = outcomeOf(write);
   const when = ageText(write.decidedAt ?? write.createdAt, t);
-  if (outcome === "failed") {
+  if (outcome === "failed" || hasUnconfirmedResult(write)) {
     return (
       <li data-fail>
         <span><bdi>{isolate(write.title)}</bdi></span>
         <span className="text-ink-500">
-          <span className="dx-bad">{t("Did not apply")}</span> · {when}
+          <span className="dx-bad">{t(outcome === "unconfirmed" ? "Result not confirmed" : "Did not apply")}</span> · {when}
         </span>
         <span className="dx-why">
-          {t(failureReason(write))}
+          {outcome === "unconfirmed"
+            ? t("{reason}. {guidance}").replace("{reason}", t(failureReason(write))).replace("{guidance}", t(UNCONFIRMED_WRITE_GUIDANCE))
+            : t(failureReason(write))}
           <button type="button" className="lnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
             {raw ? t("Hide raw") : t("Show raw")}
           </button>

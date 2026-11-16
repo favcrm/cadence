@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, failureReason, isolate, outcomeOf, sentFields, stagedDomain, stagedDomainLabel, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
+import { ageText, failureReason, hasUnconfirmedResult, isolate, outcomeOf, sentFields, stagedDomain, stagedDomainLabel, UNCONFIRMED_WRITE_GUIDANCE, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -80,6 +80,13 @@ export function noticeText(n: DecisionNotice, t: Say): string {
         .replace("{title}", iso(n.title))
         .replace("{reason}", t(n.reason ?? "the reason is not recognised"));
     case "unconfirmed":
+      if (n.reason) {
+        const reason = n.reason;
+        return t("{title}: the result could not be confirmed: {reason}. See Updates. {guidance}")
+          .replace(/\{title\}|\{reason\}|\{guidance\}/g, (part) =>
+            part === "{title}" ? iso(n.title) : part === "{reason}" ? t(reason) : t(UNCONFIRMED_WRITE_GUIDANCE),
+          );
+      }
       return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
     case "still-waiting":
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
@@ -424,7 +431,7 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
                   ) : receipt.record?.id ? (
                     <B>{receipt.record.id}</B>
                   ) : receipt.ok === false ? (
-                    `${t("Did not apply")}: ${t(failureReason(write))}`
+                    `${t(hasUnconfirmedResult(write) ? "Result not confirmed" : "Did not apply")}: ${t(failureReason(write))}`
                   ) : receipt.ok ? (
                     t("Applied")
                   ) : (
@@ -447,6 +454,7 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
             )}
           </div>
         )}
+        {hasUnconfirmedResult(write) && <p className="rv-note">{t(UNCONFIRMED_WRITE_GUIDANCE)}</p>}
       </section>
       <p className="rv-note">{t("Approved writes run at most once as the workspace owner. Denials run nothing.")}</p>
     </div>

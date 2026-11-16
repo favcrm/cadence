@@ -356,6 +356,60 @@ listStatus = 200;
   await v.done();
 }
 
+// An earlier approval may have committed before its status was lost. Never say
+// it did not apply or invite a duplicate when the host cannot confirm it.
+for (const [code, reason] of [
+  ["app_version_changed", "the app changed after the request was staged"],
+  ["app_version_unverified", "the reviewed app version cannot be verified"],
+  ["batch_unconfirmed", "the earlier batch result cannot be verified"],
+] as const) {
+  actions = [customer("a1", { title: "Synthetic {reason} {guidance}" })];
+  onDecide = (id) => {
+    actions = actions.map((a) => a && typeof a === "object" && "id" in a && a.id === id ? { ...a, status: "approved", decidedAt: Date.now(), result: { ok: false, code } } : a);
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, `${code}: one pending card`));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), `${code}: open`));
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(!drawerEl(), `${code}: closed`));
+  const notice = text(v.host.querySelector(".todo-note"));
+  assert(notice.includes("result could not be confirmed") && notice.includes(reason), `${code}: uncertain notice (${notice})`);
+  assert(notice.includes("Synthetic {reason} {guidance}"), `${code}: the title cannot consume message placeholders`);
+  assert(notice.includes("Check the app's records and audit history before submitting a new request."), `${code}: safe recovery`);
+  assert(!notice.includes("did not apply") && sent() === 1, `${code}: no false failure or retry`);
+  assert(v.host.querySelector(".dx-dot"), `${code}: update needs attention`);
+  await click(labelled(v.host, "Updates"));
+  const line = v.host.querySelector("[data-fail]")!;
+  assert(text(line).includes("Result not confirmed") && text(line).includes(reason), `${code}: persistent explanation`);
+  assert(!v.host.querySelector(".dx-dot"), `${code}: viewing Updates clears the attention badge`);
+  assert(text(line).includes("Check the app's records and audit history before submitting a new request."), `${code}: persistent recovery`);
+  assert(!text(line).includes("Did not apply"), `${code}: no false failure in Updates`);
+  onDecide = null;
+  await v.done();
+}
+
+// The app conversation's own Updates uses the same uncertainty and recovery copy.
+{
+  scopedActions.set("uncertain-result", [customer("a1", {
+    status: "approved",
+    result: { ok: false, code: "batch_unconfirmed" },
+  })]);
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await React.act(async () => root.render(React.createElement(ConversationDecisions, {
+    conversation: "uncertain-result", revision: 0, onPendingChange: () => {}, onReview: () => {},
+  })));
+  await settle(() => assert(text(host).includes("Result not confirmed"), "conversation shows uncertain outcome"));
+  assert(text(host).includes("the earlier batch result cannot be verified"), "conversation shows the reason");
+  assert(text(host).includes("Check the app's records and audit history before submitting a new request."), "conversation shows safe recovery");
+  assert(!text(host).includes("Did not apply"), "conversation does not claim failure");
+  await React.act(async () => root.unmount());
+  host.remove();
+  scopedActions.delete("uncertain-result");
+}
+
 // ---- 8. network unconfirmed: re-read, never resubmit; refusals ----
 {
   actions = [customer("a1")];
@@ -1076,6 +1130,23 @@ listStatus = 200;
   assert(drawerEl()!.querySelector("pre")?.textContent?.includes("revision_conflict"), "Audit Show raw discloses failure code");
   decideStatus.a1 = 200;
   await f.done();
+
+  actions = [customer("a1")];
+  const uncertain = await render();
+  await settle(() => assert(uncertain.cards().length === 1, "one card for uncertain receipt"));
+  await click(labelled(uncertain.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "drawer opens for uncertain receipt"));
+  decideStatus.a1 = 409;
+  actions = [customer("a1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code: "app_version_changed" } })];
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(text(drawerEl()!).includes("already decided elsewhere"), "uncertain receipt is re-read"));
+  await click(labelled(drawerEl()!, "Audit"));
+  const receipt = text(drawerEl()!);
+  assert(receipt.includes("Result not confirmed: the app changed after the request was staged"), "Audit does not claim the write failed");
+  assert(receipt.includes("Check the app's records and audit history before submitting a new request."), "Audit gives safe recovery guidance");
+  assert(!receipt.includes("Did not apply"), "Audit never calls an uncertain result a failure");
+  decideStatus.a1 = 200;
+  await uncertain.done();
 }
 
 console.log("staged decision checks passed");

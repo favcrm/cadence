@@ -1,7 +1,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { subscribeMasterChanged } from "../../lib/masterChanged";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
-import { failureReason, outcomeOf, parseStagedList, type StagedOutcome, type StagedWrite } from "./stagedWrite";
+import { failureReason, hasUnconfirmedResult, outcomeOf, parseStagedList, type StagedOutcome, type StagedWrite } from "./stagedWrite";
 
 /**
  * CAD-2186: the owner's staged decisions as one shared store. The To do rail
@@ -31,7 +31,7 @@ export type DecideResult = "decided" | "elsewhere" | "access" | "unconfirmed";
 export interface DecisionNotice {
   outcome: StagedOutcome | "elsewhere" | "still-waiting";
   title: string;
-  /** English reason for a failed apply (translated where shown). */
+  /** English reason for a failed or unconfirmed apply (translated where shown). */
   reason?: string;
 }
 
@@ -44,7 +44,7 @@ export interface DecisionsState {
   decided: readonly StagedWrite[];
   attempts: ReadonlyMap<string, Attempt>;
   notice: DecisionNotice | null;
-  /** A write that was approved and did not apply, not yet seen in Updates. */
+  /** An approved write needing attention, not yet seen in Updates. */
   failedUnseen: boolean;
 }
 
@@ -75,7 +75,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
   function publish(next: Omit<DecisionsState, "pending" | "decided" | "failedUnseen"> & Partial<Pick<DecisionsState, "failedUnseen">>) {
     const pending = next.rows.filter((r) => r.status === "pending").sort((a, b) => a.createdAt - b.createdAt);
     const decided = next.rows.filter((r) => r.status !== "pending").sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt));
-    const failedUnseen = decided.some((r) => outcomeOf(r) === "failed" && !seenFailed.has(r.id));
+    const failedUnseen = decided.some((r) => (outcomeOf(r) === "failed" || hasUnconfirmedResult(r)) && !seenFailed.has(r.id));
     state = { ...next, pending, decided, failedUnseen };
     retain(hasUnresolved(state.attempts));
     for (const fn of listeners) fn();
@@ -219,7 +219,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   function failedOrDone(row: StagedWrite): DecisionNotice {
     const outcome = outcomeOf(row);
-    return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row) } : { outcome, title: row.title };
+    return outcome === "failed" || hasUnconfirmedResult(row) ? { outcome, title: row.title, reason: failureReason(row) } : { outcome, title: row.title };
   }
 
   /** Approve or deny one decision. Never retries; never submits twice. */
@@ -325,11 +325,11 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     if (state.notice !== null) patch({ notice: null });
   }
 
-  /** Updates was viewed: failed writes stop asking for attention. */
+  /** Updates was viewed: failed and unconfirmed writes stop asking for attention. */
   function markFailedSeen() {
     let changed = false;
     for (const r of state.decided)
-      if (outcomeOf(r) === "failed" && !seenFailed.has(r.id)) {
+      if ((outcomeOf(r) === "failed" || hasUnconfirmedResult(r)) && !seenFailed.has(r.id)) {
         seenFailed.add(r.id);
         changed = true;
       }

@@ -89,6 +89,11 @@ If a reply is lost, **Check again** re-reads the outcome rather than submitting
 another decision. Reads and decisions retain the selected conversation; the
 Home queue remains separate. Members cannot decide these requests.
 
+If the host cannot verify a reviewed app version or an earlier batch result,
+Updates says **Result not confirmed**. An earlier attempt may have committed
+before its status was saved: check the app's records and audit history before
+submitting another request.
+
 Every tool execution rechecks the supplied refusal and live authorization,
 including recovered executions and runtime-owned skill tools. Cancellation is
 checked before and after the authority check. Tool handlers receive only the
