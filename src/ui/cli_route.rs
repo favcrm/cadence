@@ -393,8 +393,14 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
 /// verb's own unknown-project answer; an unreadable tracker refuses, and
 /// so does a caller whose principal kind and actor disagree.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
+    // An absent project answers the same way for anyone but the Owner: the
+    // verbs' own unknown-project error lists every registered key, private
+    // ones included (CAD-2212).
     let refused = match actor.policy_actor() {
-        Some(spelling) => super::project_policy::refused(pm, key, &spelling),
+        Some(spelling) if spelling == "operator" => {
+            super::project_policy::refused(pm, key, &spelling)
+        }
+        Some(spelling) => !super::project_policy::readable(pm, &spelling).contains(key),
         None => true,
     };
     if refused {
@@ -1063,9 +1069,14 @@ mod policy_tests {
                 .unwrap_or_else(|| panic!("{spelling} was admitted"));
             assert_eq!(refusal.status_code(), 404, "{spelling}");
         }
-        // An absent project is not this guard's business — the verb keeps
-        // its own unknown-project answer.
-        assert!(restricted(&pm, "ghost", &actor("users/stranger")).is_none());
+        // An absent project gives everyone but the Owner the same refusal,
+        // because the verb's own unknown-project error names every key
+        // (CAD-2212). The Owner keeps the verb's answer.
+        let refusal = restricted(&pm, "ghost", &actor("users/stranger"))
+            .expect("an absent project reached the verb for a member");
+        assert_eq!(refusal.status_code(), 404);
+        assert!(restricted(&pm, "ghost", &actor("users/mia")).is_some());
+        assert!(restricted(&pm, "ghost", &actor("operator")).is_none());
     }
 
     #[test]

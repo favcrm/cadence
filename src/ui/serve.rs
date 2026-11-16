@@ -1623,6 +1623,36 @@ fn screen_read_only(
     operator::admit_screen_read(request, state_dir, opts).map(|_| ())
 }
 
+/// The caller's project scope for a read that names a project (CAD-2212).
+/// `Ok(None)` is the operator, served unfiltered; `Ok(Some(set))` is any
+/// other caller's readable projects; `Err` is the response to send.
+fn project_read_scope(
+    read_admission: Option<&operator::ReadAdmission>,
+    request: &Request,
+    pm: &Pm,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<Option<std::collections::BTreeSet<String>>, HttpResp> {
+    let Some(admission) = read_admission else {
+        return Err(err_response(503, "read admission is missing"));
+    };
+    let actor = operator::read_actor(admission, request, state_dir, opts)?;
+    Ok((actor != "operator").then(|| crate::project_policy::readable(pm, &actor)))
+}
+
+/// A project outside a non-operator caller's scope — absent or refused —
+/// answers as unknown, in words that name no project (CAD-2212). The
+/// handlers' own unknown-project error lists every registered key, so it
+/// is kept for the operator only.
+fn hidden_project(
+    scope: Option<&std::collections::BTreeSet<String>>,
+    key: &str,
+) -> Option<HttpResp> {
+    scope
+        .is_some_and(|readable| !readable.contains(key))
+        .then(|| err_response(404, "unknown project"))
+}
+
 /// The one admit sequence for a board read block: a route that matched a
 /// write surface is `405`, the guard runs before the handler, and only an
 /// admitted caller reaches it. `None` means no route matched and the
@@ -3115,10 +3145,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // `/api/projects/<key>/workflows[/<name>/preview]` — the
                 // project's workflow templates beside PROJECT.md (CAD-496).
                 if let Some(read) = workflows::read_route(&path) {
-                    match Pm::at(pm_dir) {
-                        Ok(pm) => send(request, workflows::read(&pm, state_dir, &query, read)),
-                        Err(e) => send(request, err_response(503, &e.to_string())),
-                    }
+                    let pm = match Pm::at(pm_dir) {
+                        Ok(pm) => pm,
+                        Err(e) => {
+                            send(request, err_response(503, &e.to_string()));
+                            return;
+                        }
+                    };
+                    let scope = match project_read_scope(
+                        read_admission.as_ref(),
+                        &request,
+                        &pm,
+                        state_dir,
+                        opts,
+                    ) {
+                        Ok(scope) => scope,
+                        Err(resp) => {
+                            send(request, resp);
+                            return;
+                        }
+                    };
+                    let resp = hidden_project(scope.as_ref(), read.project())
+                        .unwrap_or_else(|| workflows::read(&pm, state_dir, &query, read));
+                    send(request, resp);
                     return;
                 }
             }
@@ -3341,13 +3390,37 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // bindings and doctor findings, its runs and its outputs
             // (CAD-557, CAD-563).
             if let Some(read) = apps::read_route(&path) {
-                match Pm::at(pm_dir) {
-                    Ok(pm) => {
-                        let resp = apps::read(&request, &pm, state_dir, opts, &query, read);
-                        send(request, resp);
+                let pm = match Pm::at(pm_dir) {
+                    Ok(pm) => pm,
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
                     }
-                    Err(e) => send(request, err_response(503, &e.to_string())),
-                }
+                };
+                let scope = match project_read_scope(
+                    read_admission.as_ref(),
+                    &request,
+                    &pm,
+                    state_dir,
+                    opts,
+                ) {
+                    Ok(scope) => scope,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                };
+                // `?project=` names a project on the list route too.
+                let named = read
+                    .project()
+                    .map(str::to_string)
+                    .or_else(|| query("project"));
+                let resp = named
+                    .and_then(|key| hidden_project(scope.as_ref(), &key))
+                    .unwrap_or_else(|| {
+                        apps::read(&request, &pm, state_dir, opts, &query, read, scope.as_ref())
+                    });
+                send(request, resp);
                 return;
             }
             // `/api/memories/<project>/<slug>` — memory detail.
