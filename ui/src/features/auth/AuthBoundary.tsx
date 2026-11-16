@@ -112,6 +112,14 @@ export default function AuthBoundary({ children }: {
     setSession(null);
   }, [setSession]);
 
+  const requireHostedConfirmation = useCallback(() => {
+    if (!stateRef.current.hosted || identity.current === null) return;
+    pendingChange.current = true;
+    proposedIdentity.current = null;
+    approvedIdentity.current = null;
+    try { sessionStorage.setItem(IDENTITY_CHANGE_STORE, "1"); } catch { /* The current tab still requires confirmation. */ }
+  }, []);
+
   const recheck = useCallback((): Promise<boolean> => {
     if (logoutPending.current) return Promise.resolve(false);
     const key = sessionKey();
@@ -120,6 +128,7 @@ export default function AuthBoundary({ children }: {
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
+      requireHostedConfirmation();
       discard();
       publish({ ...stateRef.current, status: "checking", accepted: null, generation: privateSessionGeneration() });
     }
@@ -167,10 +176,8 @@ export default function AuthBoundary({ children }: {
           ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
         if (hosted && stateRef.current.hosted && identity.current !== null && identity.current !== nextIdentity) {
+          requireHostedConfirmation();
           discard();
-          pendingChange.current = true;
-          approvedIdentity.current = null;
-          try { sessionStorage.setItem(IDENTITY_CHANGE_STORE, "1"); } catch { /* The current tab still requires confirmation. */ }
         }
         if (hosted && pendingChange.current && approvedIdentity.current !== nextIdentity) {
           approvedIdentity.current = null;
@@ -199,6 +206,7 @@ export default function AuthBoundary({ children }: {
         return false;
       }
       const expired = stateRef.current.accepted !== null || identity.current !== null || key !== null || stateRef.current.status === "expired";
+      requireHostedConfirmation();
       discard();
       // Only a positive refusal of this exact tab credential removes it.
       if (key) {
@@ -211,6 +219,7 @@ export default function AuthBoundary({ children }: {
       if (!current()) return false;
       if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
         const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
+        requireHostedConfirmation();
         discard();
         publish({ ...stateRef.current, status: error.status === 403 ? "refused" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
       } else if (error instanceof ApiError && error.status === 503 && error.code === "sign_in_upgrade_required") unavailable("updating");
@@ -222,7 +231,7 @@ export default function AuthBoundary({ children }: {
     });
     inFlight.current = { key, controller, promise };
     return promise;
-  }, [discard, publish, setSession]);
+  }, [discard, publish, requireHostedConfirmation, setSession]);
 
   useEffect(() => {
     pausePrivateReads();
@@ -239,6 +248,7 @@ export default function AuthBoundary({ children }: {
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
+      requireHostedConfirmation();
       discard();
       publish({ ...stateRef.current, status: "signedout", accepted: null, generation: privateSessionGeneration() });
     };
@@ -257,6 +267,7 @@ export default function AuthBoundary({ children }: {
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
+      requireHostedConfirmation();
       discard();
       if (sessionKey() !== null) {
         credential.current = null;
@@ -298,7 +309,7 @@ export default function AuthBoundary({ children }: {
       window.removeEventListener("storage", shared);
       document.removeEventListener("visibilitychange", focused);
     };
-  }, [discard, publish, recheck]);
+  }, [discard, publish, recheck, requireHostedConfirmation]);
 
   // A local daemon restart or a brief identity outage leaves the session
   // intact (`unavailable` is not a sign-out). Retry on a short cadence so

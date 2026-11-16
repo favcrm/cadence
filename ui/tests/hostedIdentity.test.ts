@@ -214,6 +214,32 @@ async function boundaryChecks() {
     await continueWithCurrent();
     assert(host.querySelector("[data-private-workspace]") && host.querySelector("output")?.textContent === "", "confirmation opens only the newly verified identity with an empty draft");
     assert(sessionStorage.getItem("cadence.hostedIdentityConfirmationPending") === null, "successful confirmation removes the reload marker");
+
+    // A late refusal must not erase the need to confirm the next hosted sign-in.
+    response = () => json({ error: { code: "board_session_required", message: "Session required" } }, 401);
+    await focus();
+    assert(host.querySelector("[data-auth-state='expired'] h1"), "a confirmed hosted refusal ends the admitted session");
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    const afterRefusal = { ...changedAgain, session: { ...changedAgain.session, id: "fourth-hosted-session", user: { ...changedAgain.session.user, sub: "fourth-user", email: "fourth@example.test" } } };
+    response = () => json(afterRefusal);
+    await render();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a new hosted identity after refusal and reload still requires confirmation");
+    assert(host.textContent?.includes("fourth@example.test"), "the confirmation reflects the new verified identity");
+    await continueWithCurrent();
+    assert(host.querySelector("[data-private-workspace]"), "the newly verified identity opens only after confirmation");
+    const afterKeyChange = { ...afterRefusal, session: { ...afterRefusal.session, id: "fifth-hosted-session", user: { ...afterRefusal.session.user, sub: "fifth-user", email: "fifth@example.test" } } };
+    response = () => json(afterKeyChange);
+    await React.act(async () => setSessionKey("hosted-rotated-key"));
+    await flush();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a credential change cannot bypass hosted identity confirmation");
+    await continueWithCurrent();
+    const afterRequired = { ...afterKeyChange, session: { ...afterKeyChange.session, id: "sixth-hosted-session", user: { ...afterKeyChange.session.user, sub: "sixth-user", email: "sixth@example.test" } } };
+    response = () => json(afterRequired);
+    await React.act(async () => window.dispatchEvent(new Event("cadence:session-required")));
+    await focus();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a session-required event preserves the confirmation requirement");
+    await continueWithCurrent();
     response = () => json(signedIn);
     await focus();
     assert(host.querySelector("output")?.textContent === "", "changing identity clears the previous draft");

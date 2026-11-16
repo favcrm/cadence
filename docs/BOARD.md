@@ -1858,9 +1858,11 @@ the same session is verified again.
 When this tab verifies a different hosted session, it discards the previous
 private tree and requires confirmation before opening the new one. The button
 re-verifies the specific identity shown; a further change needs another
-confirmation. A non-sensitive pending marker survives same-tab reload when
-session storage is available. This presentation check does not replace
-server-side fencing of requests across tabs.
+confirmation. After a confirmed hosted session loss, the next verified sign-in
+also needs confirmation, even if it is the same account; the tab cannot prove
+the replacement while signed out. A non-sensitive pending marker survives
+same-tab reload when session storage is available. This presentation check does
+not replace server-side fencing of requests across tabs.
 A confirmed sign-out, expiry or identity change clears private observations
 and rejects stale in-flight responses. A session-required `401` supersedes
 older pending verification; a feature's ordinary role-based `403` does not
