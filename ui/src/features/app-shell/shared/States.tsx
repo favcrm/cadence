@@ -80,7 +80,7 @@ export function Loading({ children, className }: { children: ReactNode; classNam
 export function ErrorNotice({
   children,
   onRetry,
-  retryLabel = "Retry",
+  retryLabel,
   bare,
   className,
 }: {
@@ -92,6 +92,7 @@ export function ErrorNotice({
   className?: string;
 }) {
   const t = useTranslate();
+  const sessionExpired = children === SESSION_EXPIRED_TEXT || children === t(SESSION_EXPIRED_TEXT);
   return (
     <p
       className={[
@@ -106,17 +107,17 @@ export function ErrorNotice({
       role="alert"
     >
       {children}
-      {onRetry || children === SESSION_EXPIRED_TEXT ? (
+      {onRetry || sessionExpired ? (
         <>
           {" "}
-          {children === SESSION_EXPIRED_TEXT ? (
+          {sessionExpired ? (
             // A top-level navigation re-authenticates; a retried fetch cannot.
             <button type="button" className="lnk" onClick={() => window.location.reload()}>
               {t("Reload")}
             </button>
           ) : (
             <button type="button" className="lnk" onClick={onRetry}>
-              {retryLabel}
+              {retryLabel ?? t("Retry")}
             </button>
           )}
         </>

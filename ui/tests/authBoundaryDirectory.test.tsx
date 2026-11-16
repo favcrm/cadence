@@ -70,14 +70,14 @@ await React.act(async () => {
     React.createElement(AuthBoundary, { children: () => React.createElement("main", null, "PRIVATE WORKSPACE") })));
 });
 // Let the bootstrap check settle, then poll briefly for the gate to appear.
-for (let i = 0; i < 20 && !host.textContent?.includes("Your work, behind a sign-in."); i++) {
+for (let i = 0; i < 20 && !host.querySelector("[data-auth-state='signedout'] h1"); i++) {
   await flush();
   await delay(10);
 }
 await flush();
 
 const text = host.textContent ?? "";
-assert(text.includes("Your work, behind a sign-in."), "signed-out hosted tab shows the sign-in gate");
+assert(host.querySelector("[data-auth-state='signedout'] h1"), "signed-out hosted tab shows the sign-in gate");
 assert(text.includes("Continue with AgenticOS"), "signed-out hosted tab offers the platform sign-in");
 assert(!text.includes("PRIVATE WORKSPACE"), "signed-out tab must not render the private workspace");
 assert(!text.includes("All published apps"), "signed-out tab must not render catalogue UI");

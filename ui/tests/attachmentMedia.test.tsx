@@ -177,6 +177,47 @@ async function pdfCheck(): Promise<void> {
   ok(closed, "a refused read closes the blank tab");
   ok(replaced === "", "a refused read opens nothing");
 
+  // A response from the previous account must not open after an identity
+  // reset, even if a transport ignores its abort signal.
+  const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession");
+  replaced = "";
+  closed = false;
+  let deliver!: (response: Response) => void;
+  const request: { signal?: AbortSignal } = {};
+  globalThis.fetch = ((_url: RequestInfo | URL, init?: RequestInit) => {
+    request.signal = init?.signal ?? undefined;
+    return new Promise<Response>((resolve) => { deliver = resolve; });
+  }) as typeof fetch;
+  await React.act(async () => {
+    openAttachmentInTab(PDF.id, CONV);
+    resetPrivateSession();
+    allowPrivateReads();
+    deliver(new Response("synthetic account A attachment", { status: 200 }));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  });
+  ok(request.signal?.aborted, "the retired account's request is aborted");
+  ok(closed, "the previous account's blank tab closes after a delayed response");
+  ok(replaced === "", "the previous account's bytes never open after the switch");
+
+  // A reset after headers but during an uncooperative body read is fenced too.
+  replaced = "";
+  closed = false;
+  let finishBody!: (body: Blob) => void;
+  const bodyResponse = new Response(null, { status: 200 });
+  bodyResponse.blob = () => new Promise<Blob>((resolve) => { finishBody = resolve; });
+  globalThis.fetch = (async () => bodyResponse) as typeof fetch;
+  await React.act(async () => {
+    openAttachmentInTab(PDF.id, CONV);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    ok(typeof finishBody === "function", "the attachment body read has started");
+    resetPrivateSession();
+    allowPrivateReads();
+    finishBody(new Blob(["synthetic account A attachment"]));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  });
+  ok(closed, "a switched session closes the tab during an in-flight body read");
+  ok(replaced === "", "an old body cannot open after an account switch");
+
   globalThis.fetch = realFetch;
   win.open = realOpen;
   win.setTimeout = realSetTimeout;

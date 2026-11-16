@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
+import { withPrivateOperation } from "../../lib/privateSession";
 import { attachMeta } from "../app-shell/chat/attach";
 
 /**
@@ -47,14 +48,22 @@ export function attachmentPreviewKind(mime: string): "image" | "video" | null {
 export function openAttachmentInTab(id: string, conversation: string): void {
   const tab = window.open("about:blank", "_blank");
   if (tab === null) return;
-  void fetch(attachmentHref(id, conversation), { credentials: "same-origin" })
-    .then(async (response) => {
-      if (!response.ok) throw new Error(`attachment read ${response.status}`);
-      const href = URL.createObjectURL(await response.blob());
+  void withPrivateOperation(async (operation) => {
+    const response = await operation.fetch(attachmentHref(id, conversation), {
+      credentials: "same-origin",
+    });
+    if (!response.ok) throw new Error(`attachment read ${response.status}`);
+    const body = await response.blob();
+    operation.assertCurrent();
+    const href = URL.createObjectURL(body);
+    try {
       tab.location.replace(href);
-      window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
-    })
-    .catch(() => tab.close());
+    } catch (error) {
+      URL.revokeObjectURL(href);
+      throw error;
+    }
+    window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
+  }).catch(() => tab.close());
 }
 
 export default function AttachmentMedia({

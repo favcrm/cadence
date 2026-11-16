@@ -2,15 +2,14 @@ import { ApiError } from "../../../lib/apiError";
 
 /**
  * The one error-to-message layer every CRM list shares (CAD-1009).
- * A hosted session that expired answers a records fetch with a 401 and
- * a cross-origin redirect to the authorize URL, which `fetch` cannot
- * follow: it throws a bare TypeError (or a non-Error object). Those all
- * read as one human sentence, and the notice offers a reload — a
- * top-level navigation re-authenticates. A message is always a string:
- * an object is never stringified.
+ * A 401 confirms the session is unavailable; an opaque redirect or network
+ * error does not distinguish an old sign-in redirect from a connection fault.
+ * A message is always a string: an object is never stringified.
  */
 export const SESSION_EXPIRED_TEXT =
-  "Your session expired or the connection dropped — reload the page to sign in again.";
+  "Your session ended. Reload to sign in; unsent changes may be lost.";
+export const CONNECTION_UNAVAILABLE_TEXT =
+  "We couldn't reach the workspace. Your session may still be active. Check your connection and try again.";
 
 /** The daemon's bare "app <x> management refused or unavailable" line
  *  carries no reason: it is dropped, never shown glued to a message. */
@@ -26,14 +25,14 @@ export function hostErrorText(error: unknown, fallback: string): string {
     const message = error.message.replace(GENERIC_REFUSAL, "").trim();
     return message === "" || message.startsWith("[object ") ? fallback : message;
   }
-  if (error instanceof TypeError) return SESSION_EXPIRED_TEXT;
+  if (error instanceof TypeError) return CONNECTION_UNAVAILABLE_TEXT;
   if (error instanceof Error && error.message !== "") return error.message;
   if (typeof error === "string" && error !== "") return error;
   if (typeof error === "object" && error !== null) {
     const message = (error as { message?: unknown }).message;
     if (typeof message === "string" && message !== "") return message;
     // A bare object thrown by fetch (an opaque redirect) is a transport failure.
-    return SESSION_EXPIRED_TEXT;
+    return CONNECTION_UNAVAILABLE_TEXT;
   }
   return fallback;
 }

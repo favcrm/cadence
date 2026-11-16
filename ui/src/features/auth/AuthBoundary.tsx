@@ -4,7 +4,7 @@ import { useLocale } from "../../lib/locale";
 import { allowPrivateReads, pausePrivateReads, privateSessionGeneration, resetPrivateSession } from "../../lib/privateSession";
 import { applySharedSessionChange, sessionKey, setSessionKey } from "../../lib/sessionKey";
 import type { Meta } from "../../lib/types";
-import { navigate, useHref } from "../../lib/useLocation";
+import { NAVIGATED, navigate, useHref } from "../../lib/useLocation";
 import { Logo } from "../../ui/Logo";
 import Button from "../../ui/Button";
 import ThemeToggle from "../../ui/ThemeToggle";
@@ -16,11 +16,24 @@ import { hostedOrigin } from "./hosted";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
 
-type Status = "checking" | "signedout" | "unavailable" | "expired" | "refused" | "ready";
+type Status = "checking" | "signedout" | "unavailable" | "updating" | "expired" | "refused" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
 const IDENTITY_STORE = "cadence.privateSessionIdentity";
 
 const RETURN_STORE = "cadence.auth.returnTo";
+const HOSTED_RETURN_STORE = "cadence.auth.hostedReturnTo";
+
+/** Retain only plain anchor-like fragments, never credential-style key/value fragments. */
+function safeReturnFragment(fragment: string): string {
+  if (!fragment.startsWith("#")) return "";
+  try {
+    const anchor = decodeURIComponent(fragment.slice(1));
+    if (anchor.includes("=")) return "";
+    return /^[\p{L}\p{M}\p{N}\p{P}\p{S} ]{1,200}$/u.test(anchor) ? fragment : "";
+  } catch {
+    return "";
+  }
+}
 
 /** Only board-local navigation survives the sign-in handoff. */
 function safeReturnPath(candidate: string | null): string | null {
@@ -28,7 +41,7 @@ function safeReturnPath(candidate: string | null): string | null {
   try {
     const url = new URL(candidate, location.origin);
     if (url.origin !== location.origin || url.pathname === "/login" || url.pathname.startsWith("/__platform/")) return null;
-    return `${url.pathname}${url.search}${url.hash}`;
+    return `${url.pathname}${url.search}${safeReturnFragment(url.hash)}`;
   } catch { return null; }
 }
 
@@ -47,13 +60,26 @@ export default function AuthBoundary({ children }: {
 }) {
   const { t, setSession } = useLocale();
   const href = useHref();
+  const [fragment, setFragment] = useState(() => location.hash);
+  useEffect(() => {
+    const changed = () => setFragment(location.hash);
+    window.addEventListener("hashchange", changed);
+    window.addEventListener("popstate", changed);
+    window.addEventListener(NAVIGATED, changed);
+    return () => {
+      window.removeEventListener("hashchange", changed);
+      window.removeEventListener("popstate", changed);
+      window.removeEventListener(NAVIGATED, changed);
+    };
+  }, []);
+  const returnHref = `${href}${fragment}`;
   const loginRoute = href.split(/[?#]/)[0] === "/login";
   useEffect(() => {
-    const destination = safeReturnPath(href);
+    const destination = safeReturnPath(returnHref);
     if (destination) {
       try { sessionStorage.setItem(RETURN_STORE, destination); } catch { /* Same-tab return is optional when storage is unavailable. */ }
     }
-  }, [href]);
+  }, [returnHref]);
   const [state, setState] = useState<BoundaryState>({ status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(), hosted: hostedOrigin(typeof window === "undefined" ? null : window.location.hostname) });
   const stateRef = useRef(state);
   const [loginExchanged, setLoginExchanged] = useState(false);
@@ -98,12 +124,12 @@ export default function AuthBoundary({ children }: {
     // Routine successful revalidation never hides/remounts the workspace.
     if (previous.status !== "ready") publish({ ...previous, status: "checking" });
     const current = () => request === sequence.current && key === sessionKey();
-    const unavailable = () => {
+    const unavailable = (status: "unavailable" | "updating" = "unavailable") => {
       const focused = document.activeElement;
       if (stateRef.current.status === "ready" && focused instanceof HTMLElement && focused.closest("[data-app-shell]")) privateFocus.current = focused;
       pausePrivateReads();
       setSession(null);
-      publish({ ...stateRef.current, status: "unavailable" });
+      publish({ ...stateRef.current, status, hosted: status === "updating" || stateRef.current.hosted });
     };
     const promise = api.meta(true, controller.signal).then((meta) => {
       if (!current()) return false;
@@ -118,10 +144,10 @@ export default function AuthBoundary({ children }: {
       }
       const admitted = meta.signed_in === true || (!hosted && meta.anonymous_reads === true);
       if (admitted) {
-        // SessionView.id is only a non-secret display prefix; stable creation
-        // and expiry plus verified subject/role distinguish its observations.
+        // Hosted sessions use a stable server-issued id; their expiry slides
+        // without changing identity. Local sessions retain the expiry fence.
         const nextIdentity = meta.signed_in === true && session
-          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
+          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;
@@ -150,7 +176,8 @@ export default function AuthBoundary({ children }: {
         const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
         discard();
         publish({ ...stateRef.current, status: error.status === 403 ? "refused" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
-      } else unavailable();
+      } else if (error instanceof ApiError && error.status === 503 && error.code === "sign_in_upgrade_required") unavailable("updating");
+      else unavailable();
       return false;
     }).finally(() => {
       window.clearTimeout(timeout);
@@ -271,6 +298,19 @@ export default function AuthBoundary({ children }: {
     if (loginRoute && loginExchanged && state.status === "ready") navigate(returnDestination(), { replace: true });
   }, [loginRoute, loginExchanged, state.status]);
   useEffect(() => {
+    if (state.status !== "ready" || loginRoute) return;
+    try {
+      const saved = sessionStorage.getItem(HOSTED_RETURN_STORE);
+      if (saved === null) return;
+      sessionStorage.removeItem(HOSTED_RETURN_STORE);
+      const destination = safeReturnPath(saved);
+      if (!destination) return;
+      const target = new URL(destination, location.origin);
+      if (target.pathname === location.pathname && target.search === location.search && target.hash && !location.hash)
+        navigate(`${target.pathname}${target.search}${target.hash}`, { replace: true });
+    } catch { /* Same-tab return is optional when storage is unavailable. */ }
+  }, [state.status, loginRoute]);
+  useEffect(() => {
     const freshLink = () => {
       if (location.pathname !== "/login" || !location.hash) return;
       captureLoginNonce();
@@ -281,14 +321,21 @@ export default function AuthBoundary({ children }: {
   }, []);
 
   const hosted = state.hosted;
-  const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(href) ?? "/", location.origin).href)}`;
+  const hostedDestination = loginRoute ? returnDestination() : safeReturnPath(returnHref) ?? "/";
+  const hostedTarget = new URL(hostedDestination, location.origin);
+  hostedTarget.hash = "";
+  const hostedLogin = `/__platform/login?to=${encodeURIComponent(hostedTarget.href)}`;
+  const rememberHostedReturn = () => {
+    try { sessionStorage.setItem(HOSTED_RETURN_STORE, hostedDestination); } catch { /* Same-tab return is optional. */ }
+  };
   const checking = state.status === "checking";
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
-    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Your work, behind a sign-in." : "Sign in to your local board.", text: hosted ? "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
+    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Sign in to Cadence." : "Sign in to your local board.", text: hosted ? "Use your AgenticOS account to open this workspace." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
+    updating: { eyebrow: "Sign-in updating", heading: "Sign-in verification is updating.", text: "This workspace is updating its sign-in verification. Try again shortly.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
-    expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
+    expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: hosted ? "Your session ended. Unsent changes may not have been saved. Continue with AgenticOS to reopen your workspace." : "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
   };
   const gate = copy[state.status === "ready" ? "checking" : state.status];
   const showGate = state.status !== "ready" || loginRoute;
@@ -301,21 +348,21 @@ export default function AuthBoundary({ children }: {
         </header>
         <main className="auth-stage">
           {loginRoute && !loginExchanged ? <Login onSignedIn={onSignedIn} /> : <section className="auth-card" aria-labelledby="auth-title" aria-busy={checking}>
-            <div className={`auth-state-icon${state.status === "unavailable" ? " auth-warn" : ""}`} aria-hidden="true">{checking ? <span className="auth-loader" /> : <GateIcon kind={gate.icon} />}</div>
+            <div className={`auth-state-icon${state.status === "unavailable" || state.status === "updating" ? " auth-warn" : ""}`} aria-hidden="true">{checking ? <span className="auth-loader" /> : <GateIcon kind={gate.icon} />}</div>
             <p className="auth-eyebrow">{t(gate.eyebrow)}</p>
             <h1 id="auth-title" ref={title} tabIndex={-1}>{t(gate.heading)}</h1>
             <p className="auth-intro">{t(gate.text)}</p>
             {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
-              {state.status === "unavailable" ? <>
+              {state.status === "unavailable" || state.status === "updating" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
-                {hosted ? <a className="auth-back-link" href={hostedLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">
+                {state.status === "updating" ? null : hosted ? <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>
                   <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
                   <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
                   {state.meta?.device_login === true && <DeviceSignIn onSignedIn={onSignedIn} />}
                 </details>}
               </> : hosted ? <>
-                <a className="btn btn-primary btn-full" href={hostedLogin}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
+                <a className="btn btn-primary btn-full" href={hostedLogin} onClick={rememberHostedReturn}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
                 <p className="auth-quiet auth-centered">{t("No separate Cadence account needed.")}</p>
               </> : <>
                 <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>

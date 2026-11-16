@@ -155,6 +155,29 @@ async function boundaryChecks() {
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session recovery restores the in-memory draft");
     assert(effects > 1, "private effects resume after recovery");
 
+    // A hosted renewal changes its deadline, not the owner of an unsent draft.
+    const hostedSession = { ...signedIn, hosted: true, session: { ...signedIn.session, id: "hosted-session", origin: "public" } };
+    response = () => json(hostedSession);
+    await focus();
+    await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    const beforeUpgrade = privateSessionGeneration();
+    response = () => json({ error: { code: "sign_in_upgrade_required", message: "Updating" } }, 503);
+    await focus();
+    assert(host.querySelector("[data-auth-state='updating'] h1")?.textContent === "Sign-in verification is updating.", "upgrade explains why verification is unavailable");
+    assert(privateSessionGeneration() === beforeUpgrade, "an upgrade retains the current in-memory session");
+    response = () => json(hostedSession);
+    await retry();
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session recovery after an upgrade retains the in-memory draft");
+    const beforeRenewal = privateSessionGeneration();
+    response = () => json({ ...hostedSession, session: { ...hostedSession.session, expires_at: 4102473600, idle_expires_at: 4102473600 } });
+    await focus();
+    assert(privateSessionGeneration() === beforeRenewal, "hosted renewal keeps the same private session");
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "hosted renewal keeps the unsent draft");
+    response = () => json(signedIn);
+    await focus();
+    assert(host.querySelector("output")?.textContent === "", "changing identity clears the previous draft");
+    await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+
     // A newer authoritative refusal supersedes an already validated but delayed
     // metadata response. Neither envelope may restore the old private draft.
     for (const refusal of [
@@ -212,14 +235,37 @@ async function boundaryChecks() {
 
     const { navigate } = require("../src/lib/useLocation") as typeof LocationModule;
     const { captureLoginNonce } = require("../src/features/auth/session") as typeof AuthSessionModule;
-    const intendedPath = "/projects/cadence/issues?view=kanban";
-    await React.act(async () => navigate(intendedPath));
+    const pathWithoutFragment = "/wiki/releases?view=read";
+    const dottedPath = `${pathWithoutFragment}#release-v1.2`;
+    const intendedPath = `${pathWithoutFragment}#research%20%26%20development`;
+    await React.act(async () => navigate(dottedPath));
     await flush();
     const hostedLink = host.querySelector('a[href^="/__platform/login"]') as HTMLAnchorElement | null;
     assert(hostedLink, "hosted refusal offers the platform sign-in handoff");
-    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${intendedPath}`, "hosted handoff preserves the absolute original board path and query");
+    assert(new URL(hostedLink!.href).searchParams.get("to") === `http://localhost${pathWithoutFragment}`, "hosted handoff never sends fragments to the platform");
+    hostedLink.addEventListener("click", (event) => event.preventDefault());
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === dottedPath, "punctuation in a safe anchor stays in this tab for verified restoration");
+    await React.act(async () => navigate(intendedPath));
+    await flush();
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === intendedPath, "standalone ampersands in wiki anchors survive");
+    for (const fragment of ["#access_token=secret", "#access_token%3Dsecret", "#bad%"]) {
+      await React.act(async () => navigate(`${pathWithoutFragment}${fragment}`));
+      await flush();
+      await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+      assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === pathWithoutFragment, "credential-style or malformed fragments are not remembered");
+    }
+    await React.act(async () => navigate(intendedPath));
+    await flush();
     const rememberedPath = sessionStorage.getItem("cadence.auth.returnTo");
     assert(rememberedPath === intendedPath, "public deep link is remembered for the same-tab local handoff");
+    await React.act(async () => hostedLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    history.replaceState(null, "", pathWithoutFragment);
+    response = () => json(hostedSession);
+    await focus();
+    assert(location.pathname + location.search + location.hash === intendedPath, "only verified same-tab return restores the safe anchor");
+    assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === null, "the hosted return marker is single-use");
 
     // Exercise the actual Login nonce exchange. A returned key is not admission:
     // the /login route cannot redirect or mount private content before metadata.
@@ -262,7 +308,7 @@ async function boundaryChecks() {
       assert(heldMeta.length > 0, "post-exchange verification is genuinely pending");
       await React.act(async () => heldMeta[heldMeta.length - 1](json(signedIn)));
       await flush();
-      assert(location.pathname + location.search === expectedPath, `verified login returns only to a safe board route (${String(storedReturn)})`);
+      assert(location.pathname + location.search + location.hash === expectedPath, `verified login returns only to a safe board route (${String(storedReturn)})`);
       assert(history.length === beforeHistory, "verified login replaces the handoff entry instead of pushing it");
       assert(host.querySelector("[data-private-workspace]"), "private content mounts only after verified navigation");
     }
