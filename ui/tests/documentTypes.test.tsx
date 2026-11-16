@@ -262,10 +262,14 @@ async function main() {
   equal(validateTypeDraft(draft({ label: "a\u007fb" }), true, [], t), { label: "Remove line breaks and other control characters." }, "DEL in the name");
   equal(validateTypeDraft(draft({ label: " BRIEF " }), true, ["brief"], t), { label: "This type already exists. Edit it from the list instead." }, "an existing key, in any case");
   equal(validateTypeDraft(draft({ label: "" }), false, ["brief"], t), {}, "an edit does not check the name");
-  // A key of "." or ".." is a dot segment in the URL path, even percent-encoded.
-  for (const label of [".", "..", " .. "])
-    equal(validateTypeDraft(draft({ label }), true, [], t), { label: "Use a name other than “.” or “..”." }, `${JSON.stringify(label)} is refused`);
-  equal(validateTypeDraft(draft({ label: "..." }), true, [], t), {}, "three dots is an ordinary name");
+  // AOS-590: the key is one URL path segment, as the server's validTypeInput
+  // reads it: a name of only dots, or one with a slash, is refused.
+  for (const label of [".", "..", " .. ", "..."])
+    equal(validateTypeDraft(draft({ label }), true, [], t), { label: "Use a name that isn’t only dots." }, `${JSON.stringify(label)} is refused`);
+  for (const label of ["a/b", "a\\b", "/", " \\ "])
+    equal(validateTypeDraft(draft({ label }), true, [], t), { label: "Use a name without “/” or “\\”." }, `${JSON.stringify(label)} is refused`);
+  for (const label of ["v1.2", "q.a"])
+    equal(validateTypeDraft(draft({ label }), true, [], t), {}, `${JSON.stringify(label)} is an ordinary name`);
   equal(validateTypeDraft(draft({ recipientNote: "n".repeat(200) }), true, [], t), {}, "a 200-character note");
   equal(validateTypeDraft(draft({ recipientNote: "n".repeat(201) }), true, [], t), { recipientNote: "Use 200 characters or fewer." }, "a 201-character note");
   equal(validateTypeDraft(draft({ recipientNote: "a\nb" }), true, [], t), { recipientNote: "Remove line breaks and other control characters." }, "a note is one line");
@@ -928,7 +932,8 @@ async function main() {
     "Member names aren’t shown to platform sessions.",
     "Couldn’t refresh the member list, so approver names may be out of date.",
     "The member list couldn’t be read, so only the workspace owner and the current approver are offered.",
-    "Use a name other than “.” or “..”.",
+    "Use a name that isn’t only dots.",
+    "Use a name without “/” or “\\”.",
     "Document review isn’t available on this workspace any more.",
     "Archive after",
     "Couldn’t confirm the save, so the list was read again.",
