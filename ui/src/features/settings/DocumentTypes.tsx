@@ -86,9 +86,10 @@ export function validateTypeDraft(
     if (hasControl(draft.label)) errors.label = t("Remove line breaks and other control characters.");
     else if (label.length === 0) errors.label = t("Enter a name for this type.");
     else if (label.length > LABEL_MAX) errors.label = t("Use 40 characters or fewer.");
-    // The key travels as a URL path segment, where "." and ".." are dot
-    // segments even percent-encoded (WHATWG URL reads %2E as a dot).
-    else if (label === "." || label === "..") errors.label = t("Use a name other than “.” or “..”.");
+    // AOS-590: the key travels as one URL path segment, so the server refuses
+    // a name of only dots or one with a slash, as these do.
+    else if (/^\.+$/.test(label)) errors.label = t("Use a name that isn’t only dots.");
+    else if (/[/\\]/.test(label)) errors.label = t("Use a name without “/” or “\\”.");
     else if (existing.some((key) => typeKey(key) === typeKey(label)))
       errors.label = t("This type already exists. Edit it from the list instead.");
   }

@@ -2835,7 +2835,8 @@ Object.assign(zhTW, {
   "Member names aren’t shown to platform sessions.": "平台工作階段不會顯示成員名稱。",
   "Couldn’t refresh the member list, so approver names may be out of date.": "無法重新整理成員名單，因此核准者名稱可能不是最新的。",
   "The member list couldn’t be read, so only the workspace owner and the current approver are offered.": "無法讀取成員名單，因此只提供工作區擁有者與目前的核准者。",
-  "Use a name other than “.” or “..”.": "請使用「.」或「..」以外的名稱。",
+  "Use a name that isn’t only dots.": "請使用不只由「.」組成的名稱。",
+  "Use a name without “/” or “\\”.": "請使用不含「/」或「\\」的名稱。",
   "Document review isn’t available on this workspace any more.": "此工作區已無法再使用文件審查。",
 });
 

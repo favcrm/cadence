@@ -32,7 +32,7 @@ import { settingsRedirect } from "../../src/features/settings/settingsNav";
 import { parseMount } from "../../src/features/workspace-apps/screen/screenLifecycle";
 import { screenProjection, screenTag } from "../../src/features/workspace-apps/screen/screenProjection";
 import { shapeFor } from "../../src/features/workspace-apps/screen/screenProtocol";
-import type { AppContext, AppEffect, HomeInstallation, Installation, WorkspaceRun } from "../../src/features/workspace-apps/workspaceApps";
+import { workspaceApps, type AppContext, type AppEffect, type HomeInstallation, type Installation, type WorkspaceRun } from "../../src/features/workspace-apps/workspaceApps";
 import { api } from "../../src/lib/api";
 import { allowPrivateReads } from "../../src/lib/privateSession";
 import { readTeamMembers } from "../../src/lib/teamRoster";
@@ -98,6 +98,12 @@ export function boardViewer(fx: Fixtures, viewer: ViewerPreset): { sub: string; 
   if (viewer === "owner") return { sub: roster(fx).find((row) => row.role === "owner")?.userId ?? "", owner: true };
   const meta = fx.meta as { session?: { user?: { sub?: string } } };
   return { sub: meta.session?.user?.sub ?? "", owner: false };
+}
+
+/** `GET /api/app-installations`: the operator's installed-app list, which the
+ *  sidebar's app menu reads (CAD-2314). The one installed app is the list. */
+export function appInstallations(fx: Fixtures): unknown {
+  return [fx["app-installation"]];
 }
 
 /** `/api/meta` for these presets. The default presets return the fixture itself. */
@@ -407,6 +413,7 @@ function fixtureFetch(
     if (document) return json(document.body, document.status);
     if (url.pathname === "/api/team/members" && servesRoster(board().presets)) return json(fx["team-members"]);
     switch (`${init?.method ?? "GET"} ${url.pathname}`) {
+      case "GET /api/app-installations": return json(appInstallations(fx));
       case "GET /api/browser": return json(browser());
       case "POST /api/browser/view": return json({ url: viewUrl });
       case "POST /api/browser/stop": return json(fx["browser-stop"]);
@@ -735,6 +742,14 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
 
     const sent = await sendToAssistant("qa-board:validate", "hello", "qa-board-check");
     if (!sent.ok) fail("member-assistant-send", `sendToAssistant refused it: ${sent.error}`);
+
+    // The sidebar's app menu, as App.tsx builds it from the operator's list.
+    try {
+      const rows = await workspaceApps.installations();
+      const row = Array.isArray(rows) ? rows.find((i) => i.install_id === installation.install_id && i.name === installation.name) : undefined;
+      if (!row) fail("app-installation", "the installed-app list has no row for it: the sidebar would list no app");
+      else if (row.removed != null || (row.state ?? "active") !== "active") fail("app-installation", "the sidebar's menu drops it as removed or inactive");
+    } catch (error) { fail("app-installation", `workspaceApps.installations refused the list: ${failed(error)}`); }
 
     await validateDocuments(fx, board, fail);
   } finally {

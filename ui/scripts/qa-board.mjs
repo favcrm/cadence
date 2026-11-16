@@ -328,7 +328,7 @@ function serve(opts) {
   const state = readJson(path.join(root, "state.json"));
   const fx = Object.fromEntries(fs.readdirSync(path.join(root, "served")).map((f) => [f.slice(0, -5), readJson(path.join(root, "served", f))]));
   // The UI's own parser, compiled at `up`: a state set mid-run is checked too.
-  const { checkBrowser, BROWSER_PRESETS, DEFAULT_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, VIEWER_PRESETS, boardMeta, documentsResponder, isDocumentsRoute, servesRoster } = createRequire(SCRIPT)(state.validator);
+  const { appInstallations, checkBrowser, BROWSER_PRESETS, DEFAULT_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, VIEWER_PRESETS, boardMeta, documentsResponder, isDocumentsRoute, servesRoster } = createRequire(SCRIPT)(state.validator);
   const { sandbox, viewer } = state.ports;
   let browser = { ...fx["browser-handoff"] };
   const locale = { ...fx.locale };
@@ -394,6 +394,8 @@ function serve(opts) {
     },
     // The member app screen: one installed app with one context and run.
     "GET /api/app-home": () => fx["app-home"],
+    // CAD-2314: the sidebar's app menu reads the operator's installed-app list.
+    "GET /api/app-installations": () => appInstallations(fx),
     [`GET ${app}`]: () => fx["app-installation"],
     [`GET ${app}/contexts`]: () => fx["app-contexts"],
     [`GET ${app}/effects`]: () => fx["app-effects"],
