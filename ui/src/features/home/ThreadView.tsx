@@ -92,18 +92,27 @@ function ToolRows({ entries, newestFirst = false, raw = false }: { entries: Thre
           })()}
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
-          {/* A known tool's JSON result reads as a count ("0 results"); the
-              result itself stays in the raw view. */}
-          {s.result && s.call.kind === "tool_call" && !raw && !s.error && toolLabel(s.summary) !== null && /^\s*[{[]/.test(s.result.text) && resultCount(s.result.text) !== null && (
-            <span className="num shrink-0 text-ink-500" title={s.result.text}>
-              {t("{n} results").replace("{n}", String(resultCount(s.result.text)))}
-            </span>
-          )}
-          {s.result && s.call.kind === "tool_call" && (raw || toolLabel(s.summary) === null || !/^\s*[{[]/.test(s.result.text)) && (
+          {(() => {
+            // CAD-2363: a known tool's JSON result reads as a count ("0
+            // results"); the result itself stays in the raw view. An error
+            // keeps its reason, and any other result shows as before.
+            if (!s.result || s.call.kind !== "tool_call") return null;
+            const known = !raw && toolLabel(s.summary) !== null && /^\s*[{[]/.test(s.result.text);
+            const count = known && !s.error ? resultCount(s.result.text) : null;
+            if (known && !s.error && count === null) return null;
+            if (count !== null) {
+              return (
+                <span className="num shrink-0 text-ink-500" title={s.result.text}>
+                  {t("{n} results").replace("{n}", String(count))}
+                </span>
+              );
+            }
+            return (
             <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
               {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
             </span>
-          )}
+            );
+          })()}
         </li>
       ))}
     </ul>

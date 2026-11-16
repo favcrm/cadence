@@ -1618,6 +1618,7 @@ function MasterHome({
             ref={scrollRef}
             onScroll={onPanelScroll}
             data-chat-scroll
+            data-jump-pill={showJumpPill(unseen, activity) ? "" : undefined}
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
             {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (

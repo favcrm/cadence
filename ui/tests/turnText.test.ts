@@ -155,6 +155,14 @@ check(turn(entries.slice(0, 3), { running: true }).includes("data-turn-clock"), 
 // Readable steps, raw behind the toggle.
 check(done.includes("Use an app") && done.includes("· contacts.search · Gia"), "a known tool reads as what it did and its subject");
 check(done.includes(">0 results<"), "a known tool's JSON result reads as a count");
+{
+  const failed = turn([
+    agent(1, "tool_call", 'web_search {"query":"cafes"}', 1, { tool_use_id: "e" }),
+    agent(2, "tool_result", '{"error":"rate limited, retry later"}', 2, { tool_use_id: "e", is_error: true }),
+    agent(3, "turn_result", "Could not search.", 3),
+  ]);
+  check(failed.includes("rate limited, retry later"), "a known tool's error keeps its reason in the row");
+}
 check(done.includes('title="app_call {&quot;app&quot;'), "the raw call stays in the row's title");
 check(done.includes("Show raw calls") && done.includes('aria-pressed="false"'), "a raw toggle sits in the trace");
 check(done.includes("turntrace-summary") && /· Use an app/.test(done), "the closed trace names the tool readably");

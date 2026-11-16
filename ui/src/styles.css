@@ -2250,6 +2250,22 @@ button.refchip:hover {
   );
 }
 
+/* CAD-2363: while the jump-to-latest pill floats over the thread (scrolled
+   up), the fade rises to end just under the pill, so it never sits on
+   opaque text. The pill is ~2.2rem tall, .6rem above the dock. */
+.chat-scroll[data-jump-pill] {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - 4.25rem),
+    transparent calc(100% - var(--dock-h, 7rem) - 2.75rem)
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - 4.25rem),
+    transparent calc(100% - var(--dock-h, 7rem) - 2.75rem)
+  );
+}
+
 /* Below the rail breakpoint the Needs-you button is fixed in the band
    above the dock, on the right. The thread's padding clears that button
    as well as the dock, so the last message's box stays above it.
