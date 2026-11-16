@@ -56065,7 +56065,7 @@ class ThreadPreview {
   }
   update(message) {
     if (message === undefined) {
-      this.reset();
+      this.joined = "";
       return null;
     }
     if (this.overflowed || this.quarantined)
@@ -56086,6 +56086,44 @@ class ThreadPreview {
     }
     this.joined = joined;
     return this.text;
+  }
+}
+
+class PreviewGuard {
+  preview = new ThreadPreview;
+  taskId;
+  attempt;
+  firstInput;
+  current = null;
+  attached = false;
+  early = false;
+  blocked = false;
+  matches(live) {
+    return this.taskId === live?.run?.taskId && this.attempt === live?.generation?.attempt && this.firstInput === live?.run?.inputs[0];
+  }
+  advance(live) {
+    if (!this.attached)
+      this.early = true;
+    if (!this.matches(live)) {
+      this.preview.reset();
+      this.blocked = false;
+      this.taskId = live?.run?.taskId;
+      this.attempt = live?.generation?.attempt;
+      this.firstInput = live?.run?.inputs[0];
+    }
+    this.current = this.preview.update(live?.generation?.message);
+  }
+  attach(live) {
+    if (this.early)
+      this.blocked = true;
+    else
+      this.advance(live);
+    this.attached = true;
+  }
+  text(live) {
+    if (!this.attached || this.blocked || !this.matches(live))
+      return null;
+    return this.current;
   }
 }
 
@@ -56116,12 +56154,19 @@ function sessionEventResponse(watch, format, options) {
   let pending = null;
   let cursor = false;
   let snapshotComplete = false;
-  let initialDrain = null;
-  let releaseInitialDrain = null;
-  const resumeInitialDrain = () => {
-    const release = releaseInitialDrain;
-    releaseInitialDrain = null;
-    initialDrain = null;
+  let drain = null;
+  let releaseDrain = null;
+  const pauseForDrain = () => {
+    if (drain !== null)
+      return;
+    const wait = Promise.withResolvers();
+    drain = wait.promise;
+    releaseDrain = wait.resolve;
+  };
+  const resumeDrain = () => {
+    const release = releaseDrain;
+    releaseDrain = null;
+    drain = null;
     release?.();
   };
   const closeForBackpressure = () => {
@@ -56129,7 +56174,7 @@ function sessionEventResponse(watch, format, options) {
       return;
     closed = true;
     pending = null;
-    resumeInitialDrain();
+    resumeDrain();
     sink.close();
     watch.stop();
   };
@@ -56152,8 +56197,12 @@ data: ${JSON.stringify({ text })}
     sink.enqueue(encoder.encode(frame));
     if (frame.startsWith("id: "))
       cursor = true;
-    if ((sink.desiredSize ?? 0) <= 0 && (cursor || snapshotComplete))
-      closeForBackpressure();
+    if ((sink.desiredSize ?? 0) <= 0 && (cursor || snapshotComplete)) {
+      if (options?.overflow === "after-cursor")
+        closeForBackpressure();
+      else
+        pauseForDrain();
+    }
     return true;
   };
   const preview = (text) => {
@@ -56171,7 +56220,7 @@ data: ${JSON.stringify({ text })}
         if (!closed) {
           closed = true;
           pending = null;
-          resumeInitialDrain();
+          resumeDrain();
           controller.error(error);
         }
       };
@@ -56183,7 +56232,7 @@ data: ${JSON.stringify({ text })}
         if (!closed) {
           closed = true;
           pending = null;
-          resumeInitialDrain();
+          resumeDrain();
           controller.close();
         }
       }, fail);
@@ -56193,20 +56242,20 @@ data: ${JSON.stringify({ text })}
         if (closed)
           return;
         flushPreview();
-        if (options?.overflow !== "after-cursor" && (controller.desiredSize ?? 0) <= 0) {
-          const drain = Promise.withResolvers();
-          initialDrain = drain.promise;
-          releaseInitialDrain = drain.resolve;
-        }
+        if (options?.overflow !== "after-cursor" && (controller.desiredSize ?? 0) <= 0)
+          pauseForDrain();
         watch.start(async (change) => {
-          if (initialDrain !== null)
-            await initialDrain;
+          if (drain !== null)
+            await drain;
+          if (closed)
+            return;
           if (change.kind === "failed")
             throw change.error;
           if (change.retired)
             throw new Error("Conversation view retired");
-          if (!closed)
-            await format.change(change, emit, preview);
+          await format.change(change, emit, preview);
+          if (drain !== null)
+            await drain;
         });
       } catch (error) {
         fail(error);
@@ -56215,13 +56264,13 @@ data: ${JSON.stringify({ text })}
     },
     pull(controller) {
       if ((controller.desiredSize ?? 0) > 0)
-        resumeInitialDrain();
+        resumeDrain();
       flushPreview();
     },
     async cancel() {
       closed = true;
       pending = null;
-      resumeInitialDrain();
+      resumeDrain();
       await watch.stop();
     }
   }, { highWaterMark: MAX_QUEUED_BYTES, size: (chunk) => chunk.byteLength });
@@ -56564,7 +56613,59 @@ data: ${JSON.stringify(entry)}
       const thinking = url.searchParams.get("reader") === "owner";
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last = Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
-      const stream = await this.harness.session().watch();
+      const guard = new PreviewGuard;
+      const pi = await this.harness.pi();
+      let observerEnded = false;
+      let stopWatch;
+      const stopPreview = () => {
+        observerEnded = true;
+        stopWatch?.();
+      };
+      const observation = await pi.observeConversation(ROOT_CONVERSATION_ID, {
+        advance: (call) => {
+          if (call.kind === "failed" || call.retired)
+            return stopPreview();
+          try {
+            guard.advance(call.value.docs["pi.live"]);
+          } catch {
+            stopPreview();
+          }
+        },
+        end: stopPreview
+      }, BACKGROUND_CONTEXT);
+      try {
+        guard.attach(observation.value.docs["pi.live"]);
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      let watch;
+      try {
+        watch = await this.harness.session().watch();
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      stopWatch = () => {
+        watch.stop();
+      };
+      if (observerEnded) {
+        observation.detach();
+        await watch.stop();
+        return Response.json({ ok: false, error: { code: "capability_unavailable", message: "The thread observation is unavailable." } }, { status: 503 });
+      }
+      const stream = {
+        value: watch.value,
+        start: watch.start.bind(watch),
+        stop: () => {
+          observation.detach();
+          return watch.stop();
+        },
+        closed: watch.closed.finally(() => {
+          stopWatch = undefined;
+          observation.detach();
+        })
+      };
       const master = await this.connectionMaster();
       if (master === null) {
         await stream.stop();
@@ -56597,9 +56698,11 @@ data: ${JSON.stringify(entry)}
           }
         }, { status: 503 });
       }
-      const preview = new ThreadPreview;
+      let shownPreview = null;
       return sessionEventResponse(stream, {
         snapshot: (send, sendPreview) => {
+          if (observerEnded)
+            return;
           if (!send(`: connected
 
 `) || !send(masterFrame))
@@ -56608,18 +56711,20 @@ data: ${JSON.stringify(entry)}
             if (!emit(entry, send))
               break;
           if (masterOperation !== null && previewOperation === masterOperation)
-            preview.update(initialLive?.generation?.message);
-          sendPreview(preview.text);
+            shownPreview = guard.text(initialLive);
+          sendPreview(shownPreview);
         },
         change: async (change, send, sendPreview) => {
           const changes = engineViewChanges(change.ops);
           const live = change.value.docs["pi.live"];
           if (changes.master) {
             const next = await this.composedMasterFrame(pinned);
+            if (observerEnded)
+              return;
             if (next.operationId !== masterOperation) {
-              if (preview.text !== null)
+              if (shownPreview !== null)
                 sendPreview(null);
-              preview.reset();
+              shownPreview = null;
               masterOperation = next.operationId;
             }
             if (next.frame !== lastMasterFrame) {
@@ -56632,29 +56737,32 @@ data: ${JSON.stringify(entry)}
           const generation = live?.run?.taskId;
           const attempt = live?.generation?.attempt;
           if (source !== previewOperation || generation !== previewGeneration || attempt !== previewAttempt) {
-            if (preview.text !== null)
+            if (shownPreview !== null)
               sendPreview(null);
-            preview.reset();
+            shownPreview = null;
           }
           previewOperation = source;
           previewGeneration = generation;
           previewAttempt = attempt;
-          const before = preview.text;
-          let current = null;
-          if (masterOperation !== null && source === masterOperation)
-            current = preview.update(live?.generation?.message);
-          else
-            preview.reset();
+          const before = shownPreview;
           if (changes.entries) {
-            for (const entry of await this.transcript(thinking))
+            const entries = await this.transcript(thinking);
+            if (observerEnded)
+              return;
+            for (const entry of entries)
               if (!emit(entry, send))
                 break;
           }
+          if (observerEnded)
+            return;
+          const current = masterOperation !== null && source === masterOperation ? guard.text(live) : null;
           if (current !== null) {
             if (current !== before || changes.entries)
               sendPreview(current);
+            shownPreview = current;
           } else if (before !== null) {
             sendPreview(null);
+            shownPreview = null;
           }
         }
       }, { overflow: "after-cursor" });

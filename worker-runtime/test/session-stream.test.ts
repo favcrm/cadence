@@ -203,4 +203,70 @@ describe("session stream lifecycle", () => {
     await next;
     expect(fixture.stopped()).toBe(true);
   });
+
+  it("keeps a caught-up diagnostic reader connected across oversized views", async () => {
+    const fixture = watchFixture();
+    let listener: WatchListener | undefined;
+    let sequence = 0;
+    const response = sessionEventResponse(
+      {
+        ...fixture.watch,
+        start: (callback) => { listener = callback; },
+      },
+      {
+        snapshot: (emit) => { emit(": connected\n\n"); },
+        change: async (_change, emit) => {
+          emit(`data: ${JSON.stringify({ type: "view", sequence: ++sequence, body: "x".repeat(280_000) })}\n\n`);
+        },
+      },
+    );
+    if (!listener) throw new Error("watch did not start");
+    const deliver = listener;
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    try {
+      expect(decoder.decode((await reader.read()).value)).toBe(": connected\n\n");
+      for (const expected of [1, 2]) {
+        const next = deliver(viewChange, {} as never);
+        const part = await reader.read();
+        expect(part.done).toBe(false);
+        expect(decoder.decode(part.value)).toBe(
+          `data: ${JSON.stringify({ type: "view", sequence: expected, body: "x".repeat(280_000) })}\n\n`,
+        );
+        await next;
+        expect(fixture.stopped()).toBe(false);
+      }
+    } finally {
+      await reader.cancel();
+    }
+  });
+
+  it("releases an oversized diagnostic view delivery when a slow reader disconnects", async () => {
+    const fixture = watchFixture();
+    let listener: WatchListener | undefined;
+    const response = sessionEventResponse(
+      {
+        ...fixture.watch,
+        start: (callback) => { listener = callback; },
+      },
+      {
+        snapshot: (emit) => { emit(": connected\n\n"); },
+        change: async (_change, emit) => {
+          emit(`data: ${JSON.stringify({ type: "view", body: "x".repeat(280_000) })}\n\n`);
+        },
+      },
+    );
+    if (!listener) throw new Error("watch did not start");
+    const reader = response.body!.getReader();
+    await reader.read(); // Consume the snapshot; leave the next view unread.
+    const next = listener(viewChange, {} as never);
+    let settled = false;
+    void next.then(() => { settled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await reader.cancel();
+    await next;
+    expect(fixture.stopped()).toBe(true);
+  });
 });

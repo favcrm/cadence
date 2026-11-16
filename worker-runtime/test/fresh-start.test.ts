@@ -231,6 +231,7 @@ describe("fresh start", () => {
         ctx: { storage: { get: async () => undefined } },
         options: { modelAlias: "alias" },
         harness: {
+          pi: async () => harness,
           conversation: async () => conversation,
           pending: async () => [],
           session: () => ({

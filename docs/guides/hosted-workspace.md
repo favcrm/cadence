@@ -324,11 +324,14 @@ The thread stream also sends `preview` events with `{ "text": string | null }`
 for in-flight assistant text. They have no `id` and are not transcript
 entries: retry, cancellation or reconnect can replace them, while the committed
 entry and its `seq` remain authoritative. Thinking and tool arguments are not
-previewed. The preview stops at the first `{` or sensitive confirmation key
-anywhere in a message, including across text blocks; that suffix stays withheld
-until commit. This conservative rule also stops previews at benign braces.
-Preview text and tracked content blocks are bounded; an oversized partial is not
-a substitute for the final answer.
+previewed. After the connection's observer attaches, the preview stops at the
+first `{` or sensitive confirmation key anywhere in a message, including
+across text blocks; that suffix stays withheld until the generation or attempt changes.
+This conservative rule also stops previews at benign braces. A reconnect
+previews the current snapshot and cannot detect a sensitive marker overwritten
+before it attached; the operator accepted that tradeoff. Preview text and tracked
+content blocks are bounded; an oversized partial is not a substitute for the
+final answer.
 The run's first engine submission must resolve to the operation in the current
 `master` turn; an older snapshot or buffered batch is suppressed when they
 differ or the submission cannot be resolved. A turn change clears the previous

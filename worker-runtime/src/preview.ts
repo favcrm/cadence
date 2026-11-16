@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { LiveState } from "@earendil-works/pi-durable";
 
 /**
  * Upper bound on the transient text one connection retains and may send.
@@ -29,7 +30,6 @@ const SENSITIVE_KEYS = [
   { key: "confirm_token", pattern: /confirm_token/i },
   { key: "request_id", pattern: /request_id/i },
 ] as const;
-
 
 /**
  * Cap a preview without leaving half of a surrogate pair at the end.
@@ -122,7 +122,7 @@ export class ThreadPreview {
   /** Replace the retained text with the latest engine-owned partial. */
   update(message: AssistantMessage | undefined): string | null {
     if (message === undefined) {
-      this.reset();
+      this.joined = "";
       return null;
     }
     if (this.overflowed || this.quarantined) return this.text;
@@ -140,5 +140,52 @@ export class ThreadPreview {
     }
     this.joined = joined;
     return this.text;
+  }
+}
+
+/**
+ * Records every unfolded engine publication before the async stream can fold
+ * revisions. A quarantine survives replacements within the same generation.
+ */
+export class PreviewGuard {
+  private readonly preview = new ThreadPreview();
+  private taskId: number | undefined;
+  private attempt: number | undefined;
+  private firstInput: number | undefined;
+  private current: string | null = null;
+  private attached = false;
+  private early = false;
+  private blocked = false;
+
+  private matches(live: LiveState | undefined): boolean {
+    return this.taskId === live?.run?.taskId &&
+      this.attempt === live?.generation?.attempt &&
+      this.firstInput === live?.run?.inputs[0];
+  }
+
+  /** Called synchronously for each publication, without any engine reads. */
+  advance(live: LiveState | undefined): void {
+    if (!this.attached) this.early = true;
+    if (!this.matches(live)) {
+      this.preview.reset();
+      this.blocked = false;
+      this.taskId = live?.run?.taskId;
+      this.attempt = live?.generation?.attempt;
+      this.firstInput = live?.run?.inputs[0];
+    }
+    this.current = this.preview.update(live?.generation?.message);
+  }
+
+  /** Complete the atomic attachment without overwriting an early publication. */
+  attach(live: LiveState | undefined): void {
+    if (this.early) this.blocked = true;
+    else this.advance(live);
+    this.attached = true;
+  }
+
+  /** Never project a different or ambiguously observed generation. */
+  text(live: LiveState | undefined): string | null {
+    if (!this.attached || this.blocked || !this.matches(live)) return null;
+    return this.current;
   }
 }

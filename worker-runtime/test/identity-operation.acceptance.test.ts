@@ -609,7 +609,7 @@ describe("hosted identity operations", () => {
       {
         models: broken.models,
         registry: brokenRegistry,
-        onReport: (error) => reports.push(error),
+        onReport: (report) => reports.push(report.error),
       },
       BACKGROUND_CONTEXT,
     );

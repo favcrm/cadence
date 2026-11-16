@@ -72,7 +72,7 @@ import {
 } from "./operation-scope.ts";
 import { runtimeProfile } from "./profile.ts";
 import { runtimeSkillSources } from "./workspace-skills.ts";
-import { ThreadPreview } from "./preview.ts";
+import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -336,10 +336,65 @@ export class HostedSession<
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last =
         Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
-      // Attach before reading the header: the captured view and registration
-      // are atomic, so a later run appears in this view or in an update.
-      // Announce a run's header before sending any of its preview text.
-      const stream = await this.harness.session().watch();
+      // Observe every publication synchronously before attaching the async
+      // watch: its folded updates alone cannot preserve privacy quarantine.
+      const guard = new PreviewGuard();
+      const pi = await this.harness.pi();
+      let observerEnded = false;
+      let stopWatch: (() => void) | undefined;
+      const stopPreview = () => {
+        observerEnded = true;
+        stopWatch?.();
+      };
+      const observation = await pi.observeConversation(
+        ROOT_CONVERSATION_ID,
+        {
+          advance: (call) => {
+            if (call.kind === "failed" || call.retired) return stopPreview();
+            try {
+              guard.advance(call.value.docs["pi.live"] as LiveState | undefined);
+            } catch {
+              stopPreview();
+            }
+          },
+          end: stopPreview,
+        },
+        BACKGROUND_CONTEXT,
+      );
+      try {
+        guard.attach(observation.value.docs["pi.live"] as LiveState | undefined);
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      let watch;
+      try {
+        watch = await this.harness.session().watch();
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      stopWatch = () => { void watch.stop(); };
+      if (observerEnded) {
+        observation.detach();
+        await watch.stop();
+        return Response.json(
+          { ok: false, error: { code: "capability_unavailable", message: "The thread observation is unavailable." } },
+          { status: 503 },
+        );
+      }
+      const stream = {
+        value: watch.value,
+        start: watch.start.bind(watch),
+        stop: () => {
+          observation.detach();
+          return watch.stop();
+        },
+        closed: watch.closed.finally(() => {
+          stopWatch = undefined;
+          observation.detach();
+        }),
+      };
       // Read the projection now, at this connection's snapshot. A reconnect
       // reads the host's store again, so a connection never pins an older
       // revision/avatar/name over a newer committed edit; an unavailable,
@@ -406,9 +461,10 @@ export class HostedSession<
         last = entry.seq;
         return true;
       }
-      const preview = new ThreadPreview();
+      let shownPreview: string | null = null;
       return sessionEventResponse(stream, {
         snapshot: (send, sendPreview) => {
+          if (observerEnded) return;
           // The board flips its link to `live` on a `master` frame and on
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
@@ -420,17 +476,18 @@ export class HostedSession<
           // header was read later. A queued successor may already be running.
           // Only show a partial whose engine submission proves the same turn.
           if (masterOperation !== null && previewOperation === masterOperation)
-            preview.update(initialLive?.generation?.message);
-          sendPreview(preview.text);
+            shownPreview = guard.text(initialLive);
+          sendPreview(shownPreview);
         },
         change: async (change, send, sendPreview) => {
           const changes = engineViewChanges(change.ops);
           const live = change.value.docs["pi.live"] as LiveState | undefined;
           if (changes.master) {
             const next = await this.composedMasterFrame(pinned);
+            if (observerEnded) return;
             if (next.operationId !== masterOperation) {
-              if (preview.text !== null) sendPreview(null);
-              preview.reset();
+              if (shownPreview !== null) sendPreview(null);
+              shownPreview = null;
               masterOperation = next.operationId;
             }
             if (next.frame !== lastMasterFrame) {
@@ -448,25 +505,29 @@ export class HostedSession<
             generation !== previewGeneration ||
             attempt !== previewAttempt
           ) {
-            if (preview.text !== null) sendPreview(null);
-            preview.reset();
+            if (shownPreview !== null) sendPreview(null);
+            shownPreview = null;
           }
           previewOperation = source;
           previewGeneration = generation;
           previewAttempt = attempt;
-          const before = preview.text;
-          let current: string | null = null;
-          if (masterOperation !== null && source === masterOperation)
-            current = preview.update(live?.generation?.message);
-          else preview.reset();
+          const before = shownPreview;
           // A predecessor's committed entry must precede a successor's partial.
-          if (changes.entries)
-            for (const entry of await this.transcript(thinking))
-              if (!emit(entry, send)) break;
+          if (changes.entries) {
+            const entries = await this.transcript(thinking);
+            if (observerEnded) return;
+            for (const entry of entries) if (!emit(entry, send)) break;
+          }
+          if (observerEnded) return;
+          const current = masterOperation !== null && source === masterOperation
+            ? guard.text(live)
+            : null;
           if (current !== null) {
             if (current !== before || changes.entries) sendPreview(current);
+            shownPreview = current;
           } else if (before !== null) {
             sendPreview(null);
+            shownPreview = null;
           }
         },
       }, { overflow: "after-cursor" });

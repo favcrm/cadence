@@ -188,6 +188,7 @@ async function exercise(failCompactionRead: boolean) {
     agent: { model: { provider: defaultModel("default").provider, modelId: "default" } },
   });
   wired.harness = {
+    pi: async () => harness,
     session: () => ({
       id: conversation.id,
       watch: () => conversation.watch(BACKGROUND_CONTEXT),

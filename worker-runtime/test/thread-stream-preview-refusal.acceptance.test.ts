@@ -1,7 +1,8 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { diffRevisions } from "@earendil-works/chord/delta";
+import { diffRevisions, type Op } from "@earendil-works/chord/delta";
 import type { JsonValue } from "@earendil-works/chord/json";
+import { Watch, type WatchCall } from "@earendil-works/chord/watch";
 import { describe, expect, it, mock } from "bun:test";
 import { BOARD_MESSAGE_KIND, type PendingOperation, type ThreadEntry } from "../src/contract.ts";
 import { MAX_PREVIEW_BLOCKS, MAX_PREVIEW_CHARS } from "../src/preview.ts";
@@ -572,6 +573,10 @@ async function streamScenario(
     harness: {
       // The scenarios' message is written by a turn this conversation is
       // running, and the snapshot's run names the same operation.
+      pi: async () => ({
+        observeConversation: async (_id: unknown, observer: ScriptObserver) =>
+          connection.watch.observe(observer),
+      }),
       pending: async () => [
         { operationId: PREVIEW_OPERATION, status: "running" as const },
       ],
@@ -769,6 +774,15 @@ type WatchDouble = {
   readonly closed: Promise<WatchEnd>;
   start(listener: WatchListener): void;
   stop(): Promise<WatchEnd>;
+  observe(observer: ScriptObserver): Promise<{
+    readonly value: ScriptView;
+    detach(): void;
+  }>;
+};
+
+type ScriptObserver = {
+  advance(call: Parameters<WatchListener>[0], context: unknown): void;
+  end(end: WatchEnd): void;
 };
 
 /** Make one immutable 1.5.2 view from the old fixture's initial snapshot. */
@@ -889,6 +903,7 @@ function watchDouble(
   let deliver: WatchListener | undefined;
   let queue: Promise<void> = Promise.resolve();
   let ended = false;
+  let observer: ScriptObserver | undefined;
   const enqueue = (events: readonly unknown[], retired = false): Promise<void> => {
     queue = queue.then(async () => {
       if (ended) return;
@@ -897,7 +912,9 @@ function watchDouble(
       const ops = diffRevisions(value as unknown as JsonValue, next as unknown as JsonValue);
       value = next;
       try {
-        await deliver({ kind: "value", value, ops, retired }, BACKGROUND_CONTEXT);
+        const call = { kind: "value" as const, value, ops, retired };
+        observer?.advance(call, BACKGROUND_CONTEXT);
+        await deliver(call, BACKGROUND_CONTEXT);
       } catch (cause) {
         const error = cause instanceof Error ? cause : new Error(String(cause));
         ended = true;
@@ -910,6 +927,17 @@ function watchDouble(
   const watch: WatchDouble = {
     get value() { return value; },
     closed: completion.promise,
+    async observe(nextObserver) {
+      if (observer !== undefined) throw new Error("observer already attached");
+      observer = nextObserver;
+      const captured = value;
+      return {
+        value: captured,
+        detach() {
+          if (observer === nextObserver) observer = undefined;
+        },
+      };
+    },
     start(listener) {
       deliver = listener;
       for (const events of buffered) void enqueue(events).catch(() => {});
@@ -929,6 +957,8 @@ function watchDouble(
     },
     retire() {
       ended = true;
+      observer?.end({ kind: "ended" });
+      observer = undefined;
       completion.resolve({ kind: "ended" });
     },
   };
@@ -1113,6 +1143,10 @@ function boundarySession(
     },
     options: { modelAlias: "alias" },
     harness: {
+      pi: async () => ({
+        observeConversation: async (_id: unknown, observer: ScriptObserver) =>
+          script.connect().observe(observer),
+      }),
       pending: async () => script.pending(),
       session: () => ({
         id: "1",
@@ -1940,4 +1974,169 @@ describe("thread stream in-flight preview", () => {
       inspect(await streamScenario(HostedSession, scenario), issues);
     expect(issues).toEqual([]);
   });
+});
+
+describe("thread stream folded watch privacy", () => {
+  for (const overflow of [false, true]) {
+    it(
+      overflow
+        ? "withholds a replaced secret after real PendingOps overflow"
+        : "withholds a replaced secret when real Watch folds revisions",
+      async () => {
+        const { HostedSession } = await import("../src/hosted-session.ts");
+        const secret = ["SECRET", "FOLDED", "4c7d"].join("_");
+        const unsafe = `${PROSE} {"confirm_token":"${secret}"}`;
+        const replacement = `${PROSE} ${secret}`;
+        const recovered = "A new generation streams ordinary prose.";
+        const input = 21;
+        const operation = "op-folded";
+
+        let value = scriptView({
+          ...idleSnapshot(),
+          entries: [{ id: 1 }],
+          run: { inputs: [input] },
+          generation: {
+            attempt: 1,
+            message: assistant([{ type: "text", text: PROSE }]),
+          },
+        });
+        let observer: ScriptObserver | undefined;
+        let detached = 0;
+        const reported: unknown[] = [];
+        const real = new Watch<ScriptView>(value, () => {}, (error) => {
+          reported.push(error);
+        });
+        const seen: WatchCall<ScriptView>[] = [];
+        const folded = Promise.withResolvers<WatchCall<ScriptView>>();
+        const resumed = Promise.withResolvers<void>();
+        const watch = {
+          get value() { return real.value; },
+          get closed() { return real.closed; },
+          stop: () => real.stop(),
+          start(listener: (call: WatchCall<ScriptView>, context: typeof BACKGROUND_CONTEXT) => Promise<void>) {
+            real.start(async (call, context) => {
+              seen.push(call);
+              await listener(call, context);
+              if (call.kind !== "value") return;
+              const text = call.value.docs["pi.live"].generation?.message?.content?.[0]?.text;
+              if (text === replacement) folded.resolve(call);
+              if (text === recovered) resumed.resolve();
+            });
+          },
+        };
+        const publish = (next: ScriptView, ops?: Op[]) => {
+          const changes = ops ?? diffRevisions(
+            value as unknown as JsonValue,
+            next as unknown as JsonValue,
+          );
+          value = next;
+          const call = { kind: "value" as const, value, ops: changes, retired: false };
+          // An actual pi observer sees each commit synchronously, before a
+          // serialized watch listener can fold it with another commit.
+          observer?.advance(call, BACKGROUND_CONTEXT);
+          real.advance(call, BACKGROUND_CONTEXT);
+        };
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let blockTranscript = false;
+        const session = Object.assign(Object.create(HostedSession.prototype), {
+          ctx: {
+            storage: {
+              get: async () => undefined,
+              sql: engineTables([{ id: input, operationId: operation, text: "Ask." }]),
+            },
+          },
+          options: { modelAlias: "alias" },
+          harness: {
+            pi: async () => ({
+              observeConversation: async (_id: unknown, nextObserver: ScriptObserver) => {
+                observer = nextObserver;
+                const captured = value;
+                return {
+                  value: captured,
+                  detach() {
+                    if (observer === nextObserver) {
+                      observer = undefined;
+                      detached += 1;
+                    }
+                  },
+                };
+              },
+            }),
+            pending: async () => [{ operationId: operation, status: "running" as const }],
+            session: () => ({ id: "1", watch: async () => watch }),
+          },
+          transcript: async () => {
+            if (blockTranscript) {
+              blockTranscript = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return [];
+          },
+        }) as BoundarySession;
+
+        const thread = await openThread(session);
+        try {
+          // Hold the *actual stream listener* inside its transcript read.
+          // The snapshot already positively controls an eligible preview.
+          blockTranscript = true;
+          const blockedRevision = structuredClone(value);
+          blockedRevision.entries = [{ id: 2 }];
+          publish(blockedRevision);
+          await entered.promise;
+
+          const first = structuredClone(value);
+          first.docs["pi.live"].generation.message = assistant([{ type: "text", text: unsafe }]);
+          publish(first);
+
+          if (overflow) {
+            // Splices are structural ops and cannot fold like repeated sets
+            // of one scalar. Each value matches its single-element splice.
+            for (let i = 0; i <= 10_000; i += 1) {
+              const next: ScriptView = {
+                ...value,
+                entries: [{ id: i % 2 === 0 ? 3 : 2 }],
+              };
+              publish(next, [["p", ["entries"], 0, 1, next.entries]]);
+            }
+          }
+
+          const second = structuredClone(value);
+          second.docs["pi.live"].generation.message = assistant([{ type: "text", text: replacement }]);
+          publish(second);
+          release.resolve();
+          const delivered = await folded.promise;
+          expect(delivered.kind).toBe("value");
+          if (delivered.kind !== "value") throw new Error("expected a value call");
+          expect(delivered.value.docs["pi.live"].generation.message.content[0].text).toBe(replacement);
+          expect(seen.some((call) => call.kind === "value" &&
+            call.value.docs["pi.live"].generation?.message?.content?.[0]?.text === unsafe)).toBe(false);
+          if (overflow) expect(delivered.ops[0]?.[0]).toBe("r");
+
+          // A distinct generation must be able to preview again; withholding
+          // all later text is not a privacy fix.
+          const nextGeneration = structuredClone(value);
+          nextGeneration.docs["pi.live"].run.taskId += 1;
+          nextGeneration.docs["pi.live"].generation.message = assistant([{ type: "text", text: recovered }]);
+          publish(nextGeneration);
+          await resumed.promise;
+          real.end({ kind: "ended" });
+          const frames = await thread.frames();
+          const texts = frames.filter((frame) => frame.event === "preview").map(previewText);
+          expect(texts).toContain(PROSE);
+          expect(texts).toContain(recovered);
+          for (const text of texts) {
+            expect(text ?? "").not.toContain(secret);
+            expect(text ?? "").not.toContain("confirm_token");
+          }
+          expect(reported).toEqual([]);
+          expect(detached).toBe(1);
+        } finally {
+          release.resolve();
+          await real.stop();
+        }
+      },
+    );
+  }
 });
