@@ -55,7 +55,7 @@ const delay = (ms: number): Promise<void> => new Promise<void>((resolve) => { se
 // A verification failure, after enough delay for the checking state to paint.
 let failureCode = "capability_unavailable";
 globalThis.fetch = (async () => {
-  await delay(40);
+  if (failureCode === "capability_unavailable") await delay(40);
   return new Response(JSON.stringify({ ok: false, error: { code: failureCode, message: "unavailable" } }), {
     status: 503,
     headers: { "Content-Type": "application/json" },
@@ -97,8 +97,7 @@ assert(!(host.textContent ?? "").includes("PRIVATE WORKSPACE"), "no workspace co
 failureCode = "sign_in_upgrade_required";
 const retry = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retry verification");
 assert(retry, "the outage state offers a retry");
-await React.act(async () => { retry.click(); await delay(120); });
-await flush();
+await React.act(async () => { retry.click(); });
 const updating = host.textContent ?? "";
 assert(updating.includes("Sign-in verification is updating."), "the upgrade has a specific explanation");
 assert(updating.includes("Retry verification"), "the upgrade offers verification retry");
