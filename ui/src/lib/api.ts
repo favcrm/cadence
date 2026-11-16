@@ -182,6 +182,11 @@ export interface NativeChatFileRow {
   created: number;
 }
 
+/** What the hosted upload prepared; send-time model policy remains authoritative. */
+export type ChatFileModelInput =
+  | { kind: "vision"; converted: boolean }
+  | { kind: "text" | "none"; converted: false };
+
 /** The hosted tenant board's `POST /api/chat/upload` receipt (AOS-510,
  *  agenticos-v2 `upload-routes.ts`): no native scope/user/thread proofs
  *  exist there, only the `chf-` id, the content hash and the conversation
@@ -194,6 +199,7 @@ export interface HostedChatFileReceipt {
   name: string;
   conversation: string;
   created: number;
+  model_input?: ChatFileModelInput;
 }
 
 /** A send carries only `{id}`; the composer store also keeps `name` and `mime`, which both receipts carry. */
@@ -231,6 +237,18 @@ export function decodeChatFileRow(value: unknown): ChatFileRow {
 }
 
 function decodeHostedReceipt(row: Record<string, unknown>): HostedChatFileReceipt {
+  if ("model_input" in row) {
+    const input = row.model_input;
+    if (input === null || typeof input !== "object" || Array.isArray(input))
+      throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+    const value = input as Record<string, unknown>;
+    if (
+      (value.kind !== "vision" && value.kind !== "text" && value.kind !== "none") ||
+      typeof value.converted !== "boolean" ||
+      (value.kind !== "vision" && value.converted !== false) ||
+      (value.kind === "vision" && (typeof row.mime !== "string" || !row.mime.startsWith("image/")))
+    ) throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
   if (
     typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
     typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||

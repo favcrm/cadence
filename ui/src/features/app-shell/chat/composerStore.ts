@@ -634,7 +634,10 @@ function startUpload(
       operation.assertCurrent();
       if (row === null || !stillOwned() || operation.generation !== privateSessionGeneration()) return;
       controllers.delete(itemKey);
-      patch(itemKey, generation, { status: "ready", id: row.id, name: row.name, mime: row.mime, destination });
+      patch(itemKey, generation, {
+        status: "ready", id: row.id, name: row.name, mime: row.mime,
+        modelInput: "conversation" in row ? row.model_input : undefined, destination,
+      });
       try {
         destination?.refreshCapability?.();
       } catch {

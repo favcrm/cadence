@@ -3,6 +3,7 @@ import {
   ATTACH_MAX_FILES,
   attachFits,
   attachMeta,
+  attachStatus,
   isPermanentUploadFailure,
   userUploadError,
   attachRefusal,
@@ -33,6 +34,10 @@ equal(attachFits(ATTACH_MAX_FILES, 1) !== null, true, "the sixth refuses");
 
 const item = (key: string, status: AttachItem["status"], id?: string): AttachItem =>
   ({ key, name: `${key}.txt`, size: 1, status, file: null as unknown as File, id, generation: 0 });
+equal(attachStatus(item("pending", "uploading")), "Uploading and processing…", "pending work is visible");
+equal(attachStatus({ ...item("photo", "ready"), modelInput: { kind: "vision", converted: true } }), "Image ready for vision · converted", "converted pixels are described without claiming delivery");
+equal(attachStatus({ ...item("video", "ready"), modelInput: { kind: "none", converted: false } }), "Stored only · assistant cannot read content", "stored-only files are not described as readable");
+equal(attachStatus(item("legacy", "ready")), "Ready", "legacy receipts remain neutral");
 
 // ---- the send gate: unresolved rows hold the send ---------------------
 
@@ -57,6 +62,11 @@ equal(
   userUploadError("chat_file_upload refused 'fake.txt': a '.txt' file must sniff as its declared kind — the bytes did not"),
   "A '.txt' file must sniff as its declared kind — the bytes did not",
   "the RPC name and file prefix never reach the operator",
+);
+equal(
+  userUploadError("chat upload refused: photo conversion is unavailable — try again later"),
+  "Photo conversion is unavailable — try again later",
+  "hosted conversion failures show the actionable reason",
 );
 equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
 equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");

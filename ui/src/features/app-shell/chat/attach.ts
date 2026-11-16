@@ -5,6 +5,8 @@
  * so Composer stays a thin wrapper and the rules are testable.
  */
 
+import type { ChatFileModelInput } from "../../../lib/api";
+
 type Translate = (english: string) => string;
 const identity: Translate = (english) => english;
 export const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
@@ -29,6 +31,7 @@ export interface AttachItem {
   file: File;
   id?: string;
   mime?: string;
+  modelInput?: ChatFileModelInput;
   error?: string;
   /** A refusal a retry cannot change (size, count, daemon 4xx):
    *  the row offers Remove only. Transient failures keep Retry. */
@@ -38,6 +41,17 @@ export interface AttachItem {
   generation: number;
   /** Original destination, retained across retry and family/frame moves. */
   destination?: AttachDestination;
+}
+
+/** The host's receipt, not the filename, determines what the model can read. */
+export function attachStatus(item: AttachItem, t: Translate = identity): string {
+  if (item.status === "uploading") return t("Uploading and processing…");
+  if (item.status === "failed") return t("Failed");
+  if (item.modelInput?.kind === "vision")
+    return item.modelInput.converted ? t("Image ready for vision · converted") : t("Image ready for vision");
+  if (item.modelInput?.kind === "text") return t("Text ready");
+  if (item.modelInput?.kind === "none") return t("Stored only · assistant cannot read content");
+  return t("Ready");
 }
 
 /** Video containers ride the same queue with a larger cap (CAD-2219). */
@@ -64,7 +78,7 @@ export function displayAttachError(message: string, t: Translate = identity): st
 
 export function userUploadError(message: string): string {
   const reason = message
-    .replace(/^chat_file_upload(?: refused)?(?: '[^']*')?:\s*/, "")
+    .replace(/^(?:chat_file_upload(?: refused)?(?: '[^']*')?|chat upload refused):\s*/i, "")
     .trim();
   return reason.charAt(0).toUpperCase() + reason.slice(1);
 }
@@ -176,6 +190,11 @@ export function unresolvedHint(items: AttachItem[], t: Translate = identity): st
   const notice = unresolvedHintNotice(items);
   if (notice === null) return null;
   let text = t(notice.key);
-  for (const [name, value] of Object.entries(notice.slots)) text = text.replace(`{${name}}`, () => value);
+  for (const [name, value] of Object.entries(notice.slots)) {
+    const reasons = name === "reasonSuffix"
+      ? [...new Set(items.filter((item) => item.status === "failed" && item.error).map((item) => displayAttachError(item.error!, t)))].join("; ")
+      : "";
+    text = text.replace(`{${name}}`, () => name === "reasonSuffix" && reasons ? ` — ${reasons}` : value);
+  }
   return text;
 }

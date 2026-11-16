@@ -70,3 +70,14 @@ refuses("native bad user", { ...native, user_id: "u1" });
 refuses("not an object", "x");
 refuses("null", null);
 refuses("array", [hosted]);
+
+const photo = { ...hosted, name: "photo.heic", mime: "image/heic" };
+const vision = decodeChatFileRow({ ...photo, model_input: { kind: "vision", converted: true } });
+assert("conversation" in vision && vision.model_input?.kind === "vision" && vision.model_input.converted, "converted vision receipt accepted");
+assert("conversation" in decodeChatFileRow({ ...hosted, model_input: { kind: "text", converted: false } }), "text receipt accepted");
+assert("conversation" in decodeChatFileRow({ ...hosted, model_input: { kind: "none", converted: false } }), "stored-only receipt accepted");
+refuses("null model input", { ...photo, model_input: null });
+refuses("unknown model input", { ...photo, model_input: { kind: "unknown", converted: false } });
+refuses("missing conversion flag", { ...photo, model_input: { kind: "vision" } });
+refuses("converted text", { ...hosted, model_input: { kind: "text", converted: true } });
+refuses("non-image vision", { ...hosted, model_input: { kind: "vision", converted: false } });
