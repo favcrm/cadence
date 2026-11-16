@@ -1,6 +1,6 @@
 // The keyless native-model provider bridge imported by the protected Pi guest.
 //
-// The guest's Pi 1.5 agent loop keeps owning validation, tool execution and the
+// The guest's Pi 1.4 agent loop keeps owning validation, tool execution and the
 // transcript. This module exposes fixed, shared-schema Connection tools and
 // turns each model request into strict private operations frames, reconstructing
 // a real `AssistantMessageEventStream` from the sanitized terminal receipt. It
@@ -514,7 +514,7 @@ export function createNativeModelProvider({
       || typeof model.id !== 'string' || !model.id || typeof model.api !== 'string') {
     throw closed('unsupported_transport', 'the native model provider is not qualified');
   }
-  // The bootstrap passes its own public Pi 1.5 module namespace; the bridge
+  // The bootstrap passes its own public Pi 1.4 module namespace; the bridge
   // never resolves a second ambient Pi graph.
   const createAssistantMessageEventStream = piAi?.createAssistantMessageEventStream;
   if (typeof createAssistantMessageEventStream !== 'function' || typeof piAi?.createProvider !== 'function') {

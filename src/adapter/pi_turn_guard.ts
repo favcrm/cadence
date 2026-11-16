@@ -94,7 +94,7 @@ export default function install(pi) {
   // These semantics were verified on this exact runtime: awaited lifecycle
   // boundaries and synchronous streaming custom-message queue admission.
   // An upgrade must be validated, not silently granted this capability.
-  if (VERSION !== "1.0.0" && VERSION !== "1.5.2") {
+  if (VERSION !== "1.0.0") {
     pi.on("context", event => ({ messages: windowed(nonEmpty(event.messages)) }));
     return;
   }

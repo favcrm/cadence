@@ -8,15 +8,11 @@
 # pin in the profile is a calculated sha256 — never a placeholder. It never
 # starts a container, never deploys and never touches production paths.
 #
-# Pi 1.5.2 needs a newly measured image and independently approved registry.
-# The 1.4.0 graph and its profiles will be refused by the upgraded owner;
-# do not replace an installed runtime before qualifying its new image and pins.
-#
 # Usage (root):
 #   build_fixture.sh \
 #     --base registry.example/node@sha256:<64 lowercase hex> \
 #     --node /path/to/node --pi /path/to/pi.mjs \
-#     --pi-graph /path/to/pi-1.5.2/node_modules \
+#     --pi-graph /path/to/pi-1.4.0/node_modules \
 #     --model-bridge infra/native-protected-runtime/model-bridge.mjs \
 #     --model-sdk infra/native-protected-runtime/model-sdk \
 #     --guest-model claude-opus-5-high --guest-effort high --guest-tools read,bash \
@@ -195,7 +191,7 @@ fi
 SEAL_ADDON="$ROOTFS/opt/cadence/node/cadence_seal.node"
 [ -f "$SEAL_ADDON" ] && [ ! -L "$SEAL_ADDON" ] \
   || die "seal addon was not staged into the image root"
-# The pinned Pi 1.5.2 SDK graph the guest bootstrap imports by bare specifier.
+# The pinned Pi 1.4 SDK graph the guest bootstrap imports by bare specifier.
 cp -a "$PI_GRAPH" "$ROOTFS/opt/cadence/node/node_modules"
 # npm's .bin links are CLI shims, not the imported SDK graph. The guest has
 # its own fixed entrypoint; omit these unused links and retain strict graph

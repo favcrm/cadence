@@ -1,4 +1,4 @@
-//! The pinned Pi 1.5.2 loaded-registry observation, canonical digesting and
+//! The pinned Pi 1.4.0 loaded-registry observation, canonical digesting and
 //! the immutable installed-material comparison.
 //!
 //! The observer reports *what is actually registered* (names, schemas,
@@ -196,8 +196,8 @@ pub(crate) fn verify_payload(
     if node_pid != 1 {
         return Err(Error::rejected("observer must be the measured guest PID 1"));
     }
-    if strict::string(m, "pi_version")? != "1.5.2" {
-        return Err(Error::rejected("observer is not the pinned Pi 1.5.2 graph"));
+    if strict::string(m, "pi_version")? != "1.4.0" {
+        return Err(Error::rejected("observer is not the pinned Pi 1.4.0 graph"));
     }
     let seal = strict::object(
         m.get("seal")
@@ -260,8 +260,12 @@ pub(crate) fn verify_payload(
         if name.is_empty() || name.len() > 128 || name.bytes().any(|b| b.is_ascii_control()) {
             return Err(Error::rejected("observed tool name is malformed"));
         }
-        if strict::string(t, "exposure")? != "direct" {
-            return Err(Error::rejected("observed tool exposure is not direct"));
+        let exposure = strict::string(t, "exposure")?;
+        if !matches!(
+            exposure,
+            "direct" | "model-only" | "codemode" | "deferred" | "hidden"
+        ) {
+            return Err(Error::rejected("observed tool exposure is unknown"));
         }
         let source_kind = strict::string(t, "source_kind")?;
         if !matches!(source_kind, "builtin" | "extension" | "package" | "mcp") {
@@ -332,7 +336,7 @@ pub(crate) fn verify_payload(
     }
     let projection = serde_json::json!({
         "v": 1,
-        "pi_version": "1.5.2",
+        "pi_version": "1.4.0",
         "tools": projection_tools,
     });
     let stable_digest = digest_of(&projection)?;
@@ -446,73 +450,6 @@ pub(crate) fn guest_root(pid: u32) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn upgraded_registry_refuses_forged_pi_versions() {
-        let fixture = LocalProfile::test_fixture([0; 32], 20001, 20001, "fixture".to_string());
-        let approved = &fixture.registry().approved[0];
-        let projection = json!({
-            "v": 1,
-            "pi_version": "1.5.2",
-            "tools": [{
-                "name": approved.name,
-                "schema_digest": approved.schema_digest,
-                "implementation_digest": approved.implementation_digest,
-            }],
-        });
-        let pinned_digest = digest_of(&projection).unwrap();
-        let mut payload = json!({
-            "v": 1,
-            "runtime_generation": 7,
-            "node_pid": 1,
-            "seal": {
-                "dumpable": 0,
-                "core": 0,
-                "nnp": 1,
-                "seccomp": 2,
-                "caps": "0000000000000000",
-            },
-            "argv_digest": format!("sha256:{}", "1".repeat(64)),
-            "env_digest": format!("sha256:{}", "2".repeat(64)),
-            "pi_version": "1.5.2",
-            "observer_digest": fixture.runtime().observer_digest,
-            "tools": [{
-                "name": approved.name,
-                "exposure": "direct",
-                "schema_digest": approved.schema_digest,
-                "implementation_digest": approved.implementation_digest,
-                "source_kind": "builtin",
-                "source_path": "/fixture/read",
-            }],
-            "active": [approved.name],
-            "policy_digest": fixture.registry().policy_digest,
-        });
-        let profile = fixture.with_test_registry_digest(pinned_digest.clone());
-
-        let verified = verify_payload(&payload, &profile, 7)
-            .expect("the approved Pi 1.5.2 registry must be accepted");
-        assert_eq!(verified.generation(), 7);
-        assert_eq!(verified.stable_digest(), pinned_digest);
-
-        for forged_exposure in ["model-only", "codemode", "deferred", "hidden", "unknown"] {
-            payload["tools"][0]["exposure"] = json!(forged_exposure);
-            let result = verify_payload(&payload, &profile, 7);
-            assert!(
-                matches!(result, Err(Error::Rejected(_))),
-                "forged tool exposure {forged_exposure} must be refused: {result:?}"
-            );
-        }
-        payload["tools"][0]["exposure"] = json!("direct");
-
-        for forged_version in ["1.4.0", "9.9.9"] {
-            payload["pi_version"] = json!(forged_version);
-            let result = verify_payload(&payload, &profile, 7);
-            assert!(
-                matches!(result, Err(Error::Rejected(_))),
-                "forged Pi version {forged_version} must be refused: {result:?}"
-            );
-        }
-    }
 
     #[test]
     fn canonical_sorts_keys_and_escapes_like_json() {

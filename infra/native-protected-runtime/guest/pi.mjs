@@ -2,7 +2,7 @@
 // CAD-1085 r7 — the reviewed protected guest Pi bootstrap.
 //
 // This is the ONLY entry the measured OCI runtime launches. It uses the public
-// Pi 1.5.2 SDK surface (`SettingsManager`, `SessionManager`,
+// Pi 1.4.0 SDK surface (`SettingsManager`, `SessionManager`,
 // `createAgentSessionServices`, `createAgentSessionFromServices`,
 // `createAgentSessionRuntime`, `runRpcMode`) and nothing else:
 //
@@ -45,6 +45,7 @@ const OPS_SOCKET = '/opt/cadence/run/ops.sock';
 const SESSION_CONFIG = '/opt/cadence/material/guest/session.json';
 const WORKSPACE = '/workspace';
 const AGENT_DIR = '/home/agent/pi';
+const PI_VERSION = '1.4.0';
 const PROVIDER = 'devin';
 const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;

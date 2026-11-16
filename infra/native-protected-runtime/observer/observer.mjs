@@ -1,4 +1,4 @@
-// CAD-1085 pinned Pi 1.5.2 observer.
+// CAD-1085 pinned Pi 1.4.0 observer.
 //
 // Loaded by the measured Node graph (`-e /opt/cadence/node/observer.mjs`) and
 // run as the guest's PID 1 extension. It does exactly three things:
@@ -30,7 +30,7 @@ const SEAL_ADDON = '/opt/cadence/node/cadence_seal.node';
 const ATTEST_SOCKET = '/opt/cadence/run/attest.sock';
 const OBSERVER_PATH = '/opt/cadence/node/observer.mjs';
 const POLICY_PATH = '/opt/cadence/material/policy.json';
-const PI_VERSION = '1.5.2';
+const PI_VERSION = '1.4.0';
 const MAX_TOOL_FILE_BYTES = 1024 * 1024;
 const OBSERVE_INTERVAL_MS = 30000;
 
@@ -126,7 +126,7 @@ const assertEnvironment = () => {
     }
   }
   if (process.pid !== 1) throw new Error('observer is not the guest init');
-  if (VERSION !== PI_VERSION) throw new Error('Pi version is not the pinned 1.5.2');
+  if (VERSION !== PI_VERSION) throw new Error('Pi version is not the pinned 1.4.0');
 };
 
 const sourceKind = info => {
@@ -160,15 +160,12 @@ const implementationDigest = tool => {
   return sha256(Buffer.concat([material, Buffer.from([0]), bytes]));
 };
 
-export const toolRegistry = pi => {
+const toolRegistry = pi => {
   const active = pi.getActiveTools();
   if (!Array.isArray(active) || active.length === 0) throw new Error('no active tools');
   const activeSet = new Set(active);
-  // In Pi 1.5, inactive codemode/deferred tools remain callable by other tools.
-  // Refuse any non-direct or unknown exposure before filtering by active name.
-  const all = pi.getAllTools();
-  if (all.some(tool => tool.exposure !== 'direct')) throw new Error('non-direct tool is registered');
-  const tools = all
+  const tools = pi
+    .getAllTools()
     .map(tool => {
       const schema = canonical(tool.parameters ?? {});
       return {

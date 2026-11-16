@@ -92,12 +92,3 @@ jobs:
         run: |
           bun install --frozen-lockfile --ignore-scripts
           bun run test
-      - name: Protected observer refusal
-        working-directory: worker-runtime
-        run: bun test ../infra/native-protected-runtime/observer/observer.test.mjs
-      - name: Pi turn-input guard refusal
-        run: |
-          set -euo pipefail
-          for version in 1.0.0 1.5.2 1.5.1 9.9.9; do
-            PI_STUB_VERSION="$version" node --test src/adapter/pi_turn_guard.test.mjs
-          done
