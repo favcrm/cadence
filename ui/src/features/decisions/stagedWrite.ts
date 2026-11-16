@@ -263,10 +263,24 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
   return body.actions.map(parseStagedRow).filter((r): r is StagedWrite => r !== null);
 }
 
+const UNCONFIRMED_RESULTS: Record<string, true> = {
+  app_version_changed: true,
+  app_version_unverified: true,
+  batch_unconfirmed: true,
+  record_exists: true,
+};
+export const UNCONFIRMED_WRITE_GUIDANCE = "Check the app's records and audit history before submitting a new request.";
+
+/** A refusal to retry does not prove an earlier attempt did not already commit. */
+export function hasUnconfirmedResult(write: StagedWrite): boolean {
+  return write.status === "approved" && write.kind === "app_call" && write.result?.ok === false &&
+    typeof write.result.code === "string" && UNCONFIRMED_RESULTS[write.result.code] === true;
+}
+
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
   if (write.status === "denied") return "denied";
-  if (write.result?.ok === false) return "failed";
+  if (write.result?.ok === false) return hasUnconfirmedResult(write) ? "unconfirmed" : "failed";
   // Success is only ever what the row says: ok === true (or the ticket a create made).
   if (write.result?.ok === true || (write.kind === "create_issue" && write.result?.ticket)) return "applied";
   return "unconfirmed";
@@ -284,6 +298,9 @@ const REASONS: Readonly<Record<string, string>> = {
   screen_access_denied: "the app's connection lacks permission",
   operation_not_declared: "the app does not offer this operation",
   app_unavailable: "the app could not be reached",
+  app_version_changed: "the app changed after the request was staged",
+  app_version_unverified: "the reviewed app version cannot be verified",
+  batch_unconfirmed: "the earlier batch result cannot be verified",
   storage_unavailable: "the record store could not be reached",
   refused: "the app refused it",
 };

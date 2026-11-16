@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "../../../lib/locale";
 import StagedWriteDetail, { noticeText } from "../../decisions/StagedWriteDetail";
-import { failureReason, isolate, outcomeOf } from "../../decisions/stagedWrite";
+import { failureReason, hasUnconfirmedResult, isolate, outcomeOf, UNCONFIRMED_WRITE_GUIDANCE } from "../../decisions/stagedWrite";
 import { conversationDecisions, useDecisions } from "../../decisions/useDecisions";
 
 /** The caller keys this component by the selected, server-proven conversation. */
@@ -85,7 +85,9 @@ export default function ConversationDecisions({
                   const label = outcome === "applied" ? t("Applied") : outcome === "denied" ? t("Denied") : outcome === "failed" ? t("Did not apply") : t("Result not confirmed");
                   return (
                     <li key={write.id} className="text-label text-ink-300">
-                      <bdi>{isolate(write.title)}</bdi> · {label}{outcome === "failed" ? ` · ${t(failureReason(write))}` : ""}
+                      <bdi>{isolate(write.title)}</bdi> · {label}{hasUnconfirmedResult(write)
+                        ? ` · ${t("{reason}. {guidance}").replace("{reason}", t(failureReason(write))).replace("{guidance}", t(UNCONFIRMED_WRITE_GUIDANCE))}`
+                        : outcome === "failed" ? ` · ${t(failureReason(write))}` : ""}
                     </li>
                   );
                 })}
