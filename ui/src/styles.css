@@ -1474,6 +1474,89 @@ textarea.agentform-input { height: auto; width: 100%; }
 .chat-bubble[data-pending="sending"] {
   opacity: 0.85;
 }
+/* CAD-2362: the operator's own message. No "You" row: the time sits under
+   the bubble, shown on hover or focus and always on touch; a delivery state
+   (`data-always`) never hides. */
+.chat-me-at {
+  margin-top: .25rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  opacity: 0;
+  transition: opacity .14s ease;
+}
+.chat-me:hover .chat-me-at,
+.chat-me:focus-within .chat-me-at,
+.chat-me-at[data-always] {
+  opacity: 1;
+}
+@media (hover: none) {
+  .chat-me-at { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-me-at { transition: none; }
+}
+[data-chat-message="user"] .op-code {
+  padding: .05rem .3rem;
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-100) 9%, transparent);
+  font: .9em "IBM Plex Mono", monospace;
+}
+[data-chat-message="user"] .op-pre {
+  margin: .5rem -.25rem 0;
+  padding: .55rem .7rem;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-950) 28%, transparent);
+  color: var(--color-ink-200);
+  font-size: .78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+[data-chat-message="user"] .op-pre:first-child {
+  margin-top: 0;
+}
+/* A long message folds to six lines with a fade; the foot carries its line
+   count, Show all and Copy. */
+.op-fold-body {
+  max-height: 9.3em;
+  max-height: 6lh;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 60%, transparent);
+  mask-image: linear-gradient(#000 60%, transparent);
+}
+.op-fold[data-open] .op-fold-body {
+  max-height: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.op-fold-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .25rem 1rem;
+  margin-top: .4rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.op-fold-actions {
+  display: inline-flex;
+  gap: .75rem;
+}
+/* A form answer the card already shows: one quiet receipt line. */
+.form-receipt {
+  display: inline-block;
+  max-width: min(100%, 34rem);
+  padding: .2rem .7rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .75rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.form-receipt-line {
+  color: var(--color-ink-200);
+}
 /* Markdown drops its trailing margin inside the padded surface, so the
    last line and the bubble edge stay even. */
 .chat-bubble > :last-child {

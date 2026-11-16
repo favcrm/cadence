@@ -2840,3 +2840,10 @@ Object.assign(zhTW, {
   "Document review isn’t available on this workspace any more.": "此工作區已無法再使用文件審查。",
 });
 
+
+// CAD-2362: the operator's own message (inline Markdown, folded pastes).
+Object.assign(zhTW, {
+  "Show all": "顯示全部",
+  "lines": "行",
+  "Copy message": "複製訊息",
+});

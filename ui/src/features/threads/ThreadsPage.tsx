@@ -1134,7 +1134,7 @@ function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects:
     : entry.role === "agent" ? t("Agent") : t("System");
   return (
     <article className="threads-msg" data-role={entry.role}>
-      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} state={stage}>
+      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} showName state={stage}>
         {entry.text}
       </Turn>
       {refs.length > 0 && (

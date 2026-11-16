@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
-import { Bubble } from "../home/ThreadView";
+import { Bubble, OperatorText } from "../home/ThreadView";
 import type { DeliveryState } from "./threadsClient";
 import { deliveryLabel } from "./threadsView";
 
@@ -11,30 +11,35 @@ export function StageLabel({ state }: { state: DeliveryState | string }) {
 }
 
 /** One transcript turn: the Home message bubble (Bubble, with the real sender
- *  and time). Operator turns take the Home outgoing tint and shape; agent and
- *  system turns stay plain. Compact density drops Home's 92% cap, so the body
- *  uses the full column. A `state` adds the delivery stage line. */
+ *  and time). Operator turns take the Home outgoing tint and shape, and a
+ *  text body renders as Home's operator message (CAD-2362: inline Markdown,
+ *  folded pastes); agent and system turns stay plain. `showName` keeps the
+ *  sender row on an outgoing message another person sent. Compact density
+ *  drops Home's 92% cap, so the body uses the full column. A `state` adds the
+ *  delivery stage line. */
 export function Turn({
   who,
   at,
   me,
+  showName,
   state,
   children,
 }: {
   who: string;
   at?: string;
   me?: boolean;
+  showName?: boolean;
   state?: DeliveryState | string | null;
   children: ReactNode;
 }) {
   return (
-    <Bubble who={who} at={at} me={me}>
+    <Bubble who={who} at={at} me={me} showName={showName}>
       <div
-        className={`text-left text-secondary text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere] ${
-          me ? "chat-bubble" : "inline-block px-3 py-2 text-ink-200"
+        className={`text-left text-secondary text-ink-100 [overflow-wrap:anywhere] ${
+          me ? "chat-bubble" : "inline-block px-3 py-2 text-ink-200 whitespace-pre-wrap"
         }`}
       >
-        {children}
+        {me && typeof children === "string" ? <OperatorText text={children} /> : children}
       </div>
       {state ? (
         <div className="mt-1">
