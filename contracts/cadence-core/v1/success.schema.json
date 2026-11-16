@@ -141,6 +141,22 @@
         "op",
         "value"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "agent.form.compile"
+        },
+        "value": {
+          "$ref": "#/$defs/FormCompileValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
     }
   ],
   "required": [
@@ -334,6 +350,39 @@
             "string",
             "null"
           ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid"
+      ]
+    },
+    "FormCompileValue": {
+      "description": "Success value of `agent.form.compile`. When `valid`, `form`, `fallback`\nand `digest` are set; otherwise `message` names the refused spec or form\npath and rule.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "form": {
+          "description": "The compiled `{\"version\":\"1.0\",\"createSurface\":{...}}` envelope."
         },
         "message": {
           "type": [

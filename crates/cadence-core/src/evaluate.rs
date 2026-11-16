@@ -40,7 +40,8 @@
 //! `agent.form.check` runs the one agent-form validator
 //! ([`crate::agent_form::check`]) the native `master ask-form` gate runs, so
 //! a non-native host refuses exactly what the daemon refuses and builds the
-//! same fallback text and digest. It is a shape check only: who may ask,
+//! same fallback text and digest. `agent.form.compile` builds the envelope
+//! from a flat field list first ([`crate::agent_form::compile`]). It is a shape check only: who may ask,
 //! in which conversation and on which turn stays the host's own decision.
 
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
@@ -144,6 +145,55 @@ pub enum Operation {
     /// refuses is a `valid: false` value, not an envelope refusal.
     #[serde(rename = "agent.form.check")]
     AgentFormCheck(FormCheckInput),
+    /// Compile an agent's flat field list into the A2UI envelope and check it
+    /// (CAD-2345). The same answer shape as `agent.form.check`, plus `form`.
+    #[serde(rename = "agent.form.compile")]
+    AgentFormCompile(FormCompileInput),
+}
+
+/// Input of `agent.form.compile`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FormCompileInput {
+    /// The agent's `FormSpec`: optional `id`, `title`, `intro` and `submit`,
+    /// and 1-12 `fields`. Unknown keys are refused.
+    pub spec: Value,
+}
+
+/// Success value of `agent.form.compile`. When `valid`, `form`, `fallback`
+/// and `digest` are set; otherwise `message` names the refused spec or form
+/// path and rule.
+#[derive(Serialize, JsonSchema)]
+pub struct FormCompileValue {
+    pub valid: bool,
+    /// The compiled `{"version":"1.0","createSurface":{...}}` envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn form_compile(input: &FormCompileInput) -> FormCompileValue {
+    match crate::agent_form::compile(&input.spec) {
+        Ok(form) => FormCompileValue {
+            valid: true,
+            form: Some(form.envelope),
+            fallback: Some(form.fallback),
+            digest: Some(form.digest),
+            message: None,
+        },
+        Err(error) => FormCompileValue {
+            valid: false,
+            form: None,
+            fallback: None,
+            digest: None,
+            message: Some(error.to_string()),
+        },
+    }
 }
 
 /// Input of `agent.form.check`.
@@ -477,6 +527,8 @@ pub enum OpValue {
     DeliveryRequirements(Value),
     #[serde(rename = "agent.form.check")]
     FormCheck(FormCheckValue),
+    #[serde(rename = "agent.form.compile")]
+    FormCompile(FormCompileValue),
 }
 
 /// Success response.
@@ -755,6 +807,7 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
         Operation::AgentFormCheck(input) => Ok(OpValue::FormCheck(form_check(&input))),
+        Operation::AgentFormCompile(input) => Ok(OpValue::FormCompile(form_compile(&input))),
     }
 }
 
