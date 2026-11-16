@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type * as ThreadViewModule from "../src/features/home/ThreadView";
 import { clockRuns, threadItems, threadRuns, turnStartMs, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 import { dayText } from "../src/features/home/DayDivider";
+import { translateUiText } from "../src/lib/locale";
 import {
   elapsedSecs,
   formatElapsed,
@@ -196,5 +197,9 @@ check(done.includes("4111111111111111"), "a number is never a token");
   const linked = turn([agent(1, "turn_result", "[`7d2e4c1a9b3f40e8a6c5d2b1f0e9a873`](https://example.test/a)", 1)]);
   check(!linked.includes("data-id-token") && /<a [^>]*>[\s\S]*7d2e4c1a9b3f40e8a6c5d2b1f0e9a873/.test(linked), "an id inside a link stays code, never a button in an anchor");
 }
+
+// Every string the turn renders has a written-Chinese entry (Browser QA found "in the canvas" untranslated).
+for (const key of ["in the canvas", "1 result", "{n} results", "Show raw calls", "Hide raw calls", "Copy ID", "{s}s", "{m}m {s}s", "{h}h {m}m", "Today", "Yesterday", "Use an app", "Save an artifact", "Delivery unconfirmed", "Assistant could not finish this turn"])
+  check(translateUiText(key, "zh-TW") !== key, `zh-TW has "${key}"`);
 
 console.log("turnText: ok");
