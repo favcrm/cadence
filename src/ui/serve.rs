@@ -2513,7 +2513,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             _ => None,
                         }
                     }
-                    (Some(pm), Some(actor)) => {
+                    // `readable` fails closed to an empty set on an
+                    // unreadable tracker; check the listing so that case
+                    // omits the counts instead of reporting zeros.
+                    (Some(pm), Some(actor)) if project::list(&pm.dir).is_ok() => {
                         let readable = crate::project_policy::readable(pm, actor);
                         board::load_all(&pm.dir, None).ok().map(|issues| {
                             let issues = issues
