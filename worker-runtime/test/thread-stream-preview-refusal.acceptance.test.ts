@@ -2140,3 +2140,199 @@ describe("thread stream folded watch privacy", () => {
     );
   }
 });
+
+/** Real watch plus synchronous observation with controllable attachment timing. */
+function observerLifecycleFixture(
+  Session: { prototype: object },
+  options: { early?: boolean; setupFailure?: "watch" | "transcript" } = {},
+) {
+  const input = 21;
+  const operation = "op-observer";
+  const secret = "SECRET_EARLY_42";
+  const recovered = "Fresh generation preview after attachment.";
+  let value = scriptView({
+    ...idleSnapshot(),
+    run: { inputs: [input] },
+    generation: {
+      attempt: 1,
+      message: assistant([{ type: "text", text: PROSE }]),
+    },
+  });
+  let observer: ScriptObserver | undefined;
+  let real: Watch<ScriptView> | undefined;
+  let detaches = 0;
+  let advances = 0;
+  const recoveredDelivery = Promise.withResolvers<void>();
+
+  const publish = (next: ScriptView) => {
+    const ops = diffRevisions(value as unknown as JsonValue, next as unknown as JsonValue);
+    value = next;
+    const call = { kind: "value" as const, value, ops, retired: false };
+    if (observer !== undefined) {
+      advances += 1;
+      observer.advance(call, BACKGROUND_CONTEXT);
+    }
+    real?.advance(call, BACKGROUND_CONTEXT);
+  };
+  const publishText = (text: string, nextTask = false) => {
+    const next = structuredClone(value);
+    if (nextTask) next.docs["pi.live"].run.taskId += 1;
+    next.docs["pi.live"].generation.message = assistant([{ type: "text", text }]);
+    publish(next);
+  };
+
+  const session = Object.assign(Object.create(Session.prototype), {
+    ctx: {
+      storage: {
+        get: async () => undefined,
+        sql: engineTables([{ id: input, operationId: operation, text: "Ask." }]),
+      },
+    },
+    options: { modelAlias: "alias" },
+    harness: {
+      pi: async () => ({
+        observeConversation: async (_id: unknown, nextObserver: ScriptObserver) => {
+          observer = nextObserver;
+          // Durable captures this value atomically, but callbacks can run
+          // before the returned promise resolves.
+          const captured = value;
+          if (options.early) {
+            publishText(`${PROSE} {"confirm_token":"${secret}"}`);
+            publishText(`${PROSE} ${secret}`);
+          }
+          return {
+            value: captured,
+            detach() {
+              if (observer === nextObserver) {
+                observer = undefined;
+                detaches += 1;
+              }
+            },
+          };
+        },
+      }),
+      pending: async () => [{ operationId: operation, status: "running" as const }],
+      session: () => ({
+        id: "1",
+        watch: async () => {
+          if (options.setupFailure === "watch") throw new Error("watch unavailable");
+          real = new Watch<ScriptView>(value, () => {}, () => {});
+          const actual = real;
+          return {
+            get value() { return actual.value; },
+            get closed() { return actual.closed; },
+            stop: () => actual.stop(),
+            start(listener: (call: WatchCall<ScriptView>, context: typeof BACKGROUND_CONTEXT) => Promise<void>) {
+              actual.start(async (call, context) => {
+                await listener(call, context);
+                if (call.kind === "value" &&
+                    call.value.docs["pi.live"].generation?.message?.content?.[0]?.text === recovered)
+                  recoveredDelivery.resolve();
+              });
+            },
+          };
+        },
+      }),
+    },
+    transcript: async () => {
+      if (options.setupFailure === "transcript") throw new Error("transcript unavailable");
+      return [];
+    },
+  }) as BoundarySession;
+
+  return {
+    session, secret, recovered, publishText,
+    recoveredDelivery: recoveredDelivery.promise,
+    detaches: () => detaches,
+    advances: () => advances,
+    watch: () => {
+      if (real === undefined) throw new Error("watch was not acquired");
+      return real;
+    },
+  };
+}
+
+/** Consume until the positive snapshot control is actually on the wire. */
+async function readSnapshotPreview(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  const decoder = new TextDecoder();
+  let wire = "";
+  while (!parseFrames(wire).some((frame) =>
+    frame.event === "preview" && previewText(frame) === PROSE)) {
+    const part = await reader.read();
+    if (part.done) throw new Error("stream ended before the positive preview");
+    wire += decoder.decode(part.value, { stream: true });
+  }
+}
+
+describe("thread stream observer attachment and cleanup", () => {
+  it("does not overwrite an early observer callback and resumes on a new generation", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession, { early: true });
+    const thread = await openThread(fixture.session);
+    try {
+      expect(fixture.advances()).toBe(2);
+      fixture.publishText(fixture.recovered, true);
+      await fixture.recoveredDelivery;
+      fixture.watch().end({ kind: "ended" });
+      const frames = await thread.frames();
+      const previews = frames.filter((frame) => frame.event === "preview").map(previewText);
+      // The safe new generation is a positive control; the earlier generation
+      // was observed before the attachment promise resolved and is withheld.
+      expect(previews).toContain(fixture.recovered);
+      for (const text of previews) {
+        expect(text ?? "").not.toContain(fixture.secret);
+        expect(text ?? "").not.toContain("confirm_token");
+      }
+      expect(fixture.detaches()).toBe(1);
+    } finally {
+      await fixture.watch().stop();
+    }
+  });
+
+  it("detaches the observer when the client cancels", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession);
+    const response = await fixture.session.fetch(new Request("https://board.test/thread-stream"));
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    await readSnapshotPreview(reader);
+    await reader.cancel();
+    expect(fixture.detaches()).toBe(1);
+    const before = fixture.advances();
+    fixture.publishText("A publication after detach.");
+    expect(fixture.advances()).toBe(before);
+  });
+
+  it("detaches the observer and fails the body when the watch fails", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession);
+    const response = await fixture.session.fetch(new Request("https://board.test/thread-stream"));
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    await readSnapshotPreview(reader);
+    fixture.watch().end({ kind: "failed", error: new Error("watch failed") });
+    await expect(reader.read()).rejects.toThrow("watch failed");
+    expect(fixture.detaches()).toBe(1);
+    const before = fixture.advances();
+    fixture.publishText("A publication after failure.");
+    expect(fixture.advances()).toBe(before);
+  });
+
+  for (const setupFailure of ["watch", "transcript"] as const) {
+    it(`detaches the observer on ${setupFailure} setup failure`, async () => {
+      const { HostedSession } = await import("../src/hosted-session.ts");
+      const fixture = observerLifecycleFixture(HostedSession, { setupFailure });
+      const request = new Request("https://board.test/thread-stream");
+      if (setupFailure === "watch") {
+        await expect(fixture.session.fetch(request)).rejects.toThrow("watch unavailable");
+      } else {
+        const response = await fixture.session.fetch(request);
+        expect(response.status).toBe(503);
+      }
+      expect(fixture.detaches()).toBe(1);
+      const before = fixture.advances();
+      fixture.publishText("A publication after setup failure.");
+      expect(fixture.advances()).toBe(before);
+    });
+  }
+});
