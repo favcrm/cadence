@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { Bubble, OperatorText } from "../home/ThreadView";
+import { readableAnswer } from "../home/operatorText";
 import type { DeliveryState } from "./threadsClient";
 import { deliveryLabel } from "./threadsView";
 
@@ -39,7 +40,7 @@ export function Turn({
           me ? "chat-bubble" : "inline-block px-3 py-2 text-ink-200 whitespace-pre-wrap"
         }`}
       >
-        {me && typeof children === "string" ? <OperatorText text={children} /> : children}
+        {me && typeof children === "string" ? <OperatorText text={readableAnswer(children)} /> : children}
       </div>
       {state ? (
         <div className="mt-1">

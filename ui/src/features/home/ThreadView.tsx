@@ -239,7 +239,8 @@ export function OperatorText({ text }: { text: string }) {
   const lines = lineCount(parts);
   return (
     <div className="op-fold" data-open={open ? "" : undefined}>
-      <div className="op-fold-body" id={bodyId}>
+      {/* Focus landing on a clipped link opens the message, so it is never invisible. */}
+      <div className="op-fold-body" id={bodyId} onFocus={() => setOpen(true)}>
         {body}
       </div>
       <div className="op-fold-foot">
@@ -293,14 +294,16 @@ export function ThreadItemView({
     case "operator": {
       const refs = entryRefs(item.entry.payload);
       const files = entryAttachments(item.entry.payload);
-      // CAD-2362: an answer the form card can show reads as one receipt line;
-      // the stored text (the model's copy) is unchanged.
-      const receipt = isFormAnswer(refs) ? formReceipt(item.entry.text) : null;
+      // CAD-2362: an answer the form card shows (threadItems checked the card
+      // reads it) is one receipt line; the stored text (the model's copy) is
+      // unchanged. Any other answer keeps its bubble and the caption.
+      const receipt = item.formShown ? formReceipt(item.entry.text) : null;
       if (receipt) {
         const at = time(item.entry.created);
         return (
           <div className="min-w-0 text-right" data-chat-message="user" data-form-receipt>
             <span className="form-receipt">
+              <span className="sr-only">{t("You")}: </span>
               <span aria-hidden>↳ </span>
               {t("Answered with the form")}
               {receipt.map((line, i) => (

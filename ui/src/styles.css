@@ -1495,6 +1495,13 @@ textarea.agentform-input { height: auto; width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   .chat-me-at { transition: none; }
 }
+/* The board loads upright faces only and turns synthesis off (base.css),
+   so <em> rendered upright and an operator's *emphasis* vanished. Chat
+   emphasis asks the browser for a slanted style. */
+[data-chat-message] em,
+.answer em {
+  font-synthesis-style: auto;
+}
 [data-chat-message="user"] .op-code {
   padding: .05rem .3rem;
   border-radius: .25rem;

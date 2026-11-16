@@ -26,10 +26,11 @@ const CODE = /`([^`\n]+)`/g;
  * bare `http(s)://` URL (trailing punctuation stays text), `**strong**`, and
  * `*em*` / `_em_`. Emphasis needs a non-space just inside each marker and no
  * letter or digit just outside it, so `2*3*4` and `snake_case_name` stay as
- * typed.
+ * typed. Every span is bounded (300 characters of label or emphasis), so a
+ * long line of unmatched markers costs linear time, not quadratic.
  */
 const RICH =
-  /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"’」』）])|\*\*(?=\S)([^*\n]*?\S)\*\*|(?<![\p{L}\p{N}*\\])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}_\\])_(?=[^\s_])([^_\n]*?[^\s_])_(?![\p{L}\p{N}_])/gu;
+  /\[([^\]\n]{1,300})\]\((https?:\/\/[^\s)]{1,2000})\)|(https?:\/\/[^\s<>()]{0,2000}[^\s<>().,;:!?'"’」』）])|\*\*(?=\S)([^*\n]{0,300}?\S)\*\*|(?<![\p{L}\p{N}*\\])\*(?=[^\s*])([^*\n]{0,300}?[^\s*])\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}_\\])_(?=[^\s_])([^_\n]{0,300}?[^\s_])_(?![\p{L}\p{N}_])/gu;
 
 function push(out: Inline[], token: Inline): void {
   const last = out[out.length - 1];
@@ -67,26 +68,85 @@ export function inlineTokens(text: string): Inline[] {
 export type Segment = { kind: "prose"; text: string } | { kind: "code"; text: string; lang: string | null };
 
 const FENCE = /^```([^\n`]*)\n([\s\S]*?)\n?```[ \t]*$/gm;
-/** Past this the paste is too large to scan for a JSON tail; it stays prose. */
-const SCAN_LIMIT = 200_000;
-/** A JSON tail shorter than this is a value in a sentence, not a paste. */
-const MIN_JSON = 40;
+/** Past this a message is not scanned for a payload; it stays prose. */
+const SCAN_LIMIT = 20_000;
+/** Opening brackets tried as the start of a payload, first ones first. */
+const MAX_ATTEMPTS = 8;
+/** A payload shorter than this is a value in a sentence, not a paste. */
+const MIN_JSON = 80;
+
+/**
+ * One-line JSON, indented without parsing it: a newline after each opening
+ * bracket and comma, before each closing one, nothing inside strings
+ * touched. Values, key order and duplicate keys stay exactly as typed; only
+ * the whitespace between tokens changes. Nesting deeper than `MAX_DEPTH`
+ * returns the text unchanged, so indentation never outgrows the paste.
+ */
+const MAX_DEPTH = 32;
+export function indentJson(json: string): string {
+  let out = "";
+  let depth = 0;
+  let inString = false;
+  const pad = () => "\n" + "  ".repeat(depth);
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i];
+    if (inString) {
+      out += c;
+      if (c === "\\") out += json[++i] ?? "";
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "{" || c === "[") {
+      const close = c === "{" ? "}" : "]";
+      let j = i + 1;
+      while (json[j] === " " || json[j] === "\t") j++;
+      if (json[j] === close) {
+        out += c + close;
+        i = j;
+      } else {
+        if (++depth > MAX_DEPTH) return json;
+        out += c + pad();
+      }
+    } else if (c === "}" || c === "]") {
+      depth = Math.max(0, depth - 1);
+      out += pad() + c;
+    } else if (c === ",") {
+      out += c + pad();
+    } else if (c === ":") {
+      out += ": ";
+    } else if (c !== " " && c !== "\t") {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/** An object, or an array holding objects or arrays: a payload, not a list of values. */
+function isPayload(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  return !Array.isArray(value) || value.some((v) => v !== null && typeof v === "object");
+}
 
 function jsonTail(text: string): Segment[] | null {
   if (text.length > SCAN_LIMIT) return null;
-  for (let i = text.search(/[{[]/); i >= 0 && i < text.length; ) {
+  let attempts = 0;
+  for (let i = text.search(/[{[]/); i >= 0 && attempts < MAX_ATTEMPTS; attempts++) {
     const tail = text.slice(i).trim();
-    if (tail.length >= MIN_JSON) {
-      try {
-        const value: unknown = JSON.parse(tail);
-        if (value && typeof value === "object") {
-          const lead = text.slice(0, i).trimEnd();
-          const code: Segment = { kind: "code", text: JSON.stringify(value, null, 2), lang: "json" };
-          return lead ? [{ kind: "prose", text: lead }, code] : [code];
-        }
-      } catch {
-        /* not JSON from here: try the next opening bracket */
-      }
+    if (tail.length < MIN_JSON) return null;
+    let value: unknown = undefined;
+    try {
+      value = JSON.parse(tail);
+    } catch {
+      /* not JSON from here: try the next opening bracket */
+    }
+    if (isPayload(value)) {
+      const lead = text.slice(0, i).trimEnd();
+      // Shown as typed; only a one-line paste is spread over lines.
+      const code: Segment = { kind: "code", text: tail.includes("\n") ? tail : indentJson(tail), lang: "json" };
+      return lead ? [{ kind: "prose", text: lead }, code] : [code];
     }
     const next = text.slice(i + 1).search(/[{[]/);
     i = next < 0 ? -1 : i + 1 + next;
@@ -96,8 +156,10 @@ function jsonTail(text: string): Segment[] | null {
 
 /**
  * The message as prose and code: each fenced block is code; with no fence, a
- * trailing JSON object or array (a pasted payload, even on one line) is code,
- * shown indented. Anything else is one prose segment.
+ * trailing JSON payload (an object, or an array of objects or arrays, at
+ * least 80 characters) is code, shown as typed — a one-line paste spread
+ * over lines. Anything else, including a list of values in a sentence, is
+ * one prose segment.
  */
 export function segments(text: string): Segment[] {
   const fenced: Segment[] = [];
@@ -152,4 +214,11 @@ export function formReceipt(text: string): string[] | null {
   const lines = text.slice(0, at).split("\n");
   if (!/^Form answer \(.*\):$/.test(lines[0] ?? "")) return null;
   return lines.slice(1).filter((l) => l.trim() !== "");
+}
+
+/** A form answer's readable lines without its A2UI action, when the action
+ *  parses; any other text unchanged. For surfaces that carry no form ref
+ *  (the Threads pages), so the action never shows as a pasted payload. */
+export function readableAnswer(text: string): string {
+  return formReceipt(text) === null ? text : text.slice(0, text.lastIndexOf(ACTION_MARK));
 }

@@ -1,5 +1,6 @@
 import { ACTION_MARK } from "../src/features/home/formModel";
-import { FOLD_LINES, foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "../src/features/home/operatorText";
+import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { FOLD_LINES, foldable, formReceipt, indentJson, inlineTokens, lineCount, readableAnswer, segments, type Inline } from "../src/features/home/operatorText";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`operatorText: ${message}`);
@@ -99,6 +100,85 @@ const answer = `Form answer (qa_review):\nYour name: QA Tester Six\nReview day: 
 check(JSON.stringify(formReceipt(answer)) === JSON.stringify(["Your name: QA Tester Six", "Review day: Friday"]), "the receipt is the label lines");
 for (const broken of ["Form answer (x):\nA: b", `Form answer (x):\nA: b${ACTION_MARK}{not json`, `Form answer (x):\nA: b${ACTION_MARK}${JSON.stringify({ nope: 1 })}`, `typed by hand${ACTION_MARK}${action}`]) {
   check(formReceipt(broken) === null, `no receipt when the card cannot show it: ${broken}`);
+}
+
+// Review of #1775: a payload is shown as typed — never re-serialized.
+{
+  const typed = 'Here is the payload for the import job: {"id": 12345678901234567890, "rate": 1.10, "b": 1, "2": "second", "1": "first", "v": "1.0", "e": 1e3, "dup": 1, "dup": 2}';
+  const p = segments(typed);
+  check(p.length === 2 && p[1].kind === "code", "a one-line object payload is a code block");
+  const shown = p[1].text;
+  for (const exact of ["12345678901234567890", "1.10", "1e3", '"dup": 1', '"dup": 2'])
+    check(shown.includes(exact), `the payload keeps ${exact} as typed: ${shown}`);
+  check(shown.indexOf('"b"') < shown.indexOf('"2"') && shown.indexOf('"2"') < shown.indexOf('"1"'), "key order is as typed");
+  check(shown.replace(/\s+/g, "") === typed.slice(typed.indexOf("{")).replace(/\s+/g, ""), "only whitespace between tokens changes");
+  // Strings are never touched, including brackets, commas and escapes inside them.
+  check(indentJson('{"a":"x, [y] {z}: \\" q","b":[]}') === '{\n  "a": "x, [y] {z}: \\" q",\n  "b": []\n}', `indentJson leaves strings alone: ${JSON.stringify(indentJson('{"a":"x, [y] {z}: \\" q","b":[]}'))}`);
+  // A multi-line paste is shown exactly as typed.
+  const multi = 'see:\n{\n    "a":   1,\n    "nested": {"b": [1, 2, 3]}, "c": "padding to make it long enough"\n}';
+  const m = segments(multi);
+  check(m.length === 2 && m[1].kind === "code" && m[1].text === multi.slice(multi.indexOf("{")), "a multi-line payload keeps its own layout");
+}
+// A list of values at the end of a sentence stays the sentence.
+for (const text of [
+  "Please use these ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]",
+  'Tags: ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"]',
+]) {
+  const s1 = segments(text);
+  check(s1.length === 1 && s1[0].kind === "prose" && !foldable(s1), `stays one unfolded prose line: ${text}`);
+}
+// Bracket-dense or marker-dense input stays fast (it used to be quadratic).
+{
+  const time = (f: () => unknown) => {
+    const t0 = Date.now();
+    f();
+    return Date.now() - t0;
+  };
+  for (const [name, input] of [
+    ["unclosed arrays", "[1,".repeat(21_333)],
+    ["unclosed objects", '{"a":'.repeat(40_000)],
+    ["nested arrays under the limit", "[".repeat(5_000) + "1" + "]".repeat(5_000)],
+  ] as const) {
+    const ms = time(() => segments(input));
+    check(ms < 500, `segments on ${name} took ${ms}ms`);
+  }
+  for (const [name, input] of [["open brackets", "[".repeat(64_000)], ["open labels", "[a ".repeat(40_000)], ["stars", "*a ".repeat(40_000)]] as const) {
+    const ms = time(() => inlineTokens(input));
+    check(ms < 500, `inlineTokens on ${name} took ${ms}ms`);
+  }
+}
+{
+  const deep = "[".repeat(5_000) + "1" + "]".repeat(5_000);
+  check(indentJson(deep) === deep, "deep nesting is shown as typed, not indented");
+}
+// The Threads pages carry no form ref: a form answer shows its readable lines only.
+check(readableAnswer(answer) === "Form answer (qa_review):\nYour name: QA Tester Six\nReview day: Friday", "readableAnswer drops the A2UI action");
+check(readableAnswer("plain text") === "plain text" && readableAnswer(`typed${ACTION_MARK}{oops`) === `typed${ACTION_MARK}{oops`, "anything else is unchanged");
+
+// Browser QA of #1775: the receipt appears only when the card reads the answer.
+{
+  const form: ThreadEntry = {
+    seq: 2, role: "agent", kind: "surface", text: "Weekly review", message: "m1", created: "2026-11-16T08:00:00Z",
+    payload: { a2ui: { createSurface: { surfaceId: "qa_review", dataModel: { name: "", day: [] }, components: [
+      { id: "root", component: "Column", children: ["name", "day", "send"] },
+      { id: "name", component: "TextField", label: "Your name", value: { "@path": "/name" } },
+      { id: "day", component: "ChoicePicker", label: "Review day", variant: "mutuallyExclusive", options: [{ label: "Friday", value: "fri" }], value: { "@path": "/day" } },
+      { id: "send", component: "Button", child: "l", action: { event: { name: "review.answer", context: { name: { "@path": "/name" }, day: { "@path": "/day" } } } } },
+      { id: "l", component: "Text", text: "Send" },
+    ] } } },
+  };
+  const answerOf = (action: unknown): ThreadEntry => ({
+    seq: 3, role: "operator", kind: "message", message: "m2", created: "2026-11-16T08:01:00Z",
+    text: `Form answer (qa_review):\nYour name: QA\nReview day: Friday${ACTION_MARK}${JSON.stringify(action)}`,
+    payload: { refs: [{ kind: "surface", id: "2" }] },
+  });
+  const shown = (action: unknown) => {
+    const op = threadItems({ exists: true, entries: [form, answerOf(action)], pending: [] } as ThreadState).find((i) => i.type === "operator");
+    return op?.type === "operator" && op.formShown === true;
+  };
+  check(shown({ version: "1.0", action: { name: "review.answer", sourceComponentId: "send", context: { name: "QA", day: ["fri"] } } }), "a readable answer is shown by the card: receipt");
+  check(!shown({ version: "1.0", action: { name: "answer", sourceComponentId: "send", context: ["fri"] } }), "an array context the card cannot read: no receipt");
+  check(!shown({ version: "1.0", action: { name: "answer", sourceComponentId: "gone", context: { name: "QA" } } }), "an unknown sending button: no receipt");
 }
 
 console.log("operatorText: ok");
