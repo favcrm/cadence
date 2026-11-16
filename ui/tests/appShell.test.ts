@@ -133,9 +133,16 @@ const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof 
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const AppShellComponent = AppShellModule.default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null,
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(React.Fragment, null,
+        React.createElement("nav", { ref: setBreadcrumbs, "aria-label": "Breadcrumb" }),
+        React.createElement("div", { ref: setActions }),
+        React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } })) }));
+};
 const entryApp = AppShellModule.entryApp;
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
@@ -294,31 +301,29 @@ await React.act(async () => {
   root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } })));
 });
 await flush(); await flush(); await flush();
-assert(text().includes("All apps") && text().includes("Reports"), "← All apps back-link plus installed App title, deduped");
+assert(host.querySelector('nav[aria-label="Breadcrumb"]')?.textContent?.includes("Reports"), "verified app identity appears in the shared header");
 assert(text().includes("This app's screen is unavailable."), "an app without its own screen shows the one unavailable state");
 assert(!text().includes("No records yet") && !text().includes("CAD-781"), "core draws no records UI of its own");
-assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
+assert(text().includes("Master answer stays connected"), "the assistant shows the real master thread");
 assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
-// Narrow switch (approved mock): a full-width Assistant | Workspace
-// segmented control replaces the overlay drawer. The assistant is shown
-// by default; both panels stay mounted so the draft survives switching.
-const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".app-shell-panel-tab"));
-equal(tabs.map((t) => t.textContent), ["Assistant", "Workspace"], "segmented Assistant | Workspace switch");
-assert(!host.querySelector(".app-shell-chat-toggle") && !host.querySelector(".app-shell-scrim"), "no overlay drawer toggle or scrim remains");
+// The header disclosure changes visibility without replacing either pane.
+const toggle = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
 const grid = host.querySelector(".app-shell-grid") as HTMLElement;
-equal(grid.getAttribute("data-shell-panel"), "chat", "the assistant is the default narrow panel");
-equal(tabs[0].getAttribute("aria-pressed"), "true", "Assistant tab is pressed by default");
+await click(toggle);
+const mountedPane = host.querySelector("[data-chat-pane]");
+const mountedBox = host.querySelector("#app-shell-chat-box");
 await fill("#app-shell-chat-box", "unsent shell draft");
-await click(tabs[1]);
-equal(grid.getAttribute("data-shell-panel"), "work", "Workspace tab shows the workspace");
-equal(tabs[1].getAttribute("aria-pressed"), "true", "Workspace tab pressed");
-await click(tabs[0]);
-equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across switching");
-equal(panes(), 1, "switching never mounts a second chat pane");
+await click(toggle);
+assert(grid.hasAttribute("data-chat-collapsed"), "the header control closes the assistant");
+assert(document.activeElement === toggle, "closing keeps focus on the visible header control");
+await click(toggle);
+assert(host.querySelector("[data-chat-pane]") === mountedPane, "the same conversation stays mounted");
+assert(host.querySelector("#app-shell-chat-box") === mountedBox, "the same composer stays mounted");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "the header switch preserves the unsent draft");
 
 // Chat sends carry the verified-scope request; refusal would surface.
 // Context is adopted from the URL — no selector needed.
@@ -570,7 +575,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
 
 // CAD-1519: core bundles no app UI. A CRM install whose package ships no
 // screen gets the same one unavailable state as any other app — no
-// host-drawn Customers/Segments/Campaigns pages, and one Apps link only.
+// host-drawn Customers/Segments/Campaigns pages.
 {
   win.sessionStorage.clear();
   const hostEl = document.createElement("div");
@@ -583,7 +588,6 @@ async function mountColdCold(url: string, install: string, scope: string) {
   await settle(() => assert((hostEl.textContent ?? "").includes("This app's screen is unavailable."), "CRM without its own screen shows the unavailable state"));
   assert(!hostEl.querySelector("[data-outlet-heading]"), "no host-drawn CRM section pages");
   assert(!(hostEl.textContent ?? "").match(/No customers yet|No segments yet|No campaigns yet/), "no host-drawn CRM lists");
-  equal(Array.from(hostEl.querySelectorAll<HTMLAnchorElement>("a[href='/apps']")).length, 1, "exactly one Apps link — the shell row only");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }

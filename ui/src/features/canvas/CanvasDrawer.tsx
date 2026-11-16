@@ -51,10 +51,11 @@ function useViewport(): number {
   return w;
 }
 
-/** The chat pane's right edge with no drawer padding applied (app shell). */
-function chatRightEdge(pushed: number): number | null {
-  const pane = document.querySelector<HTMLElement>("[data-chat-pane]");
-  return pane ? pane.getBoundingClientRect().right + pushed : null;
+/** The stable app workspace box; the assistant lives beyond its right edge. */
+function appWorkspaceBounds(): { left: number; right: number } | null {
+  const pane = document.querySelector<HTMLElement>("#app-shell-workspace");
+  const bounds = pane?.getBoundingClientRect();
+  return bounds && bounds.width > 0 ? { left: bounds.left, right: bounds.right } : null;
 }
 
 /** The passage the operator selected inside the document, or "". */
@@ -285,16 +286,24 @@ export default function CanvasDrawer() {
   }, [handFocusOn]);
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
-  const pushed = useRef(0);
+  const [, measureWorkspace] = useState(0);
 
-  // The layout is measured from the page (the chat pane's edge), so it is
-  // recomputed after every render that could move it.
+  // A chat toggle changes the available workspace without remounting it.
+  useLayoutEffect(() => {
+    if (!open || canvas.surface !== "app") return;
+    const workspace = document.querySelector("#app-shell-workspace");
+    if (!workspace) return;
+    const observer = new ResizeObserver(() => measureWorkspace((value) => value + 1));
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  }, [open, canvas.surface]);
+
+  // Measure after layout; cover mode leaves both underlying panes unchanged.
   useLayoutEffect(() => {
     if (!open) return;
     const surface: Surface = canvas.surface;
-    const next = drawerLayout(viewport, want, surface, surface === "app" ? chatRightEdge(pushed.current) : null, expanded);
-    pushed.current = next.mode === "push" ? next.width : 0;
-    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width ? cur : next));
+    const next = drawerLayout(viewport, want, surface, surface === "app" ? appWorkspaceBounds() : null, expanded);
+    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right ? cur : next));
   });
 
   // The page makes room (push) or steps aside through these two attributes.
@@ -389,9 +398,10 @@ export default function CanvasDrawer() {
       className="canvas-drawer"
       data-canvas-drawer
       data-mode={layout.mode}
+      data-surface={canvas.surface}
       aria-label={t("Canvas")}
       tabIndex={-1}
-      style={sheet ? undefined : { width: layout.width }}
+      style={sheet ? undefined : { width: layout.width, right: layout.right ?? 0 }}
     >
       {!sheet && !expanded ? (
         <div

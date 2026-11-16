@@ -37,9 +37,16 @@ const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof 
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellComponent = require("../src/features/app-shell/AppShell").default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null,
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(React.Fragment, null,
+        React.createElement("nav", { ref: setBreadcrumbs }),
+        React.createElement("div", { ref: setActions }),
+        React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } })) }));
+};
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
@@ -478,7 +485,7 @@ await pick("Spring launch");
 // CAD-1810: an app page may open with the assistant collapsed (unless a
 // decision is waiting); this test needs the pane visible.
 if (host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed")) {
-  await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
 }
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the assistant is visible for this check");
@@ -501,11 +508,11 @@ await settle();
 equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
-await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "CRM chat collapses");
 await mount("install-other");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app opens with its own assistant collapsed");
-await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat expands independently");
 equal(await optionLabels(), ["General"], "another app lists only its own conversations");
@@ -532,7 +539,7 @@ assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed
     return fixtureFetch(input as RequestInfo | URL, init);
   }) as typeof fetch;
   try {
-    await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await settle();
     await React.act(async () => { await conversationList("install-crm").refresh(); });
     await settle();

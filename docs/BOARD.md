@@ -2784,6 +2784,17 @@ same app key. An existing conflicting pin refuses before redirect or app
 mount; it is never overwritten. The redirect replaces history and preserves
 the original query and fragment, adding only a missing installation pin.
 
+Installed apps use the board header for `Apps / App name / Section`; the
+version is secondary metadata, and a default section adds no duplicate leaf.
+Sections come only from the active screen's declared `section_query`.
+Parent navigation retains installation/context pins and unrelated query
+parameters while clearing record and segment selection. The aligned
+**Assistant** button controls the right-hand chat pane without remounting the
+conversation or app frame. A collapsed chat leaves no rail; on narrow screens
+the workspace and assistant share one pane. Workflow launchers and developer
+tools live in the header's **More actions** menu. Narrow layouts keep account,
+board status and update controls in the existing mobile navigation.
+
 Every setup or Browser QA handover states these separately:
 
 - The actually served backend build and board address, with the existing

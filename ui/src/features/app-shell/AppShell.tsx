@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
+import { IconMore, IconThreads } from "../../ui/icons";
 import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
 import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
@@ -12,7 +14,7 @@ import { screenTag } from "../workspace-apps/screen/screenProjection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
 import { readReturnDrawer, withoutReturnDrawer } from "../workspace-apps/socialConnect";
-import { sectionFromSearch } from "./appNav";
+import { appSectionHref, sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
 import { localizeAppChat } from "./chat/contract";
@@ -109,17 +111,12 @@ function parseConversationLink(href: string): ParsedConversationLink | null {
 
 /**
  * The trusted shared App shell (CAD-802): host-owned board surface for
- * every installed App. The board keeps its header/sidebar (App.tsx); the
- * shell adds nested Apps → installed-App navigation, the persistent
- * master conversation on the left with an accessible left drawer at
- * narrow widths, and a generic list/detail/new outlet on the right.
+ * every installed App. The shell portals its verified location and controls
+ * into the board header. Its workspace is left and assistant is right.
  *
- * One ChatPane instance lives for the shell's lifetime — desktop pane
- * and narrow drawer are one node restyled by CSS, so there is exactly
- * one draft and one SSE subscription, and closing the drawer (which
- * hides it from the tab order via `visibility`) never loses the draft.
- * The shell stays mounted across installation switches, so the chat
- * survives navigation while outlet state resets.
+ * One conversation and one outlet stay mounted while the header control
+ * changes visibility, including at narrow widths. Drafts, streams and the
+ * app frame survive opening and closing the assistant.
  *
  * Installation and context come from the trusted route plus verified
  * HTTP receipts; record links are context-bound (`ctx` + `record`).
@@ -140,14 +137,21 @@ export interface ActiveInstallation {
   i18n?: AppDisplayI18n | null;
 }
 
+export interface AppShellHeaderTargets {
+  breadcrumbs: HTMLElement | null;
+  actions: HTMLElement | null;
+}
+
 export default function AppShell({
   installId,
   viewer,
   children,
   onInstallation,
+  header,
 }: {
   installId: string;
   viewer: Viewer;
+  header?: AppShellHeaderTargets;
   /** Installed screen receives only the trusted native chat handoff and
    *  the shell's one verified app scope (CAD-1560). */
   children?: (onMediaAttach: MediaChatAttach, contextId: string, screen: {
@@ -175,6 +179,7 @@ export default function AppShell({
   onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
   const { locale, t } = useLocale();
+  const appActionsId = useId();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
   // A connect that left the board comes back with the drawer surface it was
@@ -504,23 +509,24 @@ export default function AppShell({
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
-  // Narrow widths: one full-width panel at a time (the approved mock's
-  // Assistant | Workspace switch). Both stay mounted — only CSS hides the
-  // other — so draft, stream and workspace state survive switching.
-  const [panel, setPanel] = useState<"chat" | "work">("chat");
   const mediaTarget = useRef<MediaComposerTarget | null>(null);
   const registerMediaTarget = useCallback((target: MediaComposerTarget) => {
     mediaTarget.current = target;
     return () => { if (mediaTarget.current === target) mediaTarget.current = null; };
   }, []);
-  // CAD-1051: desktop rail. Narrow widths keep the drawer above.
-  // CAD-1098: collapse state is per app installation.
+  // One per-install choice controls both desktop and narrow layouts.
   const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
   const [pendingDecision, setPendingDecision] = useState(false);
+  const [waitingReply, setWaitingReply] = useState(false);
   // A pending decision survives an installation switch only as long as the
   // assistant that reported it is the one on screen.
   useEffect(() => { setPendingDecision(false); }, [installId]);
   const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingDecision);
+  const chatToggleRef = useRef<HTMLButtonElement | null>(null);
+  const collapseChat = useCallback((collapsed: boolean) => {
+    setChatCollapsed(collapsed);
+    if (collapsed) chatToggleRef.current?.focus({ preventScroll: true });
+  }, [setChatCollapsed]);
   // CAD-861: the app-views/v1 contract preview is a dev-only overlay
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
@@ -982,7 +988,6 @@ export default function AppShell({
       throw new Error("Return to this draft's original app context before attaching an image.");
     const request = beginLibraryImagePin(target.composerKey);
     if (request === null) throw new Error("Wait for the current message to finish before attaching an image.");
-    setPanel("chat");
     setChatCollapsed(false);
     try {
       const out = await workspaceApps.mediaChatAttach({
@@ -1026,7 +1031,7 @@ export default function AppShell({
       if (command.conversation_id) selectConversation(installId, command.conversation_id);
       else setDraftSubject(installId, campaignSubject(campaign));
       if (command.operation === "chat.campaign.brief") void conversationList(installId).refresh();
-      setPanel("chat");
+      setChatCollapsed(false);
     }
     if (command.operation === "chat.whatsapp.open" || command.operation === "chat.whatsapp.brief") {
       // CAD-1636: the subject chat of one WhatsApp conversation; same selection-only rule.
@@ -1035,7 +1040,7 @@ export default function AppShell({
       if (command.conversation_id) selectConversation(installId, command.conversation_id);
       else setDraftSubject(installId, whatsappSubject(conversation));
       if (command.operation === "chat.whatsapp.brief") void conversationList(installId).refresh();
-      setPanel("chat");
+      setChatCollapsed(false);
     }
   };
   const title = installation
@@ -1088,6 +1093,10 @@ export default function AppShell({
   // section when it declares navigation, else its screen tag.
   const section = effectiveNavigation ? sectionFromSearch(href.split("?")[1] ?? "", effectiveNavigation) : null;
   const chatScreen = chatScreenFor(installation, verified, section, view);
+  const headerSection = verified && screenNavigation && section !== screenNavigation.default_section
+    ? screenNavigation.sections.find((item) => item.id === section)?.label ?? null
+    : verified && view === "new" ? "New" : null;
+  const appParentHref = appSectionHref(href, screenNavigation);
   // `open-view` card action: a declared section of the mounted screen, or
   // the generic list/new view, within this installation and context.
   const openView = useCallback(
@@ -1135,20 +1144,39 @@ export default function AppShell({
   return (
     <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={drawerOpen ? "true" : undefined} data-screen-drawer-surface={screenDrawer || undefined}>
       {(drawerOpen || independentOpen) && <div ref={independentOpen ? drawerScrimRef : undefined} className="app-shell-screen-scrim" aria-hidden="true" onClick={independentOpen ? closeIndependentDrawer : closeScreenDrawer} />}
-      <div className="app-shell-crumb" inert={drawerOpen || independentOpen}>
-        <Link href="/apps" className="lnk text-label">
-          ← {t("All apps")}
-        </Link>
-        <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
-          {loading ? t("Loading…") : title}
-        </span>
-        {!loading && installation?.version && (
-          <span className="text-micro text-ink-500" data-app-version={installation.version}>
-            v{installation.version}
-          </span>
-        )}
-
-        <span className="flex-1" />
+      {header?.breadcrumbs && createPortal(
+        <span className="app-header-location" inert={drawerOpen || independentOpen}>
+          <span className="text-ink-600" aria-hidden="true">/</span>
+          {headerSection !== null ? (
+            <Link href={appParentHref} className="app-header-name" title={title}>{title}</Link>
+          ) : (
+            <span className="app-header-name" aria-current="page" title={verified ? title : undefined}>
+              {loading ? t("Loading…") : verified ? title : t("App")}
+            </span>
+          )}
+          {verified && installation.version && (
+            <span className="app-header-version text-micro text-ink-500" data-app-version={installation.version}>
+              v{installation.version}
+            </span>
+          )}
+          {headerSection !== null && (
+            <>
+              <span className="text-ink-600" aria-hidden="true">/</span>
+              <span className="app-header-section" aria-current="page" title={t(headerSection)}>{t(headerSection)}</span>
+            </>
+          )}
+        </span>,
+        header.breadcrumbs,
+      )}
+      {header?.actions && createPortal(
+      <div className="app-header-app-actions" inert={drawerOpen || independentOpen}>
+        {(launchableWorkflows.length > 0 || (isDev && installation !== null)) && <>
+          <button type="button" className="header-icon app-header-more" popoverTarget={appActionsId} aria-label={t("More actions")} title={t("More actions")}>
+            <IconMore size={16} />
+          </button>
+          <div id={appActionsId} popover="auto" className="app-header-action-menu" onClick={(event) => {
+            if ((event.target as Element).closest("button, a")) event.currentTarget.hidePopover();
+          }}>
         {launchableWorkflows.map((flow) => (
           <Button
             key={flow.name}
@@ -1182,55 +1210,26 @@ export default function AppShell({
             {t(previewKey === null ? "Contract preview (dev)" : "Exit contract preview")}
           </a>
         )}
-      </div>
+          </div>
+        </>}
+        <button
+          ref={chatToggleRef}
+          type="button"
+          className="app-header-assistant"
+          aria-label={t(chatCollapsed ? "Expand assistant chat" : "Collapse assistant chat")}
+          aria-expanded={!chatCollapsed}
+          aria-controls="app-shell-chat"
+          onClick={() => collapseChat(!chatCollapsed)}
+        >
+          <IconThreads size={14} />
+          <span>{t("Assistant")}</span>
+          {waitingReply && <span className="app-header-assistant-unread" role="status" aria-label={t("New reply waiting")} />}
+        </button>
+      </div>,
+      header.actions,
+      )}
 
-      <div className="app-shell-panels" role="group" aria-label={t("Panel")} inert={drawerOpen || independentOpen}>
-        {(["chat", "work"] as const).map((p) => (
-          <button
-            key={p}
-            type="button"
-            className="app-shell-panel-tab"
-            aria-pressed={panel === p}
-            aria-controls={p === "chat" ? "app-shell-chat" : "app-shell-workspace"}
-            onClick={() => setPanel(p)}
-          >
-            {t(p === "chat" ? "Assistant" : "Workspace")}
-          </button>
-        ))}
-      </div>
-
-      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
-        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")} inert={drawerOpen || independentOpen}>
-          <Conversation
-            mode={{
-              kind: "app",
-              installId,
-              contextId: binding.scope?.context_id ?? "",
-              screen: chatScreen,
-              recordOpen: recordId !== null,
-              contextName: singleScope ? null : contextLabel(activeContexts, contextId),
-              scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
-              descriptor: chatDescriptor,
-              conversationRequest,
-              contextProof: conversationContextProof,
-              // CAD-1438: shareable links spell the canonical key route. The
-              // shell only mounts after the route proved the key unique for
-              // this install, so the verified receipt's name is its path.
-              appPath: verified && installation ? installedAppHref(installation.name) : null,
-              fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
-              fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
-            }}
-            density="compact"
-            viewer={viewer}
-            binding={binding}
-            onFileUploadUnavailable={() => void chatProjection.refresh()}
-            onMediaTarget={registerMediaTarget}
-            collapsed={chatCollapsed}
-            onCollapsed={setChatCollapsed}
-            onPendingDecision={setPendingDecision}
-            onOpenView={openView}
-          />
-        </div>
+      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined}>
         <section id="app-shell-workspace" ref={outletRef} className="app-shell-outlet" data-screen-drawer={drawerOpen ? "true" : undefined} inert={independentOpen} aria-label={`${title} ${t("workspace")}`} role={drawerOpen ? "dialog" : undefined} aria-modal={drawerOpen ? true : undefined} tabIndex={drawerOpen ? -1 : undefined}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
             isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
@@ -1353,6 +1352,38 @@ export default function AppShell({
             </>
           )}
         </section>
+        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")} inert={drawerOpen || independentOpen}>
+          <Conversation
+            mode={{
+              kind: "app",
+              installId,
+              contextId: binding.scope?.context_id ?? "",
+              screen: chatScreen,
+              recordOpen: recordId !== null,
+              contextName: singleScope ? null : contextLabel(activeContexts, contextId),
+              scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
+              descriptor: chatDescriptor,
+              conversationRequest,
+              contextProof: conversationContextProof,
+              // CAD-1438: shareable links spell the canonical key route. The
+              // shell only mounts after the route proved the key unique for
+              // this install, so the verified receipt's name is its path.
+              appPath: verified && installation ? installedAppHref(installation.name) : null,
+              fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
+              fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
+            }}
+            density="compact"
+            viewer={viewer}
+            binding={binding}
+            onFileUploadUnavailable={() => void chatProjection.refresh()}
+            onMediaTarget={registerMediaTarget}
+            collapsed={chatCollapsed}
+            onCollapsed={collapseChat}
+            onPendingDecision={setPendingDecision}
+            onWaitingChange={setWaitingReply}
+            onOpenView={openView}
+          />
+        </div>
       </div>
       {/* CAD-1777 — the one trusted host overlay for an independent drawer.
           The primary list keeps its normal box; only this fixed panel (and

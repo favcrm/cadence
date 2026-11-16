@@ -17,8 +17,11 @@
   animation: canvas-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .canvas-drawer[data-mode="cover"] { box-shadow: -18px 0 40px rgb(0 0 0 / 0.35); }
+/* App canvases fade within the workspace, never sliding over right-docked chat. */
+.canvas-drawer[data-surface="app"][data-mode="cover"] { animation-name: canvas-app-in; }
 .canvas-drawer[data-mode="sheet"] { width: 100%; left: 0; border-left: 0; animation-name: sheet-in; }
 @keyframes canvas-in { from { transform: translateX(24px); opacity: 0; } }
+@keyframes canvas-app-in { from { opacity: 0; } }
 @keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
   .canvas-drawer { animation: none; }
