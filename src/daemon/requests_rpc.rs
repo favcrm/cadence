@@ -261,9 +261,19 @@ impl Shared {
             return Err(Self::foreign_request("request_open", &caller, &alias));
         }
         let agent = self.store.agent(&alias)?;
-        if agent.role == "reviewer" {
+        if crate::adapter::is_reviewer_role(&agent.role) {
             return Err(Error::rejected(
                 "reviewer sessions are read-only and cannot open tool approval requests",
+            ));
+        }
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "request_open refused: master uses master_ask_permission, not request_open",
+            ));
+        }
+        if params.get("cwd").is_some_and(|v| !v.is_null()) {
+            return Err(Error::rejected(
+                "request_open refused: cwd is derived from the registered agent, not caller parameters",
             ));
         }
         let brokered = agent
@@ -280,6 +290,16 @@ impl Shared {
         }
         let kind = optional_str(params, "kind").unwrap_or("approval");
         proto::identifier(kind, "Request kind")?;
+        if kind != "approval" {
+            return Err(Error::rejected(format!(
+                "request_open refused: unsupported brokered request kind '{kind}' — only 'approval' is supported"
+            )));
+        }
+        if agent.cwd.trim().is_empty() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' has no registered working directory"
+            )));
+        }
         let tool = required_str(params, "tool")?;
         let input_summary = optional_str(params, "input_summary").unwrap_or_default();
         let input = params.get("input").cloned().unwrap_or(Value::Null);
@@ -305,13 +325,9 @@ impl Shared {
         if let Some(existing) = self.held_handle_response(&handle, &alias)? {
             return Ok(existing);
         }
-        let pending_perm = if kind == "approval" && !crate::master::is_master(&alias) {
+        let pending_perm = {
             let pm_dir = self.pm_dir()?;
-            let cwd_buf = optional_str(params, "cwd")
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
-                .or_else(|| (!agent.cwd.is_empty()).then(|| std::path::PathBuf::from(&agent.cwd)))
-                .unwrap_or_else(|| pm_dir.clone());
+            let cwd_buf = std::path::PathBuf::from(&agent.cwd);
             let (_checkouts, states) = self.perm_roots();
             let state_refs = Self::perm_states(&states);
             match crate::master_perm::evaluate_worker(
@@ -346,8 +362,6 @@ impl Shared {
                 }
                 crate::master_perm::WorkerEval::Pending(req) => Some(req),
             }
-        } else {
-            None
         };
         // A handle names one agent's request until that agent's wait
         // collects the answer (CAD-452). `agent respond` parks the

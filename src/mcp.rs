@@ -160,15 +160,9 @@ fn decide(
     // a lost response re-opens the same handle — the daemon dedupes,
     // so a transport hiccup can never double-notify the PM.
     let handle = format!("perm-{}", uuid::Uuid::new_v4().simple());
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_owned));
-    let mut open_params = json!({"alias": alias, "kind": "approval", "tool": tool,
+    let open_params = json!({"alias": alias, "kind": "approval", "tool": tool,
         "request": handle,
         "input_summary": summarize(input), "input": input});
-    if let Some(cwd) = cwd.as_deref() {
-        open_params["cwd"] = json!(cwd);
-    }
     // `request_open` retries only on transport errors — a rejection
     // (unknown alias, not brokered) is final and denies immediately.
     let handle = loop {

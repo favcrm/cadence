@@ -265,10 +265,7 @@ fn pattern_arg_ok(arg: &str) -> bool {
         && arg.len() <= ARG_LEN
         && arg.chars().all(|c| {
             c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    '.' | '_' | '/' | '=' | ':' | '-' | '+' | '@' | ',' | '%' | '~'
-                )
+                || matches!(c, '.' | '_' | '/' | '=' | ':' | '-' | '+' | '@' | ',' | '%')
         })
 }
 
@@ -346,14 +343,65 @@ pub fn allowlisted(argv: &[String]) -> bool {
     false
 }
 
-fn cadence_subcommand(argv: &[String]) -> Option<&str> {
+const NEVER_WRAPPERS: &[&str] = &[
+    "sudo", "su", "doas", "env", "timeout", "nice", "nohup", "command", "builtin", "exec", "eval",
+    "xargs", "stdbuf", "setsid", "taskset", "ionice", "chrt", "strace", "ltrace", "watch", "time",
+    "rtk", "busybox", "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh",
+];
+
+fn cadence_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--org"
+            | "--state-dir"
+            | "--project"
+            | "--wake-timeout"
+            | "--file"
+            | "--provider"
+            | "--model"
+            | "--effort"
+            | "--to"
+            | "--since"
+            | "--grant"
+            | "--reason"
+            | "--scope"
+            | "--arg"
+            | "--agent"
+            | "--repo"
+            | "--issue"
+            | "--pr"
+            | "--head"
+            | "--source"
+            | "--action"
+            | "--id"
+            | "--target"
+            | "--channel"
+            | "--version"
+            | "--config"
+            | "--db"
+            | "--as"
+            | "--timeout"
+            | "--until"
+            | "--holder"
+            | "--ttl"
+            | "--digest"
+            | "--expected-revision"
+            | "--question"
+            | "-R"
+            | "-C"
+    )
+}
+
+fn cadence_positionals(argv: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
         if a == "--" {
-            return argv.get(i + 1).map(String::as_str);
+            out.extend(argv[i + 1..].iter().map(String::as_str));
+            break;
         }
-        if matches!(a, "--org" | "--state-dir" | "--project" | "--wake-timeout") {
+        if cadence_flag_takes_value(a) {
             i += 2;
             continue;
         }
@@ -361,38 +409,34 @@ fn cadence_subcommand(argv: &[String]) -> Option<&str> {
             i += 1;
             continue;
         }
-        return Some(a);
+        out.push(a);
+        i += 1;
     }
-    None
+    out
+}
+
+fn cadence_subcommand(argv: &[String]) -> Option<&str> {
+    cadence_positionals(argv).into_iter().next()
 }
 
 fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'static str> {
     never_why_for(argv, cwd, state_dirs, true)
 }
 
-fn never_why_for(
-    argv: &[String],
+fn never_why_command_slice(
+    slice: &[String],
     cwd: &Path,
     state_dirs: &[&Path],
-    allow_master_scratch: bool,
 ) -> Option<&'static str> {
-    if !allow_master_scratch
-        && !argv
-            .first()
-            .is_some_and(|t| worker_allowed_non_bash_tool(t))
-        && (argv.is_empty() || argv.len() > ARG_MAX || !argv.iter().all(|a| pattern_arg_ok(a)))
-    {
-        return Some("malformed shell command is never requestable");
-    }
-    let tokens: Vec<&str> = argv.iter().map(|s| tool_name(s)).collect();
+    let tokens: Vec<&str> = slice.iter().map(|s| tool_name(s)).collect();
     let has = |w: &str| tokens.contains(&w);
-    let cadence = is_cadence(argv.first().map(String::as_str).unwrap_or(""));
+    let cadence = is_cadence(slice.first().map(String::as_str).unwrap_or(""));
     if has("merge") && (cadence || matches!(tokens.first(), Some(&"git" | &"gh"))) {
         return Some("merge is never requestable");
     }
     if tokens.first() == Some(&"git")
         && has("push")
-        && argv.iter().skip(1).any(|a| {
+        && slice.iter().skip(1).any(|a| {
             a == "-f"
                 || a == "--force"
                 || a.starts_with("--force=")
@@ -404,58 +448,114 @@ fn never_why_for(
         return Some("git force-push is never requestable");
     }
     if cadence {
-        let stripped = strip_own_state_dir(argv, cwd, state_dirs);
-        if cadence_subcommand(&stripped) == Some("update") {
+        let stripped = strip_own_state_dir(slice, cwd, state_dirs);
+        let pos = cadence_positionals(&stripped);
+        let noun = pos.first().copied();
+        if noun == Some("update") {
             return Some("cadence update is never requestable");
         }
-    }
-    if cadence && has("rollout") {
-        return Some("rollout is never requestable");
-    }
-    if cadence && tokens.iter().any(|t| t.starts_with("secret")) {
-        return Some("secret commands are never requestable");
-    }
-    if cadence
-        && tokens.windows(2).any(|w| {
-            (w[0] == "daemon" && matches!(w[1], "restart" | "stop"))
-                || (w[0] == "master"
-                    && matches!(
-                        w[1],
+        if noun == Some("rollout") || has("rollout") {
+            return Some("rollout is never requestable");
+        }
+        if noun.is_some_and(|n| n.starts_with("secret"))
+            || tokens.iter().any(|t| t.starts_with("secret"))
+        {
+            return Some("secret commands are never requestable");
+        }
+        if (noun == Some("daemon") && pos[1..].iter().any(|t| matches!(*t, "restart" | "stop")))
+            || (noun == Some("master")
+                && pos[1..].iter().any(|t| {
+                    matches!(
+                        *t,
                         "allow-once" | "always-allow" | "reject" | "revoke-permission" | "resume"
-                    ))
-        })
-    {
-        // CAD-1586: `master resume` is lifecycle authority carried by a
-        // settings grant, never by an approved argv — a granted child
-        // runs it only as the bound agent, so it is never requestable.
-        return Some("daemon restart and permission decisions are never requestable");
-    }
-    if cadence
-        && tokens
-            .windows(2)
-            .any(|w| w[0] == "audit" && matches!(w[1], "approve" | "designate"))
-    {
-        // CAD-918: a granted child runs with operator authority, so
-        // neither an approval nor a designation can be requested.
-        return Some("audit approve and audit designate are never requestable");
-    }
-    if cadence && has("settings") {
-        // CAD-1586: reads stay requestable — an approved child may read
-        // settings (argv approval is enough for a read). Mutations, the
-        // catalog fetch and every grant verb are not: argv never binds
-        // payload bytes, and a granted child can never mint settings
-        // delegation.
-        const NEVER_SETTINGS: &[&str] = &[
-            "apply", "put", "remove", "rename", "scope", "set", "clear", "import", "sync", "grant",
-            "refresh",
-        ];
-        if tokens.iter().any(|t| NEVER_SETTINGS.contains(t)) {
+                    )
+                }))
+        {
+            // CAD-1586: `master resume` is lifecycle authority carried by a
+            // settings grant, never by an approved argv — a granted child
+            // runs it only as the bound agent, so it is never requestable.
+            return Some("daemon restart and permission decisions are never requestable");
+        }
+        if noun == Some("audit")
+            && pos[1..]
+                .iter()
+                .any(|t| matches!(*t, "approve" | "accept-revise" | "designate"))
+        {
+            // CAD-918: a granted child runs with operator authority, so
+            // neither an approval nor a designation can be requested.
+            return Some("audit approve and audit designate are never requestable");
+        }
+        if noun == Some("settings") || has("settings") {
+            // CAD-1586: reads stay requestable — an approved child may read
+            // settings (argv approval is enough for a read). Mutations, the
+            // catalog fetch and every grant verb are not: argv never binds
+            // payload bytes, and a granted child can never mint settings
+            // delegation.
+            const NEVER_SETTINGS: &[&str] = &[
+                "apply", "put", "remove", "rename", "scope", "set", "clear", "import", "sync",
+                "grant", "refresh",
+            ];
+            if tokens.iter().any(|t| NEVER_SETTINGS.contains(t))
+                || pos.iter().any(|t| NEVER_SETTINGS.contains(t))
+            {
+                return Some(
+                    "settings mutations, the catalog fetch and grant verbs are never requestable",
+                );
+            }
+        }
+        if noun == Some("master")
+            && pos[1..].contains(&"edit")
+            && pos[1..].iter().any(|t| protected_name(tool_name(t)))
+        {
             return Some(
-                "settings mutations, the catalog fetch and grant verbs are never requestable",
+                "agent SOUL.md, AGENT.md and permissions.yaml files are never requestable",
             );
         }
     }
-    if argv.iter().any(|a| touches_protected_file(a, cwd)) || edit_target_protected(argv) {
+    None
+}
+
+fn never_why_for(
+    argv: &[String],
+    cwd: &Path,
+    state_dirs: &[&Path],
+    allow_master_scratch: bool,
+) -> Option<&'static str> {
+    let is_non_bash_tool = argv
+        .first()
+        .is_some_and(|t| worker_allowed_non_bash_tool(t));
+    let tokens: Vec<&str> = argv.iter().map(|s| tool_name(s)).collect();
+    if !allow_master_scratch && !is_non_bash_tool {
+        if argv.is_empty() || argv.len() > ARG_MAX || !argv.iter().all(|a| pattern_arg_ok(a)) {
+            return Some("malformed shell command is never requestable");
+        }
+        if tokens.first().is_some_and(|t| NEVER_WRAPPERS.contains(t)) {
+            return Some("wrapper and subshell commands are never requestable");
+        }
+        if tokens.first() == Some(&"find")
+            && argv.iter().skip(1).any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete"
+                )
+            })
+        {
+            return Some("find -exec and -delete are never requestable");
+        }
+    }
+    if let Some(why) = never_why_command_slice(argv, cwd, state_dirs) {
+        return Some(why);
+    }
+    if !allow_master_scratch && !is_non_bash_tool {
+        for idx in 1..argv.len() {
+            if is_cadence(&argv[idx]) || matches!(tokens[idx], "git" | "gh") {
+                if let Some(why) = never_why_command_slice(&argv[idx..], cwd, state_dirs) {
+                    return Some(why);
+                }
+            }
+        }
+    }
+    if argv.iter().any(|a| touches_protected_file(a, cwd)) {
         return Some("agent SOUL.md, AGENT.md and permissions.yaml files are never requestable");
     }
     if touches_state_for(argv, cwd, state_dirs, allow_master_scratch) {
@@ -494,13 +594,6 @@ fn protected_file(arg: &str) -> bool {
         && protected_name(segs[segs.len() - 1])
 }
 
-/// `cadence master edit SOUL.md` names the file as an argument, not a path.
-fn edit_target_protected(argv: &[String]) -> bool {
-    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    args.windows(3)
-        .any(|w| w[0] == "master" && w[1] == "edit" && protected_name(w[2]))
-}
-
 fn state_root(dir: &Path) -> PathBuf {
     fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
@@ -513,7 +606,17 @@ fn arg_path_candidates(arg: &str) -> [Option<&str>; 2] {
     [Some(arg), rhs]
 }
 
+fn has_tilde_path(cand: &str) -> bool {
+    if cand.starts_with('~') {
+        return true;
+    }
+    !cand.contains("://") && cand.split(':').skip(1).any(|part| part.starts_with('~'))
+}
+
 fn expand_path_symlinks(path: &Path) -> std::result::Result<PathBuf, ()> {
+    if path.to_string_lossy().starts_with('~') {
+        return Err(());
+    }
     const MAX_SYMLINK_HOPS: usize = 40;
     let mut cur = PathBuf::new();
     let mut queue: VecDeque<OsString> = VecDeque::new();
@@ -578,7 +681,7 @@ fn expand_path_symlinks(path: &Path) -> std::result::Result<PathBuf, ()> {
 
 fn touches_protected_file(arg: &str, cwd: &Path) -> bool {
     arg_path_candidates(arg).into_iter().flatten().any(|cand| {
-        if protected_file(cand) {
+        if has_tilde_path(cand) || protected_file(cand) {
             return true;
         }
         let probed = probe_path(cand, cwd);
@@ -624,6 +727,9 @@ fn touches_pm_agents_dir_inner(
         return true;
     };
     arg_path_candidates(arg).into_iter().flatten().any(|cand| {
+        if has_tilde_path(cand) {
+            return true;
+        }
         let probed = probe_path(cand, cwd);
         match expand_for_state(&probed) {
             Ok(exp) => {
@@ -722,7 +828,10 @@ fn touches_state_path(
         }
     }
     arg_path_candidates(arg).into_iter().flatten().any(|cand| {
-        if cand.contains(".local/state/cadence") || cand.contains(".local/share/cadence") {
+        if has_tilde_path(cand)
+            || cand.contains(".local/state/cadence")
+            || cand.contains(".local/share/cadence")
+        {
             return true;
         }
         let Ok(canon) = expand_for_state(&probe_path(cand, cwd)) else {
@@ -775,7 +884,10 @@ fn touches_state_for(
             continue;
         }
         for cand in arg_path_candidates(arg).into_iter().flatten() {
-            if cand.contains(".local/state/cadence") || cand.contains(".local/share/cadence") {
+            if has_tilde_path(cand)
+                || cand.contains(".local/state/cadence")
+                || cand.contains(".local/share/cadence")
+            {
                 return true;
             }
             if !allow_master_scratch
@@ -1591,32 +1703,41 @@ fn clip_reason(text: &str) -> String {
     trimmed[..end].to_string()
 }
 
-fn collect_input_paths(val: &Value, depth: usize, out: &mut Vec<String>) {
+fn is_prose_body_field(tool: &str, key: &str) -> bool {
+    (matches!(tool, "Write" | "TodoWrite") && key == "content")
+        || (matches!(tool, "Edit" | "MultiEdit") && matches!(key, "old_string" | "new_string"))
+        || (tool == "NotebookEdit" && key == "new_source")
+}
+
+fn collect_input_paths(tool: &str, val: &Value, depth: usize, out: &mut Vec<String>) -> Result<()> {
     if depth > 5 {
-        return;
+        return Err(Error::rejected(
+            "tool input nesting exceeds maximum depth (5)",
+        ));
     }
     match val {
         Value::Object(map) => {
             for (k, v) in map {
-                if matches!(
-                    k.as_str(),
-                    "file_path" | "notebook_path" | "path" | "cwd" | "directory" | "target_file"
-                ) {
-                    if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                        out.push(s.to_string());
-                    }
-                } else if v.is_object() || v.is_array() {
-                    collect_input_paths(v, depth + 1, out);
+                if is_prose_body_field(tool, k) && v.is_string() {
+                    continue;
                 }
+                collect_input_paths(tool, v, depth + 1, out)?;
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                collect_input_paths(item, depth + 1, out);
+                collect_input_paths(tool, item, depth + 1, out)?;
+            }
+        }
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 const WORKER_NON_BASH_TOOLS: &[&str] = &[
@@ -1824,7 +1945,7 @@ pub fn evaluate_worker(
         }
     }
     let mut input_paths = Vec::new();
-    collect_input_paths(input, 0, &mut input_paths);
+    collect_input_paths(tool.trim(), input, 0, &mut input_paths)?;
     for path in input_paths {
         if touches_protected_file(&path, &cwd)
             || pm_dir.is_some_and(|pm| touches_pm_agents_dir(&path, &cwd, pm))
@@ -3592,5 +3713,175 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(eval_wiki, WorkerEval::Pending(_)));
+    }
+
+    #[test]
+    fn interleaved_flags_tilde_wrappers_and_deep_inputs_are_never() {
+        let dir = tmp();
+        let state = dir.path().join("state");
+        let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(pm.join("agents/w1")).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let state_canon = fs::canonicalize(&state).unwrap();
+        let pm_canon = fs::canonicalize(&pm).unwrap();
+        let repo_cwd = fs::canonicalize(&repo).unwrap();
+
+        // 1. Interleaved global/named flags never bypass Class::Never.
+        for cmd in [
+            "cadence audit --org fav-limited approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+            "cadence audit --wake-timeout 10 approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+            "cadence master --wake-timeout 10 allow-once mp-1",
+            "cadence daemon --wake-timeout 10 restart",
+            "cadence master edit --file rep.md SOUL.md",
+        ] {
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                matches!(
+                    classify(&argv, &repo_cwd, &[], &[state_canon.as_path()]),
+                    Class::Never { .. }
+                ),
+                "expected Class::Never for `{cmd}`"
+            );
+            let err = evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-flag-never",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                cmd,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_030,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("never requestable"), "{cmd}: {err}");
+        }
+
+        // 2. Tilde paths in Bash or tool input fail closed.
+        for cmd in [
+            "cat ~/pm/agents/w1/profile/secret.md",
+            "dd if=~/pm/agents/w1/memory/x of=/tmp/out",
+        ] {
+            evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-tilde-bash",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                cmd,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_031,
+            )
+            .expect_err(&format!("expected tilde refusal for `{cmd}`"));
+        }
+        evaluate_worker(
+            &state_canon,
+            Some(pm_canon.as_path()),
+            "w1",
+            "h-tilde-write",
+            "Write",
+            &serde_json::json!({"file_path": "~/pm/agents/w1/profile/secret.md", "content": "x"}),
+            "~/pm/agents/w1/profile/secret.md",
+            &repo_cwd,
+            &[state_canon.as_path()],
+            1_031,
+        )
+        .expect_err("expected tilde refusal on Write");
+
+        // 3. Wrapper prefixes never smuggle Class::Never commands past worker evaluation or live rules.
+        for cmd in [
+            "env git push --force origin main",
+            "timeout 30 git push origin +main",
+            "nice -n 5 gh pr merge 123",
+            "rtk proxy cadence update",
+            "unknownwrap git push --force origin main",
+            "unknownwrap cadence --org fav-limited audit approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+        ] {
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            let rule = Rule {
+                id: "wr-wrap".into(),
+                effect: Effect::Allow,
+                scope: Scope::Exact,
+                argv,
+                tail: vec![],
+                cwd: repo_cwd.to_string_lossy().into_owned(),
+                by: "operator".into(),
+                at: 1_032,
+            };
+            write_rules(&pm_canon, "w1", &[rule]).unwrap();
+            assert!(
+                live_rules(&pm_canon, "w1", &[state_canon.as_path()])
+                    .unwrap()
+                    .is_empty(),
+                "wrapped never command must not produce a live rule: `{cmd}`"
+            );
+            evaluate_worker(
+                &state_canon,
+                Some(pm_canon.as_path()),
+                "w1",
+                "h-wrap",
+                "Bash",
+                &serde_json::json!({"command": cmd}),
+                cmd,
+                &repo_cwd,
+                &[state_canon.as_path()],
+                1_032,
+            )
+            .expect_err(&format!("expected wrapper refusal for `{cmd}`"));
+        }
+        write_rules(&pm_canon, "w1", &[]).unwrap();
+
+        // 4. Nested arrays and excessive input nesting fail closed, while prose Write bodies stay requestable.
+        evaluate_worker(
+            &state_canon,
+            Some(pm_canon.as_path()),
+            "w1",
+            "h-arr-soul",
+            "mcp__fs__read_many",
+            &serde_json::json!({"paths": ["agents/w1/SOUL.md"]}),
+            "read_many",
+            &repo_cwd,
+            &[state_canon.as_path()],
+            1_033,
+        )
+        .expect_err("array element touching protected SOUL.md must be refused");
+
+        evaluate_worker(
+            &state_canon,
+            Some(pm_canon.as_path()),
+            "w1",
+            "h-deep-json",
+            "mcp__fs__read_many",
+            &serde_json::json!({"a": {"b": {"c": {"d": {"e": {"f": "x"}}}}}}),
+            "deep",
+            &repo_cwd,
+            &[state_canon.as_path()],
+            1_033,
+        )
+        .expect_err("deep nesting >5 must fail closed");
+
+        let ok_prose = evaluate_worker(
+            &state_canon,
+            Some(pm_canon.as_path()),
+            "w1",
+            "h-prose-write",
+            "Write",
+            &serde_json::json!({
+                "file_path": "ok.md",
+                "content": "Stored in ~/.local/state/cadence and agents/master/SOUL.md",
+            }),
+            "ok.md",
+            &repo_cwd,
+            &[state_canon.as_path()],
+            1_034,
+        )
+        .unwrap();
+        assert!(matches!(ok_prose, WorkerEval::Pending(_)));
     }
 }

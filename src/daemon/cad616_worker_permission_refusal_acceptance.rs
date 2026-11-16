@@ -217,10 +217,10 @@ impl Fixture {
     }
 }
 
-fn exact_allow_rule(id: &str, argv: Vec<String>, cwd: &Path) -> Rule {
+fn exact_rule(id: &str, effect: Effect, argv: Vec<String>, cwd: &Path) -> Rule {
     Rule {
         id: id.to_string(),
-        effect: Effect::Allow,
+        effect,
         scope: Scope::Exact,
         argv,
         tail: Vec::new(),
@@ -228,6 +228,14 @@ fn exact_allow_rule(id: &str, argv: Vec<String>, cwd: &Path) -> Rule {
         by: "operator".to_string(),
         at: master_perm::clock(),
     }
+}
+
+fn exact_allow_rule(id: &str, argv: Vec<String>, cwd: &Path) -> Rule {
+    exact_rule(id, Effect::Allow, argv, cwd)
+}
+
+fn exact_deny_rule(id: &str, argv: Vec<String>, cwd: &Path) -> Rule {
+    exact_rule(id, Effect::Deny, argv, cwd)
 }
 
 fn seed_master_perm_doc(state_dir: &Path, doc: Value) -> PathBuf {
@@ -964,6 +972,11 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
     let master_cwd = fx.state_dir.join("master/cwd");
     fs::create_dir_all(&master_cwd).unwrap();
 
+    // Foreign directory for caller-supplied cwd spoofing & rule-scope bypass checks.
+    let other_dir = fx._dir.path().join("other");
+    fs::create_dir_all(&other_dir).unwrap();
+    let other_canon = fs::canonicalize(&other_dir).unwrap();
+
     // Vector 3: relative symlink inside fx.repo_dir pointing to fx.state_dir.
     std::os::unix::fs::symlink(Path::new("../state"), fx.repo_dir.join("st")).unwrap();
     assert_eq!(
@@ -1098,6 +1111,23 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
             &master_cwd_canon,
         ));
     }
+    rules.push(exact_allow_rule(
+        "allow-foreign-cwd-ls",
+        vec!["ls".into(), "-la".into()],
+        &other_dir,
+    ));
+    if other_canon != other_dir {
+        rules.push(exact_allow_rule(
+            "allow-foreign-cwd-ls-canon",
+            vec!["ls".into(), "-la".into()],
+            &other_canon,
+        ));
+    }
+    rules.push(exact_deny_rule(
+        "deny-repo-ls",
+        vec!["ls".into(), "-la".into()],
+        &fx.repo_dir,
+    ));
     master_perm::write_rules(&fx.pm_dir, "w1", &rules).unwrap();
 
     // 1. Caller-supplied "cwd" inside state_dir / state_dir/master/cwd with relative Bash command.
@@ -1251,9 +1281,207 @@ fn worker_state_dir_and_symlink_bypass_vectors_refused_immediately() {
         );
     }
 
+    // 6a. Foreign caller-supplied "cwd" attempting to select other_dir's Allow rule
+    //     or bypass fx.repo_dir's Deny rule for `ls -la`.
+    let res_foreign_cwd = fx.dispatch(
+        "request_open",
+        request_open_bash_in("w1", "perm-bypass-foreign-cwd", "ls -la", &other_dir),
+        w1.pid(),
+    );
+    assert!(
+        res_foreign_cwd.is_err(),
+        "caller-supplied foreign cwd must be refused immediately (not select other_dir Allow or bypass repo_dir Deny), got: {res_foreign_cwd:?}"
+    );
+    if other_canon != other_dir {
+        let res_foreign_canon = fx.dispatch(
+            "request_open",
+            request_open_bash_in(
+                "w1",
+                "perm-bypass-foreign-cwd-canon",
+                "ls -la",
+                &other_canon,
+            ),
+            w1.pid(),
+        );
+        assert!(
+            res_foreign_canon.is_err(),
+            "caller-supplied canonical foreign cwd must be refused immediately, got: {res_foreign_canon:?}"
+        );
+    }
+
+    // 6b. Unsupported request_open `kind` (anything other than "approval").
+    let res_bad_kind = fx.dispatch(
+        "request_open",
+        json!({
+            "alias": "w1",
+            "kind": "custom",
+            "tool": "Bash",
+            "request": "perm-bad-kind-1",
+            "input_summary": "ls",
+            "input": { "command": "ls" },
+        }),
+        w1.pid(),
+    );
+    assert!(
+        res_bad_kind.is_err(),
+        "unsupported request_open kind 'custom' must be refused immediately, got: {res_bad_kind:?}"
+    );
+
     assert!(
         fx.pending_requests_for("w1").is_empty(),
         "refused bypass vectors must never park pending entries"
+    );
+}
+
+#[test]
+fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
+    let fx = Fixture::new("c616r5");
+    let w1 = fx.enroll_managed("w1", "worker", true);
+
+    let interleaved_cadence_cmds = [
+        "cadence audit --org fav-limited approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+        "cadence audit --wake-timeout 10 approve --pr 1 --head 0123456789abcdef0123456789abcdef01234567 --source ok",
+        "cadence master --wake-timeout 10 allow-once perm-1",
+        "cadence daemon --wake-timeout 10 restart",
+        "cadence master edit --file rep.md SOUL.md",
+    ];
+
+    let tilde_bash_cmds = [
+        "cat ~/pm/agents/w1/profile/secret.md",
+        "dd if=~/pm/agents/w1/memory/notes.md of=/tmp/out",
+    ];
+    let tilde_write_path = "~/pm/agents/w1/profile/secret.md";
+
+    let wrapper_cmds = [
+        "env git push --force origin main",
+        "timeout 30 git push origin +main",
+        "nice -n 5 gh pr merge 123",
+        "rtk proxy cadence update",
+        "unknownwrap git push --force origin main",
+    ];
+
+    let checkouts = [fx.repo_dir.clone()];
+    let states = [fx.state_dir.as_path()];
+
+    // Plant Exact Allow rules in agents/w1/permissions.yaml for every command/write below.
+    let mut rules: Vec<Rule> = Vec::new();
+    for (idx, cmd) in interleaved_cadence_cmds.iter().enumerate() {
+        let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        let cls = master_perm::classify(&argv, &fx.pm_dir, &checkouts, &states);
+        assert!(
+            matches!(cls, Class::Never { .. }),
+            "master_perm::classify must mark interleaved command '{cmd}' as Class::Never, got {cls:?}"
+        );
+        rules.push(exact_allow_rule(
+            &format!("allow-interleaved-{idx}"),
+            argv,
+            &fx.repo_dir,
+        ));
+    }
+    for (idx, cmd) in tilde_bash_cmds.iter().enumerate() {
+        let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        rules.push(exact_allow_rule(
+            &format!("allow-tilde-bash-{idx}"),
+            argv,
+            &fx.repo_dir,
+        ));
+    }
+    rules.push(exact_allow_rule(
+        "allow-tilde-write",
+        vec!["Write".into(), tilde_write_path.into()],
+        &fx.repo_dir,
+    ));
+    for (idx, cmd) in wrapper_cmds.iter().enumerate() {
+        let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        rules.push(exact_allow_rule(
+            &format!("allow-wrapper-{idx}"),
+            argv,
+            &fx.repo_dir,
+        ));
+    }
+    master_perm::write_rules(&fx.pm_dir, "w1", &rules).unwrap();
+
+    // 2. Interleaved global/named flags on Class::Never cadence commands.
+    for (idx, cmd) in interleaved_cadence_cmds.iter().enumerate() {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-r5-cadence-{idx}"), cmd),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "interleaved Class::Never command '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+
+    // 3a. Tilde (~) paths via Bash and Write.
+    for (idx, cmd) in tilde_bash_cmds.iter().enumerate() {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-r5-tilde-bash-{idx}"), cmd),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "tilde Bash path '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+    let res_tilde_write = fx.dispatch(
+        "request_open",
+        request_open_write("w1", "perm-r5-tilde-write", tilde_write_path, "x"),
+        w1.pid(),
+    );
+    assert!(
+        res_tilde_write.is_err(),
+        "tilde Write path '{tilde_write_path}' must be refused immediately even with planted allow rule, got: {res_tilde_write:?}"
+    );
+
+    // 3b. Shell wrapper prefixes via Bash.
+    for (idx, cmd) in wrapper_cmds.iter().enumerate() {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_bash("w1", &format!("perm-r5-wrap-{idx}"), cmd),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "wrapper-prefixed command '{cmd}' must be refused immediately even with planted allow rule, got: {res:?}"
+        );
+    }
+
+    // 3c. Nested/array tool inputs on mcp__fs__batch.
+    for (idx, (label, input)) in [
+        (
+            "array path SOUL.md",
+            json!({"paths": ["agents/w1/SOUL.md"]}),
+        ),
+        (
+            "depth >5 nested input",
+            json!({"a": {"b": {"c": {"d": {"e": {"f": "ok.md"}}}}}}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = fx.dispatch(
+            "request_open",
+            request_open_tool(
+                "w1",
+                &format!("perm-r5-batch-{idx}"),
+                "mcp__fs__batch",
+                input,
+            ),
+            w1.pid(),
+        );
+        assert!(
+            res.is_err(),
+            "mcp__fs__batch ({label}) must be refused immediately, got: {res:?}"
+        );
+    }
+
+    assert!(
+        fx.pending_requests_for("w1").is_empty(),
+        "refused Round 5 bypass vectors must never park pending entries"
     );
 }
 
