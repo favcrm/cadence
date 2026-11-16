@@ -366,6 +366,22 @@ fn visible_threads_fp(
     Some(value_fp(&json!(pages)))
 }
 
+/// The member's agent scope, asked at most twice. The daemon refuses an
+/// `agent_list` whose running set moved while it was being selected ("running
+/// work changed"); a live board makes that routine, and the answer to the
+/// very next ask is settled. Two refusals in a row still fail, so the stream
+/// closes exactly as before and never keeps flowing on an unproven scope.
+fn member_scope(
+    state_dir: &Path,
+    proof: &super::operator::ReadRelayProof,
+) -> crate::error::Result<super::serve::MemberAgentScope> {
+    retry_once(|| super::serve::member_agent_scope(state_dir, proof))
+}
+
+fn retry_once<T, E>(mut ask: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    ask().or_else(|_| ask())
+}
+
 /// One signed member's projection of the shared watcher.
 ///
 /// Every frame is decided by comparing the reader's own representation with
@@ -416,7 +432,7 @@ impl MemberReader {
         let pm = Pm::at(pm_dir).ok()?;
         let model = read_model::get(state_dir, pm_dir);
         let jobs = super::serve::readable_job_state(state_dir, &pm, actor, proof).ok()?;
-        let scope = super::serve::member_agent_scope(state_dir, proof).ok()?;
+        let scope = member_scope(state_dir, proof).ok()?;
         let read =
             super::serve::member_board_over(state_dir, &pm, actor, proof, None, &jobs, &scope)
                 .ok()?;
@@ -573,7 +589,7 @@ impl MemberReader {
             None
         };
         let scope = if want_scope || want_board {
-            Some(super::serve::member_agent_scope(state_dir, proof).ok()?)
+            Some(member_scope(state_dir, proof).ok()?)
         } else {
             None
         };
@@ -963,5 +979,35 @@ pub(super) fn stream_events(
             }
             ping_at = Instant::now() + Duration::from_secs(15);
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_once;
+
+    fn asked(results: &[Result<u8, &'static str>]) -> (Result<u8, &'static str>, usize) {
+        let mut calls = 0;
+        let out = retry_once(|| {
+            let r = results[calls.min(results.len() - 1)];
+            calls += 1;
+            r
+        });
+        (out, calls)
+    }
+
+    #[test]
+    fn one_transient_failure_is_retried_once() {
+        assert_eq!(asked(&[Err("moved"), Ok(7)]), (Ok(7), 2));
+    }
+
+    #[test]
+    fn a_persistent_failure_still_fails_after_exactly_one_retry() {
+        assert_eq!(asked(&[Err("revoked")]), (Err("revoked"), 2));
+    }
+
+    #[test]
+    fn a_first_answer_is_not_asked_again() {
+        assert_eq!(asked(&[Ok(1), Err("late")]), (Ok(1), 1));
     }
 }
