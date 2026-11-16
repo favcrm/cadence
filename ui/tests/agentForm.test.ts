@@ -1,3 +1,4 @@
+import { failedCheck } from "../src/features/home/AgentForm";
 import { formStatus, threadItems, threadRuns, type PendingMessage, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
 function check(condition: boolean, message: string): void {
@@ -58,5 +59,22 @@ const types = items.map((i) => i.type);
 check(types.join(",") === "operator,tools,form,answer", `the form follows its tool run, got ${types.join(",")}`);
 const runs = threadRuns(items);
 check(runs.length === 2 && runs[1].turn === true && runs[1].items.some((i) => i.type === "form"), "the form is a card of the master's turn");
+
+// An optional email may be left blank; a filled one must look like an address,
+// and `required` is what refuses blank.
+const emailField = (extra: Record<string, unknown>[] = []) => ({
+  id: "field_email",
+  component: "TextField",
+  value: { "@path": "/email" },
+  "@checks": [
+    ...extra,
+    { condition: { "@call": "email", args: { value: { "@path": "/email" } } }, message: "Email must be an email address" },
+  ],
+});
+const requiredRule = { condition: { "@call": "required", args: { value: { "@path": "/email" } } }, message: "Email is required" };
+check(failedCheck(emailField(), { email: "" }) === null, "a blank optional email passes");
+check(failedCheck(emailField(), { email: "nope" }) === "Email must be an email address", "a bad email is refused");
+check(failedCheck(emailField(), { email: "a@b.co" }) === null, "a good email passes");
+check(failedCheck(emailField([requiredRule]), { email: "" }) === "Email is required", "a blank required email is refused by required");
 
 console.log("agentForm: ok");

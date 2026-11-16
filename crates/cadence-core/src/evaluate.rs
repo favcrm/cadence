@@ -40,9 +40,12 @@
 //! `agent.form.check` runs the one agent-form validator
 //! ([`crate::agent_form::check`]) the native `master ask-form` gate runs, so
 //! a non-native host refuses exactly what the daemon refuses and builds the
-//! same fallback text and digest. `agent.form.compile` builds the envelope
-//! from a flat field list first ([`crate::agent_form::compile`]). It is a shape check only: who may ask,
+//! same fallback text and digest. It is a shape check only: who may ask,
 //! in which conversation and on which turn stays the host's own decision.
+//!
+//! `agent.form.compile` takes the agent's flat field list instead of an
+//! envelope, builds the envelope ([`crate::agent_form::compile`]) and runs
+//! the same check, so its value is the check's plus the `form`.
 
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
 use crate::app_screen_decl::{

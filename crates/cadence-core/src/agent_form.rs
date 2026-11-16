@@ -18,6 +18,11 @@
 //! directly; a non-native host (the hosted runtime) reaches the same
 //! function through `evaluate`'s `agent.form.check`, so the two gates
 //! cannot drift.
+//!
+//! CAD-2345: [`compile`] builds that envelope from a flat field list (the
+//! agent's `FormSpec`), so a model describes fields and never writes A2UI;
+//! the result still goes through [`check`], which refuses an input whose
+//! `value` is not a `{"@path"}` binding.
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -254,6 +259,11 @@ const FIELD_TYPES: &[&str] = &[
     "checkbox",
 ];
 const MAX_FIELDS: usize = 12;
+/// A field id is the component id `field_<id>`, which must fit `MAX_ID`.
+const MAX_FIELD_ID: usize = MAX_ID - "field_".len();
+/// Room left in a check message for the label ("{label} is required", "{label} must be an email address").
+const REQUIRED_SUFFIX: usize = " is required".len();
+const EMAIL_SUFFIX: usize = " must be an email address".len();
 const MAX_SUBMIT: usize = 60;
 const DEFAULT_SUBMIT: &str = "Send answer";
 
@@ -375,13 +385,13 @@ fn compile_field<'a>(f: &'a Value, at: &str, seen: &[&str]) -> Result<(&'a str, 
             .ok_or_else(|| refuse(&format!("{at}/{k}"), "is required"))
     };
     let idv = need("id")?;
-    if !ident_ok(idv) {
+    let id = idv.as_str().unwrap_or_default();
+    if !ident_ok(idv) || id.len() > MAX_FIELD_ID {
         return Err(refuse(
             &format!("{at}/id"),
-            "must be an id of 1-64 [A-Za-z0-9_-]",
+            format!("must be an id of 1-{MAX_FIELD_ID} [A-Za-z0-9_-]"),
         ));
     }
-    let id = idv.as_str().unwrap_or_default();
     if RESERVED.contains(&id) {
         return Err(refuse(&format!("{at}/id"), format!("'{id}' is reserved")));
     }
@@ -430,6 +440,27 @@ fn compile_field<'a>(f: &'a Value, at: &str, seen: &[&str]) -> Result<(&'a str, 
             .as_bool()
             .ok_or_else(|| refuse(&format!("{at}/required"), "must be true or false"))?,
     };
+
+    if required && ty == "checkbox" {
+        return Err(refuse(
+            &format!("{at}/required"),
+            "is not allowed for a checkbox field",
+        ));
+    }
+    let suffix = match (ty, required) {
+        ("email", _) => EMAIL_SUFFIX,
+        (_, true) => REQUIRED_SUFFIX,
+        _ => 0,
+    };
+    if suffix > 0 && text_of(label).chars().count() > MAX_LABEL - suffix {
+        return Err(refuse(
+            &format!("{at}/label"),
+            format!(
+                "is too long for its check message (at most {} characters)",
+                MAX_LABEL - suffix
+            ),
+        ));
+    }
 
     let initial = match (obj.get("default"), ty) {
         (None, "checkbox") => Value::Bool(false),
@@ -712,9 +743,21 @@ fn literal<'a>(c: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 fn fallback(order: &[&Map<String, Value>]) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut titled = false;
+    // A Button's label is not content, so it is never the title line.
+    let button_labels: Vec<&str> = order
+        .iter()
+        .filter(|c| kind(c) == "Button")
+        .filter_map(|c| c.get("child").and_then(Value::as_str))
+        .collect();
     for &c in order {
         match kind(c) {
             "Text" if !titled => {
+                if c.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| button_labels.contains(&id))
+                {
+                    continue;
+                }
                 if let Some(t) = literal(c, "text").filter(|t| !t.is_empty()) {
                     lines.push(t.to_string());
                     titled = true;
@@ -1451,5 +1494,59 @@ mod tests {
             err.starts_with("form /createSurface/dataModel/size:"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn compile_caps_ids_and_labels_so_generated_parts_fit() {
+        let mut v = spec();
+        v["fields"][0]["id"] = json!("a".repeat(MAX_FIELD_ID));
+        compile(&v).expect("the longest field id compiles");
+        v["fields"][0]["id"] = json!("a".repeat(MAX_FIELD_ID + 1));
+        spec_refused(&v, "spec /fields/0/id: must be an id of 1-58 [A-Za-z0-9_-]");
+
+        // "<label> is required" and "<label> must be an email address" fit 200.
+        let mut v = spec();
+        v["fields"][0]["label"] = json!("l".repeat(188));
+        compile(&v).expect("188 characters fit 'is required'");
+        v["fields"][0]["label"] = json!("l".repeat(189));
+        spec_refused(
+            &v,
+            "spec /fields/0/label: is too long for its check message (at most 188 characters)",
+        );
+        let mut v = json!({"fields": [{"id": "e", "label": "l".repeat(175), "type": "email"}]});
+        compile(&v).expect("175 characters fit the email message");
+        v["fields"][0]["label"] = json!("l".repeat(176));
+        spec_refused(
+            &v,
+            "spec /fields/0/label: is too long for its check message (at most 175 characters)",
+        );
+        // A label with no generated message keeps the full 200.
+        let v = json!({"fields": [{"id": "e", "label": "l".repeat(200), "type": "text"}]});
+        compile(&v).expect("an unchecked label may use 200");
+    }
+
+    #[test]
+    fn compile_refuses_required_on_a_checkbox() {
+        let v =
+            json!({"fields": [{"id": "ok", "label": "OK", "type": "checkbox", "required": true}]});
+        spec_refused(
+            &v,
+            "spec /fields/0/required: is not allowed for a checkbox field",
+        );
+    }
+
+    #[test]
+    fn fallback_never_takes_the_button_label_as_the_title() {
+        let form =
+            compile(&json!({"fields": [{"id": "n", "label": "Name", "type": "text"}]})).unwrap();
+        assert_eq!(
+            form.fallback,
+            "- Name\nAnswer the form in the board, or reply here."
+        );
+        let form = compile(
+            &json!({"title": "Hi", "fields": [{"id": "n", "label": "Name", "type": "text"}]}),
+        )
+        .unwrap();
+        assert!(form.fallback.starts_with("Hi\n- Name"));
     }
 }
