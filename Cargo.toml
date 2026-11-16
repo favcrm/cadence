@@ -17,7 +17,7 @@ license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
 [workspace]
-members = ["crates/cadence-core"]
+members = ["crates/cadence-core", "crates/cadence-image"]
 resolver = "2"
 
 [lib]
@@ -88,6 +88,7 @@ cli-runtime-test = ["test-seam"]
 
 [dependencies]
 cadence-core = { path = "crates/cadence-core", features = ["custody-crypto"] }
+cadence-image = { path = "crates/cadence-image" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Frozen app/agent identity receipts must survive production JSON reads.

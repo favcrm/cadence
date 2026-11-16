@@ -99,19 +99,6 @@ fn image_format(mime: &str) -> Option<image::ImageFormat> {
     }
 }
 
-/// The byte-sniffed raster MIME, independent of any caller claim.
-pub fn sniff_raster(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]) {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
@@ -152,21 +139,8 @@ fn decode_raster(bytes: &[u8], mime: &str) -> Result<image::DynamicImage> {
 /// the delivery bound. The caller passes bytes whose size and digest it
 /// already checked; this never opens a path.
 pub fn validate_raster(bytes: &[u8], mime: &str) -> Result<()> {
-    if bytes.len() > IMAGE_MAX_BYTES {
-        return Err(Error::rejected(format!(
-            "the image is {} bytes — over the {IMAGE_MAX_BYTES}-byte native image \
-             prompt bound",
-            bytes.len()
-        )));
-    }
-    let sniffed = sniff_raster(bytes)
-        .ok_or_else(|| Error::rejected("the bytes carry no supported image signature"))?;
-    if sniffed != mime {
-        return Err(Error::rejected(format!(
-            "the image declares '{mime}' but its bytes sniff as '{sniffed}'"
-        )));
-    }
-    decode_raster(bytes, mime).map(|_| ())
+    cadence_image::validate_native(bytes, mime)
+        .map_err(|error| Error::rejected(error.to_string()))
 }
 
 /// The most nodes one document may decode into. A source small enough to
