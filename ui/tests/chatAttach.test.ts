@@ -4,6 +4,7 @@ import {
   attachFits,
   attachMeta,
   attachStatus,
+  displayAttachError,
   isPermanentUploadFailure,
   userUploadError,
   attachRefusal,
@@ -11,6 +12,7 @@ import {
   unresolvedHint,
   type AttachItem,
 } from "../src/features/app-shell/chat/attach";
+import { translateUiText } from "../src/lib/locale";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -67,6 +69,12 @@ equal(
   userUploadError("chat upload refused: photo conversion is unavailable — try again later"),
   "Photo conversion is unavailable — try again later",
   "hosted conversion failures show the actionable reason",
+);
+const photoFailure = userUploadError("chat upload refused: the photo could not be processed — retry or choose another image");
+equal(
+  displayAttachError(photoFailure, (text) => translateUiText(text, "zh-TW")),
+  "無法處理此相片，請重試或選擇另一張圖片",
+  "an unknown conversion failure gives actionable Chinese guidance",
 );
 equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
 equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");

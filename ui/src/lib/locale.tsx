@@ -116,7 +116,7 @@ const zhTW: Record<string, string> = {
   "Text ready": "文字已準備好供助理讀取",
   "Stored only · assistant cannot read content": "僅已儲存 · 助理無法讀取內容",
   "Photo conversion is unavailable — try again later": "相片轉換功能暫時無法使用，請稍後重試",
-  "Photo conversion is temporarily unavailable — try again later": "相片轉換功能暫時無法使用，請稍後重試",
+  "The photo could not be processed — retry or choose another image": "無法處理此相片，請重試或選擇另一張圖片",
   "The photo could not be read safely — try another image": "無法安全讀取此相片，請選擇另一張圖片",
   "The photo exceeds the supported dimensions — choose a smaller image": "相片尺寸超出支援範圍，請選擇較小的圖片",
   "Thinking": "思考過程", "Reasoning withheld — it contained a request token.": "思考內容已隱藏 — 其中含有請求權杖。", "Reconnecting — showing the last saved turn": "正在重新連線 — 顯示上次儲存的回合",
