@@ -1938,6 +1938,24 @@ fn artifact(
             print_json(&out);
             Ok(0)
         }
+        // CAD-2286: the type list is also the probe that decides whether the
+        // document lifecycle is available here.
+        ArtifactAction::Types => {
+            print_json(&read("document_types", serde_json::Map::new())?);
+            Ok(0)
+        }
+        // The probe, the submit and the probe-then-submit race are in
+        // `remote_cli::submit_document`.
+        ArtifactAction::Submit { id } => {
+            print_json(&cadence_agent::remote_cli::submit_document(
+                target,
+                id,
+                deadline,
+                wake_timeout,
+                eprint_line,
+            )?);
+            Ok(0)
+        }
         ArtifactAction::Show { id, version, out } => {
             let Some(path) = out else {
                 if version.is_some() {
