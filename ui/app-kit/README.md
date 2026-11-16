@@ -102,15 +102,16 @@ input and request ID before starting a new action. It returns `not_started`,
 `result_available: false` when the platform recorded settlement but the
 original result was lost. An unrecorded platform lookup stays uncertain; it
 does not prove the provider did nothing. An app update or removal revokes
-its grants. Sends and publishing remain on their existing approval paths.
+its grants; status then refuses rather than exposing the prior app's result.
+Sends and publishing remain on their existing approval paths.
 
 Connected reads put the provider's reviewed arguments in `input.body`; the
 host supplies the bound `connection_id`. Do not put connection IDs, secrets,
 or charge ceilings in app input. Availability and compatible input schemas
 depend on the workspace's enabled catalogue. First-party text generation and
-audio transcription are not supported by this bridge; their legacy funded
-billing path needs a separate uncapped integration. This hosted contract also
-requires an updated host and app-inspection CLI. The native host refuses
+audio transcription are not supported by this bridge; each needs a separate
+integration with its funded pricing and settlement path. This hosted contract
+also requires an updated host and app-inspection CLI. The native host refuses
 execution rather than pretending to run the tool.
 
 ## Presentation and the board-wide drawer
