@@ -499,7 +499,7 @@ pub(crate) fn provider_launch(
     let attachable = registry::attachable(provider, endpoint_kind);
     let deadline = Instant::now() + Duration::from_secs(45);
     let (agent, unknown) = loop {
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+        let show = client::rpc(state_dir, "agent_show", briefing::launch_poll_read(&alias))?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
         let open = agent["endpoint"].is_string();
@@ -520,8 +520,7 @@ pub(crate) fn provider_launch(
     // reports open — a launch that fences or stalls leaves the cwd
     // repository byte-identical. Normal gating applies on the message:
     // a pty pane still needs the ready claim.
-    let opened = agent["endpoint"].is_string()
-        || (!attachable && matches!(state, "idle" | "running" | "waiting_input"));
+    let opened = briefing::endpoint_opened(&agent, attachable);
     let mut briefing_file = Value::Null;
     if opened && briefing != BriefMode::Off {
         if registered_fresh {
