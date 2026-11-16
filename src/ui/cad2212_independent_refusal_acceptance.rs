@@ -90,7 +90,7 @@ fn signed_board_serves_a_private_projects_apps_workflows_and_totals_to_no_member
     };
 
     // The owner can still recover the private content (control).
-    let (s, owner_wf) = raw_get(&rig, &owner, &format!("/api/projects/secret/workflows"));
+    let (s, owner_wf) = raw_get(&rig, &owner, "/api/projects/secret/workflows");
     assert_eq!(s, 200, "owner lost the private workflow list: {owner_wf}");
     assert!(owner_wf.contains(WF_TITLE), "owner cannot recover workflow");
     let (s, owner_apps) = raw_get(&rig, &owner, "/api/apps");
