@@ -125,7 +125,7 @@ pub(crate) enum MasterAction {
     /// datetime; a number for number; one option value for choice; a list of
     /// option values for multichoice; true or false for checkbox. A label
     /// is at most 188 characters for a required field and 175 for email.
-    /// multichoice). Unknown keys are refused naming the path
+    /// Unknown keys are refused naming the path
     /// (`spec /fields/0/colour: ...`) and nothing is written. A file with a
     /// top-level `createSurface` is still sent as an A2UI v1.0 envelope
     /// and checked by the same rules; any other file is read as a FormSpec.
