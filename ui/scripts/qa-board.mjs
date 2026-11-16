@@ -22,7 +22,7 @@ const APP_BUNDLE = path.resolve(path.dirname(SCRIPT), "..", "..", "app-toolchain
 const NAME = /^[a-z0-9][a-z0-9-]{0,15}$/;
 const ROOT = /^\/tmp\/qa-board-[a-z0-9][a-z0-9-]{0,15}$/;
 const SANDBOX = "qa";
-const EVIDENCE = "Hosted surfaces (member chat, the Browser panel, member app screens) are answered from qa-board fixtures: this is FIXTURE EVIDENCE, not a real hosted board. A check on a real hosted board stays an operator canary.";
+const EVIDENCE = "Hosted surfaces (member chat, the Browser panel, member app screens, Documents and Settings → Documents) are answered from qa-board fixtures: this is FIXTURE EVIDENCE, not a real hosted board. A check on a real hosted board stays an operator canary.";
 
 function args(argv) {
   const out = { _: [] };
@@ -328,7 +328,7 @@ function serve(opts) {
   const state = readJson(path.join(root, "state.json"));
   const fx = Object.fromEntries(fs.readdirSync(path.join(root, "served")).map((f) => [f.slice(0, -5), readJson(path.join(root, "served", f))]));
   // The UI's own parser, compiled at `up`: a state set mid-run is checked too.
-  const { checkBrowser, BROWSER_PRESETS } = createRequire(SCRIPT)(state.validator);
+  const { checkBrowser, BROWSER_PRESETS, DEFAULT_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, VIEWER_PRESETS, boardMeta, documentsResponder, isDocumentsRoute, servesRoster } = createRequire(SCRIPT)(state.validator);
   const { sandbox, viewer } = state.ports;
   let browser = { ...fx["browser-handoff"] };
   const locale = { ...fx.locale };
@@ -338,6 +338,11 @@ function serve(opts) {
   const context = fx["app-contexts"].contexts[0].id;
   const mount = fx["app-screen-mount"];
   let views = 0;
+  // CAD-2286: the viewer, the Settings list and the document lifecycle, as
+  // the hosted board answers them. A `documents` preset starts the rows and
+  // types again from the fixtures and clears the refusals.
+  let presets = { ...DEFAULT_PRESETS };
+  let documents = documentsResponder(fx, () => presets);
   const counts = { routes: {}, proxied: 0, masked_401: {}, views: 0, viewer_loads: 0, viewer_done: 0 };
   const count = (key) => (counts.routes[key] = (counts.routes[key] ?? 0) + 1);
 
@@ -373,7 +378,7 @@ function serve(opts) {
   }
 
   const fixtures = {
-    "GET /api/meta": () => fx.meta,
+    "GET /api/meta": () => boardMeta(fx, presets),
     "GET /api/locale": () => locale,
     "POST /api/locale": (b) => {
       if (b?.scope === "user") locale.user_locale = b.locale ?? null;
@@ -437,15 +442,40 @@ function serve(opts) {
       const why = checkBrowser(next);
       if (why) return send(res, 400, { error: `browser state refused: ${why}` });
       if ("locale" in b && b.locale !== null && b.locale !== "en" && b.locale !== "zh-TW") return send(res, 400, { error: "locale must be en, zh-TW or null" });
+      if (b.viewer !== undefined && !VIEWER_PRESETS.includes(b.viewer)) return send(res, 400, { error: `viewer preset must be one of ${VIEWER_PRESETS.join(", ")}` });
+      if (b.settings !== undefined && !SETTINGS_PRESETS.includes(b.settings)) return send(res, 400, { error: `settings preset must be one of ${SETTINGS_PRESETS.join(", ")}` });
+      if (b.documents !== undefined && !DOCUMENT_PROBES.includes(b.documents)) return send(res, 400, { error: `documents preset must be one of ${DOCUMENT_PROBES.join(", ")}` });
+      const refusals = b.document_refusals;
+      if (refusals !== undefined && (!Array.isArray(refusals) || refusals.some((route) => !DOCUMENT_WRITES.includes(route)))) {
+        return send(res, 400, { error: `document_refusals must be a list of ${DOCUMENT_WRITES.join(", ")}` });
+      }
       browser = next;
       if ("locale" in b) locale.user_locale = b.locale;
+      if (b.viewer !== undefined) presets = { ...presets, viewer: b.viewer };
+      if (b.settings !== undefined) presets = { ...presets, settings: b.settings };
+      if (b.documents !== undefined) {
+        presets = { ...presets, probe: b.documents, refusals: [] };
+        documents = documentsResponder(fx, () => presets);
+      }
+      if (refusals !== undefined) presets = { ...presets, refusals: [...new Set(refusals)] };
     } else if (req.method !== "GET") return send(res, 405, { error: "GET or POST" });
-    return send(res, 200, { browser, locale, views });
+    const { viewer, settings, probe, refusals } = presets;
+    return send(res, 200, { browser, locale, views, viewer, settings, documents: { probe, refusals, changed: documents.changes() } });
   }
 
   http.createServer(async (req, res) => {
-    const { pathname } = new URL(req.url, "http://qa-board.invalid");
+    const url = new URL(req.url, "http://qa-board.invalid");
+    const { pathname } = url;
     if (pathname.startsWith("/__qa/")) return control(req, res, pathname);
+    if (isDocumentsRoute(pathname)) {
+      const answer = documents.answer(req.method, url, req.method === "POST" ? await body(req) : null);
+      count(answer.route);
+      return send(res, answer.status, answer.body);
+    }
+    if (pathname === "/api/team/members" && req.method === "GET" && servesRoster(presets)) {
+      count("GET /api/team/members");
+      return send(res, 200, fx["team-members"]);
+    }
     const handler = fixtures[`${req.method} ${pathname}`];
     if (!handler) return proxy(req, res, pathname);
     count(`${req.method} ${pathname}`);

@@ -1,0 +1,145 @@
+/* CAD-2286: the Documents table keeps a readable floor, as `.crm-table` and
+   `.av-table` do: at a 390px viewport, or beside the open canvas, the shared
+   `.stable-wrap` scrolls it internally instead of crushing the columns. The
+   floor is sized for the six Active columns with whole headers and chips; the
+   Archived tab adds a seventh, and the table grows past the floor (and
+   scrolls in its wrapper) when its columns need more. Wider, the table's 100%
+   width rules. */
+.documents-table {
+  min-width: 760px;
+}
+
+/* The shared cells break anywhere (`.stable td { overflow-wrap: anywhere }`),
+   which split headers and stage chips mid-word ("In revie/w", "審查/中").
+   Here cells wrap only between words, and headers and chips never wrap.
+   `.stable.documents-table` outranks the shared `.stable` rules by
+   specificity, whichever stylesheet loads last. */
+.stable.documents-table td {
+  overflow-wrap: normal;
+}
+
+.stable.documents-table th {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.documents-table .chip {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+/* The title may break inside a word: a filename-like title has no spaces.
+   `anywhere` (unlike `break-word`) also lowers the cell's min-content, so the
+   column does not grow to the longest word and widen the whole table. The
+   title keeps its own floor so the nowrap columns cannot squeeze it to a
+   sliver. */
+.stable.documents-table td.documents-title-cell {
+  overflow-wrap: anywhere;
+}
+
+.documents-title {
+  display: inline-block;
+  min-width: 12rem;
+}
+
+/* CAD-2286 Settings → Documents. Rows reuse the shared `.settings-row`; only
+   the values list, the row actions and the form live here. */
+.document-types-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-block-end: 1rem;
+}
+
+.document-types-heading > div {
+  min-inline-size: 0;
+}
+
+.document-types-page > .snotice {
+  margin-block-end: 1rem;
+}
+
+.document-types-group + .document-types-group {
+  margin-block-start: 1.25rem;
+}
+
+.document-types-label {
+  margin: 0 0 0.375rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+
+.document-type-row {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.document-type-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-inline-size: 0;
+}
+
+/* A badge wraps to its own line as a whole, never mid-word. */
+.document-type-name .chip {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.document-type-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.25rem 1rem;
+  margin: 0.25rem 0 0;
+  font-size: var(--text-label);
+}
+
+.document-type-values dt {
+  color: var(--color-ink-500);
+}
+
+.document-type-values dd {
+  margin: 0;
+  color: var(--color-ink-200);
+  overflow-wrap: anywhere;
+}
+
+.document-type-warn {
+  margin-block-start: 0.25rem;
+}
+
+.document-type-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 0.375rem;
+  margin-inline-start: auto;
+}
+
+.document-type-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.document-type-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: var(--color-ink-200);
+  font-size: var(--text-secondary);
+}
+
+.document-type-check input {
+  margin-block-start: 0.2rem;
+}
+
+.document-type-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  inline-size: 100%;
+}

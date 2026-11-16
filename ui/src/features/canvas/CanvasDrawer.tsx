@@ -85,6 +85,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
+  // A version whose size is unknown shows none, never another version's.
+  const size = info?.bytes;
   // "updating v1 → v2" only while this turn has asked to add a version to
   // this artifact and it has not landed; once it has, "updated to v2".
   // A put still waiting for its result wins, so a second put of the same
@@ -226,7 +228,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
       {image ? null : (
       <footer className="cv-foot">
         <span>
-          v{tab.selected} · {sizeLabel(info?.bytes ?? tab.bytes)}
+          v{tab.selected}{size === undefined ? "" : ` · ${sizeLabel(size)}`}
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
         {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
