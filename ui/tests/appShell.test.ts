@@ -668,6 +668,8 @@ const declaredNavigation = {
     { id: "insights", label: "Insights", i18n: { "zh-TW": { label: "專屬洞察" } } },
   ],
 };
+const previousViewport = win.innerWidth;
+Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
 for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-social"]] as const) {
   Object.assign(fixture, { navigation: declaredNavigation });
   for (const locale of ["en", "zh-TW"]) {
@@ -688,13 +690,24 @@ for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-soci
     const target = new URL(parent.getAttribute("href")!, "http://localhost");
     assert(!target.searchParams.has("tab") && !target.searchParams.has("record"), "the app parent clears section and record selection");
     equal([target.searchParams.get("hr"), target.searchParams.get("accounting")], ["leave", "reports"], "the parent preserves unrelated app queries");
+    const assistant = surface.querySelector<HTMLButtonElement>(".app-header-assistant")!;
+    if (assistant.getAttribute("aria-expanded") === "false") await click(assistant);
+    equal(assistant.getAttribute("aria-expanded"), "true", "the narrow section begins with Assistant open");
+    await React.act(async () => { navigate(`${location.pathname}${location.search}&unrelated=keep`); });
+    equal(assistant.getAttribute("aria-expanded"), "true", "unrelated query changes do not hide Assistant");
     await click(parent);
     await settle(() => assert(!header().querySelector(".app-header-section"), "the default section adds no duplicate leaf"));
+    equal(assistant.getAttribute("aria-expanded"), "false", "parent navigation reveals the narrow workspace");
+    await click(assistant);
+    await React.act(async () => { navigate(`/app-installations/${installId}?tab=insights&hr=leave&accounting=reports`); });
+    await settle(() => equal(header().querySelector('[aria-current="page"]')?.textContent, expected, "section-only navigation reaches the selected page"));
+    equal(assistant.getAttribute("aria-expanded"), "false", "section-only navigation reveals the narrow workspace");
     await React.act(async () => { cold.unmount(); });
     surface.remove();
   }
 }
 win.localStorage.removeItem("cadence-locale");
+Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
 
 // The assistant activity panel never asks before it has a context (an empty
 // context ID is a 400 on every poll).

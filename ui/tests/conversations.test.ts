@@ -70,6 +70,7 @@ const convs: Record<string, any[]> = {
   "install-other": [conv("o-gen", { is_general: true })],
   "install-social": [conv("s-gen", { is_general: true }), conv("s-full", { title: "Has messages" })],
   "install-native-approval": [conv("native-gen", { is_general: true })],
+  "install-native-approval-other": [conv("native-other-gen", { is_general: true })],
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
@@ -81,6 +82,7 @@ const threads: Record<string, any[]> = {
   "s-gen": [],
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
   "native-gen": [],
+  "native-other-gen": [],
 };
 let turn: any = null;
 // CAD-1700: the master queue in delivery order, and the board commands posted.
@@ -174,7 +176,10 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
   if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [
     { id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] },
-    ...(nativePermissionPending ? [{ id: "permission-native", status: "pending", command: "echo preview", cwd: null, reason: "Review this command", risk: "low", prefix: [] }] : []),
+    ...(nativePermissionPending ? [
+      { id: "permission-native", status: "pending", command: "echo preview", cwd: null, reason: "Review this command", risk: "low", prefix: [] },
+      { id: "permission-native-other", status: "pending", command: "echo other", cwd: null, reason: "Review the other command", risk: "low", prefix: [] },
+    ] : []),
   ] });
   if (url.pathname === "/api/artifacts/focus-doc/1")
     return new Response("A synthetic canvas document.", { headers: { "Content-Type": "text/markdown" } });
@@ -309,6 +314,17 @@ await pick("Spring launch");
     await conversationThread("native-gen").refresh();
   });
   equal(disclosure.getAttribute("aria-expanded"), "true", "a native permission request reveals its approval controls");
+  threads["native-other-gen"].push({
+    ...ent(1, "system", "message", "Permission requested (permission-native-other, risk low): echo other", null),
+    payload: { source: "permission" },
+  });
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "the other app reveals its own pending permission");
+  await mount("install-native-approval");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "returning to a cached pending app reveals its approval");
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "switching between two cached pending apps reveals the current approval");
+  await mount("install-native-approval");
   await React.act(async () => { disclosure.click(); });
   equal(disclosure.getAttribute("aria-expanded"), "false", "an explicit collapse still wins over a pending request");
   await React.act(async () => {

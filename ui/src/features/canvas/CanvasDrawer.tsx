@@ -65,13 +65,14 @@ function selectedPassage(root: HTMLElement | null): string {
   return sel.toString().trim().slice(0, 1200);
 }
 
-function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, onClose, htmlView, onHtmlView }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
   working: Working | null;
   sheet: boolean;
   expanded: boolean;
+  canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
   htmlView: HtmlView;
@@ -147,6 +148,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
               type="button"
               className="cv-iconbtn"
               onClick={onExpand}
+              disabled={!canExpand}
               aria-pressed={expanded}
               aria-label={t("Expand canvas")}
               title={t("Expand canvas")}
@@ -250,6 +252,7 @@ export default function CanvasDrawer() {
   // The width the operator dragged to wins; until then each kind has its own.
   const [dragged, setDragged] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
   // Per artifact, held here because Body remounts when the version changes.
   const [htmlViews, setHtmlViews] = useState<Record<string, HtmlView>>({});
   // The session tab (browserStore.ts) is not an artifact: it can open the drawer
@@ -302,8 +305,10 @@ export default function CanvasDrawer() {
   useLayoutEffect(() => {
     if (!open) return;
     const surface: Surface = canvas.surface;
-    const next = drawerLayout(viewport, want, surface, surface === "app" ? appWorkspaceBounds() : null, expanded);
+    const workspace = surface === "app" ? appWorkspaceBounds() : null;
+    const next = drawerLayout(viewport, want, surface, workspace, expanded);
     setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right ? cur : next));
+    setCanExpand(expanded || drawerLayout(viewport, want, surface, workspace, true).width > next.width);
   });
 
   // The page makes room (push) or steps aside through these two attributes.
@@ -471,6 +476,7 @@ export default function CanvasDrawer() {
             working={working}
             sheet={sheet}
             expanded={expanded}
+            canExpand={canExpand}
             onExpand={() => setExpanded((x) => !x)}
             onClose={closeAll}
             htmlView={htmlViews[tab.id] ?? "rendered"}
@@ -485,6 +491,7 @@ export default function CanvasDrawer() {
           active={showBrowser}
           sheet={sheet}
           expanded={expanded}
+          canExpand={canExpand}
           onExpand={() => setExpanded((x) => !x)}
           onClose={closeAll}
         />

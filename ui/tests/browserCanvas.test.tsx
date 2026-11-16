@@ -2051,6 +2051,41 @@ for (const next of ["ended", "none"] as const) {
   await m.unmount();
 }
 
+// App canvases cannot expand past the workspace or cover the right assistant.
+{
+  reset({ body: { state: "active", signedIn: false, url: "https://portal.example.test/orders" } });
+  canvasStore.resetCanvas("c1", "app:c1", "app");
+  let room = canvasStore.MIN_WIDTH;
+  const workspace = document.createElement("section");
+  workspace.id = "app-shell-workspace";
+  workspace.getBoundingClientRect = () => new win.DOMRect(208, 40, room, 600);
+  document.body.append(workspace);
+  const m = await mount();
+  await React.act(async () => {
+    store.feedBrowser("c1");
+    canvasStore.openArtifact({ id: "capped-doc", version: 1, kind: "md", title: "Capped document", bytes: 12 });
+  });
+  await settle();
+  const artifactExpand = () => m.host.querySelector<HTMLButtonElement>('.cv-pane [aria-label="Expand canvas"]');
+  const browserExpand = () => m.host.querySelector<HTMLButtonElement>('.bz-head [aria-label="Expand canvas"]');
+  assert(artifactExpand()?.disabled && browserExpand()?.disabled, "both canvas headers disable expansion when the workspace is full");
+  await React.act(async () => {
+    room = 1100;
+    Object.defineProperty(win, "innerWidth", { value: 2000, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await settle();
+  assert(artifactExpand() && !artifactExpand()!.disabled && browserExpand() && !browserExpand()!.disabled, "both headers offer expansion when there is room");
+  const normalWidth = Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w"));
+  await click(artifactExpand()!);
+  equal(Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w")), room, "expansion fills the available workspace");
+  assert(room > normalWidth, "expansion actually widens the canvas");
+  await click(browserExpand()!);
+  equal(Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w")), normalWidth, "the Browser control restores the shared canvas width");
+  await m.unmount();
+  workspace.remove();
+}
+
 console.log("browser canvas tests passed");
 }
 main().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });

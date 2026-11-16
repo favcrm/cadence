@@ -516,12 +516,15 @@ export default function AppShell({
   }, []);
   // One per-install choice controls both desktop and narrow layouts.
   const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
-  const [pendingDecision, setPendingDecision] = useState(false);
+  const [pendingDecision, setPendingDecision] = useState({ installId, pending: false });
   const [waitingReply, setWaitingReply] = useState(false);
-  // A pending decision survives an installation switch only as long as the
-  // assistant that reported it is the one on screen.
-  useEffect(() => { setPendingDecision(false); }, [installId]);
-  const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingDecision);
+  // Re-key the reporter so cached permissions replay when the installation changes.
+  const reportPendingDecision = useCallback((pending: boolean) => {
+    setPendingDecision({ installId, pending });
+  }, [installId]);
+  const chatCollapsed = resolveChatCollapsed(
+    chatChoice, installId, pendingDecision.installId === installId && pendingDecision.pending,
+  );
   const chatToggleRef = useRef<HTMLButtonElement | null>(null);
   const collapseChat = useCallback((collapsed: boolean) => {
     setChatCollapsed(collapsed);
@@ -760,6 +763,24 @@ export default function AppShell({
     () => screenNavigation ?? parseNavigation(installation?.navigation),
     [installation?.navigation, screenNavigation],
   );
+  // Content navigation reveals the narrow workspace; context/chat-only URL writes do not.
+  const previousAppNavigation = useRef({ installId, href });
+  useEffect(() => {
+    const previous = previousAppNavigation.current;
+    previousAppNavigation.current = { installId, href };
+    if (window.innerWidth >= 1024 || (previous.installId === installId && previous.href === href)) return;
+    const previousSearch = previous.href.split("?")[1] ?? "";
+    const currentSearch = href.split("?")[1] ?? "";
+    const before = new URLSearchParams(previousSearch);
+    const after = new URLSearchParams(currentSearch);
+    const sectionChanged = effectiveNavigation !== null &&
+      sectionFromSearch(previousSearch, effectiveNavigation) !== sectionFromSearch(currentSearch, effectiveNavigation);
+    if (previous.installId !== installId || sectionChanged ||
+      before.get("record") !== after.get("record") ||
+      (before.get("appview") === "new") !== (after.get("appview") === "new")) {
+      setChatCollapsed(true);
+    }
+  }, [effectiveNavigation, href, installId, setChatCollapsed]);
 
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
@@ -1382,7 +1403,7 @@ export default function AppShell({
             onMediaTarget={registerMediaTarget}
             collapsed={chatCollapsed}
             onCollapsed={collapseChat}
-            onPendingDecision={setPendingDecision}
+            onPendingDecision={reportPendingDecision}
             onWaitingChange={setWaitingReply}
             onOpenView={openView}
           />
