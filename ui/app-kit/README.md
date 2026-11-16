@@ -75,9 +75,9 @@ In the app toolchain's `package.json`, add `catalog.call`, `catalog.status` and
 `catalog.confirm` to `cadence.screen.operations`, and both `records.call` and
 `records.slot` to `cadence.screen.may`; keep the screen's
 `host_contract: "screen-records.v1"` and `tools: {}`. Document which catalogue
-tool and input shape the app expects: the workspace owner chooses the actual
-tool and, for a connected read, an eligible account. A grant never gives the
-app a provider credential or an unrestricted tool slug.
+tool and, for a connected read, an eligible account under Apps → Manage →
+Platform tool. A grant never gives the app a provider credential or an
+unrestricted tool slug.
 
 ```js
 const bridge = createScreenBridge({ tag: "main", records: true, catalog: true });

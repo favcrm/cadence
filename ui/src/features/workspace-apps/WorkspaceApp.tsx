@@ -22,7 +22,6 @@ import { SourcesPanel } from "./SourcesPanel";
 import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
-import { CatalogBindings } from "./CatalogBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { TeamSettings } from "./TeamSettings";
 import { PublishToInstagram } from "./PublishToInstagram";
@@ -1618,13 +1617,6 @@ export default function WorkspaceApp({
                   slots={declaredSlots(data.installation)}
                   bindings={data.bindings}
                   connections={data.connections}
-                  canWrite={canWrite}
-                  busy={busy}
-                  mutate={mutate}
-                />
-                <CatalogBindings
-                  installation={data.installation}
-                  bindings={data.bindings}
                   canWrite={canWrite}
                   busy={busy}
                   mutate={mutate}

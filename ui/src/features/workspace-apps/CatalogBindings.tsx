@@ -60,8 +60,8 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
   const selectedTool = tools?.find(tool => tool.slug === selected);
   const needsAccount = selectedTool?.connectedAccounts !== undefined;
   const selectedAccount = selectedTool?.connectedAccounts?.find(account => account.id === accountId);
-  return <section className="wa-panel wa-stack" aria-label={`${slot.slot} ${t("platform tool")}`}>
-    <h2>{t("Platform tool")}: {slot.slot}</h2>
+  return <section className="card mcard wa-stack" aria-label={`${slot.slot} ${t("platform tool")}`}>
+    <h3>{t("Platform tool")}: {slot.slot}</h3>
     <p className="wa-kicker">{effect === "read" ? t("This slot requests a read tool.") : t("This slot requests a draft tool.")}</p>
     <p className="wa-muted">{t("This app can provide data to the selected tool. Charges use the workspace balance; paid calls require confirmation.")}</p>
     {invalid ? <p className="wa-alert" role="alert">{t("The saved tool grant could not be verified.")}</p> : binding ? <>
