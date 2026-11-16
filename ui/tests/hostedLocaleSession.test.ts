@@ -127,6 +127,10 @@ async function main(): Promise<void> {
     const retry = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find((node) => node.textContent === "Retry verification");
     assert(retry, "verification offers explicit retry");
     await React.act(async () => { retry.click(); });
+    await settle(() => Boolean(host.querySelector('[data-auth-state="changed"]')), "a replacement identity requires confirmation");
+    const confirm = host.querySelector<HTMLButtonElement>('[data-auth-state="changed"] .auth-actions button');
+    assert(confirm, "the replacement identity offers confirmation");
+    await React.act(async () => { confirm.click(); });
     await settle(() => host.querySelector("[data-language]")?.textContent === "en|en", "the replacement member loads its own preferences");
   }
   function heldBody() {

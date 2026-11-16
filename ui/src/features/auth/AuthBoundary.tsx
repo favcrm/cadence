@@ -16,9 +16,10 @@ import { hostedOrigin } from "./hosted";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
 
-type Status = "checking" | "signedout" | "unavailable" | "updating" | "expired" | "refused" | "ready";
+type Status = "checking" | "signedout" | "unavailable" | "updating" | "expired" | "refused" | "changed" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
 const IDENTITY_STORE = "cadence.privateSessionIdentity";
+const IDENTITY_CHANGE_STORE = "cadence.hostedIdentityConfirmationPending";
 
 const RETURN_STORE = "cadence.auth.returnTo";
 const HOSTED_RETURN_STORE = "cadence.auth.hostedReturnTo";
@@ -50,6 +51,9 @@ function returnDestination(): string {
 }
 function rememberedIdentity(): string | null {
   try { return sessionStorage.getItem(IDENTITY_STORE); } catch { return null; }
+}
+function pendingIdentityChange(): boolean {
+  try { return sessionStorage.getItem(IDENTITY_CHANGE_STORE) === "1"; } catch { return false; }
 }
 
 /** Safe bootstrap only. The workspace is first mounted after read admission.
@@ -84,6 +88,9 @@ export default function AuthBoundary({ children }: {
   const stateRef = useRef(state);
   const [loginExchanged, setLoginExchanged] = useState(false);
   const identity = useRef<string | null>(rememberedIdentity());
+  const pendingChange = useRef(pendingIdentityChange());
+  const proposedIdentity = useRef<string | null>(null);
+  const approvedIdentity = useRef<string | null>(null);
   const credential = useRef(sessionKey());
   const sequence = useRef(0);
   const inFlight = useRef<{ key: string | null; controller: AbortController; promise: Promise<boolean> } | null>(null);
@@ -143,6 +150,7 @@ export default function AuthBoundary({ children }: {
         && Number.isFinite(session.expires_at)
         && (session.origin !== "public" || (
           typeof session.user?.sub === "string" && session.user.sub.trim().length > 0
+          && typeof session.user.email === "string"
           && (session.user.role === "operator" || session.user.role === "member")
         ));
       // A claimed sign-in without its verified identity is unanswered, not
@@ -158,6 +166,26 @@ export default function AuthBoundary({ children }: {
         const nextIdentity = meta.signed_in === true && session
           ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
+        if (hosted && stateRef.current.hosted && identity.current !== null && identity.current !== nextIdentity) {
+          discard();
+          pendingChange.current = true;
+          approvedIdentity.current = null;
+          try { sessionStorage.setItem(IDENTITY_CHANGE_STORE, "1"); } catch { /* The current tab still requires confirmation. */ }
+        }
+        if (hosted && pendingChange.current && approvedIdentity.current !== nextIdentity) {
+          approvedIdentity.current = null;
+          proposedIdentity.current = nextIdentity;
+          pausePrivateReads();
+          setSession(null);
+          publish({ status: "changed", meta, accepted: null, generation: privateSessionGeneration(), hosted });
+          return false;
+        }
+        if (hosted && pendingChange.current) {
+          pendingChange.current = false;
+          proposedIdentity.current = null;
+          approvedIdentity.current = null;
+          try { sessionStorage.removeItem(IDENTITY_CHANGE_STORE); } catch { /* No private data is stored in the marker. */ }
+        }
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;
         try { sessionStorage.setItem(IDENTITY_STORE, nextIdentity); } catch { /* Same-page state still owns its drafts. */ }
@@ -338,12 +366,15 @@ export default function AuthBoundary({ children }: {
     try { sessionStorage.setItem(HOSTED_RETURN_STORE, hostedDestination); } catch { /* Same-tab return is optional. */ }
   };
   const checking = state.status === "checking";
+  const accountLabel = [state.meta?.session?.user?.email, state.meta?.session?.user?.name]
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
     signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Sign in to Cadence." : "Sign in to your local board.", text: hosted ? "Use your AgenticOS account to open this workspace." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
     updating: { eyebrow: "Sign-in updating", heading: "Sign-in verification is updating.", text: "This workspace is updating its sign-in verification. Try again shortly.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
+    changed: { eyebrow: "Sign-in changed", heading: "Confirm your current sign-in.", text: "Your sign-in changed. Unsent changes from the previous session may not have been saved. Review the current account before reopening this workspace.", icon: "shield" },
     expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: hosted ? "Your session ended. Unsent changes may not have been saved. Continue with AgenticOS to reopen your workspace." : "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
   };
   const gate = copy[state.status === "ready" ? "checking" : state.status];
@@ -362,7 +393,11 @@ export default function AuthBoundary({ children }: {
             <h1 id="auth-title" ref={title} tabIndex={-1}>{t(gate.heading)}</h1>
             <p className="auth-intro">{t(gate.text)}</p>
             {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
-              {state.status === "unavailable" || state.status === "updating" ? <>
+              {state.status === "changed" ? <>
+                <p className="auth-quiet auth-centered">{t("Current sign-in")}: <strong>{accountLabel ?? t("Account details unavailable")}</strong></p>
+                <Button variant="primary" full onClick={() => { approvedIdentity.current = proposedIdentity.current; retryFocus.current = true; void recheck(); }}>{t("Continue with this sign-in")}</Button>
+                <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a>
+              </> : state.status === "unavailable" || state.status === "updating" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
                 {state.status === "updating" ? null : hosted ? <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>

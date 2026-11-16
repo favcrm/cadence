@@ -173,6 +173,47 @@ async function boundaryChecks() {
     await focus();
     assert(privateSessionGeneration() === beforeRenewal, "hosted renewal keeps the same private session");
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "hosted renewal keeps the unsent draft");
+
+    // A different hosted identity must not silently replace the admitted one.
+    const switched = { ...hostedSession, session: { ...hostedSession.session, id: "new-hosted-session", user: { ...hostedSession.session.user, sub: "second-user", email: "second@example.test" } } };
+    response = () => json(switched);
+    await focus();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "a changed hosted identity requires confirmation");
+    assert(!host.querySelector("[data-private-workspace]") && !privateReadsAllowed(), "the previous private tree is discarded before confirmation");
+    assert(host.textContent?.includes("Unsent changes from the previous session may not have been saved."), "the confirmation warns that unsent changes may be lost");
+    assert(host.textContent?.includes("second@example.test"), "the prompt names only the freshly verified account");
+    await focus();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "automatic verification cannot bypass confirmation");
+    response = () => json({ ...switched, session: { ...switched.session, user: { ...switched.session.user, email: { malformed: true } } } });
+    await focus();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "a malformed account display is unavailable, not authority");
+    response = () => json(switched);
+    await retry();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "corrected identity still needs confirmation");
+    response = () => json({ ...switched, session: { ...switched.session, user: { ...switched.session.user, email: "", name: "" } } });
+    await focus();
+    assert(host.textContent?.includes("Account details unavailable") && !privateReadsAllowed(), "missing display details are not invented");
+    response = () => json(switched);
+    await focus();
+
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "reload does not bypass pending confirmation");
+    const continueWithCurrent = async () => {
+      const button = Array.from(host.querySelectorAll("button")).find((entry) => entry.textContent?.trim() === "Continue with this sign-in");
+      assert(button, "the changed-identity screen asks for confirmation");
+      await React.act(async () => button.click());
+      await flush();
+    };
+    const changedAgain = { ...switched, session: { ...switched.session, id: "third-hosted-session", user: { ...switched.session.user, sub: "third-user", email: "third@example.test" } } };
+    response = () => json(changedAgain);
+    await continueWithCurrent();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "a different identity arriving during confirmation needs a new confirmation");
+    assert(host.textContent?.includes("third@example.test") && !privateReadsAllowed(), "the new verified account is shown without opening private work");
+    await continueWithCurrent();
+    assert(host.querySelector("[data-private-workspace]") && host.querySelector("output")?.textContent === "", "confirmation opens only the newly verified identity with an empty draft");
+    assert(sessionStorage.getItem("cadence.hostedIdentityConfirmationPending") === null, "successful confirmation removes the reload marker");
     response = () => json(signedIn);
     await focus();
     assert(host.querySelector("output")?.textContent === "", "changing identity clears the previous draft");

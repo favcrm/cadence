@@ -1855,6 +1855,12 @@ verifier reports `sign_in_upgrade_required`, the gate names the
 upgrade and offers Retry instead of describing a connection outage or asking
 the user to switch accounts. The hidden in-memory workspace resumes only after
 the same session is verified again.
+When this tab verifies a different hosted session, it discards the previous
+private tree and requires confirmation before opening the new one. The button
+re-verifies the specific identity shown; a further change needs another
+confirmation. A non-sensitive pending marker survives same-tab reload when
+session storage is available. This presentation check does not replace
+server-side fencing of requests across tabs.
 A confirmed sign-out, expiry or identity change clears private observations
 and rejects stale in-flight responses. A session-required `401` supersedes
 older pending verification; a feature's ordinary role-based `403` does not
