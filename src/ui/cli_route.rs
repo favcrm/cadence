@@ -404,21 +404,45 @@ fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
         Some(spelling) => !super::project_policy::readable(pm, &spelling).contains(key),
         None => true,
     };
-    if refused {
-        Some(cli_fail(404, "not_found", "unknown project"))
-    } else {
-        None
-    }
+    refused.then(hidden)
+}
+
+/// The one refusal for anything a caller may not read: a project key or
+/// issue id that is refused or absent. It names no id and no project, so
+/// a private project or issue cannot be told apart from a missing one. An
+/// issue verb gives it too: CAD-2321 fixed "unknown project" as the answer
+/// to a refused project read, and CAD-2357 gives an absent id the same
+/// bytes, since any other text would mark the private ones.
+fn hidden() -> HttpResp {
+    cli_fail(404, "not_found", "unknown project")
 }
 
 /// [`restricted`] for a verb that names an issue id rather than a project
-/// key: resolve the issue's project first. An unknown id is left to the
-/// verb's own not-found answer.
+/// key. The Owner's request resolves the issue's project and is otherwise
+/// left to the verb, whose own answer covers an unknown id. Anyone else is
+/// looked up only inside the projects they may read: an id found nowhere
+/// there gets [`hidden`], whether it is absent or private, and an
+/// unresolved caller gets it too. Every issue verb calls this before its
+/// own lookup, so no verb's not-found text reaches a non-owner.
 fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
-    let Ok(issue) = board::find_issue(&pm.dir, id) else {
-        return None;
-    };
-    restricted(pm, &issue.project, actor)
+    match actor.policy_actor() {
+        Some(spelling) if spelling == "operator" => {
+            let Ok(issue) = board::find_issue(&pm.dir, id) else {
+                return None;
+            };
+            restricted(pm, &issue.project, actor)
+        }
+        Some(spelling) => {
+            let found = super::project_policy::readable(pm, &spelling)
+                .iter()
+                .any(|key| {
+                    let dir = pm.dir.join(key).join(id);
+                    board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md"))
+                });
+            (!found).then(hidden)
+        }
+        None => Some(hidden()),
+    }
 }
 
 /// The project keys this verified caller may read. Fail closed: an
@@ -594,6 +618,9 @@ fn dispatch(
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
                     Ok(pm) => {
+                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
+                            return resp;
+                        }
                         let read = read_model::get(state_dir, pm_dir).board(&pm, None);
                         let by_id = read.by_id();
                         match by_id.get(&id) {
@@ -628,18 +655,25 @@ fn dispatch(
                 };
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
-                    Ok(pm) => match board::find_issue(&pm.dir, &id) {
-                        Ok(issue) => {
-                            if let Some(resp) = restricted(&pm, &issue.project, actor) {
-                                return resp;
-                            }
-                            match history::log(&pm.dir, &issue, limit.max(1)) {
-                                Ok(h) => json_ok(json!({"id": id, "history": h})),
-                                Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
-                            }
+                    Ok(pm) => {
+                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
+                            return resp;
                         }
-                        Err(e) => cli_fail(404, "not_found", &e.to_string()),
-                    },
+                        match board::find_issue(&pm.dir, &id) {
+                            Ok(issue) => {
+                                if let Some(resp) = restricted(&pm, &issue.project, actor) {
+                                    return resp;
+                                }
+                                match history::log(&pm.dir, &issue, limit.max(1)) {
+                                    Ok(h) => json_ok(json!({"id": id, "history": h})),
+                                    Err(e) => {
+                                        cli_fail(503, "tracker_unavailable", &e.to_string())
+                                    }
+                                }
+                            }
+                            Err(e) => cli_fail(404, "not_found", &e.to_string()),
+                        }
+                    }
                 }
             }
             _ => cli_fail(400, "invalid_request", "issue_history needs arguments.id"),
@@ -784,6 +818,15 @@ fn dispatch(
                 }
                 if let Some(resp) = restricted(&pm, &req.project, actor) {
                     return resp;
+                }
+                // A linked id is an issue id the caller names too: one it
+                // may not read answers as an absent one (CAD-2357), and is
+                // never linked.
+                let linked = req.parent.iter().chain(req.blocked_by.iter().flatten());
+                for id in linked.filter(|id| model::check_id(id).is_ok()) {
+                    if let Some(resp) = restricted_issue(&pm, id, actor) {
+                        return resp;
+                    }
                 }
                 match issue_write::new_issue(
                     &pm,
