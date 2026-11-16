@@ -164,6 +164,22 @@ check(done.includes(">0 results<"), "a known tool's JSON result reads as a count
   check(failed.includes("rate limited, retry later"), "a known tool's error keeps its reason in the row");
   check(failed.includes(">rate limited, retry later<"), "the reason reads as text, not raw JSON; the raw result stays in the title");
 }
+{
+  // Review notes on #1778: a saved artifact still reads "in the canvas"; one result is singular;
+  // an unknown tool's error and the raw view show the raw result, as on main.
+  const rows = turn([
+    agent(1, "tool_call", 'artifact_put {"title":"Report"}', 1, { tool_use_id: "p" }),
+    agent(2, "tool_result", '{"id":"art-1","version":1}', 2, { tool_use_id: "p" }),
+    agent(3, "tool_call", 'board_list_issues {"q":"open"}', 3, { tool_use_id: "l" }),
+    agent(4, "tool_result", '[{"id":"CAD-1"}]', 4, { tool_use_id: "l" }),
+    agent(5, "tool_call", "bash: ls", 5, { tool_use_id: "b" }),
+    agent(6, "tool_result", '{"error":"denied"}', 6, { tool_use_id: "b", is_error: true }),
+    agent(7, "turn_result", "Done.", 7),
+  ]);
+  check(rows.includes(">in the canvas<"), "a hosted artifact save reads 'in the canvas', like the native one");
+  check(rows.includes(">1 result<"), "one result is singular");
+  check(rows.includes(">{&quot;error&quot;:&quot;denied&quot;}<"), "an unknown tool's error shows its raw result, as on main");
+}
 check(done.includes('title="app_call {&quot;app&quot;'), "the raw call stays in the row's title");
 check(done.includes("Show raw calls") && done.includes('aria-pressed="false"'), "a raw toggle sits in the trace");
 check(done.includes("turntrace-summary") && /· Use an app/.test(done), "the closed trace names the tool readably");

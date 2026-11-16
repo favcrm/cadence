@@ -17,7 +17,7 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
-import { elapsedSecs, errorReason, formatElapsed, resultCount, toolLabel, toolSubject } from "./turnText";
+import { elapsedSecs, errorReason, formatElapsed, resultCount, toolKey, toolLabel, toolSubject } from "./turnText";
 import {
   isArtifactPutCall,
   isCardItem,
@@ -93,24 +93,27 @@ function ToolRows({ entries, newestFirst = false, raw = false }: { entries: Thre
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
           {(() => {
-            // CAD-2363: a known tool's JSON result reads as a count ("0
-            // results"); the result itself stays in the raw view. An error
-            // keeps its reason, and any other result shows as before.
+            // CAD-2363: what a result reads as. A saved artifact (native
+            // `cadence artifact put`, or the hosted `artifact_put`) and the raw
+            // view or an unknown tool read exactly as before; a known tool's
+            // error shows its reason, and its JSON result a count (a record
+            // with no list shows nothing — its row says what it did).
             if (!s.result || s.call.kind !== "tool_call") return null;
-            const known = !raw && toolLabel(s.summary) !== null && /^\s*[{[]/.test(s.result.text);
-            const count = known && !s.error ? resultCount(s.result.text) : null;
-            if (known && !s.error && count === null) return null;
-            if (count !== null) {
-              return (
-                <span className="num shrink-0 text-ink-500" title={s.result.text}>
-                  {count === 1 ? t("1 result") : t("{n} results").replace("{n}", String(count))}
-                </span>
-              );
-            }
+            const text = s.result.text;
+            const label = raw ? null : toolLabel(s.summary);
+            let shown: string | null;
+            if (!s.error && (isArtifactPutCall(s.call.text) || toolKey(s.summary) === "artifact_put")) shown = t("in the canvas");
+            else if (label === null) shown = stepSummary(text);
+            else if (s.error) shown = stepSummary(errorReason(text) ?? text);
+            else if (/^\s*[{[]/.test(text)) {
+              const count = resultCount(text);
+              shown = count === null ? null : count === 1 ? t("1 result") : t("{n} results").replace("{n}", String(count));
+            } else shown = stepSummary(text);
+            if (shown === null) return null;
             return (
-            <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
-              {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary((s.error ? errorReason(s.result.text) : null) ?? s.result.text)}
-            </span>
+              <span className="num truncate max-w-[40%] text-ink-500" title={text}>
+                {shown}
+              </span>
             );
           })()}
         </li>
