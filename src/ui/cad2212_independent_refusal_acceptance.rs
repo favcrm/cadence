@@ -36,7 +36,9 @@ fn plant_private_fixtures(rig: &Rig) {
     std::fs::create_dir_all(project.join("workflows")).unwrap();
     std::fs::write(
         project.join("workflows").join(format!("{WF}.md")),
-        format!("---\ntitle: {WF_TITLE}\ngoal: {WF_GOAL}\n---\n\n## Step\n\n{WF_BODY}\n"),
+        format!(
+            "---\ntitle: {WF_TITLE}\ngoal: {WF_GOAL}\n---\n\nWhy.\n\n## Work\nagent: acceptance-worker\nsize: S\n\n{WF_BODY}\n\n### Acceptance\n- [ ] synthetic work complete\n"
+        ),
     )
     .unwrap();
     let apps = project.join("apps");
@@ -142,7 +144,8 @@ fn signed_board_serves_a_private_projects_apps_workflows_and_totals_to_no_member
     }
 
     // Workspace totals: the member counts only what their policy admits
-    // (visible: VIS-1 and VIS-9), and is never handed the tracker path.
+    // (visible: VIS-1, VIS-9, plus the rig's own workspace-visible
+    // `fixture` project with FIX-1 and FIX-2), and is never handed the tracker path.
     let (s, health) = raw_get(&rig, &member, "/api/health");
     assert_eq!(s, 200);
     let health: Value = serde_json::from_str(&health).unwrap();
@@ -150,10 +153,10 @@ fn signed_board_serves_a_private_projects_apps_workflows_and_totals_to_no_member
         health.get("pm_dir").is_none(),
         "member was handed the tracker path: {health}"
     );
-    assert_eq!(health["projects"], 1, "member project total counts private");
-    assert_eq!(health["issues"], 2, "member issue total counts private");
+    assert_eq!(health["projects"], 2, "member project total counts private");
+    assert_eq!(health["issues"], 4, "member issue total counts private");
     let (_, owner_health) = raw_get(&rig, &owner, "/api/health");
     let owner_health: Value = serde_json::from_str(&owner_health).unwrap();
-    assert_eq!(owner_health["projects"], 2, "owner lost the project total");
-    assert_eq!(owner_health["issues"], 3, "owner lost the issue total");
+    assert_eq!(owner_health["projects"], 3, "owner lost the project total");
+    assert_eq!(owner_health["issues"], 5, "owner lost the issue total");
 }
