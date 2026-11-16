@@ -17,7 +17,7 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
-import { elapsedSecs, formatElapsed, toolLabel, toolSubject } from "./turnText";
+import { elapsedSecs, formatElapsed, resultCount, toolLabel, toolSubject } from "./turnText";
 import {
   isArtifactPutCall,
   isCardItem,
@@ -82,7 +82,7 @@ function ToolRows({ entries, newestFirst = false, raw = false }: { entries: Thre
             // acted on; the raw call stays one toggle (and the title) away.
             const label = !raw && s.call.kind === "tool_call" && !carriesSecret(s.summary) ? toolLabel(s.summary) : null;
             if (label === null) return <span className="num min-w-0 flex-1 truncate" title={s.summary}>{s.summary}</span>;
-            const subject = toolSubject(s.summary);
+            const subject = toolSubject(s.call.text);
             return (
               <span className="step-what min-w-0 flex-1 truncate" title={s.summary}>
                 {t(label)}
@@ -92,7 +92,13 @@ function ToolRows({ entries, newestFirst = false, raw = false }: { entries: Thre
           })()}
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
-          {/* A known tool's JSON result stays in the raw view; its row says what it did. */}
+          {/* A known tool's JSON result reads as a count ("0 results"); the
+              result itself stays in the raw view. */}
+          {s.result && s.call.kind === "tool_call" && !raw && !s.error && toolLabel(s.summary) !== null && /^\s*[{[]/.test(s.result.text) && resultCount(s.result.text) !== null && (
+            <span className="num shrink-0 text-ink-500" title={s.result.text}>
+              {t("{n} results").replace("{n}", String(resultCount(s.result.text)))}
+            </span>
+          )}
           {s.result && s.call.kind === "tool_call" && (raw || toolLabel(s.summary) === null || !/^\s*[{[]/.test(s.result.text)) && (
             <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
               {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
@@ -970,6 +976,7 @@ export function ThreadTurn({
   previewConversation = null,
   previewTransform,
   startedAt = null,
+  clock = true,
 }: {
   items: ThreadItem[];
   /** CAD-2363: when this turn started (ms) — the stamp of the row just before
@@ -977,6 +984,8 @@ export function ThreadTurn({
    *  The live clock counts from it and the finished "Thought for" measures
    *  from it, so the two agree. Absent: the trace's first entry. */
   startedAt?: number | null;
+  /** False on a later segment of the same send (`clockRuns`): one clock per turn. */
+  clock?: boolean;
   running?: boolean;
   density?: Density;
   /** The conversation whose live preview text this turn may paint, when the
@@ -1047,7 +1056,7 @@ export function ThreadTurn({
         <div className="turn-head">
           <AssistantFace size={16} />
           <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
-          {streaming && startMs !== null ? (
+          {streaming && clock && startMs !== null ? (
             <TurnClock since={startMs} />
           ) : (
             <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>

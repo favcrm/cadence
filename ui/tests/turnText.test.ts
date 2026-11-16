@@ -1,12 +1,13 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type * as ThreadViewModule from "../src/features/home/ThreadView";
-import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { clockRuns, threadItems, threadRuns, turnStartMs, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 import { dayText } from "../src/features/home/DayDivider";
 import {
   elapsedSecs,
   formatElapsed,
   isIdToken,
+  resultCount,
   shortId,
   splitIds,
   toolKey,
@@ -42,10 +43,18 @@ check(elapsedSecs(1000, 10_000) === 9 && elapsedSecs(10_000, 1000) === null && e
 check(toolKey('app_call {"q":"Gia"}') === "app_call" && toolKey("web_search: cafes") === "web_search", "tool key");
 check(toolLabel('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Use an app", "a known tool has a label");
 check(toolLabel("bash: cadence board read") === null && toolLabel("master ask-form") === null, "an unknown tool has none");
-check(toolSubject('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Gia", "the naming field of a JSON argument");
+check(toolSubject('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "contacts.search · Gia", "an app call leads with its operation, then the naming field");
+check(toolSubject('web_search {"query":"cafés","api_key":"k_123"}') === "cafés", "only naming fields are shown, never other arguments");
 check(toolSubject('artifact_show {"id":"art-5f3a","version":1}') === "art-5f3a", "an id when nothing names it better");
 check(toolSubject("web_search: cafés in Central") === "cafés in Central", "a plain argument");
-check(toolSubject('artifact_show {"title":"Q3 report","id":"x"') === "Q3 report", "a truncated JSON still yields its first value");
+check(toolSubject('artifact_show {"request_id":"req_9f8e","title":"Q3 report"') === "", "an argument that does not parse shows nothing, not a guessed value");
+{
+  // The row reads the call's full text: a long call whose stored summary is cut at 120 still names its subject.
+  const long = `app_call ${JSON.stringify({ app: "accounting", op: "contacts.search", filters: { kind: "supplier", since: "2026-01-01", tags: ["a", "b", "c"] }, q: "Gia" })}`;
+  check(long.length > 120 && toolSubject(long) === "contacts.search · Gia", "a long call keeps its real subject");
+}
+check(resultCount('{"rows":[]}') === 0 && resultCount("[1,2,3]") === 3 && resultCount('{"items":[{}]}') === 1, "result counts");
+check(resultCount('{"id":"x"}') === null && resultCount("ok") === null, "no count for a single record or plain text");
 check(toolSubject("board_read") === "" && toolSubject('app_call {"version":1}') === "", "no subject when there is none");
 check(toolSubject(`web_read: ${"x".repeat(200)}`).length === 60, "a long subject is cut to one line");
 
@@ -98,6 +107,42 @@ const entries = [
 ];
 const started = Date.parse(at(0));
 
+// Review of #1778: a turn starts at its own send, never at a queued row.
+{
+  const op = (seq: number, message: string, sec: number): ThreadEntry => ({ seq, role: "operator", kind: "message", text: "hi", payload: null, message, created: at(sec) });
+  const ag = (seq: number, kind: string, text: string, sec: number, message: string, payload: Record<string, unknown> | null = null): ThreadEntry => ({ seq, role: "agent", kind, text, payload, message, created: at(sec) });
+  // A: the send at 0s, a queued send at 2s, then the first send's turn from 3s to 10s.
+  const a = items([op(1, "m-a", 0), op(2, "m-b", 2), ag(3, "thinking", "x", 3, "m-a"), ag(4, "turn_result", "done", 10, "m-a")]);
+  const runA = threadRuns(a).find((r) => r.turn);
+  check(runA?.turn === true && turnStartMs(a, runA.items) === Date.parse(at(0)), "case A: the start is the turn's own send, not the queued row before it");
+  // B: a queued send inside the turn splits it in two segments; the start is still the send, and only the first segment has the clock.
+  const b = items([
+    op(1, "m-a", 0),
+    ag(2, "thinking", "x", 1, "m-a"),
+    ag(3, "tool_call", 'web_search: a', 2, "m-a", { tool_use_id: "t1" }),
+    ag(4, "tool_result", "ok", 2, "m-a", { tool_use_id: "t1" }),
+    op(5, "m-b", 3),
+    ag(6, "tool_call", 'web_search: b', 5, "m-a", { tool_use_id: "t2" }),
+    ag(7, "tool_result", "ok", 5, "m-a", { tool_use_id: "t2" }),
+    ag(8, "turn_result", "done", 10, "m-a"),
+  ]);
+  const runsB = threadRuns(b).filter((r) => r.turn);
+  check(runsB.length === 2, `case B splits into two segments, got ${runsB.length}`);
+  const starts = runsB.map((r) => (r.turn ? turnStartMs(b, r.items) : null));
+  check(starts.every((ms) => ms === Date.parse(at(0))), `case B: both segments start at the send, got ${JSON.stringify(starts)}`);
+  const clocks = clockRuns(threadRuns(b));
+  check(clocks.size === 1 && clocks.has(runsB[0].key), "case B: only the first segment carries the clock");
+  const last = runsB[1];
+  const finished = last.turn ? renderToStaticMarkup(createElement(ThreadTurn, { items: last.items, startedAt: starts[1], clock: false, onOpenIssue: () => undefined })) : "";
+  check(finished.includes(">Thought for 10s<"), "case B: the finished segment measures from the send, as the live clock did");
+  const twoLive = runsB.map((r) => (r.turn ? renderToStaticMarkup(createElement(ThreadTurn, { items: r.items, running: true, startedAt: Date.parse(at(0)), clock: clocks.has(r.key), onOpenIssue: () => undefined })) : ""));
+  check(twoLive.join("").split("data-turn-clock").length - 1 === 1, "two live segments of one send paint one clock");
+  // No message id: no send to find, so the head counts from its own first entry.
+  const hosted = items([op(1, "", 0), { ...ag(2, "thinking", "x", 4, ""), message: null }, { ...ag(3, "turn_result", "done", 9, ""), message: null }]);
+  const runH = threadRuns(hosted).find((r) => r.turn);
+  check(runH?.turn === true && turnStartMs(hosted, runH.items) === null, "rows with no message id: no start from an unrelated row");
+}
+
 // One clock: the finished turn measures from the same start the live clock counts from.
 const done = turn(entries, { startedAt: started });
 check(done.includes(">Thought for 9s<"), "finished turn measures from its start (the send), not its first entry");
@@ -108,7 +153,8 @@ check((live.match(/data-turn-clock/g) ?? []).length === 1, "exactly one clock");
 check(turn(entries.slice(0, 3), { running: true }).includes("data-turn-clock"), "a running turn without a start counts from its first entry");
 
 // Readable steps, raw behind the toggle.
-check(done.includes("Use an app") && done.includes("· Gia"), "a known tool reads as what it did and its subject");
+check(done.includes("Use an app") && done.includes("· contacts.search · Gia"), "a known tool reads as what it did and its subject");
+check(done.includes(">0 results<"), "a known tool's JSON result reads as a count");
 check(done.includes('title="app_call {&quot;app&quot;'), "the raw call stays in the row's title");
 check(done.includes("Show raw calls") && done.includes('aria-pressed="false"'), "a raw toggle sits in the trace");
 check(done.includes("turntrace-summary") && /· Use an app/.test(done), "the closed trace names the tool readably");
@@ -121,5 +167,9 @@ check(done.includes(">7d2e…a873<") && done.includes(">828c…758a<"), "tokens 
 check(done.includes('title="7d2e4c1a9b3f40e8a6c5d2b1f0e9a873"'), "the full id is the title");
 check(/<pre[^>]*>[\s\S]*7d2e4c1a9b3f40e8a6c5d2b1f0e9a873[\s\S]*<\/pre>/.test(done), "a fenced block keeps the full id");
 check(done.includes("4111111111111111"), "a number is never a token");
+{
+  const linked = turn([agent(1, "turn_result", "[`7d2e4c1a9b3f40e8a6c5d2b1f0e9a873`](https://example.test/a)", 1)]);
+  check(!linked.includes("data-id-token") && /<a [^>]*>[\s\S]*7d2e4c1a9b3f40e8a6c5d2b1f0e9a873/.test(linked), "an id inside a link stays code, never a button in an anchor");
+}
 
 console.log("turnText: ok");

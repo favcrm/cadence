@@ -310,18 +310,24 @@ let pageComponents: { page: string; components: Components } | null = null;
 /** The renderer set is cached per issue handler. Recreating these component
  *  types on every thread update would make React unmount and reinsert old
  *  code, links and images, which a live log would announce as new content. */
+/** CAD-2363: inline code that is exactly one identifier is a copy token —
+ *  except inside a link, where a button would both copy and navigate. */
+function IdCode({ className, children }: { className?: string; children?: ReactNode }) {
+  const linked = useContext(InLinkContext);
+  return !className && !linked && typeof children === "string" && isIdToken(children) ? (
+    <IdToken id={children} />
+  ) : (
+    <code className={className}>{children}</code>
+  );
+}
+
 function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false): Components {
   return {
     ...(ids
       ? {
           // Only inline code that is exactly one identifier; block code keeps
           // its `<code>` (CodeBlock reads these same props).
-          code: ({ className, children }) =>
-            !className && typeof children === "string" && isIdToken(children) ? (
-              <IdToken id={children} />
-            ) : (
-              <code className={className}>{children}</code>
-            ),
+          code: ({ className, children }) => <IdCode className={className}>{children}</IdCode>,
         }
       : {}),
     table: ({ children }) => (

@@ -87,32 +87,59 @@ export function toolLabel(summary: string): string | null {
   return TOOL_LABELS[toolKey(summary)] ?? null;
 }
 
-/** Argument fields that name what a call acted on, most specific first. */
-const SUBJECT_KEYS = ["title", "name", "q", "query", "url", "path", "label", "op", "operation", "id"];
+/** Argument fields that name what a call acted on, most specific first.
+ *  Only these are ever shown: no other argument value reaches the row. */
+const SUBJECT_KEYS = ["title", "name", "q", "query", "url", "path", "label", "id"];
 const SUBJECT_MAX = 60;
 
 /**
- * What a known tool call acted on, for the step row: the first naming field
- * of a JSON argument (`{"op":"contacts.search","q":"Gia"}` → `Gia`), or the
- * plain argument, cut to one short line. Empty when there is none.
+ * What a known tool call acted on, for the step row, read from the call's
+ * full text (the stored summary is cut at 120 characters). A JSON argument
+ * gives its first naming field (`{"q":"Gia"}` → `Gia`); `app_call` leads with
+ * its operation (`contacts.search · Gia`); a plain argument is shown as is.
+ * An argument that does not parse shows nothing rather than guessing.
  */
-export function toolSubject(summary: string): string {
-  const rest = summary.trim().slice(toolKey(summary).length).replace(/^[\s:]+/, "").trim();
+export function toolSubject(text: string): string {
+  const firstLine = text.trim().split("\n", 1)[0];
+  const key = toolKey(firstLine);
+  const rest = text.trim().slice(key.length).replace(/^[\s:]+/, "").trim();
   if (rest === "") return "";
-  let subject = rest;
+  let subject: string;
   if (rest.startsWith("{")) {
+    let args: Record<string, unknown>;
     try {
-      const args = JSON.parse(rest) as Record<string, unknown>;
-      const key = SUBJECT_KEYS.find((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
-      subject = key ? (args[key] as string) : "";
+      args = JSON.parse(rest) as Record<string, unknown>;
     } catch {
-      // A truncated JSON summary still reads better than nothing: its first quoted value.
-      const quoted = rest.match(/"[^"]+"\s*:\s*"([^"]+)"/);
-      subject = quoted ? quoted[1] : "";
+      return "";
     }
+    if (!args || typeof args !== "object") return "";
+    const field = SUBJECT_KEYS.find((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
+    const named = field ? (args[field] as string) : "";
+    const op = key === "app_call" && typeof args.op === "string" ? args.op : "";
+    subject = [op, named].filter((part) => part !== "").join(" · ");
+  } else {
+    subject = rest.split("\n", 1)[0];
   }
   subject = subject.replace(/\s+/g, " ").trim();
   return subject.length > SUBJECT_MAX ? `${subject.slice(0, SUBJECT_MAX - 1)}…` : subject;
+}
+
+/** How many results a JSON tool result holds: an array's length, or the
+ *  length of its `rows` / `items` / `results` / `data` list. Null otherwise. */
+export function resultCount(text: string): number | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(value)) return value.length;
+  if (!value || typeof value !== "object") return null;
+  for (const k of ["rows", "items", "results", "data"]) {
+    const list = (value as Record<string, unknown>)[k];
+    if (Array.isArray(list)) return list.length;
+  }
+  return null;
 }
 
 /**
