@@ -267,7 +267,9 @@ export default function AgentPage({
     readOnlyReason:
       operator === false
         ? "Only the operator can edit instructions."
-        : (boardBlock ?? (rosterStale ? "The board isn’t answering, so instructions are read-only for now." : null)),
+        : operator === null
+          ? "We couldn’t confirm your access"
+          : (boardBlock ?? (rosterStale ? "The board isn’t answering, so instructions are read-only for now." : null)),
     toast: onToast,
     stats,
     // Without a roster row nothing is known about the agent, so this reads as

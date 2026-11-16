@@ -648,6 +648,13 @@ async function main() {
   await render();
   assert(dock().includes("couldn’t confirm your access") && !dock().includes("for the operator"), "an unanswered access check is not a non-operator");
   assert(!host.querySelector("[data-composer]") && threadReads.length === 0, "an unanswered access check grants nothing");
+  tab = "instructions";
+  await render();
+  assert(
+    box()?.readOnly === true && host.querySelector("#ap-panel")?.textContent?.includes("We couldn’t confirm your access") === true,
+    "read-only instructions under an unanswered access check say why",
+  );
+  tab = "overview";
   viewerIsOperator = true;
   // A roster that failed on a fresh mount claims nothing about the agent.
   failDetail = true;
