@@ -378,8 +378,15 @@ fn member_scope(
     retry_once(|| super::serve::member_agent_scope(state_dir, proof))
 }
 
-fn retry_once<T, E>(mut ask: impl FnMut() -> Result<T, E>) -> Result<T, E> {
-    ask().or_else(|_| ask())
+/// Ask again only after a refusal. A transport or internal error (an
+/// unreachable daemon, a reply past the RPC deadline) closes at once: asking
+/// a hung daemon a second time would hold the stream thread for another full
+/// RPC timeout.
+fn retry_once<T>(mut ask: impl FnMut() -> crate::error::Result<T>) -> crate::error::Result<T> {
+    match ask() {
+        Err(crate::error::Error::Rejected(_)) => ask(),
+        first => first,
+    }
 }
 
 /// One signed member's projection of the shared watcher.
@@ -985,29 +992,60 @@ pub(super) fn stream_events(
 #[cfg(test)]
 mod retry_tests {
     use super::retry_once;
+    use crate::error::{Error, Result};
 
-    fn asked(results: &[Result<u8, &'static str>]) -> (Result<u8, &'static str>, usize) {
+    /// Feed `retry_once` these answers in order; return its result and how
+    /// many answers it asked for.
+    fn asked(answers: Vec<Result<u8>>) -> (Result<u8>, usize) {
+        let mut answers = answers.into_iter();
         let mut calls = 0;
         let out = retry_once(|| {
-            let r = results[calls.min(results.len() - 1)];
             calls += 1;
-            r
+            answers.next().expect("asked more often than answered")
         });
         (out, calls)
     }
 
     #[test]
-    fn one_transient_failure_is_retried_once() {
-        assert_eq!(asked(&[Err("moved"), Ok(7)]), (Ok(7), 2));
+    fn one_refusal_is_retried_once() {
+        let (out, calls) = asked(vec![Err(Error::rejected("moved")), Ok(7)]);
+        assert!(matches!(out, Ok(7)), "{out:?}");
+        assert_eq!(calls, 2);
     }
 
     #[test]
-    fn a_persistent_failure_still_fails_after_exactly_one_retry() {
-        assert_eq!(asked(&[Err("revoked")]), (Err("revoked"), 2));
+    fn two_refusals_still_fail_after_exactly_one_retry() {
+        let (out, calls) = asked(vec![
+            Err(Error::rejected("moved")),
+            Err(Error::rejected("revoked")),
+            Ok(7),
+        ]);
+        assert!(
+            matches!(&out, Err(Error::Rejected(m)) if m == "revoked"),
+            "{out:?}"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_transport_error_is_not_retried() {
+        // What `client::rpc` returns for a daemon past its deadline and for
+        // one it cannot reach.
+        for error in [
+            Error::busy("daemon original header deadline reached"),
+            Error::internal("Daemon is not reachable"),
+        ] {
+            let kind = error.kind();
+            let (out, calls) = asked(vec![Err(error), Ok(7)]);
+            assert_eq!(out.err().map(|e| e.kind()), Some(kind));
+            assert_eq!(calls, 1, "{kind} was asked again");
+        }
     }
 
     #[test]
     fn a_first_answer_is_not_asked_again() {
-        assert_eq!(asked(&[Ok(1), Err("late")]), (Ok(1), 1));
+        let (out, calls) = asked(vec![Ok(1), Err(Error::rejected("late"))]);
+        assert!(matches!(out, Ok(1)), "{out:?}");
+        assert_eq!(calls, 1);
     }
 }

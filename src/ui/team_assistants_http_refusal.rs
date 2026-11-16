@@ -478,27 +478,6 @@ impl Rig {
 /// provision: a stored `assistants` binding per sub (the daemon-side row)
 /// plus a LIVE authoritative member record at the platform — the two
 /// halves of a provisioned member.
-/// Keep SIGCHLD from waking the client's socket reads (CAD-2347). The daemon
-/// and board threads this rig starts spawn `git`; a child that exits while its
-/// parent thread has signals blocked leaves the SIGCHLD queued on the process,
-/// and the kernel may deliver it to the test thread in a timed `recv`. A socket
-/// with a receive timeout is never restarted, so the read fails with EINTR and
-/// ureq does not retry it. The mask is inherited by every thread `start`
-/// spawns; `wait`/`waitpid` do not need the signal delivered. Same helper as
-/// `cad2018_wiki_http_acceptance::block_sigchld`.
-fn block_sigchld() {
-    // SAFETY: a local signal set and a mask change on the calling thread.
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGCHLD);
-        assert_eq!(
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
-            0
-        );
-    }
-}
-
 fn start(subs: &[&str]) -> Rig {
     start_with_queue_service(subs, None, false)
 }
