@@ -6084,16 +6084,55 @@ fn thread_attachments(
 }
 
 /// One visual attachment's delivery proof: an SVG is screened and rendered, a
-/// raster is already decoded, and the result is the exact byte count it
+/// raster is checked and normalized, and the result is the exact byte count it
 /// contributes to the combined turn-image bound. The same proof re-runs at
 /// delivery.
 fn visual_delivery_bytes(mime: &str, bytes: &[u8]) -> Result<u64> {
     if mime != "image/svg+xml" {
-        return Ok(bytes.len() as u64);
+        return Ok(crate::attachment_image::validate_raster(bytes, mime)?.len() as u64);
     }
     let (_, raster) = crate::attachment_image::rasterize_svg(bytes)
         .map_err(|e| Error::rejected(format!("the SVG cannot be delivered as an image: {e}")))?;
     Ok(raster.len() as u64)
+}
+
+#[cfg(test)]
+#[test]
+fn cad2355_preflight_counts_the_prepared_raster() {
+    use image::ImageEncoder;
+
+    // TIFF Orientation=6, followed by harmless padding inside the eXIf
+    // chunk. Native preparation rotates the image and drops that metadata.
+    let mut exif = vec![
+        b'I', b'I', 42, 0, 8, 0, 0, 0, // TIFF header and IFD offset
+        1, 0, // one directory entry
+        0x12, 0x01, 3, 0, // Orientation tag, SHORT type
+        1, 0, 0, 0, // one value
+        6, 0, 0, 0, // Orientation=6 and inline padding
+        0, 0, 0, 0, // no next IFD
+    ];
+    exif.resize(exif.len() + 4096, 0);
+    let mut original = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut original);
+    encoder.set_exif_metadata(exif).expect("set PNG eXIf");
+    encoder
+        .write_image(
+            &[255, 0, 0, 0, 0, 255],
+            2,
+            1,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("encode PNG fixture");
+
+    let prepared = crate::attachment_image::validate_raster(&original, "image/png")
+        .expect("prepare native PNG");
+    assert_ne!(prepared.len(), original.len(), "fixture must change size");
+    assert_eq!(
+        visual_delivery_bytes("image/png", &original).expect("preflight image"),
+        prepared.len() as u64,
+        "preflight must count the bytes the model receives"
+    );
+    assert!(visual_delivery_bytes("image/png", b"not a PNG").is_err());
 }
 
 /// The aggregate form used on the send path: add one attachment's delivered

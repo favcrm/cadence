@@ -710,8 +710,10 @@ pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
         .clean_source
         .as_ref()
         .map_or(decoded.source_end, Vec::len);
+    // Oversized PNGs still need pixel normalization after metadata is stripped.
     if decoded.unchanged
         && source_len <= MODEL_IMAGE_MAX
+        && (format != Format::Png || bytes.len() <= MODEL_IMAGE_MAX)
         && u64::from(decoded.mapping.width) * u64::from(decoded.mapping.height) <= OTHER_MAX_PIXELS
     {
         let converted = decoded.clean_source.is_some() || decoded.source_end != bytes.len();
