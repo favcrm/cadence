@@ -4,8 +4,8 @@
 //! Two responsibilities, kept out of `store::chat_files` so the custody
 //! module stays about provenance:
 //!
-//! - **Raster validation.** PNG/JPEG/WebP bytes are decoded under hard
-//!   dimension, pixel and allocation limits. The compressed size is
+//! - **Raster validation.** PNG/JPEG/WebP bytes are decoded under
+//!   dimension and pixel bounds, with decoder allocation limits. Compressed size is
 //!   bounded separately ([`IMAGE_MAX_BYTES`]) by the native prompt bound
 //!   the Pi adapter enforces, so an image accepted here can actually be
 //!   delivered as native image pixels instead of failing later.

@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - "crates/cadence-core/**"
+      - "crates/cadence-image/**"
       - "contracts/cadence-core/**"
       - "contracts/board-api/**"
       - "Cargo.lock"
@@ -48,6 +49,14 @@ jobs:
           (cd dist && sha256sum core.wasm > core.wasm.sha256)
           echo "contract version: v1" | tee dist/CONTRACT_VERSION
           cat dist/core.wasm.sha256
+      - name: Build cadence-image.wasm
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/src --remap-path-prefix=/home/runner/.cargo=/cargo -C link-arg=--max-memory=100663296
+        run: |
+          set -eu
+          cargo build -p cadence-image --target wasm32-unknown-unknown --release --locked
+          cp target/wasm32-unknown-unknown/release/cadence_image.wasm dist/cadence-image.wasm
+          (cd dist && sha256sum cadence-image.wasm > cadence-image.wasm.sha256)
       # CAD-1085: the custody envelope primitive is a SEPARATE artifact built
       # from the same source with the optional feature. The ordinary core.wasm
       # must not contain any core_custody_* export.
@@ -113,5 +122,6 @@ jobs:
             gh release create "$TAG" --draft --latest=false --title "$TAG" --notes "cadence-core wasm, contract v1"
           fi
           gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 \
+            dist/cadence-image.wasm dist/cadence-image.wasm.sha256 \
             dist/custody-core.wasm dist/custody-core.wasm.sha256 dist/*.schema.json
           gh release edit "$TAG" --draft=false --latest=false

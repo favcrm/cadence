@@ -10,7 +10,6 @@ mod jpeg;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
 use geometry::Mapping;
@@ -85,12 +84,15 @@ struct Decoded {
     width: u32,
     channels: usize,
     mapping: Mapping,
+    source_end: usize,
     unchanged: bool,
     icc: Option<Vec<u8>>,
 }
 
 fn dimensions(width: u32, height: u32, max_side: u32, max_pixels: u64) -> Result<()> {
-    if width == 0 || height == 0 { return Err(ImageError::Invalid); }
+    if width == 0 || height == 0 {
+        return Err(ImageError::Invalid);
+    }
     if width > max_side || height > max_side || u64::from(width) * u64::from(height) > max_pixels {
         return Err(ImageError::TooLarge);
     }
@@ -127,13 +129,23 @@ fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
     let mut mapping = Mapping::new(layout.width, layout.height);
     mapping.exif(layout.orientation)?;
     Ok(Decoded {
-        pixels: image.into_vec(), width: layout.width, channels: 3, mapping,
-        unchanged: layout.end == bytes.len() && layout.orientation == 1,
+        pixels: image.into_vec(),
+        width: layout.width,
+        channels: 3,
+        mapping,
+        source_end: layout.end,
+        unchanged: layout.orientation == 1,
         icc,
     })
 }
 
-fn decode_image(bytes: &[u8], format: ImageFormat, width: u32, height: u32, max_side: u32) -> Result<(Vec<u8>, usize)> {
+fn decode_image(
+    bytes: &[u8],
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+    max_side: u32,
+) -> Result<(Vec<u8>, usize)> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(max_side);
     limits.max_image_height = Some(max_side);
@@ -151,23 +163,104 @@ fn decode_image(bytes: &[u8], format: ImageFormat, width: u32, height: u32, max_
     }
 }
 
+fn decode_indexed_png(bytes: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, usize)> {
+    let mut decoder = png::Decoder::new_with_limits(
+        Cursor::new(bytes),
+        png::Limits {
+            bytes: DECODE_MEMORY as usize,
+        },
+    );
+    decoder.ignore_checksums(false);
+    let mut reader = decoder.read_info().map_err(|_| ImageError::Invalid)?;
+    let size = reader.output_buffer_size().ok_or(ImageError::TooLarge)?;
+    if size > width as usize * height as usize {
+        return Err(ImageError::Invalid);
+    }
+    let mut indexes = vec![0; size];
+    let info = reader
+        .next_frame(&mut indexes)
+        .map_err(|_| ImageError::Invalid)?;
+    if info.width != width || info.height != height || info.color_type != png::ColorType::Indexed {
+        return Err(ImageError::Invalid);
+    }
+    let bits = match info.bit_depth {
+        png::BitDepth::One => 1,
+        png::BitDepth::Two => 2,
+        png::BitDepth::Four => 4,
+        png::BitDepth::Eight => 8,
+        _ => return Err(ImageError::Invalid),
+    };
+    let palette = reader
+        .info()
+        .palette
+        .as_deref()
+        .ok_or(ImageError::Invalid)?;
+    let alpha = reader.info().trns.as_deref().unwrap_or_default();
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height as usize {
+        let row = &indexes[y * info.line_size..(y + 1) * info.line_size];
+        for x in 0..width as usize {
+            let bit = x * bits;
+            let index = usize::from(
+                (u16::from(row[bit / 8]) >> (8 - bits - bit % 8)) & ((1u16 << bits) - 1),
+            );
+            let color = palette
+                .get(index * 3..index * 3 + 3)
+                .ok_or(ImageError::Invalid)?;
+            pixels.extend_from_slice(color);
+            pixels.push(alpha.get(index).copied().unwrap_or(255));
+        }
+    }
+    Ok((pixels, 4))
+}
+
 fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> {
     let context = heic_rs::context::Context::open(bytes).map_err(|_| ImageError::Invalid)?;
     let id = context.meta.primary;
     let props = context.props(id).map_err(|_| ImageError::Invalid)?;
-    let (width, height) = context.coded_size(id, &props).map_err(|_| ImageError::Invalid)?;
+    if props.nclx.is_some_and(|color| {
+        matches!(
+            color.matrix,
+            heic_rs::props::colr::MatrixCoefficients::Other(_)
+        )
+    }) {
+        return Err(ImageError::Unsupported);
+    }
+    let icc = match (props.icc, props.nclx) {
+        (Some(profile), _) => Some(profile.to_vec()),
+        // The P3/sRGB-transfer profile is CC0 1.0 from heic.fyi's sample files.
+        (None, Some(color)) if color.primaries == 12 && color.transfer == 13 => {
+            Some(include_bytes!("display-p3.icc").to_vec())
+        }
+        (None, Some(color))
+            if matches!(color.primaries, 1 | 2) && matches!(color.transfer, 1 | 2 | 13) =>
+        {
+            None
+        }
+        (None, None) => None,
+        _ => return Err(ImageError::Unsupported),
+    };
+    let (width, height) = context
+        .coded_size(id, &props)
+        .map_err(|_| ImageError::Invalid)?;
     dimensions(width, height, max_side, max_pixels)?;
     let info = heic_rs::probe(bytes).map_err(|_| ImageError::Invalid)?;
     dimensions(info.width, info.height, max_side, max_pixels)?;
     let mut mapping = Mapping::new(width, height);
-    for transform in &props.transforms { mapping.push(*transform)?; }
+    for transform in &props.transforms {
+        mapping.push(*transform)?;
+    }
     if props.transforms.is_empty() {
         if let Some(tiff) = context.exif(id).map_err(|_| ImageError::Invalid)? {
             mapping.exif(jpeg::exif_orientation(tiff)?.unwrap_or(1))?;
         }
     }
     let channels = if info.has_alpha { 4 } else { 3 };
-    let layout = if channels == 4 { heic_rs::PixelLayout::Rgba8 } else { heic_rs::PixelLayout::Rgb8 };
+    let layout = if channels == 4 {
+        heic_rs::PixelLayout::Rgba8
+    } else {
+        heic_rs::PixelLayout::Rgb8
+    };
     let options = heic_rs::DecodeOptions::default()
         .with_layout(layout)
         .with_max_pixels(Some(max_pixels))
@@ -178,16 +271,37 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
         heic_rs::Error::PixelLimit { .. } => ImageError::TooLarge,
         _ => ImageError::Invalid,
     })?;
-    if image.width != width || image.height != height { return Err(ImageError::Invalid); }
-    let icc = props.icc.map(|profile| profile.to_vec());
-    Ok(Decoded { pixels: image.data, width, channels, mapping, unchanged: false, icc })
+    if image.width != width || image.height != height {
+        return Err(ImageError::Invalid);
+    }
+    Ok(Decoded {
+        pixels: image.data,
+        width,
+        channels,
+        mapping,
+        source_end: bytes.len(),
+        unchanged: false,
+        icc,
+    })
 }
 
 fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
-    let max_size = if native { NATIVE_INPUT_MAX } else { PHOTO_INPUT_MAX };
-    if bytes.is_empty() { return Err(ImageError::Invalid); }
-    if bytes.len() > max_size { return Err(ImageError::TooLarge); }
-    let max_side = if native { NATIVE_MAX_SIDE } else { PHOTO_MAX_SIDE };
+    let max_size = if native {
+        NATIVE_INPUT_MAX
+    } else {
+        PHOTO_INPUT_MAX
+    };
+    if bytes.is_empty() {
+        return Err(ImageError::Invalid);
+    }
+    if bytes.len() > max_size {
+        return Err(ImageError::TooLarge);
+    }
+    let max_side = if native {
+        NATIVE_MAX_SIDE
+    } else {
+        PHOTO_MAX_SIDE
+    };
     let max_pixels = if native || matches!(format, Format::Jpeg | Format::Heic) {
         PHOTO_MAX_PIXELS
     } else {
@@ -200,15 +314,36 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
         Format::Png => {
             let (width, height, clean) = containers::png(bytes)?;
             dimensions(width, height, max_side, max_pixels)?;
-            let unchanged = matches!(clean, Cow::Borrowed(_));
-            let (pixels, channels) = decode_image(&clean, ImageFormat::Png, width, height, max_side)?;
-            Ok(Decoded { pixels, width, channels, mapping: Mapping::new(width, height), unchanged, icc: None })
+            containers::png_stream(&clean, width, height)?;
+            let (pixels, channels) = if clean[25] == 3 {
+                decode_indexed_png(&clean, width, height)?
+            } else {
+                decode_image(&clean, ImageFormat::Png, width, height, max_side)?
+            };
+            Ok(Decoded {
+                pixels,
+                width,
+                channels,
+                mapping: Mapping::new(width, height),
+                source_end: bytes.len(),
+                unchanged: true,
+                icc: None,
+            })
         }
         Format::Webp => {
             let (width, height) = containers::webp(bytes)?;
             dimensions(width, height, max_side, max_pixels)?;
-            let (pixels, channels) = decode_image(bytes, ImageFormat::WebP, width, height, max_side)?;
-            Ok(Decoded { pixels, width, channels, mapping: Mapping::new(width, height), unchanged: true, icc: None })
+            let (pixels, channels) =
+                decode_image(bytes, ImageFormat::WebP, width, height, max_side)?;
+            Ok(Decoded {
+                pixels,
+                width,
+                channels,
+                mapping: Mapping::new(width, height),
+                source_end: bytes.len(),
+                unchanged: true,
+                icc: None,
+            })
         }
     }
 }
@@ -225,20 +360,32 @@ pub fn validate_native(bytes: &[u8], mime: &str) -> Result<()> {
 
 fn png_encode(pixels: &[u8], width: u32, height: u32, channels: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let color = if channels == 4 { ExtendedColorType::Rgba8 } else { ExtendedColorType::Rgb8 };
+    let color = if channels == 4 {
+        ExtendedColorType::Rgba8
+    } else {
+        ExtendedColorType::Rgb8
+    };
     image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(pixels, width, height, color).map_err(|_| ImageError::Unavailable)?;
+        .write_image(pixels, width, height, color)
+        .map_err(|_| ImageError::Unavailable)?;
     Ok(out)
 }
 
-fn jpeg_encode(mut pixels: Vec<u8>, width: u32, height: u32, channels: usize, icc: Option<&[u8]>) -> Result<Vec<u8>> {
+fn jpeg_encode(
+    mut pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    channels: usize,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     if channels == 4 {
         for i in 0..(width as usize * height as usize) {
             let src = i * 4;
             let dst = i * 3;
             let alpha = u32::from(pixels[src + 3]);
             for c in 0..3 {
-                pixels[dst + c] = ((u32::from(pixels[src + c]) * alpha + 255 * (255 - alpha)) / 255) as u8;
+                pixels[dst + c] =
+                    ((u32::from(pixels[src + c]) * alpha + 255 * (255 - alpha)) / 255) as u8;
             }
         }
         pixels.truncate(width as usize * height as usize * 3);
@@ -246,9 +393,13 @@ fn jpeg_encode(mut pixels: Vec<u8>, width: u32, height: u32, channels: usize, ic
     let mut out = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
     if let Some(profile) = icc {
-        encoder.set_icc_profile(profile.to_vec()).map_err(|_| ImageError::Unsupported)?;
+        encoder
+            .set_icc_profile(profile.to_vec())
+            .map_err(|_| ImageError::Unsupported)?;
     }
-    encoder.encode(&pixels, width, height, ExtendedColorType::Rgb8).map_err(|_| ImageError::Unavailable)?;
+    encoder
+        .encode(&pixels, width, height, ExtendedColorType::Rgb8)
+        .map_err(|_| ImageError::Unavailable)?;
     Ok(out)
 }
 
@@ -256,26 +407,69 @@ fn jpeg_encode(mut pixels: Vec<u8>, width: u32, height: u32, channels: usize, ic
 /// upload separately and must still enforce the whole-turn image budget.
 pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
     let decoded = decode(bytes, format, false)?;
-    if decoded.unchanged && bytes.len() <= MODEL_IMAGE_MAX {
-        return Ok(PreparedImage { bytes: bytes.to_vec(), format, width: decoded.mapping.width, height: decoded.mapping.height, converted: false });
+    let source = &bytes[..decoded.source_end];
+    if decoded.unchanged
+        && source.len() <= MODEL_IMAGE_MAX
+        && u64::from(decoded.mapping.width) * u64::from(decoded.mapping.height) <= OTHER_MAX_PIXELS
+    {
+        return Ok(PreparedImage {
+            bytes: source.to_vec(),
+            format,
+            width: decoded.mapping.width,
+            height: decoded.mapping.height,
+            converted: source.len() != bytes.len(),
+        });
     }
     let longest = decoded.mapping.width.max(decoded.mapping.height);
     let target = longest.min(OUTPUT_MAX_SIDE);
-    let mut width = ((u64::from(decoded.mapping.width) * u64::from(target) + u64::from(longest) / 2) / u64::from(longest)).max(1) as u32;
-    let mut height = ((u64::from(decoded.mapping.height) * u64::from(target) + u64::from(longest) / 2) / u64::from(longest)).max(1) as u32;
+    let mut width = ((u64::from(decoded.mapping.width) * u64::from(target)
+        + u64::from(longest) / 2)
+        / u64::from(longest))
+    .max(1) as u32;
+    let mut height = ((u64::from(decoded.mapping.height) * u64::from(target)
+        + u64::from(longest) / 2)
+        / u64::from(longest))
+    .max(1) as u32;
     for _ in 0..8 {
-        let pixels = geometry::downsample(&decoded.pixels, decoded.width, decoded.channels, &decoded.mapping, width, height)?;
+        let pixels = geometry::downsample(
+            &decoded.pixels,
+            decoded.width,
+            decoded.channels,
+            &decoded.mapping,
+            width,
+            height,
+        )?;
         if format == Format::Png {
             let png = png_encode(&pixels, width, height, decoded.channels)?;
             if png.len() <= MODEL_IMAGE_MAX {
-                return Ok(PreparedImage { bytes: png, format: Format::Png, width, height, converted: true });
+                return Ok(PreparedImage {
+                    bytes: png,
+                    format: Format::Png,
+                    width,
+                    height,
+                    converted: true,
+                });
             }
         }
-        let jpeg = jpeg_encode(pixels, width, height, decoded.channels, decoded.icc.as_deref())?;
+        let jpeg = jpeg_encode(
+            pixels,
+            width,
+            height,
+            decoded.channels,
+            decoded.icc.as_deref(),
+        )?;
         if jpeg.len() <= MODEL_IMAGE_MAX {
-            return Ok(PreparedImage { bytes: jpeg, format: Format::Jpeg, width, height, converted: true });
+            return Ok(PreparedImage {
+                bytes: jpeg,
+                format: Format::Jpeg,
+                width,
+                height,
+                converted: true,
+            });
         }
-        if width == 1 && height == 1 { break; }
+        if width == 1 && height == 1 {
+            break;
+        }
         width = (width * 72 / 100).max(1);
         height = (height * 72 / 100).max(1);
     }

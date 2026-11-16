@@ -24,13 +24,21 @@ const EMPTY_COMPONENT: Component = Component {
 fn read_u16(data: &[u8], offset: usize, little: bool) -> Option<u16> {
     let b = data.get(offset..offset.checked_add(2)?)?;
     let pair = [b[0], b[1]];
-    Some(if little { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) })
+    Some(if little {
+        u16::from_le_bytes(pair)
+    } else {
+        u16::from_be_bytes(pair)
+    })
 }
 
 fn read_u32(data: &[u8], offset: usize, little: bool) -> Option<u32> {
     let b = data.get(offset..offset.checked_add(4)?)?;
     let bytes = [b[0], b[1], b[2], b[3]];
-    Some(if little { u32::from_le_bytes(bytes) } else { u32::from_be_bytes(bytes) })
+    Some(if little {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
 }
 
 pub(crate) fn exif_orientation(tiff: &[u8]) -> Result<Option<u8>> {
@@ -100,12 +108,22 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
         let marker = *data.get(offset).ok_or(ImageError::Invalid)?;
         offset += 1;
         if marker == 0xd9 {
-            if width == 0 || height == 0 || !saw_scan || component_count == 0
-                || components[..component_count].iter().any(|c| !c.scanned || c.coefficients[0] < 0)
+            if width == 0
+                || height == 0
+                || !saw_scan
+                || component_count == 0
+                || components[..component_count]
+                    .iter()
+                    .any(|c| !c.scanned || c.coefficients[0] < 0)
             {
                 return Err(ImageError::Invalid);
             }
-            return Ok(Layout { end: offset, width, height, orientation: orientation.unwrap_or(1) });
+            return Ok(Layout {
+                end: offset,
+                width,
+                height,
+                orientation: orientation.unwrap_or(1),
+            });
         }
         if marker == 0x00 || marker == 0xd8 {
             return Err(ImageError::Invalid);
@@ -153,7 +171,10 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
         }
         if marker == 0xda {
             let count = *data.get(offset + 2).ok_or(ImageError::Invalid)? as usize;
-            if width == 0 || height == 0 || count == 0 || count > component_count
+            if width == 0
+                || height == 0
+                || count == 0
+                || count > component_count
                 || length != 6 + 2 * count
             {
                 return Err(ImageError::Invalid);
@@ -163,7 +184,11 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
             let approximation = data[offset + 5 + 2 * count];
             let high = approximation >> 4;
             let low = approximation & 15;
-            if start > last || last > 63 || high > 13 || low > 13 || (high > 0 && high != low + 1)
+            if start > last
+                || last > 63
+                || high > 13
+                || low > 13
+                || (high > 0 && high != low + 1)
                 || (!progressive && (start != 0 || last != 63 || approximation != 0))
                 || (progressive && ((start == 0 && last != 0) || (start > 0 && count != 1)))
             {
@@ -172,7 +197,9 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
             let mut selected = [false; 4];
             for i in 0..count {
                 let id = data[offset + 3 + 2 * i];
-                let index = components[..component_count].iter().position(|c| c.id == id)
+                let index = components[..component_count]
+                    .iter()
+                    .position(|c| c.id == id)
                     .ok_or(ImageError::Invalid)?;
                 if selected[index] {
                     return Err(ImageError::Invalid);

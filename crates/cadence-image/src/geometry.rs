@@ -20,7 +20,11 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { steps: Vec::new(), width, height }
+        Self {
+            steps: Vec::new(),
+            width,
+            height,
+        }
     }
 
     pub fn push(&mut self, transform: Transform) -> Result<()> {
@@ -29,22 +33,25 @@ impl Mapping {
         }
         match transform {
             Transform::Crop(crop) => {
-                let (x, y, width, height) = heic_rs::transform::crop_rect(self.width, self.height, crop)
-                    .map_err(|_| ImageError::Invalid)?;
+                let (x, y, width, height) =
+                    heic_rs::transform::crop_rect(self.width, self.height, crop)
+                        .map_err(|_| ImageError::Invalid)?;
                 self.steps.push(Inverse::Crop(x, y));
                 self.width = width;
                 self.height = height;
             }
             Transform::Rotate(rotation) => {
                 if rotation != Rotation::None {
-                    self.steps.push(Inverse::Rotate(rotation, self.width, self.height));
+                    self.steps
+                        .push(Inverse::Rotate(rotation, self.width, self.height));
                     if rotation.swaps_axes() {
                         core::mem::swap(&mut self.width, &mut self.height);
                     }
                 }
             }
             Transform::Mirror(mirror) => {
-                self.steps.push(Inverse::Mirror(mirror, self.width, self.height));
+                self.steps
+                    .push(Inverse::Mirror(mirror, self.width, self.height));
             }
         }
         Ok(())
@@ -92,13 +99,25 @@ impl Mapping {
 /// Area downsample in upright coordinates. Source bytes stay in their decoded
 /// layout and each source pixel is visited at most once for each attempt.
 pub(crate) fn downsample(
-    source: &[u8], source_width: u32, channels: usize, map: &Mapping, width: u32, height: u32,
+    source: &[u8],
+    source_width: u32,
+    channels: usize,
+    map: &Mapping,
+    width: u32,
+    height: u32,
 ) -> Result<Vec<u8>> {
-    if !matches!(channels, 3 | 4) || width == 0 || height == 0 || width > map.width || height > map.height {
+    if !matches!(channels, 3 | 4)
+        || width == 0
+        || height == 0
+        || width > map.width
+        || height > map.height
+    {
         return Err(ImageError::Invalid);
     }
-    let size = (width as usize).checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(channels)).ok_or(ImageError::TooLarge)?;
+    let size = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or(ImageError::TooLarge)?;
     let mut output = vec![0u8; size];
     for y in 0..height {
         let top = (u64::from(y) * u64::from(map.height) / u64::from(height)) as u32;
@@ -113,20 +132,33 @@ pub(crate) fn downsample(
                 for sx in left..right {
                     let (px, py) = map.source(sx, sy);
                     let at = ((py as usize * source_width as usize) + px as usize)
-                        .checked_mul(channels).ok_or(ImageError::Invalid)?;
+                        .checked_mul(channels)
+                        .ok_or(ImageError::Invalid)?;
                     let pixel = source.get(at..at + channels).ok_or(ImageError::Invalid)?;
-                    let a = if channels == 4 { u64::from(pixel[3]) } else { 255 };
-                    for c in 0..3 { rgb[c] += u64::from(pixel[c]) * a; }
+                    let a = if channels == 4 {
+                        u64::from(pixel[3])
+                    } else {
+                        255
+                    };
+                    for c in 0..3 {
+                        rgb[c] += u64::from(pixel[c]) * a;
+                    }
                     alpha += a;
                     count += 1;
                 }
             }
-            if count == 0 { return Err(ImageError::Invalid); }
+            if count == 0 {
+                return Err(ImageError::Invalid);
+            }
             let dest = ((y as usize * width as usize) + x as usize) * channels;
             if alpha != 0 {
-                for c in 0..3 { output[dest + c] = (rgb[c] / alpha) as u8; }
+                for c in 0..3 {
+                    output[dest + c] = (rgb[c] / alpha) as u8;
+                }
             }
-            if channels == 4 { output[dest + 3] = (alpha / count) as u8; }
+            if channels == 4 {
+                output[dest + 3] = (alpha / count) as u8;
+            }
         }
     }
     Ok(output)

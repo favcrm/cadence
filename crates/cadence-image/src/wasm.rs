@@ -5,7 +5,9 @@ const HEADER: usize = 20;
 
 #[no_mangle]
 pub extern "C" fn photo_alloc(length: usize) -> *mut u8 {
-    if length == 0 || length > PHOTO_INPUT_MAX { return core::ptr::null_mut(); }
+    if length == 0 || length > PHOTO_INPUT_MAX {
+        return core::ptr::null_mut();
+    }
     Box::into_raw(vec![0u8; length].into_boxed_slice()) as *mut u8
 }
 
@@ -13,7 +15,9 @@ pub extern "C" fn photo_alloc(length: usize) -> *mut u8 {
 pub unsafe extern "C" fn photo_free(pointer: *mut u8, length: usize) {
     if !pointer.is_null() && length > 0 && length <= PHOTO_INPUT_MAX {
         core::ptr::write_bytes(pointer, 0, length);
-        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(pointer, length)));
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+            pointer, length,
+        )));
     }
 }
 
@@ -38,7 +42,13 @@ pub unsafe extern "C" fn photo_prepare(pointer: *const u8, length: usize, format
     let (mut bytes, fields) = match result {
         Ok(image) => (
             image.bytes,
-            [0, image.format as u32, image.width, image.height, u32::from(image.converted)],
+            [
+                0,
+                image.format as u32,
+                image.width,
+                image.height,
+                u32::from(image.converted),
+            ],
         ),
         Err(error) => (Vec::new(), [error as u32, 0, 0, 0, 0]),
     };
