@@ -1,0 +1,26 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "fields": [
+          {
+            "id": "due",
+            "label": "Due",
+            "type": "date",
+            "default": "2026-02-29"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": false,
+      "message": "form /createSurface/dataModel/due: must be the date or time shape the field shows for DateTimeInput 'field_due'"
+    }
+  }
+}
