@@ -275,6 +275,7 @@ dependencies = [
  "heic-rs",
  "image",
  "libjpeg-turbo-rs",
+ "moxcms",
  "png",
 ]
 

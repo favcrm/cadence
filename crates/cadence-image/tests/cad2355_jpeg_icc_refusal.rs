@@ -68,8 +68,7 @@ fn invalid_and_oversized_jpeg_icc_profiles_are_refused() {
         "P3 control must have distinct tag signatures"
     );
     let mut duplicate = PROFILE.to_vec();
-    duplicate[second_tag..second_tag + 4]
-        .copy_from_slice(&PROFILE[first_tag..first_tag + 4]);
+    duplicate[second_tag..second_tag + 4].copy_from_slice(&PROFILE[first_tag..first_tag + 4]);
     assert_refused("duplicate ICC tag signature", &jpeg_with_icc(&duplicate));
 
     // Point a different tag into the middle of an existing tag element.
@@ -90,7 +89,10 @@ fn invalid_and_oversized_jpeg_icc_profiles_are_refused() {
     let mut overlap = PROFILE.to_vec();
     overlap[target + 4..target + 8].copy_from_slice(&(offset + 4).to_be_bytes());
     overlap[target + 8..target + 12].copy_from_slice(&(length - 4).to_be_bytes());
-    assert_refused("partially overlapping ICC tag data", &jpeg_with_icc(&overlap));
+    assert_refused(
+        "partially overlapping ICC tag data",
+        &jpeg_with_icc(&overlap),
+    );
 
     let invalid = jpeg_with_icc(b"not-an-ICC-profile");
     assert_refused("invalid ICC profile", &invalid);

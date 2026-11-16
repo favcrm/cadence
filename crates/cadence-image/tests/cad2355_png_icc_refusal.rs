@@ -46,7 +46,10 @@ fn assert_refused(label: &str, compressed: &[u8]) {
 fn malformed_or_over_limit_icc_profiles_are_refused() {
     let valid_stream = zlib(PROFILE);
     let valid = png_with_iccp(&valid_stream);
-    assert!(validate_native(&valid, "image/png").is_ok(), "native valid control");
+    assert!(
+        validate_native(&valid, "image/png").is_ok(),
+        "native valid control"
+    );
     assert!(prepare(&valid, Format::Png).is_ok(), "hosted valid control");
 
     let mut truncated = valid_stream.clone();

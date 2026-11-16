@@ -11,7 +11,7 @@ mod jpeg;
 mod wasm;
 
 use std::borrow::Cow;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 
 use geometry::Mapping;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
@@ -87,6 +87,10 @@ struct Decoded {
     mapping: Mapping,
     source_end: usize,
     clean_source: Option<Vec<u8>>,
+    native_png16: bool,
+    png_custom_color: bool,
+    gray_profile: bool,
+    unconvertible_icc: bool,
     unchanged: bool,
     icc: Option<Vec<u8>>,
 }
@@ -141,6 +145,18 @@ fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Re
         );
     }
     let icc = decoder.icc_profile().map_err(jpeg_error)?;
+    if layout.has_icc != icc.is_some() {
+        return Err(ImageError::Invalid);
+    }
+    let (gray_profile, unconvertible_icc) = match icc.as_deref() {
+        None => (false, false),
+        Some(profile) => match (layout.components, containers::validate_icc(profile)?) {
+            (1, moxcms::DataColorSpace::Gray) => (true, false),
+            (3, moxcms::DataColorSpace::Rgb) => (false, false),
+            (4, moxcms::DataColorSpace::Cmyk) => (false, true),
+            _ => return Err(ImageError::Unsupported),
+        },
+    };
     let image = decoder.decode_image().map_err(jpeg_error)?;
     let width = if scaled {
         layout.width.div_ceil(2)
@@ -164,6 +180,10 @@ fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Re
         mapping,
         source_end: layout.end,
         clean_source: None,
+        native_png16: false,
+        png_custom_color: false,
+        gray_profile,
+        unconvertible_icc,
         unchanged: layout.orientation == 1 && !scaled,
         icc,
     })
@@ -244,6 +264,41 @@ fn decode_indexed_png(bytes: &[u8], width: u32, height: u32) -> Result<(Vec<u8>,
     Ok((pixels, 4))
 }
 
+// Retain the PNG decoder's big-endian 16-bit samples for lossless native rotation.
+fn decode_png16(bytes: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, usize)> {
+    let mut decoder = png::Decoder::new_with_limits(
+        Cursor::new(bytes),
+        png::Limits {
+            bytes: DECODE_MEMORY as usize,
+        },
+    );
+    decoder.ignore_checksums(false);
+    let mut reader = decoder.read_info().map_err(|_| ImageError::Invalid)?;
+    let (color, depth) = reader.output_color_type();
+    let channels = match color {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return Err(ImageError::Invalid),
+    };
+    let size = reader.output_buffer_size().ok_or(ImageError::TooLarge)?;
+    if depth != png::BitDepth::Sixteen
+        || size != width as usize * height as usize * channels * 2
+        || size > DECODE_MEMORY as usize
+    {
+        return Err(ImageError::Invalid);
+    }
+    let mut pixels = vec![0; size];
+    let info = reader
+        .next_frame(&mut pixels)
+        .map_err(|_| ImageError::Invalid)?;
+    if info.width != width || info.height != height || info.bit_depth != png::BitDepth::Sixteen {
+        return Err(ImageError::Invalid);
+    }
+    Ok((pixels, channels))
+}
+
 fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> {
     let context = heic_rs::context::Context::open(bytes).map_err(|_| ImageError::Invalid)?;
     let id = context.meta.primary;
@@ -257,8 +312,16 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
     }) {
         return Err(ImageError::Unsupported);
     }
+    let mut gray_profile = false;
     let icc = match (props.icc, props.nclx) {
-        (Some(profile), _) => Some(profile.to_vec()),
+        (Some(profile), _) => {
+            match containers::validate_icc(profile)? {
+                moxcms::DataColorSpace::Rgb => {}
+                moxcms::DataColorSpace::Gray => gray_profile = true,
+                _ => return Err(ImageError::Unsupported),
+            }
+            Some(profile.to_vec())
+        }
         // The P3/sRGB-transfer profile is CC0 1.0 from heic.fyi's sample files.
         (None, Some(color)) if color.primaries == 12 && color.transfer == 13 => {
             Some(include_bytes!("display-p3.icc").to_vec())
@@ -305,6 +368,14 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
     if image.width != width || image.height != height {
         return Err(ImageError::Invalid);
     }
+    if gray_profile
+        && image
+            .data
+            .chunks_exact(channels)
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2])
+    {
+        return Err(ImageError::Invalid);
+    }
     Ok(Decoded {
         pixels: image.data,
         width,
@@ -312,6 +383,10 @@ fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> 
         mapping,
         source_end: bytes.len(),
         clean_source: None,
+        native_png16: false,
+        png_custom_color: false,
+        gray_profile,
+        unconvertible_icc: false,
         unchanged: false,
         icc,
     })
@@ -344,26 +419,43 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
         Format::Heic if !native => decode_heic(bytes, max_side, max_pixels),
         Format::Heic => Err(ImageError::Unsupported),
         Format::Png => {
-            let (width, height, clean) = containers::png(bytes)?;
+            let containers::Png {
+                width,
+                height,
+                clean,
+                icc,
+                orientation,
+                custom_color,
+                gray_profile,
+            } = containers::png(bytes)?;
             dimensions(width, height, max_side, max_pixels)?;
             containers::png_stream(&clean, width, height)?;
-            let (pixels, channels) = if clean[25] == 3 {
+            let native_png16 = native && orientation != 1 && clean[24] == 16;
+            let (pixels, channels) = if native_png16 {
+                decode_png16(&clean, width, height)?
+            } else if clean[25] == 3 {
                 decode_indexed_png(&clean, width, height)?
             } else {
                 decode_image(&clean, ImageFormat::Png, width, height, max_side)?
             };
+            let mut mapping = Mapping::new(width, height);
+            mapping.exif(orientation)?;
             Ok(Decoded {
                 pixels,
                 width,
                 channels,
-                mapping: Mapping::new(width, height),
+                mapping,
                 source_end: bytes.len(),
                 clean_source: match clean {
                     Cow::Borrowed(_) => None,
                     Cow::Owned(bytes) => Some(bytes),
                 },
-                unchanged: true,
-                icc: None,
+                native_png16,
+                png_custom_color: custom_color,
+                gray_profile,
+                unconvertible_icc: false,
+                unchanged: orientation == 1,
+                icc,
             })
         }
         Format::Webp => {
@@ -378,6 +470,10 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
                 mapping: Mapping::new(width, height),
                 source_end: bytes.len(),
                 clean_source: None,
+                native_png16: false,
+                png_custom_color: false,
+                gray_profile: false,
+                unconvertible_icc: false,
                 unchanged: true,
                 icc: None,
             })
@@ -386,27 +482,175 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
 }
 
 /// Validate an image under native prompt limits and return the bytes that may
-/// be delivered. PNG metadata not checked by the decoder is removed; callers
+/// be delivered. PNG metadata is removed after applying orientation; callers
 /// must use the returned bytes rather than assuming the retained source is safe.
 pub fn validate_native<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>> {
     let format = Format::from_mime(mime).ok_or(ImageError::Unsupported)?;
     let decoded = decode(bytes, format, true)?;
+    if format == Format::Png && !decoded.unchanged {
+        if decoded.native_png16 {
+            return encode_native_png16(&decoded, bytes).map(Cow::Owned);
+        }
+        let mut width = decoded.mapping.width;
+        let mut height = decoded.mapping.height;
+        let source = decoded.clean_source.as_deref().unwrap_or(bytes);
+        for _ in 0..8 {
+            let mut pixels = geometry::downsample(
+                &decoded.pixels,
+                decoded.width,
+                decoded.channels,
+                &decoded.mapping,
+                width,
+                height,
+            )?;
+            let channels = png_samples(
+                &mut pixels,
+                width,
+                height,
+                decoded.channels,
+                decoded.gray_profile,
+            )?;
+            let png = png_encode(
+                &pixels,
+                width,
+                height,
+                channels,
+                decoded.gray_profile,
+                source,
+            )?;
+            if png.len() <= NATIVE_INPUT_MAX {
+                return Ok(Cow::Owned(png));
+            }
+            if width == 1 && height == 1 {
+                break;
+            }
+            width = (width * 72 / 100).max(1);
+            height = (height * 72 / 100).max(1);
+        }
+        return Err(ImageError::CannotFit);
+    }
     Ok(match decoded.clean_source {
         Some(clean) => Cow::Owned(clean),
         None => Cow::Borrowed(bytes),
     })
 }
 
-fn png_encode(pixels: &[u8], width: u32, height: u32, channels: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let color = if channels == 4 {
-        ExtendedColorType::Rgba8
-    } else {
-        ExtendedColorType::Rgb8
+#[derive(Default)]
+struct NativePngOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for NativePngOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > NATIVE_INPUT_MAX.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::other("native PNG output exceeds its limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// Rotate without reducing 16-bit precision or allocating a second full raster.
+fn encode_native_png16(decoded: &Decoded, original: &[u8]) -> Result<Vec<u8>> {
+    let color = match decoded.channels {
+        1 => png::ColorType::Grayscale,
+        2 => png::ColorType::GrayscaleAlpha,
+        3 => png::ColorType::Rgb,
+        4 => png::ColorType::Rgba,
+        _ => return Err(ImageError::Invalid),
     };
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(pixels, width, height, color)
+    let mut output = NativePngOutput::default();
+    let result = (|| -> Result<()> {
+        let mut encoder =
+            png::Encoder::new(&mut output, decoded.mapping.width, decoded.mapping.height);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        encoder.set_color(color);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|_| ImageError::Unavailable)?;
+        let source = decoded.clean_source.as_deref().unwrap_or(original);
+        containers::write_png_color(&mut writer, source, true)?;
+        {
+            let mut stream = writer
+                .stream_writer()
+                .map_err(|_| ImageError::Unavailable)?;
+            let stride = decoded.channels * 2;
+            let mut row = vec![0; decoded.mapping.width as usize * stride];
+            for y in 0..decoded.mapping.height {
+                for x in 0..decoded.mapping.width {
+                    let (sx, sy) = decoded.mapping.source(x, y);
+                    let from = (sy as usize * decoded.width as usize + sx as usize) * stride;
+                    let to = x as usize * stride;
+                    row[to..to + stride].copy_from_slice(&decoded.pixels[from..from + stride]);
+                }
+                stream
+                    .write_all(&row)
+                    .map_err(|_| ImageError::Unavailable)?;
+            }
+            stream.finish().map_err(|_| ImageError::Unavailable)?;
+        }
+        writer.finish().map_err(|_| ImageError::Unavailable)
+    })();
+    if output.exceeded {
+        return Err(ImageError::CannotFit);
+    }
+    result?;
+    Ok(output.bytes)
+}
+
+fn png_samples(
+    pixels: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    channels: usize,
+    gray: bool,
+) -> Result<usize> {
+    if !gray {
+        return Ok(channels);
+    }
+    if channels != 4 {
+        return Err(ImageError::Invalid);
+    }
+    for index in 0..(width as usize * height as usize) {
+        pixels[index * 2] = pixels[index * 4];
+        pixels[index * 2 + 1] = pixels[index * 4 + 3];
+    }
+    pixels.truncate(width as usize * height as usize * 2);
+    Ok(2)
+}
+
+fn png_encode(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    channels: usize,
+    gray: bool,
+    source: &[u8],
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_color(if gray {
+        png::ColorType::GrayscaleAlpha
+    } else if channels == 4 {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
+    let mut writer = encoder
+        .write_header()
         .map_err(|_| ImageError::Unavailable)?;
+    containers::write_png_color(&mut writer, source, false)?;
+    writer
+        .write_image_data(pixels)
+        .map_err(|_| ImageError::Unavailable)?;
+    writer.finish().map_err(|_| ImageError::Unavailable)?;
     Ok(out)
 }
 
@@ -416,19 +660,35 @@ fn jpeg_encode(
     height: u32,
     channels: usize,
     icc: Option<&[u8]>,
+    gray_profile: bool,
 ) -> Result<Vec<u8>> {
-    if channels == 4 {
-        for i in 0..(width as usize * height as usize) {
-            let src = i * 4;
-            let dst = i * 3;
-            let alpha = u32::from(pixels[src + 3]);
-            for c in 0..3 {
-                pixels[dst + c] =
-                    ((u32::from(pixels[src + c]) * alpha + 255 * (255 - alpha)) / 255) as u8;
-            }
+    let color = if gray_profile {
+        for index in 0..(width as usize * height as usize) {
+            let src = index * channels;
+            let alpha = if matches!(channels, 2 | 4) {
+                u32::from(pixels[src + channels - 1])
+            } else {
+                255
+            };
+            pixels[index] = ((u32::from(pixels[src]) * alpha + 255 * (255 - alpha)) / 255) as u8;
         }
-        pixels.truncate(width as usize * height as usize * 3);
-    }
+        pixels.truncate(width as usize * height as usize);
+        ExtendedColorType::L8
+    } else {
+        if channels == 4 {
+            for i in 0..(width as usize * height as usize) {
+                let src = i * 4;
+                let dst = i * 3;
+                let alpha = u32::from(pixels[src + 3]);
+                for c in 0..3 {
+                    pixels[dst + c] =
+                        ((u32::from(pixels[src + c]) * alpha + 255 * (255 - alpha)) / 255) as u8;
+                }
+            }
+            pixels.truncate(width as usize * height as usize * 3);
+        }
+        ExtendedColorType::Rgb8
+    };
     let mut out = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
     if let Some(profile) = icc {
@@ -437,7 +697,7 @@ fn jpeg_encode(
             .map_err(|_| ImageError::Unsupported)?;
     }
     encoder
-        .encode(&pixels, width, height, ExtendedColorType::Rgb8)
+        .encode(&pixels, width, height, color)
         .map_err(|_| ImageError::Unavailable)?;
     Ok(out)
 }
@@ -465,6 +725,9 @@ pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
             converted,
         });
     }
+    if decoded.unconvertible_icc {
+        return Err(ImageError::Unsupported);
+    }
     let longest = decoded.mapping.width.max(decoded.mapping.height);
     let target = longest.min(OUTPUT_MAX_SIDE);
     let mut width = ((u64::from(decoded.mapping.width) * u64::from(target)
@@ -476,7 +739,7 @@ pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
         / u64::from(longest))
     .max(1) as u32;
     for _ in 0..8 {
-        let pixels = geometry::downsample(
+        let mut pixels = geometry::downsample(
             &decoded.pixels,
             decoded.width,
             decoded.channels,
@@ -484,8 +747,21 @@ pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
             width,
             height,
         )?;
+        let mut channels = decoded.channels;
         if format == Format::Png {
-            let png = png_encode(&pixels, width, height, decoded.channels)?;
+            channels = png_samples(&mut pixels, width, height, channels, decoded.gray_profile)?;
+            let source = decoded
+                .clean_source
+                .as_deref()
+                .unwrap_or(&bytes[..decoded.source_end]);
+            let png = png_encode(
+                &pixels,
+                width,
+                height,
+                channels,
+                decoded.gray_profile,
+                source,
+            )?;
             if png.len() <= MODEL_IMAGE_MAX {
                 return Ok(PreparedImage {
                     bytes: png,
@@ -496,21 +772,24 @@ pub fn prepare(bytes: &[u8], format: Format) -> Result<PreparedImage> {
                 });
             }
         }
-        let jpeg = jpeg_encode(
-            pixels,
-            width,
-            height,
-            decoded.channels,
-            decoded.icc.as_deref(),
-        )?;
-        if jpeg.len() <= MODEL_IMAGE_MAX {
-            return Ok(PreparedImage {
-                bytes: jpeg,
-                format: Format::Jpeg,
+        if !decoded.png_custom_color {
+            let jpeg = jpeg_encode(
+                pixels,
                 width,
                 height,
-                converted: true,
-            });
+                channels,
+                decoded.icc.as_deref(),
+                decoded.gray_profile,
+            )?;
+            if jpeg.len() <= MODEL_IMAGE_MAX {
+                return Ok(PreparedImage {
+                    bytes: jpeg,
+                    format: Format::Jpeg,
+                    width,
+                    height,
+                    converted: true,
+                });
+            }
         }
         if width == 1 && height == 1 {
             break;

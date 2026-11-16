@@ -15,10 +15,155 @@ fn le32(data: &[u8], at: usize) -> Result<u32> {
         .ok_or(ImageError::Invalid)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
+pub(crate) const ICC_MAX: usize = 256 * 1024;
+const SRGB_CHROMATICITIES: [u32; 8] = [31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000];
 
-/// Validate every PNG chunk, and remove ancillary chunks that the raster
-/// decoder does not need. Compressed metadata must not be inflated at upload.
-pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
+fn png_icc(data: &[u8], grayscale: bool) -> Result<Vec<u8>> {
+    let name_end = data
+        .iter()
+        .take(80)
+        .position(|byte| *byte == 0)
+        .ok_or(ImageError::Invalid)?;
+    let name = &data[..name_end];
+    if name.is_empty()
+        || name.len() > 79
+        || name.first() == Some(&b' ')
+        || name.last() == Some(&b' ')
+        || name.windows(2).any(|pair| pair == b"  ")
+        || name
+            .iter()
+            .any(|byte| *byte < 32 || (127..=160).contains(byte))
+        || data.get(name_end + 1) != Some(&0)
+    {
+        return Err(ImageError::Invalid);
+    }
+    let compressed = data.get(name_end + 2..).ok_or(ImageError::Invalid)?;
+    let mut decoder = flate2::Decompress::new(true);
+    let mut profile = Vec::new();
+    let mut block = [0u8; 8192];
+    loop {
+        let consumed = decoder.total_in() as usize;
+        let before = decoder.total_out();
+        let status = decoder
+            .decompress(
+                &compressed[consumed..],
+                &mut block,
+                flate2::FlushDecompress::None,
+            )
+            .map_err(|_| ImageError::Invalid)?;
+        let produced = (decoder.total_out() - before) as usize;
+        if profile.len() + produced > ICC_MAX {
+            return Err(ImageError::TooLarge);
+        }
+        profile.extend_from_slice(&block[..produced]);
+        if status == flate2::Status::StreamEnd {
+            if decoder.total_in() as usize != compressed.len() {
+                return Err(ImageError::Invalid);
+            }
+            break;
+        }
+        if consumed == decoder.total_in() as usize && produced == 0 {
+            return Err(ImageError::Invalid);
+        }
+    }
+    let expected = if grayscale {
+        moxcms::DataColorSpace::Gray
+    } else {
+        moxcms::DataColorSpace::Rgb
+    };
+    if validate_icc(&profile)? != expected {
+        return Err(ImageError::Invalid);
+    }
+    Ok(profile)
+}
+
+/// Validate an ICC profile before forwarding it in any raster format.
+pub(crate) fn validate_icc(profile: &[u8]) -> Result<moxcms::DataColorSpace> {
+    if profile.len() > ICC_MAX {
+        return Err(ImageError::TooLarge);
+    }
+    if profile.len() < 132
+        || be32(profile, 0)? as usize != profile.len()
+        || &profile[36..40] != b"acsp"
+    {
+        return Err(ImageError::Invalid);
+    }
+    let count = be32(profile, 128)? as usize;
+    let table_end = 132usize
+        .checked_add(count.checked_mul(12).ok_or(ImageError::Invalid)?)
+        .ok_or(ImageError::Invalid)?;
+    if count > 256 || table_end > profile.len() {
+        return Err(ImageError::Invalid);
+    }
+    let mut entries = [(0u32, 0usize, 0usize); 256];
+    for index in 0..count {
+        let at = 132 + index * 12;
+        let signature = be32(profile, at)?;
+        let offset = be32(profile, at + 4)? as usize;
+        let length = be32(profile, at + 8)? as usize;
+        let end = offset.checked_add(length).ok_or(ImageError::Invalid)?;
+        if offset < table_end || !offset.is_multiple_of(4) || length < 8 || end > profile.len() {
+            return Err(ImageError::Invalid);
+        }
+        if entries[..index]
+            .iter()
+            .any(|&(other_signature, other_offset, other_length)| {
+                signature == other_signature
+                    || (offset < other_offset + other_length
+                        && other_offset < end
+                        && (offset != other_offset || length != other_length))
+            })
+        {
+            return Err(ImageError::Invalid);
+        }
+        entries[index] = (signature, offset, length);
+    }
+    let parsed = moxcms::ColorProfile::new_from_slice(profile).map_err(|_| ImageError::Invalid)?;
+    Ok(parsed.color_space)
+}
+
+pub(crate) struct Png<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub clean: Cow<'a, [u8]>,
+    pub icc: Option<Vec<u8>>,
+    pub orientation: u8,
+    pub custom_color: bool,
+    pub gray_profile: bool,
+}
+
+/// Write validated color declarations, and optionally transparency, before image data.
+pub(crate) fn write_png_color<W: std::io::Write>(
+    writer: &mut png::Writer<W>,
+    data: &[u8],
+    keep_transparency: bool,
+) -> Result<()> {
+    let mut at = 8usize;
+    while at < data.len() {
+        let length = be32(data, at)? as usize;
+        let end = at + 12 + length;
+        let kind = &data[at + 4..at + 8];
+        if matches!(kind, b"sRGB" | b"gAMA" | b"cHRM" | b"iCCP")
+            || (keep_transparency && kind == b"tRNS")
+        {
+            writer
+                .write_chunk(
+                    png::chunk::ChunkType([kind[0], kind[1], kind[2], kind[3]]),
+                    &data[at + 8..end - 4],
+                )
+                .map_err(|_| ImageError::Unavailable)?;
+        }
+        if kind == b"IDAT" {
+            break;
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// Validate PNG chunks, keeping bounded color information and removing other
+/// ancillary data that the raster decoder does not need.
+pub(crate) fn png(data: &[u8]) -> Result<Png<'_>> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     if !data.starts_with(SIGNATURE) {
         return Err(ImageError::Invalid);
@@ -34,6 +179,11 @@ pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
     let mut transparency: Option<usize> = None;
     let mut bit_depth = 0;
     let mut color_type = 0;
+    let mut gamma = None;
+    let mut chromaticities = None;
+    let mut srgb = false;
+    let mut icc = None;
+    let mut orientation = None;
     let mut clean: Option<Vec<u8>> = None;
     while at.checked_add(12).is_some_and(|n| n <= data.len()) {
         let length = be32(data, at)? as usize;
@@ -96,6 +246,59 @@ pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
                 transparency = Some(length);
                 true
             }
+            b"gAMA" => {
+                if gamma.is_some() || palette.is_some() || saw_data || length != 4 {
+                    return Err(ImageError::Invalid);
+                }
+                let value = be32(data, at + 8)?;
+                if value == 0 {
+                    return Err(ImageError::Invalid);
+                }
+                gamma = Some(value);
+                true
+            }
+            b"cHRM" => {
+                if chromaticities.is_some() || palette.is_some() || saw_data || length != 32 {
+                    return Err(ImageError::Invalid);
+                }
+                let mut values = [0u32; 8];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = be32(data, at + 8 + index * 4)?;
+                }
+                if values.as_chunks::<2>().0.iter().any(|pair| {
+                    pair[0] > 100_000 || pair[1] > 100_000 || pair[0] + pair[1] > 100_000
+                }) {
+                    return Err(ImageError::Invalid);
+                }
+                chromaticities = Some(values);
+                true
+            }
+            b"sRGB" => {
+                if srgb || palette.is_some() || saw_data || length != 1 || data[at + 8] > 3 {
+                    return Err(ImageError::Invalid);
+                }
+                srgb = true;
+                true
+            }
+            b"iCCP" => {
+                if icc.is_some() || palette.is_some() || saw_data {
+                    return Err(ImageError::Invalid);
+                }
+                icc = Some(png_icc(
+                    &data[at + 8..end - 4],
+                    matches!(color_type, 0 | 4),
+                )?);
+                true
+            }
+            b"eXIf" => {
+                if orientation.is_some() {
+                    return Err(ImageError::Invalid);
+                }
+                orientation =
+                    Some(crate::jpeg::exif_orientation(&data[at + 8..end - 4])?.unwrap_or(1));
+                false
+            }
+            b"cICP" | b"mDCV" | b"cLLI" => return Err(ImageError::Unsupported),
             b"IDAT" => {
                 if data_ended {
                     return Err(ImageError::Invalid);
@@ -142,14 +345,25 @@ pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
     {
         return Err(ImageError::Invalid);
     }
-    Ok((
+    if srgb
+        && (icc.is_some()
+            || gamma.is_some_and(|value| value != 45_455)
+            || chromaticities.is_some_and(|value| value != SRGB_CHROMATICITIES))
+    {
+        return Err(ImageError::Invalid);
+    }
+    Ok(Png {
         width,
         height,
-        match clean {
+        clean: match clean {
             Some(bytes) => Cow::Owned(bytes),
             None => Cow::Borrowed(data),
         },
-    ))
+        custom_color: !srgb && icc.is_none() && (gamma.is_some() || chromaticities.is_some()),
+        gray_profile: icc.is_some() && matches!(color_type, 0 | 4),
+        orientation: orientation.unwrap_or(1),
+        icc,
+    })
 }
 
 /// Validate one complete zlib stream, including its Adler checksum and the

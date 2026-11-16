@@ -46,12 +46,14 @@ fn check_decoder<D: ImageDecoder>(mut decoder: D, expected: &[u8]) {
         .expect("image must retain its ICC profile");
     assert_eq!(profile, expected, "image ICC profile changed");
     let mut pixels = vec![0; decoder.total_bytes() as usize];
-    decoder.read_image(&mut pixels).expect("decode image pixels");
+    decoder
+        .read_image(&mut pixels)
+        .expect("decode image pixels");
 }
 
 fn check_png(bytes: &[u8]) {
-    let decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
-        .expect("open PNG decoder");
+    let decoder =
+        image::codecs::png::PngDecoder::new(Cursor::new(bytes)).expect("open PNG decoder");
     check_decoder(decoder, PROFILE);
 }
 
@@ -77,14 +79,23 @@ fn png_color_profile_survives_native_and_hosted_preparation() {
     check_prepared(&hosted.bytes, hosted.format);
 
     let large = png_with_profile(1601, 512);
-    assert!(large.len() > 145_920, "fixture must exceed the model byte budget");
-    assert!(large.len() <= 4 * 1024 * 1024, "fixture must fit the native input cap");
+    assert!(
+        large.len() > 145_920,
+        "fixture must exceed the model byte budget"
+    );
+    assert!(
+        large.len() <= 4 * 1024 * 1024,
+        "fixture must fit the native input cap"
+    );
     check_png(&large);
     let native = validate_native(&large, "image/png").expect("prepare native large PNG");
     check_png(native.as_ref());
     let hosted = prepare(&large, Format::Png).expect("prepare hosted large PNG");
     assert!(hosted.converted, "large PNG must be converted");
     assert!(hosted.width < 1601, "large PNG must be reduced");
-    assert!(hosted.bytes.len() <= 145_920, "prepared output exceeds the model budget");
+    assert!(
+        hosted.bytes.len() <= 145_920,
+        "prepared output exceeds the model budget"
+    );
     check_prepared(&hosted.bytes, hosted.format);
 }

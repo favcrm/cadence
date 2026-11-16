@@ -81,6 +81,7 @@ for (const [reason, chinese] of [
   ["the image exceeds the supported size — choose a smaller image", "圖片超出支援大小，請選擇較小的圖片"],
   ["this image encoding is not supported — export it as JPEG or PNG", "不支援此圖片編碼，請匯出為 JPEG 或 PNG"],
   ["the image could not be reduced under the model image budget", "無法將圖片縮小至模型的圖片大小限制內"],
+  ["the image could not be reduced enough — choose a smaller image", "無法將圖片縮小至支援大小，請選擇較小的圖片"],
 ]) {
   equal(
     displayAttachError(userUploadError(`chat upload refused: ${reason}`), (text) => translateUiText(text, "zh-TW")),

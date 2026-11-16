@@ -80,7 +80,7 @@ impl Mapping {
         Ok(())
     }
 
-    fn source(&self, mut x: u32, mut y: u32) -> (u32, u32) {
+    pub(crate) fn source(&self, mut x: u32, mut y: u32) -> (u32, u32) {
         for step in self.steps.iter().rev() {
             (x, y) = match *step {
                 Inverse::Crop(left, top) => (x + left, y + top),

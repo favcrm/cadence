@@ -5,6 +5,8 @@ pub(crate) struct Layout {
     pub end: usize,
     pub width: u32,
     pub height: u32,
+    pub components: usize,
+    pub has_icc: bool,
     pub orientation: u8,
 }
 
@@ -98,6 +100,8 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
     let mut component_count = 0usize;
     let mut saw_scan = false;
     let mut orientation = None;
+    let mut has_icc = false;
+    let mut icc_size = 0usize;
     while offset + 1 < data.len() {
         if data[offset] != 0xff {
             return Err(ImageError::Invalid);
@@ -122,6 +126,8 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
                 end: offset,
                 width,
                 height,
+                components: component_count,
+                has_icc,
                 orientation: orientation.unwrap_or(1),
             });
         }
@@ -135,6 +141,18 @@ pub(crate) fn inspect(data: &[u8]) -> Result<Layout> {
         let end = offset.checked_add(length).ok_or(ImageError::Invalid)?;
         if length < 2 || end > data.len() {
             return Err(ImageError::Invalid);
+        }
+        if marker == 0xe2 && data[offset + 2..end].starts_with(b"ICC_PROFILE\0") {
+            if length < 16 {
+                return Err(ImageError::Invalid);
+            }
+            has_icc = true;
+            icc_size = icc_size
+                .checked_add(length - 16)
+                .ok_or(ImageError::TooLarge)?;
+            if icc_size > crate::containers::ICC_MAX {
+                return Err(ImageError::TooLarge);
+            }
         }
         if marker == 0xe1 && length >= 8 && data.get(offset + 2..offset + 8) == Some(b"Exif\0\0") {
             if let Some(value) = exif_orientation(&data[offset + 8..end])? {
