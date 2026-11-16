@@ -76,9 +76,9 @@ decision 2026-11-03): a non-author session with no inherited context, including
 a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
 attested principal and refuses the author's principal, while local notes count
 by their self-declared `From:` alias, which is not attested. Review
-workflows (CAD-2081 stage 3) and the temporary `--exception --advisory ...` path
-(ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31) are described in
-AGENTS.md "Review", as is why agents file no hosted verdict.
+workflows (CAD-2081 stage 3) and why agents file no hosted verdict are described in
+AGENTS.md "Review"; local `v1`, `exception v1`, and `delivery-gate sign` signing in
+`scripts/delivery-gate` were retired by CAD-1946.
 
 CAD-2081 row shape: a hosted row with `identity_source: "workflow-oidc"` has no
 `github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and
@@ -515,11 +515,17 @@ or git notes and need no local daemon. Instead, the tenant Durable Object evalua
 the gate server-side, requires a fresh 15-minute (`900`s) 6-digit Email-OTP
 step-up for board `Approve & merge`, appends an immutable row to
 `tenant_delivery_evidence`, and signs the PR comment with the hosted Ed25519
-delivery-gate key (`cadence-delivery-gate/v2`). During `merge_group` CI,
-`scripts/delivery-gate` verifies the `v2` SSHSIG signature and confirms the live
-enqueue record with GitHub Actions OIDC (`id-token: write`) at
-`POST https://<host>/__platform/delivery-gate/verify`. The CLI verbs
-(`delivery check`, `delivery enqueue`, `audit scope`, `audit approve`
+delivery-gate key (`cadence-delivery-gate/v2`). `docs/roles/delivery-gate.allowed_signers`
+trusts only `cadence-hosted-delivery-gate` (`v2`), and `scripts/delivery-gate sign`
+refuses all local `v1` and `--exception` signing. During `merge_group` CI,
+`scripts/delivery-gate verify` accepts only `<!-- cadence-delivery-gate v2 -->`
+SSHSIG comments and confirms the live unrevoked `tenant_delivery_evidence` row
+with GitHub Actions OIDC (`id-token: write`) at
+`POST https://<host>/__platform/delivery-gate/verify`. When a workflow review
+(`identity_source: "workflow-oidc"`) records a verdict on an open hosted ticket,
+the tenant DO atomically binds the canonical
+`https://github.com/<owner>/<repo>/pull/<n>` `pr` ref onto that ticket. The CLI
+verbs (`delivery check`, `delivery enqueue`, `audit scope`, `audit approve`
 `--action scope`/`--delegated`, `audit designate`, `audit designations`,
 `audit digest`, `audit revoke`) and `scripts/enqueue-reviewed --org <org>`
 all fail closed when a hosted org is unreachable or returns a refusal.
