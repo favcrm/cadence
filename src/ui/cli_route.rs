@@ -389,8 +389,9 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
-/// (AOS-274 / SEC-003). A project that does not exist is left to the
-/// verb's own unknown-project answer; an unreadable tracker refuses, and
+/// (AOS-274 / SEC-003). A project that does not exist gets the same
+/// refusal for anyone but the Owner, whose request reaches the verb's own
+/// unknown-project answer (CAD-2212); an unreadable tracker refuses, and
 /// so does a caller whose principal kind and actor disagree.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
     // An absent project answers the same way for anyone but the Owner: the

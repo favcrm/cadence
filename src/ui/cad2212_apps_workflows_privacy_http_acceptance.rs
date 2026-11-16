@@ -222,6 +222,34 @@ fn signed_member_gets_no_private_apps_or_workflows_and_no_project_names() {
         "count disagrees with rows: {body}"
     );
 
+    // Health: the tracker path and workspace totals are the owner's; a
+    // member counts only the projects and issues the policy admits.
+    let (status, body) = get_status(&rig, &ben, "/api/health");
+    assert_eq!(status, 200, "member health failed: {body}");
+    let member_health: Value = serde_json::from_str(&body).unwrap();
+    let (status, body) = get_status(&rig, &owner, "/api/health");
+    assert_eq!(status, 200, "owner health failed: {body}");
+    let owner_health: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        member_health.get("pm_dir").is_none(),
+        "member health disclosed the tracker path: {member_health}"
+    );
+    assert!(
+        owner_health["pm_dir"].is_string(),
+        "owner lost the tracker path: {owner_health}"
+    );
+    let count = |v: &Value, k: &str| v[k].as_u64().unwrap_or_else(|| panic!("{k} missing: {v}"));
+    assert_eq!(
+        count(&owner_health, "projects") - count(&member_health, "projects"),
+        1,
+        "member project count includes the private project: {member_health} vs {owner_health}"
+    );
+    assert_eq!(
+        count(&owner_health, "issues") - count(&member_health, "issues"),
+        1,
+        "member issue count includes the private project's issue: {member_health} vs {owner_health}"
+    );
+
     // The owner keeps administrative access to both.
     let (status, body) = get_status(&rig, &owner, "/api/projects/secret/workflows");
     assert_eq!(status, 200, "owner lost private workflows: {body}");

@@ -2485,9 +2485,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // Health probes are public, but the workspace projection is
             // not. Keep authenticated status chips truthful without
             // leaking tracker paths/counts to an unsigned probe.
-            let admitted = match operator::admit_read(&request, state_dir, opts) {
-                Ok(_) => true,
-                Err(resp) if resp.status_code().0 == 401 => false,
+            let admission = match operator::admit_read(&request, state_dir, opts) {
+                Ok(admission) => Some(admission),
+                Err(resp) if resp.status_code().0 == 401 => None,
                 Err(resp) => {
                     send(request, resp);
                     return;
@@ -2498,16 +2498,32 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 "embedded": cfg!(feature = "ui"),
                 "build": crate::overview::BUILD_COMMIT,
             });
-            if admitted {
+            if let Some(admission) = admission {
                 let pm = Pm::at(pm_dir).ok();
-                let (projects, issues) = match &pm {
-                    Some(pm) => (
-                        project::list(&pm.dir).map(|list| list.len()).unwrap_or(0),
-                        board::load_all(&pm.dir, None)
-                            .map(|list| list.len())
-                            .unwrap_or(0),
-                    ),
-                    None => (0, 0),
+                // CAD-2212: the tracker path and workspace-wide totals are
+                // the operator's. Anyone else counts only the projects
+                // their policy admits; an unresolved caller or an
+                // unreadable tracker gets no counts at all.
+                let actor = operator::read_actor(&admission, &request, state_dir, opts).ok();
+                let operator = actor.as_deref() == Some("operator");
+                let counts = match (&pm, actor.as_deref()) {
+                    (Some(pm), Some("operator")) => {
+                        match (project::list(&pm.dir), board::load_all(&pm.dir, None)) {
+                            (Ok(projects), Ok(issues)) => Some((projects.len(), issues.len())),
+                            _ => None,
+                        }
+                    }
+                    (Some(pm), Some(actor)) => {
+                        let readable = crate::project_policy::readable(pm, actor);
+                        board::load_all(&pm.dir, None).ok().map(|issues| {
+                            let issues = issues
+                                .iter()
+                                .filter(|i| readable.contains(&i.project))
+                                .count();
+                            (readable.len(), issues)
+                        })
+                    }
+                    _ => None,
                 };
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
                 let daemon = if budget.read(state_dir, "health", json!({})).is_ok() {
@@ -2515,10 +2531,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 } else {
                     "unreachable"
                 };
-                health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                if operator {
+                    health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                }
                 health["pm_present"] = json!(pm.is_some());
-                health["projects"] = json!(projects);
-                health["issues"] = json!(issues);
+                if let Some((projects, issues)) = counts {
+                    health["projects"] = json!(projects);
+                    health["issues"] = json!(issues);
+                }
                 health["daemon"] = json!(daemon);
             }
             send(request, json_response(health));
