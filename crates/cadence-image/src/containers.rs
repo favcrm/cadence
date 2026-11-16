@@ -78,7 +78,12 @@ pub(crate) fn png(data: &[u8]) -> Result<(u32, u32, Cow<'_, [u8]>)> {
                 true
             }
             b"PLTE" => {
-                if palette.is_some() || saw_data || length == 0 || length % 3 != 0 || length > 768 {
+                if palette.is_some()
+                    || saw_data
+                    || length == 0
+                    || !length.is_multiple_of(3)
+                    || length > 768
+                {
                     return Err(ImageError::Invalid);
                 }
                 palette = Some(length / 3);

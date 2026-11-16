@@ -151,9 +151,9 @@ pub(crate) fn downsample(
                 return Err(ImageError::Invalid);
             }
             let dest = ((y as usize * width as usize) + x as usize) * channels;
-            if alpha != 0 {
+            if let Some(nonzero_alpha) = std::num::NonZeroU64::new(alpha) {
                 for c in 0..3 {
-                    output[dest + c] = (rgb[c] / alpha) as u8;
+                    output[dest + c] = (rgb[c] / nonzero_alpha.get()) as u8;
                 }
             }
             if channels == 4 {

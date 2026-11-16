@@ -109,6 +109,9 @@ fn jpeg_error(error: libjpeg_turbo_rs::JpegError) -> ImageError {
 
 fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Result<Decoded> {
     let layout = jpeg::inspect(bytes)?;
+    if native && layout.end != bytes.len() {
+        return Err(ImageError::Invalid);
+    }
     dimensions(layout.width, layout.height, max_side, max_pixels)?;
     let scaled = cfg!(target_arch = "wasm32")
         && !native
@@ -377,9 +380,6 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
 /// not delivered to a native model as if it were part of a checked JPEG.
 pub fn validate_native(bytes: &[u8], mime: &str) -> Result<()> {
     let format = Format::from_mime(mime).ok_or(ImageError::Unsupported)?;
-    if format == Format::Jpeg && jpeg::inspect(bytes)?.end != bytes.len() {
-        return Err(ImageError::Invalid);
-    }
     decode(bytes, format, true).map(|_| ())
 }
 
