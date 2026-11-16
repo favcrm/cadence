@@ -15,7 +15,8 @@ import { useImageConversation } from "../canvas/imageConversation";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
-import AgentForm, { ACTION_MARK } from "./AgentForm";
+import AgentForm from "./AgentForm";
+import { ACTION_MARK } from "./formModel";
 import {
   isArtifactPutCall,
   isCardItem,
