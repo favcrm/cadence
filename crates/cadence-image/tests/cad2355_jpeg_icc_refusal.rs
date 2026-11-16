@@ -56,8 +56,53 @@ fn invalid_and_oversized_jpeg_icc_profiles_are_refused() {
     assert_accepted("ordinary JPEG", &ordinary_jpeg());
     assert_accepted("valid ICC profile", &jpeg_with_icc(PROFILE));
 
+    // The valid control above may share tag data exactly. A second tag with
+    // the same signature, however, makes the directory ambiguous.
+    let tag_count = u32::from_be_bytes(PROFILE[128..132].try_into().unwrap()) as usize;
+    assert!(tag_count >= 2, "P3 fixture needs at least two tags");
+    let first_tag = 132;
+    let second_tag = 144;
+    assert_ne!(
+        &PROFILE[first_tag..first_tag + 4],
+        &PROFILE[second_tag..second_tag + 4],
+        "P3 control must have distinct tag signatures"
+    );
+    let mut duplicate = PROFILE.to_vec();
+    duplicate[second_tag..second_tag + 4]
+        .copy_from_slice(&PROFILE[first_tag..first_tag + 4]);
+    assert_refused("duplicate ICC tag signature", &jpeg_with_icc(&duplicate));
+
+    // Point a different tag into the middle of an existing tag element.
+    // Its range is aligned and in bounds, but overlaps only part of the
+    // original element rather than sharing its exact offset and size.
+    let source_index = (0..tag_count)
+        .find(|index| {
+            let at = 132 + index * 12;
+            let length = u32::from_be_bytes(PROFILE[at + 8..at + 12].try_into().unwrap());
+            length >= 12
+        })
+        .expect("P3 fixture needs a tag element of at least 12 bytes");
+    let target_index = if source_index == 0 { 1 } else { 0 };
+    let source = 132 + source_index * 12;
+    let target = 132 + target_index * 12;
+    let offset = u32::from_be_bytes(PROFILE[source + 4..source + 8].try_into().unwrap());
+    let length = u32::from_be_bytes(PROFILE[source + 8..source + 12].try_into().unwrap());
+    let mut overlap = PROFILE.to_vec();
+    overlap[target + 4..target + 8].copy_from_slice(&(offset + 4).to_be_bytes());
+    overlap[target + 8..target + 12].copy_from_slice(&(length - 4).to_be_bytes());
+    assert_refused("partially overlapping ICC tag data", &jpeg_with_icc(&overlap));
+
     let invalid = jpeg_with_icc(b"not-an-ICC-profile");
     assert_refused("invalid ICC profile", &invalid);
+
+    // The only APP2 ICC segment claims to be part one of two. The JPEG
+    // raster remains valid, but the profile is incomplete.
+    let mut incomplete = jpeg_with_icc(PROFILE);
+    assert_eq!(&incomplete[6..18], b"ICC_PROFILE\0");
+    assert_eq!(incomplete[18], 1);
+    assert_eq!(incomplete[19], 1);
+    incomplete[19] = 2;
+    assert_refused("incomplete ICC segment sequence", &incomplete);
 
     // Keep the known profile's tag table and contents intact while extending
     // its declared profile size beyond the 256 KiB metadata limit.
