@@ -3,6 +3,7 @@ import { parseAgentTab, type AgentTab } from "../features/agents/agentTabModel";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } from "./myWorkQuery";
+import type { DocumentStage } from "../features/documents/documentsClient";
 
 /**
  * The app's routes — real paths with browser history, so every screen has
@@ -26,9 +27,11 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
  *   /wiki/edit|history|upload/<path>   its modes for one path
  *   /wiki/search[/<query>]     full-text search
+ *   /documents                 hosted only: documents by stage (CAD-2286); `?archived=1` the Archived tab, `?stage=` the Active tab's filter
  *   /setup                     first-run setup
  *   /settings[/memory|update|account|permissions|connections]  model defaults, memory, update, account, master permissions, connections
  *   /settings/members                       hosted only: the workspace's people (CAD-2115)
+ *   /settings/documents                     hosted only: document type preferences (CAD-2286)
  *   /settings/connections/new[/<provider>]   the add-connection chooser and one pinned service's setup
  *   /settings/connections/account/<id>       one connection's detail page
  *   /login                     a `cadence ui login` link lands here
@@ -47,7 +50,7 @@ export type ProjectSection = "overview" | "timeline" | "issues" | "epics" | "mil
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
  *  moves it off a board whose `/api/meta` does not name it. */
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody" | "members";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody" | "members" | "documents";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -59,6 +62,13 @@ export type WikiMode = "browse" | "edit" | "history" | "search" | "upload" | "tr
  * setup (the canonical provider name); `detail` = one connection's
  * page (its id). Never carries a credential — only identifiers.
  */
+/**
+ * CAD-2286: the Documents screen's Active-tab filter. `archived` is the
+ * Archived tab, not a stage the Active tab filters by.
+ */
+export type DocumentStageFilter = Exclude<DocumentStage, "archived">;
+const DOCUMENT_STAGE_FILTERS: readonly DocumentStageFilter[] = ["draft", "in_review", "approved", "delivered"];
+
 export type ConnectionPage =
   | { kind: "add" }
   | { kind: "addProvider"; provider: string }
@@ -81,6 +91,9 @@ export type Route =
   | { screen: "myWork"; view?: MyWorkView }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number }
   | { screen: "outbox" }
+  /** CAD-2286: hosted only. The tab and the Active tab's stage filter, from
+   *  the query (`?archived=1`, `?stage=in_review`). */
+  | { screen: "documents"; archived: boolean; stage?: DocumentStageFilter }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection; page?: ConnectionPage }
   /** CAD-1085: the trusted credential entry page for one metadata request.
@@ -101,6 +114,8 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "threads", label: "Threads", route: { screen: "threads" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
+  // CAD-2286: hosted only; App hides it unless the capability probe answers available.
+  { screen: "documents", label: "Documents", route: { screen: "documents", archived: false } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
   // CAD-1312: Outbox leaves the nav (its route, API and page remain).
@@ -293,6 +308,7 @@ export function matchRoute(pathname: string): Route {
     // `?item=<effect_id>` deep-links one published item (CAD-546).
     if (head === "outbox" && !a) return { screen: "outbox" };
     if (head === "my-work" && !a) return { screen: "myWork" };
+    if (head === "documents" && !a) return { screen: "documents", archived: false };
     // `!b` keeps the original one-segment shape; the connections
     // section alone may carry its /new, /new/<provider> and
     // /account/<id> sub-pages (bounded to one extra segment above).
@@ -306,6 +322,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "email") return { screen: "settings", section: "email" };
       if (a === "general") return { screen: "settings", section: "general" };
       if (a === "members") return { screen: "settings", section: "members" };
+      if (a === "documents") return { screen: "settings", section: "documents" };
       if (a === "custody") return { screen: "settings", section: "custody" };
       if (a === "templates") return { screen: "settings", section: "templates" };
       if (a === "connections") {
@@ -397,6 +414,8 @@ export function routePath(route: Route): string {
       return "/outbox";
     case "myWork":
       return "/my-work";
+    case "documents":
+      return "/documents";
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "preferences") return "/settings/preferences";
@@ -416,6 +435,7 @@ export function routePath(route: Route): string {
       if (route.section === "email") return "/settings/email";
       if (route.section === "general") return "/settings/general";
       if (route.section === "members") return "/settings/members";
+      if (route.section === "documents") return "/settings/documents";
       if (route.section === "custody") return "/settings/custody";
       if (route.section === "templates") return "/settings/templates";
       return "/settings";
@@ -463,6 +483,13 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
     const view = readMyWorkView(q);
     route = Object.keys(view).length ? { screen: "myWork", view } : { screen: "myWork" };
   }
+  if (route.screen === "documents") {
+    // CAD-2286: unknown or malformed values fall back to the default, as My
+    // work's do. The Archived tab has no stage filter.
+    const archived = q.get("archived") === "1";
+    const stage = DOCUMENT_STAGE_FILTERS.find((value) => value === q.get("stage"));
+    route = { screen: "documents", archived, ...(!archived && stage ? { stage } : {}) };
+  }
   const onProjects = route.screen === "projects";
   const queried = q.get("project");
   return {
@@ -494,6 +521,9 @@ function scopedRoute(route: Route, project: string): Route {
   const slug = project === "all" ? null : project;
   return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
+
+/** Query parameters the Documents screen owns (CAD-2286). */
+const DOCUMENTS_PARAMS = ["archived", "stage"] as const;
 
 /** Query parameters only a mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
@@ -580,6 +610,11 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  // CAD-2286: Documents owns `archived` and `stage` and drops them elsewhere,
+  // except on a mounted app route, whose own query may use either name. Leaving
+  // Documents for an app route drops them too: there they are still Documents'.
+  const appRoute = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
+  if (!appRoute || from?.screen === "documents") for (const key of DOCUMENTS_PARAMS) q.delete(key);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
   // `workspaceApp` compat route) own these; they stay on the app's own
   // route and never follow the user to /settings, /threads, or another app.
@@ -611,6 +646,11 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   if (threadsProject !== null) q.set("project", threadsProject);
   if (loc.openId) q.set("issue", loc.openId);
   if (route.screen === "myWork" && route.view) writeMyWorkView(q, route.view);
+  // CAD-2286: Documents owns `archived` and `stage`; the defaults are a bare URL.
+  if (route.screen === "documents") {
+    if (route.archived) q.set("archived", "1");
+    else if (route.stage) q.set("stage", route.stage);
+  }
   if (route.screen === "wiki") {
     if (route.at !== undefined) q.set("at", route.at);
     if (route.section) q.set("section", route.section);

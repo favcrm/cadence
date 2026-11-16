@@ -1,0 +1,25 @@
+{
+  "members": [
+    {
+      "userId": "usr_qa_owner",
+      "name": "QA Owner",
+      "email": "qa-owner@example.test",
+      "role": "owner",
+      "joinedAt": "2026-01-05T09:00:00Z"
+    },
+    {
+      "userId": "usr_qa_member",
+      "name": "QA Member",
+      "email": "qa-member@example.test",
+      "role": "member",
+      "joinedAt": "2026-02-02T09:00:00Z"
+    },
+    {
+      "userId": "usr_qa_reviewer",
+      "name": "QA Reviewer",
+      "email": "qa-reviewer@example.test",
+      "role": "member",
+      "joinedAt": "2026-03-03T09:00:00Z"
+    }
+  ]
+}

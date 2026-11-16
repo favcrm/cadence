@@ -10,6 +10,23 @@ import type { Meta } from "../../lib/types";
 
 export const SIGN_IN_COMMAND = "cadence ui login";
 
+/** Whether `/api/meta`'s session is a verified identity the shell admits
+ *  (AuthBoundary): a known origin, its times, and on a public (hosted)
+ *  session a subject and a role of exactly `operator` or `member`. A
+ *  signed-in answer without one is unanswered, never authority. */
+export function sessionAdmissible(session: Meta["session"] | undefined): boolean {
+  return session !== null && session !== undefined
+    && typeof session.id === "string" && session.id.trim().length > 0
+    && ["loopback", "tailnet", "public"].includes(session.origin)
+    && Number.isFinite(session.created)
+    && Number.isFinite(session.idle_expires_at)
+    && Number.isFinite(session.expires_at)
+    && (session.origin !== "public" || (
+      typeof session.user?.sub === "string" && session.user.sub.trim().length > 0
+      && (session.user.role === "operator" || session.user.role === "member")
+    ));
+}
+
 export const READ_ONLY_REASON = "The board is read-only — the server refuses every write.";
 
 /** Why writes are disabled for this client, or null when they are not.
