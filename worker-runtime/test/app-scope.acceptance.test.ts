@@ -2483,6 +2483,59 @@ describe("no-wake settlement acceptance", () => {
       });
       database.prepare("UPDATE pi_submissions SET request_id=? WHERE id=?").run(JSON.stringify("op-finished"), stored.id);
 
+      // Positive entry ids alone are not evidence that the input and answer
+      // entries exist or belong to this submission's root conversation.
+      for (const field of ["entry", "answer"] as const) {
+        const entryId = Number(decoded[field]);
+        const entry = database.prepare(
+          "SELECT conversation_id, record FROM pi_entries WHERE id=?",
+        ).get(entryId) as { conversation_id: number; record: string } | undefined;
+        expect(entry).toBeDefined();
+        if (entry === undefined) throw new Error(`missing original ${field} entry`);
+        expect(entry.conversation_id).toBe(1);
+
+        // This id is outside the current table and remains a valid positive
+        // integer, unlike the missing-field cases above.
+        const max = database.prepare("SELECT MAX(id) AS id FROM pi_entries").get() as { id: number };
+        const danglingId = max.id + 1000000;
+        expect(Number.isSafeInteger(danglingId)).toBe(true);
+        database.prepare(
+          "UPDATE pi_submissions SET record=json_set(record, ?, ?) WHERE id=?",
+        ).run(`$.${field}`, danglingId, stored.id);
+        expect(await inspect("op-finished")).toEqual({
+          state: "unknown", operationId: "op-finished", conversation: "1",
+        });
+        database.prepare("UPDATE pi_submissions SET record=? WHERE id=?").run(original, stored.id);
+
+        database.prepare(
+          "UPDATE pi_entries SET conversation_id=?, record=json_set(record, '$.conversationId', ?) WHERE id=?",
+        ).run(2, 2, entryId);
+        expect(await inspect("op-finished")).toEqual({
+          state: "unknown", operationId: "op-finished", conversation: "1",
+        });
+        database.prepare("UPDATE pi_entries SET conversation_id=?, record=? WHERE id=?")
+          .run(entry.conversation_id, entry.record, entryId);
+      }
+
+      // Task index columns and the JSON body must agree, even for terminal
+      // nested/background tasks and even when the requested id is absent.
+      const terminalTask = database.prepare(
+        "SELECT id, kind, background, abort_requested FROM pi_tasks WHERE status='terminal' ORDER BY id LIMIT 1",
+      ).get() as { id: number; kind: string; background: number; abort_requested: number } | undefined;
+      expect(terminalTask).toBeDefined();
+      if (terminalTask === undefined) throw new Error("missing terminal task");
+      for (const [column, bad, originalValue] of [
+        ["kind", JSON.stringify("pi.corrupted-kind"), terminalTask.kind],
+        ["background", 1 - terminalTask.background, terminalTask.background],
+        ["abort_requested", 1 - terminalTask.abort_requested, terminalTask.abort_requested],
+      ] as const) {
+        database.prepare(`UPDATE pi_tasks SET ${column}=? WHERE id=?`).run(bad, terminalTask.id);
+        for (const id of ["op-finished", "op-missing"]) {
+          expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+        }
+        database.prepare(`UPDATE pi_tasks SET ${column}=? WHERE id=?`).run(originalValue, terminalTask.id);
+      }
+
       // A different, terminal submission with a conflicting body status
       // makes both a settled proof and an absence proof unsafe.
       const unrelated = database.prepare(
@@ -2494,6 +2547,26 @@ describe("no-wake settlement acceptance", () => {
         expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
       }
       database.prepare("UPDATE pi_submissions SET status=? WHERE id=?").run(unrelated.status, unrelated.id);
+
+      // A terminal status without its required outcome is not proof of rest.
+      const terminalOutcomeTask = database.prepare(
+        "SELECT id, record FROM pi_tasks WHERE status='terminal' ORDER BY id LIMIT 1",
+      ).get() as { id: number; record: string } | undefined;
+      expect(terminalOutcomeTask).toBeDefined();
+      if (terminalOutcomeTask === undefined) throw new Error("missing terminal task");
+      const terminalBody = JSON.parse(terminalOutcomeTask.record) as {
+        state?: { status?: unknown; outcome?: unknown };
+      };
+      expect(terminalBody.state?.status).toBe("terminal");
+      expect(terminalBody.state?.outcome).toBeDefined();
+      database.prepare(
+        "UPDATE pi_tasks SET record=json_remove(record, '$.state.outcome') WHERE id=?",
+      ).run(terminalOutcomeTask.id);
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+      }
+      database.prepare("UPDATE pi_tasks SET record=? WHERE id=?")
+        .run(terminalOutcomeTask.record, terminalOutcomeTask.id);
 
       // The engine writes this request id; the inspector must compare its
       // unpaired UTF-16 surrogate without normalizing it through SQLite JSON.
@@ -2517,6 +2590,24 @@ describe("no-wake settlement acceptance", () => {
       // table. Do not use rows() here because the table is intentionally gone.
       await engine.close(BACKGROUND_CONTEXT);
       engineClosed = true;
+
+      // Missing-schema refusal: this is not physical B-tree corruption.
+      // Restore the exact index before testing the separate missing-table case.
+      const requestIndex = database.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='pi_submissions_by_request'",
+      ).get() as { sql: string } | undefined;
+      expect(typeof requestIndex?.sql).toBe("string");
+      if (requestIndex === undefined || typeof requestIndex.sql !== "string") {
+        throw new Error("missing original submissions request index");
+      }
+      database.exec("DROP INDEX pi_submissions_by_request");
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await inspect(id)).toEqual({
+          state: "unknown", operationId: id, conversation: "1",
+        });
+      }
+      database.exec(requestIndex.sql);
+
       database.exec("DROP TABLE pi_tasks");
       const before = database.prepare("SELECT * FROM pi_submissions ORDER BY id").all();
       const writes = changes();
