@@ -376,6 +376,12 @@ The gateway's real refusal shapes (AOS-243):
   workspace before repeating an upload that could add another version. The
   native CLI route's `tracker_unavailable` proof does not apply to this
   separate upload endpoint or wiki uploads.
+- `artifact submit <id>` has no receipt correlation beyond the board's stage
+  answer. A lost or unproved answer is unknown: repeat the same
+  `artifact submit <id>` in the same workspace, which answers the document's
+  current stage and does not submit it twice. `artifact types` is a read.
+  `document_lifecycle_unavailable` is a final refusal with nothing read or
+  submitted, not an outage.
 - Hosted local-assignment writes use a separate protocol: authorization can be
   rechecked after a report, claim or reassignment commits. A post-dispatch
   `401` or `403` therefore does not prove rejection. A failed local activation

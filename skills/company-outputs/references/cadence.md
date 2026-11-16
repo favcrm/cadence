@@ -12,12 +12,15 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Render | `cadence document create`, `show`, `export`, for an approved DOCX financial template | Not available yet |
 | Show | `cadence artifact put`, for the master's own turn | `artifact_put` saves and shows a file, and takes its `id` for a new version; `artifact_show` for one already saved |
 | Save file | `cadence --org <name> artifact put --issue <id>`, for a worker on a hosted workspace; without `--issue` it stays private to you | `artifact_put`, which also shows it; the file stays private to you until shared |
+| Submit for review | `cadence --org <name> artifact submit <id>`, on a hosted workspace; `artifact types` lists the document types | `document_submit`; `document_types` lists the document types |
 | Save draft | `cadence template create`, `revise` | Not available yet |
 | Approve | The operator's `cadence template approve` | Not available yet |
 
 "Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.
 
 When saving, set the label to the document type, such as `quotation`, and name the customer when you know it. Draft status such as `SAMPLE` belongs in the title and the document, not the label.
+
+On a hosted workspace with document review, that label is the type a submitted file is reviewed under. After saving, submit the file. Its type's approver approves that exact version on the board, the owner shares the approved version to deliver it, and the delivered document is archived after the type's delay. No tool or command approves a document. The cadence skill's "Deliverables and review handoff" has the details.
 
 The rest of this file is the native detail. The daemon validates the spec, stores the version and enforces company scope from the connection.
 

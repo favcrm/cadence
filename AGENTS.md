@@ -356,8 +356,18 @@ targets, lints it, and proves the release seam on the merge
 queue and main; the suite runs on a schedule and on demand (`tests.yml`), where
 a red test finds its owner instead of blocking an unrelated push. Per-module
 acceptance suites, integration targets and contract tests for the CI scripts
-themselves are retired. Write a test only when it earns its place, and
-then to these rules:
+themselves are retired. One narrow exception (CAD-2307): `changed-tests.yml`
+runs, on a PR, only the daemon and suite tests that PR adds or changes
+(`src/daemon/tests/**`, `tests/**`), under `--features test-seam`, in one
+build with no shards; a PR touching none skips the build and run. Selection
+fails closed but bounded: an edit it cannot map to a test widens to one module
+tree, the one `suite` binary, or both (a fixture), never to the full suite, and
+an empty selection fails the run. The exact rules are in the header of
+`scripts/changed-test-filter`. Compile coverage of every test-seam target is
+`ci.yml`'s required clippy job; this job adds running the changed tests. On
+`merge_group` it runs nothing and succeeds, because the PR already ran it and
+`ci.yml` is the queue's integration proof. The full suite stays off PRs. Write
+a test only when it earns its place, and then to these rules:
 
 - **Direct functions, not processes.** Business logic is tested by calling it.
   If a test needs a daemon, a board, a socket or a spawned CLI to reach the
@@ -583,6 +593,21 @@ limitation; only an authorized operator can decide an exception.
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
   inventory restoration establishes its inputs.
+- Run the pre-push plan yourself before `git push`:
+  `scripts/pre-push-check`. It feeds the installed hook the line git would, so
+  the hook's own plan and receipt are used, and the long compile happens in
+  your shell instead of inside the push. GitHub drops an SSH push whose hook
+  runs for minutes (rc=141, "Connection to github.com closed by remote host").
+  The hook records a `tree=clean` rc=0 receipt for the head, and only when the
+  working tree had no edits, staged, unstaged or untracked, both before and
+  after the plan ran (`pre-push-check` refuses a dirty tree). The push's own
+  hook run returns at once only for a receipt that says rc=0 and `tree=clean`
+  for that exact head (a Boat receipt must also show an empty patch), on a
+  clean tree now, with no `PRE_PUSH_TESTS` set. A failure, a dirty-recorded
+  pass, a new commit or an edited tree runs the plan again. A lane minted
+  before this hook change gets it when `issue start` re-heals the hook; until
+  then the push reruns the plan (several minutes). If a push dies with rc=141,
+  retry it once.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`. Example: `scripts/boat-build -- cargo
   test --locked --features test-seam --test daemon <FILTER> --

@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""CAD-2307: the nextest filterset for the tests a pull request adds or changes.
+
+    scripts/changed-test-filter --base BASE_SHA [--head HEAD] [--github-output FILE]
+
+Prints the filterset on stdout (empty when the diff touches no selectable
+test) and notices on stderr. With --github-output it also writes `selected=`
+(true/false), `filter=` and `cargo_args=` (the cargo flags that narrow the
+build to the targets holding the selected tests).
+
+Selection, from the merge-base diff (renames as a deletion plus an addition, so a
+file moved out of these trees still counts; type changes and deletions included):
+
+  src/daemon/tests/<path>.rs   every test under daemon::tests::<path>:: (lib).
+                               A `mod.rs` selects the modules whose
+                               `mod x;` line it adds (with attributes added
+                               directly above it); any removed line (a `mod`
+                               line, a `#[cfg]` gate) or other edit (a shared
+                               helper, `use`) also selects its whole directory,
+                               as does a mod.rs diff that adds no module (the
+                               root one is all of daemon::tests, about 190
+                               tests). Any other file under src/daemon/tests/
+                               (not .rs), added, changed or deleted, also
+                               selects all of daemon::tests, and so does every
+                               daemon change while any `path` attribute
+                               (`#[path]`, `#[cfg_attr(.., path = ..)]`) exists
+                               there: a file's path may then not be its module.
+  tests/suite.rs               the single integration target (CAD-1727). Each
+                               changed line maps to its enclosing `#[test]`
+                               fn; a changed helper selects its enclosing
+                               `mod`. Names match by suffix at a `::`
+                               boundary, so a missed enclosing module can
+                               only widen the selection, never drop a test.
+                               A deletion selects the items on both
+                               sides of it. A change outside any test fn or mod
+                               (top-level helper, `use`) cannot be bounded, so
+                               it selects the whole `suite` binary (about 224
+                               tests, one binary) and says so on stderr.
+  tests/<anything else>        fixtures (read via include_str! or at run time,
+                               by the suite and by daemon tests) select the
+                               whole `suite` binary and all of daemon::tests,
+                               deletions included.
+
+A path under src/daemon/tests/ whose components are not plain identifiers
+(non-ASCII, quotes, backslashes, spaces) selects all of daemon::tests; such a
+name is never written to an output or a regex. Paths are read NUL-separated
+and unquoted (`-z`, `core.quotePath=false`).
+
+Fail closed, bounded: nothing added, changed, moved or deleted under those two
+paths is dropped (a deleted .rs file leaves its `mod` line to clippy). An unbounded
+change widens to one binary or one module tree, never to the full suite, and a
+selection that matches no test fails the run (`--no-tests fail`).
+Known limit: a helper is assumed to serve only the module it lives in. Today no
+test module in either tree uses another sibling module's helpers; if one ever
+does, put the helper in a mod.rs (which widens) rather than a test file.
+Compile coverage of every test-seam target is ci.yml's required clippy job;
+this selection decides only which tests to run.
+
+Nothing here runs a test; the workflow runs the filterset under test-seam.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+
+DAEMON_ROOT = "src/daemon/tests/"
+SUITE = "tests/suite.rs"
+LIB = "binary_id(=cadence-agent)"
+SUITE_BIN = "binary_id(=cadence-agent::suite)"
+
+
+def git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"changed-test-filter: git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def daemon_prefix(path):
+    """daemon::tests:: module path for a file under src/daemon/tests/."""
+    parts = path[len(DAEMON_ROOT):-len(".rs")].split("/")
+    if parts[-1] == "mod":
+        parts.pop()
+    return "daemon::tests::" + "".join(p + "::" for p in parts)
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+ATTRS = re.compile(r"^(?:#\[[^\]]*\]\s*)+")
+# `#[path = ...]` or `#[cfg_attr(..., path = ...)]`: a module whose file is
+# named elsewhere.
+PATH_ATTR = re.compile(r"#\[[^\]]*\bpath\s*=")
+MOD_DECL = re.compile(r"(?:pub(?:\([\w:]+\))? )?mod (\w+);$")
+
+
+def classify_mod_diff(diff, parent):
+    """Prefixes a mod.rs diff selects: each added `mod x;`, plus the whole
+    directory when anything else changed. Only a purely added `mod x;` line
+    (with attributes added directly above it or on the same line) and blank
+    lines stay narrow. Any removed line (a `mod` line, or a `#[cfg]` gate that
+    switches an existing module on), an attribute not attached to an added
+    `mod x;`, or any other edit (a shared helper, `use`, an inline module)
+    selects the whole directory."""
+    added, widen = [], False
+    body = False
+    pending_attr = False
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            body = True
+            widen = widen or pending_attr
+            pending_attr = False
+            continue
+        if not body or line[:1] not in "+-":
+            continue
+        raw = line[1:].strip()
+        if not raw:
+            continue
+        if PATH_ATTR.search(raw):
+            # A module whose file is named elsewhere: its later edits would not
+            # map back to it, so treat the directory as changed.
+            widen = True
+            continue
+        if line[0] == "-":
+            widen = True
+            continue
+        text = ATTRS.sub("", raw)
+        if not text:
+            pending_attr = True
+            continue
+        decl = MOD_DECL.match(text)
+        if decl:
+            added.append(f"{parent}{decl.group(1)}::")
+        else:
+            widen = True
+        pending_attr = False
+    widen = widen or pending_attr
+    return ([parent] if widen else []) + added
+
+
+def mod_prefixes(base, head, path):
+    """Test prefixes selected by a mod.rs under src/daemon/tests/."""
+    diff = git("diff", "-U0", f"{base}...{head}", "--", path)
+    return classify_mod_diff(diff, daemon_prefix(path))
+
+
+def mask(text):
+    """`text` with string, char and comment contents blanked (newlines kept).
+
+    Braces, `;` and item keywords inside a raw string, a string, a char literal
+    or a comment must not move the scanner. Handles r"..", r#".."#, any `#`
+    count, b/c prefixes, escapes, lifetimes (not char literals) and nested
+    block comments.
+    """
+    out, i, n = [], 0, len(text)
+
+    def blank(chunk):
+        return "".join(c if c == "\n" else " " for c in chunk)
+
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(blank(text[i:j]))
+            i = j
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(blank(text[i:j]))
+            i = j
+        else:
+            m = re.compile(r'(?:b|c)?r(#*)"').match(text, i) if c in "rbc" else None
+            prev_ident = i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+            if m and not prev_ident:
+                close = '"' + m.group(1)
+                j = text.find(close, m.end())
+                j = n if j < 0 else j + len(close)
+                out.append(blank(text[i:j]))
+                i = j
+            elif c == '"' or (c in "bc" and text.startswith('"', i + 1) and not prev_ident):
+                j = i + (2 if c != '"' else 1)
+                while j < n and text[j] != '"':
+                    j += 2 if text[j] == "\\" else 1
+                j = min(j + 1, n)
+                out.append(blank(text[i:j]))
+                i = j
+            elif c == "'":
+                m = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^\\'])'").match(text, i)
+                if m:
+                    out.append(blank(m.group(0)))
+                    i = m.end()
+                else:  # a lifetime or label
+                    out.append(c)
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+    return "".join(out)
+
+
+def suite_spans(text):
+    """[(start, end, kind, qualified name, is_test)] for fns and mods, 1-based.
+
+    Items are delimited by brace depth over the masked text, so braces in
+    strings and comments cannot desync it. An item ends at the `}` that closes
+    its first `{`, or at a `;` reached before any `{` (a bodyless fn). A span
+    starts at the first attribute or comment line directly above the item.
+    """
+    lines = text.splitlines()
+    masked = mask(text).splitlines()
+    spans, stack, depth, above = [], [], 0, None
+    item_re = re.compile(
+        r"(?:pub(?:\([\w:]+\))? )?(?:(mod) (\w+)\b|(?:const )?(?:async )?(?:unsafe )?(fn) (\w+))"
+    )
+    for i, (orig, line) in enumerate(zip(lines, masked), 1):
+        s = orig.strip()
+        if s.startswith("//"):
+            above = above or i
+            continue
+        if s.startswith("#["):
+            # Attributes may share a line with the item (`#[test] fn x() {`):
+            # record the line, then scan what follows them, braces included.
+            above = above or i
+            line = ATTRS.sub("", line.strip())
+            if not line:
+                continue
+        item = item_re.match(line.strip())
+        if item:
+            kind = item.group(1) or item.group(3)
+            name = item.group(2) or item.group(4)
+            start = above or i
+            is_test = any(
+                re.match(r"#\[(?:\w+::)?test\b", lines[j - 1].strip()) for j in range(start, i + 1)
+            )
+            mods = [x["name"].rsplit("::", 1)[-1] for x in stack if x["kind"] == "mod"]
+            stack.append(dict(start=start, kind=kind, name="::".join(mods + [name]),
+                              is_test=is_test, base=depth, opened=False))
+        above = None
+        for ch in line:
+            if ch == "{":
+                depth += 1
+                if stack and not stack[-1]["opened"] and depth == stack[-1]["base"] + 1:
+                    stack[-1]["opened"] = True
+            elif ch == "}":
+                depth -= 1
+                if stack and stack[-1]["opened"] and depth == stack[-1]["base"]:
+                    it = stack.pop()
+                    spans.append((it["start"], i, it["kind"], it["name"], it["is_test"]))
+            elif ch == ";" and stack and not stack[-1]["opened"] and depth == stack[-1]["base"]:
+                it = stack.pop()
+                spans.append((it["start"], i, it["kind"], it["name"], it["is_test"]))
+    return spans
+
+
+def changed_lines(base, head, path):
+    diff = git("diff", "-U0", f"{base}...{head}", "--", path)
+    out = set()
+    for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff, re.M):
+        start = int(m.group(1))
+        count = 1 if m.group(2) is None else int(m.group(2))
+        if count == 0:
+            # A deletion-only hunk sits after line `start`: select the items
+            # on both sides, so the item the deleted text belonged to (for
+            # example a removed `#[ignore]`) is never missed.
+            out.update(n for n in (start, start + 1) if n >= 1)
+        else:
+            out.update(range(start, start + count))
+    return out
+
+
+def suite_filters(base, head):
+    spans = suite_spans(git("show", f"{head}:{SUITE}"))
+    exact, mods, unbounded = set(), set(), []
+    for line in sorted(changed_lines(base, head, SUITE)):
+        inside = [s for s in spans if s[0] <= line <= s[1]]
+        fns = [s for s in inside if s[2] == "fn"]
+        ms = [s for s in inside if s[2] == "mod"]
+        inner = min(fns, key=lambda s: s[1] - s[0]) if fns else None
+        if inner and inner[4]:
+            exact.add(inner[3])
+        elif ms:
+            mods.add(min(ms, key=lambda s: s[1] - s[0])[3])
+        else:
+            unbounded.append(line)
+    # A mod selected whole subsumes its exact tests.
+    mods = {m for m in mods if not any(m.startswith(o + "::") for o in mods)}
+    exact = {e for e in exact if not any(e.startswith(m + "::") for m in mods)}
+    # Anchored at the end and at a `::` boundary, not at the start: if the
+    # scanner ever misreads an enclosing module, a dropped prefix still
+    # matches the real test (at worst a same-named test elsewhere also runs).
+    parts = [f"test(/(^|::){e}$/)" for e in sorted(exact)]
+    parts += [f"test(/(^|::){m}::/)" for m in sorted(mods)]
+    return parts, unbounded
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--github-output")
+    args = ap.parse_args()
+    # NUL-separated and unquoted: git's default quoting would hide a path with
+    # a non-ASCII, control, quote or backslash byte from the prefix checks.
+    files = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames",
+                            "--diff-filter=ACMRT",
+                            f"{args.base}...{args.head}").split("\0") if f]
+    # Deleted data files: a test may read one at run time, and nothing fails
+    # to compile when it goes. A deleted .rs file under src/daemon/tests/
+    # leaves its `mod` line behind, which clippy catches.
+    deleted = [f for f in git("-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames",
+                              "--diff-filter=D",
+                              f"{args.base}...{args.head}").split("\0") if f]
+    daemon, suite = [], []
+    whole_suite = False
+    # A `path` attribute anywhere under src/daemon/tests/ means a file's path
+    # may not be its module path: every daemon change then selects the whole
+    # daemon::tests tree rather than a guessed module.
+    redirected = subprocess.run(
+        ["git", "grep", "-q", "-E", r"#\[[^]]*\bpath[[:space:]]*=", args.head, "--", DAEMON_ROOT],
+        capture_output=True).returncode == 0
+    for p in deleted:
+        if p.startswith(DAEMON_ROOT) and not p.endswith(".rs"):
+            daemon.append("daemon::tests::")
+        elif p.startswith("tests/") and p != SUITE:
+            whole_suite = True
+            daemon.append("daemon::tests::")
+    for p in files:
+        if p.startswith(DAEMON_ROOT):
+            rel = p[len(DAEMON_ROOT):]
+            names = rel[:-3].split("/") if rel.endswith(".rs") else None
+            if redirected or names is None or not all(SAFE_NAME.match(n) for n in names):
+                # A non-Rust file, or a name that cannot be a module path: never
+                # put it in a regex or an output; select the whole module tree.
+                daemon.append("daemon::tests::")
+            elif names[-1] == "mod":
+                daemon += mod_prefixes(args.base, args.head, p) or [daemon_prefix(p)]
+            else:
+                daemon.append(daemon_prefix(p))
+        elif p.startswith("tests/") and p != SUITE:
+            # Fixtures: the suite reads them (include_str! and at run time), and
+            # so do daemon tests (e.g. tests/fixtures/apps via
+            # CARGO_MANIFEST_DIR). Both bounded trees run.
+            whole_suite = True
+            daemon.append("daemon::tests::")
+    if SUITE in files:
+        suite, unbounded = suite_filters(args.base, args.head)
+        if not suite and not unbounded:
+            # The file changed but no line mapped (a binary-marked diff, say):
+            # never select nothing for a changed suite.
+            unbounded = ["?"]
+        if unbounded:
+            print(f"changed-test-filter: {SUITE} lines {unbounded[:10]} are outside any "
+                  "test fn or mod; selecting the whole suite binary", file=sys.stderr)
+            whole_suite = True
+    if whole_suite:
+        suite = ["test(/./)"]
+    cargo, clauses = [], []
+    if daemon:
+        cargo.append("--lib")
+        keep = {p for p in daemon if not any(p != o and p.startswith(o) for o in daemon)}
+        alts = " or ".join(f"test(/^{p}/)" for p in sorted(keep))
+        clauses.append(f"({LIB} and ({alts}))")
+    if suite:
+        cargo += ["--test", "suite"]
+        clauses.append(f"({SUITE_BIN} and ({' or '.join(suite)}))")
+    flt = " or ".join(clauses)
+    print(flt)
+    if args.github_output:
+        with open(args.github_output, "a") as f:
+            f.write(f"selected={'true' if flt else 'false'}\n")
+            f.write(f"filter={flt}\n")
+            f.write(f"cargo_args={' '.join(cargo)}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -121,6 +121,31 @@ async function main() {
     await React.act(async () => root.unmount());
   }
 
+  // CAD-2286: the confirm button is the danger variant unless the caller asks
+  // for primary (an approval is not destructive).
+  for (const [variant, expected] of [[undefined, "btn-danger"], ["danger", "btn-danger"], ["primary", "btn-primary"]] as const) {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(ConfirmDialog, {
+        title: "Confirm",
+        body: "Body",
+        confirmLabel: "Go",
+        ...(variant ? { confirmVariant: variant } : {}),
+        pending: false,
+        error: null,
+        onConfirm: () => {},
+        onCancel: () => {},
+      })));
+    });
+    const go = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Go")!;
+    assert(go.classList.contains(expected), `confirmVariant ${String(variant)} renders ${expected}`);
+    assert(!go.classList.contains(expected === "btn-danger" ? "btn-primary" : "btn-danger"), `confirmVariant ${String(variant)} is only ${expected}`);
+    await React.act(async () => root.unmount());
+    host.remove();
+  }
+
   console.log("confirm dialog focus checks passed");
 }
 void main();

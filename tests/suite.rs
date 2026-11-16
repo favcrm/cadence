@@ -17341,3 +17341,519 @@ mod cad2064_artifact_acceptance {
         assert_eq!(receipt["written"], destination.to_str().unwrap());
     }
 }
+
+// CAD-2286 acceptance: `artifact types` and `artifact submit` through the
+// packaged CLI against a TLS fake that answers the tenant's statuses and codes
+// (`apps/api/src/tenant-board/cli.ts`: `readDocumentTypes`,
+// `writeDocumentSubmit`, `DOCUMENT_SUBMIT_STATUS`, `documentVerbOff`).
+#[cfg(all(unix, feature = "test-seam"))]
+mod cad2286_document_acceptance {
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ORG: &str = "document-acceptance";
+    const ORG_ID: &str = "ws_document_acceptance";
+    const ENDPOINT: &str = "https://lc.cadencecloud.app";
+    const RELAY_VERSION: &str = "hosted-cadence-cli.v1";
+    const FILE_ID: &str = "art-x";
+
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentTypesView` with `DOCUMENT_CAPABILITY`.
+    fn types() -> Value {
+        json!({
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
+            "types": []
+        })
+    }
+
+    /// `documentSubmitView` for a first submission of an unconfirmed type.
+    fn submitted() -> Value {
+        json!({
+            "stage": "in_review", "type": "invoice", "typeConfirmed": false,
+            "baseline": baseline()
+        })
+    }
+
+    fn refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn openssl(dir: &Path, args: &[&str]) {
+        let mut command = Command::new("openssl");
+        command
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = cadence_agent::reaper::status(&mut command)
+            .expect("openssl is required for CAD-2286's disposable TLS fixture");
+        assert!(status.success(), "openssl fixture step failed: {args:?}");
+    }
+
+    fn status_line(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            400 => "400 Bad Request",
+            403 => "403 Forbidden",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            501 => "501 Not Implemented",
+            _ => "500 Internal Server Error",
+        }
+    }
+
+    struct Board {
+        home: tempfile::TempDir,
+        address: SocketAddr,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Board {
+        /// `answers` are the `/__platform/cli/call` answers, in order. Every
+        /// authorize mints an envelope; a call past the script answers 500.
+        fn new(answers: Vec<(u16, Value)>) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path();
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "ca.key",
+                    "-out",
+                    "ca.pem",
+                    "-days",
+                    "2",
+                    "-subj",
+                    "/CN=CAD-2286-CA",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
+                ],
+            );
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-new",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "leaf.key",
+                    "-out",
+                    "leaf.csr",
+                    "-subj",
+                    "/CN=lc.cadencecloud.app",
+                ],
+            );
+            fs::write(
+                root.join("leaf.ext"),
+                concat!(
+                    "subjectAltName=DNS:lc.cadencecloud.app\n",
+                    "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n",
+                    "extendedKeyUsage=serverAuth\n"
+                ),
+            )
+            .unwrap();
+            openssl(
+                root,
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "leaf.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "2",
+                    "-extfile",
+                    "leaf.ext",
+                    "-out",
+                    "leaf.pem",
+                ],
+            );
+            fs::set_permissions(root.join("ca.pem"), fs::Permissions::from_mode(0o600)).unwrap();
+            let chain = rustls_pemfile::certs(&mut BufReader::new(
+                fs::File::open(root.join("leaf.pem")).unwrap(),
+            ))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(&mut BufReader::new(
+                fs::File::open(root.join("leaf.key")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+            );
+
+            let config = root.join("config/cadence");
+            let auth = config.join("remote-auth");
+            fs::create_dir_all(&auth).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                config.join("orgs.json"),
+                serde_json::to_vec(&json!({
+                    "selected": {"org": ORG},
+                    "connections": [{
+                        "selection": {"org": ORG},
+                        "destination": {
+                            "mode": "remote", "endpoint": ENDPOINT, "org_id": ORG_ID
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let credential = auth.join(format!("cli-{ORG}.json"));
+            fs::write(
+                &credential,
+                serde_json::to_vec(&json!({
+                    "version": "hosted-cadence-auth.v1",
+                    "organization_id": ORG_ID, "audience": ENDPOINT,
+                    "access_token": format!("hct_{}", "B".repeat(43)),
+                    "expires_at": expires
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(credential, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server_calls = Arc::clone(&calls);
+            let mut script: VecDeque<(u16, Value)> = answers.into();
+            let worker = thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    let socket = incoming.unwrap();
+                    if server_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let stream = rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(Arc::clone(&tls)).unwrap(),
+                        socket,
+                    );
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut length = None;
+                    loop {
+                        line.clear();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (key, value) = line.split_once(':').unwrap();
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let mut raw = vec![0; length.expect("JSON request must have content-length")];
+                    reader.read_exact(&mut raw).unwrap();
+                    let request: Value = serde_json::from_slice(&raw).unwrap();
+                    let (status, response) = match path.as_str() {
+                        "/__platform/cli/authorize" => (
+                            200,
+                            json!({
+                                "version": RELAY_VERSION, "envelope": "synthetic.fixture.envelope"
+                            }),
+                        ),
+                        "/__platform/cli/call" => {
+                            server_calls.lock().unwrap().push(request);
+                            script
+                                .pop_front()
+                                .unwrap_or_else(|| (500, refusal("unexpected_call")))
+                        }
+                        other => panic!("unexpected fixture request: {other}"),
+                    };
+                    let encoded = serde_json::to_vec(&response).unwrap();
+                    let wire = reader.get_mut();
+                    write!(
+                        wire,
+                        concat!(
+                            "HTTP/1.1 {}\r\ncontent-type: application/json\r\n",
+                            "content-length: {}\r\nconnection: close\r\n\r\n"
+                        ),
+                        status_line(status),
+                        encoded.len()
+                    )
+                    .unwrap();
+                    wire.write_all(&encoded).unwrap();
+                    wire.flush().unwrap();
+                }
+            });
+            Self {
+                home,
+                address,
+                stop,
+                worker: Some(worker),
+                calls,
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            let root = self.home.path();
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "20s"])
+                .arg(env!("CARGO_BIN_EXE_cadence"))
+                .env_clear()
+                .current_dir(root)
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                )
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("CADENCE_TEST_TLS_CA", root.join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", self.address.to_string())
+                .args(["--org", ORG, "artifact"])
+                .args(args);
+            bounded(&mut command)
+        }
+
+        /// The verb and arguments of every call the board served.
+        fn verbs(&self) -> Vec<(Value, Option<Value>)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| (call["verb"].clone(), call.get("arguments").cloned()))
+                .collect()
+        }
+    }
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake accept; no timing-based polling and no background fixture left alive.
+            let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(2));
+            let result = self.worker.take().unwrap().join();
+            if !thread::panicking() {
+                result.expect("CAD-2286 TLS fixture panicked");
+            }
+        }
+    }
+
+    fn bounded(command: &mut Command) -> Output {
+        let output = cadence_agent::reaper::output(command)
+            .expect("CAD-2286 acceptance requires GNU timeout on PATH; no unbounded fallback");
+        assert!(
+            output
+                .status
+                .code()
+                .is_some_and(|code| code != 124 && code != 137),
+            "packaged CLI exceeded its 20-second fixture deadline or was signalled: \
+             status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn probe() -> (Value, Option<Value>) {
+        // `document_types` takes no arguments, so the call carries none.
+        (json!("document_types"), None)
+    }
+
+    fn submit() -> (Value, Option<Value>) {
+        (json!("document_submit"), Some(json!({"id": FILE_ID})))
+    }
+
+    /// A refusal exits with the rejected code (3), prints no receipt, and names
+    /// the stable code on stderr.
+    fn assert_refused(output: &Output, code: &str) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stdout.is_empty(), "a refusal printed a receipt");
+        assert!(
+            stderr.contains(&format!("\"code\": \"{code}\"")),
+            "expected {code}: {stderr}"
+        );
+    }
+
+    #[test]
+    fn artifact_types_prints_the_server_document() {
+        let board = Board::new(vec![(200, types())]);
+        let output = board.run(&["types"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(printed, types());
+        assert_eq!(board.verbs(), vec![probe()]);
+    }
+
+    #[test]
+    fn artifact_submit_probes_then_prints_the_stage() {
+        let board = Board::new(vec![(200, types()), (200, submitted())]);
+        let output = board.run(&["submit", FILE_ID]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(printed, submitted());
+        assert_eq!(board.verbs(), vec![probe(), submit()]);
+    }
+
+    #[test]
+    fn artifact_submit_refusals_exit_with_the_stable_code() {
+        for (status, code) in [
+            (403, "not_creator"),
+            (409, "already_shared"),
+            (400, "unlabelled"),
+            (409, "document_archived"),
+            // A 404 after a successful probe is the file, never the lifecycle.
+            (404, "not_found"),
+            // A server that answers the probe but predates the submit.
+            (501, "not_implemented"),
+        ] {
+            let board = Board::new(vec![(200, types()), (status, refusal(code))]);
+            let output = board.run(&["submit", FILE_ID]);
+            assert_refused(&output, code);
+            assert_eq!(board.verbs(), vec![probe(), submit()], "{code}");
+        }
+    }
+
+    #[test]
+    fn a_submit_success_without_a_receipt_is_unknown_and_prints_nothing() {
+        let board = Board::new(vec![(200, types()), (200, json!({"ok": false}))]);
+        let output = board.run(&["submit", FILE_ID]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "an unproved submit printed a receipt"
+        );
+        assert!(stderr.contains("\"kind\": \"unknown\""), "{stderr}");
+        assert!(stderr.contains("repeat `artifact submit <id>`"), "{stderr}");
+        assert_eq!(board.verbs(), vec![probe(), submit()]);
+    }
+
+    #[test]
+    fn document_lifecycle_unavailable_is_decided_by_the_type_list() {
+        for (status, code) in [
+            (501, "not_implemented"),
+            (404, "not_found"),
+            // A relay older than the verb.
+            (400, "invalid_request"),
+            (400, "unknown_verb"),
+        ] {
+            let board = Board::new(vec![(status, refusal(code))]);
+            let output = board.run(&["types"]);
+            assert_refused(&output, "document_lifecycle_unavailable");
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("retry"),
+                "an unavailable lifecycle is not an outage"
+            );
+            assert_eq!(board.verbs(), vec![probe()], "{status} {code}");
+
+            // Submit asks the same question first and sends nothing else.
+            let board = Board::new(vec![(status, refusal(code))]);
+            let output = board.run(&["submit", FILE_ID]);
+            assert_refused(&output, "document_lifecycle_unavailable");
+            assert_eq!(board.verbs(), vec![probe()], "submit {status} {code}");
+        }
+    }
+
+    #[test]
+    fn artifact_types_and_submit_are_refused_on_a_native_org() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        for args in [&["types"][..], &["submit", FILE_ID][..]] {
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "20s"])
+                .arg(env!("CARGO_BIN_EXE_cadence"))
+                .env_clear()
+                .current_dir(root)
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                )
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .arg("artifact")
+                .args(args);
+            let output = bounded(&mut command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(stderr.contains("\"code\": \"usage\""), "{args:?}: {stderr}");
+            assert!(stderr.contains("hosted-only"), "{args:?}: {stderr}");
+        }
+    }
+}

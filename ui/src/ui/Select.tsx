@@ -105,6 +105,9 @@ export function Select({
       alt: event.altKey,
     });
     if (result.prevent) event.preventDefault();
+    // Escape that closes the open list belongs to the list: a drawer or dialog
+    // listening above (DrawerShell on the window) must not close as well.
+    if (event.key === "Escape" && current.open) event.stopPropagation();
     if (result.model !== current || result.pick !== null) {
       const closing = current.open && !result.model.open;
       finish(result.pick, result.model, closing && event.key !== "Tab");

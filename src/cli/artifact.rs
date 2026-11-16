@@ -5,7 +5,8 @@
 //!
 //! AOS-346: on a hosted org (`--org`) a worker uses the same verb; see
 //! `cli/remote.rs`. `--issue`, `--label` and `--customer`, `find` and `show`
-//! are hosted-only for now.
+//! are hosted-only for now, as are CAD-2286's `types` and `submit` (the
+//! document lifecycle).
 
 use super::*;
 
@@ -63,6 +64,16 @@ pub(crate) enum ArtifactAction {
         /// A new file; identity, version, pages and digest are checked first. Never overwrites.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Hosted only: the workspace's document types and the baseline rules for an
+    /// unconfirmed type. Refused when the document lifecycle is not available.
+    Types,
+    /// Hosted only: submit a file you saved for review as a document. Its label
+    /// is its document type. Prints the stage it is in now; submitting again
+    /// answers the current stage.
+    Submit {
+        /// The artifact id (`art-…`).
+        id: String,
     },
 }
 
@@ -130,9 +141,12 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             print_json(&client::rpc(&state_dir, "artifact_put", params)?);
             Ok(0)
         }
-        ArtifactAction::Find { .. } | ArtifactAction::Show { .. } => Err(Error::usage(
-            "artifact find and show are hosted-only for now; pass --org <name>. On this \
-             board, the canvas shows what `artifact put` stored",
+        ArtifactAction::Find { .. }
+        | ArtifactAction::Show { .. }
+        | ArtifactAction::Types
+        | ArtifactAction::Submit { .. } => Err(Error::usage(
+            "artifact find, show, types and submit are hosted-only for now; pass --org \
+             <name>. On this board, the canvas shows what `artifact put` stored",
         )),
     }
 }

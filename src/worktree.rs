@@ -268,7 +268,9 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// records the checked head, base, sandbox and result under this
 /// worktree's git dir. Required CI, review and approval remain
 /// authoritative. A `--no-verify` push leaves no receipt, which is the
-/// detection signal (contract D3).
+/// detection signal (contract D3). The hook skips the plan only for the exact
+/// pushed HEAD on a clean tree when the last receipt says rc=0 and
+/// `tree=clean` for it (CAD-2341); any other receipt runs the plan.
 const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
 # CAD-1909: run scripts/pre-push in a Boat sandbox; the shared host does not
 # compile. A missing Boat CLI or helper refuses the push rather than falling
@@ -324,14 +326,44 @@ if [ ! -x scripts/pre-push ]; then
         "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 0
 fi
+# CAD-2341: GitHub drops an SSH push whose hook runs for minutes (rc=141).
+# `scripts/pre-push-check` runs this hook before the push and records the
+# receipt. A pass is recorded as `tree=clean` only when the working tree had no
+# edits (staged, unstaged or untracked) before and after the plan ran, so it
+# describes the commit and not the files beside it. The skip needs all of: no
+# PRE_PUSH_TESTS at this push, the pushed commit is HEAD, a clean tree now, and
+# a receipt for this head that says rc=0 and tree=clean (a Boat receipt must
+# also carry the empty-patch hash). Any other receipt (failure, skipped,
+# refused, dirty-recorded) runs the plan again. An unreadable status counts as
+# dirty.
+EMPTY_PATCH=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+if st=$(git status --porcelain --untracked-files=normal 2>/dev/null) && [ -z "$st" ]; then
+    tree_clean=1
+else
+    tree_clean=
+fi
+if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -n "$tree_clean" ] &&
+    [ -f "$out" ]; then
+    prev=$(tail -n 1 "$out" 2>/dev/null)
+    case "$prev" in
+        *steps=skipped*|*steps=refused*) ;;
+        "head=$head "*" patch=$EMPTY_PATCH "*" rc=0 "*" tree=clean" | "head=$head lane="*" kind="*" rc=0 "*" tree=clean")
+            echo "pre-push: recorded clean pass for $head; not re-running the plan"
+            exit 0 ;;
+    esac
+fi
 if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     if [ "$pushed" != "$head" ]; then
         printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
             "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
         exit 1
     fi
-    line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
+    output=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
     rc=$?
+    # The plan's progress and failure detail go to stderr; the receipt
+    # keeps only its last line.
+    printf '%s\n' "$output" >&2
+    line=$(printf '%s\n' "$output" | tail -n 1)
 else
     if [ ! -x scripts/boat-build ]; then
         printf 'head=%s lane=%s mode=boat steps=refused:no-boat-build rc=1 at=%s\n' \
@@ -342,6 +374,15 @@ else
     rc=$?
     line=$(printf '%s\n' "$output" | tail -n 1)
     [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
+fi
+# CAD-2341: a clean pass names the head the plan started on. A commit or
+# branch switch during the run (local mode reads HEAD when it ends) leaves
+# the receipt unmarked, so the next push runs the plan.
+if [ "$rc" -eq 0 ] && [ -n "$tree_clean" ] &&
+    [ "$(git rev-parse HEAD 2>/dev/null)" = "$head" ] &&
+    case "$line" in "head=$head "*) true ;; *) false ;; esac &&
+    st=$(git status --porcelain --untracked-files=normal 2>/dev/null) && [ -z "$st" ]; then
+    line="$line tree=clean"
 fi
 printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
 exit $rc

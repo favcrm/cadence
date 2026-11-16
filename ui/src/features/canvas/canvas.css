@@ -217,7 +217,7 @@
 .canvas-drawer:focus { outline: none; }
 
 /* The header is one row: globe, name and state, the address in the flexible middle, the
-   actions, then the canvas controls. The confirm may wrap to a second row rather than clip. */
+   actions, then the canvas controls. During a stop confirmation, the actions take a full row underneath. */
 .bz-head { flex-wrap: nowrap; gap: 8px; }
 .bz-head[data-confirm] { flex-wrap: wrap; }
 .bz-globe { display: inline-flex; flex: none; }
@@ -256,7 +256,6 @@
 .bz-actions .btn { display: inline-flex; align-items: center; gap: 5px; }
 .bz-ask { color: var(--color-ink-300); font-size: var(--text-label); }
 .bz-head[data-confirm] .bz-actions { order: 9; flex: 1 0 100%; flex-wrap: wrap; }
-.bz-head[data-confirm] .bz-ask { margin-right: auto; }
 /* The two answers stay together and at the right edge, beside the question or under it. */
 .bz-answers { display: inline-flex; flex: none; gap: 6px; margin-left: auto; }
 
@@ -264,6 +263,7 @@
 .bz-viewer { flex: 1; min-height: 0; display: flex; }
 .bz-viewer:focus-within { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .bz-viewer iframe { flex: 1; min-width: 0; min-height: 14rem; border: 0; background: var(--color-ink-100); }
+.bz-viewer[data-phase="loading"] iframe { background: var(--color-ink-900); }
 
 /* The card's host: its own line, wrapped, and clipped from the START (the last
    lines stay visible), so the registrable end is always readable. */
@@ -275,7 +275,8 @@
 @media (prefers-reduced-motion: reduce) {
   .bz-dot[data-pulse], .cv-bar-run { animation: none; }
 }
-.canvas-drawer[data-mode="sheet"] .cv-iconbtn { min-width: 2.25rem; min-height: 2.25rem; }
+.canvas-drawer[data-mode="sheet"] .cv-iconbtn,
+.canvas-drawer[data-mode="sheet"] .bz-actions .btn { min-width: 2.25rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
 /* A phone's canvas is the whole screen with its actions in the header: the toast stays at the foot, clear of them.
    Narrow: the address goes first (the actions then keep the right edge), then the action labels (the

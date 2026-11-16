@@ -27,7 +27,9 @@ export interface ArtifactRef {
   version: number;
   kind: ArtifactKind;
   title: string;
-  bytes: number;
+  /** Absent when the opener does not know this version's size (CAD-2286: a
+   *  document opened at an older version than the one its list row names). */
+  bytes?: number;
   digest?: string;
   /** A generated image's shape (`16:9`), shown on its overlay; absent otherwise. */
   aspect?: string;
@@ -35,7 +37,7 @@ export interface ArtifactRef {
 
 /** What the board knows of one stored version (from its thread card). */
 export interface VersionInfo {
-  bytes: number;
+  bytes?: number;
   digest?: string;
 }
 
@@ -43,7 +45,8 @@ export interface CanvasTab {
   id: string;
   kind: ArtifactKind;
   title: string;
-  bytes: number;
+  /** Absent when the version that opened the tab had no known size. */
+  bytes?: number;
   aspect?: string;
   /** The newest version the thread has announced. */
   latest: number;
@@ -265,7 +268,7 @@ export function openArtifact(ref: ArtifactRef): void {
 
 export function focusTab(id: string): void {
   if (!state.tabs.some((t) => t.id === id)) return;
-  if (state.active !== id) set({ ...state, active: id });
+  if (state.active !== id || !state.open) set({ ...state, active: id, open: true });
   artifactFocused("user");
 }
 

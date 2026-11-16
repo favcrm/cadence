@@ -151,3 +151,20 @@ for (const [source, expected] of Object.entries(workerPermissionTranslations)) {
     throw new Error(`Expected zh-TW worker permission string "${source}" to be "${expected}", got "${translated}"`);
   }
 }
+
+const canvasBrowserTranslations: Record<string, string> = {
+  "Open Browser": "開啟瀏覽器",
+  "Canvas": "畫布",
+  "Resize canvas": "調整畫布寬度",
+  "Ask to change": "要求修改",
+  "drafting": "撰寫草稿中",
+  "updating": "更新中",
+  "updated to": "已更新至",
+};
+
+for (const [source, expected] of Object.entries(canvasBrowserTranslations)) {
+  const translated = translateUiText(source, "zh-TW");
+  if (translated !== expected) {
+    throw new Error(`Expected zh-TW canvas/browser string "${source}" to be "${expected}", got "${translated}"`);
+  }
+}

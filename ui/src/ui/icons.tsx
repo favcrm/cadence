@@ -18,6 +18,7 @@ import {
   DashboardSquare01Icon,
   Delete02Icon,
   DeletePutBackIcon,
+  DocumentValidationIcon,
   File01Icon,
   Folder01Icon,
   Home01Icon,
@@ -109,6 +110,10 @@ export const IconSettings = ({ size = 15, ...rest }: IconProps = {}) => (
 /** Wiki — the page store, and a page or file in the tree. */
 export const IconWiki = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={File01Icon} size={size} {...rest} />
+);
+/** Documents — the hosted document lifecycle (CAD-2286). */
+export const IconDocuments = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={DocumentValidationIcon} size={size} {...rest} />
 );
 /** A folder in the wiki tree and its empty state. */
 export const IconFolder = ({ size = 14, ...rest }: IconProps = {}) => (

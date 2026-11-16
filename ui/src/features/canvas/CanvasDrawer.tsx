@@ -6,7 +6,7 @@ import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView 
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
-import { closeBrowserDrawer, focusBrowser, hideBrowser, tabVisible, useBrowserTab } from "./browserStore";
+import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
   clampWidth,
   closeDrawer,
@@ -85,6 +85,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
+  // A version whose size is unknown shows none, never another version's.
+  const size = info?.bytes;
   // "updating v1 → v2" only while this turn has asked to add a version to
   // this artifact and it has not landed; once it has, "updated to v2".
   // A put still waiting for its result wins, so a second put of the same
@@ -226,7 +228,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
       {image ? null : (
       <footer className="cv-foot">
         <span>
-          v{tab.selected} · {sizeLabel(info?.bytes ?? tab.bytes)}
+          v{tab.selected}{size === undefined ? "" : ` · ${sizeLabel(size)}`}
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
         {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
@@ -260,7 +262,7 @@ export default function CanvasDrawer() {
   const conversation = canvas.conversation ?? browser.conversation;
   const open = conversation !== null && ((canvas.open && canvas.tabs.length > 0) || (browser.open && hasBrowser));
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
-  const showBrowser = hasBrowser && (browser.focused || tab === null);
+  const showBrowser = isBrowserPanelShown(canvas, browser);
   const rootRef = useRef<HTMLElement | null>(null);
   // Where focus goes when a control inside the drawer goes away (a closed or
   // hidden tab, or the drawer itself): the next tab, else the drawer; if the
@@ -281,7 +283,7 @@ export default function CanvasDrawer() {
     closeDrawer();
     closeBrowserDrawer();
   }, [handFocusOn]);
-  const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(tab?.kind ?? "md", viewport);
+  const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
   const pushed = useRef(0);
 
@@ -360,6 +362,23 @@ export default function CanvasDrawer() {
     else return;
     e.preventDefault();
   };
+  const onTabListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement | null;
+    if (target?.getAttribute("role") !== "tab") return;
+    const tabs = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    const idx = tabs.indexOf(target as HTMLButtonElement);
+    if (idx < 0 || tabs.length < 2) return;
+    let nextIdx = -1;
+    if (e.key === "ArrowRight") nextIdx = (idx + 1) % tabs.length;
+    else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + tabs.length) % tabs.length;
+    else if (e.key === "Home") nextIdx = 0;
+    else if (e.key === "End") nextIdx = tabs.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    const next = tabs[nextIdx];
+    next.click();
+    next.focus();
+  };
 
   if (!open || (!tab && !showBrowser) || conversation === null) return null;
   const sheet = layout.mode === "sheet";
@@ -392,7 +411,7 @@ export default function CanvasDrawer() {
         />
       ) : null}
       {canvas.tabs.length + (hasBrowser ? 1 : 0) > 1 ? (
-        <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")}>
+        <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")} onKeyDown={onTabListKeyDown}>
           {canvas.tabs.map((x) => {
             const on = !showBrowser && tab !== null && x.id === tab.id;
             return (

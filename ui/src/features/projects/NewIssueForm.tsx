@@ -98,9 +98,10 @@ export default function NewIssueForm({
   };
   return (
     <form className="card board-new-issue mb-4 p-4 border-accent/40 reveal" onSubmit={submit} onKeyDown={(event) => {
-      // The shared Select uses Escape to close its own popup. Portal key
-      // events still bubble through this form, so only Escape in Title
-      // cancels the draft.
+      // The shared Select closes its own open list on Escape and stops the
+      // event there, so that Escape never reaches this form. Only Escape in
+      // Title cancels the draft; elsewhere (a closed Select, another field)
+      // it does nothing.
       if (event.key === "Escape" && !busy && event.target instanceof HTMLInputElement && event.target.name === "title") {
         event.preventDefault();
         onCancel();

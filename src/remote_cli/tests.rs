@@ -5836,6 +5836,278 @@ fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
     assert!(!old.contains("unavailable"));
 }
 
+// CAD-2286: `artifact types` and `artifact submit`. The statuses and codes are
+// the tenant's (`apps/api/src/tenant-board/cli.ts`, `readDocumentTypes`,
+// `writeDocumentSubmit`, `DOCUMENT_SUBMIT_STATUS`).
+mod cad2286_document {
+    use super::*;
+
+    fn refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn submit_args() -> Map<String, Value> {
+        json!({"id": "art-x"}).as_object().unwrap().clone()
+    }
+
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`, through
+    /// `documentBaselineView`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentSubmitView`: an unconfirmed type carries the baseline.
+    fn submit_receipt() -> Value {
+        json!({"stage": "in_review", "type": "quotation", "typeConfirmed": false,
+            "baseline": baseline()})
+    }
+
+    #[test]
+    fn document_verbs_are_registered_with_one_scope_each() {
+        use super::super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb};
+        assert!(REMOTE_VERBS.contains(&"document_types"));
+        assert!(REMOTE_VERBS.contains(&"document_submit"));
+        assert_eq!(cli_requested_scopes("document_types"), &["cli.read"]);
+        assert_eq!(cli_requested_scopes("document_submit"), &["cli.write"]);
+        assert!(!mutating_cli_verb("document_types"));
+        assert!(mutating_cli_verb("document_submit"));
+        // No correlated receipt: a repeated submit answers the current stage,
+        // so a lost answer sends the caller back to the same command.
+        let note = lost_mutation_note("document_submit");
+        assert!(note.contains("repeat `artifact submit <id>`"), "{note}");
+        assert!(note.contains("current stage"), "{note}");
+        assert!(note.contains("does not submit it twice"), "{note}");
+    }
+
+    #[test]
+    fn document_verbs_ride_the_agent_credential() {
+        // Operator decision 2026-11-15: the credential carries the member's
+        // subject, so neither verb is an exception to the default.
+        use super::super::agent_credential::stays_on_login;
+        assert!(!stays_on_login(Surface::Cli, "document_submit"));
+        assert!(!stays_on_login(Surface::Cli, "document_types"));
+    }
+
+    #[test]
+    fn document_types_answers_the_body_and_sends_no_arguments() {
+        // `documentTypesView`, with `DOCUMENT_CAPABILITY`.
+        let types = json!({
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
+            "types": [],
+        });
+        let (out, requests) = run(
+            vec![(200, "", types.clone())],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_eq!(out.unwrap(), types);
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["body"]["verb"], json!("document_types"));
+        assert!(calls[0]["body"].get("arguments").is_none());
+    }
+
+    #[test]
+    fn document_types_unavailable_answers_are_typed_and_never_an_outage() {
+        const OLDER: &str = "the workspace's server is older than this command";
+        const OFF: &str = "document review is turned off on this workspace";
+        for (status, code, cause) in [
+            // A tenant without the verb.
+            (501u16, "not_implemented", OLDER),
+            // The lifecycle flag is off.
+            (404, "not_found", OFF),
+            // A relay older than the verb: `document_types` takes no
+            // arguments, so the refusal can only be the name.
+            (400, "invalid_request", OLDER),
+            (400, "unknown_verb", OLDER),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_types",
+                Map::new(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(
+                err.code(),
+                Some("document_lifecycle_unavailable"),
+                "{status} {code}: {err}"
+            );
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            let shown = err.to_string();
+            assert!(
+                shown.contains("document lifecycle is not available on this workspace"),
+                "{shown}"
+            );
+            assert!(shown.contains(cause), "{status} {code}: {shown}");
+            assert!(!shown.contains("retry"), "{status} {code}: {shown}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+        // An access refusal is not an unavailable lifecycle.
+        let (out, _) = run(
+            vec![(403, "", refusal("forbidden"))],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_ne!(
+            out.unwrap_err().code(),
+            Some("document_lifecycle_unavailable")
+        );
+    }
+
+    #[test]
+    fn document_submit_refusals_carry_the_store_code() {
+        for (status, code) in [
+            (403u16, "not_creator"),
+            (400, "unlabelled"),
+            (409, "already_shared"),
+            (409, "document_archived"),
+            // After a successful probe, a 404 is the file, not the lifecycle.
+            (404, "not_found"),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some(code), "{status} {code}: {err}");
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
+    fn a_tenant_without_document_submit_is_named_and_is_not_an_outage() {
+        // After a successful probe a 501 can only be a server that serves the
+        // type list but not the submit: name the release order, as the
+        // ticket-message verbs do.
+        let (out, requests) = run(
+            vec![(501, "", refusal("not_implemented"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some("not_implemented"), "{err}");
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("`artifact submit`"), "{shown}");
+        assert!(shown.contains("update the tenant server first"), "{shown}");
+        assert!(shown.contains("Nothing was submitted"), "{shown}");
+        for outage in ["unavailable", "retry"] {
+            assert!(!shown.contains(outage), "reads as an outage: {shown}");
+        }
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+    }
+
+    #[test]
+    fn a_document_submit_success_without_a_submit_receipt_is_unknown() {
+        // A 2xx proves the submit only as `documentSubmitView`: a known stage, a
+        // type string, a boolean `typeConfirmed` and an object baseline if
+        // any. Anything else may follow a recorded submit, so it is unknown and
+        // sends the caller back to the repeat, never a success.
+        let mut bad_baseline = submit_receipt();
+        bad_baseline["baseline"] = json!("baseline");
+        let mut unknown_stage = submit_receipt();
+        unknown_stage["stage"] = json!("submitted");
+        let mut no_type = submit_receipt();
+        no_type.as_object_mut().unwrap().remove("type");
+        let mut string_confirmed = submit_receipt();
+        string_confirmed["typeConfirmed"] = json!("false");
+        for reply in [
+            json!({}),
+            json!({"ok": false}),
+            json!({"stage": 7}),
+            unknown_stage,
+            no_type,
+            string_confirmed,
+            bad_baseline,
+        ] {
+            let (out, requests) = run(
+                vec![(200, "", reply.clone())],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.expect_err(&format!("{reply} is not a submit receipt"));
+            assert_eq!(err.kind(), "unknown", "{reply}: {err}");
+            assert!(
+                err.to_string().contains("repeat `artifact submit <id>`"),
+                "{reply}: {err}"
+            );
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
+    fn document_submit_answers_the_stage_and_a_lost_answer_is_unknown() {
+        let stage = submit_receipt();
+        let (out, requests) = run(
+            vec![(200, "", stage.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), stage);
+        // A confirmed type answers without the baseline.
+        let confirmed = json!({"stage": "approved", "type": "quotation", "typeConfirmed": true});
+        let (out, _) = run(
+            vec![(200, "", confirmed.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), confirmed);
+        let call = requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!({"id": "art-x"}));
+        assert_eq!(
+            minted_scopes(&requests),
+            ["cli.write"],
+            "submit asks for cli.write only"
+        );
+        // An unmapped store code answers 500 `internal`: the write may have
+        // landed, so it is unknown and names the read, never a refusal.
+        let (out, _) = run(
+            vec![(500, "", refusal("internal"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(
+            err.to_string().contains("repeat `artifact submit <id>`"),
+            "{err}"
+        );
+    }
+
+    fn minted_scopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/authorize"))
+            .unwrap()["body"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
 // CAD-2083 acceptance, written from the ticket by the reviewer rather than the
 // implementer. It drives the real client path (`call_verb_in`, or the real local
 // dispatch) with the statuses and bodies the tenant's `tenantCliCall` answers.
@@ -8194,6 +8466,75 @@ mod agent_credential_acceptance {
             ]
         );
         assert!(s.lines().is_empty());
+    }
+
+    impl Session {
+        /// The real `artifact submit` order: the type-list probe, then the submit.
+        fn submit_document(&self) -> Result<Value> {
+            super::super::submit_document_in(
+                &self.target,
+                "art-x",
+                Instant::now() + Duration::from_secs(10),
+                10,
+                &self.dir,
+                Some(&self.slot),
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+        }
+
+        fn verbs(&self) -> Vec<Value> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|req| req.path.ends_with("/cli/call"))
+                .map(|req| req.body["verb"].clone())
+                .collect()
+        }
+    }
+
+    // CAD-2286, operator decision 2026-11-15: the credential carries the
+    // member's subject, so the creator check admits the member's files on it,
+    // and a reader or reviewer session's submit meets the board's read-only
+    // guard. Both the probe and the submit ride the agent credential.
+    #[test]
+    fn a_managed_artifact_submit_probes_and_submits_on_the_agent_credential() {
+        // The probe's body is not read; the submit's answer must be a receipt.
+        let mut b = board();
+        b.agent_call = (
+            200,
+            json!({"stage": "in_review", "type": "quotation", "typeConfirmed": true}),
+        );
+        let s = session(b, 5);
+        s.submit_document().unwrap();
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        assert_eq!(
+            s.verbs(),
+            vec![json!("document_types"), json!("document_submit")]
+        );
+        assert!(s.lines().is_empty(), "{:?}", s.lines());
+    }
+
+    // A failed mint never falls back to the member's wider login: the probe is
+    // refused, so no submit is ever sent.
+    #[test]
+    fn a_failed_mint_refuses_artifact_submit_before_anything_is_submitted() {
+        let mut b = board();
+        b.mint = (403, json!({"ok": false, "code": "forbidden"}));
+        let s = session(b, 1);
+        s.submit_document().unwrap_err();
+        assert_eq!(s.trail(), vec![step("agent-credential", "login")]);
+        assert!(s.verbs().is_empty());
     }
 
     // The board's own `issued_at` bounds the lifetime; a slow mint (the client

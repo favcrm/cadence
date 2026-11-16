@@ -56999,10 +56999,10 @@ function operationContextExtension(load, authored, attachedImages, maxImages = 1
 }
 
 // src/company-outputs.generated.ts
-var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-8e44e79bcc5ebdc3";
+var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-35bcc590c7c95e9f";
 var COMPANY_OUTPUTS_SKILL = {
   name: "company-outputs",
-  version: "8e44e79bcc5ebdc3",
+  version: "35bcc590c7c95e9f",
   description: "Prepare and reuse a company's quotes, quotations, invoices, proposals, tenders, reports, letters, slides and page mockups, and save a good result as a reusable template. Use when someone asks for one of these, asks to use or change their template, or asks to save something as a template. Produces drafts only; nothing is sent, issued or approved.",
   body: `# Company outputs
 
@@ -57061,7 +57061,7 @@ When a capability is missing, say which one and what that means for this request
     {
       kind: "reference",
       path: "references/cadence.md",
-      content: '# Where each capability exists\n\nUse this lookup only to find the command or tool. A listed command is not proof that this session may run it or that rendering will succeed; recheck the session\'s own tools and help.\n\n| Capability | Hosted workspace |\n|---|---|\n| Company facts | `wiki_search`, `wiki_list`, `wiki_read` |\n| Find past work | `artifact_find`, `artifact_read` |\n| Find template | Not available yet |\n| Read template | Not available yet |\n| Calculate | Not available yet |\n| Render | Not available yet |\n| Show | `artifact_put` saves and shows a file, and takes its `id` for a new version; `artifact_show` for one already saved |\n| Save file | `artifact_put`, which also shows it; the file stays private to you until shared |\n| Save draft | Not available yet |\n| Approve | Not available yet |\n\n"Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.\n\nWhen saving, set the label to the document type, such as `quotation`, and name the customer when you know it. Draft status such as `SAMPLE` belongs in the title and the document, not the label.\n'
+      content: '# Where each capability exists\n\nUse this lookup only to find the command or tool. A listed command is not proof that this session may run it or that rendering will succeed; recheck the session\'s own tools and help.\n\n| Capability | Hosted workspace |\n|---|---|\n| Company facts | `wiki_search`, `wiki_list`, `wiki_read` |\n| Find past work | `artifact_find`, `artifact_read` |\n| Find template | Not available yet |\n| Read template | Not available yet |\n| Calculate | Not available yet |\n| Render | Not available yet |\n| Show | `artifact_put` saves and shows a file, and takes its `id` for a new version; `artifact_show` for one already saved |\n| Save file | `artifact_put`, which also shows it; the file stays private to you until shared |\n| Submit for review | `document_submit`; `document_types` lists the document types |\n| Save draft | Not available yet |\n| Approve | Not available yet |\n\n"Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.\n\nWhen saving, set the label to the document type, such as `quotation`, and name the customer when you know it. Draft status such as `SAMPLE` belongs in the title and the document, not the label.\n\nOn a hosted workspace with document review, that label is the type a submitted file is reviewed under. After saving, submit the file. Its type\'s approver approves that exact version on the board, the owner shares the approved version to deliver it, and the delivered document is archived after the type\'s delay. No tool or command approves a document. The cadence skill\'s "Deliverables and review handoff" has the details.\n'
     },
     {
       kind: "reference",
