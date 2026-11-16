@@ -70,6 +70,7 @@ async function boundaryChecks() {
   const { api } = require("../src/lib/api") as typeof ApiModule;
   const { QueryCache } = require("../src/lib/cache") as typeof CacheModule;
   const { sessionKey, setSessionKey, SESSION_HEADER } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
+  const { openAttachmentInTab } = require("../src/features/home/AttachmentMedia") as typeof import("../src/features/home/AttachmentMedia");
   const { privateSessionGeneration, privateReadsAllowed } = require("../src/lib/privateSession") as typeof PrivateSessionModule;
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
   const signedIn = { ...base, hosted: false, operator: false, session: { id: "local-member", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: "member", name: "Member", email: "member@example.test", handle: "member", role: "member" } } };
@@ -77,6 +78,7 @@ async function boundaryChecks() {
   let projectsResponse = () => json({ projects: [{ key: "private-project" }] });
   const proofHeaders: (string | null)[] = [];
   let lateRead: ((response: Response) => void) | undefined;
+  let pdfExpectedSession: string | null = null;
   let privateRequests = 0, effects = 0, cleanups = 0;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input), "http://localhost");
@@ -87,6 +89,10 @@ async function boundaryChecks() {
       return response();
     }
     privateRequests++;
+    if (url.pathname.startsWith("/api/chat/attachments/")) {
+      pdfExpectedSession = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+      return new Response("synthetic PDF from an older host");
+    }
     if (url.pathname === "/api/projects") return projectsResponse();
     if (url.pathname === "/api/issues") return new Promise<Response>((resolve) => { lateRead = resolve; });
     throw new Error(`Unexpected boundary request ${url.pathname}`);
@@ -159,6 +165,19 @@ async function boundaryChecks() {
     const hostedSession = { ...signedIn, hosted: true, session: { ...signedIn.session, id: "hosted-session", origin: "public" } };
     response = () => json(hostedSession);
     await focus();
+    const oldOpen = win.open;
+    let pdfClosed = false;
+    win.open = (() => ({ close: () => { pdfClosed = true; } })) as typeof win.open;
+    try {
+      await React.act(async () => {
+        openAttachmentInTab("synthetic-pdf", "synthetic-conversation");
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+      assert(pdfExpectedSession === "hosted-session", "verified metadata pins the hosted PDF request");
+      assert(pdfClosed, "an older host without the session proof cannot open the PDF");
+    } finally {
+      win.open = oldOpen;
+    }
     await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
     const beforeUpgrade = privateSessionGeneration();
     response = () => json({ error: { code: "sign_in_upgrade_required", message: "Updating" } }, 503);

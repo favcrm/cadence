@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
-import { withPrivateOperation } from "../../lib/privateSession";
+import { verifiedHostedSessionId, withPrivateOperation } from "../../lib/privateSession";
 import { attachMeta } from "../app-shell/chat/attach";
 
 /**
@@ -49,12 +49,19 @@ export function openAttachmentInTab(id: string, conversation: string): void {
   const tab = window.open("about:blank", "_blank");
   if (tab === null) return;
   void withPrivateOperation(async (operation) => {
+    const expectedSession = verifiedHostedSessionId();
+    if (!expectedSession) throw new Error("A verified hosted session is required");
     const response = await operation.fetch(attachmentHref(id, conversation), {
       credentials: "same-origin",
+      headers: { "X-Cadence-Expected-Session": expectedSession },
     });
     if (!response.ok) throw new Error(`attachment read ${response.status}`);
+    if (response.headers.get("X-Cadence-Verified-Session") !== expectedSession)
+      throw new Error("Attachment session verification failed");
     const body = await response.blob();
     operation.assertCurrent();
+    if (verifiedHostedSessionId() !== expectedSession)
+      throw new Error("The hosted session changed during the attachment read");
     const href = URL.createObjectURL(body);
     try {
       tab.location.replace(href);

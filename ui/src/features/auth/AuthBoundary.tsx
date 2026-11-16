@@ -196,7 +196,7 @@ export default function AuthBoundary({ children }: {
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;
         try { sessionStorage.setItem(IDENTITY_STORE, nextIdentity); } catch { /* Same-page state still owns its drafts. */ }
-        allowPrivateReads();
+        allowPrivateReads(hosted && session?.origin === "public" ? session.id : null);
         setSession(meta);
         publish({ status: "ready", meta, accepted: meta, generation: privateSessionGeneration(), hosted });
         return true;

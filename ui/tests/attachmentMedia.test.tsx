@@ -145,6 +145,9 @@ React.act(() => {
 declare const process: { exitCode: number };
 async function pdfCheck(): Promise<void> {
   const { openAttachmentInTab } = AttachmentMediaModule;
+  const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  const sessionId = "bsi_11111111-1111-4111-8111-111111111111";
+  const otherSession = "bsi_22222222-2222-4222-8222-222222222222";
   const realFetch = globalThis.fetch;
   const realOpen = win.open;
   const realSetTimeout = win.setTimeout;
@@ -155,16 +158,21 @@ async function pdfCheck(): Promise<void> {
     close: () => { closed = true; },
   })) as unknown as typeof win.open;
   win.setTimeout = (() => 0) as unknown as typeof win.setTimeout;
-  globalThis.fetch = (async () =>
-    new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+  let requestedSession: string | null = null;
+  allowPrivateReads(sessionId);
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requestedSession = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+    return new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
       status: 200,
-      headers: { "content-type": "application/pdf" },
-    })) as typeof fetch;
+      headers: { "content-type": "application/pdf", "X-Cadence-Verified-Session": sessionId },
+    });
+  }) as typeof fetch;
   await React.act(async () => {
     openAttachmentInTab(PDF.id, CONV);
     for (let i = 0; i < 20; i++) await Promise.resolve();
   });
   ok(replaced.startsWith("blob:"), "the PDF opens through a fetched object URL");
+  equal(requestedSession, sessionId, "the PDF read pins the verified hosted session");
   ok(!closed, "a successful read keeps the tab");
 
   replaced = "";
@@ -177,9 +185,34 @@ async function pdfCheck(): Promise<void> {
   ok(closed, "a refused read closes the blank tab");
   ok(replaced === "", "a refused read opens nothing");
 
+  for (const proof of [null, otherSession]) {
+    replaced = "";
+    closed = false;
+    globalThis.fetch = (async () => new Response("synthetic", {
+      status: 200,
+      headers: proof ? { "X-Cadence-Verified-Session": proof } : {},
+    })) as typeof fetch;
+    await React.act(async () => {
+      openAttachmentInTab(PDF.id, CONV);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    ok(closed && replaced === "", "a missing or mismatched server session proof opens no PDF");
+  }
+
+  replaced = "";
+  closed = false;
+  let unverifiedRequest = false;
+  allowPrivateReads();
+  globalThis.fetch = (async () => { unverifiedRequest = true; return new Response("synthetic"); }) as typeof fetch;
+  await React.act(async () => {
+    openAttachmentInTab(PDF.id, CONV);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  });
+  ok(closed && replaced === "" && !unverifiedRequest, "a PDF cannot open without a verified hosted session");
+  allowPrivateReads(sessionId);
+
   // A response from the previous account must not open after an identity
   // reset, even if a transport ignores its abort signal.
-  const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession");
   replaced = "";
   closed = false;
   let deliver!: (response: Response) => void;
@@ -191,8 +224,8 @@ async function pdfCheck(): Promise<void> {
   await React.act(async () => {
     openAttachmentInTab(PDF.id, CONV);
     resetPrivateSession();
-    allowPrivateReads();
-    deliver(new Response("synthetic account A attachment", { status: 200 }));
+    allowPrivateReads(otherSession);
+    deliver(new Response("synthetic account A attachment", { status: 200, headers: { "X-Cadence-Verified-Session": sessionId } }));
     for (let i = 0; i < 20; i++) await Promise.resolve();
   });
   ok(request.signal?.aborted, "the retired account's request is aborted");
@@ -203,15 +236,16 @@ async function pdfCheck(): Promise<void> {
   replaced = "";
   closed = false;
   let finishBody!: (body: Blob) => void;
-  const bodyResponse = new Response(null, { status: 200 });
+  const bodyResponse = new Response(null, { status: 200, headers: { "X-Cadence-Verified-Session": sessionId } });
   bodyResponse.blob = () => new Promise<Blob>((resolve) => { finishBody = resolve; });
   globalThis.fetch = (async () => bodyResponse) as typeof fetch;
+  allowPrivateReads(sessionId);
   await React.act(async () => {
     openAttachmentInTab(PDF.id, CONV);
     for (let i = 0; i < 10; i++) await Promise.resolve();
     ok(typeof finishBody === "function", "the attachment body read has started");
     resetPrivateSession();
-    allowPrivateReads();
+    allowPrivateReads(otherSession);
     finishBody(new Blob(["synthetic account A attachment"]));
     for (let i = 0; i < 20; i++) await Promise.resolve();
   });

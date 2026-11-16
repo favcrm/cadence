@@ -1,11 +1,13 @@
 /** In-memory admission and generation for private observations, never a credential. */
 let admitted = true;
 let generation = 0;
+let hostedSessionId: string | null = null;
 const resets = new Set<() => void>();
 const pauses = new Set<() => void>();
 
 export const privateReadsAllowed = (): boolean => admitted;
 export const privateSessionGeneration = (): number => generation;
+export const verifiedHostedSessionId = (): string | null => admitted ? hostedSessionId : null;
 
 const SESSION_REQUIRED = "Session verification required";
 
@@ -279,13 +281,15 @@ export async function privateFetch(
 
 export function pausePrivateReads(): void {
   admitted = false;
+  hostedSessionId = null;
   for (const state of [...live]) {
     if (!state.controller.signal.aborted) state.controller.abort(sessionChanged());
   }
   for (const pause of [...pauses]) pause();
 }
 
-export function allowPrivateReads(): void {
+export function allowPrivateReads(verifiedHostedId: string | null = null): void {
+  hostedSessionId = verifiedHostedId && verifiedHostedId.trim() ? verifiedHostedId : null;
   admitted = true;
 }
 
