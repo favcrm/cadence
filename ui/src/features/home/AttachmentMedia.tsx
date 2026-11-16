@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { requireHostedMediaWorker } from "../../lib/hostedMediaSession";
 import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed, verifiedHostedSessionId, withPrivateOperation } from "../../lib/privateSession";
 import { attachMeta } from "../app-shell/chat/attach";
@@ -9,9 +10,8 @@ import { useNear } from "../canvas/ImageBlock";
  * CAD-2219: the operator's own attachment, shown as what it is.
  *
  * A raster gets a capped thumbnail that opens a lightbox; a clip plays inline
- * with the browser's own controls. Both read the same-origin, scoped route the
- * board serves the attachment from, so the request carries the session cookie
- * and the conversation — never a token in a URL the page could leak.
+ * with the browser's own controls. Images use verified response headers; the
+ * service worker pins each video range to this tab's verified session.
  *
  * The chip row stays: the thumbnail is an addition, and a load that fails
  * (older board, another conversation, bytes gone) removes it and leaves the
@@ -33,6 +33,10 @@ export type AttachmentFile = { id: string; name: string; size: number; mime: str
 export function attachmentHref(id: string, conversation: string): string {
   return `/api/chat/attachments/${encodeURIComponent(id)}?conversation=${encodeURIComponent(conversation)}`;
 }
+function attachmentRangeHref(id: string, conversation: string): string {
+  return `/api/chat/attachments-bound/v1/${encodeURIComponent(id)}?conversation=${encodeURIComponent(conversation)}`;
+}
+
 
 function attachmentSourceKey(conversation: string, id: string): string {
   return JSON.stringify([conversation, id]);
@@ -122,16 +126,7 @@ export default function AttachmentMedia({
     <div className="sentmedia" data-entry-media>
       {shown.map(({ file, kind, key }) =>
         kind === "video" ? (
-          <figure key={key} className="sentclip">
-            <video
-              className="sentvideo"
-              src={attachmentHref(file.id, conversation)}
-              controls
-              playsInline
-              preload="metadata"
-              onError={() => onFailed(key)}
-            />
-          </figure>
+          <PinnedVideo key={key} file={file} conversation={conversation} sourceKey={key} onFailed={onFailed} />
         ) : (
           <PinnedImage
             key={key}
@@ -158,6 +153,80 @@ export default function AttachmentMedia({
     </div>
   );
 }
+/** A clip keeps range streaming, but only after this tab controls a v1 worker. */
+function PinnedVideo({
+  file,
+  conversation,
+  sourceKey,
+  onFailed,
+}: {
+  file: AttachmentFile;
+  conversation: string;
+  sourceKey: string;
+  onFailed: (id: string) => void;
+}) {
+  const figure = useRef<HTMLElement | null>(null);
+  const video = useRef<HTMLVideoElement | null>(null);
+  const near = useNear(figure);
+  const [ready, setReady] = useState(false);
+  const [workerRevision, setWorkerRevision] = useState(0);
+  useEffect(() => {
+    if (!near) return;
+    const abort = new AbortController();
+    let active = false;
+    const service = typeof navigator !== "undefined" && "serviceWorker" in navigator ? navigator.serviceWorker : null;
+    const clear = () => {
+      const element = video.current;
+      if (!element || !element.hasAttribute("src")) return;
+      try { element.pause(); } catch { /* The media element may already be detached. */ }
+      element.removeAttribute("src");
+      try { element.load(); } catch { /* Removing the source still stops further requests. */ }
+    };
+    const controllerChanged = () => {
+      if (!active || abort.signal.aborted) return;
+      abort.abort();
+      clear();
+      setReady(false);
+      setWorkerRevision((revision) => revision + 1);
+    };
+    service?.addEventListener("controllerchange", controllerChanged);
+    const stopPause = onPrivateReadsPaused(() => { abort.abort(); clear(); setReady(false); });
+    void withPrivateOperation(async (operation) => {
+      const expectedSession = verifiedHostedSessionId();
+      if (!expectedSession) throw new Error("A verified hosted session is required");
+      await requireHostedMediaWorker(operation.signal);
+      operation.assertCurrent();
+      if (verifiedHostedSessionId() !== expectedSession)
+        throw new Error("The hosted session changed during media setup");
+      active = true;
+      setReady(true);
+    }, abort.signal).catch(() => {
+      if (!abort.signal.aborted) onFailed(sourceKey);
+    });
+    return () => {
+      service?.removeEventListener("controllerchange", controllerChanged);
+      stopPause();
+      abort.abort();
+      clear();
+      setReady(false);
+    };
+  }, [near, sourceKey, onFailed, workerRevision]);
+  return (
+    <figure ref={figure} className="sentclip">
+      <video
+        ref={video}
+        className="sentvideo"
+        src={ready ? attachmentRangeHref(file.id, conversation) : undefined}
+        crossOrigin="anonymous"
+        controls
+        playsInline
+        preload="metadata"
+        onError={() => { if (ready && privateReadsAllowed() && video.current?.hasAttribute("src")) onFailed(sourceKey); }}
+      />
+    </figure>
+  );
+}
+
 
 /** Fetch only near the viewport (or when selected), under this tab's verified session. */
 function PinnedImage({

@@ -61,7 +61,8 @@ ok(!markup.includes(`src="${attachmentHref(IMAGE.id, CONV)}"`), "the thumbnail n
 ok(markup.includes('alt="shot.png"'), "the thumbnail carries the file name");
 ok(markup.includes('loading="lazy"'), "the thumbnail loads lazily");
 ok(markup.includes("<video"), "a clip renders a player");
-ok(markup.includes(`src="${attachmentHref(CLIP.id, CONV)}"`), "the player names the scoped route");
+ok(!markup.includes(`src="${attachmentHref(CLIP.id, CONV)}"`), "the player never exposes the unpinned route");
+ok(!markup.includes("/api/chat/attachments-bound/v1/"), "the server pass cannot assume a controlling worker");
 ok(!markup.includes("brief.pdf"), "a PDF keeps only its chip, never a picture");
 equal(
   renderToStaticMarkup(React.createElement(AttachmentMedia, { files: [PDF], conversation: CONV, hosted: true })),
@@ -92,22 +93,160 @@ equal(
 );
 
 
-// ---- a refused clip falls back the same way (no bare player) ----
-const clips = document.createElement("div");
-document.body.appendChild(clips);
-const clipRoot = createRoot(clips);
-React.act(() => {
-  clipRoot.render(React.createElement(AttachmentMedia, { files: [CLIP], conversation: CONV, hosted: true }));
-});
-const player = clips.querySelector("video");
-ok(player, "a clip renders a player");
-React.act(() => {
-  player!.dispatchEvent(new win.Event("error"));
-});
-ok(!clips.querySelector(".sentclip"), "a refused clip leaves no bare player");
-React.act(() => {
-  clipRoot.unmount();
-});
+
+// ---- a clip waits for a current worker, and stops on private-session pause ----
+async function videoPinChecks(): Promise<void> {
+  const { allowPrivateReads, pausePrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  const { listenForHostedMediaSession } = require("../src/lib/hostedMediaSession") as typeof import("../src/lib/hostedMediaSession");
+  const sessionId = "bsi_11111111-1111-4111-8111-111111111111";
+  const realObserver = globalThis.IntersectionObserver;
+  const realChannel = globalThis.MessageChannel;
+  const serviceDescriptor = Object.getOwnPropertyDescriptor(navigator, "serviceWorker");
+  const mediaPrototype = win.HTMLMediaElement.prototype;
+  const realPause = mediaPrototype.pause;
+  const realLoad = mediaPrototype.load;
+  let pauses = 0;
+  let loads = 0;
+  mediaPrototype.pause = () => { pauses++; };
+  mediaPrototype.load = () => { loads++; };
+  let notify: IntersectionObserverCallback | undefined;
+  class Observer {
+    constructor(callback: IntersectionObserverCallback) { notify = callback; }
+    observe() {}
+    disconnect() {}
+  }
+  class Port {
+    other!: Port;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    onmessageerror: (() => void) | null = null;
+    postMessage(data: unknown) { queueMicrotask(() => this.other.onmessage?.({ data })); }
+    close() {}
+  }
+  class Channel {
+    port1 = new Port();
+    port2 = new Port();
+    constructor() { this.port1.other = this.port2; this.port2.other = this.port1; }
+  }
+  globalThis.IntersectionObserver = Observer as unknown as typeof IntersectionObserver;
+  globalThis.MessageChannel = Channel as unknown as typeof MessageChannel;
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const makeWorker = (version: number) => ({
+    postMessage(message: { type: string; version: number }, ports: Port[]) {
+      equal(message, { type: "cadence:media-capability", version: 1 }, "the page asks for the exact worker protocol");
+      ports[0]!.postMessage({ type: "cadence:media-capability", version });
+    },
+  });
+  const oldWorker = makeWorker(0);
+  const currentWorker = makeWorker(1);
+  let registrations = 0;
+  const service = {
+    controller: oldWorker as ReturnType<typeof makeWorker> | null,
+    register: async (url: string) => {
+      equal(url, "/notifications-sw.js", "video uses the existing same-origin worker");
+      registrations++;
+      return { update: async () => {} };
+    },
+    addEventListener(type: string, listener: (event: unknown) => void) {
+      const group = listeners.get(type) ?? new Set();
+      group.add(listener);
+      listeners.set(type, group);
+    },
+    removeEventListener(type: string, listener: (event: unknown) => void) { listeners.get(type)?.delete(listener); },
+  };
+  const emit = (type: string, event: unknown) => { for (const listener of listeners.get(type) ?? []) listener(event); };
+  Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: service });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let stopSession = () => {};
+  try {
+    resetPrivateSession();
+    allowPrivateReads(sessionId);
+    stopSession = listenForHostedMediaSession();
+    await React.act(async () => {
+      root.render(React.createElement(AttachmentMedia, { files: [CLIP], conversation: CONV, hosted: true }));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    const player = host.querySelector("video");
+    if (!player) throw new Error("a clip renders a player");
+    ok(!player.hasAttribute("src"), "an offscreen clip does not request bytes");
+    ok(notify, "a clip observes visibility before preparing its worker");
+    await React.act(async () => {
+      notify!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    equal(registrations, 1, "a visible clip registers the existing worker without asking for notification permission");
+    ok(!player.hasAttribute("src"), "an old worker cannot unlock the player");
+    await React.act(async () => {
+      service.controller = currentWorker;
+      emit("controllerchange", {});
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    equal(
+      player.getAttribute("src"),
+      `/api/chat/attachments-bound/v1/${CLIP.id}?conversation=${CONV}`,
+      "the proved worker unlocks only the versioned session-bound route",
+    );
+    equal(player.getAttribute("crossorigin"), "anonymous", "same-origin media requests allow protected headers");
+    let reply: unknown;
+    const port = { postMessage: (value: unknown) => { reply = value; }, close() {} };
+    emit("message", { source: oldWorker, data: { type: "cadence:media-session", version: 1 }, ports: [port] });
+    equal(reply, undefined, "a worker that no longer controls this tab gets no witness");
+    emit("message", { source: currentWorker, data: { type: "cadence:media-session", version: 1 }, ports: [port] });
+    equal(reply, { type: "cadence:media-session", version: 1, sessionId }, "the controlling worker gets the admitted tab witness");
+    service.controller = null;
+    reply = undefined;
+    emit("message", { source: null, data: { type: "cadence:media-session", version: 1 }, ports: [port] });
+    equal(reply, undefined, "a missing controller never receives a witness");
+    service.controller = currentWorker;
+    await React.act(async () => {
+      service.controller = oldWorker;
+      emit("controllerchange", {});
+      ok(!player.hasAttribute("src"), "a changed controller immediately unloads the clip");
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    ok(!player.hasAttribute("src"), "an unproved replacement cannot restart the clip");
+    await React.act(async () => {
+      service.controller = currentWorker;
+      emit("controllerchange", {});
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    ok(player.hasAttribute("src"), "a proved replacement can restore the clip");
+    await React.act(async () => { pausePrivateReads(); });
+    ok(!player.hasAttribute("src"), "pausing private reads synchronously unloads the clip");
+    equal([pauses, loads], [2, 2], "controller change and pause stop and unload native media");
+    reply = undefined;
+    emit("message", { source: currentWorker, data: { type: "cadence:media-session", version: 1 }, ports: [port] });
+    equal(reply, { type: "cadence:media-session", version: 1, sessionId: null }, "a paused tab refuses later worker reads");
+    await React.act(async () => { player.dispatchEvent(new win.Event("error")); });
+    ok(host.querySelector(".sentclip"), "a pause-induced media error does not discard the preview");
+    await React.act(async () => { root.render(null); });
+    allowPrivateReads(sessionId);
+    await React.act(async () => {
+      root.render(React.createElement(AttachmentMedia, { files: [CLIP], conversation: CONV, hosted: true }));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await React.act(async () => {
+      notify!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+    });
+    const recovered = host.querySelector("video");
+    ok(recovered?.hasAttribute("src"), "the same admitted session can prepare a new player");
+    await React.act(async () => { recovered!.dispatchEvent(new win.Event("error")); });
+    ok(!host.querySelector(".sentclip"), "a refused clip falls back to its metadata chip");
+  } finally {
+    stopSession();
+    await React.act(async () => { root.unmount(); });
+    host.remove();
+    if (serviceDescriptor) Object.defineProperty(navigator, "serviceWorker", serviceDescriptor);
+    else Reflect.deleteProperty(navigator, "serviceWorker");
+    globalThis.IntersectionObserver = realObserver;
+    globalThis.MessageChannel = realChannel;
+    mediaPrototype.pause = realPause;
+    mediaPrototype.load = realLoad;
+    resetPrivateSession();
+  }
+}
 
 // ---- image previews remain lazy and scoped to the verified session ----
 async function imagePinChecks(): Promise<void> {
@@ -419,7 +558,7 @@ async function pdfCheck(): Promise<void> {
   win.setTimeout = realSetTimeout;
   console.log("attachment media passed");
 }
-void imagePinChecks().then(imageRefusalChecks).then(pdfCheck).catch((error: unknown) => {
+void videoPinChecks().then(imagePinChecks).then(imageRefusalChecks).then(pdfCheck).catch((error: unknown) => {
   console.error(error);
   process.exitCode = 1;
 });

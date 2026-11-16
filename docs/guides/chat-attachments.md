@@ -378,9 +378,23 @@ deploy server support first. Raster thumbnails load near the viewport; the
 lightbox and download reuse the verified blob. Pausing private reads revokes
 its object URL. Any CSP applied to the hosted shell must allow `blob:` in
 `img-src`; `'self'` alone does not cover it in all browsers. The session ID is a
-consistency check, not a credential. This does not yet pin video element reads,
-stop a stream already started, or detect a switch in another tab after the
-final server check.
+consistency check, not a credential.
+
+Video uses `GET /api/chat/attachments-bound/v1/<chf-id>?conversation=<id>` to
+retain native byte-range streaming and seeking. Before assigning a video source,
+the page requires its controlling same-origin service worker to prove the v1
+protocol. For each range, that worker obtains the initiating tab's admitted
+session, forwards it in `X-Cadence-Expected-Session`, requires the matching
+`X-Cadence-Verified-Session` on `200`, `206` and `416`, and checks the tab
+again before releasing the response. Missing worker support, session proof or
+server support leaves only the metadata chip; there is no unpinned fallback.
+Deploy the server endpoint before the client. An already-open older client can
+still use the legacy read route; a complete cutover must retire it before
+claiming all video reads are session-bound. Registering the existing worker
+for video does not request notification permission. A hosted-shell CSP must
+allow same-origin workers and media (`worker-src 'self'` and `media-src 'self'`).
+Pausing private reads unloads the player, but bytes already delivered cannot be
+recalled and a switch in another tab is not known until it is verified.
 
 Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
 10 MiB). A video is stored and played, never decoded: the model still receives

@@ -1,5 +1,6 @@
 import { Activity, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
+import { listenForHostedMediaSession } from "../../lib/hostedMediaSession";
 import { useLocale } from "../../lib/locale";
 import { allowPrivateReads, pausePrivateReads, privateSessionGeneration, resetPrivateSession } from "../../lib/privateSession";
 import { applySharedSessionChange, sessionKey, setSessionKey } from "../../lib/sessionKey";
@@ -234,6 +235,7 @@ export default function AuthBoundary({ children }: {
   }, [discard, publish, requireHostedConfirmation, setSession]);
 
   useEffect(() => {
+    const stopMediaSession = listenForHostedMediaSession();
     pausePrivateReads();
     void recheck();
     const changed = () => {
@@ -294,6 +296,7 @@ export default function AuthBoundary({ children }: {
     document.addEventListener("visibilitychange", focused);
     const timer = window.setInterval(focused, 30_000);
     return () => {
+      stopMediaSession();
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
