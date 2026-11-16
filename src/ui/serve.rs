@@ -2508,7 +2508,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let operator = actor.as_deref() == Some("operator");
                 let counts = match (&pm, actor.as_deref()) {
                     (Some(pm), Some("operator")) => {
-                        match (project::list(&pm.dir), board::load_all(&pm.dir, None)) {
+                        match (
+                            project::list_checked(&pm.dir),
+                            board::load_all(&pm.dir, None),
+                        ) {
                             (Ok(projects), Ok(issues)) => Some((projects.len(), issues.len())),
                             _ => None,
                         }
@@ -2516,7 +2519,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     // `readable` fails closed to an empty set on an
                     // unreadable tracker; check the listing so that case
                     // omits the counts instead of reporting zeros.
-                    (Some(pm), Some(actor)) if project::list(&pm.dir).is_ok() => {
+                    (Some(pm), Some(actor)) if project::list_checked(&pm.dir).is_ok() => {
                         let readable = crate::project_policy::readable(pm, actor);
                         board::load_all(&pm.dir, None).ok().map(|issues| {
                             let issues = issues
