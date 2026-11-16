@@ -6,6 +6,8 @@ recovery. Native adapters translate delivery; they are not a second broker.
 ## Delivery matrix
 
 Observed runtimes: Codex 0.160.0 and 0.161.0, Pi 1.0.0, Claude Code 2.1.287.
+Pi 1.5.2's turn guard was also exercised through isolated RPC with a local
+model stub; this is not a production-daemon test.
 
 | Intent | Managed Codex | Managed Pi | Managed Claude | PTY |
 | --- | --- | --- | --- | --- |
@@ -167,9 +169,10 @@ versions are evidence, not certification of native steering.
 
 Native steering on these versions: managed Claude refuses strict nudges;
 Codex refuses until its exact version is validated (0.160.0/0.161.0 above);
-Pi's generated guard opens turn admission only on Pi 1.0.0, so 1.4.0 serves
-ordinary turns and refuses strict nudges (`agent show` distinguishes
-`capabilities.native_turn_steering` from `native_turn_steering_enabled`).
+Pi's generated guard opens turn admission only on Pi 1.0.0 and 1.5.2, so
+1.4.0 serves ordinary turns and refuses strict nudges (`agent show`
+distinguishes `capabilities.native_turn_steering` from
+`native_turn_steering_enabled`).
 Ordinary queued delivery and observation are unaffected.
 
 OMP startup uses its own CLI flags and core-tool names, not Pi's
