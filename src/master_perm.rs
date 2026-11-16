@@ -427,6 +427,7 @@ fn never_why_command_slice(
     slice: &[String],
     cwd: &Path,
     state_dirs: &[&Path],
+    worker_only_never: bool,
 ) -> Option<&'static str> {
     let tokens: Vec<&str> = slice.iter().map(|s| tool_name(s)).collect();
     let has = |w: &str| tokens.contains(&w);
@@ -434,7 +435,8 @@ fn never_why_command_slice(
     if has("merge") && (cadence || matches!(tokens.first(), Some(&"git" | &"gh"))) {
         return Some("merge is never requestable");
     }
-    if tokens.first() == Some(&"git")
+    if worker_only_never
+        && tokens.first() == Some(&"git")
         && has("push")
         && slice.iter().skip(1).any(|a| {
             a == "-f"
@@ -451,7 +453,7 @@ fn never_why_command_slice(
         let stripped = strip_own_state_dir(slice, cwd, state_dirs);
         let pos = cadence_positionals(&stripped);
         let noun = pos.first().copied();
-        if noun == Some("update") {
+        if worker_only_never && noun == Some("update") {
             return Some("cadence update is never requestable");
         }
         if noun == Some("rollout") || has("rollout") {
@@ -543,13 +545,15 @@ fn never_why_for(
             return Some("find -exec and -delete are never requestable");
         }
     }
-    if let Some(why) = never_why_command_slice(argv, cwd, state_dirs) {
+    if let Some(why) = never_why_command_slice(argv, cwd, state_dirs, !allow_master_scratch) {
         return Some(why);
     }
     if !allow_master_scratch && !is_non_bash_tool {
         for idx in 1..argv.len() {
             if is_cadence(&argv[idx]) || matches!(tokens[idx], "git" | "gh") {
-                if let Some(why) = never_why_command_slice(&argv[idx..], cwd, state_dirs) {
+                if let Some(why) =
+                    never_why_command_slice(&argv[idx..], cwd, state_dirs, !allow_master_scratch)
+                {
                     return Some(why);
                 }
             }
@@ -3320,11 +3324,8 @@ mod tests {
         ] {
             let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
             assert!(
-                matches!(
-                    classify(&argv, &cwd, &[], &[state.as_path()]),
-                    Class::Never { .. }
-                ),
-                "expected Class::Never for `{cmd}`"
+                never_why_for(&argv, &cwd, &[state.as_path()], false).is_some(),
+                "expected worker never_why_for rejection for `{cmd}`"
             );
             let err = evaluate_worker(
                 &state,
@@ -3342,6 +3343,20 @@ mod tests {
             .to_string();
             assert!(err.contains("never requestable"), "{cmd}: {err}");
         }
+
+        // Master's requestable `cadence update` classification remains unchanged vs origin/main.
+        assert!(
+            matches!(
+                classify(
+                    &["cadence".into(), "update".into()],
+                    &cwd,
+                    &[],
+                    &[state.as_path()]
+                ),
+                Class::Requestable { .. }
+            ),
+            "master classify for cadence update must match origin/main"
+        );
 
         let allowed_argv: Vec<String> = "cadence --wake-timeout 10 issue show CAD-616"
             .split_whitespace()
@@ -3542,8 +3557,8 @@ mod tests {
         ] {
             let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
             assert!(
-                never_why(&argv, &repo_cwd, &[state_canon.as_path()]).is_some(),
-                "expected never_why for `{cmd}`"
+                never_why_for(&argv, &repo_cwd, &[state_canon.as_path()], false).is_some(),
+                "expected worker never_why_for for `{cmd}`"
             );
             assert!(
                 !matches!(
