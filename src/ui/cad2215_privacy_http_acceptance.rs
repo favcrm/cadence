@@ -63,6 +63,9 @@ mod cad2215_member_private_delivery_http_acceptance;
 #[path = "cad2215_member_monitor_control_http_acceptance.rs"]
 mod cad2215_member_monitor_control_http_acceptance;
 
+#[path = "cad2212_independent_refusal_acceptance.rs"]
+mod cad2212_independent_refusal_acceptance;
+
 fn sso(rig: &Rig, sub: &str, role: &str) -> String {
     let now = crate::issue::time::now_epoch();
     let header = json!({"alg": "EdDSA", "typ": "JWT", "kid": KID});
