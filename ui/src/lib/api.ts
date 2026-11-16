@@ -1,7 +1,7 @@
 import type { LanePayload } from "../features/issues/lane";
 import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
-import { ApiError, errorMessage } from "./apiError";
+import { ApiError, errorMessage, parseRetryAfterSeconds } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
 import {
   bindPrivateAbort,
@@ -396,14 +396,27 @@ async function readConditional<T>(path: string, signal: AbortSignal | undefined,
       const body = await resp.json().catch(() => null);
       if (operation) operation.assertCurrent();
       else if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
-      const code = body?.code ?? body?.error?.code;
+      const record = asRecord(body);
+      const nested = asRecord(record?.error);
+      const code = typeof record?.code === "string"
+        ? record.code
+        : typeof nested?.code === "string"
+          ? nested.code
+          : undefined;
       if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
         window.dispatchEvent(new Event("cadence:session-required"));
       }
+      const retryAfter = parseRetryAfterSeconds(body, resp.headers?.get?.("retry-after") ?? null);
       throw new ApiError(
         errorMessage(body, `${resp.status} ${resp.statusText}`),
         resp.status,
-        body ? { ...body, code } : undefined,
+        record || retryAfter !== null
+          ? {
+              ...record,
+              ...(code === undefined ? {} : { code }),
+              ...(retryAfter === null ? {} : { retryAfter }),
+            }
+          : undefined,
       );
     }
     if (operation) operation.assertCurrent();
@@ -463,36 +476,52 @@ async function write<T extends object | undefined>(
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
     if (!resp.ok) {
+      const record = asRecord(parsed);
+      const retryAfter = parseRetryAfterSeconds(parsed, resp.headers?.get?.("retry-after") ?? null);
       throw new ApiError(
         errorMessage(parsed, `${resp.status} ${resp.statusText}`),
         resp.status,
-        parsed ?? undefined,
+        record || retryAfter !== null
+          ? { ...record, ...(retryAfter === null ? {} : { retryAfter }) }
+          : undefined,
       );
     }
     return parsed as WriteResp;
   });
 }
 
-function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unknown): T {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function unwrapPostJson<T>(
+  status: number,
+  fallbackMessage: string,
+  parsed: unknown,
+  retryAfterHeader?: string | null,
+): T {
   if (status < 200 || status >= 300) {
-    const record =
-      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : null;
-    const nested =
-      record && typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
-        ? (record.error as Record<string, unknown>)
-        : null;
+    const record = asRecord(parsed);
+    const nested = asRecord(record?.error);
     const nestedCode =
       typeof record?.code === "string"
         ? record.code
         : typeof nested?.code === "string"
           ? nested.code
           : undefined;
+    const retryAfter = parseRetryAfterSeconds(parsed, retryAfterHeader);
     throw new ApiError(
       errorMessage(parsed, fallbackMessage),
       status,
-      record ? { ...record, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
+      record || retryAfter !== null
+        ? {
+            ...record,
+            ...(nestedCode === undefined ? {} : { code: nestedCode }),
+            ...(retryAfter === null ? {} : { retryAfter }),
+          }
+        : undefined,
     );
   }
   return parsed as T;
@@ -512,7 +541,12 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+    return unwrapPostJson<T>(
+      resp.status,
+      `${resp.status} ${resp.statusText}`,
+      parsed,
+      resp.headers?.get?.("retry-after") ?? null,
+    );
   });
 }
 
@@ -530,7 +564,12 @@ async function put<T>(path: string, body: object, operation?: PrivateOperation):
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+    return unwrapPostJson<T>(
+      resp.status,
+      `${resp.status} ${resp.statusText}`,
+      parsed,
+      resp.headers?.get?.("retry-after") ?? null,
+    );
   });
 }
 
@@ -1674,13 +1713,19 @@ export const api = {
   /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
    *  merge approval for the exact head the drawer showed. A moved head
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
-  approveHead: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+  approveHead: (
+    repo: string,
+    pr: number,
+    head: string,
+    context?: { issue?: string; project?: string; request_id?: string },
+  ) =>
     post<{ approval_id: string }>("/api/approvals/approve", {
       repo,
       pr,
       head,
       ...(context?.issue ? { issue: context.issue } : {}),
       ...(context?.project ? { project: context.project } : {}),
+      ...(context?.request_id ? { request_id: context.request_id } : {}),
     }),
   /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
    *  approval in force, revoked, or none. */

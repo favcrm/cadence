@@ -126,6 +126,12 @@ const hostedMergeGateTranslations: Record<string, string> = {
   "Confirm stop merge": "確認停止合併",
   "Hosted merge gate": "代管合併閘道",
   "Pull request updated — a new commit was pushed.": "拉取請求已更新 — 已推送新提交。",
+  "Verify & approve": "驗證並核准",
+  "Verify with a 6-digit email code before approving this version.": "核准此版本前，請先以 6 位數電子郵件驗證碼完成驗證。",
+  "Email verification is required before approving this version.": "核准此版本前須先完成電子郵件驗證。",
+  "The owner records this project's access policy first": "請先由工作區擁有者設定此專案的存取政策",
+  "Too many verification emails requested. Wait {seconds}s before resending.": "驗證信請求過於頻繁，請等待 {seconds} 秒後再重新寄送。",
+  "Could not reach the approval service right now. Try again in a moment.": "目前無法連線至核准服務，請稍後再試。",
 };
 
 for (const [source, expected] of Object.entries(hostedMergeGateTranslations)) {

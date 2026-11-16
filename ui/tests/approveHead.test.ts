@@ -153,6 +153,231 @@ async function main() {
     if (approveCalls.length !== beforeRace + 1) {
       throw new Error(`target change during 400 fallback must suppress retry (${approveCalls.length - beforeRace} calls)`);
     }
+
+    // CAD-2332: Email-OTP step-up on `403 step_up_required`, refusal copy, and one-shot approve retry.
+    const stepUpSendCalls: number[] = [];
+    const stepUpVerifyCalls: Array<{ challenge_id: string; code: string }> = [];
+    let nextSendStepUp: () => Promise<{ challenge_id: string; expires_at: number; email_hint: string }> = async () => {
+      stepUpSendCalls.push(Date.now());
+      return { challenge_id: "ch_stepup_1", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" };
+    };
+    let nextVerifyStepUp: (challenge_id: string, code: string) => Promise<{ ok: true; authenticated_at: number; fresh_until: number }> = async (challenge_id, code) => {
+      stepUpVerifyCalls.push({ challenge_id, code });
+      return { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 };
+    };
+    api.sendApprovalStepUp = () => nextSendStepUp();
+    api.verifyApprovalStepUp = (challenge_id: string, code: string) => nextVerifyStepUp(challenge_id, code);
+
+    let stepUpApproveBehavior: "require_then_ok" | "fresh_ok" | "policy_unavailable" = "require_then_ok";
+    const stepUpApproveBodies: Array<{ repo: string; pr: number; head: string; context?: { issue?: string; project?: string; request_id?: string } }> = [];
+    stateAfterApprove = "missing";
+    api.approvalState = async () => ({
+      state: stateAfterApprove,
+      ...(stateAfterApprove === "in-force" ? { approval_id: "apr_stepup", board_revocable: true } : {}),
+    });
+    api.approveHead = async (repo: string, pr: number, head: string, context?: { issue?: string; project?: string; request_id?: string }) => {
+      stepUpApproveBodies.push({ repo, pr, head, context });
+      if (stepUpApproveBehavior === "require_then_ok" && stepUpVerifyCalls.length === 0) {
+        throw new ApiError("Recent email verification is required before approving a merge.", 403, { code: "step_up_required" });
+      }
+      if (stepUpApproveBehavior === "policy_unavailable") {
+        throw new ApiError("Policy missing", 403, { code: "project_policy_unavailable" });
+      }
+      stateAfterApprove = "in-force";
+      return { approval_id: "apr_stepup" };
+    };
+
+    const headStepUp = "1".repeat(40);
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: headStepUp, issue: "CAD-2332", project: "cadence" }));
+    });
+
+    // 1) Stale session -> approve() opens OTP flow & auto-sends challenge without retrying approveHead.
+    await React.act(async () => {
+      await latest.approve();
+    });
+    if (!latest.stepUpOpen || latest.challenge?.email_hint !== "o***@fav.hk" || stepUpSendCalls.length !== 1 || stepUpApproveBodies.length !== 1) {
+      throw new Error(`expected step_up_required to open OTP challenge and send once: ${JSON.stringify({ stepUpOpen: latest.stepUpOpen, challenge: latest.challenge, sends: stepUpSendCalls.length, approves: stepUpApproveBodies.length })}`);
+    }
+    if (latest.error !== null) {
+      throw new Error(`opening step-up challenge should clear prior error, got ${latest.error}`);
+    }
+
+    // 2) Wrong code -> refuses with clear message, keeps challenge for retry, and does not retry approveHead.
+    nextVerifyStepUp = async (challenge_id, code) => {
+      stepUpVerifyCalls.push({ challenge_id, code });
+      throw new ApiError("Verification code is invalid or expired.", 403, { code: "otp_invalid" });
+    };
+    await React.act(async () => { latest.setOtpCode("abc000000"); });
+    await React.act(async () => { await latest.verifyAndApprove(); });
+    if (
+      latest.error !== "That 6-digit code did not match. Check the email and try again." ||
+      latest.challenge === null ||
+      latest.approved ||
+      stepUpApproveBodies.length !== 1
+    ) {
+      throw new Error(`wrong OTP must keep challenge and not approve: ${JSON.stringify({ error: latest.error, challenge: latest.challenge, approved: latest.approved, approves: stepUpApproveBodies.length })}`);
+    }
+
+    // 3) Expired / exhausted code -> clears burned challenge so user can resend, still no approveHead call.
+    for (const [status, code, expectedCopy] of [
+      [403, "challenge_expired", "That verification code has expired. Send a new code and try again."],
+      [429, "too_many_attempts", "Too many verification attempts. Wait a few minutes or send a new code."],
+    ] as const) {
+      await React.act(async () => {
+        latest.clearError();
+      });
+      nextSendStepUp = async () => {
+        stepUpSendCalls.push(Date.now());
+        return { challenge_id: "ch_stepup_burned", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" };
+      };
+      await React.act(async () => { await latest.sendStepUpCode(); });
+      nextVerifyStepUp = async (challenge_id, otp) => {
+        stepUpVerifyCalls.push({ challenge_id, code: otp });
+        throw new ApiError("burned", status, { code });
+      };
+      await React.act(async () => { latest.setOtpCode("111111"); });
+      await React.act(async () => { await latest.verifyAndApprove(); });
+      if (latest.challenge !== null || latest.error !== expectedCopy || stepUpApproveBodies.length !== 1) {
+        throw new Error(`burned challenge (${code}) must clear challenge and show '${expectedCopy}', got ${JSON.stringify({ challenge: latest.challenge, error: latest.error })}`);
+      }
+    }
+
+    // 4) Valid code -> verifies and retries approveHead once with request_id, marking head approved.
+    stepUpVerifyCalls.length = 0;
+    nextSendStepUp = async () => {
+      stepUpSendCalls.push(Date.now());
+      return { challenge_id: "ch_stepup_2", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" };
+    };
+    await React.act(async () => { await latest.sendStepUpCode(); });
+    nextVerifyStepUp = async (challenge_id, code) => {
+      stepUpVerifyCalls.push({ challenge_id, code });
+      return { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 };
+    };
+    await React.act(async () => { latest.setOtpCode("654321"); });
+    await React.act(async () => { await latest.verifyAndApprove(); });
+    const approveCountAfterVerify: number = stepUpApproveBodies.length;
+    if (
+      !latest.approved ||
+      latest.stepUpOpen ||
+      stepUpVerifyCalls.length !== 1 ||
+      stepUpVerifyCalls[0].code !== "654321" ||
+      approveCountAfterVerify !== 2 ||
+      !stepUpApproveBodies[1].context?.request_id
+    ) {
+      throw new Error(`expected verified OTP to approve once with request_id: ${JSON.stringify({ approved: latest.approved, stepUpOpen: latest.stepUpOpen, verify: stepUpVerifyCalls, approves: stepUpApproveBodies })}`);
+    }
+
+    // 5) Fresh session (< 15m) -> approveHead succeeds with zero step-up prompts or calls.
+    stateAfterApprove = "missing";
+    stepUpApproveBehavior = "fresh_ok";
+    const sendsBeforeFresh = stepUpSendCalls.length;
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "2".repeat(40), issue: "CAD-2332", project: "cadence" }));
+    });
+    await React.act(async () => { await latest.approve(); });
+    if (!latest.approved || latest.stepUpOpen || stepUpSendCalls.length !== sendsBeforeFresh) {
+      throw new Error(`fresh session must approve without step-up prompt: ${JSON.stringify({ approved: latest.approved, stepUpOpen: latest.stepUpOpen })}`);
+    }
+
+    // 6) Resending inside cooldown (429 rate_limited) preserves the active challenge so the owner can still submit the received code;
+    //    and a post-verify transient failure preserves request_id for the next approve() retry.
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "6".repeat(40), issue: "CAD-2332", project: "cadence" }));
+    });
+    nextSendStepUp = async () => {
+      stepUpSendCalls.push(Date.now());
+      return { challenge_id: "ch_keep_active", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" };
+    };
+    await React.act(async () => { await latest.sendStepUpCode(); });
+    nextSendStepUp = async () => {
+      throw new ApiError("rate limited", 429, { code: "rate_limited", retryAfter: 30 });
+    };
+    await React.act(async () => { await latest.sendStepUpCode(); });
+    if (latest.challenge?.challenge_id !== "ch_keep_active" || latest.error !== "Too many verification emails requested. Wait 30s before resending.") {
+      throw new Error(`resend refusal must preserve active challenge: ${JSON.stringify({ challenge: latest.challenge, error: latest.error })}`);
+    }
+
+    let postVerifyCalls = 0;
+    let approvedAfterRetry = false;
+    let firstReqId: string | undefined;
+    let secondReqId: string | undefined;
+    nextVerifyStepUp = async (challenge_id, code) => {
+      stepUpVerifyCalls.push({ challenge_id, code });
+      return { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 };
+    };
+    api.approveHead = async (
+      repo: string,
+      pr: number,
+      head: string,
+      context?: { issue?: string; project?: string; request_id?: string },
+    ) => {
+      stepUpApproveBodies.push({ repo, pr, head, context });
+      postVerifyCalls += 1;
+      if (postVerifyCalls === 1) {
+        firstReqId = context?.request_id;
+        throw new ApiError("transient", 503, { code: "capability_unavailable" });
+      }
+      secondReqId = context?.request_id;
+      approvedAfterRetry = true;
+      stateAfterApprove = "in-force";
+      return { approval_id: "apr_retry_ok" };
+    };
+    await React.act(async () => { latest.setOtpCode("654321"); });
+    await React.act(async () => { await latest.verifyAndApprove(); });
+    if (latest.stepUpOpen || !latest.error?.includes("Could not reach the approval service right now")) {
+      throw new Error(`post-verify transient failure must close OTP box and show refusal, got ${JSON.stringify({ stepUpOpen: latest.stepUpOpen, error: latest.error })}`);
+    }
+    await React.act(async () => { await latest.approve(); });
+    if (!approvedAfterRetry || !firstReqId || secondReqId !== firstReqId) {
+      throw new Error(`post-verify approve retry must preserve request_id: ${JSON.stringify({ approvedAfterRetry, firstReqId, secondReqId })}`);
+    }
+
+    // 7) Plain refusal copy for rate_limited (with/without retryAfter), email_delivery_unavailable, capability_unavailable, and project_policy_unavailable.
+    stateAfterApprove = "missing";
+    api.approveHead = async (
+      repo: string,
+      pr: number,
+      head: string,
+      context?: { issue?: string; project?: string; request_id?: string },
+    ) => {
+      stepUpApproveBodies.push({ repo, pr, head, context });
+      if (stepUpApproveBehavior === "policy_unavailable") {
+        throw new ApiError("Policy missing", 403, { code: "project_policy_unavailable" });
+      }
+      stateAfterApprove = "in-force";
+      return { approval_id: "apr_stepup" };
+    };
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "3".repeat(40), issue: "CAD-2332", project: "cadence" }));
+    });
+    for (const [err, expected] of [
+      [new ApiError("rate", 429, { code: "rate_limited", retryAfter: 42 }), "Too many verification emails requested. Wait 42s before resending."],
+      [new ApiError("rate", 429, { code: "rate_limited" }), "Too many verification emails requested. Wait a moment before resending."],
+      [new ApiError("mail", 503, { code: "email_delivery_unavailable" }), "Could not send the verification email right now. Try again shortly."],
+      [new ApiError("cap", 503, { code: "capability_unavailable" }), "Could not reach the approval service right now. Try again in a moment."],
+    ] as const) {
+      nextSendStepUp = async () => { throw err; };
+      await React.act(async () => { await latest.sendStepUpCode(); });
+      if (latest.error !== expected || /outage/i.test(latest.error ?? "")) {
+        throw new Error(`expected plain message '${expected}', got '${latest.error}'`);
+      }
+    }
+    stepUpApproveBehavior = "policy_unavailable";
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "4".repeat(40), issue: "CAD-2332", project: "cadence" }));
+    });
+    await React.act(async () => { await latest.approve(); });
+    if (latest.error !== "The owner records this project's access policy first (`cadence issue project policy cadence`).") {
+      throw new Error(`expected project_policy_unavailable guidance with project key, got '${latest.error}'`);
+    }
+    await React.act(async () => {
+      root.render(React.createElement(ContextProbe, { head: "5".repeat(40), issue: "CAD-2332" }));
+    });
+    await React.act(async () => { await latest.approve(); });
+    if (latest.error !== "The owner records this project's access policy first (`cadence issue project policy <key>`).") {
+      throw new Error(`expected <key> fallback when project is omitted, got '${latest.error}'`);
+    }
     console.log("approval member-to-owner recovery passed");
   } finally {
     await React.act(async () => root.unmount());

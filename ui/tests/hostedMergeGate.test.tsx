@@ -205,6 +205,25 @@ async function main() {
   });
   let stepUpVerifyStatus = 200;
 
+  let nextStepUpSendResponse: () => { status: number; body: unknown; headers?: Record<string, string> } = () => ({
+    status: 200,
+    body: { challenge_id: "chal_1", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" },
+  });
+  let nextStepUpVerifyResponse: (body?: Record<string, unknown>) => { status: number; body: unknown } = () => {
+    if (stepUpVerifyStatus !== 200) {
+      return { status: stepUpVerifyStatus, body: { error: { code: "invalid_code", message: "Invalid verification code." } } };
+    }
+    return { status: 200, body: { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 } };
+  };
+  let nextApprovalStateResponse: () => { status: number; body: unknown } = () => ({
+    status: 200,
+    body: { state: "missing" },
+  });
+  let nextApproveHeadResponse: (body?: Record<string, unknown>) => { status: number; body: unknown } = () => ({
+    status: 200,
+    body: { state: "in-force", approval_id: "app_legacy_1", board_revocable: true },
+  });
+
   const requests: { method: string; path: string; body?: Record<string, unknown> }[] = [];
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -217,24 +236,31 @@ async function main() {
         : undefined;
     requests.push({ method, path: url.pathname, body: parsedBody });
 
-    const reply = (status: number, body: unknown) =>
+    const reply = (status: number, body: unknown, extraHeaders?: Record<string, string>) =>
       new Response(JSON.stringify(body), {
         status,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...extraHeaders },
       });
 
     if (url.pathname === "/api/approvals/gate") {
       const r = nextGateResponse();
       return reply(r.status, r.body);
     }
+    if (url.pathname === "/api/approvals/state") {
+      const r = nextApprovalStateResponse();
+      return reply(r.status, r.body);
+    }
+    if (url.pathname === "/api/approvals/approve") {
+      const r = nextApproveHeadResponse(parsedBody);
+      return reply(r.status, r.body);
+    }
     if (url.pathname === "/api/approvals/step-up/send") {
-      return reply(200, { challenge_id: "chal_1", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" });
+      const r = nextStepUpSendResponse();
+      return reply(r.status, r.body, r.headers);
     }
     if (url.pathname === "/api/approvals/step-up/verify") {
-      if (stepUpVerifyStatus !== 200) {
-        return reply(stepUpVerifyStatus, { error: { code: "invalid_code", message: "Invalid verification code." } });
-      }
-      return reply(200, { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 });
+      const r = nextStepUpVerifyResponse(parsedBody);
+      return reply(r.status, r.body);
     }
     if (url.pathname === "/api/approvals/merge") {
       const r = nextMergeResponse(parsedBody ?? {});
@@ -597,6 +623,154 @@ async function main() {
     await settle(() => assert(btn(view.host, "Approve & merge"), "renders Approve & merge for 409 test"));
     await click(btn(view.host, "Approve & merge"));
     await settle(() => assert((view.host.textContent ?? "").includes("Merge gate refused this pull request. Review the checks above and refresh the gate."), "maps 409 gate_refused cleanly"));
+    await view.unmount();
+  }
+
+  // 8. CAD-2332: real backend step-up codes (`otp_invalid`, `challenge_expired`, `too_many_attempts`),
+  //    `Retry-After` on `rate_limited`, `email_delivery_unavailable`, `capability_unavailable`, and `project_policy_unavailable`.
+  nextGateResponse = () => ({ status: 403, body: { error: { code: "project_policy_unavailable", message: "No access policy" } } });
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert((view.host.textContent ?? "").includes("The owner records this project's access policy first (`cadence issue project policy demo`)."), "HostedMergeGate shows project_policy_unavailable guidance with project key"));
+    await view.unmount();
+  }
+
+  nextGateResponse = () => ({ status: 200, body: makeCard("ready", { step_up_fresh: false }) });
+  for (const sendErr of [
+    { status: 429, body: { error: { code: "rate_limited", message: "slow down" } }, headers: { "Retry-After": "45" }, expected: "Too many verification emails requested. Wait 45s before resending." },
+    { status: 503, body: { error: { code: "email_delivery_unavailable", message: "mail down" } }, expected: "Could not send the verification email right now. Try again shortly." },
+    { status: 503, body: { error: { code: "capability_unavailable", message: "db down" } }, expected: "Could not reach the approval service right now. Try again in a moment." },
+  ]) {
+    nextStepUpSendResponse = () => ({ status: sendErr.status, body: sendErr.body, headers: sendErr.headers });
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Send 6-digit code"), "renders Send 6-digit code for refusal check"));
+    await click(btn(view.host, "Send 6-digit code"));
+    await settle(() => assert((view.host.textContent ?? "").includes(sendErr.expected), `renders plain copy for step-up send ${sendErr.status}`));
+    await view.unmount();
+  }
+
+  nextStepUpSendResponse = () => ({
+    status: 200,
+    body: { challenge_id: "chal_live", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" },
+  });
+  for (const verifyErr of [
+    { status: 403, code: "otp_invalid", expected: "That 6-digit code did not match. Check the email and try again.", clearsChallenge: false },
+    { status: 403, code: "challenge_expired", expected: "That verification code has expired. Send a new code and try again.", clearsChallenge: true },
+    { status: 429, code: "too_many_attempts", expected: "Too many verification attempts. Wait a few minutes or send a new code.", clearsChallenge: true },
+  ]) {
+    nextStepUpVerifyResponse = () => ({ status: verifyErr.status, body: { error: { code: verifyErr.code, message: verifyErr.code } } });
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Send 6-digit code"), "renders Send 6-digit code"));
+    await click(btn(view.host, "Send 6-digit code"));
+    await settle(() => assert(view.host.querySelector('input[inputmode="numeric"]'), "renders OTP input"));
+    await setInput(view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null, "123456");
+    await click(btn(view.host, "Verify & merge"));
+    await settle(() => assert((view.host.textContent ?? "").includes(verifyErr.expected), `renders ${verifyErr.code}`));
+    if (verifyErr.clearsChallenge) {
+      assert(Boolean(btn(view.host, "Send 6-digit code")), `clears burned challenge after ${verifyErr.code}`);
+    } else {
+      assert(Boolean(btn(view.host, "Verify & merge")), `keeps active challenge on ${verifyErr.code}`);
+    }
+    await view.unmount();
+  }
+
+  // 9. CAD-2332: DecisionPanel LegacyMergeReview drawer handles `403 step_up_required`, verifies code, and retries `/api/approvals/approve` once.
+  requests.length = 0;
+  let legacyApprovalState: "missing" | "in-force" = "missing";
+  let legacyVerified = false;
+  let legacyApproveCalls = 0;
+  nextGateResponse = () => ({ status: 404, body: { error: { message: "Not found" } } });
+  nextApprovalStateResponse = () => ({
+    status: 200,
+    body: {
+      state: legacyApprovalState,
+      ...(legacyApprovalState === "in-force" ? { approval_id: "app_legacy_stepup", board_revocable: true } : {}),
+    },
+  });
+  nextStepUpVerifyResponse = (body) => {
+    if (body?.code !== "654321") {
+      return { status: 403, body: { error: { code: "otp_invalid", message: "Wrong code" } } };
+    }
+    legacyVerified = true;
+    return { status: 200, body: { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 } };
+  };
+  nextApproveHeadResponse = () => {
+    legacyApproveCalls += 1;
+    if (!legacyVerified) {
+      return { status: 403, body: { error: { code: "step_up_required", message: "Recent email verification is required before approving a merge." } } };
+    }
+    legacyApprovalState = "in-force";
+    return { status: 200, body: { state: "in-force", approval_id: "app_legacy_stepup", board_revocable: true } };
+  };
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Approve this version"), "LegacyMergeReview renders Approve this version"));
+    await click(btn(view.host, "Approve this version"));
+    await settle(() => assert(view.host.querySelector('input[inputmode="numeric"]'), "403 step_up_required opens OTP input in LegacyMergeReview"));
+    assert((view.host.textContent ?? "").includes("o***@fav.hk"), "shows masked email hint in LegacyMergeReview");
+    await setInput(view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null, "000000");
+    await click(btn(view.host, "Verify & approve"));
+    await settle(() => assert((view.host.textContent ?? "").includes("That 6-digit code did not match. Check the email and try again."), "wrong OTP refuses cleanly in LegacyMergeReview"));
+    assert(legacyApproveCalls === 1, "wrong OTP does not retry /api/approvals/approve");
+
+    await setInput(view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null, "654321");
+    await click(btn(view.host, "Verify & approve"));
+    await settle(() => assert((view.host.textContent ?? "").includes("Approved on this board for this exact version."), "valid OTP retries /api/approvals/approve once and marks version approved"));
+    assert(Number(legacyApproveCalls) === 2, "retries /api/approvals/approve exactly once after step-up verify");
+    await view.unmount();
+  }
+
+  // 10. CAD-2332: After `step-up/verify` 200 succeeds, a subsequent `/api/approvals/merge` refusal
+  //     (`403 project_policy_unavailable` / `503 capability_unavailable`) clears the burned challenge
+  //     and retries merge directly via `Approve & merge` with the same `request_id` without re-verifying OTP.
+  requests.length = 0;
+  let postVerifyMergeAttempt = 0;
+  let cardFreshOnRefresh = false;
+  nextGateResponse = () => ({ status: 200, body: makeCard("ready", { step_up_fresh: cardFreshOnRefresh }) });
+  nextStepUpSendResponse = () => ({
+    status: 200,
+    body: { challenge_id: "chal_once", expires_at: Date.now() + 600_000, email_hint: "o***@fav.hk" },
+  });
+  nextStepUpVerifyResponse = () => ({
+    status: 200,
+    body: { ok: true, authenticated_at: Date.now(), fresh_until: Date.now() + 900_000 },
+  });
+  nextMergeResponse = () => {
+    postVerifyMergeAttempt += 1;
+    if (postVerifyMergeAttempt === 1) {
+      return { status: 403, body: { error: { code: "project_policy_unavailable", message: "No policy" } } };
+    }
+    if (postVerifyMergeAttempt === 2) {
+      return { status: 503, body: { error: { code: "capability_unavailable", message: "Unavailable" } } };
+    }
+    cardFreshOnRefresh = true;
+    nextGateResponse = () => ({ status: 200, body: makeCard("merging", { step_up_fresh: true }) });
+    return { status: 200, body: { ok: true, state: "merging", approval_id: "app_after_verify_retry", evidence_id: "ev_after_verify" } };
+  };
+  {
+    const view = await mountDecisionPanel(true, false);
+    await settle(() => assert(btn(view.host, "Send 6-digit code"), "renders Send 6-digit code for post-verify cleanup test"));
+    await click(btn(view.host, "Send 6-digit code"));
+    await settle(() => assert(view.host.querySelector('input[inputmode="numeric"]'), "renders OTP input"));
+    await setInput(view.host.querySelector('input[inputmode="numeric"]') as HTMLInputElement | null, "654321");
+    await click(btn(view.host, "Verify & merge"));
+    await settle(() => assert((view.host.textContent ?? "").includes("The owner records this project's access policy first (`cadence issue project policy demo`)."), "shows project_policy_unavailable after step-up verify"));
+    assert(!view.host.querySelector('input[inputmode="numeric"]'), "clears consumed OTP prompt when merge refuses after verify");
+    assert(Boolean(btn(view.host, "Approve & merge")), "switches primary button to Approve & merge once session is verified");
+
+    await click(btn(view.host, "Approve & merge"));
+    await settle(() => assert((view.host.textContent ?? "").includes("Could not reach the approval service right now. Try again in a moment."), "shows capability_unavailable on direct merge retry"));
+    assert(!view.host.querySelector('input[inputmode="numeric"]'), "keeps OTP prompt closed on transient 503 retry");
+
+    await click(btn(view.host, "Approve & merge"));
+    await settle(() => assert((view.host.textContent ?? "").includes("Approved and queued for merge."), "subsequent retry completes merge"));
+
+    const verifyCalls = requests.filter((r) => r.path === "/api/approvals/step-up/verify");
+    const mergeCalls = requests.filter((r) => r.path === "/api/approvals/merge");
+    assert(verifyCalls.length === 1, `must call step-up/verify once, got ${verifyCalls.length}`);
+    assert(mergeCalls.length === 3, `expected 3 merge attempts across retries, got ${mergeCalls.length}`);
+    const reqIds = mergeCalls.map((r) => (r.body as { request_id?: string }).request_id);
+    assert(Boolean(reqIds[0]) && reqIds[0] === reqIds[1] && reqIds[1] === reqIds[2], `expected stable request_id across post-verify retries, got ${JSON.stringify(reqIds)}`);
     await view.unmount();
   }
 

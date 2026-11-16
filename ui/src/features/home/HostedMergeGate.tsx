@@ -14,6 +14,12 @@ import SafeLink from "../../ui/SafeLink";
 import { isolate } from "../decisions/stagedWrite";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import { prTarget } from "./ApproveHead";
+import {
+  BURNED_STEP_UP_CHALLENGE_CODES,
+  formatProjectPolicyUnavailable,
+  formatRateLimitedStepUp,
+  makeRequestId,
+} from "./MergeForm";
 import { changeSize, type HomeNeed } from "./needs";
 
 const ROLE_RESTRICTED_CODES = new Set(["member_role", "owner_required", "approver_not_allowed"]);
@@ -22,8 +28,11 @@ const UNSUPPORTED_404_CODES = new Set(["", "not_implemented", "unknown_route", "
 type TranslateFn = (key: string) => string;
 
 const GATE_REFUSAL_MESSAGES: Record<string, string> = {
+  otp_invalid: "That 6-digit code did not match. Check the email and try again.",
   invalid_code: "That 6-digit code did not match. Check the email and try again.",
+  challenge_expired: "That verification code has expired. Send a new code and try again.",
   expired_code: "That verification code has expired. Send a new code and try again.",
+  challenge_invalid: "Verification challenge expired or missing. Send a new 6-digit code.",
   challenge_not_found: "Verification challenge expired or missing. Send a new 6-digit code.",
   challenge_consumed: "That verification code was already used. Send a new code and try again.",
   too_many_attempts: "Too many verification attempts. Wait a few minutes or send a new code.",
@@ -39,7 +48,6 @@ const GATE_REFUSAL_MESSAGES: Record<string, string> = {
   board_session_required: "Sign in to the hosted board again to continue.",
   origin_refused: "Request origin was refused. Reload this hosted board page and try again.",
   project_not_authorized: "This project is not authorized on the hosted merge gate.",
-  project_policy_unavailable: "Project merge policy is unavailable. Check workspace policy setup and try again.",
   head_moved: "Pull request updated — a new commit was pushed.",
   request_conflict: "An approval request is already in flight or conflicted. Refresh the gate and retry.",
   gate_refused: "Merge gate refused this pull request. Review the checks above and refresh the gate.",
@@ -55,23 +63,30 @@ const GATE_REFUSAL_MESSAGES: Record<string, string> = {
   pr_not_found: "Pull request was not found in the bound repository.",
   project_not_found: "Project was not found on this hosted workspace.",
   not_found: "The requested approval or pull request record was not found.",
-  capability_unavailable: "Hosted merge service is temporarily unavailable. Try again shortly.",
-  unavailable: "Hosted merge service is temporarily unavailable. Try again shortly.",
+  capability_unavailable: "Could not reach the approval service right now. Try again in a moment.",
+  unavailable: "Could not reach the approval service right now. Try again in a moment.",
 };
 
 function apiErrorCodes(err: ApiError): string[] {
   return [err.check, err.code].filter((value): value is string => Boolean(value && value.trim()));
 }
 
-function hostedGateRefusal(err: unknown, t: TranslateFn): string {
+function hostedGateRefusal(err: unknown, t: TranslateFn, project?: string | null): string {
   if (err instanceof ApiError) {
-    for (const code of apiErrorCodes(err)) {
+    const codes = apiErrorCodes(err);
+    if (codes.includes("project_policy_unavailable")) {
+      return formatProjectPolicyUnavailable(project, t);
+    }
+    if (codes.includes("rate_limited")) {
+      return formatRateLimitedStepUp(err.retryAfter, t);
+    }
+    for (const code of codes) {
       const mapped = GATE_REFUSAL_MESSAGES[code];
       if (mapped) return t(mapped);
     }
     if (err.status === 401) return t("Sign in to the hosted board again to continue.");
     if (err.status === 429) return t("Too many requests right now. Wait a moment and try again.");
-    if (err.status === 503) return t("Hosted merge service is temporarily unavailable. Try again shortly.");
+    if (err.status === 503) return t("Could not reach the approval service right now. Try again in a moment.");
     const msg = err.message.trim();
     if (msg && !/^\s*</.test(msg)) return msg;
     return t("Hosted merge request was refused.");
@@ -125,13 +140,6 @@ function isApproveCardView(value: unknown): value is ApproveCardView {
     candidate.details !== null &&
     typeof candidate.details.head_sha === "string"
   );
-}
-
-function makeRequestId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export interface HostedMergeGateState {
@@ -242,7 +250,7 @@ export function useHostedMergeGate(params: {
         setSupported(true);
         setLoading(false);
         setMemberRestricted(false);
-        setLoadError(hostedGateRefusal(err, t));
+        setLoadError(hostedGateRefusal(err, t, project));
         return null;
       }
     },
@@ -409,6 +417,7 @@ export function useHostedGateActions(params: {
   const [busy, setBusy] = useState<HostedGateActions["busy"]>(null);
   const [challenge, setChallenge] = useState<HostedStepUpChallenge | null>(null);
   const [reactiveOtpOpen, setReactiveOtpOpen] = useState(false);
+  const [localStepUpVerified, setLocalStepUpVerified] = useState(false);
   const [otpCode, setOtpCodeState] = useState("");
   const [sendBackOpen, setSendBackOpen] = useState(false);
   const [revokeOpen, setRevokeOpen] = useState(false);
@@ -421,6 +430,7 @@ export function useHostedGateActions(params: {
   useEffect(() => {
     setChallenge(null);
     setReactiveOtpOpen(false);
+    setLocalStepUpVerified(false);
     setOtpCodeState("");
     setRevokeOpen(false);
     attemptRef.current = null;
@@ -450,11 +460,11 @@ export function useHostedGateActions(params: {
       setReactiveOtpOpen(true);
       setOtpCodeState("");
     } catch (err) {
-      setError(hostedGateRefusal(err, t));
+      setError(hostedGateRefusal(err, t, card?.project));
     } finally {
       setBusy(null);
     }
-  }, [block, busy, t]);
+  }, [block, busy, card?.project, t]);
 
   const performMerge = useCallback(async () => {
     if (!card || block) return;
@@ -477,27 +487,32 @@ export function useHostedGateActions(params: {
       if (card.issue) void resources.issue(card.issue).refresh();
       await gate.refresh();
     } catch (err) {
-      if (err instanceof ApiError && err.status === 403 && err.code === "step_up_required") {
+      const codes = err instanceof ApiError ? apiErrorCodes(err) : [];
+      if (err instanceof ApiError && err.status === 403 && codes.includes("step_up_required")) {
+        setLocalStepUpVerified(false);
         setReactiveOtpOpen(true);
         try {
           const next = await api.sendApprovalStepUp();
           setChallenge(next);
           setOtpCodeState("");
         } catch (sendErr) {
-          setError(hostedGateRefusal(sendErr, t));
+          setError(hostedGateRefusal(sendErr, t, card.project));
         }
         return;
       }
-      if (err instanceof ApiError && err.status === 409 && err.code === "head_moved") {
+      if (err instanceof ApiError && err.status === 409 && codes.includes("head_moved")) {
         attemptRef.current = null;
         setChallenge(null);
         setReactiveOtpOpen(false);
         setOtpCodeState("");
-        setError(hostedGateRefusal(err, t));
+        setError(hostedGateRefusal(err, t, card.project));
         await gate.refresh();
         return;
       }
-      setError(hostedGateRefusal(err, t));
+      if (err instanceof ApiError && codes.includes("request_conflict")) {
+        attemptRef.current = null;
+      }
+      setError(hostedGateRefusal(err, t, card.project));
     }
   }, [card, block, getRequestId, gate, t]);
 
@@ -528,10 +543,23 @@ export function useHostedGateActions(params: {
     setError(null);
     setNotice(null);
     try {
-      await api.verifyApprovalStepUp(challenge.challenge_id, clean);
+      try {
+        await api.verifyApprovalStepUp(challenge.challenge_id, clean);
+      } catch (err) {
+        if (err instanceof ApiError && apiErrorCodes(err).some((c) => BURNED_STEP_UP_CHALLENGE_CODES.has(c))) {
+          setChallenge(null);
+          setOtpCodeState("");
+        }
+        setError(hostedGateRefusal(err, t, card.project));
+        return;
+      }
+      // Verification consumed the challenge and stamped the session for 900s: clear the
+      // burned challenge immediately even if the subsequent merge call fails (e.g. policy/503).
+      setLocalStepUpVerified(true);
+      setChallenge(null);
+      setReactiveOtpOpen(false);
+      setOtpCodeState("");
       await performMerge();
-    } catch (err) {
-      setError(hostedGateRefusal(err, t));
     } finally {
       setBusy(null);
     }
@@ -556,7 +584,7 @@ export function useHostedGateActions(params: {
         if (card.issue) void resources.issue(card.issue).refresh();
         await gate.refresh();
       } catch (err) {
-        setError(hostedGateRefusal(err, t));
+        setError(hostedGateRefusal(err, t, card.project));
       } finally {
         setBusy(null);
       }
@@ -589,7 +617,7 @@ export function useHostedGateActions(params: {
         );
         await gate.refresh();
       } catch (err) {
-        setError(hostedGateRefusal(err, t));
+        setError(hostedGateRefusal(err, t, card.project));
       } finally {
         setBusy(null);
       }
@@ -597,8 +625,9 @@ export function useHostedGateActions(params: {
     [card, block, busy, gate, onSentBack, t],
   );
 
+  const stepUpFresh = Boolean(card?.step_up_fresh || localStepUpVerified);
   const otpPromptOpen = Boolean(
-    card && !block && card.can_approve_and_merge && (!card.step_up_fresh || reactiveOtpOpen),
+    card && !block && card.can_approve_and_merge && (!stepUpFresh || reactiveOtpOpen),
   );
 
   return {
