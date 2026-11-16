@@ -38,6 +38,7 @@ mod devin;
 mod discovery;
 mod dispatch;
 mod doctor;
+mod endpoint;
 mod events;
 mod export;
 mod guidance;
@@ -72,6 +73,7 @@ mod resume;
 mod resume_helpers;
 mod review;
 mod rollout;
+mod routine;
 mod sandbox;
 mod secret;
 mod self_info;
@@ -129,6 +131,7 @@ use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
 pub(crate) use devin::{apply_cloud_params, insert_devin_cloud_params, split_cloud_params};
+use endpoint::EndpointAction;
 use idea::IdeaAction;
 use inbox::InboxAction;
 use intake::IntakeAction;
@@ -151,6 +154,7 @@ use resume_helpers::{
     resume_sweep, stop_group,
 };
 use rollout::RolloutAction;
+use routine::RoutineAction;
 use secret::SecretAction;
 use serde_json::json;
 use serde_json::Value;
@@ -570,6 +574,7 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             issue: Some(issue),
             source,
             action,
+            delegated: false,
             ..
         } => {
             if action != "scope" {
@@ -664,13 +669,45 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             "approval_designate",
             json!({"alias": alias, "project": project, "source": source, "active": !revoke}),
         )?,
-        AuditAction::Designations => client::rpc(state_dir, "approval_designations", json!({}))?,
-        AuditAction::Digest { since } => cadence_agent::audit::digest(state_dir, since.as_deref())?,
-        AuditAction::Revoke { id, source, reason } => client::rpc(
-            state_dir,
-            "approval_revoke",
-            json!({"id": id, "source": source, "reason": reason}),
-        )?,
+        AuditAction::Designations { project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     designations store no project. Nothing was read"
+                )));
+            }
+            client::rpc(state_dir, "approval_designations", json!({}))?
+        }
+        AuditAction::Digest { since, project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     digest takes no --project. Nothing was read"
+                )));
+            }
+            cadence_agent::audit::digest(state_dir, since.as_deref())?
+        }
+        AuditAction::Revoke {
+            id,
+            project,
+            source,
+            reason,
+        } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped revoke: local \
+                     revocations take no --project. Nothing was recorded"
+                )));
+            }
+            let source = source.ok_or_else(|| {
+                Error::usage("--source is required in local mode. Nothing was recorded")
+            })?;
+            client::rpc(
+                state_dir,
+                "approval_revoke",
+                json!({"id": id, "source": source, "reason": reason}),
+            )?
+        }
     };
     print_json(&result);
     Ok(0)
@@ -802,7 +839,12 @@ pub(crate) fn list_agents(
     }
     // The daemon counts before client-side group and project filters.
     // Keep the advertised capacity in the same scope as the visible rows.
-    list["live"] = json!(count_live_agents(&list));
+    // CAD-2215: a scoped read reports capacity as unavailable (`null`); a
+    // client-side filter must not turn that into a count of the rows it can
+    // see.
+    if list["live"].is_number() {
+        list["live"] = json!(count_live_agents(&list));
+    }
     Ok(list)
 }
 
@@ -818,10 +860,10 @@ pub(crate) fn retain_by_placement(view: &mut Value, want: registry::Placement) {
             ) == want
         });
     }
-    if view.get("live").is_some() {
+    if view["live"].is_number() {
         view["live"] = json!(count_live_agents(view));
     }
-    if view.get("footer").is_some() {
+    if view["footer"]["live"].is_number() {
         view["footer"]["live"] = json!(count_live_agents(view));
     }
 }

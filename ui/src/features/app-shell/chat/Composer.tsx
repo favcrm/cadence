@@ -11,6 +11,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
+import type { PendingAttachment } from "../../home/thread";
 import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
@@ -61,8 +62,9 @@ import {
 export interface ComposerSend {
   body: string;
   refs: ThreadRef[];
-  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`. */
-  attachments?: { id: string }[];
+  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`
+   *  (plus local metadata so the pending bubble renders chips/previews). */
+  attachments?: PendingAttachment[];
   /** One host-resolved library image pin. Not a file upload. */
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
 }
@@ -135,6 +137,8 @@ export interface ComposerProps {
    * Absent while the stream is down (last known state) and in read-only.
    */
   stop?: { onStop: () => void } | null;
+  /** Optional Up-arrow handler when the composer is empty and no menu is open. */
+  onArrowUpEmpty?: () => boolean;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -398,6 +402,7 @@ export default function Composer({
   onResolveOriginal,
   actions,
   stop = null,
+  onArrowUpEmpty,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -627,6 +632,12 @@ export default function Composer({
         return;
       }
     }
+    if (e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && draft === "" && !matches.length && !block) {
+      if (onArrowUpEmpty?.()) {
+        e.preventDefault();
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -705,7 +716,7 @@ export default function Composer({
     <button
       type="button"
       className="app-chat-attach"
-      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
+      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : t("unavailable")}`}
       title={attachEnabled
         ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
@@ -829,7 +840,7 @@ export default function Composer({
               >
                 <span className="num text-accent shrink-0">/{c.name}</span>
                 {c.arg && <span className="num text-ink-500 shrink-0">{c.arg}</span>}
-                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{c.blurb}</span>
+                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{t(c.blurb)}</span>
                 <span
                   className={`chip shrink-0 ${
                     c.kind === "read"

@@ -130,11 +130,49 @@ async function masterDoesNotWaitForTheLegacyBatch() {
   updates.close();
 }
 
+function degradedCoverageLifecycle() {
+  const states: boolean[] = [];
+  const invalidates: string[] = [];
+  let resyncs = 0;
+  let batch: (() => void) | null = null;
+  const runBatch = () => { const fn = batch; batch = null; fn?.(); };
+  const live = new LiveUpdates({
+    resync: () => { resyncs++; },
+    invalidate: (key) => { invalidates.push(key); },
+    patch: () => undefined,
+    onDegraded: (degraded) => { states.push(degraded); },
+    schedule: (fn) => { batch = fn; return 1 as unknown as ReturnType<typeof setTimeout>; },
+    cancel: () => { batch = null; },
+  });
+  live.opened();
+  equal(states, [false], "opening starts with partialUpdates cleared");
+  live.event({ type: "hello", data: JSON.stringify({ entities: true, liveness: "degraded", degraded: ["assignments", "profile_claims"] }), id: null });
+  equal(states, [false, true], "degraded hello notifies onDegraded(true)");
+  equal(live.healthy(), false, "degraded hello withholds health so recovery polling stays active");
+  live.event({ type: "issues", data: JSON.stringify({ resources: ["issues"] }), id: null });
+  runBatch();
+  equal(invalidates, ["issues"], "local invalidations still fire while coverage is degraded");
+  equal(live.healthy(), false, "subsequent local frames never flip degraded stream to healthy");
+  live.failed();
+  equal(states, [false, true, false], "failed connection resets partialUpdates to false");
+  equal(live.healthy(), false, "failed connection remains unhealthy");
+  live.opened();
+  live.event({ type: "hello", data: JSON.stringify({ entities: true, liveness: "stream", degraded: [] }), id: null });
+  equal(states.slice(-2), [false, false], "stream hello keeps partialUpdates false");
+  equal(live.healthy(), true, "stream hello restores health");
+  live.event({ type: "hello", data: "not-json", id: null });
+  equal(states.slice(-1), [true], "malformed hello triggers degraded coverage");
+  equal(resyncs, 3, "malformed hello triggers resync");
+  live.close();
+  equal(states.slice(-1), [false], "close resets partialUpdates to false");
+}
+
 async function main() {
   await race();
   await startupGap(true);
   await startupGap(false);
   await masterDoesNotWaitForTheLegacyBatch();
+  degradedCoverageLifecycle();
   console.log("live updates checks passed");
 }
 main().catch((error) => { setTimeout(() => { throw error; }); });

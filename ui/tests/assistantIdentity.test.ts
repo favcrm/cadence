@@ -3,7 +3,9 @@ import {
   identityLook,
   messageLabel,
   messagePlaceholder,
+  mutatePersonalProfile,
   readConversationIdentity,
+  readPersonalBootstrap,
 } from "../src/features/assistant/identity";
 
 function ok(condition: boolean, message: string): void {
@@ -71,4 +73,62 @@ const translate = (text: string) => text === "Assistant" ? "助理" : text;
   }
 }
 
-console.log("assistant identity isolation and literal-name behavior passed");
+// CAD-2269: fenced personal profile mutations fail closed on malformed 200s and degrade cleanly on 404/501/409.
+void (async () => {
+  ok(readPersonalBootstrap({ assistant: { bootstrap_state: "pending" } }) === "pending", "reads pending bootstrap state");
+  ok(readPersonalBootstrap({ assistant: {} }) === null, "absent bootstrap state is null");
+
+  const completed = await mutatePersonalProfile(
+    async () => ({
+      assistant: {
+        alias: "assistant",
+        bootstrap_state: "complete",
+        identity: { name: "Nova", tone: null, look: "guard", revision: 1 },
+      },
+      conversation_id: "home-1",
+      action: "complete",
+      applies: "next_turn",
+    }),
+    { expected_revision: 0, action: "complete", name: "Nova", look: "guard" },
+  );
+  ok(
+    completed.ok &&
+      completed.identity.name === "Nova" &&
+      completed.identity.look === "guard" &&
+      completed.identity.revision === 1 &&
+      completed.bootstrap === "complete" &&
+      completed.conversation === "home-1",
+    "valid 200 profile response decodes committed identity and bootstrap state",
+  );
+
+  for (const bad of [
+    null,
+    {},
+    { applies: "immediate", assistant: { identity: personal } },
+    { applies: "next_turn", assistant: { identity: { ...personal, look: "not-in-catalog" } } },
+    { applies: "next_turn", assistant: { identity: { ...personal, revision: "1" } } },
+  ]) {
+    const res = await mutatePersonalProfile(async () => bad, { expected_revision: 0, action: "update" });
+    ok(!res.ok && !res.unsupported && !res.conflict, "malformed 200 profile response fails closed");
+  }
+
+  for (const status of [404, 501]) {
+    const res = await mutatePersonalProfile(
+      async () => {
+        throw Object.assign(new Error("not implemented"), { status });
+      },
+      { expected_revision: 0, action: "complete", look: "robot" },
+    );
+    ok(!res.ok && res.unsupported === true, `${status} degrades as unsupported`);
+  }
+
+  const conflict = await mutatePersonalProfile(
+    async () => {
+      throw Object.assign(new Error("revision_conflict"), { status: 409 });
+    },
+    { expected_revision: 0, action: "complete", look: "robot" },
+  );
+  ok(!conflict.ok && conflict.conflict === true, "409 marks revision/state conflict");
+
+  console.log("assistant identity isolation and literal-name behavior passed");
+})();

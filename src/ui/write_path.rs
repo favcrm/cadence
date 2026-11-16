@@ -23,7 +23,7 @@ use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
     connections, credential_entry, crm_send, crm_smtp, endpoints, home, lane, operator, read_model,
-    social_publish, stages, threads, updates, whatsapp, wiki, workflows,
+    routines, social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1146,7 +1146,8 @@ pub(crate) fn write_route(
             | RouteId::ArtifactVersions
             | RouteId::AgentDetail
             | RouteId::AgentRoles
-            | RouteId::AutomaticUpdatesGet => {
+            | RouteId::AutomaticUpdatesGet
+            | RouteId::MemberAccessGet => {
                 err_response(500, "a read row reached the write dispatcher")
             }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
@@ -1242,6 +1243,22 @@ pub(crate) fn write_route(
                 opts,
                 caller.as_ref(),
                 app_explorer::WriteAction::Restore,
+                bound.get("id"),
+            ),
+            RouteId::MemberAccessGrant => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessGrant,
+                bound.get("id"),
+            ),
+            RouteId::MemberAccessRevoke => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessRevoke,
                 bound.get("id"),
             ),
             RouteId::Mount => app_screens::mount(
@@ -1610,6 +1627,15 @@ pub(crate) fn write_route(
         }
         let relay = operator::public_relay(&request, opts);
         let response = app_content::handle(&mut request, state_dir, route, true, relay);
+        send(request, response);
+        return;
+    }
+    if let Some(route) = routines::route(path) {
+        if *method != Method::Post || !route.is_writable() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = routines::handle_write(&mut request, state_dir, route);
         send(request, response);
         return;
     }
@@ -2096,9 +2122,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
-    // AOS-274: the policy key, built from the variant — `actor()` above is
-    // display text for attribution.
-    let spelling = operator::caller_spelling(&caller);
+    // Project authorization uses the verified subject, not the attribution
+    // handle, which can collide after sanitization.
+    let spelling = operator::policy_caller(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {

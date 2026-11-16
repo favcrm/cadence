@@ -202,11 +202,12 @@ pub(crate) fn message_bound(view: &DaemonView, state_dir: &Path, msg: &Value, t:
 
 /// One daemon-contact snapshot per finish probe — or per sweep, so N
 /// issues do not each fan out `agent_list` + `task_show`×N. `up` is
-/// false only when the socket does not exist: a cleanly stopped
-/// daemon removes it, so "not running" means "no agents" and the
-/// /proc + pane scans carry the check. A socket that exists but does
-/// not answer is a daemon that was there and stopped answering — its
-/// checks still block.
+/// false when the socket does not exist (a cleanly stopped daemon
+/// removes it) or exists with no listener (a daemon that died left it,
+/// CAD-2337): "not running" means "no agents" and the /proc + pane
+/// scans carry the check. A socket that accepts and then errors or
+/// stalls is a daemon that is there but not answering — its checks
+/// still block.
 pub(crate) struct DaemonView {
     pub(crate) up: bool,
     /// task id → its `task` payload for every task any agent lists —
@@ -277,6 +278,18 @@ pub(crate) fn lane_in_use(
     blocks.first().map(|b| b.reason.clone())
 }
 
+/// A daemon probe error as finish prints it. The client's transport
+/// error tells the reader to run a bare `cadence daemon start`, which a
+/// hosted default org refuses as remote; the local daemon is the
+/// `local` org's, so name it.
+pub(crate) fn probe_text(e: &Error) -> String {
+    e.to_string().replace(
+        "start it with `cadence daemon start`",
+        "if the local daemon should be running, start it with \
+         `cadence --org local daemon start`",
+    )
+}
+
 pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
     let mut v = DaemonView {
         up: client::socket_path(state_dir).exists(),
@@ -311,22 +324,31 @@ pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
                             ProbeError::Unreachable(e) => {
                                 v.task_errors
                                     .insert(tid.to_string(), ProbeKind::Unreachable);
-                                v.enum_unreachable.get_or_insert(e.to_string());
+                                v.enum_unreachable.get_or_insert(probe_text(&e));
                             }
                             ProbeError::Inconclusive(e) => {
                                 v.task_errors
                                     .insert(tid.to_string(), ProbeKind::Inconclusive);
-                                v.enum_inconclusive.get_or_insert(e.to_string());
+                                v.enum_inconclusive.get_or_insert(probe_text(&e));
                             }
                         },
                     }
                 }
             }
         }
+        // A socket file nobody listens on is a daemon that exited and
+        // left it behind: stopped, so "no agents" (CAD-2337). A daemon
+        // that took the connection and then failed still blocks.
+        Err(Error::Internal(m))
+            if m.starts_with("Daemon is not reachable")
+                && client::socket_has_no_listener(&client::socket_path(state_dir)) =>
+        {
+            v.up = false;
+        }
         // agent_list takes no alias — no rejection can mean "absent";
         // anything else the daemon answered is inconclusive.
-        Err(e @ Error::Internal(_)) => v.enum_unreachable = Some(e.to_string()),
-        Err(e) => v.enum_inconclusive = Some(e.to_string()),
+        Err(e @ Error::Internal(_)) => v.enum_unreachable = Some(probe_text(&e)),
+        Err(e) => v.enum_inconclusive = Some(probe_text(&e)),
     }
     v
 }

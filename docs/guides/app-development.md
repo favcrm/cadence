@@ -6,6 +6,12 @@ the app owns its surface and its domain. The shared transport is
 `@cadence/app-kit` plus the host's `screenProtocol`; the shared build input is
 the versioned app toolchain.
 
+For agent-guided day-to-day workflows across bridge caps, sandboxed forms,
+`app-storage/v1`, `@cadence/screen-ui`, and catalog validation, see the bundled
+[`cadence-app-dev`](../../skills/cadence-app-dev/SKILL.md) skill (readable via
+`cadence skill show cadence-app-dev` or linked into agent providers via
+`cadence skill install cadence-app-dev`).
+
 ## What is shared, and what stays app-owned
 
 | Layer | Owner | Contract |

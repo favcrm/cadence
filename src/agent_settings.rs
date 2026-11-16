@@ -1516,6 +1516,8 @@ fn project_pi(stored: &Option<PiPolicy>, overlay: &Overlay) -> Result<Option<PiP
     Ok(Some(policy))
 }
 
+// Hosted receipt validators in remote_cli.rs mirror this module's normalization and
+// projection; change them together (see "Seam note (CAD-2096)" there).
 fn build_snapshot(
     token: String,
     overlay: &Overlay,

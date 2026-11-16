@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FocusEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FocusEvent } from "react";
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
 import { useCanvas } from "./canvasStore";
@@ -6,13 +6,14 @@ import { EmptyState } from "../app-shell/shared/States";
 import { viewBrowser } from "./browserClient";
 import {
   alertBrowser,
+  browserSnapshot,
   cancelStop,
   confirmStop,
+  isBrowserPanelShown,
+  needsStopConfirm,
   openBrowser,
-  browserSnapshot,
   refreshBrowser,
   requestStop,
-  tabVisible,
   useBrowserTab,
   type BrowserTabState,
 } from "./browserStore";
@@ -82,34 +83,186 @@ export function BrowserTabLabel() {
 function addressParts(address: string): { scheme: string; host: string; rest: string } | null {
   try {
     const u = new URL(address);
+    if (!u.host) return null;
     return { scheme: `${u.protocol}//`, host: u.host, rest: `${u.pathname}${u.search}` };
   } catch {
     return null;
   }
 }
 
-/** The last page the assistant read, outside the live view only: inside it the
- *  provider's own address bar is the one that matters. */
-function AddressRow({ url }: { url: string | null }) {
+/** The last page the assistant read, in the header and outside the live view
+ *  only: inside it the provider's own address bar is the one that matters.
+ *  One line. The path gives way first. Inline in the first row only while the
+ *  whole host fits there (`hostFitsInRow`); otherwise on its own row under the
+ *  header, where a host that still does not fit is clipped from its START, so
+ *  the registrable end stays visible. */
+function Address({ url }: { url: string }) {
   const t = useTranslate();
-  const parts = url ? addressParts(url) : null;
+  const parts = addressParts(url);
+  const displayHost = parts ? (parts.scheme === "https://" ? parts.host : `${parts.scheme}${parts.host}`) : "";
   return (
-    <div className="bz-addr" aria-label={t("Page address")} data-empty={url ? undefined : true}>
-      <GlobeIcon size={12} />
+    <div className="bz-addr" aria-label={t("Page address")} title={parts ? `${parts.scheme}${parts.host}${parts.rest}` : url}>
       {parts ? (
         <>
-          <span className="bz-scheme">{parts.scheme}</span>
-          <b className="bz-host">{parts.host}</b>
-          <span className="bz-rest">{parts.rest}</span>
+          <b className="bz-host"><bdi>{displayHost}</bdi></b>
+          {parts.rest !== "/" ? <span className="bz-rest">{parts.rest}</span> : null}
         </>
       ) : (
-        <span>{url ?? t("No page open")}</span>
+        <span className="bz-rest"><bdi>{url}</bdi></span>
       )}
     </div>
   );
 }
 
-type Viewer = { phase: "idle" } | { phase: "connecting" } | { phase: "loading" | "open"; url: string; n: number };
+/** Whether the address's whole host fits in the room the header's first row
+ *  leaves it: the row's width less every other item on it and the gaps. That
+ *  room does not depend on where the address sits, so moving it to its own row
+ *  cannot flip the answer back. During a stop confirm the actions have their own
+ *  row and are not counted. Widths are fractional, with a pixel to spare, so a
+ *  rounded width never lets a host that is a fraction too wide stay and clip.
+ *  An address that is not shown (a phone's sheet), or no layout at all (a test
+ *  DOM), needs no row: no decision. */
+function hostFitsInRow(head: HTMLElement): boolean {
+  const items = Array.from(head.children) as HTMLElement[];
+  const addr = items.find((el) => el.classList.contains("bz-addr"));
+  const host = addr?.querySelector<HTMLElement>(".bz-host");
+  if (!addr || !host || head.clientWidth === 0 || getComputedStyle(addr).display === "none") return true;
+  const cs = getComputedStyle(head);
+  const gap = parseFloat(cs.columnGap) || 0;
+  let room = head.getBoundingClientRect().width - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)
+    - (parseFloat(cs.borderLeftWidth) || 0) - (parseFloat(cs.borderRightWidth) || 0);
+  const confirm = head.hasAttribute("data-confirm");
+  for (const el of items) {
+    if (el === addr || el.classList.contains("cv-bar") || (confirm && el.classList.contains("bz-actions"))) continue;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.position === "absolute") continue;
+    room -= el.getBoundingClientRect().width + gap;
+  }
+  // The host's text box keeps its full width even while its box clips it.
+  const text = (host.firstElementChild as HTMLElement | null) ?? host;
+  return text.getBoundingClientRect().width + 1 <= room;
+}
+
+const Icon = ({ d, children }: { d?: string; children?: React.ReactNode }) => (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    {d ? <path d={d} /> : children}
+  </svg>
+);
+
+type ViewerState =
+  | { phase: "idle" }
+  | { phase: "connecting" }
+  | {
+      phase: "loading" | "open";
+      url: string;
+      n: number;
+      /** True once this open frame stayed read-only across handoff -> active. */
+      handedBack: boolean;
+      /** True while "Open live view again" fetches a fresh URL over an existing frame. */
+      reopening: boolean;
+    };
+
+/** Header dock controls: stop confirmation, in-flight stop, or handoff/active actions. */
+function BrowserActions({
+  b,
+  phase,
+  fresh,
+  wait,
+  onView,
+  onAskStop,
+  onKeep,
+  onStop,
+  t,
+}: {
+  b: BrowserTabState;
+  phase: string;
+  fresh: boolean;
+  wait: boolean;
+  onView: () => void;
+  onAskStop: () => void;
+  onKeep: () => void;
+  onStop: () => void;
+  t: (english: string) => string;
+}) {
+  const live = phase === "active" || phase === "handoff";
+  if (b.stop === "confirm") {
+    return (
+      <>
+        <span className="bz-ask" role="alert">
+          {t("Stop the session?")}
+          {b.session?.signedIn ? ` ${t("Anything signed in to this session is lost.")}` : ""}
+        </span>
+        {/* One group: a long question never leaves either answer alone on a row. */}
+        <span key="answers" className="bz-answers">
+          <button key="go" type="button" className="btn btn-sm btn-danger" data-bz-act="go" onClick={onStop}>
+            {t("Stop session")}
+          </button>
+          <button key="keep" type="button" className="btn btn-sm" data-bz-act="keep" onClick={onKeep}>
+            {t("Keep it running")}
+          </button>
+        </span>
+      </>
+    );
+  }
+  if (b.stop === "stopping") {
+    return (
+      <button key="stopping" type="button" className="btn btn-sm btn-danger" disabled aria-disabled="true" aria-busy="true" aria-label={t("Stopping…")}>
+        <span className="btn-spin" aria-hidden />
+        <span className="bz-lbl">{t("Stopping…")}</span>
+      </button>
+    );
+  }
+  if (!live) return null;
+  const spin = wait ? <span className="btn-spin" aria-hidden /> : null;
+  return (
+    <>
+      {phase === "handoff" && fresh ? (
+        <button
+          key="view"
+          type="button"
+          className="cv-iconbtn"
+          data-bz-act="view"
+          aria-disabled={wait || undefined}
+          aria-busy={wait || undefined}
+          aria-label={t("Open live view again")}
+          title={t("Open live view again")}
+          onClick={onView}
+        >
+          {spin ?? <Icon d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" />}
+        </button>
+      ) : phase === "handoff" ? (
+        <button
+          key="view"
+          type="button"
+          className="btn btn-sm btn-primary"
+          data-bz-act="view"
+          aria-disabled={wait || undefined}
+          aria-busy={wait || undefined}
+          aria-label={t("Open live view")}
+          title={t("Open live view")}
+          onClick={onView}
+        >
+          {spin ?? <Icon d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />}
+          <span className="bz-lbl">{t("Open live view")}</span>
+        </button>
+      ) : null}
+      {/* Distinct keys: React must never reuse the Open live view node as Stop
+          session when a takeover ends under the person's focus. */}
+      <button
+        key="stop"
+        type="button"
+        className="btn btn-sm btn-danger"
+        data-bz-act="stop"
+        aria-label={t("Stop session")}
+        title={t("Stop session")}
+        onClick={b.stop === "failed" ? onStop : onAskStop}
+      >
+        <Icon><rect x="6" y="6" width="12" height="12" rx="1.5" /></Icon>
+        <span className="bz-lbl">{t("Stop session")}</span>
+      </button>
+    </>
+  );
+}
 
 /** The origin of a URL, or null when it does not parse. */
 function originOf(value: string): string | null {
@@ -138,10 +291,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
 }) {
   const t = useTranslate();
   const b = useBrowserTab();
-  const [viewer, setViewer] = useState<Viewer>({ phase: "idle" });
-  // A reopen asks for a new URL while the current frame stays; if it fails the
-  // person keeps what they had.
-  const [fetching, setFetching] = useState(false);
+  const [viewer, setViewer] = useState<ViewerState>({ phase: "idle" });
   const attempt = useRef(0);
   const frames = useRef(0);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -155,20 +305,94 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   const live = phase === "active" || phase === "handoff";
   const stopping = b.stop === "stopping";
   const viewing = viewer.phase === "loading" || viewer.phase === "open";
-  // A takeover over, or any other phase, tears the frame down. A stop in
-  // flight does not: the view stays (inert) until the stop has succeeded.
-  const showFrame = viewing && phase === "handoff";
+  // A handback tears a frame that is still loading down, and so does any
+  // other non-handoff phase. A stop in flight does not: the view stays (inert)
+  // until the stop has succeeded. A frame already open when the person presses
+  // Done stays view-only (inert) while the assistant reads on: the same node,
+  // never reloaded — even if a "Open live view again" reopen was in flight.
+  const viewOnly = phase === "active" && viewer.phase === "open";
+  // A new takeover never inherits the frame kept view-only: the person sees the
+  // assistant's new request and opens a fresh view on purpose. It is hidden in
+  // the same render the takeover arrives in (no moment where it takes input),
+  // then torn down.
+  const carried = phase === "handoff" && viewing && viewer.handedBack;
+  const fresh = viewing && !carried;
+  const showFrame = viewing && ((phase === "handoff" && !carried) || viewOnly);
   const asking = phase === "handoff" && !stopping && !showFrame;
-  const loadingUrl = viewer.phase === "loading" ? viewer.url : null;
+  const wait = viewer.phase === "connecting" || (viewing && viewer.reopening && phase === "handoff");
+  const frameBusy = wait || (showFrame && viewer.phase === "loading");
+  const loadingUrl = showFrame && viewer.phase === "loading" ? viewer.url : null;
   const instructions = b.session?.instructions ?? "";
 
-  useEffect(() => {
-    if (phase !== "handoff" && (viewer.phase !== "idle" || fetching)) {
-      attempt.current++;
-      setFetching(false);
-      setViewer({ phase: "idle" });
+  // Where the header puts the address: inline while its whole host fits, else
+  // on its own row. Measured again when the header or any item in it resizes,
+  // on the next frame so the move never feeds back into the same observation.
+  const head = useRef<HTMLElement | null>(null);
+  const [addrBelow, setAddrBelow] = useState(false);
+  const addrUrl = live && !showFrame ? b.session?.url ?? "" : "";
+  useLayoutEffect(() => {
+    const el = head.current;
+    if (!el || !addrUrl) {
+      setAddrBelow(false);
+      return;
     }
-  }, [phase, viewer.phase, fetching]);
+    const measure = () => setAddrBelow(!hostFitsInRow(el));
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    let frame = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(measure);
+    });
+    ro.observe(el);
+    for (const item of Array.from(el.children)) ro.observe(item);
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
+  }, [addrUrl, b.stop, phase, viewing, wait, sheet, expanded, st.text]);
+
+  useEffect(() => {
+    if (viewOnly) {
+      if (!viewer.handedBack || viewer.reopening) {
+        if (viewer.reopening) attempt.current++;
+        setViewer((v) => (v.phase === "open" ? { ...v, handedBack: true, reopening: false } : v));
+      }
+      return;
+    }
+    if (phase !== "handoff" || carried) {
+      if (viewer.phase !== "idle") {
+        attempt.current++;
+        setViewer({ phase: "idle" });
+      }
+    }
+  }, [phase, viewOnly, carried, viewer]);
+
+  // Clicking directly into a cross-origin iframe from outside the panel moves
+  // `document.activeElement` to the iframe without firing `focusin` on `#bz-panel`.
+  useEffect(() => {
+    if (!active || !showFrame) return;
+    const onWindowBlur = () => {
+      const at = document.activeElement;
+      if (at instanceof HTMLIFrameElement && box.current?.contains(at)) {
+        claim.current = at;
+      }
+    };
+    window.addEventListener("blur", onWindowBlur);
+    return () => window.removeEventListener("blur", onWindowBlur);
+  }, [active, showFrame]);
+
+  // Focus inside the visible frame goes with the takeover: it moves to the
+  // tab, or the heading, never onto Stop, and only if the person is still
+  // where the view was. An inactive tab keeps its hands off focus.
+  const box = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!active || !viewOnly) return;
+    const at = document.activeElement;
+    if (at !== document.body && !(at && box.current?.contains(at))) return;
+    claim.current = null;
+    (document.getElementById("bz-tab") ?? heading.current)?.focus();
+  }, [active, viewOnly]);
 
   // The frame is refused by the board's own CSP: say so now. Only an enforced
   // `frame-src` violation for the viewer's own origin counts. (A frame refused
@@ -207,7 +431,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     claim.current = null;
     const specific =
       b.stop === "failed" ? '[data-bz-act="stop"]'
-      : phase === "handoff" && !viewing ? '[data-bz-act="view"]'
+      : phase === "handoff" && !fresh ? '[data-bz-act="view"]'
       : null;
     (specific ? root.current?.querySelector<HTMLElement>(specific) : null)?.focus();
     if (document.activeElement === document.body) (document.getElementById("bz-tab") ?? heading.current)?.focus();
@@ -242,20 +466,22 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
 
   const openView = async () => {
     const mine = ++attempt.current;
-    const had = viewing;
-    if (had) setFetching(true);
-    else setViewer({ phase: "connecting" });
+    const had = fresh;
+    if (had) {
+      setViewer((v) => (v.phase === "loading" || v.phase === "open" ? { ...v, reopening: true } : v));
+    } else {
+      setViewer({ phase: "connecting" });
+    }
     try {
       const r = await viewBrowser(conversation);
       if (mine !== attempt.current) return;
-      setFetching(false);
       if (r.kind === "not_in_handoff") {
         // The takeover is over: the read that follows says so.
         setViewer({ phase: "idle" });
         void refreshBrowser();
         return;
       }
-      setViewer({ phase: "loading", url: r.url, n: ++frames.current });
+      setViewer({ phase: "loading", url: r.url, n: ++frames.current, handedBack: false, reopening: false });
       // Into the frame only if the person is still where they clicked (the
       // button, or nowhere) and nothing else has been opened since: a stop
       // confirm or the chat draft keeps the keystrokes.
@@ -267,16 +493,20 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
       });
     } catch {
       if (mine !== attempt.current) return;
-      setFetching(false);
       // A failed reopen leaves the frame the person already has.
-      if (!had) setViewer({ phase: "idle" });
+      if (had) {
+        setViewer((v) => (v.phase === "loading" || v.phase === "open" ? { ...v, reopening: false } : v));
+      } else {
+        setViewer({ phase: "idle" });
+      }
       alertBrowser("Couldn't open the live view.");
     }
   };
 
   const ask = () => {
+    const confirming = needsStopConfirm(browserSnapshot());
     requestStop();
-    focusSoon('[data-bz-act="keep"]');
+    if (confirming) focusSoon('[data-bz-act="keep"]');
   };
   const keep = () => {
     cancelStop();
@@ -284,7 +514,6 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   };
   const stop = () => {
     void confirmStop();
-    focusSoon("[data-bz-dock]");
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -295,48 +524,8 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     }
   };
 
-  // Distinct keys: React must never reuse the Open live view node as Stop
-  // session when a takeover ends under the person's focus.
-  const stopBtn = (
-    <button key="stop" type="button" className="btn btn-danger" data-bz-act="stop" onClick={b.stop === "failed" ? stop : ask}>{t("Stop session")}</button>
-  );
-  const wait = viewer.phase === "connecting" || fetching;
   const onView = () => { if (!wait) void openView(); };
-  const spin = wait ? <span className="btn-spin" aria-hidden /> : null;
-
-  let dock: React.ReactNode = null;
-  if (b.stop === "confirm") {
-    dock = (
-      <>
-        <span className="bz-ask" role="alert">{t("Stop the session?")}{b.session?.signedIn ? ` ${t("Anything signed in to this session is lost.")}` : ""}</span>
-        <button key="go" type="button" className="btn btn-danger" data-bz-act="go" onClick={stop}>{t("Stop session")}</button>
-        <button key="keep" type="button" className="btn" data-bz-act="keep" onClick={keep}>{t("Keep it running")}</button>
-      </>
-    );
-  } else if (stopping) {
-    dock = (
-      <button key="stopping" type="button" className="btn btn-danger" disabled aria-disabled="true" aria-busy="true">
-        <span className="btn-spin" aria-hidden />
-        <span className="btn-label">{t("Stopping…")}</span>
-      </button>
-    );
-  } else if (live) {
-    dock = (
-      <>
-        {phase === "handoff" && viewing ? (
-          <button key="view" type="button" className="cv-iconbtn" data-bz-act="view" aria-disabled={wait} aria-label={t("Open live view again")} title={t("Open live view again")} onClick={onView}>
-            {spin ?? <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" /></svg>}
-          </button>
-        ) : phase === "handoff" ? (
-          <button key="view" type="button" className="btn btn-primary" data-bz-act="view" aria-disabled={wait} onClick={onView}>
-            {spin}
-            <span className="btn-label">{t("Open live view")}</span>
-          </button>
-        ) : null}
-        {stopBtn}
-      </>
-    );
-  }
+  const hasDock = b.stop === "confirm" || stopping || live;
 
   return (
     <div
@@ -350,7 +539,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
       onFocus={onFocusIn}
       onBlur={onFocusOut}
     >
-      <header className="cv-head">
+      <header ref={head} className="cv-head bz-head" data-confirm={b.stop === "confirm" || undefined} data-addr={addrBelow ? "below" : undefined}>
         {sheet ? (
           <button type="button" className="cv-iconbtn cv-back" onClick={onClose} aria-label={t("Back to chat")}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -358,13 +547,27 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
             </svg>
           </button>
         ) : null}
-        <span className="arttype"><GlobeIcon size={16} /></span>
-        <span className="cv-title">
+        <span className="bz-globe"><GlobeIcon size={14} /></span>
+        <span className="bz-title">
           <b id="bz-heading" tabIndex={-1} ref={heading}>{t("Browser")}</b>
-          <span>
-            <span className="bz-badge" style={{ "--c": TONE[st.tone] } as React.CSSProperties} role="status">{st.text}</span>
-          </span>
+          <span className="bz-badge" style={{ "--c": TONE[st.tone] } as React.CSSProperties} role="status">{st.text}</span>
         </span>
+        {live && !showFrame && b.session?.url ? <Address url={b.session.url} /> : <span className="bz-gap" />}
+        {hasDock ? (
+          <div className="bz-actions" ref={dockRef} data-bz-dock tabIndex={-1} role="group" aria-label={t("Browser session actions")}>
+            <BrowserActions
+              b={b}
+              phase={phase}
+              fresh={fresh}
+              wait={wait}
+              onView={onView}
+              onAskStop={ask}
+              onKeep={keep}
+              onStop={stop}
+              t={t}
+            />
+          </div>
+        ) : null}
         {!sheet ? (
           <>
             <button type="button" className="cv-iconbtn" onClick={onExpand} aria-pressed={expanded} aria-label={t("Expand canvas")} title={t("Expand canvas")}>
@@ -377,8 +580,12 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
             </button>
           </>
         ) : null}
+        {frameBusy ? (
+          <div className="cv-bar" aria-hidden data-bz-loading>
+            <i className="cv-bar-run" />
+          </div>
+        ) : null}
       </header>
-      {live && !showFrame ? <AddressRow url={b.session?.url ?? null} /> : null}
       {/* Fixed slots, whatever the rest shows (stopping, a failed stop, a failed
           read): React must never remount the frame, which would load the bearer
           URL again. The frame is inert while the session is being stopped:
@@ -392,7 +599,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
           </div>
         ) : null}
         {showFrame && (viewer.phase === "loading" || viewer.phase === "open") ? (
-          <div className="bz-viewer" data-phase={viewer.phase} inert={stopping || undefined}>
+          <div className="bz-viewer" ref={box} data-phase={viewer.phase} inert={stopping || viewOnly || undefined}>
             <iframe
               key={viewer.n}
               data-bz-frame
@@ -403,12 +610,13 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
               // of this reaches the board.
               sandbox="allow-scripts allow-same-origin allow-forms"
               referrerPolicy="no-referrer"
-              onLoad={() => setViewer((v) => (v.phase === "loading" ? { phase: "open", url: v.url, n: v.n } : v))}
+              onLoad={() => setViewer((v) => (v.phase === "loading" ? { ...v, phase: "open" } : v))}
             />
           </div>
         ) : null}
+        {/* Outside the inert box, which assistive tech skips; always mounted so live announcements fire reliably. */}
+        <span className="sr-only" role="status">{viewOnly ? t("Live view, view only while the assistant reads.") : ""}</span>
       </div>
-      {dock ? <div className="bz-dock" ref={dockRef} data-bz-dock tabIndex={-1} role="group" aria-label={t("Browser session actions")}>{dock}</div> : null}
     </div>
   );
 }
@@ -424,18 +632,26 @@ export function BrowserCard() {
   const phase = b.session?.state ?? "none";
   // An ended session has nothing to open, and the card sits under the live turn.
   if (phase === "none" || phase === "ended") return null;
-  const shown = ((canvas.open && canvas.tabs.length > 0) || b.open) && b.focused && tabVisible(b);
+  const shown = isBrowserPanelShown(canvas, b);
+  const statusText = browserStatus(b, t).text;
   // Only the real host, never the raw address (a look-alike can hide behind
   // userinfo), on a line of its own and never preceded by words that could push
   // its end out of the box: when it is too long, the START is what is clipped.
   const host = (phase === "active" || phase === "handoff") && b.session?.url ? (addressParts(b.session.url)?.host ?? "") : "";
   return (
     <div className="bz-card-wrap">
-      <button type="button" className="artcard bz-card" data-kind="session" data-open={shown || undefined} aria-label={`${t("Open")} ${t("Browser")}`} onClick={openBrowser}>
+      <button
+        type="button"
+        className="artcard bz-card"
+        data-kind="session"
+        data-open={shown || undefined}
+        aria-label={[t("Open Browser"), statusText, host].filter(Boolean).join(" · ")}
+        onClick={openBrowser}
+      >
         <span className="arttype"><GlobeIcon size={16} /></span>
         <span className="arttext">
           <b>{t("Browser")}</b>
-          <span className="artmeta">{browserStatus(b, t).text}</span>
+          <span className="artmeta">{statusText}</span>
           {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
         </span>
       </button>

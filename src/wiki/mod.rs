@@ -88,11 +88,16 @@ pub const NATIVE_TOOL_LINE_BOUND: usize = 50_000;
 
 /// CAD-2187: the project a wiki path names, when it names one.
 ///
-/// `projects/<key>/…` and the bare `projects/<key>` — which is a page, and a
-/// directory, in its own right — are project-scoped. `global/` names no
-/// project and must never be filtered by one.
+/// Both `projects/<key>/…` and the virtual
+/// `agents/<alias>/memory/<key>/…` view carry the project's policy.
+/// `global/` names no project.
 fn project_of_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("projects/")?;
+    let rest = if let Some(rest) = path.strip_prefix("projects/") {
+        rest
+    } else {
+        let (_, rest) = path.strip_prefix("agents/")?.split_once('/')?;
+        rest.strip_prefix("memory/")?
+    };
     let (key, _) = rest.split_once('/').unwrap_or((rest, ""));
     (!key.is_empty()).then_some(key)
 }
@@ -124,6 +129,10 @@ fn admitted(pm: &Pm, caller: &Caller, path: &str) -> bool {
     let Some(project) = project_of_path(path) else {
         return true;
     };
+    admitted_project(pm, caller, project)
+}
+
+fn admitted_project(pm: &Pm, caller: &Caller, project: &str) -> bool {
     crate::project_policy::readable(pm, &policy_spelling(caller)).contains(project)
 }
 
@@ -214,11 +223,13 @@ pub fn allowed(pm: &Pm, caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     // every operation already calls, read and write alike — because a check
     // per route is a list that the next route forgets, and the reviews found
     // five such doors before the gate moved here.
-    if segs.first() == Some(&"projects") {
-        if let Some(key) = segs.get(1) {
-            if !admitted(pm, caller, &format!("projects/{key}")) {
-                return Err(no_such_page(&format!("projects/{key}")));
-            }
+    let project = match segs {
+        ["projects", key, ..] | ["agents", _, "memory", key, ..] => Some(*key),
+        _ => None,
+    };
+    if let Some(key) = project {
+        if !admitted_project(pm, caller, key) {
+            return Err(no_such_page(&segs.join("/")));
         }
     }
     allowed_by_table(caller, op, segs)
@@ -819,7 +830,11 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             if segs.len() == 3 {
                 // Project dirs holding lessons this agent authored.
                 let mut out = Vec::new();
+                let readable = crate::project_policy::readable(pm, &policy_spelling(caller));
                 for p in memory_projects(pm, &alias)? {
+                    if !readable.contains(&p) {
+                        continue;
+                    }
                     out.push(
                         Entry {
                             path: format!("{base}/{p}"),
@@ -1197,9 +1212,6 @@ pub fn read_revision_for_evidence(
     at: &str,
     max_bytes: usize,
 ) -> Result<Option<Value>> {
-    if !admitted(pm, caller, path) {
-        return Ok(None);
-    }
     let Some(found) = revision::evidence_text(pm, caller, path, at, max_bytes)? else {
         return Ok(None);
     };
@@ -2910,6 +2922,53 @@ mod tests {
         let empty = Pm::at(&empty_dir).unwrap();
         assert!(!admitted(&empty, &Caller::Operator, page));
         assert!(admitted(&empty, &Caller::Operator, "global/x.md"));
+    }
+
+    #[test]
+    fn evidence_distinguishes_an_unreadable_project_from_a_proven_missing_page() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("private")).unwrap();
+        let project = pm.dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+
+        let page = "projects/secret/notes.md";
+        write(&pm, &Caller::Operator, page, "private original", None).unwrap();
+        let revision = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let member = Caller::User("mia".into());
+        let outsider = Caller::User("rob".into());
+
+        let original = read_revision_for_evidence(&pm, &member, page, &revision, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["text"], "private original");
+        assert!(read_revision_for_evidence(
+            &pm,
+            &member,
+            "projects/secret/missing.md",
+            &revision,
+            1024,
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_revision_for_evidence(&pm, &member, page, &"0".repeat(40), 1024).is_err());
+
+        let denied = read_revision_for_evidence(&pm, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        let empty = Pm::init(&root.path().join("empty")).unwrap();
+        let unknown = read_revision_for_evidence(&empty, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(denied, unknown, "refusal must not reveal project existence");
+        assert!(!denied.contains("private original"));
     }
 
     fn segs(path: &str) -> Vec<&str> {

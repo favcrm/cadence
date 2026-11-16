@@ -125,6 +125,13 @@ async function main() {
   assert(card?.textContent?.includes("not available"), "the card says it is not available");
   assert(!card?.textContent?.includes("failed"), "an unavailable command did not fail");
 
+  requests.length = 0;
+  await type("/permissions");
+  await enter();
+  assert(!requests.some((r) => r.startsWith("POST") || r.includes("/api/master/permissions")), `hosted /permissions sends and reads nothing (got ${requests.join(", ")})`);
+  const permCard = host.querySelector('[data-cmd="permissions"]');
+  assert(permCard?.textContent?.includes("not available"), "hosted /permissions says it is not available");
+
   // No such verb: the words may be a message, and they must not be lost.
   const prose = "/tmp is full and the nightly backup stopped";
   requests.length = 0;
@@ -152,7 +159,7 @@ async function main() {
   await enter();
   assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
-  assert(!help.includes("/compact") && !help.includes("/model"), "help lists only what this board can run");
+  assert(!help.includes("/compact") && !help.includes("/model") && !help.includes("/permissions"), "help lists only what this board can run");
   assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
 
   // A board that advertises a verb gets it in the menu and sends it.
@@ -249,8 +256,100 @@ async function main() {
   requests.length = 0;
   await mount(false);
   await type("/");
-  assert(menu().length === 10, `a native menu keeps every verb (got ${menu().length})`);
+  assert(menu().length === 11, `a native menu keeps every verb (got ${menu().length})`);
+  assert(menu().some((row) => row.includes("/permissions")), "native menu includes /permissions");
   assert(host.querySelector<HTMLButtonElement>(".master-chips .chip-btn")?.disabled === false, "a native model chip stays a picker");
+
+  // CAD-2319: `offeredCommands` excludes `permissions` whenever hosted !== false,
+  // even when `/api/meta` is unresolved (null) or a hosted board advertises it.
+  const { offeredCommands } = require("../src/features/home/master") as typeof import("../src/features/home/master");
+  assert(!offeredCommands(null, ["permissions"]).some((c) => c.name === "permissions"), "unresolved hosted (null) excludes /permissions");
+  assert(!offeredCommands(true, ["permissions"]).some((c) => c.name === "permissions"), "hosted (true) excludes /permissions even if advertised");
+  assert(offeredCommands(false, []).some((c) => c.name === "permissions"), "native (false) keeps /permissions");
+
+  // CAD-2319: hosted Home (hosted=null or true) never reads `/api/master/permissions`
+  // even when the transcript carries a permission request entry, and native Home
+  // requires operator=true for writable permission controls.
+  const threadEntriesFixture: Record<string, unknown>[] = [
+    { seq: 1, role: "system", kind: "system", text: "Permission requested (perm-h1, risk high): ls", payload: { source: "permission" } },
+  ];
+  (master as { turn: unknown }).turn = {
+    state: "working",
+    message: "m-perm",
+    conversation: "home-thread",
+    summary: null,
+    since: 1,
+  };
+  let hostedPermFetchCount = 0;
+  const baseFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/threads/master") {
+      return json({ thread: { id: "home-thread", alias: "master" }, conversation: "home-thread", entries: threadEntriesFixture, more_before: false });
+    }
+    if (url.pathname === "/api/master/permissions") {
+      hostedPermFetchCount += 1;
+      return json({
+        requests: [{ id: "perm-h1", command: "ls", cwd: "/tmp", reason: "Inspect", risk: "high", status: "pending", expires_at: 9999999999, prefix: null }],
+        rules: [],
+      });
+    }
+    return baseFetch(input, init);
+  };
+  await React.act(async () => { root.render(null); });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ ...master }) as never);
+    resources.agents.write(() => ({ daemon: "reachable", agents: [{ alias: "master", state: "running" }], totals: null }) as never);
+    await resources.masterThread.refresh();
+  });
+  await settle();
+
+  hostedPermFetchCount = 0;
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: null, overview: resources.overview.get(),
+      onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    })));
+  });
+  await settle();
+  assert(hostedPermFetchCount === 0, `hosted=null Home makes zero /api/master/permissions reads (got ${hostedPermFetchCount})`);
+  assert(host.querySelector("[data-turn-allow-once]") === null, "hosted=null Home shows no writable TurnBar Allow once");
+
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: true, overview: resources.overview.get(),
+      onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    })));
+  });
+  await settle();
+  assert(hostedPermFetchCount === 0, `hosted=true Home makes zero /api/master/permissions reads even with ThreadPermission entry (got ${hostedPermFetchCount})`);
+
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: false, operator: false, overview: resources.overview.get(),
+      onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    })));
+  });
+  await settle();
+  assert(hostedPermFetchCount >= 1, "native Home reads /api/master/permissions for pending request");
+  assert(host.querySelector("[data-turn-bar][data-state='needs_approval']") !== null, "native Home with operator=false still shows TurnBar approval state");
+  assert(host.querySelector("[data-turn-allow-once]") === null, "native Home with operator=false hides writable TurnBar Allow once");
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: false, operator: true, overview: resources.overview.get(),
+      onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    })));
+  });
+  await settle();
+  assert(host.querySelector("[data-turn-bar][data-state='needs_approval']") !== null, "native Home with operator=true shows TurnBar approval state");
+  assert(host.querySelector("[data-turn-allow-once]") !== null, "native Home with operator=true enables TurnBar Allow once");
+  (master as { turn: unknown }).turn = null;
+  globalThis.fetch = baseFetch;
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

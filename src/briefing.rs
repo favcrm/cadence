@@ -64,6 +64,16 @@ pub fn role_instructions(briefing: &str) -> Option<&str> {
     (start <= end).then(|| briefing[start..end].trim_matches('\n'))
 }
 
+/// The `agent_show` request [`brief_agent`] reads the agent with: its stored
+/// job, and (for the agent itself or its group root) the `params` and `cwd`
+/// the briefing is built from (CAD-2310).
+pub(crate) fn briefing_read(alias: &str) -> Value {
+    json!({
+        "alias": alias, "limit": 0, "include_profile_instructions": true,
+        "include_catalogue_instructions": true,
+    })
+}
+
 /// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
 /// state dir — `<state>/briefings/<root>/`, where `<root>` is the
 /// upstream PM's alias when wired, else the agent's own. Split-mode
@@ -86,15 +96,7 @@ pub fn brief_agent(
     enqueue: bool,
     instructions: Option<&str>,
 ) -> Result<PathBuf> {
-    let agent = client::rpc(
-        state_dir,
-        "agent_show",
-        json!({
-            "alias": alias, "limit": 0, "include_profile_instructions": true,
-            "include_catalogue_instructions": true,
-        }),
-    )?["agent"]
-        .clone();
+    let agent = client::rpc(state_dir, "agent_show", briefing_read(alias))?["agent"].clone();
     // A mailbox consumes no briefing — nothing runs in it.
     if !registry::has_actor(
         agent["provider"].as_str().unwrap_or_default(),
@@ -462,10 +464,18 @@ pub fn briefing_body(
         "- Each durable message arrives as one turn; your turn's final\n\
          \x20 text IS the report — no `cadence message result` call is\n\
          \x20 needed. Tool denials stay denials (they don't fail the\n\
-         \x20 turn); work around them and say so in your result.\n"
+         \x20 turn); work around them and say so in your result.\n\
+         \x20 When the turn is a ticket dispatch, file the tracker done\n\
+         \x20 report once (`cadence report file --task <ID> --kind done\n\
+         \x20 --file <f>`) and include its exact `Report: <ID>/reports/<name>`\n\
+         \x20 line and a final `SHA: <head>` in your final text; unrelated\n\
+         \x20 messages owe no tracker report.\n"
     } else {
         "- `cadence message result <id> --token <turn_id> --text '<summary>'`\n\
-         \x20 — complete the running task and report it.\n\
+         \x20 — complete the running task and report it. For a ticket\n\
+         \x20 dispatch's done report, add `--report <done-report-file>` to\n\
+         \x20 that same call (it files the report once and records the\n\
+         \x20 `Report:` link); do not also run `cadence report file`.\n\
          - `cadence message ack <id> --token <turn_id>` — acknowledge\n\
          \x20 receipt without completing.\n"
     };

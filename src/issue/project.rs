@@ -423,7 +423,17 @@ pub fn list_checked(pm_dir: &Path) -> Result<Vec<Project>> {
         // lstat-style, as `list`: a symlinked or non-regular project.yaml is
         // not a project.
         if meta.is_file() && !meta.file_type().is_symlink() {
-            projects.push(load(&file)?);
+            let project = load(&file)?;
+            let name = entry.file_name();
+            if !crate::issue::model::valid_key(&project.key)
+                || name.to_str() != Some(project.key.as_str())
+            {
+                return Err(Error::internal(format!(
+                    "project key does not match its tracker directory: {}",
+                    file.display()
+                )));
+            }
+            projects.push(project);
         }
     }
     projects.sort_by(|a, b| a.key.cmp(&b.key));

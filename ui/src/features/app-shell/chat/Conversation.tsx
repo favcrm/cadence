@@ -21,6 +21,7 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
+import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -54,10 +55,12 @@ import {
   threadItems,
   threadRuns,
   visibleWindow,
+  type PendingAttachment,
   type ThreadItem,
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import { useLocale } from "../../../lib/locale";
+import { isEnglishLocale } from "../../workspace-apps/appLocale";
 import { displayUiNotice, type UiNotice } from "../../../lib/uiNotice";
 import {
   conversationLabel,
@@ -81,6 +84,7 @@ import {
 } from "../conversationClient";
 import {
   carryEarlyDraft,
+  composerDraftState,
   composerHasIntent,
   composerScope,
   moveComposerScope,
@@ -112,9 +116,9 @@ import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
 import type { ChatBinding, MediaComposerTarget } from "./types";
-import { usePendingPermission } from "./usePendingApproval";
+import { usePendingPermissionRequest } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
-import { TurnBar } from "./TurnBar";
+import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
@@ -173,6 +177,9 @@ const COMPOSER_ID = "app-shell-chat-box";
 export interface HomeListProps {
   mode: { kind: "home" };
   items: ThreadItem[];
+  /** The Home conversation this list shows; its live preview text (CAD-2228)
+   *  is painted on the turn that is generating. */
+  conversation?: string | null;
   readOnly: boolean;
   liveAfter: number;
   /** The running turn's message id, when a turn runs: a grouped turn uses it
@@ -190,7 +197,7 @@ export interface HomeListProps {
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   /** Extra content under a row (Home's plan cards). */
@@ -243,6 +250,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  */
 function HomeList({
   items,
+  conversation = null,
   readOnly,
   liveAfter,
   running = null,
@@ -440,6 +448,7 @@ function HomeList({
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
+              previewConversation={conversation}
               after={
                 <>
                   {answer && (
@@ -507,6 +516,18 @@ function hidden(item: ThreadItem): ThreadItem {
     default:
       return item;
   }
+}
+
+/**
+ * The live preview goes through the same `hideIds` rewrite as committed app
+ * text (CAD-2228). A trailing `ctx-` that has no identifier character yet is
+ * held back: the next frame completes it and the whole identifier is
+ * rewritten, so a chunk boundary can never paint a partial id in place of a
+ * later raw one.
+ */
+function redactPreview(text: string): string {
+  const redacted = hideIds(text);
+  return /\bctx-$/.test(redacted) ? redacted.slice(0, -"ctx-".length) : redacted;
 }
 
 /** The reader's anchor: the first list row still visible at the scroller's
@@ -599,7 +620,7 @@ function AppRow({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   question?: string;
@@ -647,7 +668,8 @@ function AppRow({
  * stamps the verified binding on the entry.
  */
 function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
-  const { t, formatNumber } = useLocale();
+  const { locale, t, formatNumber } = useLocale();
+  const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
   const documentVisible = useDocumentVisible();
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
@@ -905,6 +927,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     usable && loaded && thread.data?.missing !== true && draftSubject === null,
     setStreamLink,
     onSnapshot,
+    undefined,
+    // CAD-2228: preview frames on this stream belong to the selected
+    // conversation; with no selected id (legacy chat) none are painted.
+    convId,
   );
 
   const items = threadItems(thread.data);
@@ -1183,29 +1209,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   }
   const canAttach = attachEnabled && attachDestination !== undefined;
   const attachReason = fileUploadLoading
-    ? "Checking this app's file-upload capability…"
+    ? t("Checking this app's file-upload capability…")
     : !fileUpload.declared
-      ? "This app has not declared the approved text-file upload capability."
+      ? t("This app has not declared the approved text-file upload capability.")
       : !fileUpload.available
-        ? "This app's text-file upload capability is currently unavailable."
+        ? t("This app's text-file upload capability is currently unavailable.")
         : capturedBinding === null
-          ? "This saved draft has no app binding; start a new app-scoped draft before attaching."
+          ? t("This saved draft has no app binding; start a new app-scoped draft before attaching.")
           : binding.error !== null
-            ? binding.error
-            : "Attach is available only in a writable, resolved app conversation.";
+            ? t(binding.error)
+            : t("Attach is available only in a writable, resolved app conversation.");
   // Why the composer is disabled — always a plain reason, never a fake reply.
   const sendBlockedReason = viewer.operator === null
     ? viewer.access === "unavailable"
-      ? "Access could not be confirmed — retry the access check"
-      : "Checking access before messaging the assistant"
+      ? t("Access could not be confirmed — retry the access check")
+      : t("Checking access before messaging the assistant")
     : viewer.operator === false
-    ? "Sign in as the operator to message the assistant"
-    : viewer.readOnly
-      ? "Read-only · Sending is unavailable"
-      : active.state === "failed"
-        ? "The conversations could not be read — retry above"
-        : "No conversation yet — start one with + New";
-  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
+      ? t("Sign in as the operator to message the assistant")
+      : viewer.readOnly
+        ? t("Read-only · Sending is unavailable")
+        : active.state === "failed"
+          ? t("The conversations could not be read — retry above")
+          : t("No conversation yet — start one with + New");
+  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
   // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
@@ -1214,7 +1240,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // conversation's own running message; Cancel its own queued message.
   const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const permissionPending = usePendingPermission(entries);
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -1269,7 +1296,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const refs = objects(listOf("refs"), (r) =>
             typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
           );
-          const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
+          const attachments = objects(listOf("attachments"), (a): PendingAttachment | null =>
+            typeof a.id === "string"
+              ? {
+                  id: a.id,
+                  ...(typeof a.name === "string" ? { name: a.name } : {}),
+                  ...(typeof a.size === "number" ? { size: a.size } : {}),
+                  ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                }
+              : null,
+          );
           const mediaRefs = objects(listOf("media_refs"), (m) =>
             typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
               ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
@@ -1374,7 +1410,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       message: string,
       body: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       app?: { install_id: string; context_id?: string },
       operation?: PrivateOperation,
       mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
@@ -1541,7 +1577,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const send = (
     body: string,
     refs: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     originalApp?: OutboxEnvelope["app"] | null,
   ): Promise<void> => {
@@ -1901,7 +1937,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const subjectOf = (subject: string | null) => subject?.split(":")[0] ?? null;
   const draftKind = subjectOf(draftSubject);
-  const draftLabel = subjects.find((s) => s.kind === draftKind)?.label.toLowerCase();
+  const rawDraftLabel = subjects.find((s) => s.kind === draftKind)?.label;
+  const draftLabel = rawDraftLabel ? (isEnglishLocale(locale) ? rawDraftLabel.toLowerCase() : rawDraftLabel) : undefined;
   // The removed picker was the only place naming the open conversation.
   const selectedIndex = active.state === "ready" ? active.conversations.findIndex((c) => c.id === convId) : -1;
   const convLabel =
@@ -1909,16 +1946,31 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       ? null
       : draftSubject !== null
         ? draftLabel
-          ? `New ${draftLabel} conversation (unsaved)`
-          : "New conversation (unsaved)"
+          ? t("New {label} conversation (unsaved)").replace("{label}", () => draftLabel)
+          : t("New conversation (unsaved)")
         : active.selected !== null
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;
 
+  const canReplyDraft = canSend && binding.error === null;
+  const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (!canReplyDraft) return;
+      const existing = composerDraftState(composerKey).text;
+      setComposerDraft(composerKey, appendRejectReplyDraft(existing, command));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
+    <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
+    <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
-    <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
+    <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
         className="btn btn-ghost btn-sm app-chat-rail"
@@ -2196,6 +2248,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 allowLegacy={legacyTranscript}
                 copy={false}
                 running={view.running}
+                previewConversation={convId}
+                previewTransform={redactPreview}
                 after={
                   <>
                     {view.cards.map((item) => (
@@ -2260,7 +2314,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
             rows.push(
               <li key={typingKey} className="text-secondary text-ink-300 break-words" data-chat-typing>
-                <ThreadTurn items={[]} running density={density} />
+                <ThreadTurn
+                  items={[]}
+                  running
+                  density={density}
+                  previewConversation={convId}
+                  previewTransform={redactPreview}
+                />
               </li>,
             );
           }
@@ -2402,7 +2462,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
-      <TurnBar state={turnState} actions={turnActions} reconnecting={streamDown} />
+      <TurnBar
+        state={turnState}
+        actions={turnActions}
+        reconnecting={streamDown}
+        permission={
+          pendingPermission !== null
+            ? {
+                request: pendingPermission,
+                readOnly: !canControlTurns,
+                onRejectAndReply: canReplyDraft ? (req) => rejectAndReplyDraft(req.command) : undefined,
+                onFocusComposer: focusPaneComposer,
+              }
+            : null
+        }
+      />
       <Composer
         key={composerKey}
         density="compact"
@@ -2425,6 +2499,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return false;
         }}
         onNotice={setComposerNotice}
+        onArrowUpEmpty={turnState.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
@@ -2436,6 +2511,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       />
     </div>
     </ImageConversation.Provider>
+    </PermissionReplyContext.Provider>
+    </PermissionEnabledContext.Provider>
     </AssistantActorProvider>
   );
 }

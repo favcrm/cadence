@@ -2,6 +2,16 @@ import { ApiError } from "../../lib/api";
 import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateFetch, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "../../lib/privateSession";
 import type { Agent } from "../../lib/types";
+import {
+  parseGrantReceipt,
+  parseMemberAccess,
+  parseRevokeReceipt,
+  type MemberAccess,
+  type MemberAccessGrant,
+  type RevokeReceipt,
+} from "../explorer/memberAccess";
+import type { AppDisplayI18n, ListingDisplayLocale } from "./appLocale";
+import type { ScreenNavigation } from "./screen/screenProtocol";
 
 export type { Agent };
 
@@ -33,6 +43,11 @@ export interface Installation {
   connection_slots: string[];
   /** CAD-1543: the live bundle declares host SMTP custody (a screen lists `smtp.bind`). */
   smtp_custody?: boolean;
+  /** Declared screen navigation (`app-screens/v1|v2` single-screen package). */
+  navigation?: ScreenNavigation | null;
+  /** Display translations merged from `listing.i18n` and top-level `i18n`. */
+  i18n?: AppDisplayI18n | null;
+  listing?: Listing | null;
   /** Tenant lifecycle; absent on older/local responses, which mean active. */
   state?: "active" | "disabled" | "removed";
   disabled_at?: number | null;
@@ -306,9 +321,19 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
 /** One of the company's connected Instagram accounts or Facebook Pages (CAD-1290, CAD-1939). */
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
-  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
-  connectLink: (id: string, returnTo: string, signal?: AbortSignal, toolkit?: string) =>
-    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo, ...(toolkit ? { toolkit } : {}) }),
+  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board.
+   *  `inlineConsent` is forwarded only when the board's own consent read proves the central
+   *  capability exists, so an older daemon never receives a field it does not accept. */
+  connectLink: (id: string, returnTo: string, signal?: AbortSignal, toolkit?: string, inlineConsent?: boolean) =>
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo, ...(toolkit ? { toolkit } : {}), ...(inlineConsent ? { inline_consent: true } : {}) }),
+  /** The owner-scoped publishing consent read. Its shape is the host's contract with the board:
+   *  `{available, consents:[{destination_id, toolkit, state:"allowed"|"none"}]}`; an older board
+   *  answers 404 and the caller treats that as unavailable, never as "no consent". */
+  consentStatus: (id: string, signal?: AbortSignal) =>
+    request<unknown>(`${installation(id)}/publishing/consent`, signal),
+  /** Ask the board to record the owner's consent for the account this install publishes to. */
+  consentAllow: (id: string, body: { destination_id: string }) =>
+    request<unknown>(`${installation(id)}/publishing/consent`, undefined, body),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
   useDestination: (id: string, body: { destination_id: string; toolkit?: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
@@ -510,6 +535,7 @@ export interface CatalogCard {
   never?: string;
   about?: string; can?: string[]; screenshots?: { file: string; caption?: string }[];
   setup?: SetupStep[]; data?: ListingData; access_notes?: Record<string, string>;
+  i18n?: Record<string, ListingDisplayLocale> | null;
   changes?: { version: string; notes: string[]; keeps?: string }[];
 }
 
@@ -521,6 +547,8 @@ export interface HomeInstallation {
    *  apart (the old `/apps` list's `Project:` chip). */
   project?: string;
   tagline?: string; icon?: string;
+  navigation?: ScreenNavigation | null;
+  i18n?: AppDisplayI18n | null;
   /** The readable manifest record, when the row carries one: the
    *  installed version, the bundle's own listing copy and the recorded
    *  catalogue locator (null/absent on a path or Git install). */
@@ -561,6 +589,7 @@ export interface Listing {
   setup?: SetupStep[]; access_notes?: Record<string, string>;
   changes?: { version: string; notes: string[]; keeps?: string }[];
   data?: ListingData;
+  i18n?: Record<string, ListingDisplayLocale> | null;
 }
 
 export interface InstallRequest {
@@ -653,6 +682,26 @@ export const appExplorer = {
   removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
+  /** CAD-2215: exact-conversation member access. The read is validated
+   * before it reaches a screen, so a malformed answer is an error, not an
+   * empty grant list. `members` is the daemon-verified live roster (or
+   * null when this session cannot prove it); `grant_reason` is "" only
+   * when a grant may proceed. */
+  memberAccess: async (installId: string, signal?: AbortSignal): Promise<MemberAccess> =>
+    parseMemberAccess(await request<unknown>(`/api/app-installations/${part(installId)}/member-access`, signal)),
+  /** One exact member and one exact conversation; the pinned digest is the
+   * one the operator reviewed. */
+  grantMemberAccess: async (
+    installId: string,
+    body: { member_sub: string; conversation_id: string; expected_digest: string },
+  ): Promise<MemberAccessGrant> =>
+    parseGrantReceipt(await request<unknown>(`/api/app-installations/${part(installId)}/member-access`, undefined, body)),
+  /** Revoke exactly that member from exactly that conversation. */
+  revokeMemberAccess: async (
+    installId: string,
+    body: { member_sub: string; conversation_id: string },
+  ): Promise<RevokeReceipt> =>
+    parseRevokeReceipt(await request<unknown>(`/api/app-installations/${part(installId)}/member-access/revoke`, undefined, body)),
 };
 // ---------- CAD-1137: per-session snapshot cache ----------
 

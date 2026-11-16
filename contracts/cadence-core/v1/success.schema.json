@@ -125,6 +125,22 @@
         "op",
         "value"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "agent.form.check"
+        },
+        "value": {
+          "$ref": "#/$defs/FormCheckValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
     }
   ],
   "required": [
@@ -299,6 +315,38 @@
       "required": [
         "field",
         "message"
+      ]
+    },
+    "FormCheckValue": {
+      "description": "Success value of `agent.form.check`. When `valid`, `fallback` and\n`digest` are set; otherwise `message` names the refused path and rule,\nexactly as the native daemon words it.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Lowercase sha256 hex of the envelope's compact JSON; a replay of the\nsame form compares equal.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback": {
+          "description": "The text every surface that does not render the form shows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid"
       ]
     },
     "ManifestPreflightValue": {

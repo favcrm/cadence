@@ -12,10 +12,15 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use cadence_core::board_api::{HUMAN_ROOM_CURSOR_FORMAT, HUMAN_ROOM_SCOPE_ACK, READER_SCOPE_FIELD};
+
+use super::job_events_opaque;
+use super::scoped_cursor::{CursorBinding, CursorDirection, ScopedCursorCodec};
 use super::{optional_i64, optional_str, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::store::human_threads::{
-    HumanRoomMember, HumanRoomSummary, RoomMember, VerifiedHuman, ROOM_TOPIC_TYPE,
+    HumanRoomCursorScope, HumanRoomMember, HumanRoomSummary, RoomMember, VerifiedHuman,
+    ROOM_TOPIC_TYPE,
 };
 use crate::store::TopicPost;
 
@@ -97,16 +102,138 @@ fn member_json(m: &HumanRoomMember) -> Value {
     json!({"kind": m.kind, "id": m.id, "label": m.label})
 }
 
-/// A post as the room shows it: the body redacted by the existing helper
-/// (CAD-818 R4), the sender as a durable id plus presentation label.
-fn post_json(p: &TopicPost) -> Value {
-    json!({
-        "id": p.id,
-        "seq": p.seq,
-        "sender": {"id": p.sender_uid, "label": p.sender},
-        "body": crate::store::conversations::body(&p.body),
-        "created": p.created,
-    })
+fn require_cursor_format(params: &Value) -> Result<()> {
+    if params.get("cursor_format").and_then(Value::as_str) != Some(HUMAN_ROOM_CURSOR_FORMAT) {
+        return Err(Error::invalid(
+            "human_room_cursor_format",
+            "human room requires opaque-v1 cursors",
+        ));
+    }
+    Ok(())
+}
+
+fn cursor_param<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match params.get(field) {
+        None => Ok(None),
+        Some(Value::String(token)) if !token.is_empty() => Ok(Some(token)),
+        Some(Value::Number(_)) => Err(Error::invalid(
+            "human_room_cursor_numeric",
+            "human room requires an opaque cursor",
+        )),
+        Some(_) => Err(Error::invalid(
+            "human_room_cursor_invalid",
+            "human room cursor is invalid",
+        )),
+    }
+}
+
+/// Bind positions to the verified human, room incarnation and join boundary.
+struct HumanRoomCursors {
+    codec: ScopedCursorCodec,
+    principal: String,
+    resource: String,
+}
+
+impl HumanRoomCursors {
+    fn new(
+        shared: &Shared,
+        actor: &VerifiedHuman,
+        room: &str,
+        scope: &HumanRoomCursorScope,
+    ) -> Result<Self> {
+        let created = format!("{:016x}", scope.created);
+        let cutoff = scope.cutoff.to_string();
+        Ok(Self {
+            codec: shared.scoped_cursor_codec()?,
+            principal: job_events_opaque::framed(&[&actor.org, &actor.id]),
+            resource: job_events_opaque::framed(&[
+                "human-room",
+                room,
+                &scope.topic,
+                &created,
+                &cutoff,
+            ]),
+        })
+    }
+
+    fn binding(&self, direction: CursorDirection) -> CursorBinding<'_> {
+        CursorBinding {
+            domain: match direction {
+                CursorDirection::Backward => "human-room-history",
+                CursorDirection::Forward => "human-room-marker",
+            },
+            direction,
+            principal: &self.principal,
+            resource: &self.resource,
+            filters: "",
+        }
+    }
+
+    fn open(&self, token: &str, direction: CursorDirection) -> Result<i64> {
+        self.codec
+            .open(token, &self.binding(direction))
+            .map_err(|_| {
+                Error::invalid("human_room_cursor_invalid", "human room cursor is invalid")
+            })
+    }
+
+    fn seal(&self, seq: i64, direction: CursorDirection) -> Result<String> {
+        self.codec
+            .seal(seq, &self.binding(direction))
+            .map_err(|_| super::scoped_cursor_config::unavailable())
+    }
+
+    /// Stable only for this principal and membership incarnation; unlike a
+    /// cursor, this contains no page position and permits safe page merging.
+    fn scope_id(&self) -> Result<String> {
+        self.codec
+            .stable_row_id(
+                "human-room-scope",
+                &self.resource,
+                self.principal.as_bytes(),
+            )
+            .map_err(|_| super::scoped_cursor_config::unavailable())
+    }
+
+    /// Never relay the global sequence, including on write receipts.
+    fn post(&self, post: &TopicPost, cutoff: i64) -> Result<Value> {
+        if post.seq <= cutoff {
+            return Err(Error::rejected("human room post is unavailable"));
+        }
+        Ok(json!({
+            "id": post.id,
+            "sender": {"id": post.sender_uid, "label": post.sender},
+            "body": crate::store::conversations::body(&post.body),
+            "created": post.created,
+            "read_cursor": self.seal(post.seq, CursorDirection::Forward)?,
+        }))
+    }
+}
+
+#[cfg(test)]
+fn inject_page_fault(shared: &Shared, page: &mut Value) {
+    if let Some(fault) = &shared.human_room_page_fault {
+        match fault.load(std::sync::atomic::Ordering::Acquire) {
+            1 => {
+                page.as_object_mut()
+                    .expect("response object")
+                    .remove(READER_SCOPE_FIELD);
+            }
+            2 => {
+                if let Some(post) = page.get_mut("post") {
+                    post["seq"] = json!(1);
+                } else if let Some(post) = page
+                    .get_mut("posts")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|p| p.first_mut())
+                {
+                    post["seq"] = json!(1);
+                }
+            }
+            3 => page[READER_SCOPE_FIELD] = json!("wrong-scope"),
+            _ => {}
+        }
+    }
 }
 
 /// The stored peer subject must name a current roster member; the store
@@ -222,6 +349,7 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         let token = required_str(params, "token")?;
+        require_cursor_format(params)?;
         let current = self.human_current_actor(token, params, peer_pid)?;
         if !self.ask_authority(token, peer_pid, &current) {
             return Err(Error::rejected(
@@ -229,6 +357,8 @@ impl Shared {
             ));
         }
         let room = room_param(params)?;
+        let scope = self.store.human_room_cursor_scope(&current.actor, room)?;
+        let cursors = HumanRoomCursors::new(self, &current.actor, room, &scope)?;
         let agent_uid = required_str(params, "agent_uid")?;
         let key = client_id_param(params)?;
         let body = required_str(params, "body")?;
@@ -259,6 +389,7 @@ impl Shared {
         let (post, _fresh) =
             self.store
                 .human_room_ask_post(&current.actor, room, agent_uid, key, body)?;
+        let post_receipt = cursors.post(&post, scope.cutoff)?;
         // The queue names the selected member's uid; the enqueue transaction
         // refuses if the alias now belongs to another uid (no reassignment race).
         let send =
@@ -279,12 +410,17 @@ impl Shared {
             .get("duplicate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok(json!({
+        self.reprove_human_room(token, params, peer_pid, room, &current.actor, &scope)?;
+        let mut result = json!({
             "request": request_id,
-            "post": post_json(&post),
+            "post": post_receipt,
             "target": {"uid": agent_uid, "alias": alias},
             "duplicate": duplicate,
-        }))
+        });
+        result[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
+        #[cfg(test)]
+        inject_page_fault(self, &mut result);
+        Ok(result)
     }
 
     /// `human_rooms_list {token}`
@@ -325,9 +461,29 @@ impl Shared {
         Ok(json!({"room": room}))
     }
 
-    /// `human_room_read {token, room, before?, limit?}`
+    fn reprove_human_room(
+        &self,
+        token: &str,
+        params: &Value,
+        peer_pid: u32,
+        room: &str,
+        actor: &VerifiedHuman,
+        expected: &HumanRoomCursorScope,
+    ) -> Result<()> {
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        if current.actor.id != actor.id
+            || self.store.human_room_cursor_scope(&current.actor, room)? != *expected
+        {
+            return Err(Error::rejected("human room access changed"));
+        }
+        Ok(())
+    }
+
+    /// `human_room_read {token, room, cursor_format, before?, limit?}`
     pub(super) fn rpc_human_room_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let token = required_str(params, "token")?;
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        require_cursor_format(params)?;
         let room = room_param(params)?;
         let limit = optional_i64(params, "limit").unwrap_or(50);
         if !(1..=HISTORY_MAX).contains(&limit) {
@@ -336,30 +492,65 @@ impl Shared {
                 format!("limit must be 1-{HISTORY_MAX}"),
             ));
         }
-        let before = optional_i64(params, "before");
+        let supplied = cursor_param(params, "before")?;
+        let scope = self.store.human_room_cursor_scope(&current.actor, room)?;
+        let cursors = HumanRoomCursors::new(self, &current.actor, room, &scope)?;
+        let position = supplied
+            .map(|token| cursors.open(token, CursorDirection::Backward))
+            .transpose()?;
         let members = self.store.human_room_members(&current.actor, room)?;
-        let posts = self
-            .store
-            .human_room_history(&current.actor, room, before, limit)?;
-        let can_ask = self.ask_authority(required_str(params, "token")?, peer_pid, &current);
-        Ok(json!({
+        let (posts, more_before) =
+            self.store
+                .human_room_history_scoped(&current.actor, room, &scope, position, limit)?;
+        let before = posts
+            .first()
+            .map(|post| cursors.seal(post.seq, CursorDirection::Backward))
+            .transpose()?
+            .or_else(|| supplied.map(str::to_owned));
+        let rows = posts
+            .iter()
+            .map(|post| cursors.post(post, scope.cutoff))
+            .collect::<Result<Vec<_>>>()?;
+        let can_ask = self.ask_authority(token, peer_pid, &current);
+        self.reprove_human_room(token, params, peer_pid, room, &current.actor, &scope)?;
+        let mut page = json!({
             "room": room,
+            "scope_id": cursors.scope_id()?,
             "members": members.iter().map(member_json).collect::<Vec<_>>(),
-            "posts": posts.iter().map(post_json).collect::<Vec<_>>(),
+            "posts": rows,
             "can_ask": can_ask,
-        }))
+            "before": before,
+            "more_before": more_before,
+        });
+        page[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
+        #[cfg(test)]
+        inject_page_fault(self, &mut page);
+        Ok(page)
     }
 
     /// `human_room_post {token, room, client_id, body}` — transcript only.
     pub(super) fn rpc_human_room_post(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let token = required_str(params, "token")?;
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        require_cursor_format(params)?;
         let room = room_param(params)?;
+        let scope = self.store.human_room_cursor_scope(&current.actor, room)?;
+        let cursors = HumanRoomCursors::new(self, &current.actor, room, &scope)?;
         let client_id = client_id_param(params)?;
         let body = required_str(params, "body")?;
         let (post, created) = self
             .store
             .human_room_post(&current.actor, room, client_id, body)?;
-        Ok(json!({"post": post_json(&post), "created": created}))
+        let post = cursors.post(&post, scope.cutoff)?;
+        self.reprove_human_room(token, params, peer_pid, room, &current.actor, &scope)?;
+        let mut result = json!({
+            "post": post,
+            "created": created,
+        });
+        result[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
+        #[cfg(test)]
+        inject_page_fault(self, &mut result);
+        Ok(result)
     }
 
     /// `human_notifications {token}` — all the actor's inbox groups, the
@@ -506,14 +697,29 @@ impl Shared {
         Ok(json!({"removed": removed}))
     }
 
-    /// `human_room_mark_read {token, room, seq}`
+    /// `human_room_mark_read {token, room, cursor_format, cursor}`
     pub(super) fn rpc_human_room_mark_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        require_cursor_format(params)?;
+        if params.get("seq").is_some() {
+            return Err(Error::invalid(
+                "human_room_cursor_numeric",
+                "human room requires an opaque cursor",
+            ));
+        }
         let room = room_param(params)?;
-        let seq = optional_i64(params, "seq")
-            .ok_or_else(|| Error::invalid("invalid_request", "seq must be an integer"))?;
-        let unread = self.store.human_room_mark_read(&current.actor, room, seq)?;
-        Ok(json!({"unread": unread}))
+        let token = cursor_param(params, "cursor")?.ok_or_else(|| {
+            Error::invalid("human_room_cursor_invalid", "human room cursor is required")
+        })?;
+        let scope = self.store.human_room_cursor_scope(&current.actor, room)?;
+        let cursors = HumanRoomCursors::new(self, &current.actor, room, &scope)?;
+        let seq = cursors.open(token, CursorDirection::Forward)?;
+        let unread = self
+            .store
+            .human_room_mark_read(&current.actor, room, seq, &scope)?;
+        let mut result = json!({"unread": unread});
+        result[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
+        Ok(result)
     }
 
     /// `human_room_add {token, room, human_subject | agent_uid}` — creator

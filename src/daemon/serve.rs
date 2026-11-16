@@ -174,6 +174,13 @@ impl PeerUidScope {
     }
 }
 
+/// Supplies socket UID context to in-process authorization tests only; it
+/// does not demonstrate an operating-system isolation boundary.
+#[cfg(all(test, feature = "test-seam"))]
+pub(super) fn test_peer_uid_scope(uid: u32) -> PeerUidScope {
+    PeerUidScope::enter(uid)
+}
+
 impl Drop for PeerUidScope {
     fn drop(&mut self) {
         FRAME_PEER_UID.with(|slot| slot.set(self.0));

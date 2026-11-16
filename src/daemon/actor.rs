@@ -233,6 +233,30 @@ impl Shared {
         self.wake();
     }
 
+    /// A hot-restart adoption that cannot proceed: the in-flight message goes
+    /// `unknown` and `turn_adopt_refused` names why.
+    fn settle_refused_adoption(
+        &self,
+        alias: &str,
+        entries: &[crate::store::AdoptEntry],
+        error: &Error,
+    ) {
+        let reason = error.to_string();
+        let _ = self
+            .store
+            .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
+        for e in entries {
+            let _ = self.store.event_public(
+                alias,
+                "turn_adopt_refused",
+                json!({"message": e.message_id,
+                       "turn_id": e.turn_id,
+                       "reason": reason}),
+            );
+        }
+        self.adoptions_settle(alias);
+    }
+
     /// Open/adopt and enroll the endpoint before any queued turn can run.
     pub(super) fn open_actor_adapter(
         self: &Arc<Self>,
@@ -253,7 +277,20 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        let adapter = adapter::build(agent, hooks, &log_path, &self.provider_env, self.agent_uid)?;
+        // Taken before `build`: an agent refused at build (CAD-2239: a reviewer
+        // pane row) must settle its in-flight adoption like a refused adoption,
+        // not leave the message `running`.
+        let adoption = self.store.take_adoption(alias);
+        let adapter =
+            match adapter::build(agent, hooks, &log_path, &self.provider_env, self.agent_uid) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    if let Some(entries) = &adoption {
+                        self.settle_refused_adoption(alias, entries, &error);
+                    }
+                    return Err(error);
+                }
+            };
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
@@ -271,27 +308,13 @@ impl Shared {
         // agent only: the message goes `unknown`, the actor exits into
         // `attention`, and `turn_adopt_refused` names the check that
         // failed.
-        let adoption = self.store.take_adoption(alias);
         let identity = match &adoption {
             // One pane proof covers the whole list — every entry for
             // an alias shares the marker's generation/pane/session.
             Some(entries) => match adapter.open_adopted(agent, &entries[0]) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    let reason = error.to_string();
-                    let _ = self
-                        .store
-                        .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
-                    for e in entries {
-                        let _ = self.store.event_public(
-                            alias,
-                            "turn_adopt_refused",
-                            json!({"message": e.message_id,
-                                   "turn_id": e.turn_id,
-                                   "reason": reason}),
-                        );
-                    }
-                    self.adoptions_settle(alias);
+                    self.settle_refused_adoption(alias, entries, &error);
                     return Err(error);
                 }
             },
@@ -453,6 +476,12 @@ impl Shared {
                             if !settled {
                                 return Err(error);
                             }
+                        }
+                        // CAD-2215: a polled kickoff completing here is the
+                        // private ledger's trigger, exactly like the other
+                        // completion paths. Never a shared effect.
+                        if status == "completed" && pending.source == "job_dispatch" {
+                            let _ = self.settle_private_completion(&pending.id);
                         }
                         cloud_held = None;
                         ctl.cloud_held.store(false, Ordering::SeqCst);
@@ -1112,6 +1141,13 @@ impl Shared {
         } else {
             self.store
                 .finish(message, &status, &stored, result.error.as_deref())?;
+            // CAD-2215: the adapter's own completion is the private
+            // ledger's trigger. A ledger failure is reported beside the
+            // committed completion, never folded into it. Only a kickoff
+            // can own a private delivery, so ordinary turns do no work.
+            if status == "completed" && message.source == "job_dispatch" {
+                let _ = self.settle_private_completion(&message.id);
+            }
         }
         self.notify_routed_target(message, &stored);
         self.wake();

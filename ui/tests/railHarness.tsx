@@ -7,7 +7,7 @@ import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen } from "../sr
 import { restoreDetailFocus } from "../src/features/work-items/focus";
 import { LocaleProvider } from "../src/lib/locale";
 
-type RailProps = Omit<ComponentProps<typeof NeedsRail>, "onOpenDecision">;
+type RailProps = Omit<ComponentProps<typeof NeedsRail>, "onOpenDecision"> & { hosted?: boolean };
 
 /**
  * The App's mount in miniature (CAD-1811): NeedsRail hands its reading item
@@ -46,6 +46,7 @@ export default function RailWithDetail(props: RailProps) {
           href={`/projects/demo/issues/${id}`}
           onClose={close}
           readOnly={props.readOnly}
+          hosted={props.hosted}
           onOpen={() => {}}
           home={{
             open: decision,

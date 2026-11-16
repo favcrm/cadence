@@ -14,7 +14,104 @@ interface MdNode {
   value?: string;
   url?: string;
   children?: MdNode[];
+  data?: { hProperties?: Record<string, unknown> };
 }
+
+type CalloutKind = "note" | "tip" | "important" | "warning" | "caution";
+
+const CALLOUT_LABELS: Record<CalloutKind, string> = {
+  note: "Note",
+  tip: "Tip",
+  important: "Important",
+  warning: "Warning",
+  caution: "Caution",
+};
+
+const CALLOUT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*\r?\n|[ \t]+|$)/i;
+
+function stripBlockquotePrefix(line: string): { quotes: number; rest: string } {
+  let pos = 0;
+  let quotes = 0;
+  while (pos < line.length) {
+    let spaces = 0;
+    while (spaces < 3 && pos + spaces < line.length && line.charCodeAt(pos + spaces) === 0x20) {
+      spaces += 1;
+    }
+    if (pos + spaces >= line.length || line.charCodeAt(pos + spaces) !== 0x3e) break;
+    quotes += 1;
+    pos += spaces + 1;
+    if (pos < line.length && line.charCodeAt(pos) === 0x20) pos += 1;
+  }
+  return { quotes, rest: line.slice(pos) };
+}
+
+function scanFence(rest: string): { ch: "`" | "~"; len: number; after: string } | null {
+  let i = 0;
+  while (i < 3 && i < rest.length && rest.charCodeAt(i) === 0x20) i += 1;
+  const first = rest[i];
+  if (first !== "`" && first !== "~") return null;
+  let end = i;
+  while (end < rest.length && rest[end] === first) end += 1;
+  const len = end - i;
+  return len >= 3 ? { ch: first, len, after: rest.slice(end) } : null;
+}
+
+/** Close an unfinished fenced code block at the end of an in-flight preview so
+ *  live streaming Markdown renders as a code surface instead of raw fences.
+ *  Presentation-only: stored entries and stream state keep the server's text. */
+export function healStreamingMarkdown(text: string): string {
+  let open: { ch: "`" | "~"; len: number; quotes: number } | null = null;
+  for (const line of text.split(/\r?\n|\u2028|\u2029/)) {
+    const { quotes, rest } = stripBlockquotePrefix(line);
+    if (open !== null) {
+      if (quotes < open.quotes) {
+        open = null;
+      } else {
+        if (quotes === open.quotes) {
+          const close = scanFence(rest);
+          if (close && close.ch === open.ch && close.len >= open.len && /^[ \t]*$/.test(close.after)) {
+            open = null;
+          }
+        }
+        continue;
+      }
+    }
+    const fence = scanFence(rest);
+    if (fence && (fence.ch === "~" || !fence.after.includes("`"))) {
+      open = { ch: fence.ch, len: fence.len, quotes };
+    }
+  }
+  if (open === null) return text;
+  return `${text}${text.endsWith("\n") ? "" : "\n"}${"> ".repeat(open.quotes)}${open.ch.repeat(open.len)}`;
+}
+
+function walkCallouts(node: MdNode): void {
+  const kids = node.children;
+  if (!kids) return;
+  if (node.type === "blockquote" && kids[0]?.type === "paragraph") {
+    const firstPara = kids[0];
+    const firstText = firstPara.children?.[0];
+    const match = firstText?.type === "text" && firstText.value ? CALLOUT_MARKER.exec(firstText.value) : null;
+    if (match && firstText?.value !== undefined && firstPara.children) {
+      const rest = firstText.value.slice(match[0].length);
+      if (rest === "") {
+        firstPara.children.shift();
+        if (firstPara.children[0]?.type === "break") firstPara.children.shift();
+      } else {
+        firstText.value = rest;
+      }
+      if (firstPara.children.length === 0) kids.shift();
+      const kind = match[1].toLowerCase();
+      node.data = {
+        ...node.data,
+        hProperties: { ...node.data?.hProperties, "data-callout": kind },
+      };
+    }
+  }
+  for (const kid of kids) walkCallouts(kid);
+}
+
+const remarkCallouts = () => (tree: MdNode) => walkCallouts(tree);
 
 // One id shape for both the linkifier (bounded, global) and the `issue:`
 // validator (anchored); digits are capped so a long run is not an id.
@@ -161,6 +258,24 @@ export function CodeSurface({ label, code, children }: { label: string; code: st
   );
 }
 
+function CalloutBlockquote({
+  callout,
+  children,
+}: {
+  callout?: string;
+  children?: ReactNode;
+}) {
+  const t = useTranslate();
+  const label = callout && Object.hasOwn(CALLOUT_LABELS, callout) ? CALLOUT_LABELS[callout as CalloutKind] : null;
+  if (label === null) return <blockquote>{children}</blockquote>;
+  return (
+    <blockquote data-callout={callout}>
+      <div className="md-callout-head">{t(label)}</div>
+      {children}
+    </blockquote>
+  );
+}
+
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
@@ -173,6 +288,16 @@ let pageComponents: { page: string; components: Components } | null = null;
  *  code, links and images, which a live log would announce as new content. */
 function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Components {
   return {
+    table: ({ children }) => (
+      <div className="md-table-wrap">
+        <table>{children}</table>
+      </div>
+    ),
+    blockquote: (props) => (
+      <CalloutBlockquote callout={(props as { "data-callout"?: string })["data-callout"]}>
+        {props.children}
+      </CalloutBlockquote>
+    ),
     img: ({ src, alt }) => {
       const linked = useContext(InLinkContext);
       const safe = markdownImageSrc(src);
@@ -239,7 +364,7 @@ function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Compon
   return built;
 }
 
-const PLUGINS = [remarkGfm, remarkWikiCitations, remarkIssueLinks];
+const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
 
 export default function Md({

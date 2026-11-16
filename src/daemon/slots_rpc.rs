@@ -109,9 +109,23 @@ impl Shared {
             .refuse_unproven_on(&chain)
             .map_err(|why| Error::rejected(format!("Slot caller pid {peer_pid}: {why}")))?;
         let panes = recorded.live();
-        let pane_at = chain.iter().position(|pid| panes.contains_key(pid));
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let root_at = slots.nearest_enrolled_root(&chain);
+        Self::slot_identity_from(peer_pid, &chain, &panes, &mut slots)
+    }
+
+    /// [`Self::slot_identity`] with the ancestry chain and pane rows supplied
+    /// by the caller and the enrollment guard already held. A scoped write
+    /// re-runs this exact decision inside its own store transaction so a
+    /// registration/enrollment change that committed after admission refuses
+    /// the write; the top-level wrapper keeps its existing outer semantics.
+    pub(super) fn slot_identity_from(
+        peer_pid: u32,
+        chain: &[u32],
+        panes: &std::collections::HashMap<u32, String>,
+        slots: &mut crate::slots::Slots,
+    ) -> Result<Option<SlotWho>> {
+        let pane_at = chain.iter().position(|pid| panes.contains_key(pid));
+        let root_at = slots.nearest_enrolled_root(chain);
         match (pane_at, root_at) {
             (Some(p), Some(r)) if p == r => Err(Error::rejected(format!(
                 "Slot caller pid {peer_pid}: pid {} is both a registered pane and \
@@ -133,10 +147,13 @@ impl Shared {
                 Ok(Some(SlotWho::Strict(caller)))
             }
             (Some(p), _) => {
-                let lane = adapter::pty::nearest_pane(&chain[p..], &panes)
+                let lane = adapter::pty::nearest_pane(&chain[p..], panes)
                     .cloned()
                     .unwrap_or_default();
-                Ok(Some(SlotWho::Pane { lane, chain }))
+                Ok(Some(SlotWho::Pane {
+                    lane,
+                    chain: chain.to_vec(),
+                }))
             }
             _ => Ok(None),
         }

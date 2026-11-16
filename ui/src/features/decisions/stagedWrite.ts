@@ -61,6 +61,8 @@ export interface StagedWrite {
   raw: string;
   origin: StagedOrigin | null;
   result: StagedResult | null;
+  /** Optional owner note recorded when denying a request. */
+  decisionReason?: string | null;
   /** The record behind "Open record", when the API names a link. */
   recordLink: string | null;
 }
@@ -149,7 +151,7 @@ export function rawText(args: unknown): string {
   }
 }
 
-function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : {};
   const origin = parseOrigin(row.origin);
   const title = str(row.title);
@@ -203,7 +205,7 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
   };
 }
 
-function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : null;
   const title = input ? str(input.title)?.trim() ?? null : null;
   if (input === null || title === null) return null;
@@ -249,6 +251,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
     status: status as StagedStatus,
     createdAt: row.createdAt,
     decidedAt: typeof row.decidedAt === "number" && Number.isFinite(row.decidedAt) ? row.decidedAt : null,
+    decisionReason: str(row.decision_reason),
   };
   if (row.tool === "app_call") return parseAppCall(base, row, result);
   if (row.tool === "board_create_issue") return parseCreateIssue(base, row, result);
@@ -328,3 +331,39 @@ export function sentFields(write: StagedWrite): Set<string> | null {
 
 /** Isolate initiators and terminators inside shown text could close the isolate around it. */
 export const isolate = (text: string): string => text.replace(/[\u2066-\u2069]/g, "");
+
+export type StagedDomain = "marketing" | "design" | "business" | "operations" | "engineering" | "workspace";
+
+function matchDomainText(text: string): StagedDomain | null {
+  const s = text.toLowerCase();
+  if (/\b(marketing|campaign|newsletter|mailchimp|resend|promo|seo|social|ad|ads|audience)\b/.test(s)) return "marketing";
+  if (/\b(design|figma|brand|creative|mockup|asset|palette|typography|ui|ux)\b/.test(s)) return "design";
+  if (/\b(crm|customer|contact|deal|lead|quote|invoice|billing|stripe|shopify|sales|account|revenue)\b/.test(s)) return "business";
+  if (/\b(ops|operation|operations|incident|vendor|inventory|support|runbook|compliance|procurement|schedule)\b/.test(s)) return "operations";
+  if (/\b(git|github|repo|pull request|deploy|release|ci|api|worker|code|engineering)\b/.test(s)) return "engineering";
+  return null;
+}
+
+/** Classify a staged write by its domain surface for consistent cross-domain presentation. */
+export function stagedDomain(write: StagedWrite): StagedDomain {
+  if (write.kind === "create_issue") {
+    const project = write.changes.find((c) => c.field === "project")?.after ?? "";
+    return (
+      matchDomainText(project) ??
+      matchDomainText([write.title, ...write.changes.map((c) => `${c.field} ${c.after ?? ""}`)].join(" ")) ??
+      "workspace"
+    );
+  }
+  return matchDomainText([write.app ?? "", write.target?.kind ?? ""].join(" ")) ?? matchDomainText(write.title) ?? "workspace";
+}
+
+const DOMAIN_LABELS: Readonly<Record<StagedDomain, string>> = {
+  marketing: "Marketing",
+  design: "Design",
+  business: "Business",
+  operations: "Operations",
+  engineering: "Engineering",
+  workspace: "Workspace",
+};
+
+export const stagedDomainLabel = (domain: StagedDomain): string => DOMAIN_LABELS[domain];

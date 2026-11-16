@@ -1,0 +1,12 @@
+{
+  "installations": [
+    {
+      "install_id": "qa-template",
+      "name": "app-template",
+      "title": "App template",
+      "tagline": "The repo's starter screen app, served as a QA board fixture",
+      "version": "0.1.0",
+      "attention": { "state": "ok", "message": null, "action": null, "count": 0 }
+    }
+  ]
+}

@@ -109,6 +109,34 @@ const MAX_OPERATION_BYTES: usize = 64;
 /// check both read this one number, so a package set is bounded identically on
 /// both hosts.
 pub const MAX_SCREENS: usize = 8;
+/// Most locale entries one app display/nav i18n map may declare.
+pub const MAX_I18N_LOCALES: usize = 8;
+
+/// Validates a BCP-47 locale tag (`2..=20` ASCII bytes, `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$`).
+pub fn valid_locale_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    if !(2..=20).contains(&bytes.len()) || !bytes.is_ascii() {
+        return false;
+    }
+    let mut parts = tag.split('-');
+    let Some(lang) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut subtags = 0usize;
+    for sub in parts {
+        subtags += 1;
+        if subtags > 2
+            || !(2..=8).contains(&sub.len())
+            || !sub.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+    }
+    true
+}
 /// The whole-app aggregate content budget, bytes. A screen's supplied assets
 /// share it, and the native installer keeps the same number: the limit is
 /// stated here once and re-exported as the native app budget, so the two
@@ -165,6 +193,13 @@ pub enum ScreenOperation {
     RecordsUpdate,
     #[serde(rename = "records.csv.preview")]
     RecordsCsvPreview,
+    // CAD-2263: hosted app-storage verbs. Both are CALLs (not SLOTs):
+    // `records.aggregate` is a read, `records.batch` an owner-gated write.
+    // Native execution of either stays unimplemented and refuses.
+    #[serde(rename = "records.batch")]
+    RecordsBatch,
+    #[serde(rename = "records.aggregate")]
+    RecordsAggregate,
     #[serde(rename = "records.csv.import")]
     RecordsCsvImport,
     #[serde(rename = "records.csv.confirm")]
@@ -476,6 +511,7 @@ impl ScreenOperation {
             Self::RecordsCsvPreview | Self::RecordsCsvImport | Self::RecordsCsvConfirm => 327_680,
             Self::RecordsCreate
             | Self::RecordsUpdate
+            | Self::RecordsBatch
             | Self::ContentSave
             | Self::ScreenPreviewShow
             | Self::WhatsappReplyPrepare
@@ -502,9 +538,21 @@ pub struct ScreenNavigation {
 
 #[derive(Clone, Debug, serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ScreenSectionI18n {
+    pub label: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenSection {
     pub id: String,
     pub label: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "unique_opt_section_i18n"
+    )]
+    pub i18n: Option<BTreeMap<String, ScreenSectionI18n>>,
 }
 
 impl ScreenNavigation {
@@ -517,6 +565,7 @@ impl ScreenNavigation {
             "install_id",
             "context",
             "context_id",
+            "ctx",
             "actor",
             "identity",
             "auth",
@@ -540,6 +589,8 @@ impl ScreenNavigation {
             "contract-preview",
             "nonce",
             "proof",
+            "generation",
+            "digest",
         ];
         let key = self.section_query.as_bytes();
         if key.is_empty()
@@ -557,15 +608,39 @@ impl ScreenNavigation {
         if self.sections.is_empty() || self.sections.len() > 8 {
             return Err(Error::rejected("navigation requires 1..8 sections"));
         }
+        let has_disallowed_ctrl = |s: &str| {
+            s.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        };
         let mut seen = HashSet::new();
         for section in &self.sections {
             if !valid_tag(&section.id)
                 || !seen.insert(&section.id)
-                || section.label.is_empty()
+                || section.label.trim().is_empty()
                 || section.label.encode_utf16().count() > 40
-                || section.label.chars().any(char::is_control)
+                || has_disallowed_ctrl(&section.label)
             {
                 return Err(Error::rejected("invalid or duplicate navigation section"));
+            }
+            if let Some(i18n) = &section.i18n {
+                if i18n.is_empty() || i18n.len() > MAX_I18N_LOCALES {
+                    return Err(Error::rejected(
+                        "navigation section i18n requires 1..=8 locales",
+                    ));
+                }
+                let mut seen_locales = HashSet::new();
+                for (locale, entry) in i18n {
+                    if !valid_locale_tag(locale)
+                        || !seen_locales.insert(locale.to_ascii_lowercase())
+                        || entry.label.trim().is_empty()
+                        || entry.label.encode_utf16().count() > 40
+                        || has_disallowed_ctrl(&entry.label)
+                    {
+                        return Err(Error::rejected(
+                            "invalid navigation section i18n locale or label",
+                        ));
+                    }
+                }
             }
         }
         if !seen.contains(&self.default_section) {
@@ -1613,19 +1688,19 @@ fn check_assets<S: Supplied>(assets: &[RawAsset], supplied: &S) -> Result<()> {
     Ok(())
 }
 
-/// A string→string map that refuses a repeated key. serde's map decoding keeps
-/// the last value for a repeated key, so a declaration could otherwise hide a
-/// shadowed tool slot behind one. Every other object in a declaration is a
-/// closed struct, whose derived decode already refuses a repeated field.
-fn unique_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+fn unique_btreemap<'de, D, V>(
+    deserializer: D,
+    kind: &'static str,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
 where
     D: Deserializer<'de>,
+    V: Deserialize<'de>,
 {
-    struct UniqueMap;
-    impl<'de> Visitor<'de> for UniqueMap {
-        type Value = BTreeMap<String, String>;
+    struct UniqueMap<V>(std::marker::PhantomData<V>, &'static str);
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMap<V> {
+        type Value = BTreeMap<String, V>;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("a map of string values without a repeated key")
+            f.write_str("a map without a repeated key")
         }
         fn visit_map<A: MapAccess<'de>>(
             self,
@@ -1635,15 +1710,42 @@ where
             while let Some(key) = map.next_key::<String>()? {
                 if out.contains_key(&key) {
                     return Err(serde::de::Error::custom(format!(
-                        "tool alias {key:?} is declared twice"
+                        "{} {key:?} is declared twice",
+                        self.1
                     )));
                 }
-                out.insert(key, map.next_value::<String>()?);
+                out.insert(key, map.next_value::<V>()?);
             }
             Ok(out)
         }
     }
-    deserializer.deserialize_map(UniqueMap)
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData, kind))
+}
+
+/// A string→string map that refuses a repeated key. serde's map decoding keeps
+/// the last value for a repeated key, so a declaration could otherwise hide a
+/// shadowed tool slot behind one. Every other object in a declaration is a
+/// closed struct, whose derived decode already refuses a repeated field.
+fn unique_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    unique_btreemap(deserializer, "tool alias")
+}
+
+fn unique_opt_section_i18n<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, ScreenSectionI18n>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct W(BTreeMap<String, ScreenSectionI18n>);
+    impl<'de> Deserialize<'de> for W {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> std::result::Result<Self, D2::Error> {
+            unique_btreemap(d, "i18n locale").map(Self)
+        }
+    }
+    Option::<W>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
 }
 
 #[cfg(test)]
@@ -1807,6 +1909,39 @@ mod tests {
         .to_string()
     }
 
+    /// CAD-2263: `records.batch` and `records.aggregate` are native
+    /// vocabulary. A declaration listing them passes the strict admission
+    /// with only the `records.call` grant, because both are CALLs; a name
+    /// outside the closed set still refuses there.
+    #[test]
+    fn batch_and_aggregate_are_calls_and_an_unknown_verb_still_refuses() {
+        let operations = ["records.batch", "records.aggregate"];
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &operations);
+        let checked = validate_map(&call, &bodies).expect("both verbs decode and validate");
+        assert_eq!(
+            checked.operations(),
+            &[
+                ScreenOperation::RecordsBatch,
+                ScreenOperation::RecordsAggregate
+            ]
+        );
+        assert!(checked.operations().iter().all(|op| !op.is_slot()));
+        assert_eq!(ScreenOperation::RecordsBatch.args_limit(), 49_152);
+        assert_eq!(ScreenOperation::RecordsAggregate.args_limit(), 16_384);
+        assert!(validate_facts(&call, &facts(BODY)).is_ok());
+
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &operations);
+        assert!(
+            validate_map(&slot_only, &bodies).is_err(),
+            "a CALL verb is not granted by the slot permission"
+        );
+
+        let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["records.truncate"]);
+        assert!(validate_map(&unknown, &bodies).is_err());
+        assert!(validate_facts(&unknown, &facts(BODY)).is_err());
+    }
+
     /// The seam this operation exists for: a host-only operation passes the
     /// host-owned asset-integrity admission while every native/strict
     /// admission still refuses it. The admitted value is the narrow
@@ -1942,5 +2077,77 @@ mod tests {
         let bad_digest = manifest.replacen(&digest(BODY), "sha256:short", 1);
         assert!(validate_facts_asset_integrity(&bad_digest, &facts(BODY)).is_err());
         assert!(validate_facts_asset_integrity("{", &facts(BODY)).is_err());
+    }
+
+    #[test]
+    fn navigation_section_i18n_validates_bounds_and_rejects_bad_inputs() {
+        let base_manifest = |sections: &str| {
+            format!(
+                r#"{{"contract":"app-screens/v2","app":"crm","entry":"client.js","assets":[{{"name":"client.js","media_type":"text/javascript","size":{},"sha256":"{}"}}],"provenance":{{"source_digest":"{}","sdk_digest":"{}","toolchain_digest":"{}"}},"host_contract":"screen-records.v1","may":[],"navigation":{{"section_query":"section","default_section":"customers","sections":{sections}}}}}"#,
+                BODY.len(),
+                digest(BODY),
+                digest("source"),
+                digest("sdk"),
+                digest("toolchain"),
+            )
+        };
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let nav = validate_map(
+            &base_manifest(r#"[{"id":"customers","label":"Customers","i18n":{"zh-TW":{"label":"客戶"},"zh-HK":{"label":"客戶"}}}]"#),
+            &bodies,
+        )
+        .unwrap()
+        .navigation()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            nav.sections[0].i18n.as_ref().unwrap()["zh-TW"].label,
+            "客戶"
+        );
+
+        for bad_i18n in [
+            "{}",
+            r#"{"zh_TW":{"label":"客"}}"#,
+            r#"{"zh-TW":{"label":"   "}}"#,
+            r#"{"zh-TW":{"label":"客\n"}}"#,
+            r#"{"zh-TW":{"label":"客\u2028"}}"#,
+            r#"{"zh-tw":{"label":"客"},"zh-TW":{"label":"客"}}"#,
+            r#"{"zh-TW":{"label":"客","extra":"x"}}"#,
+            r#"{"zh-TW":{"label":"客"},"zh-TW":{"label":"客"}}"#,
+        ] {
+            let m = base_manifest(&format!(r#"[{{"id":"c","label":"C","i18n":{bad_i18n}}}]"#));
+            assert!(validate_map(&m, &bodies).is_err(), "{bad_i18n}");
+        }
+        for bad_lbl in [r#""   ""#, r#""Bad\u2029Label""#] {
+            assert!(validate_map(
+                &base_manifest(&format!(r#"[{{"id":"c","label":{bad_lbl}}}]"#)),
+                &bodies
+            )
+            .is_err());
+        }
+
+        for reserved in ["ctx", "generation", "digest", "proof"] {
+            let m = format!(
+                r#"{{"contract":"app-screens/v2","app":"crm","entry":"client.js","assets":[{{"name":"client.js","media_type":"text/javascript","size":{},"sha256":"{}"}}],"provenance":{{"source_digest":"{}","sdk_digest":"{}","toolchain_digest":"{}"}},"host_contract":"screen-records.v1","may":[],"navigation":{{"section_query":"{reserved}","default_section":"customers","sections":[{{"id":"customers","label":"Customers"}}]}}}}"#,
+                BODY.len(),
+                digest(BODY),
+                digest("source"),
+                digest("sdk"),
+                digest("toolchain"),
+            );
+            assert!(validate_map(&m, &bodies).is_err(), "{reserved}");
+        }
+
+        let many = (0..=MAX_I18N_LOCALES)
+            .map(|i| format!(r#""en-x{i}":{{"label":"S"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_map(
+            &base_manifest(&format!(
+                r#"[{{"id":"customers","label":"C","i18n":{{{many}}}}}]"#
+            )),
+            &bodies
+        )
+        .is_err());
     }
 }

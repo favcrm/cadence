@@ -171,6 +171,19 @@
   padding-left: 6px;
   border-left: 1px solid var(--color-ink-700);
 }
+:where(.navtree > .navrow) > .navlink-sub {
+  font-weight: 500;
+  color: var(--color-ink-300);
+}
+.navtree .navtree {
+  margin: 1px 0 4px 8px;
+  padding-left: 8px;
+}
+:where(.navtree .navtree) .navlink-sub {
+  min-height: 26px;
+  font-size: 12px;
+  color: var(--color-ink-500);
+}
 @media (prefers-reduced-motion: reduce) {
   .navfold,
   .navdisc svg,
@@ -347,6 +360,12 @@
    keeps it, in the accent. */
 .projrow {
   position: relative;
+}
+.projrow > .proj {
+  grid-template-columns: minmax(0, 1fr) minmax(22px, auto) 2.4em;
+}
+#mobile-navigation .projrow > .proj {
+  grid-template-columns: minmax(0, 1fr) minmax(32px, auto) 2.4em;
 }
 .projpin {
   position: absolute;
@@ -556,7 +575,22 @@ pre {
 }
 .turnbar[data-state="queued"],
 .turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
+.turnbar[data-state="needs_approval"] {
+  flex-wrap: wrap;
+  row-gap: .375rem;
+}
 .turnbar[data-state="failed"] { --tb: var(--color-fail); }
+/* A failure's detail is the operator's next step, not a label: wrap it on a
+   narrow board instead of cutting the instruction off, inside a bounded
+   scroll area so a long provider message cannot push the composer away. */
+.turnbar[data-state="failed"] .tb-detail {
+  max-height: 4.5em;
+  overflow-x: hidden;
+  overflow-y: auto;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .turnbar[data-stale] { opacity: .7; }
 .tb-dot {
   flex: none;
@@ -567,7 +601,7 @@ pre {
 }
 .tb-text {
   display: flex;
-  flex: 1;
+  flex: 1 1 12rem;
   align-items: baseline;
   gap: .5rem;
   min-width: 0;
@@ -586,13 +620,34 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.tb-detail-perm {
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  max-width: 100%;
+}
+.tb-risk {
+  flex: none;
+}
+.tb-cmd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-ink-200);
+}
 .tb-actions {
   display: flex;
   flex: none;
+  flex-wrap: wrap;
   align-items: center;
-  gap: .125rem;
+  gap: .25rem;
+  max-width: 100%;
 }
 .tb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
   height: 1.625rem;
   padding: 0 .5625rem;
   border: 0;
@@ -605,7 +660,40 @@ pre {
   cursor: pointer;
 }
 .tb-btn:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.tb-btn:disabled { opacity: .5; cursor: default; }
 .tb-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.tb-btn-primary {
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-accent);
+}
+.tb-btn-primary:hover {
+  background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+  color: var(--color-ink-100);
+}
+.tb-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: .05rem .3rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  font: 500 .65rem/1.1 "IBM Plex Mono", monospace;
+  color: var(--color-ink-400);
+}
+.turnbar-sub {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .25rem;
+  padding-top: .25rem;
+  padding-inline-start: 1rem;
+  border-top: 1px solid var(--color-ink-800);
+}
+.turnbar-error {
+  flex: 1 0 100%;
+  padding-inline-start: 1rem;
+}
 /* CAD-1700: an assistant reply waits unseen — a dot, not a count. */
 .navlink .navdot {
   flex: none;
@@ -617,7 +705,22 @@ pre {
 }
 .navlink .navbadge + .navdot { margin-left: .375rem; }
 @media (max-width: 1023.98px) {
-  .tb-btn { height: 2.25rem; }
+  .tb-btn { min-height: 2.25rem; height: auto; }
+}
+@media (max-width: 639.98px) {
+  .turnbar[data-state="needs_approval"] .tb-text {
+    flex: 1 1 calc(100% - 1rem);
+  }
+  .turnbar[data-state="needs_approval"] .tb-actions {
+    width: 100%;
+    padding-inline-start: 1rem;
+  }
+  .tb-btn {
+    min-height: 2.75rem;
+  }
+  .tb-kbd {
+    display: none;
+  }
 }
 .stopbtn {
   padding: .12rem .55rem;
@@ -946,6 +1049,12 @@ pre {
 .chat-bubble.issue-reader td:first-child {
   min-width: 9rem;
 }
+.answer .issue-reader th:not(:first-child),
+.answer .issue-reader td:not(:first-child),
+.chat-bubble.issue-reader th:not(:first-child),
+.chat-bubble.issue-reader td:not(:first-child) {
+  min-width: 6rem;
+}
 .answer .issue-reader blockquote {
   padding: .65rem .85rem;
   border-inline-start: 0;
@@ -953,10 +1062,16 @@ pre {
   background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
   color: var(--color-ink-300);
 }
-.answer .issue-reader blockquote p {
+.answer .issue-reader blockquote p,
+.chat-bubble.issue-reader blockquote p {
   margin: 0;
 }
-.answer .issue-reader blockquote strong {
+.answer .issue-reader blockquote p + p,
+.chat-bubble.issue-reader blockquote p + p {
+  margin-top: .5rem;
+}
+.answer .issue-reader blockquote strong,
+.chat-bubble.issue-reader blockquote strong {
   color: var(--color-ink-100);
 }
 .answer .issue-reader code,
@@ -1006,6 +1121,42 @@ pre {
   gap: .375rem;
   margin-top: .5rem;
 }
+/* CAD-2285: the master's form. A board card built from board classes (card,
+   field, btn); its choices restyle chip-btn as input chips with a pressed
+   state. The header's chip is the form's one status. */
+.turn-artifacts > div:has(> .agentform) { flex-basis: 100%; }
+.agentform { max-width: min(100%, 32rem); overflow: hidden; }
+.agentform-body { padding: .75rem; display: grid; gap: .85rem; }
+.agentform-head { display: flex; align-items: center; gap: .5rem; min-height: 1.25rem; margin-bottom: -.4rem; }
+.agentform-head .chip { margin-left: auto; }
+.agentform-kind { display: inline-flex; align-items: center; gap: .3rem; font-size: var(--text-micro); color: var(--color-ink-500); }
+.agentform-kind svg { width: 12px; height: 12px; flex: none; }
+.agentform h3 { margin: 0; font-size: var(--text-cardtitle); font-weight: 600; color: var(--color-ink-100); }
+.agentform-lead { margin: -.55rem 0 0; font-size: var(--text-label); color: var(--color-ink-400); }
+.agentform-text { margin: 0; font-size: var(--text-label); color: var(--color-ink-200); }
+.agentform-col { display: grid; gap: .85rem; min-width: 0; }
+.agentform-row { display: flex; flex-wrap: wrap; gap: .85rem 1.5rem; align-items: flex-start; }
+.agentform-hr { border: 0; border-top: 1px solid var(--color-ink-700); margin: 0; }
+.agentform-field { border: 0; margin: 0; padding: 0; min-width: 0; display: grid; gap: .4rem; }
+.agentform-field > legend { padding: 0; margin-bottom: .4rem; font-size: var(--text-label); font-weight: 500; color: var(--color-ink-300); }
+.agentform-opts { display: flex; flex-wrap: wrap; gap: .375rem; }
+.agentform .chip-btn { font: 500 var(--text-label)/1.4 var(--font-sans); padding: .25rem .6rem; border: 1px solid var(--color-edge); background: var(--color-ink-900); color: var(--color-ink-300); border-radius: .375rem; }
+.agentform .chip-btn[aria-pressed="true"], .agentform .chip-btn[aria-checked="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700));
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-900));
+}
+.agentform .chip-btn[aria-pressed="true"]::before, .agentform .chip-btn[aria-checked="true"]::before { content: "✓" / ""; font-size: .75em; }
+.agentform .chip-btn:disabled { opacity: .6; cursor: default; }
+.agentform-field[data-invalid] .chip-btn { border-color: color-mix(in srgb, var(--color-fail) 55%, var(--color-ink-700)); }
+.agentform-input { width: min(100%, 16rem); height: 1.75rem; }
+textarea.agentform-input { height: auto; width: 100%; }
+.agentform-check { display: inline-flex; align-items: center; gap: .5rem; font-size: var(--text-label); color: var(--color-ink-200); }
+.agentform-check input { width: 1rem; height: 1rem; margin: 0; accent-color: var(--color-accent); }
+.agentform-foot { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .75rem; }
+.agentform-foot .btn { max-width: none; }
+.agentform[data-form-state="sent"] .agentform-body, .agentform[data-form-state="closed"] .agentform-body { background: color-mix(in srgb, var(--color-ink-900) 45%, transparent); }
+.agentform-fallback { max-width: min(100%, 40rem); }
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
    made-up answer body. */
 .typing {
@@ -1134,7 +1285,7 @@ pre {
   left: 50%;
   transform: translateX(-50%);
   bottom: calc(var(--dock-h, 7rem) + .6rem);
-  z-index: 25;
+  z-index: 15;
   white-space: nowrap;
   padding: .35rem .9rem;
   border-radius: 9999px;
@@ -1465,6 +1616,27 @@ pre {
   color: var(--color-ink-300);
   padding: .65rem .85rem;
 }
+.issue-reader blockquote[data-callout] {
+  --callout-tone: var(--color-accent);
+  border-inline-start: 3px solid var(--callout-tone);
+  background: color-mix(in srgb, var(--callout-tone) 8%, var(--color-ink-850));
+}
+.issue-reader blockquote[data-callout="tip"] {
+  --callout-tone: var(--color-ok);
+}
+.issue-reader blockquote[data-callout="warning"] {
+  --callout-tone: var(--color-warn);
+}
+.issue-reader blockquote[data-callout="caution"] {
+  --callout-tone: var(--color-fail);
+}
+.md-callout-head {
+  margin-bottom: .25rem;
+  color: var(--callout-tone, var(--color-accent));
+  font-size: var(--text-label);
+  font-weight: 600;
+  line-height: 1.35;
+}
 .issue-reader code {
   overflow-wrap: anywhere;
   color: var(--color-ink-200);
@@ -1514,6 +1686,21 @@ pre {
 }
 /* CAD-551 r2: GFM tables (the /help card) — the command column keeps a
  * real gap so an arg like `provider/id` never runs into the blurb. */
+.md-table-wrap {
+  max-inline-size: 100%;
+  margin-block: .6rem;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table-wrap > table {
+  margin-block: 0;
+}
+.issue-reader .md-table-wrap > table {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+}
 .issue-reader table {
   border-collapse: collapse;
   display: block;
@@ -1622,7 +1809,7 @@ pre {
 .needbtn {
   position: fixed;
   right: 1rem;
-  bottom: calc(var(--dock-h, 7rem) + .75rem);
+  bottom: calc(var(--dock-h, 7rem) + 1.5rem);
   z-index: 45;
   display: flex;
   align-items: center;
@@ -2420,5 +2607,75 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   }
   .composer-hint {
     display: none;
+  }
+}
+
+/* CAD-2240: project Timeline (hosted boards). Ported from the accepted mockup. */
+.tl-lede { margin-top: .5rem; color: var(--color-ink-400); font-size: var(--text-secondary); }
+.tl-filters { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.25rem; margin-bottom: .6rem; }
+.tl-kinds { display: flex; flex-wrap: wrap; gap: .35rem; }
+.tl-filters .chip-btn[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-accent); }
+.tl-filters .chip-btn .count { margin-left: .35rem; }
+.tl-open { margin-left: auto; }
+.tl-day { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: 0 1rem; }
+.tl-date { padding-top: .8rem; font: 500 var(--text-label) "IBM Plex Mono", monospace; color: var(--color-ink-400); }
+.tl-date small { display: block; margin-top: .15rem; font-family: var(--font-sans); font-weight: 400; font-size: var(--text-micro); color: var(--color-ink-500); }
+.tl-list { border-left: 1px solid var(--color-ink-700); padding-left: 1.25rem; max-width: 50rem; min-width: 0; }
+.tl-item { position: relative; padding-block: .75rem; }
+.tl-item + .tl-item { border-top: 1px solid var(--color-ink-800); }
+.tl-item::before { content: ""; position: absolute; left: calc(-1.25rem - 4px); top: 1.1rem; width: 7px; height: 7px; border-radius: 9999px; background: var(--c, var(--color-ink-500)); box-shadow: 0 0 0 3px var(--color-ink-900); }
+.tl-item[data-landed="true"] { --c: var(--color-ok); }
+.tl-item[data-kind="review"] { --c: var(--color-info); }
+.tl-item[data-kind="message"][data-open="true"] { --c: var(--color-warn); }
+.tl-top { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .6rem; font-size: var(--text-micro); color: var(--color-ink-500); }
+.tl-top .kind { color: var(--color-ink-300); font-weight: 500; }
+.tl-top .push { margin-left: auto; }
+.tl-what { margin-top: .3rem; color: var(--color-ink-200); font-size: var(--text-body); line-height: 1.55; overflow-wrap: anywhere; }
+.tl-what button { margin-right: .4rem; }
+.tl-meta { margin-top: .2rem; color: var(--color-ink-500); font-size: var(--text-label); line-height: 1.5; overflow-wrap: anywhere; }
+.tl-here { display: flex; align-items: center; gap: .75rem; margin: .5rem 0 .5rem -1.25rem; list-style: none; font: 500 var(--text-micro) "IBM Plex Mono", monospace; color: var(--color-accent); }
+/* A refetch keeps the old entries on screen; dim them so they do not read as the new filter's. */
+.tl-busy { opacity: .5; }
+.tl-here::before, .tl-here::after { content: ""; flex: 1; height: 1px; background: color-mix(in srgb, var(--color-accent) 40%, transparent); }
+.tl-more { margin: 1rem 0 0 7.5rem; }
+.tl-empty { margin-left: 7.5rem; padding-block: 1.5rem; color: var(--color-ink-500); font-size: var(--text-secondary); }
+@media (width < 700px) {
+  .tl-day { grid-template-columns: minmax(0, 1fr); }
+  .tl-date { padding-top: .8rem; }
+  .tl-more, .tl-empty { margin-left: 0; }
+  .tl-open { margin-left: 0; }
+}
+
+/* CAD-2255: project settings. The grant editor pairs the shared `.field`
+   (2.25rem) with the shared `.btn` (1.75rem); the scoped rules below give the
+   button and the Select trigger the field's height and type so the row reads
+   as one control at every width. Focus and disabled states stay the shared
+   ones — nothing here overrides them. */
+.ps-grant-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: .5rem;
+}
+.ps-grant-add > .ps-grant-field,
+.ps-grant-add > .field,
+.ps-grant-add .select,
+.ps-grant-add .select-trigger,
+.ps-grant-add > .btn {
+  height: 2.25rem;
+  font-size: .8125rem;
+}
+.ps-grant-add .select {
+  width: 100%;
+}
+.ps-grant-add > .btn {
+  padding-inline: .85rem;
+}
+@media (width < 640px) {
+  .ps-grant-add {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ps-grant-add > .btn {
+    width: 100%;
   }
 }

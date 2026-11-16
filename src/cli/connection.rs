@@ -1,7 +1,7 @@
 //! Proven-operator connection management; no agent grants or offline fallback.
 use super::*;
 
-fn validate_connection_id(value: &str) -> Result<&str> {
+pub(super) fn validate_connection_id(value: &str) -> Result<&str> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -20,6 +20,15 @@ pub(crate) enum ConnectionAction {
     /// List exact authorized account references and built-in Local outbox.
     #[command(visible_alias = "list")]
     Ls,
+    /// List the properties a connected Search Console account can read.
+    Sites { connection_id: String },
+    /// Pin one verified Search Console property for future reports.
+    #[command(name = "select-site")]
+    SelectSite {
+        connection_id: String,
+        /// Exact property identifier (`sc-domain:example.test` or a URL prefix).
+        site_url: String,
+    },
     /// Show one durable connection incarnation.
     Show { connection_id: String },
     /// Enroll an explicitly supported scoped token; grants no workers.
@@ -38,7 +47,9 @@ pub(crate) enum ConnectionAction {
     },
     /// Create a metadata-only protected enrollment request and open the
     /// trusted entry page; the account handle, transport and secret are
-    /// typed there, never here.
+    /// typed there, never here. On a hosted org this starts the workspace
+    /// owner's provider authorization instead and prints its one-time link;
+    /// no browser is opened here.
     Enroll {
         provider: String,
         #[arg(long = "scope")]
@@ -317,6 +328,12 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
     let (method, params) = match action {
         ConnectionAction::Providers => ("connection_providers", json!({})),
         ConnectionAction::Ls => ("connection_list", json!({})),
+        ConnectionAction::Sites { .. } | ConnectionAction::SelectSite { .. } => {
+            return Err(Error::usage(
+                "connection sites/select-site are hosted-workspace operations; \
+                 pass --org <logged-in-workspace>",
+            ));
+        }
         ConnectionAction::Show { connection_id } => {
             ("connection_show", json!({"connection_id":connection_id}))
         }

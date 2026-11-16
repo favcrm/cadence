@@ -2,12 +2,14 @@
 //! board — daemon `monitor_list`/`monitor_alerts` rows validated, then
 //! projected into the board-facing view; read via daemon RPCs only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use cadence_core::board_api::{MONITOR_CURSOR_FORMAT, READER_SCOPE_FIELD};
 use serde_json::{json, Value};
 
 use crate::client;
+use crate::daemon::monitors_rpc::MONITOR_READER_SCOPE_ACK;
 
 use super::{now_epoch, PROBE_TIMEOUT};
 
@@ -171,33 +173,67 @@ fn monitoring_view(
             if alert["state"].as_str() == Some("open") {
                 open_alerts += 1;
             }
-            let row = json!({
-                "seq": alert["seq"],
-                "monitor": id,
-                "project": monitor["project"],
-                "monitor_owner": monitor["owner"],
-                "task": alert["task"],
-                "event_seq": alert["event_seq"],
-                "fingerprint": alert["fingerprint"],
-                "kind": alert["kind"],
-                "payload": alert["payload"],
-                "state": alert["state"],
-                "attempts": alert["attempts"],
-                "last_error": alert["last_error"],
-                "created": alert["created"],
-                "updated": alert["updated"],
-                "age_secs": age_secs,
-                "next_action": next_action,
-                "next_owner": next_owner,
-                "authority": authority,
-                "evidence": {
+            // A CAD-2215 scoped row carries no global position: its stable
+            // keyed `id` and encrypted `ack` replace `seq`, `event_seq` and
+            // the `event:<seq>` fingerprint. A proven-operator row keeps the
+            // legacy numeric document.
+            let row = if alert.get("seq").is_none() {
+                // The board's acknowledgement route is operator-only, so a
+                // scoped member projection does not need the native agent's
+                // `ack` token; it is validated above and withheld here so a
+                // randomized token cannot churn the SSE fingerprint.
+                json!({
+                    "id": alert["id"],
                     "monitor": id,
-                    "alert_seq": alert["seq"],
+                    "project": monitor["project"],
+                    "monitor_owner": monitor["owner"],
+                    "task": alert["task"],
+                    "kind": alert["kind"],
+                    "payload": alert["payload"],
+                    "state": alert["state"],
+                    "attempts": alert["attempts"],
+                    "last_error": alert["last_error"],
+                    "created": alert["created"],
+                    "updated": alert["updated"],
+                    "age_secs": age_secs,
+                    "next_action": next_action,
+                    "next_owner": next_owner,
+                    "authority": authority,
+                    "evidence": {
+                        "monitor": id,
+                        "alert": alert["id"],
+                        "payload": alert["payload"],
+                    },
+                })
+            } else {
+                json!({
+                    "seq": alert["seq"],
+                    "monitor": id,
+                    "project": monitor["project"],
+                    "monitor_owner": monitor["owner"],
+                    "task": alert["task"],
                     "event_seq": alert["event_seq"],
                     "fingerprint": alert["fingerprint"],
+                    "kind": alert["kind"],
                     "payload": alert["payload"],
-                },
-            });
+                    "state": alert["state"],
+                    "attempts": alert["attempts"],
+                    "last_error": alert["last_error"],
+                    "created": alert["created"],
+                    "updated": alert["updated"],
+                    "age_secs": age_secs,
+                    "next_action": next_action,
+                    "next_owner": next_owner,
+                    "authority": authority,
+                    "evidence": {
+                        "monitor": id,
+                        "alert_seq": alert["seq"],
+                        "event_seq": alert["event_seq"],
+                        "fingerprint": alert["fingerprint"],
+                        "payload": alert["payload"],
+                    },
+                })
+            };
             rows.push(row.clone());
             all_alerts.push(row);
         }
@@ -216,7 +252,21 @@ fn monitoring_view(
     } else {
         "stopped"
     };
-    all_alerts.sort_by_key(|a| a["seq"].as_i64().unwrap_or(0));
+    all_alerts.sort_by(
+        |left, right| match (left["seq"].as_i64(), right["seq"].as_i64()) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => left["created"]
+                .as_f64()
+                .partial_cmp(&right["created"].as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left["id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .cmp(right["id"].as_str().unwrap_or_default())
+                }),
+        },
+    );
     let latest = |value: Option<f64>| value.map(|v| v as i64);
     json!({
         "available": true,
@@ -281,6 +331,20 @@ fn validate_monitor_rows(rows: &[Value]) -> Result<(), String> {
             if object.get(field).and_then(Value::as_i64).is_none() {
                 return Err(format!("monitor_list row {index} missing {field}"));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a CAD-2215 scoped `monitor_list` page. It must carry the
+/// daemon's reader-scope acknowledgement and no monitor row may carry the
+/// internal `event_cursor` watermark; a daemon that leaked either is treated
+/// as unavailable instead of trusted.
+fn validate_scoped_monitor_rows(rows: &[Value]) -> Result<(), String> {
+    validate_monitor_rows(rows)?;
+    for (index, row) in rows.iter().enumerate() {
+        if row.get("event_cursor").is_some() {
+            return Err(format!("monitor_list row {index} exposed a global cursor"));
         }
     }
     Ok(())
@@ -382,7 +446,104 @@ fn validate_monitor_alert_response<'a>(
     Ok(rows)
 }
 
-fn monitoring_unavailable(error: impl Into<String>) -> Value {
+/// Validate a CAD-2215 scoped `monitor_alerts` page. Each row must carry the
+/// stable keyed `id` and encrypted `ack` and must NOT carry a global `seq`,
+/// `event_seq` or `fingerprint`; the page must acknowledge its reader scope
+/// and speak the opaque cursor format. Any deviation is unavailable, never a
+/// trusted numeric fallback.
+pub fn validate_scoped_monitor_alert_response<'a>(
+    monitor_id: &str,
+    response: &'a Value,
+) -> Result<&'a [Value], String> {
+    if response[READER_SCOPE_FIELD].as_str() != Some(MONITOR_READER_SCOPE_ACK) {
+        return Err("monitor_alerts response has no scoped reader acknowledgement".to_string());
+    }
+    if response["cursor_format"].as_str() != Some(MONITOR_CURSOR_FORMAT) {
+        return Err("monitor_alerts response has an unsupported cursor format".to_string());
+    }
+    if !matches!(
+        response.get("cursor"),
+        Some(Value::Null) | Some(Value::String(_))
+    ) {
+        return Err("monitor_alerts response has malformed cursor".to_string());
+    }
+    let object = response
+        .as_object()
+        .ok_or_else(|| "monitor_alerts response is not an object".to_string())?;
+    if object
+        .get("monitor")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        != Some(monitor_id)
+    {
+        return Err("monitor_alerts response has the wrong monitor".to_string());
+    }
+    let rows = object
+        .get("alerts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "monitor_alerts response missing alerts".to_string())?;
+    for (index, row) in rows.iter().enumerate() {
+        let alert = row
+            .as_object()
+            .ok_or_else(|| format!("monitor_alerts row {index} is not an object"))?;
+        for forbidden in ["seq", "event_seq", "fingerprint"] {
+            if alert.contains_key(forbidden) {
+                return Err(format!(
+                    "monitor_alerts row {index} exposed the global position field {forbidden}"
+                ));
+            }
+        }
+        let string_field = |field: &str| {
+            alert
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("monitor_alerts row {index} missing {field}"))
+        };
+        string_field("id")?;
+        string_field("ack")?;
+        let row_monitor = string_field("monitor")?;
+        if row_monitor != monitor_id {
+            return Err(format!(
+                "monitor_alerts row {index} belongs to a different monitor"
+            ));
+        }
+        string_field("task")?;
+        string_field("kind")?;
+        if !alert.contains_key("payload") {
+            return Err(format!("monitor_alerts row {index} missing payload"));
+        }
+        if !matches!(
+            alert.get("state").and_then(Value::as_str),
+            Some("open") | Some("acknowledged") | Some("resolved")
+        ) {
+            return Err(format!("monitor_alerts row {index} has unsupported state"));
+        }
+        if alert
+            .get("attempts")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value < 0)
+        {
+            return Err(format!("monitor_alerts row {index} missing attempts"));
+        }
+        if !matches!(
+            alert.get("last_error"),
+            Some(value) if value.is_null() || value.as_str().is_some()
+        ) {
+            return Err(format!(
+                "monitor_alerts row {index} has malformed last_error"
+            ));
+        }
+        for field in ["created", "updated"] {
+            if alert.get(field).and_then(Value::as_f64).is_none() {
+                return Err(format!("monitor_alerts row {index} missing {field}"));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn monitoring_unavailable(error: impl Into<String>) -> Value {
     json!({
         "available": false,
         "state": "unavailable",
@@ -401,8 +562,59 @@ fn monitoring_unavailable(error: impl Into<String>) -> Value {
 /// board is allowed to show an explicit unavailable state when the daemon is
 /// older than the monitor RPC; it must not open the live SQLite store itself.
 pub fn monitoring(state_dir: &Path) -> Value {
+    monitoring_with(state_dir, None, &json!({}))
+}
+
+/// The board-side reader-scoped projection. `relay_params` is built from the
+/// verified read admission (`ReadAdmission::relay_proof().attach`), never
+/// from a request claim: it carries `public_session`, `cli_envelope` or the
+/// operator-proven `read_as` identity the daemon re-verifies. Without one the
+/// projection fails closed with an explicit unavailable state — the board
+/// never falls back to the operator's numeric monitor document.
+pub(crate) fn monitoring_for_tasks(
+    state_dir: &Path,
+    allowed: &HashSet<String>,
+    relay_params: &Value,
+) -> Value {
+    monitoring_with(state_dir, Some(allowed), relay_params)
+}
+
+/// The relay fields a verified read admission attaches. A value that names
+/// none of them is not a proven reader and must not reach the daemon as the
+/// board's own operator connection.
+fn relay_request(relay_params: &Value) -> Option<serde_json::Map<String, Value>> {
+    let object = relay_params.as_object()?.clone();
+    if ["public_session", "read_as", "cli_envelope"]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        Some(object)
+    } else {
+        None
+    }
+}
+
+fn monitoring_with(
+    state_dir: &Path,
+    allowed: Option<&HashSet<String>>,
+    relay_params: &Value,
+) -> Value {
     let now = now_epoch();
-    let list = match client::rpc_timeout(state_dir, "monitor_list", json!({}), PROBE_TIMEOUT) {
+    let scoped = allowed.is_some();
+    let relay = if scoped {
+        match relay_request(relay_params) {
+            Some(relay) => relay,
+            None => return monitoring_unavailable("monitoring reader scope is unavailable"),
+        }
+    } else {
+        serde_json::Map::new()
+    };
+    let list = match client::rpc_timeout(
+        state_dir,
+        "monitor_list",
+        Value::Object(relay.clone()),
+        PROBE_TIMEOUT,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return monitoring_unavailable(error.to_string());
@@ -411,27 +623,77 @@ pub fn monitoring(state_dir: &Path) -> Value {
     let Some(rows) = list["monitors"].as_array() else {
         return monitoring_unavailable("monitor_list response missing monitors");
     };
-    if let Err(error) = validate_monitor_rows(rows) {
+    if scoped {
+        if list[READER_SCOPE_FIELD].as_str() != Some(MONITOR_READER_SCOPE_ACK) {
+            return monitoring_unavailable("monitor scope is unavailable");
+        }
+        if let Err(error) = validate_scoped_monitor_rows(rows) {
+            return monitoring_unavailable(format!("monitor scope is unavailable: {error}"));
+        }
+    } else if let Err(error) = validate_monitor_rows(rows) {
         return monitoring_unavailable(error);
     }
-    let monitors = rows.to_vec();
+    let monitors = rows
+        .iter()
+        .filter(|monitor| {
+            allowed.is_none_or(|allowed| {
+                monitor["coverage"].as_array().is_some_and(|coverage| {
+                    !coverage.is_empty()
+                        && coverage
+                            .iter()
+                            .all(|task| task.as_str().is_some_and(|task| allowed.contains(task)))
+                })
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut alerts_by_monitor = HashMap::new();
     for monitor in &monitors {
         let id = monitor["id"].as_str().unwrap_or_default();
+        let mut params = relay.clone();
+        params.insert("monitor".to_string(), json!(id));
+        params.insert("open".to_string(), json!(false));
+        params.insert("limit".to_string(), json!(100));
+        if scoped {
+            params.insert("cursor_format".to_string(), json!(MONITOR_CURSOR_FORMAT));
+        }
         match client::rpc_timeout(
             state_dir,
             "monitor_alerts",
-            json!({"monitor": id, "open": false, "limit": 100}),
+            Value::Object(params),
             PROBE_TIMEOUT,
         ) {
-            Ok(value) => match validate_monitor_alert_response(id, &value) {
-                Ok(rows) => {
-                    alerts_by_monitor.insert(id.to_string(), rows.to_vec());
+            Ok(value) => {
+                let validated = if scoped {
+                    validate_scoped_monitor_alert_response(id, &value)
+                } else {
+                    validate_monitor_alert_response(id, &value)
+                };
+                match validated {
+                    Ok(rows) => {
+                        if let Some(allowed) = allowed {
+                            let coverage =
+                                monitor["coverage"].as_array().expect("validated coverage");
+                            if rows.iter().any(|alert| {
+                                alert["task"].as_str().is_none_or(|task| {
+                                    !allowed.contains(task)
+                                        || !coverage
+                                            .iter()
+                                            .any(|covered| covered.as_str() == Some(task))
+                                })
+                            }) {
+                                return monitoring_unavailable(
+                                    "monitor alert scope is unavailable",
+                                );
+                            }
+                        }
+                        alerts_by_monitor.insert(id.to_string(), rows.to_vec());
+                    }
+                    Err(error) => {
+                        return monitoring_unavailable(format!("monitor_alerts '{id}': {error}"));
+                    }
                 }
-                Err(error) => {
-                    return monitoring_unavailable(format!("monitor_alerts '{id}': {error}"));
-                }
-            },
+            }
             Err(error) => {
                 return monitoring_unavailable(format!("monitor_alerts '{id}': {error}"));
             }

@@ -86,12 +86,14 @@ pub(crate) enum JobAction {
     Show { job: String },
     /// The job-scoped event view — every event any alias row recorded
     /// for this job. Default page is the newest 50; `--after` pages
-    /// forward like `cadence events`.
+    /// forward like `cadence events`. A proven operator keeps numeric
+    /// sequence cursors; every other reader follows opaque tokens.
     Events {
         job: String,
-        /// Return events after this cursor; omit for the newest page.
+        /// An opaque cursor from a previous page, or a numeric sequence
+        /// on a proven operator page; omit for the newest page.
         #[arg(long)]
-        after: Option<i64>,
+        after: Option<String>,
         /// Seconds to wait for new events per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -194,6 +196,286 @@ pub(crate) enum JobAction {
     },
 }
 
+/// CAD-2215: the forward position of a job-event page — whatever the daemon
+/// decided THIS reader may hold. The CLI never chooses the kind: a numeric
+/// position exists only on a page whose acknowledgement names a proven
+/// operator.
+#[derive(Clone, Debug)]
+enum JobEventsAfter {
+    /// A proven operator's native sequence position.
+    Sequence(i64),
+    /// Every other reader's opaque token, carried verbatim.
+    Token(String),
+}
+
+/// The reader a page's `_reader_scope` acknowledgement names. It is proof
+/// from the authenticated daemon, never a caller flag or environment
+/// value — an alias pane and an operator both run this binary. The ack
+/// values live in `board_api`; nothing here restates them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobEventsReader {
+    Operator,
+    Scoped,
+}
+
+/// One protocol refusal: actionable, and never a page.
+fn job_events_protocol(detail: &str) -> Error {
+    Error::rejected(format!(
+        "job events: the daemon answered outside the shipped protocol ({detail}); \
+         no page was printed"
+    ))
+}
+
+/// Take the per-response reader acknowledgement off the page (it is
+/// protocol evidence, not payload) and name the reader it proves. A
+/// missing or unknown acknowledgement is an actionable protocol error: an
+/// older daemon must not be read as a scoped raw numeric feed.
+fn job_events_ack(page: &mut Value) -> Result<JobEventsReader> {
+    let ack = page
+        .as_object_mut()
+        .and_then(|body| body.remove(cadence_core::board_api::READER_SCOPE_FIELD));
+    match ack.as_ref().and_then(Value::as_str) {
+        Some(ack) if ack == cadence_core::board_api::JOB_EVENTS_SCOPE_ACK => {
+            Ok(JobEventsReader::Scoped)
+        }
+        Some(ack) if ack == cadence_core::board_api::JOB_EVENTS_OPERATOR_SCOPE_ACK => {
+            Ok(JobEventsReader::Operator)
+        }
+        _ => Err(Error::rejected(
+            "job events: this daemon did not confirm the scoped job-event protocol \
+             (_reader_scope is missing or unknown), so no page was printed. Restart \
+             the daemon from a build that supports CAD-2215 and retry",
+        )),
+    }
+}
+
+/// Check one page against the reader it acknowledged and return it (the
+/// acknowledgement already stripped) for printing. A scoped page must omit
+/// global positions entirely, carry a stable keyed `id` and its own forward
+/// `cursor` on every visible event, and end on the last visible cursor —
+/// the exact supplied token on an empty page, or null on an initial empty
+/// page. An operator page keeps its native numeric document.
+fn job_events_page(
+    page: Value,
+    reader: JobEventsReader,
+    after: Option<&JobEventsAfter>,
+) -> Result<Value> {
+    if page.get("has_older").is_some_and(|flag| !flag.is_boolean()) {
+        return Err(job_events_protocol("`has_older` is not a boolean"));
+    }
+    match reader {
+        JobEventsReader::Operator => {
+            if page.get("events").and_then(Value::as_array).is_none() {
+                return Err(job_events_protocol("the page has no `events` array"));
+            }
+            if page.get("cursor").and_then(Value::as_i64).is_none() {
+                return Err(job_events_protocol(
+                    "an operator page has no numeric cursor",
+                ));
+            }
+            Ok(page)
+        }
+        JobEventsReader::Scoped => {
+            let events = page
+                .get("events")
+                .and_then(Value::as_array)
+                .ok_or_else(|| job_events_protocol("the page has no `events` array"))?;
+            let mut last: Option<&str> = None;
+            for event in events {
+                let row = event
+                    .as_object()
+                    .ok_or_else(|| job_events_protocol("an event row is not an object"))?;
+                if row.contains_key("seq") || row.contains_key("event_seq") {
+                    return Err(job_events_protocol(
+                        "a scoped event row carries a global sequence position",
+                    ));
+                }
+                if row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(job_events_protocol("a scoped event row has no stable id"));
+                }
+                let cursor = row
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .filter(|cursor| !cursor.is_empty())
+                    .ok_or_else(|| {
+                        job_events_protocol("a scoped event row has no forward cursor")
+                    })?;
+                last = Some(cursor);
+            }
+            let echoed = match after {
+                Some(JobEventsAfter::Token(token)) => Some(token.as_str()),
+                Some(JobEventsAfter::Sequence(_)) | None => None,
+            };
+            let expected = last.or(echoed);
+            let page_cursor = match page.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.as_str()),
+                _ => {
+                    return Err(job_events_protocol(
+                        "the scoped page cursor is not an opaque token",
+                    ))
+                }
+            };
+            if page_cursor != expected {
+                return Err(job_events_protocol(
+                    "the scoped page cursor is not the last visible event's cursor",
+                ));
+            }
+            Ok(page)
+        }
+    }
+}
+
+/// The position the next request carries: the page's own forward cursor,
+/// never a guessed, clamped or defaulted value.
+fn job_events_next(page: &Value, reader: JobEventsReader) -> Result<Option<JobEventsAfter>> {
+    match reader {
+        JobEventsReader::Operator => page
+            .get("cursor")
+            .and_then(Value::as_i64)
+            .map(|position| Some(JobEventsAfter::Sequence(position)))
+            .ok_or_else(|| job_events_protocol("an operator page has no numeric cursor")),
+        JobEventsReader::Scoped => Ok(page
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(|cursor| JobEventsAfter::Token(cursor.to_string()))),
+    }
+}
+
+/// One `job_events` request in the scoped protocol. `tail` asks for the
+/// newest page; otherwise `after` is the forward position (omitted only
+/// when there is no position yet).
+fn job_events_request(job: &str, after: Option<&JobEventsAfter>, tail: bool, wait: u64) -> Value {
+    let mut request = json!({
+        "job": job,
+        "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+    });
+    if tail {
+        request["tail"] = json!(true);
+    } else {
+        match after {
+            Some(JobEventsAfter::Sequence(position)) => request["after"] = json!(position),
+            Some(JobEventsAfter::Token(token)) => request["after"] = json!(token),
+            None => {}
+        }
+        request["wait"] = json!(wait);
+    }
+    request
+}
+
+/// `--after` as supplied. All-ASCII-digit text is a numeric sequence, which
+/// only a proven operator page accepts; anything else is an opaque token
+/// carried verbatim. Neither form is ever coerced into the other.
+fn job_events_after_argument(raw: &str) -> Result<JobEventsAfter> {
+    if raw.is_empty() {
+        return Err(Error::rejected(
+            "job events: --after needs an opaque cursor or a nonnegative sequence",
+        ));
+    }
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        let position = raw
+            .parse::<i64>()
+            .map_err(|_| Error::rejected("job events: --after sequence is out of range"))?;
+        return Ok(JobEventsAfter::Sequence(position));
+    }
+    Ok(JobEventsAfter::Token(raw.to_string()))
+}
+
+/// CAD-2215: stream one job-event feed through the scoped protocol. Shared
+/// by `cadence job events` and `cadence events --job`, so both callers take
+/// the same validated page path: numeric positions only for a proven
+/// operator page, opaque tokens carried verbatim for every other reader.
+/// The daemon proves the reader; the caller never picks the kind.
+pub(super) fn stream_job_events(
+    state_dir: &Path,
+    job: &str,
+    after: Option<&str>,
+    wait: u64,
+    follow: bool,
+) -> Result<i32> {
+    let rpc = |method: &str, params: Value| client::rpc(state_dir, method, params);
+    // The daemon proves which reader this is; these commands only ask for
+    // the scoped format and follow the per-page acknowledgement. A numeric
+    // --after is a proven operator's position, so the reader is resolved
+    // from a tail page before it is ever sent.
+    let mut position = after.map(job_events_after_argument).transpose()?;
+    let mut reader = None;
+    if position.is_none() {
+        // Same default as `cadence events`: no --after means the newest
+        // page, then forward paging from its cursor.
+        let mut page = rpc("job_events", job_events_request(job, None, true, 0))?;
+        let ack = job_events_ack(&mut page)?;
+        page = job_events_page(page, ack, None)?;
+        reader = Some(ack);
+        if !cadence_agent::output::stream_json(&page) {
+            return Ok(0);
+        }
+        if !follow {
+            return Ok(0);
+        }
+        position = job_events_next(&page, ack)?;
+    } else if matches!(position.as_ref(), Some(JobEventsAfter::Sequence(_))) {
+        let mut probe = rpc("job_events", job_events_request(job, None, true, 0))?;
+        let ack = job_events_ack(&mut probe)?;
+        let _ = job_events_page(probe, ack, None)?;
+        if ack != JobEventsReader::Operator {
+            return Err(Error::rejected(
+                "job events: --after is a numeric sequence, which only a proven \
+                 operator page accepts; this reader gets opaque cursors — pass \
+                 the `cursor` value a previous page returned instead",
+            ));
+        }
+        reader = Some(ack);
+    }
+    loop {
+        let mut page = rpc(
+            "job_events",
+            job_events_request(
+                job,
+                position.as_ref(),
+                false,
+                if follow { 25 } else { wait },
+            ),
+        )?;
+        let ack = job_events_ack(&mut page)?;
+        match reader {
+            Some(established) if established != ack => {
+                return Err(Error::rejected(
+                    "job events: the daemon changed the reader this stream is \
+                     scoped for; restart the command",
+                ))
+            }
+            Some(_) => {}
+            None => reader = Some(ack),
+        }
+        if ack == JobEventsReader::Operator
+            && matches!(position.as_ref(), Some(JobEventsAfter::Token(_)))
+        {
+            return Err(Error::rejected(
+                "job events: the daemon reports a proven operator, whose cursors \
+                 are numeric; the supplied opaque cursor belongs to a scoped reader",
+            ));
+        }
+        let page = job_events_page(page, ack, position.as_ref())?;
+        let empty = page
+            .get("events")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if (!empty || !follow) && !cadence_agent::output::stream_json(&page) {
+            return Ok(0);
+        }
+        position = job_events_next(&page, ack)?;
+        if !follow {
+            return Ok(0);
+        }
+    }
+}
+
 /// The `cadence job` tree — thin RPC wrappers. Validation, transitions
 /// and notifications live in the daemon/store so every caller (CLI,
 /// agent pane, operator) sees the same rules. `pane`/`by` carry the
@@ -284,41 +566,7 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             after,
             wait,
             follow,
-        } => {
-            // Same default as `cadence events`: no --after means the
-            // newest page, then forward paging from its cursor.
-            let mut cursor = match after {
-                Some(cursor) => *cursor,
-                None => {
-                    let page = rpc("job_events", json!({"job": job, "tail": true}))?;
-                    if !cadence_agent::output::stream_json(&page) {
-                        return Ok(0);
-                    }
-                    if !*follow {
-                        return Ok(0);
-                    }
-                    page.get("cursor").and_then(Value::as_i64).unwrap_or(0)
-                }
-            };
-            loop {
-                let page = rpc(
-                    "job_events",
-                    json!({"job": job, "after": cursor,
-                           "wait": if *follow { 25 } else { *wait }}),
-                )?;
-                let empty = page
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .is_some_and(Vec::is_empty);
-                if (!empty || !*follow) && !cadence_agent::output::stream_json(&page) {
-                    return Ok(0);
-                }
-                cursor = page.get("cursor").and_then(Value::as_i64).unwrap_or(cursor);
-                if !*follow {
-                    return Ok(0);
-                }
-            }
-        }
+        } => return stream_job_events(state_dir, job, after.as_deref(), *wait, *follow),
         JobAction::Dispatch {
             task,
             to,

@@ -31,6 +31,8 @@ describe("context budget refusal evidence", () => {
     expect(new ContextBudgetProofs(sqlStore(db)).matches(entry, marker)).toBe(
       true,
     );
+    // Refusals persisted by the previous release lack the classifier suffix.
+    expect(proofs.matches(entry, marker.split(":")[0])).toBe(true);
     expect(proofs.matches({ ...entry, byTaskId: 43 }, marker)).toBe(false);
     expect(proofs.matches({ ...entry, conversationId: "other" }, marker)).toBe(
       false,

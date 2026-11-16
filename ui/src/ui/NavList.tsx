@@ -58,15 +58,17 @@ interface NavListProps {
   homeCount?: number;
   /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
   noWiki?: boolean;
+  /** Additional nav screens unsupported on this board (see boardSupports). */
+  hiddenScreens?: readonly Screen[];
   /** Desktop rail hides nested rows without changing their stored fold state. */
   rail?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, rail = false }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, hiddenScreens, rail = false }: NavListProps) {
   const { t } = useLocale();
-  const items = navItems(noWiki);
+  const items = navItems(noWiki, hiddenScreens);
   const prefs = useSidebarPrefs();
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.
@@ -242,7 +244,7 @@ export function ProjectsSection(props: ProjectListProps) {
           <IconCaret size={10} />
           {t("Projects")}
         </button>
-        <span className="num text-[10px] text-ink-500">{projectsOpen ? "~/pm" : props.projects.length}</span>
+        <span className="num text-[10px] text-ink-500">{projectsOpen && !props.hosted ? "~/pm" : props.projects.length}</span>
       </div>
       <Fold id={listId} open={projectsOpen}>
         <ProjectList {...props} />
@@ -259,6 +261,8 @@ interface ProjectListProps {
   /** Counts derive from the cards (counts.ts), not `/api/projects`. */
   issues: ResourceState<IssueCard[]>;
   projectsError?: string | null;
+  /** Hosted workspaces hide the local `~/pm` filesystem path hint. */
+  hosted?: boolean;
   onNavigate?: () => void;
 }
 
@@ -304,6 +308,7 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
           onClick={onNavigate}
           className={`proj ${project === p.key ? "on" : ""}`}
           aria-current={project === p.key ? "page" : undefined}
+          title={p.key}
         >
           <span className="truncate">{p.key}</span>
           <span className="proj-prefix num">{p.prefix}</span>

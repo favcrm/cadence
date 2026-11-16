@@ -87,6 +87,30 @@ pub(super) fn automatic_updates_get(state_dir: &Path, install: &str) -> HttpResp
     )
 }
 
+/// `GET /api/app-installations/{id}/member-access` — CAD-2215. The exact
+/// conversations of one installation, the grants on them, and the live
+/// roster a grant may name. The row is `OperatorOnly`, so this handler only
+/// ever relays the operator's read; the live roster proof is the public
+/// session cookie the board already verified, never a body field. A local
+/// operator relays no proof and the daemon names no roster, which the panel
+/// reads as "cannot grant".
+pub(super) fn member_access_get(
+    request: &Request,
+    install: &str,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    match read_proof(operator::public_relay(request, opts)) {
+        Ok(proof) => relay_session(
+            state_dir,
+            "app_member_access_list",
+            json!({"install_id": install}),
+            proof.as_deref(),
+        ),
+        Err(resp) => resp,
+    }
+}
+
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,
 /// `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
 pub(super) fn read(
@@ -153,6 +177,8 @@ pub(super) enum WriteAction {
     RemovePreview,
     Remove,
     Restore,
+    MemberAccessGrant,
+    MemberAccessRevoke,
 }
 
 /// POST writes admitted by `RouteClass`. `caller` is the admitted board
@@ -255,6 +281,27 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
+        // CAD-2215: one exact member and one exact conversation. The body may
+        // name only those three fields — the install comes from the path, and
+        // the daemon reads the member's identity, the organization and the
+        // live roster from its own verified session, never from this relaying
+        // caller.
+        WriteAction::MemberAccessGrant => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_member_access_grant",
+                json!({"install_id": install}),
+                &["member_sub", "conversation_id", "expected_digest"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::MemberAccessRevoke => match public_proof(proof_relay) {
+            Ok(proof) => member_access_revoke(request, state_dir, install, proof.as_deref()),
+            Err(resp) => resp,
+        },
         WriteAction::FavoriteSet => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
@@ -324,6 +371,61 @@ fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp
             Err(err_response(401, "board session required for this write"))
         }
     }
+}
+
+/// [`public_proof`] for a read route: the same bearer, the read's own refusal
+/// wording. A public board read has no anonymous fallback either — the daemon
+/// cannot name a live roster without the session it must re-prove (CAD-2215).
+fn read_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp> {
+    match relay {
+        operator::PublicRelay::NotPublic => Ok(None),
+        operator::PublicRelay::Proven(proof) => Ok(Some(proof.token().to_string())),
+        operator::PublicRelay::Missing => {
+            Err(err_response(401, "board session required for this read"))
+        }
+    }
+}
+
+/// One exact member/conversation revoke (CAD-2215). The board refuses a body
+/// that does not name both, so the daemon's install-wide revoke can never be
+/// reached from this route: the Manage panel removes one pair at a time, and
+/// the install-wide form stays the operator's CLI verb. A revoke needs no
+/// live roster, so a member who is no longer on it can still be cleaned up.
+fn member_access_revoke(
+    request: &mut Request,
+    state_dir: &Path,
+    install: &str,
+    proof: Option<&str>,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let (Some(member_sub), Some(conversation_id)) = (field("member_sub"), field("conversation_id"))
+    else {
+        return err_response(400, "a revoke names one member and one conversation");
+    };
+    relay_session(
+        state_dir,
+        "app_member_access_revoke",
+        json!({
+            "install_id": install,
+            "member_sub": member_sub,
+            "conversation_id": conversation_id,
+        }),
+        proof,
+    )
 }
 
 /// Read a bounded JSON body, forward its allow-listed fields onto `params`

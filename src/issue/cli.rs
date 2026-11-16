@@ -938,6 +938,33 @@ pub enum ProjectAction {
         #[arg(long)]
         delivery_file: Option<std::path::PathBuf>,
     },
+    /// A project's timeline on a hosted org (CAD-2240): ticket changes,
+    /// comments, role messages and reviews, newest first. Hosted only; a
+    /// native board records no such timeline.
+    Timeline {
+        /// Project key.
+        key: String,
+        /// Only entries at or after this time (30m, 24h, 7d, YYYY-MM-DD,
+        /// epoch).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only these kinds (created status owner claim comment message
+        /// review); comma-separated or repeated.
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// Only role messages still open (not yet read by the addressed role).
+        #[arg(long)]
+        open: bool,
+        /// Entries per page, 1 to 100 (default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// The `next_before` cursor of the previous page.
+        #[arg(long)]
+        before: Option<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `--visibility` for `project policy`: the recorded vocabulary, before it

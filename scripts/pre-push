@@ -106,19 +106,24 @@ def contract_scripts(root):
 
 def focused_tests(root, changed):
     """CAD-1021: cheap invariant unit tests run when their input file
-    changes — a path → test-target map. Each entry is
-    (paths-it-watches, [cargo test filter args]). The test runs with
+    changes. Each entry is (paths-it-watches, [cargo test filter args]);
+    a test runs once however many of its paths changed. The test runs with
     the same --test-threads budget as every other step."""
-    MAP = {
+    MAP = [
         # CAD-1024: a new top-level verb in src/cli/commands.rs went red
         # on CI — the help-bucket invariant lives in cli::help tests.
-        "src/cli/commands.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
-        "src/cli/help.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
-    }
+        (("src/cli/commands.rs", "src/cli/help.rs"),
+         ["cargo", "test", "--bin", "cadence", "cli::help"]),
+        # CAD-2257: the delegation tests pin risk-classes.md to risk-paths.toml
+        # and read the context manifest; PR CI does not run them.
+        (("docs/roles/risk-classes.md", "docs/roles/risk-paths.toml",
+          "docs/cadence/project-context.yaml", "src/delegation.rs"),
+         ["cargo", "test", "--lib", "delegation::tests"]),
+    ]
     out = []
-    for path, argv in MAP.items():
-        if changed is None or path in changed:
-            out.append((f"focused {path}", argv))
+    for paths, argv in MAP:
+        if changed is None or any(p in changed for p in paths):
+            out.append((f"focused {argv[-1]}", argv))
     return out
 
 

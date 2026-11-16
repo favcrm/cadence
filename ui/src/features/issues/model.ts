@@ -1,4 +1,12 @@
-import type { CardAgent, IssueDetail, IssueHistoryEntry, Ref, TaskReport } from "../../lib/types";
+import type {
+  CardAgent,
+  IssueAssignmentRow,
+  IssueDetail,
+  IssueHistoryEntry,
+  Ref,
+  TaskReport,
+} from "../../lib/types";
+import type { StagedWrite } from "../decisions/stagedWrite";
 
 /** Tabs on `/projects/<project>/issues/<id>`. `overview` is the bare path. */
 export type IssueTab = "overview" | "activity" | "conversation" | "pr" | "evidence";
@@ -55,26 +63,53 @@ export interface ShownLink {
   label: string;
   id: string;
   title?: string;
+  status?: string;
   missing: boolean;
-  /** Kind `DELETE /links` accepts. Null for inverse rows (child, blocks, dup). */
+  /** Kind `DELETE /links` accepts. Null for inverse rows (child, blocks, dup, incoming relates). */
   unlinkKind: string | null;
 }
 
-/** Every link the detail carries. Unlink only the kinds this issue writes. */
-export function shownLinks(links: IssueDetail["links"]): ShownLink[] {
+/**
+ * Every link the detail carries. Unlink only the kinds this issue writes;
+ * when `localRelates` is supplied, incoming symmetric `relates` rows carry
+ * `unlinkKind: null` so the UI never offers a broken Unlink on another card's link.
+ */
+export function shownLinks(
+  links: IssueDetail["links"] | null | undefined,
+  localRelates?: readonly string[] | null,
+): ShownLink[] {
+  if (!links) return [];
   const rows: ShownLink[] = [];
-  const one = (label: string, ref: { id: string; title?: string; missing: boolean } | undefined, unlinkKind: string | null) => {
+  const localSet = localRelates ? new Set(localRelates) : null;
+  const one = (
+    label: string,
+    ref: { id: string; title?: string; status?: string; missing: boolean } | undefined,
+    unlinkKind: string | null,
+  ) => {
     if (!ref) return;
-    rows.push({ label, id: ref.id, title: ref.title, missing: ref.missing, unlinkKind });
+    rows.push({
+      label,
+      id: ref.id,
+      title: ref.title,
+      ...(ref.status ? { status: ref.status } : {}),
+      missing: ref.missing,
+      unlinkKind,
+    });
   };
-  const many = (label: string, refs: { id: string; title?: string; missing: boolean }[], unlinkKind: string | null) => {
-    for (const ref of refs) one(label, ref, unlinkKind);
+  const many = (
+    label: string,
+    refs: { id: string; title?: string; status?: string; missing: boolean }[] | undefined,
+    unlinkKind: string | null,
+  ) => {
+    for (const ref of refs ?? []) one(label, ref, unlinkKind);
   };
   one("Parent", links.parent, "parent");
   many("Child", links.children, null);
   many("Blocked by", links.blocked_by, "blocked_by");
   many("Blocks", links.blocks, null);
-  many("Related", links.relates, "relates");
+  for (const ref of links.relates ?? []) {
+    one("Related", ref, localSet === null || localSet.has(ref.id) ? "relates" : null);
+  }
   one("Dup of", links.duplicate_of, "duplicate_of");
   many("Dup", links.duplicates, null);
   return rows;
@@ -405,6 +440,103 @@ export function mergeState(detail: IssueDetail, pr: PrRef | null): MergeState {
 /** Deployment refs only prove intent to record one — no deploy signal exists. */
 export function deployRefs(refs: Ref[]): Ref[] {
   return refs.filter((r) => /deploy|release/i.test(r.kind));
+}
+
+/** True when the issue itself records repository code, PR, deploy or head-approval evidence. */
+export function hasCodeEvidence(detail: IssueDetail | null): boolean {
+  if (!detail) return false;
+  const refs = detail.refs ?? [];
+  if (prRef(refs) !== null || deployRefs(refs).length > 0) return true;
+  if (refs.some((r) => r.kind === "commit")) return true;
+  if ((detail.commits?.length ?? 0) > 0) return true;
+  if ((detail.approvals?.heads?.length ?? 0) > 0) return true;
+  if ((detail.reports ?? []).some((r) => Boolean(r.pr || r.sha))) return true;
+  return false;
+}
+
+/**
+ * CAD-2253: whether a work item shows software-repository delivery chrome
+ * (Pull request / Code tab, Merge & Deployment rows).
+ * - True whenever `detail` carries code/PR/commit/deploy/approval-head evidence.
+ * - Epics without code evidence stay planning records (`false`).
+ * - When `projectRepos` is known (`Array.isArray(projectRepos)`), follows `projectRepos.length > 0`
+ *   so non-dev projects (`repos: []`) stay domain-neutral until code evidence is linked.
+ * - When `projectRepos` is omitted (`undefined`), falls back to `detail.work?.type !== undefined`.
+ */
+export function hasCodeDelivery(
+  detail: IssueDetail | null,
+  projectRepos?: readonly unknown[] | null,
+  hosted?: boolean,
+): boolean {
+  if (!detail) return false;
+  if (hasCodeEvidence(detail)) return true;
+  if (detail.work?.type === "epic") return false;
+  if (Array.isArray(projectRepos)) return projectRepos.length > 0;
+  if (hosted) return false;
+  return detail.work?.type !== undefined;
+}
+
+/**
+ * Newest recorded hosted assignment row (`agenticos-v2` returns `assignments`
+ * ordered `updated_at DESC, id DESC`, so `rows[0]` wins on equal/missing timestamps).
+ */
+export function latestHostedAssignment(detail: IssueDetail | null): IssueAssignmentRow | null {
+  const rows = detail?.local_assignment?.available ? detail.local_assignment.assignments : [];
+  if (rows.length === 0) return null;
+  return rows.reduce((best, cur) =>
+    timeKey(cur.updated_at ?? null) > timeKey(best.updated_at ?? null) ? cur : best,
+  );
+}
+
+/** Human-readable summary of a hosted work item's recorded assignment/owner state. */
+export function hostedAssignmentText(
+  detail: IssueDetail,
+  t: (s: string) => string,
+): string {
+  const latest = latestHostedAssignment(detail);
+  if (latest) {
+    const actor = latest.target ?? detail.owner ?? t("Assigned");
+    return `${actor} · ${t(latest.state)}`;
+  }
+  const runActor = detail.agent_run?.agent_name || detail.agent_run?.agent;
+  if (runActor) {
+    return detail.agent_run?.state
+      ? `${runActor} · ${t(detail.agent_run.state)}`
+      : runActor;
+  }
+  if (detail.owner) return detail.owner;
+  if (
+    detail.local_assignment &&
+    !detail.local_assignment.available &&
+    detail.local_assignment.reason !== "not_supported"
+  ) {
+    return t("Assignment state unavailable");
+  }
+  return t("Unassigned");
+}
+
+/**
+ * Staged/decided assistant actions (`/api/assist/actions`) that explicitly
+ * target or reference `issueId`. Bounded token matching prevents `CAD-22`
+ * from matching `CAD-2253`.
+ */
+export function matchingStagedActions(
+  issueId: string,
+  rows: readonly StagedWrite[] | undefined,
+): StagedWrite[] {
+  if (!issueId || !rows || rows.length === 0) return [];
+  const escaped = issueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tokenRe = new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:$|[^A-Za-z0-9_-])`);
+  const hasToken = (text: string | null | undefined) => Boolean(text && tokenRe.test(text));
+  return rows.filter(
+    (row) =>
+      row.result?.ticket === issueId ||
+      row.target?.id === issueId ||
+      hasToken(row.recordLink) ||
+      hasToken(row.title) ||
+      hasToken(row.reason) ||
+      hasToken(row.raw),
+  );
 }
 
 export function laneState(agents: CardAgent[]): string {

@@ -43,7 +43,14 @@ fn wiki_as(caller: &operator::Caller) -> String {
     match caller {
         operator::Caller::Operator(_) => "operator".to_string(),
         operator::Caller::Agent(alias) => format!("agent:{alias}"),
-        operator::Caller::Named(named) => format!("user:{}", named.author),
+        operator::Caller::Named(named) if named.operator => "operator".to_string(),
+        operator::Caller::Named(named)
+            if crate::ident::is_handle(&named.sub, crate::ident::HANDLE_MAX)
+                && named.author == named.sub =>
+        {
+            format!("user:{}", named.sub)
+        }
+        operator::Caller::Named(_) => "public".to_string(),
     }
 }
 

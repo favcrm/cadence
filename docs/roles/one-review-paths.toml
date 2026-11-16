@@ -1,6 +1,10 @@
 # CAD-957: the ALLOWLIST of paths whose PRs need ONE fresh-session review
 # (standards + spec). Read by AGENTS.md "Review" and by scripts (CAD-959).
 # Changing this file is class `human` (risk-classes.md trigger 7).
+# CAD-2254: `one_review_exclude` also names paths that neither a workflow review
+# nor a ticket scope approval can carry to merge without the operator's per-head
+# approval (docs/roles/risk-classes.md trigger 7), so removing an exclude widens
+# those routes too, and an empty list counts as unreadable on both (CAD-2257).
 #
 # Match semantics (a script must implement exactly this):
 # - Diff source: `git diff --raw -z --no-renames <merge-base> <head>` (two-dot).
@@ -10,8 +14,10 @@
 #   disqualifies.
 # - Every path must match at least one `one_review_include` glob and no
 #   `one_review_exclude` glob. Exclude wins.
-# - Matching is case-sensitive and byte-exact, with no normalisation. A path
+# - Matching here is case-sensitive and byte-exact, with no normalisation. A path
 #   that starts with `./`, contains `..` or contains a backslash disqualifies.
+#   (The workflow-only route in scripts/enqueue-reviewed is stricter: it also
+#   refuses a case variant of an excluded path, CAD-2254.)
 # - Globs are repo-root-relative with `/` separators. `*` matches zero or
 #   more non-`/` characters. `**` as a whole segment matches zero or more
 #   whole segments. `?` and `[` are literal. No other wildcards.

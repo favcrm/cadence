@@ -1,6 +1,7 @@
 /** The agent page's sections; the active one rides the URL as `?tab=`. */
 export const AGENT_TABS = [
   { id: "instructions", label: "Instructions" },
+  { id: "routines", label: "Routines" },
   { id: "skills", label: "Skills" },
   { id: "tools", label: "Tools" },
   { id: "history", label: "History" },
@@ -30,6 +31,7 @@ export const BUNDLED_SKILLS = [
   { name: "business-documents", line: "Document intake, templates and pricing checks" },
   { name: "company-outputs", line: "Quotes, invoices, proposals and reports" },
   { name: "website-builder", line: "Build and publish a static website" },
+  { name: "incident-response", line: "Contain and close out incidents across teams" },
 ] as const;
 
 export type HistoryFilter = "all" | "turns" | "messages" | "reports" | "memory";

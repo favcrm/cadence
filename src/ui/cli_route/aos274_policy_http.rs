@@ -138,20 +138,29 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
     let jwks = loopback_server();
     let issuer = format!("http://{}", jwks.server_addr());
     let public_key = URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+    // The route's JWKS cache is process-wide and holds one issuer, so a
+    // parallel signed-route test can force a refetch: answer every fetch
+    // until the route is done, and require at least one.
+    let jwks_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let jwks_stop = jwks_done.clone();
     let jwks_thread = thread::spawn(move || {
-        let request = jwks
-            .recv_timeout(Duration::from_secs(15))
-            .unwrap()
-            .expect("JWKS not fetched");
-        assert_eq!(request.url(), "/.well-known/agenticos-board-jwks.json");
-        let response = Response::from_string(
-            json!({"keys": [{
-                "kty": "OKP", "crv": "Ed25519", "kid": "aos274-fixture", "x": public_key
-            }]})
-            .to_string(),
-        )
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-        request.respond(response).unwrap();
+        let mut fetched = false;
+        while !jwks_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok(Some(request)) = jwks.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            assert_eq!(request.url(), "/.well-known/agenticos-board-jwks.json");
+            let response = Response::from_string(
+                json!({"keys": [{
+                    "kty": "OKP", "crv": "Ed25519", "kid": "aos274-fixture", "x": public_key
+                }]})
+                .to_string(),
+            )
+            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            request.respond(response).unwrap();
+            fetched = true;
+        }
+        assert!(fetched, "JWKS not fetched");
     });
 
     let incomplete_requests = [
@@ -325,6 +334,7 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
         "the policy journal did not identify the authenticated Owner: {journal}"
     );
 
-    jwks_thread.join().unwrap();
     route_thread.join().unwrap();
+    jwks_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    jwks_thread.join().unwrap();
 }

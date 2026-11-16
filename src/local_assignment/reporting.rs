@@ -129,6 +129,9 @@ fn write_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<()> {
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
+    // A fresh binding clears the tombstone a finished assignment left, so the
+    // next cache write for this message is allowed again.
+    let _ = fs::remove_file(path.with_extension("agent.dropped"));
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
@@ -720,8 +723,30 @@ fn mark_accepted(path: &Path, state: &str) -> Result<()> {
 
 /// The assignment is over: its cached credential goes with it. The board ends
 /// it on its own; this only keeps a dead token off the disk.
+///
+/// CAD-2165: a tombstone is written first, so a `write_cache` that races this
+/// drop sees it and refuses (or removes what it just published). A writer that
+/// died between create and rename also strands a token in a `.tmp` beside the
+/// cache, so those are removed here too.
 fn drop_agent_credential(binding: &Path) {
-    let _ = fs::remove_file(binding.with_extension("agent"));
+    let cache = binding.with_extension("agent");
+    let _ = write_private(&binding.with_extension("agent.dropped"), b"1\n");
+    let _ = fs::remove_file(&cache);
+    if let (Some(dir), Some(name)) = (
+        cache.parent(),
+        cache.file_name().and_then(|name| name.to_str()),
+    ) {
+        let prefix = format!(".{name}.");
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let file = entry.file_name();
+                let Some(file) = file.to_str() else { continue };
+                if file.starts_with(&prefix) && file.ends_with(".tmp") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 fn mark_fenced(path: &Path) -> Result<()> {

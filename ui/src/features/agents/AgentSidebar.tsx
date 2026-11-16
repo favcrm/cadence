@@ -11,6 +11,7 @@ const GROUPS: { id: string; label: string; folded?: boolean }[] = [
   { id: "attention", label: "Needs you" },
   { id: "working", label: "Working" },
   { id: "idle", label: "Idle" },
+  { id: "unknown", label: "Unknown" },
   { id: "profile", label: "Not running" },
   { id: "stopped", label: "Stopped", folded: true },
   { id: "inbox", label: "Mailboxes", folded: true },
@@ -24,7 +25,7 @@ function profileGroup(p: HiredProfile): string {
 
 function groupOf(a: Agent): string {
   const category = agentCategory(a);
-  return category === "other" ? "idle" : category;
+  return category === "other" ? (a.state == null ? "unknown" : "idle") : category;
 }
 
 export default function AgentSidebar({

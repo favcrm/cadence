@@ -90,8 +90,24 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// tables; v60 (CAD-1085) adds the connection-dispatch ledger tables; v61
 /// (CAD-1962) adds the imported-media custody tables; v62 (CAD-2042) adds the
 /// retained-source scope columns and page index plus a migration-progress
-/// table. None changes a latch or witness table, so the bound extends to 62.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 62;
+/// table; v63 (CAD-1857) adds `agent_endpoints`. v64 (CAD-2215) adds the
+/// `assist_request_queue` table and an index on `assist_requests(job)`; v65
+/// adds `app_member_grants`; v66 adds the nullable
+/// `connection_metadata.cursor_keyring_fingerprint`; v67 adds and backfills
+/// `app_member_grants.authorization_epoch`; v68 (CAD-2317) adds `routines`,
+/// `routine_runs`, `connection_policies`, `staged_routine_proposals`, and
+/// `credential_request_resolutions` (and their indexes). None changes a latch
+/// or witness table or adds a trigger, so the bound extends to 68 (CAD-2310,
+/// CAD-2317).
+///
+/// It stays a reviewed literal rather than `rollout::SCHEMA_VERSION`, so a
+/// migration that does touch a latch or witness table is never accepted
+/// unread; the assertion below fails the build when the two part.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 68;
+const _: () = assert!(
+    PROTECTED_SCHEMA_MAX == crate::rollout::SCHEMA_VERSION,
+    "review the new migrations for latch/witness tables, then raise PROTECTED_SCHEMA_MAX"
+);
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1742,6 +1758,18 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if decision_tables != 2 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 63 {
+                // v63 adds only the endpoint registry. A hand-made 63
+                // database without it is not the schema this witness accepts.
+                let endpoint_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_endpoints'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if endpoint_tables != 1 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

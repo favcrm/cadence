@@ -78,7 +78,7 @@ export function useHomeUnread(onHome: boolean): void {
         if (!mounted.current) return null;
         if (onHomeNow.current) return null;
         if (document.visibilityState !== "visible") return null;
-        toast.show("Assistant replied", "assistant:home", { href: "/", note: "Home" });
+        toast.show("Assistant replied", "assistant:home", { href: "/", note: "Home", translateNote: true });
         return () => toast.clear("assistant:home");
       });
       if (!delivered) return;

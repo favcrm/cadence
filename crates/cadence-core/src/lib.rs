@@ -1,4 +1,5 @@
 //! Shared Cadence domain rules. No filesystem, process, network or database owner lives here.
+pub mod agent_form;
 pub mod app_compat;
 pub mod app_screen_decl;
 pub mod board_api;

@@ -5,10 +5,11 @@ import { usingPrivateOperation, type PrivateOperation } from "../../lib/privateS
 import {
   addPending,
   asEntry,
-  loadThread,
+  EMPTY_THREAD,
+  mergeEntries,
   newMessageId,
   settlePending,
-  type PageReader,
+  type ThreadEntry,
   type ThreadState,
 } from "./thread";
 
@@ -52,59 +53,70 @@ export function memberScope(sessionId: string | null, sub: string): string {
   return `${sessionId ?? ""}:${sub}`;
 }
 
-/** A history page is canonical assistant history or nothing — a missing
- *  or malformed `entries` list is an unknown surface, never an empty
- *  thread. The member's own entries carry `role:"member"`; the shared
- *  render treats the me-bubble as `role:"operator"`, so they are
- *  normalised at the boundary (stored role is never rewritten on the
- *  wire). An entry the parser cannot read is dropped by `asEntry`,
- *  matching the master reader's behaviour. */
-function memberPage(page: MemberAssistHistory): {
-  thread: unknown;
-  entries: unknown[];
-  more_before?: boolean;
-} {
+type MemberWireEntry = Record<string, unknown> & { id: string };
+
+interface MemberPage {
+  conversation: { id: string; alias: string };
+  entries: MemberWireEntry[];
+  cursor: string | null;
+  before: string | null;
+  moreBefore: boolean | null;
+  moreAfter: boolean | null;
+}
+
+/** The relay must answer an opaque page; an old numeric page is unavailable. */
+function memberPage(page: MemberAssistHistory): MemberPage {
   if (page === null || typeof page !== "object" || Array.isArray(page)) {
     throw new ApiError("member history answered an unexpected shape", 0);
   }
-  const raw = page.entries;
-  if (!Array.isArray(raw)) {
+  const conversation = page.conversation;
+  if (
+    !conversation || typeof conversation.id !== "string" || !conversation.id ||
+    typeof conversation.alias !== "string" || !conversation.alias
+  ) {
+    throw new ApiError("member history answered an unusable conversation", 0);
+  }
+  if (!Array.isArray(page.entries)) {
     throw new ApiError("member history answered no usable entries", 0);
   }
-  // The bound conversation is the canonical thread object the daemon
-  // stamps on every history page. Its absence is a real state (the
-  // binding has no conversation yet → legitimately empty thread); a
-  // present-but-malformed one is an unusable page, never an empty chat.
-  let conversation: unknown = null;
-  if (page.conversation !== null && page.conversation !== undefined) {
-    const c = page.conversation as Record<string, unknown>;
-    const id = c.id;
-    const alias = c.alias;
+  const ids = new Set<string>();
+  const entries = page.entries.map((entry): MemberWireEntry => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new ApiError("member history answered an unusable entry", 0);
+    }
+    const row = entry as Record<string, unknown>;
     if (
-      typeof id !== "string" || id.length === 0 ||
-      typeof alias !== "string" || alias.length === 0
+      typeof row.id !== "string" || !row.id.startsWith("csrid_") || row.id.length <= 6 ||
+      Object.prototype.hasOwnProperty.call(row, "seq") ||
+      typeof row.role !== "string" || typeof row.kind !== "string" || typeof row.text !== "string"
     ) {
-      throw new ApiError("member history answered an unusable conversation", 0);
+      throw new ApiError("member history answered an unusable entry", 0);
     }
-    conversation = c;
-  }
-  const entries = raw.map((e) => {
-    if (e && typeof e === "object" && (e as Record<string, unknown>).role === "member") {
-      return { ...(e as Record<string, unknown>), role: "operator" };
-    }
-    return e;
+    if (ids.has(row.id)) throw new ApiError("member history repeated an entry", 0);
+    ids.add(row.id);
+    return row as MemberWireEntry;
   });
-  const renderable = entries.filter((e) => asEntry(e) !== null);
-  // A nonempty page the parser cannot read is an unknown surface, never
-  // a fresh empty chat — `asEntry` keeps ordinary metadata entries and
-  // only drops what genuinely is not a thread entry.
-  if (raw.length > 0 && renderable.length === 0) {
-    throw new ApiError("member history answered no recognisable entries", 0);
+  const position = (value: unknown): string | null => {
+    if (value === null) return null;
+    if (typeof value === "string" && value.startsWith("csc1_") && value.length > 5) return value;
+    throw new ApiError("member history answered an unusable cursor", 0);
+  };
+  const flag = (value: unknown): boolean | null => {
+    if (value === null || typeof value === "boolean") return value;
+    throw new ApiError("member history answered an unusable page boundary", 0);
+  };
+  const cursor = position(page.cursor);
+  const before = position(page.before_cursor);
+  if (entries.length > 0 && (cursor === null || before === null)) {
+    throw new ApiError("member history omitted a page boundary", 0);
   }
   return {
-    thread: conversation,
-    entries: renderable,
-    more_before: page.more_before === true,
+    conversation,
+    entries,
+    cursor,
+    before,
+    moreBefore: flag(page.more_before),
+    moreAfter: flag(page.more_after),
   };
 }
 
@@ -129,6 +141,8 @@ export interface MemberHistoryObservation {
  *  fields (the extension is additive). */
 export interface MemberThreadState extends ThreadState {
   history?: MemberHistoryObservation;
+  /** Opaque server positions; numeric render ordering below never leaves the browser. */
+  memberPosition?: { forward: string | null; before: string | null };
 }
 
 /** Derive the observation the component trusts. It reads the PAYLOAD's
@@ -153,67 +167,120 @@ export function memberHistory(state: ResourceState<MemberThreadState>): MemberHi
   return { loaded };
 }
 
-/**
- * Wrap the member history fetcher so the ONLY `loaded:true` stamp is a
- * fetcher result the Resource accepts. `loadThread` resolves to a
- * `ThreadState`; we stamp `history:{loaded:true}` on it (a clean read —
- * `readError` left absent; a later failed refresh re-records error via
- * the Resource's own stale path into `Resource.error`). The stamp is on
- * the resolved value, applied by the Resource only when its generation/
- * epoch still match — never set before acceptance.
- *
- * One exception the shared loader cannot express for us: `loadThread`'s
- * 404 branch RESOLVES `{...held, exists:false, missing:true}` — the
- * Master's documented "not started" fallback (`thread.ts`). For the
- * member's bound conversation there is no "not started" — a 404 is a
- * failed/absent history READ, never an empty thread. The canonical
- * legitimate "no conversation yet" is a successful 200 page with
- * `entries[]`/`conversation:null` (handled inside `memberPage`), which
- * resolves normally. A resolved `missing:true` therefore throws, so the
- * Resource records failure/stale and retains prior read truth — missing
- * history stays UNKNOWN, never `loaded`.
- */
-function memberLoadThread(current: MemberThreadState | null): Promise<MemberThreadState> {
-  return loadThread(memberThreadReader(), current).then(
-    (state): MemberThreadState => {
-      if (state.missing === true) {
-        throw new ApiError(
-          "member history answered 404 — the bound assistant surface is not available",
-          0,
-        );
-      }
-      return { ...state, history: { loaded: true } };
-    },
-  );
+type MemberEntry = ThreadEntry & { memberId: string };
+
+// Local render order only. It is never sent as a cursor or persisted as a
+// read marker; server-issued row ids and opaque tokens own those contracts.
+const MEMBER_ORDER_ORIGIN = 2 ** 40;
+const MEMBER_PAGE_LIMIT = 200;
+
+function foldMemberPage(
+  state: MemberThreadState,
+  page: MemberPage,
+  direction: "tail" | "forward" | "before",
+): MemberThreadState {
+  if (state.conversation && state.conversation !== page.conversation.id) {
+    throw new ApiError("member history conversation changed", 0);
+  }
+  if ((direction === "forward" && page.moreAfter === null) ||
+      (direction !== "forward" && page.moreBefore === null)) {
+    throw new ApiError("member history omitted its page boundary", 0);
+  }
+  const known = new Map<string, MemberEntry>();
+  for (const entry of state.entries) {
+    const member = entry as MemberEntry;
+    if (typeof member.memberId !== "string" || !member.memberId) {
+      throw new ApiError("member history needs a fresh session", 0);
+    }
+    known.set(member.memberId, member);
+  }
+  const fresh = page.entries.filter((row) => !known.has(row.id)).length;
+  let next = direction === "before"
+    ? (state.entries[0]?.seq ?? MEMBER_ORDER_ORIGIN) - fresh
+    : (state.entries[state.entries.length - 1]?.seq ?? MEMBER_ORDER_ORIGIN - 1) + 1;
+  if (!Number.isSafeInteger(next) || next < 1 || !Number.isSafeInteger(next + fresh)) {
+    throw new ApiError("member history render order is unavailable", 0);
+  }
+  const incoming = page.entries.map((row): MemberEntry => {
+    const prior = known.get(row.id);
+    const entry = asEntry({
+      ...row,
+      seq: prior?.seq ?? next++,
+      role: row.role === "member" ? "operator" : row.role,
+    });
+    if (!entry) throw new ApiError("member history answered an unusable entry", 0);
+    return { ...entry, memberId: row.id };
+  });
+  const merged = mergeEntries(state, incoming);
+  const forward = direction === "before"
+    ? (state.memberPosition?.forward ?? page.cursor)
+    : page.cursor;
+  const before = direction === "forward"
+    ? (state.memberPosition?.before ?? page.before)
+    : page.before;
+  return {
+    ...merged,
+    exists: true,
+    conversation: page.conversation.id,
+    memberPosition: { forward, before },
+    moreBefore: direction === "forward" ? state.moreBefore : page.moreBefore,
+  };
 }
 
-/**
- * One store per member session scope. `loadThread` keeps pending
- * sends across a refetch and reopens on the tail when too far behind —
- * identical semantics to the Master thread store, just keyed to the
- * member's scope and reading the member-assistant endpoints. The
- * privateSession epoch fences a stale store's late pages: a generation
- * that moved mid-read throws the session-changed abort before the
- * write lands.
- */
+/** Only an accepted history response may stamp the member's read truth. */
+async function memberLoadThread(current: MemberThreadState | null): Promise<MemberThreadState> {
+  let state: MemberThreadState = current ?? { ...EMPTY_THREAD };
+  if (!state.memberPosition) {
+    if (state.entries.length > 0) throw new ApiError("member history needs a fresh session", 0);
+    const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
+    state = foldMemberPage(state, page, "tail");
+  } else {
+    for (let i = 0; i < 2; i++) {
+      const after = state.memberPosition?.forward ?? null;
+      const page = memberPage(await api.memberAssistHistory({
+        ...(after === null ? {} : { after }),
+        limit: MEMBER_PAGE_LIMIT,
+      }));
+      if (page.entries.length === 0 && page.cursor !== after) {
+        throw new ApiError("member history changed its continuation", 0);
+      }
+      state = foldMemberPage(state, page, "forward");
+      if (!page.moreAfter) break;
+    }
+  }
+  return { ...state, history: { loaded: true } };
+}
+
+/** One store per verified member session; a stale cursor never resets itself. */
 export function memberThreadStore(scope: string): Resource<MemberThreadState> {
   return cache.family<string, MemberThreadState>("memberThread", (key) =>
     memberLoadThread(cache.peek<MemberThreadState>(`memberThread:${key}`)?.get().data ?? null),
   )(scope);
 }
 
-/** The page reads the member thread needs: newest page, forward
- *  catch-up, and older pages — all through `memberAssistHistory`. */
-export function memberThreadReader(): PageReader {
-  const limit = 200;
-  return {
-    after: (after, lim) =>
-      api.memberAssistHistory({ after, limit: lim ?? limit }).then(memberPage),
-    tail: (lim) =>
-      api.memberAssistHistory({ tail: true, limit: lim ?? limit }).then(memberPage),
-    before: (before, lim) =>
-      api.memberAssistHistory({ before, limit: lim ?? limit }).then(memberPage),
-  };
+/** Read an older page without replacing the live forward continuation. */
+export function fetchMemberEarlier(
+  state: MemberThreadState,
+): Promise<{ before: string; page: MemberPage }> | null {
+  const before = state.memberPosition?.before;
+  if (state.moreBefore !== true) return null;
+  if (!before) return Promise.reject(new ApiError("member history omitted its earlier cursor", 0));
+  return api.memberAssistHistory({ before, limit: MEMBER_PAGE_LIMIT }).then((response) => {
+    const page = memberPage(response);
+    if (page.entries.length === 0 && page.before !== before) {
+      throw new ApiError("member history changed its continuation", 0);
+    }
+    return { before, page };
+  });
+}
+
+/** Drop an older response if another page already moved its boundary. */
+export function applyMemberEarlier(
+  state: MemberThreadState,
+  result: { before: string; page: MemberPage },
+): MemberThreadState {
+  if (state.memberPosition?.before !== result.before) return state;
+  return foldMemberPage(state, result.page, "before");
 }
 
 /**

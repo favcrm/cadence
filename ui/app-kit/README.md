@@ -1,9 +1,16 @@
 # `@cadence/app-kit`
 
-The app side of the Cadence screen bridge, implemented once. Transport and
-lifecycle only: boot, `init`, `ready`, the closed PUSH union,
-`call`/`slot`/`tool`, assets, bounded `state`, teardown. What a PUSH *means*
-stays in the app.
+The app side of the Cadence screen bridge, implemented once with zero runtime
+dependencies and zero domain-specific assumptions:
+
+1. **`createScreenBridge(options)`** — reactive `screen.v2` store (`subscribe` +
+   `getState`), closed `ScreenPush` validation, host drawer verb separation,
+   per-verb argument allowlists and byte caps, concurrency limits, reply size
+   and secret-key guards, write vs read retirement, route patching, and scoped
+   unsaved-edit leave state.
+2. **`createScreenReceiver(options)`** — low-level transport and lifecycle:
+   boot, `init`, `ready`, the closed PUSH union, `call`/`slot`/`tool`, assets,
+   drawer surfaces + context, `ownLeaveState`, bounded `state`, teardown.
 
 The wire protocol is owned by
 `ui/src/features/workspace-apps/screen/screenProtocol.ts`; this package
@@ -26,7 +33,32 @@ This package is the one piece those do not provide: a receiver an app screen
 runs in the browser. It ships inside the toolchain rather than as a parallel
 CLI.
 
-## Usage
+## Usage (`createScreenBridge`)
+
+```js
+import { createScreenBridge } from "@cadence/app-kit";
+
+export const CALL_FIELDS = {
+  "records.list": ["query", "limit", "cursor"],
+  "records.show": ["record_id"],
+  "records.create": ["record_id", "profile"],
+  "records.update": ["record_id", "expected_revision", "profile"],
+  "screen.route.patch": ["section", "view", "record_id", "replace"],
+};
+
+export const bridge = createScreenBridge({
+  tag: "notes",
+  appName: "notes",
+  records: true,
+  surfaces: true,
+  locale: true,
+  calls: CALL_FIELDS,
+  argBytes: { "records.create": 49152, "records.update": 49152 },
+  writeVerbs: ["records.create", "records.update"],
+  observations: ["records.list", "records.show"],
+  route: { sections: ["all", "open"], defaultSection: "all" },
+});
+```
 
 ## Presentation and the board-wide drawer
 
@@ -49,10 +81,12 @@ await receiver.openDrawer("draft", { size: "wide" }); // a wider panel
 await receiver.closeDrawer();          // host returns the frame to the outlet
 ```
 
-`openDrawer(surface, { size })` takes an optional `size` of `"narrow"` (the
-default panel) or `"wide"` (about 736px at desktop widths; the panel is the full
-viewport at the board's narrow breakpoint either way). Any other size rejects
-with a `TypeError` before it is sent, and a host refuses it in place.
+`openDrawer(surface, { size, context })` takes an optional `size` of `"narrow"`
+(the default panel) or `"wide"` (about 736px at desktop widths; the panel is the
+full viewport at the board's narrow breakpoint either way), plus an optional
+bounded plain-JSON `context` (`<= 1024` bytes) on `screen-surfaces.v1` read by
+the drawer child via `drawerContext()`. Any other size or invalid context
+rejects with a `TypeError` before it is sent, and a host refuses it in place.
 
 `openDrawer`/`closeDrawer` send the host UI verbs `screen.drawer.open` and
 `screen.drawer.close`. They are shell verbs, not app capabilities, so they are
@@ -84,18 +118,40 @@ const asset = await receiver.asset("draft-image:d1:0");
 receiver.state(JSON.stringify(localDraft)); // ≤ 32 KiB
 ```
 
-### Records screens
+### Generic locale, audio capture, leave guard, and records screens
+
+Any `screen.v2` screen may opt into `screen-locale.v1` to receive the
+host-selected UI locale (`push.presentation_locale`: `"en" | "zh-TW"`), and may
+call `ownLeaveState()` after an accepted `screen.v2` PUSH to publish
+`{ v: 2, op: "leave", unsaved }` with symbol-fenced handle ownership.
+
+Any `screen.v2` screen may opt into `screen-audio.v1` (`audio: true` on
+`createScreenBridge`, or `accepts: ["screen.v2", "screen-audio.v1"]` on
+`createScreenReceiver`) for host-modal audio capture (`bridge.audioCapture`), or
+into `screen-audio.v2` (`audio: "v2"` on `createScreenBridge`, or
+`accepts: ["screen.v2", "screen-audio.v2"]` on `createScreenReceiver`) for
+headless inline audio sessions (`bridge.audioSession` + `bridge.onAudioSession`).
+When the host projects `audio_capture: 1` for the live mount
+(`bridge.canAudioCapture()`), `screen-audio.v1` opens the host modal and resolves
+`{ transcript, duration_seconds, held_at, source }`, while `screen-audio.v2`
+keeps the UI inside the app's own screen and streams bounded
+`ScreenAudioSessionSnapshot` events (`phase`, `elapsed_seconds`, `level` 0..100,
+`peak` 0..100, segment counts, `transcript`, `error`) for `start`, `pause`,
+`resume`, `stop`, `upload` (bounded `ArrayBuffer` <= 50 MiB), `retry`, and
+`cancel` without opening any host modal. Interactive audio commands wait without
+a wall-clock RPC timeout unless `timeoutMs` is passed explicitly, and refusals
+(`cancelled`, `owner_required`, `conflict`, `unavailable`, `mic_unavailable`)
+leave the open screen bridge intact.
 
 A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
-host then sends the records projection, which the app validates in `onPush`.
-`crm-locale.v1` additionally opts into the host-selected CRM locale and needs
-`screen-records.v1`. Records CSV calls are larger than the default action
-budget, so the receiver takes a `maxArgsBytes` limit (the host allows 320 KiB
-for `records.csv.*`; keep the app's own per-verb bounds too).
+host then sends the records projection, which the app validates in `onPush` (or
+delegates to `createScreenBridge`). Records CSV calls are larger than the
+default action budget, so the receiver takes a `maxArgsBytes` limit (the host
+allows 320 KiB for `records.csv.*`; keep the app's own per-verb bounds too).
 
 ```js
 const receiver = createScreenReceiver({
-  accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"],
+  accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1"],
   maxArgsBytes: 327680,
   onPush(push) { validateAndRender(push); },
 });
@@ -151,10 +207,6 @@ reference receiver and `screenProtocol.ts`):
   the promise stays open until `done`/`refused` (which resolve the host's
   event, receipt included). The optional anchor defaults to `"footer"`.
 
-What stays app-owned: the closed verb set and per-verb arg shapes (the PUSH
-`actions` advertisement), payload validation in `onPush`, and which asset refs
-are legitimate.
-
 Defaults: `accepts: ["screen.v2"]`, `timeoutMs: 15000`, boot read from
 `#cadence-screen-boot`. A reply that is neither `ok` nor a well-formed
 `{code, text}` refusal rejects with `ScreenRefusalError` (status from
@@ -163,10 +215,35 @@ protocol violation calls `onError` and closes the port.
 
 ## Migrating a repo
 
-1. Replace the hand-written receiver/bridge with `createScreenReceiver`; keep
-   the app's projection and payload validation in `onPush`.
+1. Replace the hand-written receiver/bridge with `createScreenBridge` (or
+   `createScreenReceiver` for custom projections).
 2. Keep `cadence app check` (not a local copy) in CI.
 3. Keep the app's build and bundler: this package does not build screens.
+
+## Forms in Sandboxed Screens
+
+`installSandboxFormActions(doc)` is idempotent per `Document` (reference-counted across installers) and handles actionless `<form>` submissions inside `<iframe sandbox="allow-scripts">` (where `allow-forms` is omitted and Chromium otherwise aborts `<button type="submit">` / `Enter` submissions before firing `"submit"`). It intercepts actionless submit-button clicks and single-line `<input>` `Enter` keydowns (respecting `disabled`, `<fieldset disabled>`, `form="..."`, `action`, `formaction`, and constraint validation), calls `preventDefault()`, and dispatches a cancelable `"submit"` event so React `onSubmit` handlers run normally, while also calling `preventDefault()` during capture-phase `"submit"` to block accidental iframe navigation in permissive hosts. Passing `sandboxForms: true` to `createScreenBridge(...)` installs it automatically and cleans it up on `retire()` or `reset()`.
+
+## React 19 Bindings (`@cadence/app-kit/react`)
+
+- `useScreenBridge(bridge)` subscribes with `useSyncExternalStore` and returns
+  the current `ScreenBridgeState`.
+- `useScreenSelector(bridge, selector, isEqual?)` memoizes selected slices per
+  `(state, selector)` and preserves reference identity when `isEqual` holds.
+- `useScreenStatus(bridge)` returns `{ status, error, ready, isLoading, isError }`
+  with shallow equality stability.
+- `createFrameNavigationAdapter(bridge, options?)` adapts `NavigationProvider`
+  link activations into `bridge.patchRoute(...)` calls.
+
+## Non-Fatal Host 403 Refusals
+
+Only mount revocation refusals (`"This app's access is no longer available."`
+or post-mount `403` refusals that are not a `slot` call, declared `writeVerbs`
+operation, `code === "owner_required"`, or opted-in `keepAliveOnForbidden`)
+transition the bridge to `"error"`. Host `403` refusals for declared
+`writeVerbs`, confirmation `slot` actions, `owner_required` gates, or
+`keepAliveOnForbidden` calls reject the returned promise (`ScreenRefusalError`
+with `.status === 403`) while keeping the bridge mounted and interactive.
 
 ## Tests
 

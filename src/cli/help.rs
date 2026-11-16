@@ -93,6 +93,7 @@ const OPERATOR: &[&str] = &[
     "inspect-portable",
     "ui",
     "master",
+    "routine",
     "connection",
     "platform",
     "app",
@@ -120,6 +121,7 @@ const ADVANCED: &[&str] = &[
     "delivery",
     "devin",
     "document",
+    "endpoint",
     "events",
     "idea",
     "intake",
@@ -361,19 +363,25 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
         }
         return Some(Ok(out));
     }
-    // Leaf: clap's usage for the command, built from the top tree so it
-    // keeps the full `cadence <path>` prefix. The global options and
-    // -h/--help are hidden: the guard admits none of them.
+    Some(master_leaf_text(&path))
+}
+
+/// The master's help for one admitted leaf path: clap's usage, built from
+/// the top tree so it keeps the full `cadence <path>` prefix (the global
+/// options and -h/--help are hidden: the guard admits none of them), then
+/// the path's limits and its guide (CAD-2309).
+fn master_leaf_text(path: &str) -> cadence_agent::error::Result<String> {
+    use cadence_agent::error::Error;
     let mut cmd = Cli::command();
     cmd.build();
     let mut node = &cmd;
-    for tok in target {
+    for tok in path.split(' ') {
         match node.find_subcommand(tok) {
             Some(sub) => node = sub,
             None => {
-                return Some(Err(Error::usage(format!(
+                return Err(Error::usage(format!(
                     "`{path}` is not a command path you may run"
-                ))));
+                )));
             }
         }
     }
@@ -386,10 +394,14 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
     });
     let mut out = leaf.render_help().to_string().trim_end().to_string();
     out.push('\n');
-    if let Some(limits) = master_leaf_limits(&path) {
+    if let Some(limits) = master_leaf_limits(path) {
         out.push_str(&format!("\nLimits for you: {limits}\n"));
     }
-    Some(Ok(out))
+    // CAD-2309: the detail the master's AGENT.md points to.
+    if let Some(guide) = cadence_agent::master::help_guide(path) {
+        out.push_str(&format!("\nHow to use it:\n{guide}\n"));
+    }
+    Ok(out)
 }
 
 /// The master's bounded command listing: exactly the Home profile's
@@ -507,6 +519,21 @@ mod tests {
 
     fn render_root(in_pane: bool) -> String {
         root_command(in_pane).render_help().to_string()
+    }
+
+    /// CAD-2309: a leaf the master's briefing points to prints its guide
+    /// after clap's usage; a leaf with no guide prints none.
+    #[test]
+    fn master_leaf_help_carries_the_guide_the_briefing_points_to() {
+        let plan = master_leaf_text("plan propose").unwrap();
+        assert!(plan.contains("cadence plan propose"), "{plan}");
+        assert!(plan.contains("Limits for you:"), "{plan}");
+        assert!(plan.contains("How to use it:\n"), "{plan}");
+        assert!(plan.contains("### Acceptance"), "{plan}");
+        let wiki = master_leaf_text("wiki search").unwrap();
+        assert!(wiki.contains("at most 3 query variants"), "{wiki}");
+        let overview = master_leaf_text("overview").unwrap();
+        assert!(!overview.contains("How to use it:"), "{overview}");
     }
 
     #[test]

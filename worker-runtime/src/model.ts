@@ -166,6 +166,115 @@ export interface MeteredBinding {
 }
 
 /**
+ * Pi supplies one user message containing the whole compaction source. The
+ * hosted gateway limits each message to 64,000 characters, independently of
+ * the overall byte budget. Preserve the source in consecutive messages, only
+ * for the engine's attested summarization request.
+ */
+function splitSummaryMessages(input: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(input.messages) || input.messages.length !== 2) return input;
+  const [system, user] = input.messages;
+  if (
+    typeof system !== "object" || system === null || system.role !== "system" ||
+    typeof user !== "object" || user === null || user.role !== "user"
+  ) return input;
+  let text: string;
+  if (typeof user.content === "string") text = user.content;
+  else if (
+    Array.isArray(user.content) && user.content.length === 1 &&
+    user.content[0]?.type === "text" && typeof user.content[0].text === "string"
+  ) text = user.content[0].text;
+  else return input;
+  const limit = 64_000;
+  if (text.length <= limit) return input;
+  const messages: unknown[] = [system];
+  for (let start = 0; start < text.length;) {
+    let end = Math.min(start + limit, text.length);
+    const last = text.charCodeAt(end - 1);
+    const next = text.charCodeAt(end);
+    if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+    messages.push({ ...user, content: text.slice(start, end) });
+    start = end;
+  }
+  return { ...input, messages };
+}
+
+/**
+ * The gateway refuses a body over 256 KiB before dispatch, and its per-message
+ * limit is separate. A summary is assembled from stored history, so splitting
+ * one oversized message is not enough: the assembled request can still exceed
+ * the total. Refuse it here rather than spend a call the gateway must reject.
+ */
+const SUMMARY_BODY_BYTES = 256 * 1024;
+
+/** The JSON body the transport sends, measured the way the gateway reads it. */
+function requestBytes(input: Record<string, unknown>): number {
+  return new TextEncoder().encode(JSON.stringify(input)).length;
+}
+
+const HISTORICAL_TOOL_RESULT_CHARS = 12_000;
+const HISTORICAL_TOOL_RESULT_NOTICE =
+  "\n\n[Earlier tool result shortened to save context. This excerpt is incomplete; read the source again before relying on or editing its full contents.]";
+
+/**
+ * Bound old tool results only in the model request. A completed assistant
+ * answer proves the preceding results belong to earlier work; everything
+ * after the latest such answer stays whole, including all pages of a file the
+ * active operation is editing. The durable transcript is never changed.
+ */
+function boundToolHistory(input: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(input.messages)) return input;
+  const original: unknown[] = input.messages;
+  let completed = -1;
+  for (let index = original.length - 1; index >= 0; index--) {
+    const message = original[index];
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      !Array.isArray(message) &&
+      "role" in message &&
+      message.role === "assistant" &&
+      "content" in message &&
+      typeof message.content === "string" &&
+      message.content.length > 0 &&
+      (!("tool_calls" in message) ||
+        message.tool_calls === null ||
+        (Array.isArray(message.tool_calls) && message.tool_calls.length === 0))
+    ) {
+      completed = index;
+      break;
+    }
+  }
+  if (completed < 0) return input;
+  let messages: unknown[] | undefined;
+  for (let index = 0; index < completed; index++) {
+    const message = original[index];
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      Array.isArray(message) ||
+      !("role" in message) ||
+      message.role !== "tool" ||
+      !("content" in message) ||
+      typeof message.content !== "string" ||
+      message.content.length <= HISTORICAL_TOOL_RESULT_CHARS
+    )
+      continue;
+    let end = HISTORICAL_TOOL_RESULT_CHARS;
+    const previous = message.content.charCodeAt(end - 1);
+    const next = message.content.charCodeAt(end);
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff)
+      end--;
+    messages ??= original.slice();
+    messages[index] = {
+      ...message,
+      content: message.content.slice(0, end) + HISTORICAL_TOOL_RESULT_NOTICE,
+    };
+  }
+  return messages === undefined ? input : { ...input, messages };
+}
+
+/**
  * Retain the newest image parts that fit one gateway request. Durable session
  * history is untouched; each omitted image is named in the model input.
  */
@@ -245,8 +354,8 @@ const IMAGE_REFUSED_NOTICE =
 
 /**
  * The gateway's structured size refusal and its public, actionable projection.
- * The engine receives a task-bound opaque marker, not this public sentence;
- * the marker matches neither retry nor context-overflow classifiers.
+ * The engine receives a task-bound marker that requests its bounded overflow
+ * recovery, not this public sentence or the gateway's private details.
  */
 export const CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
 export const CONTEXT_BUDGET_EXCEEDED_TEXT =
@@ -355,7 +464,7 @@ function imagesOnlyInHistory(input: Record<string, unknown>): boolean {
 /**
  * The private model endpoint.
  *
- * `identity` reads the engine's current durable generation checkpoint and must
+ * `identity` resolves the calling engine task's durable checkpoint and must
  * fail closed when absent. `alias` is deliberately not passed: the engine's
  * transport hands over the model id its session stores, and a conversation
  * created before the platform default still stores its old pinned id. The
@@ -364,10 +473,11 @@ function imagesOnlyInHistory(input: Record<string, unknown>): boolean {
  */
 export function meteredBinding(
   transport: MeteredTransport,
-  identity: () => GenerationIdentity | null,
+  identity: (signal: AbortSignal | undefined) => GenerationIdentity | null,
   onModelResolved?: (model: string) => void,
   maxImagesPerRequest = 1,
   budgetProofs?: Pick<ContextBudgetProofs, "clear" | "issue">,
+  isCompaction?: (signal: AbortSignal | undefined) => boolean,
 ): MeteredBinding {
   if (
     !Number.isSafeInteger(maxImagesPerRequest) ||
@@ -377,7 +487,7 @@ export function meteredBinding(
     throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
-      const current = identity();
+      const current = identity(options?.signal);
       if (!current) {
         return Response.json(
           {
@@ -390,7 +500,23 @@ export function meteredBinding(
           { status: 409 },
         );
       }
-      const bounded = boundImageHistory(input, maxImagesPerRequest);
+      const compacting = isCompaction?.(options?.signal) === true;
+      const summary = compacting ? splitSummaryMessages(input) : input;
+      const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
+        // A refused summary is terminal, and it must not leave an earlier
+        // attempt's evidence behind: nothing was dispatched under it.
+        budgetProofs?.clear(current);
+        return Response.json(
+          {
+            error: {
+              code: CONTEXT_BUDGET_EXCEEDED,
+              message: CONTEXT_BUDGET_EXCEEDED_TEXT,
+            },
+          },
+          { status: 400 },
+        );
+      }
       const request = (value: Record<string, unknown>) => {
         // Recovery can repeat this task after a crash before the error entry
         // was committed. Never let evidence from the earlier attempt survive.

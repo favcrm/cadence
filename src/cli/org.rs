@@ -198,6 +198,87 @@ pub(super) fn selected_org_readonly() -> Result<Option<String>> {
         .map(|selected| selected.org))
 }
 
+/// Every registered remote org name, in registry order. Read-only: a missing
+/// registry is an empty list, a broken one refuses.
+pub(super) fn remotes_readonly() -> Result<Vec<String>> {
+    let Some(path) = selection_registry_path()? else {
+        return Ok(Vec::new());
+    };
+    if !registry_present(&path)? {
+        return Ok(Vec::new());
+    }
+    Ok(read_present_registry(&path)?
+        .connections
+        .into_iter()
+        .filter(|connection| matches!(connection.destination, Destination::Remote { .. }))
+        .map(|connection| connection.selection.org)
+        .collect())
+}
+
+/// CAD-1988: `auth status` for a hosted workspace reads the saved session's
+/// local state instead of the legacy single-file credential. Explicit
+/// `--issuer` or `--auth-dir` keep the legacy path, and a saved selection or a
+/// host with exactly one registered remote needs no `--org`.
+pub(super) fn auth_status(
+    auth_dir: Option<&Path>,
+    issuer: Option<&str>,
+    org: Option<&str>,
+) -> Result<i32> {
+    let (report, code) = auth_status_body(auth_dir, issuer, org)?;
+    println!("{report}");
+    Ok(code)
+}
+
+fn auth_status_body(
+    auth_dir: Option<&Path>,
+    issuer: Option<&str>,
+    org: Option<&str>,
+) -> Result<(Value, i32)> {
+    use cadence_agent::remote_auth::status_report as legacy_status;
+    // An explicit issuer or directory names the legacy single-file store, and
+    // `CADENCE_TOKEN` takes documented precedence over every stored session.
+    if issuer.is_some() || auth_dir.is_some() || std::env::var_os("CADENCE_TOKEN").is_some() {
+        return legacy_status(auth_dir, issuer, org);
+    }
+    let name = match org {
+        Some(name) => Some(name.to_owned()),
+        None => match std::env::var("CADENCE_ORG")
+            .ok()
+            .filter(|name| !name.is_empty())
+        {
+            Some(from_env) => Some(from_env),
+            None => match selected_org_readonly()? {
+                Some(selected) => Some(selected),
+                None => {
+                    let remotes = remotes_readonly()?;
+                    match remotes.as_slice() {
+                        [] => None,
+                        [only] => Some(only.clone()),
+                        _ => {
+                            return Err(Error::rejected(format!(
+                                "several hosted workspaces are registered ({}); name one with `cadence auth status --org <name>`",
+                                remotes.join(", ")
+                            )))
+                        }
+                    }
+                }
+            },
+        },
+    };
+    let Some(name) = name else {
+        return legacy_status(None, None, None);
+    };
+    match resolve(Some(&name), None, None)? {
+        Resolved::Remote(target) => {
+            let dir = cadence_agent::remote_auth::auth_dir(None)?;
+            Ok(cadence_agent::remote_cli::status_report(&dir, &target))
+        }
+        // A saved `local` selection is the standalone install; the legacy
+        // credential is that install's only credential.
+        Resolved::Local(_) => legacy_status(None, None, None),
+    }
+}
+
 /// Read and validate `orgs.json` at `path` — the body of
 /// `RegistryFile::read` split out so a read-only caller (`cadence
 /// update` routing) shares the exact shape checks without taking the
@@ -1384,6 +1465,80 @@ pub(super) mod tests {
                 "destination": {"mode": "remote", "endpoint": endpoint, "org_id": org_id},
             }],
         })
+    }
+
+    // CAD-1988: a hosted session is read from its own stored file, not the
+    // absent legacy credential, and a bare call finds the only registered
+    // workspace. `auth_status_body` is the report seam; printing is trivial.
+    fn write_hosted_login(env: &EnvGuard, org: &str, org_id: &str, endpoint: &str) {
+        let dir = env.home.path().join("config/cadence/remote-auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(format!("cli-{org}.json"));
+        let body = json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": org_id,
+            "organization_slug": org,
+            "audience": endpoint,
+            "issuer": "https://issuer.example/original",
+            "subject_id": "user_claimant",
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "a".repeat(43)),
+            "expires_at": 4_000_000_000u64,
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn auth_status_reports_the_selected_hosted_session() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        write_hosted_login(&env, "acme", "ws_alpha", EP_A);
+        let (report, code) = auth_status_body(None, None, None).unwrap();
+        assert_eq!(report["state"], "access_valid_until_expiry");
+        assert_eq!(report["live_verified"], false);
+        assert_eq!(report["scopes"], json!(["cli.read", "cli.write"]));
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn auth_status_finds_the_only_registered_hosted_session() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        write_hosted_login(&env, "acme", "ws_alpha", EP_A);
+        let (report, code) = auth_status_body(None, None, None).unwrap();
+        assert_eq!(report["state"], "access_valid_until_expiry");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn auth_status_refuses_several_hosted_workspaces_without_a_name() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&json!({
+            "selected": null,
+            "connections": [
+                { "selection": { "org": "acme" },
+                  "destination": { "mode": "remote", "endpoint": EP_A, "org_id": "ws_alpha" } },
+                { "selection": { "org": "beta" },
+                  "destination": { "mode": "remote", "endpoint": EP_B, "org_id": "ws_beta" } }
+            ],
+        }));
+        let error = auth_status_body(None, None, None).unwrap_err();
+        assert!(error.to_string().contains("--org"), "{error}");
+    }
+
+    #[test]
+    fn auth_status_reports_no_credential_for_a_hosted_workspace_without_one() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let (report, code) = auth_status_body(None, None, None).unwrap();
+        assert_eq!(report["state"], "no_credential");
+        assert_eq!(code, 1);
     }
 
     // CAD-2009: independent integration acceptance; preserve these expectations.

@@ -88,6 +88,8 @@ pub(super) fn milestones(
     state_dir: &std::path::Path,
     pm_dir: &std::path::Path,
     project: Option<&str>,
+    actor: &str,
+    proof: &super::operator::ReadRelayProof,
 ) -> HttpResp {
     if project.is_some_and(|p| !model::valid_key(p)) {
         return err_response(400, "bad project key");
@@ -97,9 +99,20 @@ pub(super) fn milestones(
         Err(e) => return err_response(503, &e.to_string()),
     };
     // Every project loads so cross-project children count.
-    let read = super::read_model::get(state_dir, pm_dir).board(&pm, None);
+    let read = if actor == "operator" {
+        super::read_model::get(state_dir, pm_dir).board(&pm, None)
+    } else {
+        match super::serve::readable_member_board(state_dir, &pm, actor, proof, None) {
+            Ok(read) => read,
+            Err(_) => return err_response(503, "member read scope is unavailable"),
+        }
+    };
     let by_id: std::collections::HashMap<String, &board::View> = read.by_id();
-    let ctx = read.ctx(&by_id);
+    let mut ctx = read.ctx(&by_id);
+    if actor != "operator" {
+        let readable = crate::project_policy::readable(&pm, actor);
+        ctx.configs.retain(|key, _| readable.contains(key));
+    }
     json_response(json!({
         "milestones": crate::issue::work::milestones_json(&ctx, &read.views, project),
     }))

@@ -7,9 +7,13 @@ import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
-import { parseDraftImageRef, parseUploadImageRef, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import ScreenAudioModal from "./ScreenAudioModal";
+import { createScreenAudioSession, type ScreenAudioSessionController } from "./screenAudioSession";
+import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type AudioSessionRequest, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import { DrawerRestorer } from "./drawerRestore";
+import { SourcesInvalidator } from "./sourcesInvalidation";
 import { workspaceApps } from "../workspaceApps";
-import { useLocale } from "../../../lib/locale";
+import { translateUiText, useLocale } from "../../../lib/locale";
 import { appliedFrameTheme, onAppliedThemeChange, type FrameTheme } from "../../../lib/theme";
 import { downscaleToDataUrl } from "./screenAssets";
 import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
@@ -41,7 +45,7 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerTarget, parentActionToken, drawerContext }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
@@ -66,6 +70,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   surfaceRole?: ScreenSurfaceRole;
   /** CAD-1777 — the closed surface idiom this drawer child draws. */
   drawerSurface?: string;
+  /** CAD-2221 — the width the primary opened this child with, so a connect
+   *  started here asks for that width back on return. */
+  drawerSize?: ScreenDrawerSize;
   /** CAD-1777 — the shell-owned fixed overlay target a primary portals its
    *  child drawer outlet into; null while the overlay is closed. */
   drawerTarget?: HTMLElement | null;
@@ -76,6 +83,18 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
    *  drawer child was opened with; readable only through the drawer child's
    *  own `screen.drawer.context` call. */
   drawerContext?: unknown;
+  /** A connect that left the board asked the shell to re-open this drawer
+   *  surface on return; null when it named none. A primary opens it once its
+   *  frame has handshaken, so the child mount has a live token. */
+  restoreDrawer?: { surface: string; size?: ScreenDrawerSize } | null;
+  /** The hint was used (or the frame cannot mount): drop it from the URL. */
+  onRestoreDrawerConsumed?: () => void;
+  /** A host-confirmed social source save, scoped to the install/context it was made in: the
+   *  primary of that very scope tells its own frame, with a data-free window message, that its
+   *  source settings are stale. Another scope never receives it. */
+  socialSources?: { installId: string; contextId: string; epoch: number; visit: number } | null;
+  /** The current scope's visit, from the workspace's synchronous transition counter. */
+  socialVisit?: number;
 }) {
   const { t, locale } = useLocale();
   const presentationLocale = useRef(locale);
@@ -84,7 +103,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href });
   navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : { ...p, presentation_locale: presentationLocale.current };
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -99,6 +118,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
+  const [audioModal, setAudioModal] = useState<{
+    key: number;
+    mode: ScreenAudioMode;
+    actionToken: string;
+    signal: AbortSignal;
+    resolve: (result: ActionResult) => void;
+  } | null>(null);
+  const audioKeyRef = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   // The board's applied pick, carried on the frame URL: a sandboxed frame is
   // its own document and never sees the board's `data-theme`. A later change is
@@ -119,6 +146,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // mount POST (never rendered, never sent over a port).
   const [overlay, setOverlay] = useState<string | null>(null);
   const [overlayContext, setOverlayContext] = useState<unknown>(null);
+  const [overlaySize, setOverlaySize] = useState<ScreenDrawerSize | undefined>(undefined);
   const overlayRef = useRef<string | null>(null);
   overlayRef.current = overlay;
   const actionTokenRef = useRef<string | null>(null);
@@ -138,11 +166,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       if (!shell) return;
       setOverlay(surface);
       setOverlayContext(context ?? null);
+      setOverlaySize(size);
       shell("drawer", surface, true, size);
     },
     close: () => {
       setOverlay(null);
       setOverlayContext(null);
+      setOverlaySize(undefined);
       navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true);
     },
   };
@@ -169,9 +199,41 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // so the first open does not clear itself while the shell renders it.
   useEffect(() => {
     if (drawerTarget) { hadDrawerTarget.current = true; return; }
-    if (hadDrawerTarget.current) { hadDrawerTarget.current = false; setOverlay(null); setOverlayContext(null); }
+    if (hadDrawerTarget.current) { hadDrawerTarget.current = false; setOverlay(null); setOverlayContext(null); setOverlaySize(undefined); }
   }, [drawerTarget]);
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
+  // A connect that left the board returns with the surface it was started from. The hint is
+  // taken only once a primary frame is READY and can actually open the drawer: a first mount
+  // that fails keeps it for the retry, and the ready mount opens it exactly once. Nothing is
+  // latched or consumed while loading or after a failure.
+  const restorer = useRef<{ scope: string; restore: DrawerRestorer } | null>(null);
+  if (restorer.current?.scope !== scope) restorer.current = { scope, restore: new DrawerRestorer(scope) };
+  useEffect(() => {
+    if (!primary || state !== "ready" || !navigationCallbacks.current.onScreenDrawer) return;
+    const open = restorer.current?.restore.take(state, restoreDrawer ?? null);
+    if (!open) return;
+    drawerApi.current.open(open.surface, open.size);
+    onRestoreDrawerConsumed?.();
+  }, [primary, restoreDrawer, state, scope, onRestoreDrawerConsumed]);
+  // A social source save confirmed by the host (including one whose drawer child has already
+  // gone) tells the PRIMARY frame of that same install/context that its source settings are
+  // stale. The hint is data-free and parent-scoped, the way the applied theme reaches a frame:
+  // it is fenced to its own scope (another install/context drops it and reads fresh on mount)
+  // and held until that primary is ready with a live window, then delivered once.
+  const invalidator = useRef<SourcesInvalidator | null>(null);
+  invalidator.current ??= new SourcesInvalidator();
+  const sourcesHint = socialSources
+    ? { scope: `${socialSources.installId}:${socialSources.contextId}`, epoch: socialSources.epoch, visit: socialSources.visit }
+    : null;
+  const ownSourcesScope = `${projection.install_id}:${projection.context_id}`;
+  const ownSourcesVisit = socialVisit ?? 0;
+  useEffect(() => {
+    if (!primary) return;
+    const frame = container.current?.querySelector("iframe");
+    const next = invalidator.current!.take({ state, ownScope: ownSourcesScope, ownVisit: ownSourcesVisit, hint: sourcesHint, liveWindow: !!frame?.contentWindow });
+    if (next === null || !frame?.contentWindow) return;
+    frame.contentWindow.postMessage({ type: SOCIAL_SOURCES_INVALIDATED }, "*");
+  }, [primary, state, ownSourcesScope, ownSourcesVisit, sourcesHint?.scope, sourcesHint?.epoch, sourcesHint?.visit]);
   useLayoutEffect(() => {
     const generation = privateSessionGeneration();
     const controller = new AbortController();
@@ -191,6 +253,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     // The live mount's action token, held host-side for invoke relay and
     // revoked on teardown so a stale mount's handle cannot be reused.
     let actionToken: string | null = null;
+    let inlineAudio: ScreenAudioSessionController | null = null;
     let services: ReturnType<typeof recordServices> | null = null;
     const isCurrent = () => !retired && !controller.signal.aborted && !session.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && JSON.stringify([latest.current.install_id, latest.current.digest, latest.current.tag, latest.current.context_id]) === scope;
     let releaseLeaveGuard: (() => void) | null = null;
@@ -226,10 +289,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     };
     setState("loading");
     setFailure(null);
-    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]);
+    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]); setAudioModal(null);
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
-    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); setOverlay(null); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
+    setOverlaySize(undefined);
+    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); inlineAudio?.dispose(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -300,6 +364,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
         actionTokenRef.current = actionToken;
+        if (actionToken) {
+          inlineAudio = createScreenAudioSession({
+            actionToken,
+            signal: session.signal,
+            getLocale: () => presentationLocale.current,
+            onEvent: nextState => {
+              if (isCurrent()) owned?.sendAudioSessionEvent(nextState);
+            },
+          });
+        }
         owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
           () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
@@ -323,6 +397,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               const attach = navigationCallbacks.current.onMediaAttach;
               return acting.current!.call(verb, args, {
                 ...ui,
+                // The surface this frame is mounted as, host-derived: a connect
+                // started in the drawer returns to that drawer, never to a page.
+                returnSurface: primary ? undefined : drawerSurface,
+                returnSize: primary ? undefined : drawerSize,
                 attachMedia: attach ? (selected, token) => attach(selected, token, isCurrent) : undefined,
               });
             },
@@ -351,12 +429,36 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               if (result.ok && isCurrent()) await toolInvoked.current?.();
               return result;
             } } : {}),
+            ...(actionToken ? { captureAudio: (mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }) =>
+              new Promise<ActionResult>(resolve => {
+                if (!isCurrent() || ui.signal.aborted) {
+                  resolve({ ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } });
+                  return;
+                }
+                const key = ++audioKeyRef.current;
+                setAudioModal({
+                  key,
+                  mode,
+                  actionToken: ui.actionToken,
+                  signal: ui.signal,
+                  resolve: result => {
+                    setAudioModal(currentModal => (currentModal?.key === key ? null : currentModal));
+                    resolve(result);
+                  },
+                });
+              }),
+              audioSession: (req: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }) =>
+                !isCurrent() || !inlineAudio || ui.signal.aborted
+                  ? Promise.resolve({ ok: false as const, refusal: { code: "cancelled", text: "Audio capture was cancelled." } })
+                  : inlineAudio.dispatch(req, ui.signal),
+              disposeAudioSession: () => inlineAudio?.dispose(),
+            } : {}),
           } : undefined, undefined, unsaved => {
             if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
             clearLeaveGuard();
             if (!unsaved) return;
             releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
-              window.confirm("Your email draft has not been saved. Leave this page and discard those local edits?"));
+              window.confirm(translateUiText("You have unsaved changes. Leave this page and discard your local edits?", presentationLocale.current)));
             window.addEventListener("beforeunload", warnBeforeUnload);
           });
         // The role is host-derived from this outlet's mount; the surface
@@ -383,6 +485,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       unsubscribe();
       session.dispose();
       clearLeaveGuard();
+      inlineAudio?.dispose();
       services?.retire();
       mounted.current = null;
       navigationCallbacks.current.onNavigation?.(null);
@@ -391,12 +494,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
-      setSlot(null); setLink(null); setPreview(null);
+      setSlot(null); setLink(null); setPreview(null); setAudioModal(null);
       container.current?.replaceChildren();
       // A primary's retirement takes its child drawer with it; the shell
       // overlay closes so no blank blocking panel can remain.
       if (primary && overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true);
       setOverlay(null);
+      setOverlaySize(undefined);
       actionTokenRef.current = null;
       // Retire the mount's action handle server-side so a torn-down or
       // remounted screen's token cannot be replayed. Best-effort — the
@@ -428,6 +532,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}
         onCancel={token => channel.current?.cancelSlot(token)} />
     </div>
+    {audioModal && typeof document !== "undefined" && createPortal(
+      <ScreenAudioModal
+        key={audioModal.key}
+        initialMode={audioModal.mode}
+        actionToken={audioModal.actionToken}
+        signal={audioModal.signal}
+        onResolve={audioModal.resolve}
+      />,
+      document.body,
+    )}
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
     {state === "loading" && (
       <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label={t("Loading installed app")} style={{ padding: "0.5rem 0.25rem" }}>
@@ -467,6 +581,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         onToolInvoked={onToolInvoked}
         surfaceRole="drawer"
         drawerSurface={overlay ?? undefined}
+        drawerSize={overlaySize}
         drawerContext={overlayContext}
         parentActionToken={drawerToken}
         onRoute={navigationCallbacks.current.onRoute}

@@ -675,6 +675,41 @@ pub(crate) fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixSt
     }
 }
 
+/// True when `socket` is provably a dead daemon's leftover: connect(2)
+/// answers ECONNREFUSED (the file exists, nothing listens) or ENOENT.
+/// Any other outcome — a connection, a full backlog, a permission or
+/// path error — is not proof, so a daemon that might be alive is never
+/// read as stopped. A nonblocking connect never waits.
+pub(crate) fn socket_has_no_listener(socket: &Path) -> bool {
+    let Ok((addr, len)) = unix_addr(socket) else {
+        return false;
+    };
+    // SAFETY: fixed, valid socket(2) arguments.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let refused = arm_socket(fd).is_ok() && {
+        // SAFETY: `addr` is a sockaddr_un valid for `len` bytes; `fd` is a
+        // live nonblocking unix stream socket.
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        rc != 0
+            && matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            )
+    };
+    // SAFETY: `fd` is a live descriptor we own.
+    unsafe { libc::close(fd) };
+    refused
+}
+
 /// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
 /// exists on every unix target; SOCK_NONBLOCK/SOCK_CLOEXEC socket(2)
 /// flags do not (Darwin lacks them, so `connect_bounded` creates a
@@ -1001,16 +1036,33 @@ impl<'a> RpcSession<'a> {
         Ok(Self { state_dir, stream })
     }
 
+    /// Connect to one daemon within a bounded deadline.
+    pub fn connect_timeout(state_dir: &'a Path, timeout: Duration) -> Result<Self> {
+        let socket = rpc_socket_path(state_dir)?;
+        let stream = connect_bounded(&socket, Instant::now() + timeout)?;
+        Ok(Self { state_dir, stream })
+    }
+
     /// Distinguish a complete daemon answer from an unusable transport frame.
     /// There is no reconnect or replay after a request has been written.
     pub fn answer(&mut self, method: &str, params: Value) -> Result<Result<Value>> {
+        self.answer_timeout(method, params, Duration::from_secs(700))
+    }
+
+    /// Like [`Self::answer`], with a bounded deadline for this exchange.
+    pub fn answer_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Result<Value>> {
         let mut request = proto::request(method, params);
         if let Some(test_caller) = crate::test_seam::caller_frame(self.state_dir)? {
             request[crate::test_seam::FRAME_FIELD] = test_caller;
         }
         let mut body = request.to_string();
         body.push('\n');
-        let deadline = Instant::now() + Duration::from_secs(700);
+        let deadline = Instant::now() + timeout;
         let fd = self.stream.as_raw_fd();
         write_bounded(fd, body.as_bytes(), deadline)?;
         let line = read_line_with_limit(fd, deadline, RPC_SESSION_FRAME_CAP)?;

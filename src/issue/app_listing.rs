@@ -46,14 +46,22 @@ pub struct Listing {
     pub assets: Vec<String>,
 }
 
-fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+fn check_plain_text(
+    value: &serde_yaml::Value,
+    what: &str,
+    max: usize,
+    allow_newlines: bool,
+) -> Result<String> {
     let Some(text) = value.as_str() else {
         return Err(Error::rejected(format!("listing {what} is a plain string")));
     };
     let text = text.trim();
     if text.is_empty()
-        || text.chars().count() > max
-        || text.chars().any(|c| c.is_control() && c != '\n')
+        || text.encode_utf16().count() > max
+        || text.chars().any(|c| {
+            (c.is_control() && (!allow_newlines || c != '\n'))
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
         || text.contains('<')
         || text.contains('>')
         || text.contains("](")
@@ -66,6 +74,14 @@ fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<Strin
         )));
     }
     Ok(text.to_string())
+}
+
+fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+    check_plain_text(value, what, max, false)
+}
+
+fn plain_multiline_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
+    check_plain_text(value, what, max, true)
 }
 
 /// `assets/<leaf>.svg` — flat, tag-shaped stem, real file under the
@@ -206,6 +222,7 @@ pub(crate) fn parse(
             "changes",
             "setup",
             "data",
+            "i18n",
         ],
         "",
     )?;
@@ -294,7 +311,7 @@ pub(crate) fn parse(
             )),
         };
     let about = match yget(map, "about") {
-        Some(v) => Some(plain_text(v, "about", 600)?),
+        Some(v) => Some(plain_multiline_text(v, "about", 600)?),
         None => None,
     };
     let mut can = Vec::new();
@@ -426,6 +443,10 @@ pub(crate) fn parse(
             ))
         }
     };
+    let i18n = match yget(map, "i18n") {
+        None | Some(serde_yaml::Value::Null) => Value::Null,
+        Some(value) => parse_listing_i18n(value, slots)?,
+    };
     // The referenced assets: the caller proves each is in the
     // bundle's inventory (`assets/` flat *.svg). Collected, not
     // checked here — the parse runs before the file list exists.
@@ -453,6 +474,256 @@ pub(crate) fn parse(
             "changes": changes,
             "setup": setup,
             "data": data,
+            "i18n": i18n,
         }),
     })
+}
+
+fn parse_i18n_locales(
+    value: &serde_yaml::Value,
+    allowed: &[&str],
+    what: &str,
+    mut parse_entry: impl FnMut(&str, &serde_yaml::Mapping) -> Result<serde_json::Map<String, Value>>,
+) -> Result<Value> {
+    let serde_yaml::Value::Mapping(locales) = value else {
+        return Err(Error::rejected(format!("{what} must be a locale mapping")));
+    };
+    if locales.is_empty() || locales.len() > cadence_core::app_screen_decl::MAX_I18N_LOCALES {
+        return Err(Error::rejected(format!(
+            "{what} requires 1..={} locale entries",
+            cadence_core::app_screen_decl::MAX_I18N_LOCALES
+        )));
+    }
+    let mut out = serde_json::Map::new();
+    let mut seen_locales = std::collections::HashSet::new();
+    for (k, v) in locales {
+        let Some(locale) = k.as_str() else {
+            return Err(Error::rejected(format!(
+                "{what} keys must be BCP-47 locale tags"
+            )));
+        };
+        if !cadence_core::app_screen_decl::valid_locale_tag(locale) {
+            return Err(Error::rejected(format!(
+                "{what} locale key '{locale}' must be a valid BCP-47 tag"
+            )));
+        }
+        if !seen_locales.insert(locale.to_ascii_lowercase()) {
+            return Err(Error::rejected(format!(
+                "{what} locale '{locale}' is declared twice"
+            )));
+        }
+        let serde_yaml::Value::Mapping(entry) = v else {
+            return Err(Error::rejected(format!(
+                "{what}.{locale} must be a mapping"
+            )));
+        };
+        known_keys(entry, allowed, &format!("{what}.{locale}"))?;
+        let parsed = parse_entry(locale, entry)?;
+        if parsed.is_empty() {
+            return Err(Error::rejected(format!(
+                "{what}.{locale} must specify at least one localized field"
+            )));
+        }
+        out.insert(locale.to_string(), Value::Object(parsed));
+    }
+    Ok(Value::Object(out))
+}
+
+fn parse_optional_text_fields(
+    entry: &serde_yaml::Mapping,
+    fields: &[(&str, &str, usize, bool)],
+    out: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    for &(key, label, max, multiline) in fields {
+        if let Some(v) = yget(entry, key) {
+            if !v.is_null() {
+                let text = if multiline {
+                    plain_multiline_text(v, label, max)?
+                } else {
+                    plain_text(v, label, max)?
+                };
+                out.insert(key.to_string(), json!(text));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_listing_i18n(value: &serde_yaml::Value, slots: &[String]) -> Result<Value> {
+    const KEYS: &[&str] = &[
+        "title",
+        "tagline",
+        "summary",
+        "about",
+        "can",
+        "access_notes",
+    ];
+    parse_i18n_locales(value, KEYS, "listing i18n", |locale, entry| {
+        let mut obj = serde_json::Map::new();
+        parse_optional_text_fields(
+            entry,
+            &[
+                ("title", "i18n.title", 80, false),
+                ("tagline", "i18n.tagline", 80, false),
+                ("summary", "i18n.summary", 280, true),
+                ("about", "i18n.about", 600, true),
+            ],
+            &mut obj,
+        )?;
+        if yget(entry, "can").is_some_and(|v| !v.is_null()) {
+            let items = seq(entry, "can", &format!("i18n.{locale}.can"), 5)?;
+            if items.is_empty() {
+                return Err(Error::rejected(format!(
+                    "listing i18n.{locale}.can cannot be empty"
+                )));
+            }
+            let mut can = Vec::with_capacity(items.len());
+            for item in items {
+                can.push(json!(plain_text(item, "i18n.can", 100)?));
+            }
+            obj.insert("can".to_string(), Value::Array(can));
+        }
+        if let Some(v) = yget(entry, "access_notes") {
+            if !v.is_null() {
+                let serde_yaml::Value::Mapping(notes) = v else {
+                    return Err(Error::rejected(format!(
+                        "listing i18n.{locale}.access_notes is a {{slot: note}} mapping"
+                    )));
+                };
+                if notes.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "listing i18n.{locale}.access_notes must not be empty"
+                    )));
+                }
+                let mut note_map = serde_json::Map::new();
+                for (k, nv) in notes {
+                    let slot = k.as_str().ok_or_else(|| {
+                        Error::rejected("listing i18n access_notes keys are slot names")
+                    })?;
+                    if !slots.iter().any(|s| s == slot) {
+                        return Err(Error::rejected(format!(
+                            "listing i18n.{locale}.access_notes.{slot} — the app declares no such slot"
+                        )));
+                    }
+                    note_map.insert(
+                        slot.to_string(),
+                        json!(plain_text(nv, "i18n.access_notes", 140)?),
+                    );
+                }
+                if !note_map.is_empty() {
+                    obj.insert("access_notes".to_string(), Value::Object(note_map));
+                }
+            }
+        }
+        Ok(obj)
+    })
+}
+
+/// Parse top-level `i18n:` from `app.md` frontmatter (`{ <locale>: { title?, summary?, tagline? } }`).
+pub(crate) fn parse_manifest_i18n(value: &serde_yaml::Value) -> Result<Value> {
+    parse_i18n_locales(
+        value,
+        &["title", "summary", "tagline"],
+        "app.md i18n",
+        |_locale, entry| {
+            let mut obj = serde_json::Map::new();
+            parse_optional_text_fields(
+                entry,
+                &[
+                    ("title", "i18n.title", 80, false),
+                    ("summary", "i18n.summary", 280, true),
+                    ("tagline", "i18n.tagline", 80, false),
+                ],
+                &mut obj,
+            )?;
+            Ok(obj)
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_listing_i18n_and_refuses_invalid_entries() {
+        let slots = vec!["crm.read".to_string()];
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        let p = parse(
+            &y("{tagline: T., i18n: {zh-TW: {title: 客, tagline: 輕, summary: 總, about: 介, can: [維], access_notes: {crm.read: 讀}}, zh-HK: {title: 客}}}"),
+            512,
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(p.value["i18n"]["zh-TW"]["title"], "客");
+        assert_eq!(p.value["i18n"]["zh-TW"]["access_notes"]["crm.read"], "讀");
+        assert_eq!(p.value["i18n"]["zh-HK"]["title"], "客");
+
+        for bad in [
+            "{}",
+            "{zh_TW: {title: A}}",
+            "{zh-tw: {title: A}, zh-TW: {title: B}}",
+            "{zh-TW: {}}",
+            "{zh-TW: {unknown: 1}}",
+            "{zh-TW: {access_notes: {missing.slot: x}}}",
+            "{zh-TW: {title: \"客\", access_notes: {}}}",
+            "{zh-TW: {title: \"a\\nb\"}}",
+            "{zh-TW: {title: \"a\\u2028b\"}}",
+        ] {
+            assert!(
+                parse(&y(&format!("{{i18n: {bad}}}")), 256, &slots).is_err(),
+                "{bad}"
+            );
+        }
+
+        let ml = parse(
+            &y("{i18n: {zh-TW: {summary: \"a\\nb\", about: \"c\\nd\"}}}"),
+            512,
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                &ml.value["i18n"]["zh-TW"]["summary"],
+                &ml.value["i18n"]["zh-TW"]["about"]
+            ),
+            (&json!("a\nb"), &json!("c\nd"))
+        );
+
+        for (k, ch, n, ok) in [
+            ("summary", "x", 280, true),
+            ("summary", "x", 281, false),
+            ("title", "😀", 40, true),
+            ("title", "😀", 41, false),
+        ] {
+            assert_eq!(
+                parse(
+                    &y(&format!("{{i18n: {{zh-TW: {{{k}: {}}}}}}}", ch.repeat(n))),
+                    512,
+                    &slots
+                )
+                .is_ok(),
+                ok,
+                "{k}:{n}"
+            );
+        }
+
+        let nine: String = (0..9)
+            .map(|i| format!("en-x{i}: {{title: T{i}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(parse(&y(&format!("{{i18n: {{{nine}}}}}")), 512, &slots).is_err());
+    }
+
+    #[test]
+    fn parses_manifest_top_level_i18n() {
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        assert_eq!(
+            parse_manifest_i18n(&y("{zh-TW: {title: 客, summary: 總}}")).unwrap()["zh-TW"]["title"],
+            "客"
+        );
+        for bad in ["{zh-TW: {about: x}}", "{zh-TW: {title: '<b>bad</b>'}}"] {
+            assert!(parse_manifest_i18n(&y(bad)).is_err(), "{bad}");
+        }
+    }
 }

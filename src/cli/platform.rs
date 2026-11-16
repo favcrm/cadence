@@ -161,12 +161,15 @@ pub(crate) enum PlatformAction {
         /// no query half, so they refuse this flag.
         #[arg(long)]
         query: Option<String>,
-        /// Stable handle for this call. Hosted calls derive one from the tool
-        /// and input when omitted. A connected local read creates a fresh
-        /// handle. For provider/media calls, inspect `platform status` after an
-        /// uncertain result; an unrecorded retry can charge again. App writes
-        /// are not tracked there: inspect the app's records and keep the same
-        /// request and input. Use a fresh handle only for a deliberate new call.
+        /// Stable handle for this call. Hosted calls derive one from the tool,
+        /// input and any connection when omitted, and replay the recorded
+        /// outcome of the same handle instead of charging twice. A local
+        /// connected read creates a fresh handle when omitted and reports it
+        /// if its outcome is unknown. For provider, connected-read or media
+        /// calls, inspect `platform status` after an uncertain result; an
+        /// unrecorded retry can charge again. App writes are not tracked
+        /// there: inspect the app's records and keep the same request and
+        /// input. Use a fresh handle only for a deliberate new call.
         #[arg(long)]
         request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.
@@ -183,10 +186,9 @@ pub(crate) enum PlatformAction {
         /// somebody else's account is not a read the caller asked for.
         #[arg(long)]
         connection: Option<String>,
-        /// CAD-1974: the most real money this call may cost, in USD
-        /// micro-units (1 USD = 1,000,000 units). Required by a
-        /// `connected_read` tool: the caller states the ceiling it accepts
-        /// before anything runs. Forwarded unchanged — no conversion here.
+        /// Local device connected-read ceiling in USD micro-units, required by
+        /// the existing device protocol. Hosted workspaces use their balance
+        /// and do not accept this flag.
         #[arg(long)]
         max_charge: Option<u64>,
     },
@@ -211,6 +213,10 @@ pub(crate) enum PlatformAction {
         /// or verify the request key.
         #[arg(long)]
         query: Option<String>,
+        /// Connection used by a hosted connected read. Supply the same
+        /// `--tool` and `--input` as the call to reconcile its exact payload.
+        #[arg(long)]
+        connection: Option<String>,
     },
     /// Download a completed hosted media artifact (`med_<jobId>.<sha256>`) to a
     /// local file, verifying its SHA-256 digest and byte length before writing.

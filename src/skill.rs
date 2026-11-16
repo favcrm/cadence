@@ -121,15 +121,68 @@ const WEBSITE_BUILDER: BundledSkill = BundledSkill {
     ],
 };
 
-pub const SKILL_NAMES: [&str; 4] = [
+const INCIDENT_RESPONSE: BundledSkill = BundledSkill {
+    name: "incident-response",
+    // Publish the entry point after its references, not before them.
+    files: &[
+        (
+            "references/postmortem-template.html",
+            include_str!("../skills/incident-response/references/postmortem-template.html"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/incident-response/SKILL.md"),
+        ),
+    ],
+};
+
+const DELIVERABLE_QA: BundledSkill = BundledSkill {
+    name: "deliverable-qa",
+    files: &[(
+        "SKILL.md",
+        include_str!("../skills/deliverable-qa/SKILL.md"),
+    )],
+};
+
+const CADENCE_APP_DEV: BundledSkill = BundledSkill {
+    name: "cadence-app-dev",
+    files: &[
+        (
+            "references/contracts-and-storage.md",
+            include_str!("../skills/cadence-app-dev/references/contracts-and-storage.md"),
+        ),
+        (
+            "references/bridge-and-ui.md",
+            include_str!("../skills/cadence-app-dev/references/bridge-and-ui.md"),
+        ),
+        (
+            "references/release-and-catalog.md",
+            include_str!("../skills/cadence-app-dev/references/release-and-catalog.md"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/cadence-app-dev/SKILL.md"),
+        ),
+    ],
+};
+
+pub const SKILL_NAMES: [&str; 7] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
     COMPANY_OUTPUTS.name,
     WEBSITE_BUILDER.name,
+    INCIDENT_RESPONSE.name,
+    DELIVERABLE_QA.name,
+    CADENCE_APP_DEV.name,
 ];
 
 /// Provider skill directories that receive links to each selected bundle.
-const LINK_PARENTS: [&str; 3] = [".claude/skills", ".cursor/skills", ".copilot/skills"];
+const LINK_PARENTS: [&str; 4] = [
+    ".claude/skills",
+    ".cursor/skills",
+    ".copilot/skills",
+    ".gemini/skills",
+];
 
 fn canonical_root(home: &Path) -> PathBuf {
     home.join(".agents").join("skills")
@@ -155,11 +208,17 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             BUSINESS_DOCUMENTS,
             COMPANY_OUTPUTS,
             WEBSITE_BUILDER,
+            INCIDENT_RESPONSE,
+            DELIVERABLE_QA,
+            CADENCE_APP_DEV,
         ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
         Some("company-outputs") => Ok(&[BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
         Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
+        Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
+        Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
+        Some("cadence-app-dev") => Ok(&[CADENCE_APP_DEV]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -799,5 +858,117 @@ mod tests {
         };
         assert_eq!(business["name"], "business-documents");
         assert!(!paths(&business).contains(&"references/proposal.md".to_string()));
+    }
+
+    #[test]
+    fn incident_response_bundle_installs_skill_and_generic_postmortem_template() {
+        assert!(SKILL_NAMES.contains(&"incident-response"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("incident-response")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("incident-response");
+        assert!(root.join("SKILL.md").is_file());
+        assert!(root.join("references/postmortem-template.html").is_file());
+
+        let second = sync(dir.path(), false, Some("incident-response")).unwrap();
+        assert_eq!(second["wrote"], false);
+
+        match show(
+            "incident-response",
+            Some("references/postmortem-template.html"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(html) => {
+                assert!(html.contains("--doc-accent"));
+                assert!(html.contains("@page"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn deliverable_qa_bundle_installs_one_procedure_with_the_gate_pass_lines() {
+        assert!(SKILL_NAMES.contains(&"deliverable-qa"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("deliverable-qa")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("deliverable-qa");
+        assert!(root.join("SKILL.md").is_file());
+        let second = sync(dir.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(second["wrote"], false);
+        match show("deliverable-qa", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                // The exact two lines the merge gate counts (scripts/enqueue-reviewed).
+                assert!(text.contains("Browser QA: pass\n   Head: <full 40-hex sha>"));
+                assert!(text.contains("never approves on a person's behalf"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn cadence_app_dev_bundle_installs_skill_references_and_gemini_provider_link() {
+        assert!(SKILL_NAMES.contains(&"cadence-app-dev"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("cadence-app-dev")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("cadence-app-dev");
+        for relative in [
+            "SKILL.md",
+            "references/contracts-and-storage.md",
+            "references/bridge-and-ui.md",
+            "references/release-and-catalog.md",
+        ] {
+            assert!(root.join(relative).is_file(), "missing {relative}");
+        }
+        for parent in [
+            ".claude/skills",
+            ".cursor/skills",
+            ".copilot/skills",
+            ".gemini/skills",
+        ] {
+            let link = dir.path().join(parent).join("cadence-app-dev");
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "expected symlink at {}",
+                link.display()
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), root);
+        }
+        let second = sync(dir.path(), false, Some("cadence-app-dev")).unwrap();
+        assert_eq!(second["wrote"], false);
+        let report = status(dir.path());
+        let entry = report["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "cadence-app-dev")
+            .expect("cadence-app-dev status entry");
+        assert_eq!(entry["installed"], true);
+        assert_eq!(entry["content_match"], true);
+        for provider in ["claude", "cursor", "copilot", "gemini"] {
+            assert_eq!(entry["links"][provider], "ok", "provider {provider}");
+        }
+        match show("cadence-app-dev", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                assert!(text.contains("createScreenBridge"));
+                assert!(text.contains("preventDefault"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+        match show(
+            "cadence-app-dev",
+            Some("references/contracts-and-storage.md"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(text) => {
+                assert!(text.contains("app-storage/v1"));
+                assert!(text.contains("capability_slots"));
+                assert!(text.contains("agent-side and unattested"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
     }
 }

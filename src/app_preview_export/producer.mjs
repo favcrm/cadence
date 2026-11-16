@@ -1,3 +1,51 @@
+//#region src/lib/privateSession.ts
+var generation = 0;
+var privateSessionGeneration = () => generation;
+//#endregion
+//#region src/lib/sessionKey.ts
+/**
+* The operator session's second credential (CAD-313, review round 2 of
+* PR #249). The board's HttpOnly cookie alone is no session: every
+* request also carries `X-Cadence-Session: <key>`. The key is scoped to
+* the exact origin, port included — so a server on another port that
+* receives the cookie (cookies ignore ports) never sees it, and a
+* cross-site page cannot set the header.
+*
+* It lives in `localStorage` so the same browser (a new tab, a reload,
+* or a browser restart) keeps the session the cookie already carries;
+* `sessionStorage` is read as a fallback so a tab opened before this
+* change still works, and written too so a store that blocks
+* `localStorage` degrades to the old per-tab behavior instead of
+* signing out. Clearing the key is what ends this browser's session.
+*/
+var SESSION_KEY_STORE = "cadence.sessionKey";
+var entryMemoryKey = null;
+function entryMode() {
+	try {
+		return globalThis.__CADENCE_ENTRY_MODE__ === true;
+	} catch {
+		return false;
+	}
+}
+function consumeEntryBootstrap() {
+	if (!entryMode()) return;
+	const scope = globalThis;
+	const bootstrap = scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	if (bootstrap && typeof bootstrap.key === "string" && /^[0-9a-f]{64}$/.test(bootstrap.key)) entryMemoryKey = bootstrap.key;
+	try {
+		delete scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	} catch {}
+}
+consumeEntryBootstrap();
+function sessionKey() {
+	if (entryMode()) return entryMemoryKey;
+	for (const kind of ["local", "session"]) try {
+		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
+		if (key) return key;
+	} catch {}
+	return null;
+}
+//#endregion
 //#region src/lib/conditionalGet.ts
 /** Bounded validators, scoped to this tab's current operator credential.
 * 304 is useful only with a matching in-memory representation; no disk cache.
@@ -55,54 +103,6 @@ var ConditionalGet = class {
 		};
 	}
 };
-//#endregion
-//#region src/lib/sessionKey.ts
-/**
-* The operator session's second credential (CAD-313, review round 2 of
-* PR #249). The board's HttpOnly cookie alone is no session: every
-* request also carries `X-Cadence-Session: <key>`. The key is scoped to
-* the exact origin, port included — so a server on another port that
-* receives the cookie (cookies ignore ports) never sees it, and a
-* cross-site page cannot set the header.
-*
-* It lives in `localStorage` so the same browser (a new tab, a reload,
-* or a browser restart) keeps the session the cookie already carries;
-* `sessionStorage` is read as a fallback so a tab opened before this
-* change still works, and written too so a store that blocks
-* `localStorage` degrades to the old per-tab behavior instead of
-* signing out. Clearing the key is what ends this browser's session.
-*/
-var SESSION_KEY_STORE = "cadence.sessionKey";
-var entryMemoryKey = null;
-function entryMode() {
-	try {
-		return globalThis.__CADENCE_ENTRY_MODE__ === true;
-	} catch {
-		return false;
-	}
-}
-function consumeEntryBootstrap() {
-	if (!entryMode()) return;
-	const scope = globalThis;
-	const bootstrap = scope.__CADENCE_ENTRY_BOOTSTRAP__;
-	if (bootstrap && typeof bootstrap.key === "string" && /^[0-9a-f]{64}$/.test(bootstrap.key)) entryMemoryKey = bootstrap.key;
-	try {
-		delete scope.__CADENCE_ENTRY_BOOTSTRAP__;
-	} catch {}
-}
-consumeEntryBootstrap();
-function sessionKey() {
-	if (entryMode()) return entryMemoryKey;
-	for (const kind of ["local", "session"]) try {
-		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
-		if (key) return key;
-	} catch {}
-	return null;
-}
-//#endregion
-//#region src/lib/privateSession.ts
-var generation = 0;
-var privateSessionGeneration = () => generation;
 new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`);
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
 *  port. `call` verbs run directly: the install's own config and drafts, and
@@ -131,6 +131,7 @@ var CALL_VERBS = [
 	"social.sources.get",
 	"social.sources.save",
 	"social.destinations.list",
+	"publish.consent.status",
 	"publish.destination.use",
 	"publish.destination.remove",
 	"publish.settings.save",
@@ -147,6 +148,7 @@ var SLOT_VERBS = [
 	"run.start",
 	"publish.draft.confirm",
 	"publish.draft.schedule",
+	"publish.consent.allow",
 	"media.original.download",
 	"social.image.pick"
 ];
@@ -173,6 +175,8 @@ var RECORD_CALL_VERBS = [
 	"records.create",
 	"records.update",
 	"records.csv.preview",
+	"records.batch",
+	"records.aggregate",
 	"segments.list",
 	"segments.show",
 	"segments.save",
@@ -265,6 +269,7 @@ var RECORD_SLOT_VERBS = [
 	"works.export"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
+Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
 var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",
@@ -276,6 +281,7 @@ var V2_TOP = [
 	"original_downloads",
 	"media_previews",
 	"media_chat_references",
+	"audio_capture",
 	"route",
 	"read_observations",
 	"presentation_locale"
@@ -879,7 +885,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/9";
+var CONTRACT = "app-screen-projection-fixtures/10";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",

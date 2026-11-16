@@ -11,9 +11,11 @@ import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
+import { readReturnDrawer, withoutReturnDrawer } from "../workspace-apps/socialConnect";
 import { sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
+import { localizeAppChat } from "./chat/contract";
 import { useAppChatProjection } from "./chat/descriptorClient";
 import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
@@ -25,7 +27,8 @@ import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
-import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
+import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
+import { displayI18nFromListing, localizedAppTitle, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -134,6 +137,7 @@ export interface ActiveInstallation {
   kind: string;
   title: string;
   navigation?: ScreenNavigation | null;
+  i18n?: AppDisplayI18n | null;
 }
 
 export default function AppShell({
@@ -154,9 +158,14 @@ export default function AppShell({
      *  fixed child overlay instead of promoting the primary. */
     onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean, size?: "narrow" | "wide") => void;
     presentation: "outlet" | "drawer";
-    /** CAD-1777 — the fixed overlay target the primary portals its child
+    /** The fixed overlay target the primary portals its child
      *  drawer frame into; null while the overlay is closed. */
     drawerTarget: HTMLElement | null;
+    /** A connect that left the board asked for this drawer surface to be
+     *  re-opened on return; null when the return named none. */
+    restoreDrawer: { surface: string; size?: ScreenDrawerSize } | null;
+    /** The outlet opened it (or the screen cannot mount): drop the hint. */
+    onRestoreDrawerConsumed: () => void;
     /** The screen went away: the drawer closes with it. */
     onScreenClosed: () => void;
   }) => React.ReactNode;
@@ -165,9 +174,13 @@ export default function AppShell({
    *  installId to its route and compares values before storing. */
   onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
-  const { t } = useLocale();
+  const { locale, t } = useLocale();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
+  // A connect that left the board comes back with the drawer surface it was
+  // started from. The hint is the app page's own query, validated as a drawer
+  // surface name; anything else leaves the app screen in place.
+  const returnDrawer = useMemo(() => readReturnDrawer(href.split("?")[1] ?? ""), [href]);
   const parsedConversationLink = useMemo(() => parseConversationLink(href), [href]);
   const conversationVisit = useRef(0);
   const conversationRequestRef = useRef<{ key: string | null; request: ConversationLinkRequest | null }>({
@@ -242,6 +255,15 @@ export default function AppShell({
   }, [canDriveScreen]);
   const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
   const closeIndependentDrawer = useCallback(() => setIndependentDrawer(null), []);
+  // The return hint is single-use: once the outlet has re-opened the surface
+  // (or the screen cannot mount), the URL stops asking for a drawer, so a
+  // reload shows the operator's next state rather than a drawer they closed.
+  // Read the live location: the workspace strips the connect params itself
+  // with a direct history replace, which `href` does not observe.
+  const consumeReturnDrawer = useCallback(() => {
+    const rest = withoutReturnDrawer(window.location.search);
+    if (rest !== window.location.search) navigate(window.location.pathname + rest, { replace: true });
+  }, []);
   // A different installation or scope is a different screen: the drawer never
   // outlives the frame that opened it.
   useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
@@ -728,6 +750,11 @@ export default function AppShell({
     return () => { current = false; };
   }, [contexts, generalSetupAttempt, installation, installId, receiptKey, receiptReady, setupScopeKey, viewer.operator, viewer.readOnly]);
 
+  const effectiveNavigation = useMemo(
+    () => screenNavigation ?? parseNavigation(installation?.navigation),
+    [installation?.navigation, screenNavigation],
+  );
+
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
   // so the shared sidebar/phone menu can nest this installation's
@@ -740,13 +767,14 @@ export default function AppShell({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
-        navigation: screenNavigation,
+        navigation: effectiveNavigation,
+        i18n: parseAppDisplayI18n(installation.i18n, { wire: true }) ?? displayI18nFromListing(installation.listing?.i18n, { wire: true }),
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation, receiptReady, screenNavigation]);
+  }, [effectiveNavigation, installId, installation, onInstallation, receiptReady]);
   // In-workspace scope changes (Social's picker, a screen's saved-context
   // verb) persist and emit through contextSelection. The shell applies the
   // emission to its own selection — the one scope chat, screen and the run
@@ -1010,7 +1038,17 @@ export default function AppShell({
       setPanel("chat");
     }
   };
-  const title = installation?.title || installation?.name || "App";
+  const title = installation
+    ? localizedAppTitle(
+        {
+          title: installation.title || installation.name,
+          i18n: parseAppDisplayI18n(installation.i18n, { wire: true }),
+          listing: installation.listing,
+        },
+        locale,
+        t,
+      ) || t("App")
+    : t("App");
   const isSocial = isSocialContent(installation);
   // An app whose approved, executable package declares one screen mounts
   // that screen (presentation only; authorization stays in the
@@ -1041,24 +1079,28 @@ export default function AppShell({
     verified ? installation.digest : null,
     verified ? installation.name : null,
   );
-  const chatDescriptor = chatProjection.projection?.chat ?? null;
+  const rawChatDescriptor = chatProjection.projection?.chat ?? null;
+  const chatDescriptor = useMemo(
+    () => (rawChatDescriptor ? localizeAppChat(rawChatDescriptor, locale, t) : null),
+    [rawChatDescriptor, locale, t],
+  );
   // The chat descriptor's screen id (D5): the mounted screen's declared
   // section when it declares navigation, else its screen tag.
-  const section = screenNavigation ? sectionFromSearch(href.split("?")[1] ?? "", screenNavigation) : null;
+  const section = effectiveNavigation ? sectionFromSearch(href.split("?")[1] ?? "", effectiveNavigation) : null;
   const chatScreen = chatScreenFor(installation, verified, section, view);
   // `open-view` card action: a declared section of the mounted screen, or
   // the generic list/new view, within this installation and context.
   const openView = useCallback(
     (target: string) => {
-      if (screenNavigation) {
-        if (screenNavigation.sections.some((s) => s.id === target)) {
-          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: screenNavigation } });
+      if (effectiveNavigation) {
+        if (effectiveNavigation.sections.some((s) => s.id === target)) {
+          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: effectiveNavigation } });
         }
       } else if (target === "list" || target === "new") {
         writeQuery({ appview: target === "list" ? null : target, record: null });
       }
     },
-    [screenNavigation, writeQuery],
+    [effectiveNavigation, writeQuery],
   );
 
   // Capability-free local-text workflows reuse the guarded start lifecycle.
@@ -1296,7 +1338,7 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, onScreenClosed: closeScreenDrawer })
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}

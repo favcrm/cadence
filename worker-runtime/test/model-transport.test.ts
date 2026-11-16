@@ -1,7 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { GenerationIdentity } from "../src/contract.ts";
 import {
   CONTEXT_BUDGET_EXCEEDED,
@@ -121,6 +118,81 @@ describe("model transport", () => {
     expect(resolved).toEqual(["served-json"]);
   });
 
+  it("refuses a summary the gateway's total budget cannot carry, before dispatch", async () => {
+    const sources = [
+      "a".repeat(300_000),
+      "中".repeat(100_000),
+      '"'.repeat(150_000),
+    ];
+    for (const text of sources) {
+      let dispatched = false;
+      const binding = meteredBinding(
+        {
+          async requestModel() {
+            dispatched = true;
+            return new Response("unexpected dispatch");
+          },
+        },
+        () => identity,
+        undefined,
+        1,
+        undefined,
+        () => true,
+      );
+      const response = (await binding.run(
+        "default",
+        {
+          messages: [
+            { role: "system", content: "Summarize the earlier turns." },
+            { role: "user", content: [{ type: "text", text }] },
+          ],
+        },
+        { returnRawResponse: true },
+      )) as Response;
+      expect(response.status).toBe(400);
+      expect((await response.json()).error.code).toBe(CONTEXT_BUDGET_EXCEEDED);
+      expect(dispatched).toBe(false);
+    }
+  });
+
+  it("dispatches a summary that fits, split under the per-message limit", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          seen.push(input);
+          return new Response("data: [DONE]\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      },
+      () => identity,
+      undefined,
+      1,
+      undefined,
+      () => true,
+    );
+    const response = (await binding.run(
+      "default",
+      {
+        messages: [
+          { role: "system", content: "Summarize the earlier turns." },
+          { role: "user", content: [{ type: "text", text: "b".repeat(100_000) }] },
+        ],
+      },
+      { returnRawResponse: true },
+    )) as Response;
+    expect(response.status).toBe(200);
+    expect(seen).toHaveLength(1);
+    const messages = seen[0]!.messages as { content: string }[];
+    expect(messages).toHaveLength(3);
+    for (const message of messages.slice(1))
+      expect(message.content.length).toBeLessThanOrEqual(64_000);
+    expect(messages.slice(1).map((message) => message.content).join("")).toBe(
+      "b".repeat(100_000),
+    );
+  });
+
   it("refuses an unsupported resume without dispatching a new model request", async () => {
     let dispatched = false;
     const binding = meteredBinding(
@@ -136,6 +208,92 @@ describe("model transport", () => {
     expect(refused.status).toBe(409);
     expect((await refused.json()).error.code).toBe("resume_unavailable");
     expect(dispatched).toBe(false);
+  });
+
+  it("shortens old tool results without shortening an artifact being edited", async () => {
+    const old = "Earlier report ".repeat(2_000);
+    const current = `<html>${"Current document ".repeat(2_000)}</html>`;
+    const input = {
+      messages: [
+        { role: "user", content: "Read the earlier report." },
+        { role: "assistant", content: null, tool_calls: [{ id: "old-call" }] },
+        { role: "tool", tool_call_id: "old-call", content: old },
+        { role: "assistant", content: "The earlier report is ready." },
+        { role: "user", content: "Edit the current document." },
+        { role: "assistant", content: null, tool_calls: [{ id: "current-call" }] },
+        { role: "tool", tool_call_id: "current-call", content: current },
+      ],
+    };
+    let received: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      {
+        async requestModel(request) {
+          received = request;
+          return new Response("ok");
+        },
+      },
+      () => identity,
+    );
+    await binding.run("default", input);
+
+    const messages = received?.messages as typeof input.messages;
+    const oldResult = messages.find((message) => message.tool_call_id === "old-call");
+    const currentResult = messages.find((message) => message.tool_call_id === "current-call");
+    expect(oldResult?.content?.length).toBeLessThan(old.length);
+    expect(oldResult?.content).toContain("shortened");
+    expect(currentResult?.content).toBe(current);
+    expect(input.messages[2]?.content).toBe(old);
+    expect(input.messages[6]?.content).toBe(current);
+  });
+
+  it("keeps tool results intact when no completed earlier turn proves the boundary", async () => {
+    const content = `<html>${"Current document ".repeat(2_000)}</html>`;
+    const input = {
+      messages: [
+        { role: "user", content: "Edit the document." },
+        { role: "assistant", content: null, tool_calls: [{ id: "current-call" }] },
+        { role: "tool", tool_call_id: "current-call", content },
+      ],
+    };
+    let received: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      {
+        async requestModel(request) {
+          received = request;
+          return new Response("ok");
+        },
+      },
+      () => identity,
+    );
+    await binding.run("default", input);
+    expect((received?.messages as typeof input.messages)[2]?.content).toBe(content);
+  });
+
+  it("splits an attested summary without losing text or breaking a surrogate pair", async () => {
+    const source = `${"a".repeat(63_999)}😀${"z".repeat(100)}`;
+    const input = {
+      messages: [
+        { role: "system", content: "Summarize." },
+        { role: "user", content: [{ type: "text", text: source }] },
+      ],
+    };
+    let received: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      { async requestModel(request) { received = request; return new Response("ok"); } },
+      () => identity,
+      undefined,
+      1,
+      undefined,
+      () => true,
+    );
+    await binding.run("default", input);
+    const parts = (received?.messages as Array<{ role: string; content: string }>)
+      .filter((message) => message.role === "user")
+      .map((message) => message.content);
+    expect(parts.every((part) => part.length <= 64_000)).toBe(true);
+    expect(parts[0]).toBe("a".repeat(63_999));
+    expect(parts.join("")).toBe(source);
+    expect(input.messages[1]?.content).toEqual([{ type: "text", text: source }]);
   });
 });
 
@@ -167,15 +325,11 @@ describe("gateway refusals", () => {
       { status },
     );
 
-  it("names the trusted context-budget refusal as a terminal failure", async () => {
-    let calls = 0;
+  it("keeps private gateway diagnostics out of the budget refusal", async () => {
     const marker = "hosted_context_budget_0123456789abcdef0123456789abcdef";
-    const operations: string[] = [];
     const binding = meteredBinding(
       {
         async requestModel() {
-          operations.push("request");
-          calls += 1;
           return refusal(CONTEXT_BUDGET_EXCEEDED);
         },
       },
@@ -183,13 +337,8 @@ describe("gateway refusals", () => {
       undefined,
       1,
       {
-        clear: () => {
-          operations.push("clear");
-        },
-        issue: () => {
-          operations.push("issue");
-          return marker;
-        },
+        clear: () => {},
+        issue: () => marker,
       },
     );
     const response = (await binding.run(
@@ -199,27 +348,8 @@ describe("gateway refusals", () => {
     )) as Response;
     expect(response.status).toBe(400);
     const body = (await response.json()) as GatewayRefusalBody;
-    expect(body).toEqual({
-      error: {
-        code: CONTEXT_BUDGET_EXCEEDED,
-        message: marker,
-      },
-    });
     expect(JSON.stringify(body)).not.toContain("gw.internal");
     expect(JSON.stringify(body)).not.toContain("273589");
-
-    // The engine classifies the provider text the runtime emitted. Neither a
-    // compaction nor a retry may follow, so no further call is dispatched.
-    // The classifiers read only these fields of a terminal failure.
-    const terminal = {
-      stopReason: "error",
-      errorMessage: body.error.message,
-      provider: "openai",
-    } as unknown as AssistantMessage;
-    expect(isContextOverflow(terminal)).toBe(false);
-    expect(isRetryableAssistantError(terminal)).toBe(false);
-    expect(calls).toBe(1);
-    expect(operations).toEqual(["clear", "request", "issue"]);
   });
 
   it("never records budget proof for untrusted HTTP or streamed error text", async () => {

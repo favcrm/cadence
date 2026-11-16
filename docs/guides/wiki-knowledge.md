@@ -167,6 +167,26 @@ the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
 empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
 regular files are attachments.
 
+A hosted workspace board serves these transfer operations since its 2026-11-12
+release (AOS-566). On a hosted board:
+
+- Every operation is two requests (authorize, then call), and the whole command
+  has one deadline, `--wake-timeout` (120 seconds by default). Each file costs
+  at least two operations, so a copy of more than a few dozen files can run out
+  of time: pass a longer `--wake-timeout`, or let it stop and continue the same
+  job with `--resume <job>`. A resume checks every entry again, so a very large
+  copy is better split into several smaller ones.
+- The board sets its own size limits for `wiki cp`, which are lower than this
+  client's. A file over the limit refuses the whole copy before anything is
+  staged; send a large binary file on its own with `wiki upload`.
+- A refusal names the board's code and what to do, for example
+  `destination_changed` (copy again with `--update`) or `payload_too_large`.
+  An export reports a file the board refused in its JSON failure list (exit 1)
+  and stops there; the board's code is in that entry's text.
+- A board released before then answers `not_implemented` and copies nothing;
+  there, write each text page with `wiki put` and send each binary file with
+  `wiki upload`.
+
 The command hashes the source and refuses symlinks, special files, and
 internal paths before it mutates the wiki. It prints the job id and digest
 before entry writes. Repeat the same source and `--resume JOB_ID` after an
@@ -178,6 +198,31 @@ An empty directory is admitted with no entries, and finish creates that root.
 `--update` pins the destination's current revisions and replaces changed
 bytes. Without it, identical content can be skipped, but changed existing
 pages are create-only. A partial job exits nonzero and names the job id.
+When a chunk, apply or finish stops partway, the exit code says what is known
+about that one request. Entries applied earlier in the same job stay applied
+in every case.
+
+- **3** — a hosted board refused the request with one of its own transfer
+  codes, and the error keeps that code. That request changed nothing. Follow
+  the message: resume with `--resume <job>`, or copy again without `--resume`
+  when the job is gone.
+- **75** — the command deadline passed before the request was sent, or the
+  board's gateway answered that the board was still waking and did not forward
+  it. That request changed nothing. Run the same copy again with
+  `--resume <job>`, with a larger `--wake-timeout` if the board was still
+  waking; a plain rerun starts a new job instead.
+- **1** — the outcome is not confirmed: a reply was lost, a local daemon refused
+  (its refusal can follow a publish), or the client cannot prove the request
+  was never sent. It may have landed. Run the same copy with `--resume <job>`
+  before repeating anything; the job shows what was recorded.
+
+A local source problem found while sending a chunk, such as a file that changed
+or shrank after the manifest was pinned or could not be read, exits 3: that run
+did not apply the file and did not finish the job; copy again without
+`--resume`. The same holds when the board's job holds more bytes for a file than
+its pinned size, which resuming cannot fix. A chunk answer the client cannot
+read exits 1.
+
 `--wait-index` polls that job's own status until the index is covered, the job
 fails, or the command deadline
 passes. It does not refresh the global index.

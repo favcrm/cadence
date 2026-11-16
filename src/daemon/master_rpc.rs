@@ -55,10 +55,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "task_show",
     "model_defaults_get",
     // CAD-552: the reads behind the completed verb allowlist — `issue
-    // ls --json`'s work block (`project_work_approvals`) and the
-    // `overview`/`status` sections (`monitor_*`, `agent_probe`) — all
-    // Rule::Read. Self-scoped reads like `agent_requests` stay refused:
-    // empty would pass for "nothing pending".
+    // ls --json`'s work block and the `overview`/`status` sections.
+    // Project-scoped handlers apply their own caller and policy checks.
+    // Self-scoped reads like `agent_requests` stay refused: empty would
+    // pass for "nothing pending".
     "project_work_approvals",
     "monitor_list",
     "monitor_alerts",
@@ -85,6 +85,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "wiki_search",
     "wiki_history",
     "wiki_write",
+    "routine_list",
+    "routine_show",
+    "wiki_propose",
+    "routine_propose",
     // CAD-615: file a permission request, peek a grant, and retry an
     // approved command. Deciding a request is not on this list.
     "master_ask_permission",
@@ -127,6 +131,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1752: propose hiring a catalogue role on the master's own live
     // turn; the handler binds to that turn and writes one inert entry.
     "hire_propose",
+    // CAD-2285: ask the operator with a form on the master's own live
+    // turn; the handler binds to that turn and writes one inert entry.
+    "master_ask_form",
     // Retained Library image bytes, still exact-turn and source/receiver scoped.
     "app_media_inspect",
 ];
@@ -370,20 +377,25 @@ impl Shared {
         // narrowed to `MASTER_APP_ALLOWED`.
         let scope = self.master_turn_scope();
         if scope != MasterScope::Home {
-            // CAD-1767: say what is actually missing for a hire proposal -
-            // a live Home turn - instead of the app-conversation rule.
-            if method == "hire_propose" {
+            // CAD-1767 / CAD-2285: say what is actually missing for a verb
+            // bound to a live Home turn instead of the app-conversation rule.
+            let home_verb = match method {
+                "hire_propose" => Some("hire propose"),
+                "master_ask_form" => Some("master ask-form"),
+                _ => None,
+            };
+            if let Some(verb) = home_verb {
                 return Err(Error::invalid(
                     "master_refused",
                     match scope {
-                        MasterScope::App(_) => {
-                            "hire propose is made in the master's Home conversation, \
+                        MasterScope::App(_) => format!(
+                            "{verb} is made in the master's Home conversation, \
                              not in an app conversation"
-                        }
-                        _ => {
-                            "hire propose needs the master's live assigned turn in its \
+                        ),
+                        _ => format!(
+                            "{verb} needs the master's live assigned turn in its \
                              Home conversation - none is running"
-                        }
+                        ),
                     },
                 ));
             }
@@ -586,9 +598,18 @@ impl Shared {
         // it (CAD-323).
         if out["dispatched"] != json!(false) {
             // CAD-431: the ticket enters the review loop; its worker's
-            // done report is what moves it on.
-            if let Err(e) = self.delivery_start(id, &ticket.project, &to) {
-                tracing::warn!("delivery record for {id}: {e}");
+            // done report is what moves it on. CAD-2215: the accepted
+            // kickoff id is the record's exact native receipt — without
+            // one there is no ordinary record to open.
+            match out["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(message) => {
+                    if let Err(e) = self.delivery_start(id, &ticket.project, &to, message) {
+                        tracing::warn!("delivery record for {id}: {e}");
+                    }
+                }
+                None => tracing::warn!(
+                    "delivery record for {id}: the dispatch answered no accepted message id"
+                ),
             }
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
@@ -1183,9 +1204,25 @@ impl Shared {
             self.master_or_operator(params, peer_pid, "posting into the master's thread")?;
         }
         let pm = self.pm()?;
+        let mut actor = self.policy_actor(peer_pid, "master_summary")?;
+        if let Some(claim) = params.get("read_as") {
+            if actor != "operator" {
+                return Err(Error::rejected(
+                    "master_summary refused: only the operator may relay a read identity",
+                ));
+            }
+            let claim = claim
+                .as_str()
+                .filter(|claim| crate::project_policy::caller_of(claim).is_some())
+                .ok_or_else(|| Error::rejected("master_summary refused: invalid read identity"))?;
+            actor = claim.to_string();
+        }
         let escalated = master::escalations(&self.state_dir);
-        let mut out = issue::summary::since(&pm, since, &escalated)?;
-        out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        let readable = crate::project_policy::readable(&pm, &actor);
+        let mut out = issue::summary::since(&pm, since, &escalated, Some(&readable))?;
+        if crate::project_policy::reads_every_project(&pm, &actor) {
+            out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        }
         if post {
             self.store.ensure_thread(ALIAS)?;
             let seq = self.store.thread_append(

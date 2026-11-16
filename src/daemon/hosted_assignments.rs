@@ -109,8 +109,7 @@ impl Shared {
                                     "hosted workspace was disconnected or rebound",
                                 ));
                             }
-                            // Existing agent_send semantics, without operator or steering authority.
-                            shared.send_as(&params, &|_| Ok(store::Sender::Unattributed))
+                            shared.send_hosted_kickoff(&params)
                         });
                         let notifier = self.clone();
                         let notify = Arc::new(move || notifier.wake());
@@ -130,6 +129,71 @@ impl Shared {
         }
         for (_, stop) in workers {
             stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The send a workspace worker makes for a hosted kickoff to the bound
+    /// default agent, after its binding checks. A fenced default is refused
+    /// first (CAD-2259); otherwise this is the existing agent_send, without
+    /// operator or steering authority.
+    pub(super) fn send_hosted_kickoff(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = required_str(params, "alias")?;
+        refuse_fenced_default(
+            alias,
+            &self.store.agent(alias)?.state,
+            self.store.has_unknown(alias)?,
+        )?;
+        self.send_as(params, &|_| Ok(store::Sender::Unattributed))
+    }
+}
+
+/// CAD-2259: a fenced default agent (`attention`, or holding an unknown
+/// message) runs nothing until the operator resumes or unfences it, so a
+/// kickoff sent to it would only queue while the board shows the assignment
+/// `running`. This refusal is not `binding_cancelled`, so the coordinator
+/// reports the claim `blocked` with this text instead. Only these persisted
+/// states count: right after a daemon start every enabled managed agent
+/// still reads as dead until relaunch, and an idle-stopped agent is
+/// auto-resumed for queued work (CAD-413), so neither is refused here.
+fn refuse_fenced_default(alias: &str, state: &str, has_unknown: bool) -> Result<()> {
+    if state != "attention" && !has_unknown {
+        return Ok(());
+    }
+    Err(Error::invalid(
+        "default_agent_unavailable",
+        format!(
+            "The local agent {alias} is fenced and needs the operator, so this kickoff was \
+             not queued. Resume or unfence it, or connect another default agent, then \
+             connect again to pick this assignment up."
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_fenced_default;
+
+    #[test]
+    fn cad2259_a_fenced_default_refuses_the_kickoff_with_its_reason() {
+        for (state, unknown) in [("attention", false), ("attention", true), ("idle", true)] {
+            let error = refuse_fenced_default("roster-a", state, unknown).unwrap_err();
+            assert_eq!(error.kind(), "rejected", "{state}/{unknown}");
+            assert_eq!(error.code(), Some("default_agent_unavailable"));
+            let text = error.to_string();
+            assert!(
+                text.contains("roster-a") && text.contains("not queued"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cad2259_a_live_or_stopped_default_still_takes_the_kickoff() {
+        for state in ["idle", "busy", "starting", "stopped", "offline"] {
+            assert!(
+                refuse_fenced_default("roster-a", state, false).is_ok(),
+                "{state}"
+            );
         }
     }
 }

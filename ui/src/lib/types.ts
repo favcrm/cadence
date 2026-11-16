@@ -89,6 +89,63 @@ export interface LinkRef {
   missing: boolean;
 }
 
+/** CAD-2195 / CAD-2253: one project-scoped approval head on `GET /api/issues/:id`. */
+export interface IssueApprovalHead {
+  head_sha: string;
+  repo: string;
+  pr: number;
+  state: "in-force" | "missing" | "unavailable";
+  approval_id?: string;
+  source?: string;
+  action?: string;
+  recorded_at?: string;
+  reason?: string;
+}
+
+/** Hosted issue approval projection (`hosted-cadence-issue-approvals.v1`). */
+export interface IssueApprovals {
+  version: string;
+  scope: string;
+  available: boolean;
+  reason: string | null;
+  complete: boolean;
+  heads: IssueApprovalHead[];
+  heads_truncated?: boolean;
+}
+
+/** One participant-visible hosted assignment row on `GET /api/issues/:id`. */
+export interface IssueAssignmentRow {
+  assignment_id?: string;
+  issue_id?: string;
+  target?: string | null;
+  state: string;
+  text?: string | null;
+  text_truncated?: boolean;
+  deliverable?: { type: "artifact" | "link"; ref: string; title?: string | null } | null;
+  deliverable_check?: { found: boolean | null; reason: string | null };
+  updated_at?: string | null;
+}
+
+/** Hosted participant-scoped assignment projection on `GET /api/issues/:id`. */
+export interface IssueLocalAssignment {
+  version?: string;
+  source?: string;
+  scope?: string;
+  available: boolean;
+  reason: string | null;
+  observed_at?: string;
+  truncated?: boolean;
+  complete?: boolean;
+  assignments: IssueAssignmentRow[];
+}
+
+/** Hosted agent run summary on `GET /api/issues/:id`. */
+export interface IssueAgentRun {
+  agent?: string | null;
+  agent_name?: string | null;
+  state?: string | null;
+}
+
 export interface ActivityItem {
   at: string;
   kind: "note" | "comment" | "commit";
@@ -163,6 +220,12 @@ export interface IssueDetail extends Omit<IssueCard, "counts"> {
   plan?: PlanBlock | null;
   /** CAD-341 task reports on the ticket (questions carry `open`). */
   reports?: TaskReport[];
+  /** Hosted project-scoped approval heads (`hosted-cadence-issue-approvals.v1`). */
+  approvals?: IssueApprovals | null;
+  /** Hosted participant-scoped assignment read. */
+  local_assignment?: IssueLocalAssignment | null;
+  /** Hosted agent-run state when an agent run was dispatched on the ticket. */
+  agent_run?: IssueAgentRun | null;
 }
 
 /** One ticket of a plan, with its derived status. */
@@ -226,31 +289,6 @@ export interface Project {
 }
 
 export type ContextRole = "pm" | "dev" | "qa" | "devops";
-
-/**
- * A project's recorded access policy (CAD-1950, AOS-274). The values are the
- * tracker's own spelling — `workspace_visible` / `private` and grants such as
- * `users/<handle>` — so the board cannot invent a second vocabulary.
- */
-export interface ProjectPolicy {
-  version: number;
-  visibility: "workspace_visible" | "private";
-  /** Grants for a private project; absent when the list is empty. Ignored
-   *  while `workspace_visible` — stored, but it does not admit anyone. */
-  members?: string[];
-}
-
-/** `GET /api/projects/<key>/policy` — the policy, and whether one exists. */
-export interface ProjectPolicyPayload {
-  project: string;
-  /** False for a project that predates the policy contract: with no policy
-   *  recorded every caller keeps access (REQ-007). That is a different state
-   *  from workspace-visible and must not be shown as it. */
-  recorded: boolean;
-  policy: ProjectPolicy | null;
-  /** Whether this build may record `private` (the isolation gate). */
-  private_available: boolean;
-}
 
 export interface ProjectContextDocument {
   id: string;
@@ -435,14 +473,11 @@ export interface OverviewProject {
   areas_error?: string | null;
 }
 
-export interface MonitorAlert {
-  seq: number;
+interface MonitorAlertBase {
   monitor: string;
   project: string;
   monitor_owner: string;
   task?: string | null;
-  event_seq: number;
-  fingerprint: string;
   kind: string;
   payload: unknown;
   state: "open" | "acknowledged" | "resolved" | string;
@@ -454,14 +489,30 @@ export interface MonitorAlert {
   next_action: string;
   next_owner: string;
   authority: string;
-  evidence: {
-    monitor: string;
-    alert_seq: number;
-    event_seq: number;
-    fingerprint: string;
-    payload: unknown;
-  };
 }
+
+export type MonitorAlert = MonitorAlertBase & (
+  | {
+      seq: number;
+      event_seq: number;
+      fingerprint: string;
+      id?: never;
+      evidence: {
+        monitor: string;
+        alert_seq: number;
+        event_seq: number;
+        fingerprint: string;
+        payload: unknown;
+      };
+    }
+  | {
+      id: string;
+      seq?: never;
+      event_seq?: never;
+      fingerprint?: never;
+      evidence: { monitor: string; alert: string; payload: unknown };
+    }
+);
 
 export interface MonitorRow {
   id: string;
@@ -473,7 +524,7 @@ export interface MonitorRow {
   last_check_at?: number | null;
   last_success_at?: number | null;
   next_check_at?: number | null;
-  event_cursor: number;
+  event_cursor?: number;
   coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
@@ -516,6 +567,12 @@ export interface Overview {
   monitoring?: Monitoring;
   /** Sources that missed their time bound — the view narrowed. */
   degraded?: { source: string; subject?: string; detail: string }[];
+  /** CAD-2317: operator-only routines awaiting approval or repointing. */
+  routine_needs?: Routine[];
+  /** CAD-2317: operator-only pending staged routine/playbook proposals. */
+  routine_proposals?: StagedRoutineProposal[];
+  /** CAD-2317: operator-only routine runs paused on an approval-gated checklist step. */
+  routine_step_holds?: RoutineRun[];
   generated_at: number;
 }
 
@@ -638,17 +695,22 @@ export interface StoredAgentProfile {
 }
 
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
- *  fields re-declared here: a registered agent always reports `provider`,
- *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board
- *  reads the allowance record as the wider `UsageLimit`, and the detail read
- *  merges the launch `params` in. */
+ *  fields re-declared here: a registered agent always reports `provider` and
+ *  `endpoint_kind`, the board reads the allowance record as the wider
+ *  `UsageLimit`, and the detail read merges the launch `params` in.
+ *  CAD-2215: a scoped row reports `state` only when the reader's own work
+ *  proves it (`"busy"`, else `null`) and omits `dead`/`fenced`, so those are
+ *  nullable/optional here — absence is unavailable, never false. */
 export type Agent = Omit<
   Api.AgentRow,
-  "provider" | "endpoint_kind" | "state" | "quota" | "usage_limit" | "model_selection" | "last_activity"
+  "provider" | "endpoint_kind" | "state" | "dead" | "fenced" | "quota" | "usage_limit" | "model_selection" | "last_activity"
 > & {
   provider: string;
   endpoint_kind: string;
-  state: string;
+  /** `"busy"` on work the reader can see running; `null` when unreported. */
+  state: string | null;
+  dead?: boolean | null;
+  fenced?: boolean | null;
   /** Launch params; the detail read carries them. */
   params?: Record<string, unknown>;
   model_selection?: {
@@ -724,6 +786,11 @@ export interface MasterState {
   /** Queued master messages in delivery order (max 20). */
   queue?: { message: string; conversation?: string | null }[];
   queued?: number;
+  /**
+   * The runtime's own sentence for a blocking compaction that failed and left
+   * its run unanswered, or null. Never provider text.
+   */
+  compaction_failure?: string | null;
   /** CAD-1817: the workspace coordinator's committed identity — its own
    *  protected IDENTITY/SOUL projection, never a member's private profile.
    *  Generated as `MasterIdentity` from the daemon's Rust type. */
@@ -787,13 +854,14 @@ export interface AgentDetail {
     quota?: UsageLimit | null;
     usage_limit?: UsageLimit | null;
     pid?: number | null;
-    state: string;
+    /** `"busy"` on work the reader can see running; `null` when unreported. */
+    state: string | null;
     enabled: boolean;
     error?: string | null;
     endpoint?: string | null;
     params?: Record<string, unknown>;
     generation?: number;
-    dead?: boolean;
+    dead?: boolean | null;
     silent_secs?: number;
     stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
@@ -823,16 +891,17 @@ export interface AgentDetail {
   }[];
   /** Why `events` is empty when the daemon's event read failed. */
   events_error?: string | null;
-  events: {
-    seq: number;
+  events: ({
     alias: string;
     kind: string;
     payload?: Record<string, unknown>;
     job_id?: string | null;
     task_id?: string | null;
     at: string;
-  }[];
-  fenced: boolean;
+  } & ({ seq: number; id?: never; cursor?: never } | { id: string; cursor: string; seq?: never }))[];
+  /** Whether the agent is fenced; `null`/absent for a scoped reader, whose
+   *  daemon reports no state to decide it from. */
+  fenced?: boolean | null;
   recovery?: string | null;
   resume?: string | null;
   tasks?: string[];
@@ -847,6 +916,14 @@ export interface AgentDetail {
 export type Meta = Api.MetaResponse & {
   /** A hosted board sets this when its Worker serves /api/wiki. */
   wiki?: boolean;
+  /** Optional capability flags advertised by a hosted board's /api/meta. */
+  my_work?: boolean;
+  milestones?: boolean;
+  workflows?: boolean;
+  work_conversations?: boolean;
+  human_threads?: boolean;
+  credential_requests?: boolean;
+  app_automatic_updates?: boolean;
   /** The Settings sections this board serves for this viewer. Absent: not stated. */
   settings_sections?: readonly string[];
 };
@@ -1468,6 +1545,13 @@ export interface ConnectionProvider {
   /** Always false: listing providers never checks the network. */
   network_checked: boolean;
   registration_digest: string | null;
+  /** The reviewed connected read this provider serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   verification_support?: ConnectionVerificationSupport | null;
 }
 
@@ -1521,6 +1605,7 @@ export interface CredentialRequest {
   state: "pending" | "submitting" | "done" | "cancelled" | "expired" | "unknown";
   status: string;
   result_code: string | null;
+  result_connection_id?: string | null;
   verification_request_id: string | null;
   /** CAD-1085: server-selected absolute URL of the trusted entry page for
    *  this request. Present only when the deployment has a pinned separate
@@ -1538,6 +1623,10 @@ export interface CredentialRequest {
     custody_epoch: number | null;
     context_current: boolean;
   };
+  /** CAD-2317: durable one-shot inline chat resume projection. */
+  resumed?: boolean;
+  resumed_connection_id?: string | null;
+  resumed_message_id?: string | null;
 }
 
 /** CAD-1085: an agent's durable connection/access projection — metadata
@@ -1573,6 +1662,13 @@ export interface Connection {
   revision: number | null;
   registration_digest: string | null;
   scopes: string[];
+  /** The reviewed connected read this account serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   /**
    * Non-secret SMTP sender projection (CAD-785): transport and
    * verified sender from host custody. Absent for other providers —
@@ -1604,6 +1700,21 @@ export interface Connection {
     execution_authority: boolean;
     network_checked: boolean;
   };
+  /** CAD-2317: personal vs shared access & safety policy. */
+  policy?: ConnectionPolicy | null;
+}
+
+export interface ConnectionPolicy {
+  connection_id: string;
+  provider: string;
+  visibility: "shared" | "personal";
+  owner_user_id: string | null;
+  is_default: boolean;
+  write_mode: "ask_approval" | "read_only";
+  allow_external_triggers: boolean;
+  allowed_agents: string[];
+  policy_revision: number;
+  updated_at: number;
 }
 
 export interface ConnectionsPayload {
@@ -1617,6 +1728,23 @@ export interface ConnectionsPayload {
 
 export interface ConnectionPayload {
   connection: Connection;
+}
+
+/** One exact Search Console property the account can read. */
+export interface ConnectionSite {
+  site_url: string;
+  permission_level: string;
+}
+
+/** `GET /api/connections/<id>/sites` — exact properties and the current pin. */
+export interface ConnectionSitesPayload {
+  sites: ConnectionSite[];
+  selected: string | null;
+}
+
+/** `POST /api/connections/<id>/site` — the newly pinned property. */
+export interface ConnectionSitePayload {
+  site: ConnectionSite;
 }
 
 /**
@@ -1685,4 +1813,122 @@ export interface ConnectionVerificationReceipt {
 /** The typed envelope `POST /api/connections/<id>/test` returns. */
 export interface ConnectionVerificationPayload {
   verification: ConnectionVerificationReceipt;
+}
+
+/** CAD-2240: `GET /api/projects/<key>/timeline` on a hosted board
+ *  (`hosted-cadence-project-timeline.v1`), newest first. */
+export type TimelineKind = "created" | "status" | "owner" | "claim" | "comment" | "message" | "review";
+export interface TimelineEvent {
+  id: string;
+  at: string;
+  kind: TimelineKind;
+  ticket: string;
+  title: string;
+  actor: { name: string; kind: "member" | "agent" | "system" } | null;
+  from: string | null;
+  to: string | null;
+  landed: boolean;
+  text: string | null;
+  to_role: string | null;
+  decision: string | null;
+  open: boolean;
+  open_days: number | null;
+}
+export interface ProjectTimeline {
+  version: string;
+  project: string;
+  recording_since: string | null;
+  events: TimelineEvent[];
+  next_before: string | null;
+  truncated: boolean;
+}
+
+/** CAD-2317: Routines (`Context Markdown` playbooks & `sha256`-pinned scripts). */
+export interface ChecklistStep {
+  id: string;
+  label: string;
+  requires_approval: boolean;
+  state: string;
+}
+
+export interface RoutineRun {
+  id: string;
+  routine_id: string;
+  due_instant: number;
+  trigger_source: "manual" | "schedule" | "external_event" | string;
+  state:
+    | "running"
+    | "completed"
+    | "skipped_empty"
+    | "skipped_stale"
+    | "skipped_overlap"
+    | "waiting_approval"
+    | "failed"
+    | string;
+  approved_rev: string | null;
+  approved_sha256: string | null;
+  checklist_state: ChecklistStep[];
+  checklist?: ChecklistStep[];
+  script_output: unknown;
+  message_id: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+  deduped?: boolean;
+  routine_name?: string;
+  agent_alias?: string;
+}
+
+export interface Routine {
+  id: string;
+  name: string;
+  agent_alias: string;
+  trigger_kind: "schedule" | "event";
+  cron: string | null;
+  interval_mins: number | null;
+  timezone: string | null;
+  event_source: string | null;
+  target_kind: "markdown" | "script" | "script_then_markdown";
+  markdown_path: string | null;
+  approved_rev: string | null;
+  current_rev: string | null;
+  script_path: string | null;
+  approved_sha256: string | null;
+  current_sha256: string | null;
+  approval_drift: boolean;
+  destination_thread: string | null;
+  connection_account: string | null;
+  checklist: ChecklistStep[];
+  inputs: Record<string, unknown>;
+  status: "on" | "waiting_approval" | "repoint_required" | "paused";
+  stored_status: string;
+  pause_reason: string | null;
+  consecutive_failures: number;
+  next_due_at: number | null;
+  last_run_at: number | null;
+  last_run_state: string | null;
+  created: number;
+  updated: number;
+  runs?: RoutineRun[];
+}
+
+export interface StagedRoutineProposal {
+  id: string;
+  kind: "wiki_propose" | "routine_propose" | string;
+  proposed_by: string;
+  title: string;
+  payload: Record<string, unknown>;
+  state: "pending" | "approved" | "rejected" | string;
+  created_at: number;
+  decided_at: number | null;
+}
+
+export interface RoutinesPayload {
+  routines: Routine[];
+  staged_proposals: StagedRoutineProposal[];
+  waiting_runs?: RoutineRun[];
+}
+
+export interface RoutinePayload {
+  routine: Routine;
 }
