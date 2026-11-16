@@ -87,6 +87,9 @@ jobs:
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { execFileSync } from 'node:child_process';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
           if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
           // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
@@ -156,6 +159,30 @@ jobs:
             }
             if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
             return { files, sections };
+          }
+          // For a large diff, a complete hunk boundary is not proof of a complete patch.
+          // Apply the exact bytes to the pinned base index and require the pinned head tree.
+          function matchesHeadTree(diff, base, head) {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cadence-review-')), repo = path.join(dir, 'repo.git');
+            const env = {
+              PATH: E.PATH, HOME: dir, LANG: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+              GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_INDEX_FILE: path.join(dir, 'index'),
+              GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+              GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${E.GH_TOKEN}`).toString('base64')}`,
+            };
+            const git = (args, input) => execFileSync('git', args, { env, input, timeout: 120000, maxBuffer: 1024 * 1024, stdio: 'pipe' });
+            try {
+              git(['init', '--bare', '--quiet', '--template=', repo]);
+              git(['-C', repo, 'remote', 'add', 'origin', `https://github.com/${REPO}.git`]);
+              git(['-C', repo, 'config', 'remote.origin.promisor', 'true']);
+              git(['-C', repo, 'config', 'remote.origin.partialclonefilter', 'blob:none']);
+              git(['-C', repo, 'fetch', '--no-tags', '--depth=1', '--filter=blob:none', 'origin', base, head]);
+              git(['-C', repo, 'read-tree', base]);
+              git(['-C', repo, 'apply', '--cached', '--whitespace=nowarn', '-'], diff);
+              const actual = git(['-C', repo, 'write-tree', '--missing-ok']).toString('utf8').trim();
+              const expected = git(['-C', repo, 'rev-parse', `${head}^{tree}`]).toString('utf8').trim();
+              return /^[0-9a-f]{40}$/.test(actual) && actual === expected;
+            } catch { return false; } finally { fs.rmSync(dir, { recursive: true, force: true }); }
           }
           if (E.GITHUB_REF !== 'refs/heads/main') die('this workflow only runs from main: dispatch it with --ref main');
           const pub = publicKey(); // before any token is minted or context read
@@ -247,6 +274,8 @@ jobs:
           // list is complete (under the 300 cap), so a different section count means the diff was cut short by
           // GitHub or padded; that is the one case that refuses.
           if (listed < 1 || sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
+          if (Buffer.byteLength(diff) > 300000 && !matchesHeadTree(diff, mergeBase, HEAD))
+            die('the large diff cannot be bound to the compared Git trees; nothing filed');
           // The standard the reviewer applies is read at the pinned main (the rules in force when this merges),
           // never from the PR; the PR cannot change main.
           const doc = async (p) => {
@@ -414,15 +443,16 @@ jobs:
               let i;
               while ((i = buf.indexOf('\n\n')) >= 0) {
                 const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-                const line = ev.split('\n').find((l) => l.startsWith('data: '));
-                if (!line) continue; // keep-alive comments (": OPENROUTER PROCESSING") carry no data
-                if (line === 'data: [DONE]') {
+                const fields = ev.split('\n').filter((l) => l === 'data' || l.startsWith('data:'));
+                if (!fields.length) continue; // keep-alive comments carry no data
+                const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
+                if (data === '[DONE]') {
                   if (largeInput && (!sawMetadata || sawDone)) failed = true;
                   sawDone = true;
                   continue;
                 }
                 if (largeInput && (sawMetadata || sawDone)) { failed = true; continue; }
-                let d; try { d = JSON.parse(line.slice(6)); } catch { failed = true; continue; }
+                let d; try { d = JSON.parse(data); } catch { failed = true; continue; }
                 // A provider error inside a 200 stream is a chunk with a top-level error.
                 if (d === null || typeof d !== 'object' || d.error !== undefined) { failed = true; continue; }
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
