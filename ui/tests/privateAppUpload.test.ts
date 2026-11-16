@@ -35,6 +35,11 @@ async function main() {
   responses = [{ status: 409, body: { ok: false, error: { code: "host_incompatible", message: "Unsupported tool." } } }];
   await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.code === "host_incompatible",
     "a nested host refusal retains its explanation");
+  responses = [{ status: 200, body: { ...review, declared_access: { connections: [], capabilities: {
+    publishing: { schema: 1, version: 1, capability: "text.publish", action: "publish", resource_kind: "connection_account", effect: "read" },
+  } } } }];
+  await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.status === 502,
+    "an invalid capability tuple cannot be shown as an approved grant");
 
   calls = [];
   responses = [

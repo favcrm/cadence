@@ -38,9 +38,17 @@ function strings(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 function slot(value: unknown): boolean {
-  return object(value) && value.schema === 1 && typeof value.capability === "string" &&
-    typeof value.version === "number" && Number.isInteger(value.version) && value.version > 0 &&
-    typeof value.action === "string" && typeof value.resource_kind === "string" && typeof value.effect === "string";
+  if (!object(value) || value.schema !== 1 || value.version !== 1 ||
+      typeof value.capability !== "string" || typeof value.action !== "string" ||
+      typeof value.resource_kind !== "string" || typeof value.effect !== "string") return false;
+  if (value.resource_kind === "installation")
+    return value.capability === "file.upload" && value.action === "attach" && value.effect === "draft";
+  if (value.resource_kind !== "connection_account") return false;
+  if (value.capability === "text.publish") return value.action === "publish" && value.effect === "send";
+  const parts = value.capability.split(".");
+  return value.capability.length <= 64 && parts.length === 2 &&
+    parts.every((part) => /^[a-z0-9][a-z0-9-]{0,31}$/.test(part)) &&
+    /^[a-z0-9_]{1,32}$/.test(value.action) && (value.effect === "read" || value.effect === "draft");
 }
 function screens(value: unknown): value is ScreenAccess[] {
   return Array.isArray(value) && value.every((screen) => object(screen) && typeof screen.tag === "string" &&
