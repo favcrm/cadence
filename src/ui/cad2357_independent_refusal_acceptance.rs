@@ -185,7 +185,7 @@ fn member_ids_passed_indirectly_do_not_distinguish_a_private_issue() {
         assert_eq!(tracker(&rig), before, "refused issue_new {via} wrote");
     }
 
-    // The same request with a readable parent works, so the refusals above
+    // The same request with a readable parent creates the issue (201 Created), so the refusals above
     // are about the linked id and not the title, project or credential.
     let (status, body) = post(
         &rig,
@@ -194,7 +194,7 @@ fn member_ids_passed_indirectly_do_not_distinguish_a_private_issue() {
         json!({"project": "visible", "title": "CAD2357 control", "parent": "VIS-1"}),
     );
     assert_eq!(
-        status, 200,
+        status, 201,
         "member issue_new with a readable parent: {body}"
     );
     assert_ne!(tracker(&rig), before, "control issue_new wrote nothing");
@@ -304,5 +304,5 @@ fn owner_keeps_each_verbs_own_answer_for_a_private_and_a_missing_id() {
         "issue_new",
         json!({"project": "visible", "title": "CAD2357 owner", "parent": "SEC-1"}),
     );
-    assert_eq!(status, 200, "owner issue_new with a private parent: {body}");
+    assert_eq!(status, 201, "owner issue_new with a private parent: {body}");
 }
