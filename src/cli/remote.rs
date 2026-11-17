@@ -3673,6 +3673,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     pr,
                     head,
                     browser_qa,
+                    approve,
                 },
         } => {
             refuse_managed(target, "delivery enqueue")?;
@@ -3687,6 +3688,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 *pr,
                 &head,
                 *browser_qa,
+                approve.as_deref(),
             )
             .map_err(|error| {
                 scope_hint(

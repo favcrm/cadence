@@ -509,7 +509,9 @@ Do not substitute a comment or another identity for the required proof.
   backed by GitHub Actions OIDC (`POST /__platform/delivery-gate/verify`).
   Use `cadence --org <org> delivery check` to inspect gate readiness and
   `cadence --org <org> delivery enqueue` for operator CLI enqueue (no local daemon
-  required). `POST /api/approvals/:id/revoke` ("Stop merge") and
+  required). `delivery enqueue --approve "<source>"` records the operator's
+  per-head approval in the same call, so one command approves and enqueues;
+  it records nothing when any other gate rule fails (CAD-2047). `POST /api/approvals/:id/revoke` ("Stop merge") and
   `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
 
 ### Merging

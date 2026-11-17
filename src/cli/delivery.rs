@@ -187,6 +187,11 @@ pub(crate) enum DeliveryAction {
         /// Require fresh Browser QA attestation for UI changes.
         #[arg(long)]
         browser_qa: bool,
+        /// Record the owner's merge approval of this exact head, with this
+        /// source, in the same call, so no separate `audit approve` is needed
+        /// (CAD-2047). Nothing is recorded when any other gate rule fails.
+        #[arg(long = "approve", value_name = "SOURCE")]
+        approve: Option<String>,
     },
 }
 

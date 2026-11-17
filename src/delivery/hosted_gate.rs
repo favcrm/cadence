@@ -1759,6 +1759,7 @@ pub fn delivery_enqueue(
     pr: u64,
     head: &str,
     browser_qa: bool,
+    approve_source: Option<&str>,
 ) -> Result<Value> {
     let mut call_args = args(&[
         ("repo", json!(repo)),
@@ -1774,8 +1775,19 @@ pub fn delivery_enqueue(
     if browser_qa {
         call_args.insert("browser_qa".into(), json!(true));
     }
+    if let Some(source) = approve_source {
+        call_args.insert("approve_source".into(), json!(source));
+    }
     let body = call(target, wake_timeout, "delivery_enqueue", call_args)?;
-    delivery_enqueue_answer(&body, project, issue, repo, pr, head)
+    delivery_enqueue_answer(
+        &body,
+        project,
+        issue,
+        repo,
+        pr,
+        head,
+        approve_source.is_some(),
+    )
 }
 
 pub(crate) fn delivery_enqueue_answer(
@@ -1785,6 +1797,7 @@ pub(crate) fn delivery_enqueue_answer(
     repo: &str,
     pr: u64,
     head: &str,
+    approve: bool,
 ) -> Result<Value> {
     let verb = "delivery_enqueue";
     check_receipt(verb, || {
@@ -1827,6 +1840,14 @@ pub(crate) fn delivery_enqueue_answer(
         if !body["queued"].is_boolean() || !body["auto_merge_enabled"].is_boolean() {
             return Err(refuse(format!(
                 "`{verb}` receipt missing queued/auto_merge_enabled flags"
+            )));
+        }
+        // CAD-2047: a board that understood `approve_source` says whether this
+        // call wrote the approval. Without that flag the receipt does not show
+        // the approval was handled, so the outcome is unknown.
+        if approve && !body["approval_recorded"].is_boolean() {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not say whether the approval was recorded"
             )));
         }
         Ok(body.clone())
@@ -3436,7 +3457,8 @@ mod tests {
             Some("CAD-1946"),
             "favcrm/cadence",
             7,
-            head
+            head,
+            false
         )
         .is_ok());
         assert!(delivery_enqueue_answer(
@@ -3445,7 +3467,8 @@ mod tests {
             Some("CAD-1946"),
             "favcrm/cadence",
             7,
-            head
+            head,
+            false
         )
         .is_err());
         assert!(delivery_enqueue_answer(
@@ -3454,10 +3477,13 @@ mod tests {
             Some("CAD-99"),
             "favcrm/cadence",
             7,
-            head
+            head,
+            false
         )
         .is_err());
-        assert!(delivery_enqueue_answer(&enq, None, None, "favcrm/cadence", 8, head).is_err());
+        assert!(
+            delivery_enqueue_answer(&enq, None, None, "favcrm/cadence", 8, head, false).is_err()
+        );
 
         // revoke_project
         let rev = json!({"state": "revoked", "approval_id": "ap-1", "project": "cadence", "revoked_at": "2026-11-15T00:00:00Z"});
