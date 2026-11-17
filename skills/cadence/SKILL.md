@@ -457,10 +457,12 @@ agreed hand-over (recorded on the issue).
 Every lane `issue start` mints, in any repository, carries two guards. A
 per-worktree `pre-push` hook records a receipt for the head. A repository
 without an executable `scripts/pre-push` records that and lets the push through.
-When the repository has one, the hook currently also needs the repository's
-own build helper and refuses the push without it; the refusal names what is
-missing. Report a refusal; do not bypass the hook. `--no-verify` still pushes, but the missing
-receipt is the detectable signal. A `cargo` shim on the lane's PATH
+When the repository has one, the hook runs it like a git hook (git's remote and
+URL as arguments, the ref lines on stdin, `CADENCE_PRE_PUSH_MODE=repo`) against
+the working tree, so the pushed commit must be `HEAD`; a repository that also
+ships a `scripts/boat-build` helper runs its plan through that instead. A
+failing plan refuses the push. Report a refusal; do not bypass the hook.
+`--no-verify` still pushes, but the missing receipt is the detectable signal. A `cargo` shim on the lane's PATH
 sends every compiling subcommand through a build slot, so no local compile
 escapes the queue; only clearly light subcommands (`fmt`, `metadata`, `tree`,
 `version`, `help` and similar) pass straight through, and a `cargo` run inside
