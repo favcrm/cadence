@@ -14,6 +14,89 @@ pub const PATH_MAX: usize = 256;
 /// Wildcard ceiling, because wildcards are what makes matching cost grow.
 pub const WILD_MAX: usize = 16;
 
+/// CAD-2413: the `areas:` glob grammar, shared with a delivery policy's
+/// `risk.when.paths` (moved here from the binary's `issue::areas`).
+fn area_wild(seg: &str) -> bool {
+    seg.contains('*') || seg.contains('?')
+}
+
+/// The glob's segments, a trailing `/` read as `/**`.
+fn area_segments(glob: &str) -> Vec<&str> {
+    match glob.strip_suffix('/') {
+        Some(dir) => dir.split('/').chain(std::iter::once("**")).collect(),
+        None => glob.split('/').collect(),
+    }
+}
+
+/// One pattern segment against one path segment. `*` is the only
+/// pattern that consumes a variable run, so a single backtracking
+/// point — the last `*` seen — suffices: retry means that `*` takes
+/// one more byte. O(|pat| × |s|) worst case, no exponential retry, so
+/// `src/******************z` against sixty `a`s returns in
+/// microseconds instead of hanging a render.
+fn seg_match(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut c) = (0usize, 0usize);
+    // (pattern index just past the last `*`, string index it resumes at).
+    let mut star: Option<(usize, usize)> = None;
+    while c < s.len() {
+        match pat.get(p) {
+            Some(b'*') => {
+                star = Some((p + 1, c));
+                p += 1;
+            }
+            Some(&pc) if pc == b'?' || pc == s[c] => {
+                p += 1;
+                c += 1;
+            }
+            // Mismatch or pattern exhausted mid-string: the last `*`
+            // absorbs one more byte, or there is no match.
+            _ => match star {
+                Some((sp, sc)) => {
+                    p = sp;
+                    c = sc + 1;
+                    star = Some((sp, c));
+                }
+                None => return false,
+            },
+        }
+    }
+    while pat.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Pattern segments against path segments — `**` matches any run of
+/// segments, everything else is one [`seg_match`]. A dynamic program
+/// over (pattern × path): `dp[i][j]` is "`pat[i..]` matches
+/// `path[j..]`", filled back to front in O(|pat| × |path|) cells, so
+/// stacked `**`s cannot multiply work.
+fn segs_match(pat: &[&str], path: &[&str]) -> bool {
+    let (n, m) = (pat.len(), path.len());
+    let mut dp = vec![vec![false; m + 1]; n + 1];
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            dp[i][j] = match pat.get(i) {
+                None => j == m,
+                Some(&"**") => dp[i + 1][j] || (j < m && dp[i][j + 1]),
+                Some(p) => j < m && seg_match(p.as_bytes(), path[j].as_bytes()) && dp[i + 1][j + 1],
+            };
+        }
+    }
+    dp[0][0]
+}
+
+/// Does `glob` cover the concrete file `path`? A glob without wildcards
+/// is a file or a directory: it covers itself and everything under it.
+pub fn area_match(glob: &str, path: &str) -> bool {
+    let pat = area_segments(glob);
+    let file: Vec<&str> = path.split('/').collect();
+    if segs_match(&pat, &file) {
+        return true;
+    }
+    !pat.iter().any(|s| area_wild(s)) && file.len() > pat.len() && file[..pat.len()] == pat[..]
+}
+
 /// `*`/`**`/`?` glob match: `*` stays inside a path component, `**`
 /// crosses directories, `?` is one non-`/` character.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
