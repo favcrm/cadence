@@ -1609,6 +1609,53 @@ mod tests {
         );
     }
 
+    // CAD-2403 review: a repository's own script runs like a git hook — git's
+    // remote and URL as arguments, the ref lines on stdin and
+    // CADENCE_PRE_PUSH_MODE=repo — and never receives this repository's
+    // `--receipt`, even with CADENCE_PRE_PUSH_LOCAL=1.
+    #[test]
+    fn pre_push_hook_repo_mode_passes_git_args_refs_and_mode() {
+        use std::io::Write;
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        let d = rec.path().display();
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {d}/argv\ncat > {d}/stdin\nprintf '%s' \"$CADENCE_PRE_PUSH_MODE\" > {d}/mode\nexit 0\n"
+        );
+        commit_script(repo.path(), "pre-push", &body);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let hook = install_pre_push_hook(repo.path()).unwrap();
+        let home = TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .arg("origin")
+            .arg("git@example.com:o/r.git")
+            .current_dir(repo.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("USER", "tester")
+            .env("CADENCE_PRE_PUSH_LOCAL", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let line = format!("refs/heads/x {head} refs/heads/x {ZERO_SHA}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{:?}", out);
+        let read = |n: &str| std::fs::read_to_string(rec.path().join(n)).unwrap();
+        assert_eq!(read("argv"), "origin\ngit@example.com:o/r.git\n");
+        assert_eq!(read("stdin"), line);
+        assert_eq!(read("mode"), "repo");
+    }
+
     #[test]
     fn pre_push_hook_repo_mode_clean_pass_is_not_rerun() {
         let repo = git_repo();
