@@ -33,6 +33,8 @@ export interface DecisionNotice {
   title: string;
   /** English reason for a failed apply (translated where shown). */
   reason?: string;
+  /** A connected draft or send: its outcome reads Sent or Drafted. */
+  effect?: "draft" | "send";
 }
 
 export interface DecisionsState {
@@ -219,7 +221,8 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   function failedOrDone(row: StagedWrite): DecisionNotice {
     const outcome = outcomeOf(row);
-    return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row) } : { outcome, title: row.title };
+    const effect = row.connected === null ? {} : { effect: row.connected.effect };
+    return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row), ...effect } : { outcome, title: row.title, ...effect };
   }
 
   /** Approve or deny one decision. Never retries; never submits twice. */
@@ -312,7 +315,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     if (row.status === "pending") {
       const attempts = new Map(state.attempts);
       attempts.delete(id);
-      patch({ attempts, notice: { outcome: "still-waiting", title: row.title } });
+      patch({ attempts, notice: { outcome: "still-waiting", title: row.title, ...(row.connected !== null && row.result?.ok === false ? { effect: row.connected.effect, reason: failureReason(row) } : {}) } });
       return "unconfirmed";
     }
     const attempts = new Map(state.attempts);

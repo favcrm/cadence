@@ -226,6 +226,7 @@ async function main() {
       origin: { via: "chat", kind: "agent", label: "Atlas" },
       result: { ok: true },
       recordLink: null,
+      connected: null,
     },
     {
       id: "act-other",
@@ -246,6 +247,7 @@ async function main() {
       origin: null,
       result: null,
       recordLink: null,
+      connected: null,
     },
   ];
   equal(
