@@ -273,7 +273,8 @@ pub struct DeliveryRequirementsInput {
     /// A policy that parses is then resolved as approved at its own digest,
     /// exactly as an `approval` of it would be; an absent or malformed text
     /// changes nothing. Absent or `false` keeps today's answers; `true` with an
-    /// `approval` refuses as contradictory.
+    /// `approval` refuses as contradictory. Set it only for an owner-written
+    /// host record, never for text read from a repository or a PR head.
     #[serde(default)]
     pub policy_owner_approved: bool,
 }

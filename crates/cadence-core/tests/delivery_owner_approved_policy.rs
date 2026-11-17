@@ -185,7 +185,7 @@ fn flag_true_default_equivalent_policy_is_unchanged() {
 #[test]
 fn flag_true_with_an_approval_is_refused_as_contradictory() {
     let p = parsed(CUSTOM);
-    // Matching approval, mismatching approval, and "approved no section".
+    // A matching approval and a mismatching one: both contradict the flag.
     let approvals = [
         json!({"digest": digest(&p), "policy": serde_json::to_value(&p).unwrap()}),
         json!({"digest": "sha256:other", "policy": null}),
