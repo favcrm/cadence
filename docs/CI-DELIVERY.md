@@ -28,6 +28,10 @@ operator handoff, and [CI wall-time](guides/ci-performance.md) for diagnosing sl
 jobs and the rust-cache/sccache split. Shard-era benchmarks and design notes are in
 [design/ci-history-and-benchmarks.md](design/ci-history-and-benchmarks.md).
 
+Consolidating the required build and UI checks, or changing branch protection,
+needs baseline measurements and an operator decision. Do not rename a check in
+YAML before the required-check policy is migrated.
+
 ## Stage a selected batch
 
 Select the successful main CI run that holds the desired artifact and dispatch:

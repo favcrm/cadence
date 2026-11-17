@@ -50,8 +50,9 @@ Boat:
 scripts/boat-build -- cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 1
 ```
 
-`scripts/boat-build` keeps one sandbox for this worktree and sends the tracked
-patch only; `git add` new files first. Prefer `cargo check` when you only need a
+`scripts/boat-build` keeps one sandbox for this worktree. The first run sends a
+shallow git snapshot plus the tracked patch; later runs send the patch only.
+`git add` new files first. Prefer `cargo check` when you only need a
 compile. The sandbox lifecycle, snapshot and quota are in
 [DEV-CYCLE.md](docs/DEV-CYCLE.md) ("One entry point, executed on Boat").
 Required CI, review and operator approval stay authoritative.
@@ -95,6 +96,17 @@ For feedback on one retained case, run it through the live suite:
 ephemeral runners for repeated runs. This does not retry required CI or replace
 local build admission; the separate mutation workflow still requires a
 deliberate assertion failure.
+
+Do not loop a flaky test more than 10 times on the shared host. Use the stress
+workflow instead (the branch must contain `stress.yml`):
+
+```bash
+gh workflow run stress.yml -R favcrm/cadence --ref <branch> -f filter='test(=name)' \
+  -f features=test-seam -f count=30 -f copies=4 -f load=true -f stop_on_fail=false
+```
+
+Then watch the run and download `stress-failures-*`. `count` is 1-200, `copies`
+1-8, with a 120-minute cap per copy.
 
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
 and TMPDIR: Unix socket paths cannot exceed 107 bytes. Pass through the real
@@ -197,6 +209,12 @@ an isolated case uses `scripts/cadence-nextest --features test-seam --test <TARG
 These retain pinned checksums, zero retries, non-empty selections and JUnit
 evidence. Judge check exit codes through `rtk proxy`, not filtered output.
 
+Editing `skills/cadence/SKILL.md` goes through review like any rule file.
+`src/skill.rs` embeds it; daemon startup and `cadence update` sync it to hosts and
+`cadence skill install` repairs a host. Verify the source, installed and embedded
+copies, since an older binary can overwrite a local edit. Agents reload it at a
+task boundary.
+
 Update the owning contract and examples with behavior changes. Check navigation
 with `python3 scripts/check-doc-links.py`; it uses Git's tracked inventory, so
 an ignored local document cannot satisfy a link. It checks paths, not external
@@ -209,7 +227,8 @@ head and PR, with a brief that points at the change and not at your conclusions.
 
 Delivery is the operator's act. You check readiness with
 `cadence --org <org> delivery check` and hand the PR over; you never approve,
-enqueue or run `gh pr merge`. The route, the Browser QA rule and the
+enqueue or run `gh pr merge`, except `gh pr merge <n> --disable-auto` before
+changing a queued head (AGENTS.md "Merging"). The route, the Browser QA rule and the
 auto-merge precaution before changing a queued head are in AGENTS.md "Review"
 and "Merging".
 

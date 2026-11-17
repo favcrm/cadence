@@ -68,9 +68,9 @@ mechanisms, in the order they apply:
   main-based PR, else the PR's base), so a PR can never classify itself under
   rules it edited. Missing, unreadable or malformed lists mean the strict floor:
   two reviews and the operator's approval, no Browser QA. On a hosted org that
-  holds for a repository with no lists too: the gate does not tell "absent" from
-  "unreadable", so the engine's no-lists product default
-  (`classify_without_lists`) is not wired there. The one exception is
+  holds for a repository with no lists too. The engine's no-lists product default
+  (`classify_without_lists`) is applied by neither the hosted gate nor the
+  native evaluator. The one exception is
   the daemon's `--delegated` approval check (`docs/AUDIT.md`), which uses the
   copy compiled into the binary; a test pins that copy to
   `docs/roles/risk-classes.md`.
@@ -169,7 +169,8 @@ separate passes where two are required, each by its own fresh session. Gate,
 security, schema and release PRs keep fresh-session Opus reviews; the workflow
 rows below are a cheap first pass on them. The gate cannot prove freshness when
 the author and the reviewer act under one login, so the standard is ours to keep
-and the operator's approval is the accountability.
+and the operator's approval is the accountability. The standard changes no
+approval rule for send, publish, spend or deploy.
 
 **The hosted route** is this repository's supported delivery route.
 
@@ -186,8 +187,11 @@ and the operator's approval is the accountability.
    `docs/roles/workflow-auto-paths.toml` (Markdown under `docs/**` only, read at
    main's live tip) as a plain add or modify, is on no human-class path, has both
    reviews passing and fits the size limit. The gate's dry run reports that as
-   `class: auto`; being on the list is not enough. The exact checks are in
-   delivery.md.
+   `class: auto`; being on the list is not enough. In practice every hosted PR
+   needs both workflow passes: a non-routine PR needs standards and
+   spec-security from distinct principals (a combined review fills both; one
+   qualifying one-review PR needs one), and a routine PR needs both too. Field
+   shapes are in delivery.md; what a row proves is below.
 3. **Browser QA for `ui/**`.** A fresh QA session at desktop and narrow widths
    reports to the dispatcher. The dispatcher posts the full report, then, only on
    a pass, a separate unedited PR comment of exactly `Browser QA: pass` and
@@ -216,6 +220,17 @@ and the operator's approval is the accountability.
    `delivery-gate` check holds a PR without the hosted signature, so a direct
    `gh pr merge` never lands.
 6. **Agents never approve and never enqueue.** They check, report and hand off.
+
+**What a workflow row proves.** The gate also requires the workflow file at the
+row's `workflow_sha` to be byte-identical to main's tip; a re-run keeps the
+original commit's workflow for up to 30 days, and the check covers the workflow
+file, not the actions it calls. A row proves a fresh GitHub-hosted job ran main's
+workflow code for a live head, not good judgement. The tenant stops re-filing,
+not re-rolling: cancel and re-dispatch, or push a commit, for a new verdict. An
+owner-attested row naming a listed workflow principal counts for nothing, and a
+non-pass workflow row refuses in every class. There is no Browser QA workflow.
+A session holding admin can still rewrite a workflow or sign directly until
+agents lose admin.
 
 **Native only.** `scripts/enqueue-reviewed <n> --head <sha> --dry-run`
 evaluates the native path and reports the class and refusals. A native enqueue
@@ -287,6 +302,8 @@ and the section must say the same thing. Link the note from the ticket.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
+- Memory writes: `src/memory/policy.rs::qualify` enforces nature, provenance and
+  approval; mechanical promotion stays blocked until native check evidence exists.
 - A change that touches a daemon-enforced rule (gate, lease, lock, fence,
   operator-only action, exactly-once) or a risk-class trigger 1-3, or trigger 7
   when it changes a gate or who approves what, carries a short design note in
@@ -355,6 +372,8 @@ operator; do not reopen it in plans or reviews.
   hand-made worktree does not: its push runs no gate, so run
   `scripts/boat-build --receipt -- scripts/pre-push --base origin/main` yourself
   and say so. Do not report a gate result you did not run.
+- First login on a fresh machine: `docs/REMOTE-AUTH.md`, "First login on a fresh
+  machine".
 - A local connected agent has its own native daemon; hosted board access does
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
@@ -413,8 +432,8 @@ substitute a comment or another identity for the required proof.
   accepts it for every in-scope PR of that ticket. Traps: the ticket body must
   declare its triggers (`Risk: human (4, 7)`); editing the body voids the
   approval (the digest changes); a ticket outside ready, doing or review gets no
-  scope approval; a diff touching a trigger 1 or 3 path always needs the
-  per-head approval; and every counted verdict must carry `Scope: in-scope <ID>`.
+  scope approval; a diff touching a trigger 1 or 3 path, a one-review-excluded
+  path or an operator-only path always needs the per-head approval; and every counted verdict must carry `Scope: in-scope <ID>`.
   `cadence audit revoke <id>` withdraws it.
 - `POST /api/approvals/:id/revoke` ("Stop merge") and
   `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
@@ -467,7 +486,10 @@ are in `docs/DEV-CYCLE.md`; the rules are these.
   an SSH push whose hook runs for minutes (rc=141); the hook accepts a
   `tree=clean` rc=0 receipt for that exact head on a clean tree and returns at
   once. A failure, a dirty-recorded pass, a new commit or an edited tree runs
-  the plan again. If a push dies with rc=141, retry it once.
+  the plan again. If a push dies with rc=141, retry it once. A push that skips
+  the hook still goes through, and the missing receipt is the signal, so never
+  skip it. The main checkout has no hook, and the push never compiles on the
+  host.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`, for example `scripts/boat-build -- cargo test
   --locked --features test-seam --test daemon <FILTER> -- --test-threads 1`. The
@@ -488,7 +510,7 @@ are in `docs/DEV-CYCLE.md`; the rules are these.
   "daemon not reachable" while the host is loaded, rerun that test alone
   before treating the failure as real.
 
-### Pi agents and models
+### Pi agents and models (CAD-559, CAD-855)
 
 Cadence's setting is the source of truth; this file names no model.
 
@@ -526,7 +548,7 @@ Cadence's setting is the source of truth; this file names no model.
   authorize its own review.
 - Cursor through Pi stays blocked: `src/pi_policy.rs::require_safe_transport`
   rejects the unsafe argv prompt transport, and no allowlist entry or doc
-  overrides that refusal. Cursor models live on the native cursor provider in
+  overrides that refusal. Do not remove or bypass the guard. Cursor models live on the native cursor provider in
   Settings > Agents; that adapter is a different route, not a silent substitute
   for a Pi request.
 - Provider mechanics (the pinned extension, the content digest, the local `ide`
@@ -558,8 +580,16 @@ Cadence's setting is the source of truth; this file names no model.
 
   If `--check` shows `available` older than `current`, or a `blocked:` line
   naming an older build or unproven ancestry, report it and stop: the
-  approved candidate is stale. Use `--to <full main sha>` on both lines only
-  when the operator asks to pin a commit. Never relay
+  approved candidate is stale. Published means `promotion-completion`, its
+  `publish-release` job included, succeeded; before that `--check` offers the
+  previous build and a pinned `--to` refuses with `release detail (not_found)`.
+  If `available` is not the build you promoted, report it and stop. Use
+  `--to <full main sha>` on both lines only when the operator asks to pin a
+  commit; it skips the candidate receipt and runs the `upgrade --sha` checks.
+  `cadence update` syncs the bundled guidance (`--check` does not);
+  `cadence skill install` is the manual repair, and running sessions do not
+  reload guidance. Dev work uses `cadence dev up|reload|down` on a disposable
+  instance, never production. Never relay
   `rollout claim|backup|handoff|grant` or `upgrade` recipes; those are
   recovery internals (`docs/CLI.md`). If `--check` refuses, report the
   refusal text and stop.
@@ -583,6 +613,11 @@ artifact.
 - Reuse the recorded tailnet mapping; creating, removing or changing one
   needs an explicit delegation for that exact port and target. Never alter
   unrelated mappings, the tailnet configuration or operator-user settings.
+- The refresh command is `cadence --state-dir <staging> staging refresh --as
+  delegate:<you> --to <sha>`: it claims the rollout lease and restarts the daemon
+  and board (`--no-ui` skips the board). It is admitted only by a live
+  `staging_grants` row for that operation and directory and a matching
+  `CADENCE_ALIAS`. Runbook: `docs/design/staging-delegation.md`.
 - Before a refresh, verify instance identity, process and port ownership,
   artifact hashes and current mappings; retain data backups and a pinned
   rollback build, then validate the served build and behaviour afterwards.
@@ -594,6 +629,11 @@ artifact.
 - Production paths, port 3010, the installed binary, live customer
   runtimes and production rollout stay outside this exception. Standard
   source reviews, tests and audit requirements still apply.
+
+### Fenced workers
+
+Agents, PMs included, cannot run `agent unfence` or `message reconcile`. A PM
+escalates a fenced worker to the operator with the evidence.
 
 ### Shared scratch space
 

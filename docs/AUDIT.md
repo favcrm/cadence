@@ -76,22 +76,24 @@ session with no inherited context, including a subagent. These verbs do not
 enforce it. The gate counts hosted verdicts by attested principal and refuses the
 author's principal, while local notes count by their self-declared `From:` alias,
 which is not attested. The review workflows and why agents file no hosted verdict
-are described in AGENTS.md "Review". Local `v1` and `exception v1` signing in
+are described in AGENTS.md "Review" and what a workflow row proves in
+AGENTS.md "What a workflow row proves". Local `v1` and `exception v1` signing in
 `scripts/delivery-gate` is retired; `delivery-gate sign` refuses it.
 
 Workflow row shape: a hosted row with `identity_source: "workflow-oidc"` has no
 `github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and
 `base_sha`, all strings. The tenant writes it (`projectVerdictEntry`) and
 `verdict_entry` in `src/delivery/hosted_gate.rs` is the one reader. What the gate
-counts, and what that does and does not prove, is in AGENTS.md "Review".
+counts is in AGENTS.md "Review"; what a workflow row proves and does not is
+in AGENTS.md "What a workflow row proves".
 
 The document says where it came from: `origin` is `local` for the
 note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`
 (the default repo is the cwd checkout's github.com origin), sends both, and
 refuses an answer naming another project or repository; each hosted entry
-carries `repo`, `reviewer_id` and `github_login`, except a workflow-issued row
-(a workflow row), which has no `github_login`. A local read refuses
+carries `repo`, `reviewer_id` and `github_login`, except a workflow-issued row,
+which has no `github_login`. A local read refuses
 `--repo` and `--project`, because notes are neither repo- nor project-scoped.
 The binding itself is the workspace owner's record — the GitHub login once for
 the workspace, and the project's review set as principals:
@@ -288,7 +290,7 @@ no `--id` the daemon counts the default up (`<base>-2`, …), so
 `approve → revoke → approve` records a fresh approval.
 
 **Who may record.** Only an operator connection, by exactly the rule
-`slot_reconcile` applies . The daemon derives the
+`slot_reconcile` applies. The daemon derives the
 caller from the socket's `SO_PEERCRED` pid and its `/proc` ancestry: a
 caller that descends from a registered pane or an enrolled managed
 endpoint is an agent and is refused, and so is one that is not
@@ -298,14 +300,13 @@ and no `CADENCE_ALIAS`, no pane's pty on its stdio, and a session
 leader on its own ancestry). Identity-shaped request fields (`by`,
 `operator`, `actor`, `alias`, `lane`, `pid`, `pane`, `recorded_via`)
 are refused rather than read. Worker output, worker messages and queue
-messages are never authority. Accepted residual, inherited from
-A same-uid process that leaves every agent's ancestry without
+messages are never authority. Accepted residual: a same-uid process that leaves every agent's ancestry without
 orphaning its session (`setsid -f`) and scrubs its env and stdio still
 passes.
 
 On the default store, daemon operator verbs, rollout verbs and the board's
 peer proof also refuse a caller with a known coding-agent runtime variable on
-its ancestry This is a guardrail against accidents, not a boundary:
+its ancestry. This is a guardrail against accidents, not a boundary:
 an agent that scrubs its environment and leaves the marked ancestry (`setsid -f
 env -i`), or starts through `systemd-run`, cron or `ssh localhost`, still passes.
 Other stores are not covered. The check compares the store with the default in

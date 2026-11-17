@@ -1,6 +1,6 @@
 # Merge risk classes
 
-The aim: routine PRs merge without a human, and only substantial changes wait for the operator. `cadence delivery requirements` computes what a PR needs; the review and delivery route is AGENTS.md "Review".
+The aim: routine PRs need the least evidence, and only substantial changes wait for the operator's approval. On a hosted org the operator always runs the enqueue. `cadence delivery requirements` computes what a PR needs; the review and delivery route is AGENTS.md "Review".
 
 ## Class `human` — the operator approves (any ONE trigger is enough)
 When unsure whether a trigger applies, `human`. A reviewer names the triggers it finds in `Risk: human (<n>, …)`, and any `Risk:` that is not `auto` forces the operator. The shared evaluator also enforces the path and size triggers mechanically: paths in the `operator` table and triggers 2, 4, 6 and 7, and a diff over 1500 changed lines, force the operator. Triggers 1 and 3 force the strict class (two separate reviews) and add no operator floor of their own.

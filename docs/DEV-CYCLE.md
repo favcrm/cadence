@@ -41,8 +41,9 @@ order of work and the mechanics.
    only while it is ready, doing or review, and its body declares its risk
    triggers on exactly one `Risk:` line. It is bound to the ticket body, so
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
-   Scope approval is optional. A diff on a trigger 1 or 3 path, an uncovered
-   scope or an invalid binding requires the per-head approval; conversation text
+   Scope approval is optional. A diff on a trigger 1 or 3 path, a
+   one-review-excluded or operator-only path, an uncovered scope or an invalid
+   binding requires the per-head approval; conversation text
    is never approval evidence.
 7. Hand off: run `cadence --org <org> delivery check`, post the exact-head ticket
    evidence and give the operator the PR. The operator approves and enqueues;
