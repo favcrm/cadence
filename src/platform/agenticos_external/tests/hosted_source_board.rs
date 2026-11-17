@@ -345,7 +345,11 @@ fn text_door(method: &str, url: &str, body: &Value) -> Reply {
     match (method, url) {
         ("GET", "/v1/runtime/tools/generate_text") => json_response(
             200,
-            json!({"ok":true,"data":{"slug":"generate_text","displayName":"Generate text","effect":"draft","chargePrecondition":"max_charge_minor@1","price":price,"unitPrice":null}}),
+            json!({"ok":true,"data":{"slug":"generate_text","displayName":"Generate text","effect":"draft","chargePrecondition":"quote@2","defaultModel":"synthetic/new-text","price":price,"unitPrice":null}}),
+        ),
+        ("POST", "/v1/runtime/tools/generate_text/quote") => json_response(
+            200,
+            json!({"ok":true,"data":{"quoteVersion":"text-model-quote@1","chargeProtocol":"quote@2","model":"synthetic/new-text","publishedVersion":1,"basis":"fixed_call","currency":"USD","scale":6,"maxChargeMinor":2100}}),
         ),
         ("POST", CALL_PATH) if body["slug"] == "generate_text" => {
             TEXT_CALLS.lock().unwrap().push(body.clone());
@@ -471,6 +475,10 @@ fn cad1302_caption_through_a_slot_named_writer_reaches_the_lease_door() {
     let calls = TEXT_CALLS.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0]["slug"], "generate_text");
+    assert_eq!(calls[0]["body"]["model"], "synthetic/new-text");
+    assert_eq!(calls[0]["max_charge_minor"], 2100);
+    assert_eq!(calls[0]["text_quote"]["model"], "synthetic/new-text");
+    assert_eq!(calls[0]["charge_protocol"], "quote@2");
 }
 
 // ---------------------------------------------------------------------------

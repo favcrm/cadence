@@ -63,6 +63,53 @@ pub(crate) fn operator_price_refusal(message: &str) -> Option<&str> {
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }
 
+fn require_frozen_model_quote(
+    run: &Value,
+    slot: &str,
+    quote: &crate::platform::AppCapabilityQuote,
+    input: &Value,
+) -> Result<()> {
+    let binding = &run["snapshot"]["capabilities"][slot]["config"];
+    let provider = binding["provider"].as_str();
+    let capability = binding["mapping"]["capability"].as_str();
+    let text = provider == Some(crate::platform::agenticos_external::PLATFORM)
+        && capability == Some("text.generate");
+    let image = matches!(
+        provider,
+        Some(
+            crate::platform::agenticos_external::PLATFORM
+                | crate::platform::account_media::PLATFORM
+        )
+    ) && capability == Some("media.generate");
+    if !text && !image {
+        return Ok(());
+    }
+    let saved = &run["snapshot"]["quotes"][slot];
+    if !saved.is_object() {
+        return Err(Error::rejected("the approved model quote is unavailable"));
+    }
+    if text {
+        if input.get("model").is_none() && saved["model"].as_str() != quote.model.as_deref() {
+            return Err(Error::rejected(
+                "the text model changed since approval; request a new quote",
+            ));
+        }
+        return Ok(());
+    }
+    let approved =
+        crate::platform::agenticos_external::quote_image_model(saved).map_err(Error::rejected)?;
+    let current = crate::platform::agenticos_external::typed_image_quote_model(quote)
+        .map_err(Error::rejected)?;
+    if approved != current
+        || saved["price_revision"].as_str() != Some(quote.price_revision.as_str())
+    {
+        return Err(Error::rejected(
+            "the image model or price changed since approval; request a new quote",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -316,6 +363,7 @@ impl Shared {
             if proof.config["provider"] != crate::platform::account_media::PLATFORM {
                 return Err(Error::rejected("account capability source changed"));
             }
+            require_frozen_model_quote(&run, slot, quote, input)?;
             self.recheck_app_capability_quote(&proof, quote)?;
             Ok((step, proof))
         };
@@ -847,6 +895,7 @@ impl Shared {
                             "run snapshot digest changed since run approval",
                         ));
                     }
+                    require_frozen_model_quote(&run, &slot, &quote, input)?;
                     self.recheck_app_capability_quote(&proof, &quote)?;
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;

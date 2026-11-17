@@ -22,7 +22,8 @@ use crate::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
 use crate::platform::{
-    AppCapabilityAsset, AppCapabilityError, AppCapabilityOutput, AppCapabilityQuote,
+    valid_pricing_revision, AppCapabilityAsset, AppCapabilityError, AppCapabilityOutput,
+    AppCapabilityQuote,
 };
 use crate::platform::{ImageFailure, ImageReason};
 use image::{fit_to_custody, image_checked, image_prompt, ImageFault, ASSET_LIMIT, FETCH_LIMIT};
@@ -37,13 +38,72 @@ const POSTS_TOOL: &str = "read_instagram_posts";
 const POSTS_COUNT: u32 = 12;
 const IMAGE_TOOL: &str = "generate_image";
 const TEXT_TOOL: &str = "generate_text";
-/// The only model the image slot may run; the price read and every job must
-/// echo it back.
-const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
-/// The reviewed image model a native price card may name. It is the same
-/// constant the price read and every submit must echo.
-pub(crate) fn reviewed_image_model() -> &'static str {
-    IMAGE_MODEL
+/// Historical in-flight quotes predate explicit model binding.
+const LEGACY_IMAGE_MODEL: &str = "openai/gpt-image-2.5";
+
+fn valid_model_id(model: &str) -> bool {
+    if !(3..=120).contains(&model.len()) {
+        return false;
+    }
+    let Some((provider, name)) = model.split_once('/') else {
+        return false;
+    };
+    [provider, name].iter().all(|part| {
+        !part.is_empty()
+            && part.len() <= 100
+            && part.as_bytes()[0].is_ascii_alphanumeric()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    })
+}
+
+/// Old retained quotes had no model field and always used the legacy model.
+pub(crate) fn quote_image_model(quote: &Value) -> std::result::Result<&str, String> {
+    match quote.get("model") {
+        Some(Value::String(model)) if valid_model_id(model) => Ok(model),
+        None | Some(Value::Null) if quote["charge_protocol"].is_null() => Ok(LEGACY_IMAGE_MODEL),
+        _ => Err("the frozen image model is unavailable".into()),
+    }
+}
+
+pub(crate) fn typed_image_quote_model(
+    quote: &AppCapabilityQuote,
+) -> std::result::Result<&str, String> {
+    match (quote.model.as_deref(), quote.charge_protocol.as_deref()) {
+        (Some(model), _) if valid_model_id(model) => Ok(model),
+        (None, None) => Ok(LEGACY_IMAGE_MODEL),
+        _ => Err("the frozen image model is unavailable".into()),
+    }
+}
+
+fn valid_image_price_slug(slug: &str, reference_edit: bool) -> bool {
+    slug.len() <= 120
+        && (slug == IMAGE_TOOL || slug.starts_with("generate_image."))
+        && slug.ends_with(".image-to-image") == reference_edit
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn quote_image_price_slug<'a>(
+    quote: &'a Value,
+    model: &str,
+    reference_edit: bool,
+) -> std::result::Result<&'a str, String> {
+    match quote.get("price_slug") {
+        Some(Value::String(slug)) if valid_image_price_slug(slug, reference_edit) => Ok(slug),
+        None | Some(Value::Null)
+            if model == LEGACY_IMAGE_MODEL && quote["charge_protocol"].is_null() =>
+        {
+            Ok(if reference_edit {
+                "generate_image.image-to-image"
+            } else {
+                IMAGE_TOOL
+            })
+        }
+        _ => Err("the frozen image price variant is unavailable".into()),
+    }
 }
 const CALL_PATH: &str = "/v1/runtime/tools/call";
 const MEDIA_PRICE_PATH: &str = "/v1/runtime/media/price/image";
@@ -51,6 +111,8 @@ const MEDIA_SUBMIT_PATH: &str = "/v1/runtime/media/image";
 const MEDIA_JOBS_PATH: &str = "/v1/runtime/media/jobs/";
 const MEDIA_ARTIFACTS_PATH: &str = "/v1/runtime/media/artifacts/";
 const RESPONSE_CAP: u64 = 1024 * 1024;
+/// Largest integer transported without loss by the AgenticOS JSON API.
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 /// Media job/price envelopes stay JSON-small.
 const MEDIA_BODY_CAP: u64 = 64 * 1024;
 /// The AgenticOS job read's own poll floor.
@@ -345,7 +407,7 @@ impl AgenticosExternalAdapter {
         &self,
         credential: &[u8],
         binding: &Value,
-    ) -> std::result::Result<(u64, String), String> {
+    ) -> std::result::Result<(u64, String, Option<String>, Option<String>), String> {
         let config = &binding["config"];
         let mapping = &config["mapping"];
         if config["provider"] != PLATFORM
@@ -430,7 +492,7 @@ impl AgenticosExternalAdapter {
             ));
         }
         let url = format!("{}{CALL_PATH}", self.base);
-        let ceiling = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let ceiling = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
         let mut response = authorized(self.http.post(&url), token)
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
@@ -491,15 +553,14 @@ impl AgenticosExternalAdapter {
                 "AgenticOS source tool identity changed; the outcome is uncertain".into(),
             ));
         }
-        let charged = money_micros(&data["price"]).ok_or_else(|| {
+        money_micros(&data["price"]).ok_or_else(|| {
             AppCapabilityError::Uncertain(
                 "AgenticOS settled source receipt has an invalid charge".into(),
             )
         })?;
-        if charged > ceiling || !data["repeated"].is_boolean() {
+        if !data["repeated"].is_boolean() {
             return Err(AppCapabilityError::Uncertain(
-                "AgenticOS settled source receipt exceeds the approved charge or is malformed"
-                    .into(),
+                "AgenticOS settled source receipt is malformed".into(),
             ));
         }
         let upstream = data.get("result").ok_or_else(|| {
@@ -606,7 +667,7 @@ impl AgenticosExternalAdapter {
         }
         let charge = price["chargeMinor"]
             .as_u64()
-            .filter(|value| (1..=1_000_000_000).contains(value));
+            .filter(|value| *value > 0 && *value <= MAX_SAFE_JSON_INTEGER);
         let version = price["version"]
             .as_str()
             .filter(|version| !version.is_empty() && version.len() <= 40);
@@ -618,19 +679,44 @@ impl AgenticosExternalAdapter {
                 )
             }
         };
-        let expected_slug = if reference_edit {
-            "generate_image.image-to-image"
-        } else {
-            IMAGE_TOOL
+        let model = data["model"]
+            .as_str()
+            .filter(|model| valid_model_id(model))
+            .ok_or("AgenticOS image quote has an invalid model")?;
+        let slug = price["slug"]
+            .as_str()
+            .filter(|slug| valid_image_price_slug(slug, reference_edit))
+            .ok_or("AgenticOS image quote has an invalid price variant")?;
+        let protocol = match data.get("chargeProtocol") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if value == "quote@2" => Some(value.clone()),
+            _ => return Err("AgenticOS image quote protocol is unavailable".into()),
         };
-        if data["kind"] != "image"
-            || data["model"] != IMAGE_MODEL
-            || price["slug"] != expected_slug
-            || price["currency"] != "USD"
-        {
+        let pricing_revision = match (protocol.as_deref(), data.get("pricingRevision")) {
+            (Some("quote@2"), Some(Value::String(value))) if valid_pricing_revision(value) => {
+                Some(value.clone())
+            }
+            (None, None | Some(Value::Null)) => None,
+            _ => return Err("AgenticOS image quote has no valid pricing revision".into()),
+        };
+        if data["kind"] != "image" || price["currency"] != "USD" {
             return Err("AgenticOS media price view drifted from the reviewed image tool".into());
         }
-        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":expected_slug,"chargeMinor":charge,"currency":"USD","version":version}});
+        let mut canonical = json!({"kind":"image","model":model,"price":{"slug":slug,"chargeMinor":charge,"currency":"USD","version":version}});
+        if let Some(protocol) = protocol.as_deref() {
+            canonical["chargeProtocol"] = json!(protocol);
+        }
+        if let Some(revision) = pricing_revision.as_deref() {
+            canonical["pricingRevision"] = json!(revision);
+        }
+        let legacy = protocol.is_none()
+            && model == LEGACY_IMAGE_MODEL
+            && slug
+                == if reference_edit {
+                    "generate_image.image-to-image"
+                } else {
+                    IMAGE_TOOL
+                };
         let bytes = serde_json::to_vec(&canonical)
             .map_err(|_| "AgenticOS media price view cannot be serialized")?;
         Ok(AppCapabilityQuote {
@@ -647,6 +733,10 @@ impl AgenticosExternalAdapter {
                 ),
                 None => format!("media:sha256:{:x}", Sha256::digest(&bytes)),
             },
+            model: (!legacy).then(|| model.to_owned()),
+            price_slug: (!legacy).then(|| slug.to_owned()),
+            pricing_revision,
+            charge_protocol: protocol,
         })
     }
 
@@ -669,7 +759,7 @@ impl AgenticosExternalAdapter {
             return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
         }
         validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
-        let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
+        let mut body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
             .map_err(AppCapabilityError::Refused)?;
@@ -678,10 +768,63 @@ impl AgenticosExternalAdapter {
                 "provider idempotency key is invalid".into(),
             ));
         }
-        let ceiling = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let mut quote = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
+        let mut exact_quote = None;
+        if authority["quote"]["charge_protocol"] == "quote@2" {
+            let model = authority["quote"]["model"]
+                .as_str()
+                .filter(|model| valid_model_id(model))
+                .ok_or_else(|| {
+                    AppCapabilityError::Refused("the approved text model is unavailable".into())
+                })?;
+            if body.get("model").is_none() {
+                body["model"] = json!(model);
+            }
+            let mut response = authorized(
+                self.http.post(format!(
+                    "{}/v1/runtime/tools/generate_text/quote",
+                    self.base
+                )),
+                token,
+            )
+            .send_json(&body)
+            .map_err(|_| {
+                AppCapabilityError::Refused("AgenticOS text quote is unavailable".into())
+            })?;
+            let status = response.status().as_u16();
+            let bytes = response
+                .body_mut()
+                .with_config()
+                .limit(64 * 1024)
+                .read_to_vec()
+                .map_err(|_| {
+                    AppCapabilityError::Refused("AgenticOS text quote is unavailable".into())
+                })?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                AppCapabilityError::Refused("AgenticOS text quote is malformed".into())
+            })?;
+            if status != 200 || envelope["ok"] != true {
+                return Err(AppCapabilityError::Refused(format!(
+                    "AgenticOS text quote refused: {}",
+                    refused_code(&envelope)
+                )));
+            }
+            let selected = &envelope["data"];
+            let (amount, model) =
+                checked_text_quote(selected, body.get("model").and_then(Value::as_str))
+                    .map_err(AppCapabilityError::Refused)?;
+            quote = amount;
+            body["model"] = json!(model);
+            exact_quote = Some(selected.clone());
+        }
+        let mut request = json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":quote});
+        if let Some(selected) = exact_quote {
+            request["charge_protocol"] = json!("quote@2");
+            request["text_quote"] = selected;
+        }
         let mut response = authorized(self.http.post(format!("{}{CALL_PATH}", self.base)), token)
             .header("idempotency-key", idempotency_key)
-            .send_json(json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":ceiling}))
+            .send_json(request)
             .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
         let status = response.status().as_u16();
         let bytes = response
@@ -777,9 +920,10 @@ impl AgenticosExternalAdapter {
             },
             Err(detail) => return Err(ImageFailure::refused(R::PlanInvalid, detail)),
         };
-        // The frozen approval maximum uses the same micro-USD units as
-        // AgenticOS chargeMinor; submit it for enforcement before reservation.
-        let quoted = frozen_charge_ceiling(authority)
+        // The frozen quote identifies the selected model and wire protocol.
+        let quoted = frozen_charge_quote(authority)
+            .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
+        let model = quote_image_model(&authority["quote"])
             .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
@@ -804,7 +948,23 @@ impl AgenticosExternalAdapter {
                 "reference edit has no verified artifact reference",
             ));
         }
-        let mut submit_input = json!({"model":IMAGE_MODEL,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted});
+        let price_slug = quote_image_price_slug(&authority["quote"], model, reference.is_some())
+            .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
+        let mut submit_input =
+            json!({"model":model,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted});
+        if authority["quote"]["charge_protocol"] == "quote@2" {
+            let revision = authority["quote"]["pricing_revision"]
+                .as_str()
+                .filter(|revision| valid_pricing_revision(revision))
+                .ok_or_else(|| {
+                    ImageFailure::refused(
+                        R::PlanInvalid,
+                        "the image pricing revision is unavailable",
+                    )
+                })?;
+            submit_input["quote_revision"] = json!(revision);
+            submit_input["charge_protocol"] = json!("quote@2");
+        }
         if let Some(reference) = &reference {
             submit_input["references"] = json!([reference]);
         }
@@ -881,7 +1041,7 @@ impl AgenticosExternalAdapter {
             _ => return Err(uncertain_submit()),
         }
         let mut job = envelope["data"]["job"].clone();
-        checked_media_job(&job, None, reference.is_some())
+        checked_media_job(&job, None, model, price_slug)
             .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         let deadline = Instant::now() + self.poll_deadline();
         loop {
@@ -940,7 +1100,7 @@ impl AgenticosExternalAdapter {
                 ));
             }
             job = envelope["data"]["job"].clone();
-            checked_media_job(&job, Some(&id), reference.is_some())
+            checked_media_job(&job, Some(&id), model, price_slug)
                 .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         }
         let id = job["id"].as_str().unwrap_or_default().to_owned();
@@ -1011,7 +1171,7 @@ impl AgenticosExternalAdapter {
             "schema":1,"kind":"media.generated.image","provider":self.image_provider(),
             "source_receipt_id":authority["source"]["receipt_id"],
             "source_post_id":authority["source"]["post"]["id"],
-            "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
+            "model":model,"aspect_ratio":"1:1","n":1,
             "job_id":id,
             "charge":{"currency":"USD","scale":6,"amount":format!("{}.{:06}", charge_minor / 1_000_000, charge_minor % 1_000_000)},
             "price_version":job["price"]["version"],
@@ -1332,7 +1492,8 @@ fn library_reference_prompt(authority: &Value) -> std::result::Result<Option<Str
 fn checked_media_job(
     job: &Value,
     expected_id: Option<&str>,
-    reference_edit: bool,
+    expected_model: &str,
+    expected_price_slug: &str,
 ) -> std::result::Result<(), String> {
     let id = job["id"]
         .as_str()
@@ -1340,16 +1501,11 @@ fn checked_media_job(
     if !valid_media_job_id(id) || expected_id.is_some_and(|expected| expected != id) {
         return Err("AgenticOS media job identity is invalid".into());
     }
-    if job["kind"] != "image" || job["model"] != IMAGE_MODEL {
+    if job["kind"] != "image" || job["model"] != expected_model {
         return Err("AgenticOS media job drifted from the reviewed image tool".into());
     }
     let price = &job["price"];
-    let expected_slug = if reference_edit {
-        "generate_image.image-to-image"
-    } else {
-        IMAGE_TOOL
-    };
-    if price["slug"] != expected_slug
+    if price["slug"] != expected_price_slug
         || price["currency"] != "USD"
         || !price["chargeMinor"].is_u64()
         || price["version"]
@@ -1371,7 +1527,7 @@ fn money_micros(value: &Value) -> Option<u64> {
     let amount = value["amount"].as_str()?;
     let (whole, fractional) = amount.split_once('.')?;
     if whole.is_empty()
-        || whole.len() > 6
+        || whole.len() > 10
         || fractional.len() != 6
         || !whole
             .bytes()
@@ -1380,11 +1536,40 @@ fn money_micros(value: &Value) -> Option<u64> {
     {
         return None;
     }
-    whole
+    let micros = whole
         .parse::<u64>()
         .ok()?
         .checked_mul(1_000_000)?
-        .checked_add(fractional.parse::<u64>().ok()?)
+        .checked_add(fractional.parse::<u64>().ok()?)?;
+    (micros <= MAX_SAFE_JSON_INTEGER).then_some(micros)
+}
+
+fn checked_text_quote<'a>(
+    quote: &'a Value,
+    requested_model: Option<&str>,
+) -> std::result::Result<(u64, &'a str), String> {
+    let model = quote["model"]
+        .as_str()
+        .filter(|model| valid_model_id(model))
+        .ok_or("AgenticOS text quote has an invalid model")?;
+    let amount = quote["maxChargeMinor"]
+        .as_u64()
+        .filter(|amount| *amount > 0 && *amount <= MAX_SAFE_JSON_INTEGER)
+        .ok_or("AgenticOS text quote has an invalid amount")?;
+    if quote["quoteVersion"] != "text-model-quote@1"
+        || quote["chargeProtocol"] != "quote@2"
+        || quote["currency"] != "USD"
+        || quote["scale"] != 6
+        || !matches!(
+            quote["basis"].as_str(),
+            Some("fixed_call" | "metered_actual")
+        )
+        || (!quote["publishedVersion"].is_null() && quote["publishedVersion"].as_u64().is_none())
+        || requested_model.is_some_and(|requested| requested != model)
+    {
+        return Err("AgenticOS text quote is malformed or changed model".into());
+    }
+    Ok((amount, model))
 }
 
 fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
@@ -1397,13 +1582,11 @@ fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
     {
         return Err("text generation input has unsupported fields".into());
     }
-    let model = fields
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("z-ai/glm-5.3-flash");
-    if model != "z-ai/glm-5.3-flash" {
-        return Err("text generation model is not reviewed".into());
-    }
+    let model = match fields.get("model") {
+        None => None,
+        Some(Value::String(model)) if valid_model_id(model) => Some(model),
+        _ => return Err("text generation model is malformed".into()),
+    };
     let messages = fields
         .get("messages")
         .and_then(Value::as_array)
@@ -1442,7 +1625,11 @@ fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
     if !(1..=8192).contains(&tokens) {
         return Err("text generation output token limit is invalid".into());
     }
-    Ok(json!({"model":model,"messages":clean,"maxOutputTokens":tokens}))
+    let mut request = json!({"messages":clean,"maxOutputTokens":tokens});
+    if let Some(model) = model {
+        request["model"] = json!(model);
+    }
+    Ok(request)
 }
 
 fn validate_text_result(result: &Value) -> std::result::Result<Value, String> {
@@ -1497,16 +1684,26 @@ fn quote_view(
     tool: &str,
     effect: &str,
     view: &Value,
-) -> std::result::Result<(u64, String), String> {
-    // Older deployments accepted a paid POST without enforcing an approved
-    // ceiling. Never quote or call them, even if trusted metadata pins their
-    // tool manifest.
-    if view["chargePrecondition"] != "max_charge_minor@1" {
-        return Err("AgenticOS provider does not enforce the approved charge ceiling".into());
-    }
+) -> std::result::Result<(u64, String, Option<String>, Option<String>), String> {
+    let protocol = match view["chargePrecondition"].as_str() {
+        Some("max_charge_minor@1") => None,
+        Some("quote@2") => Some("quote@2".to_owned()),
+        _ => return Err("AgenticOS provider quote protocol is unavailable".into()),
+    };
     if view["slug"] != tool || view["effect"] != effect {
         return Err("AgenticOS provider quote changed tool or effect".into());
     }
+    let model = if tool == TEXT_TOOL && protocol.is_some() {
+        Some(
+            view["defaultModel"]
+                .as_str()
+                .filter(|model| valid_model_id(model))
+                .ok_or("AgenticOS text quote has no valid default model")?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let per_call = money_micros(&view["price"])
         .ok_or("AgenticOS provider quote has invalid per-call price")?;
     let per_unit = if view["unitPrice"].is_null() {
@@ -1517,27 +1714,34 @@ fn quote_view(
     };
     let total = per_call
         .checked_add(per_unit)
-        .filter(|value| (1..=1_000_000_000).contains(value))
-        .ok_or("AgenticOS provider quote exceeds the supported price bound")?;
-    let reviewed =
+        .filter(|value| *value > 0 && *value <= MAX_SAFE_JSON_INTEGER)
+        .ok_or("AgenticOS provider quote is not representable")?;
+    let mut reviewed =
         json!({"slug":tool,"effect":effect,"price":view["price"],"unitPrice":view["unitPrice"]});
+    if let Some(protocol) = protocol.as_deref() {
+        reviewed["chargeProtocol"] = json!(protocol);
+    }
+    if let Some(model) = model.as_deref() {
+        reviewed["defaultModel"] = json!(model);
+    }
     let bytes = serde_json::to_vec(&reviewed)
         .map_err(|_| "AgenticOS provider quote cannot be serialized")?;
     let revision = format!("sha256:{:x}", Sha256::digest(&bytes));
-    Ok((total, revision))
+    Ok((total, revision, protocol, model))
 }
 
-fn frozen_charge_ceiling(authority: &Value) -> std::result::Result<u64, String> {
+fn frozen_charge_quote(authority: &Value) -> std::result::Result<u64, String> {
     let quote = &authority["quote"];
     let amount = quote["total_price_micros"]
         .as_u64()
-        .filter(|value| (1..=1_000_000_000).contains(value))
-        .ok_or("run has no approved provider charge ceiling")?;
+        .filter(|value| *value > 0 && *value <= MAX_SAFE_JSON_INTEGER)
+        .ok_or("run has no representable provider quote")?;
     if quote["schema"] != 1
         || quote["currency"] != "USD"
         || quote["units"] != 1
         || quote["unit_price_micros"].as_u64() != Some(amount)
         || quote["price_revision"].as_str().is_none_or(str::is_empty)
+        || (!quote["charge_protocol"].is_null() && quote["charge_protocol"] != "quote@2")
     {
         return Err("run has an invalid frozen provider quote".into());
     }
@@ -1731,7 +1935,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         if binding["config"]["mapping"]["capability"] == "media.generate" {
             return self.quote_image(credential, binding);
         }
-        let (total, revision) = self.quote_fixed(credential, binding)?;
+        let (total, revision, charge_protocol, model) = self.quote_fixed(credential, binding)?;
         Ok(AppCapabilityQuote {
             schema: 1,
             currency: "USD".into(),
@@ -1739,6 +1943,10 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             units: 1,
             total_price_micros: total,
             price_revision: revision,
+            model,
+            price_slug: None,
+            pricing_revision: None,
+            charge_protocol,
         })
     }
 
@@ -2117,7 +2325,7 @@ mod tests {
     #[test]
     fn quote_uses_admin_price_for_one_fixed_unit_and_detects_changes() {
         let view = json!({"slug":POSTS_TOOL,"effect":"read","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"0.001880"},"unitPrice":{"currency":"USD","scale":6,"amount":"0.000120"}});
-        let (amount, revision) = quote_view(POSTS_TOOL, "read", &view).unwrap();
+        let (amount, revision, _, _) = quote_view(POSTS_TOOL, "read", &view).unwrap();
         assert_eq!(amount, 2_000);
         assert!(revision.starts_with("sha256:"));
         let mut changed = view.clone();
@@ -2135,8 +2343,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_over_ceiling_money_is_not_an_executable_quote() {
-        for amount in ["-1.000000", "1.0", "1e3", "1000000.000000", "0.000000"] {
+    fn malformed_or_unrepresentable_money_is_not_an_executable_quote() {
+        for amount in ["-1.000000", "1.0", "1e3", "9007199255.000000", "0.000000"] {
             let view = json!({"slug":POSTS_TOOL,"effect":"read","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":amount},"unitPrice":null});
             assert!(quote_view(POSTS_TOOL, "read", &view).is_err(), "{amount}");
         }
@@ -2155,16 +2363,51 @@ mod tests {
     }
 
     #[test]
+    fn informational_quote_accepts_large_amounts_and_binds_the_protocol() {
+        let legacy = json!({"slug":TEXT_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"1000000.000000"},"unitPrice":null});
+        let mut current = legacy.clone();
+        current["chargePrecondition"] = json!("quote@2");
+        current["defaultModel"] = json!("synthetic/new-text");
+        let (amount, revision, protocol, model) = quote_view(TEXT_TOOL, "draft", &current).unwrap();
+        assert_eq!(amount, 1_000_000_000_000);
+        assert_eq!(protocol.as_deref(), Some("quote@2"));
+        assert_eq!(model.as_deref(), Some("synthetic/new-text"));
+        assert_ne!(revision, quote_view(TEXT_TOOL, "draft", &legacy).unwrap().1);
+    }
+
+    #[test]
+    fn image_quote_binds_the_selected_model_and_price_variant() {
+        let legacy = media_quote();
+        assert_eq!(quote_image_model(&legacy).unwrap(), LEGACY_IMAGE_MODEL);
+        assert_eq!(
+            quote_image_price_slug(&legacy, LEGACY_IMAGE_MODEL, false).unwrap(),
+            IMAGE_TOOL
+        );
+        let mut selected = legacy;
+        selected["model"] = json!("synthetic/new-image");
+        selected["price_slug"] = json!("generate_image.synthetic.new-image");
+        selected["charge_protocol"] = json!("quote@2");
+        assert_eq!(quote_image_model(&selected).unwrap(), "synthetic/new-image");
+        assert_eq!(
+            quote_image_price_slug(&selected, "synthetic/new-image", false).unwrap(),
+            "generate_image.synthetic.new-image"
+        );
+        assert!(quote_image_price_slug(&selected, "synthetic/new-image", true).is_err());
+        selected["model"] = Value::Null;
+        assert!(quote_image_model(&selected).is_err());
+    }
+
+    #[test]
     fn paid_call_ceiling_must_be_the_frozen_one_unit_quote() {
         let mut proof = authority();
-        assert!(frozen_charge_ceiling(&proof).is_err());
+        assert!(frozen_charge_quote(&proof).is_err());
         proof["quote"] = json!({"schema":1,"currency":"USD","unit_price_micros":2000,"units":1,"total_price_micros":2000,"price_revision":"sha256:price"});
-        assert_eq!(frozen_charge_ceiling(&proof).unwrap(), 2000);
+        assert_eq!(frozen_charge_quote(&proof).unwrap(), 2000);
         proof["quote"]["total_price_micros"] = json!(3000);
-        assert!(frozen_charge_ceiling(&proof).is_err());
+        assert!(frozen_charge_quote(&proof).is_err());
         proof["quote"]["total_price_micros"] = json!(2000);
         proof["quote"]["units"] = json!(2);
-        assert!(frozen_charge_ceiling(&proof).is_err());
+        assert!(frozen_charge_quote(&proof).is_err());
     }
 
     #[test]
@@ -2479,7 +2722,7 @@ mod tests {
     }
 
     fn price_view(charge_minor: u64, version: &str) -> Value {
-        json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
+        json!({"ok":true,"data":{"kind":"image","model":LEGACY_IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
     }
 
     pub(super) fn job_view(
@@ -2489,7 +2732,7 @@ mod tests {
         repeated: bool,
         charge: u64,
     ) -> Value {
-        json!({"id":id,"kind":"image","status":status,"model":IMAGE_MODEL,"provider":"upstream-fixture",
+        json!({"id":id,"kind":"image","status":status,"model":LEGACY_IMAGE_MODEL,"provider":"upstream-fixture",
             "providerTaskId":null,"artifacts":artifacts,"artifactError":null,
             "usage":{"providerCredits":null},
             "price":{"slug":IMAGE_TOOL,"chargeMinor":charge,"currency":"USD","version":"2026-09-29T00:00:00.000Z"},
@@ -2568,6 +2811,56 @@ mod tests {
         for (worker, _adapter) in pending {
             worker.join().unwrap();
         }
+
+        // The upgraded door quotes the actual workload and preserves either
+        // the approved default or an explicit, server-reviewed selection.
+        let (base, seen, worker) = media_door(|request| match request.url.as_str() {
+            "/v1/runtime/tools/generate_text/quote" => json_response(
+                200,
+                json!({"ok":true,"data":{
+                    "quoteVersion":"text-model-quote@1","chargeProtocol":"quote@2",
+                    "model":request.body["model"],"publishedVersion":1,
+                    "basis":"fixed_call","currency":"USD","scale":6,"maxChargeMinor":2100
+                }}),
+            ),
+            CALL_PATH => {
+                assert_eq!(request.body["max_charge_minor"], 2100);
+                assert_eq!(request.body["charge_protocol"], "quote@2");
+                assert_eq!(
+                    request.body["body"]["model"],
+                    request.body["text_quote"]["model"]
+                );
+                json_response(
+                    200,
+                    json!({"ok":true,"data":{"result":{
+                        "text":"Synthetic caption","finishReason":"stop","usage":null
+                    }}}),
+                )
+            }
+            _ => panic!("unexpected text request {}", request.url),
+        });
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN)).unwrap();
+        let mut current = proof.clone();
+        current["quote"]["charge_protocol"] = json!("quote@2");
+        current["quote"]["model"] = json!("synthetic/default");
+        for (request, key) in [
+            (input.clone(), "app-call-default-1"),
+            (
+                json!({"model":"synthetic/selected","messages":[{"role":"user","content":"Draft a caption."}]}),
+                "app-call-explicit-1",
+            ),
+        ] {
+            let output = adapter
+                .execute_app_capability_outcome(b"token", &current, &request, key)
+                .unwrap();
+            assert_eq!(output.result["text"], "Synthetic caption");
+        }
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[1].body["body"]["model"], "synthetic/default");
+        assert_eq!(seen[3].body["body"]["model"], "synthetic/selected");
     }
 
     fn hosted_adapter() -> AgenticosExternalAdapter {
@@ -2796,7 +3089,12 @@ mod tests {
             assert_eq!(request.method, "GET");
             assert_eq!(request.url, MEDIA_PRICE_PATH);
             assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
-            json_response(200, price_view(31_500, "2026-09-29T00:00:00.000Z"))
+            let mut view = price_view(1_200_000_000, "2026-09-29T00:00:00.000Z");
+            view["data"]["model"] = json!("synthetic/new-image");
+            view["data"]["price"]["slug"] = json!("generate_image.synthetic.new-image");
+            view["data"]["chargeProtocol"] = json!("quote@2");
+            view["data"]["pricingRevision"] = json!(format!("sha256:{}", "a".repeat(64)));
+            json_response(200, view)
         });
         let adapter = image_adapter(&base);
         let quote = adapter
@@ -2804,9 +3102,19 @@ mod tests {
             .unwrap();
         assert_eq!(quote.schema, 1);
         assert_eq!(quote.currency, "USD");
-        assert_eq!(quote.unit_price_micros, 31_500);
+        assert_eq!(quote.unit_price_micros, 1_200_000_000);
         assert_eq!(quote.units, 1);
-        assert_eq!(quote.total_price_micros, 31_500);
+        assert_eq!(quote.total_price_micros, 1_200_000_000);
+        assert_eq!(quote.model.as_deref(), Some("synthetic/new-image"));
+        assert_eq!(
+            quote.price_slug.as_deref(),
+            Some("generate_image.synthetic.new-image")
+        );
+        assert_eq!(quote.charge_protocol.as_deref(), Some("quote@2"));
+        assert_eq!(
+            quote.pricing_revision.as_deref(),
+            Some(format!("sha256:{}", "a".repeat(64)).as_str())
+        );
         assert!(quote.price_revision.starts_with("media:sha256:"));
         worker.join().unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1);
@@ -2840,8 +3148,8 @@ mod tests {
                 "unpriced or disabled",
             ),
             (200, price_view(0, "v1"), "unpriced or disabled"),
-            (200, drifted_slug, "drifted"),
-            (200, drifted_model, "drifted"),
+            (200, drifted_slug, "invalid price variant"),
+            (200, drifted_model, "invalid model"),
         ] {
             let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
             let adapter = image_adapter(&base);
@@ -2900,33 +3208,50 @@ mod tests {
         let png = test_png();
         let artifact = artifact_entry("med_job1", &png);
         let artifact_bytes = png.clone();
-        let (base, seen, worker) = media_door(move |request| {
-            match (request.method.as_str(), request.url.as_str()) {
-                ("POST", "/v1/runtime/media/image") => {
-                    assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
-                    assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
-                    assert_eq!(request.body["model"], json!("openai/gpt-image-2.5"));
-                    assert_eq!(request.body["aspectRatio"], json!("1:1"));
-                    assert_eq!(request.body.as_object().unwrap().len(), 4);
-                    assert_eq!(request.body["max_charge_minor"], json!(31_500));
-                    assert!(request.body["prompt"]
-                        .as_str()
-                        .unwrap()
-                        .contains("JuicySuite CRM"));
-                    json_response(
-                        200,
-                        json!({"ok":true,"data":{"job":job_view("med_job1","succeeded",json!([artifact.clone()]),true,40_000)}}),
-                    )
-                }
-                ("GET", _) => artifact_response(&artifact_bytes),
-                _ => panic!(
-                    "unexpected media request {} {}",
-                    request.method, request.url
-                ),
-            }
-        });
+        let (base, seen, worker) =
+            media_door(
+                move |request| match (request.method.as_str(), request.url.as_str()) {
+                    ("POST", "/v1/runtime/media/image") => {
+                        assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
+                        assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
+                        assert_eq!(request.body["model"], json!("synthetic/new-image"));
+                        assert_eq!(request.body["aspectRatio"], json!("1:1"));
+                        assert_eq!(request.body.as_object().unwrap().len(), 6);
+                        assert_eq!(request.body["max_charge_minor"], json!(31_500));
+                        assert_eq!(request.body["charge_protocol"], json!("quote@2"));
+                        assert_eq!(
+                            request.body["quote_revision"],
+                            format!("sha256:{}", "a".repeat(64))
+                        );
+                        assert!(request.body["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("JuicySuite CRM"));
+                        let mut job = job_view(
+                            "med_job1",
+                            "succeeded",
+                            json!([artifact.clone()]),
+                            true,
+                            40_000,
+                        );
+                        job["model"] = json!("synthetic/new-image");
+                        job["price"]["slug"] = json!("generate_image.synthetic.new-image");
+                        json_response(200, json!({"ok":true,"data":{"job":job}}))
+                    }
+                    ("GET", _) => artifact_response(&artifact_bytes),
+                    _ => panic!(
+                        "unexpected media request {} {}",
+                        request.method, request.url
+                    ),
+                },
+            );
         let adapter = image_adapter(&base);
-        let proof = image_proof(media_quote());
+        let mut quote = media_quote();
+        quote["model"] = json!("synthetic/new-image");
+        quote["price_slug"] = json!("generate_image.synthetic.new-image");
+        quote["charge_protocol"] = json!("quote@2");
+        quote["pricing_revision"] = json!(format!("sha256:{}", "a".repeat(64)));
+        let proof = image_proof(quote);
         let output = adapter
             .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
             .unwrap();
@@ -2935,7 +3260,7 @@ mod tests {
         assert_eq!(asset.media_type, "image/png");
         let result = &output.result;
         assert_eq!(result["kind"], "media.generated.image");
-        assert_eq!(result["model"], "openai/gpt-image-2.5");
+        assert_eq!(result["model"], "synthetic/new-image");
         assert_eq!(result["job_id"], "med_job1");
         assert_eq!(result["charge"]["amount"], "0.040000");
         assert_eq!(result["charge"]["currency"], "USD");

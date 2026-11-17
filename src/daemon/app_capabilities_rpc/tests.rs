@@ -3,6 +3,51 @@ use super::*;
 use crate::platform::{agenticos_external, deployments::DeploymentMetadata, Custody, Key};
 use std::collections::BTreeMap;
 
+#[test]
+fn approved_image_quote_cannot_silently_switch_model_or_price() {
+    let quote: crate::platform::AppCapabilityQuote = serde_json::from_value(json!({
+        "schema":1,"currency":"USD","unit_price_micros":2000,"units":1,
+        "total_price_micros":2000,"price_revision":"media:sha256:one",
+        "model":"synthetic/image-one","price_slug":"generate_image.synthetic.image-one",
+        "charge_protocol":"quote@2"
+    }))
+    .unwrap();
+    let mut run = json!({"snapshot":{
+        "capabilities":{"image":{"config":{"provider":"agenticos_external","mapping":{"capability":"media.generate"}}}},
+        "quotes":{"image":quote}
+    }});
+    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_ok());
+    run["snapshot"]["quotes"]["image"]["model"] = json!("synthetic/image-two");
+    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_err());
+    run["snapshot"]["quotes"]["image"]["model"] = json!("synthetic/image-one");
+    run["snapshot"]["quotes"]["image"]["price_revision"] = json!("media:sha256:other");
+    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_err());
+}
+
+#[test]
+fn approved_text_quote_cannot_silently_switch_defaults() {
+    let quote: crate::platform::AppCapabilityQuote = serde_json::from_value(json!({
+        "schema":1,"currency":"USD","unit_price_micros":2000,"units":1,
+        "total_price_micros":2000,"price_revision":"sha256:quote",
+        "model":"synthetic/text-one","charge_protocol":"quote@2"
+    }))
+    .unwrap();
+    let mut run = json!({"snapshot":{
+        "capabilities":{"writer":{"config":{"provider":"agenticos_external","mapping":{"capability":"text.generate"}}}},
+        "quotes":{"writer":quote}
+    }});
+    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_ok());
+    run["snapshot"]["quotes"]["writer"]["model"] = json!("synthetic/text-two");
+    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_err());
+    assert!(require_frozen_model_quote(
+        &run,
+        "writer",
+        &quote,
+        &json!({"model":"synthetic/selected"})
+    )
+    .is_ok());
+}
+
 fn fixture() -> (
     tempfile::TempDir,
     Arc<Shared>,

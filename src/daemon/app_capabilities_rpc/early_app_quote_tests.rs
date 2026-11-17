@@ -87,6 +87,10 @@ impl crate::platform::PlatformAdapter for SmtpQuoteAdapter {
             units: 1,
             total_price_micros: 4200,
             price_revision: "price-v1".into(),
+            model: None,
+            price_slug: None,
+            pricing_revision: None,
+            charge_protocol: None,
         })
     }
     fn reported_manifest_version(&self) -> Option<String> {

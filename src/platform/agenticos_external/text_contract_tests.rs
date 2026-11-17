@@ -5,8 +5,14 @@ use serde_json::json;
 fn text_generation_contract_is_closed_and_bounded() {
     let input = json!({"messages":[{"role":"system","content":"Keep claims grounded."},{"role":"user","content":"Draft a caption."}]});
     let clean = validate_text_input(&input).unwrap();
-    assert_eq!(clean["model"], "z-ai/glm-5.3-flash");
+    assert!(clean.get("model").is_none());
     assert_eq!(clean["maxOutputTokens"], 4096);
+    let selected =
+        json!({"model":"synthetic/new-text","messages":[{"role":"user","content":"Hello"}]});
+    assert_eq!(
+        validate_text_input(&selected).unwrap()["model"],
+        "synthetic/new-text"
+    );
     for bad in [
         json!({"messages":[{"role":"assistant","content":"x"}]}),
         json!({"messages":[{"role":"user","content":"x","tools":[]}]}),
@@ -23,6 +29,28 @@ fn text_generation_contract_is_closed_and_bounded() {
     )
     .is_err());
     assert!(validate_text_result(&json!({"text":"","finishReason":"stop","usage":null})).is_err());
+}
+
+#[test]
+fn text_quote_binds_model_and_rejects_malformed_or_changed_selection() {
+    let quote = json!({
+        "quoteVersion":"text-model-quote@1",
+        "chargeProtocol":"quote@2",
+        "model":"synthetic/new-text",
+        "publishedVersion":1,
+        "basis":"metered_actual",
+        "currency":"USD",
+        "scale":6,
+        "maxChargeMinor":1_200_000_000_u64
+    });
+    assert_eq!(
+        checked_text_quote(&quote, None).unwrap(),
+        (1_200_000_000, "synthetic/new-text")
+    );
+    assert!(checked_text_quote(&quote, Some("synthetic/other")).is_err());
+    let mut invalid = quote;
+    invalid["chargeProtocol"] = json!("unknown");
+    assert!(checked_text_quote(&invalid, None).is_err());
 }
 
 #[test]
