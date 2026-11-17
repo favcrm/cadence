@@ -151,6 +151,10 @@ export interface ComposerAction {
   onSelect: () => void;
 }
 
+/** CAD-2422: a message longer than this (UTF-8) is sent as a text attachment.
+ *  Large enough for any ordinary message; small next to the 256 KiB model request. */
+const LONG_TEXT_BYTES = 32 * 1024;
+
 /** Draft attachment chips (CAD-1419): one icon slot per chip that
  *  becomes Remove on hover/focus and stays visible on touch. Up to three
  *  show; the rest sit behind +N more, with any failed or uploading file
@@ -558,6 +562,24 @@ export default function Composer({
     const hold = unresolvedHintNotice(attachHold(key));
     if (hold !== null) {
       onNotice?.(hold);
+      return;
+    }
+    // CAD-2422: a message is never compacted or shortened on its way to the
+    // model, so a very long one goes as a text file the assistant pages
+    // through instead (`chat_attachment_read`). The draft is never sent as
+    // is and never lost: it moves into an attachment row with its size,
+    // which the person can remove, retry or send.
+    const bodyBytes = new TextEncoder().encode(body).length;
+    if (bodyBytes > LONG_TEXT_BYTES && !parseSlash(body)) {
+      const kb = String(Math.ceil(bodyBytes / 1024));
+      if (!attachEnabled) {
+        onNotice?.({ key: "This message is too long to send ({kb} KB, the limit is 32 KB). Attach it as a text file instead.", slots: { kb } });
+        return;
+      }
+      const name = `pasted-text-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+      addFiles(key, [new File([body], name, { type: "text/plain" })], attachDestination);
+      setDraft(t("Please read the attached text."));
+      onNotice?.({ key: "The long text ({kb} KB) is attached as {name}. Send again once it has uploaded.", slots: { kb, name } });
       return;
     }
     // Pin before a pending row or command card paints, so a follow
