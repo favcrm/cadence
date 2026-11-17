@@ -72,15 +72,10 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
       setInstalled(result);
       notifyAppsChanged();
       onInstalled();
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500) {
-        setReview(null); setConsent(false);
-        setError(cause.status === 403
-          ? t("Only a current workspace owner can install private apps.")
-          : t("The app or package changed. Check it again before installing."));
-      } else {
-        setReview(null); setUncertain(true); notifyAppsChanged();
-      }
+    } catch {
+      // An intermediary can reject the response after the install was forwarded.
+      // Refresh the workspace before attempting another install or update.
+      setReview(null); setUncertain(true); notifyAppsChanged();
     } finally { inFlight.current = false; setBusy(null); }
   };
   return (
