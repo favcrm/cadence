@@ -34,7 +34,7 @@ subcommands, and `cadence help <verb>` is one verb's own help.
 
 `issue` is the one public unit of work. A plan is an epic in the
 `proposed` stage; the operator approves it before its tickets dispatch.
-`job` and `monitor` are PM-internal, and so are `delivery`'s write verbs;
+`job` and `monitor` are PM-internal, and `delivery`'s write verbs are the operator's;
 `delivery requirements` and `delivery check` are read-only and any agent may
 run them.
 
@@ -455,10 +455,13 @@ second lane: ask the holder, or pass `--take-over "<reason>"` for a stale or
 agreed hand-over (recorded on the issue).
 
 Every lane `issue start` mints, in any repository, carries two guards. A
-per-worktree `pre-push` hook runs the repository's own `scripts/pre-push` when
-it exists and records a receipt for the head (a repository without that script
-records that and lets the push through; `--no-verify` still pushes, but the
-missing receipt is the detectable signal). A `cargo` shim on the lane's PATH
+per-worktree `pre-push` hook records a receipt for the head. A repository
+without an executable `scripts/pre-push` records that and lets the push through.
+When the repository has one, the hook currently also needs a `scripts/boat-build`
+helper and refuses the push without it (`refused:no-boat-build`);
+`CADENCE_PRE_PUSH_LOCAL=1` runs `scripts/pre-push` on the host instead. Report a
+refusal; do not bypass the hook. `--no-verify` still pushes, but the missing
+receipt is the detectable signal. A `cargo` shim on the lane's PATH
 sends every compiling subcommand through a build slot, so no local compile
 escapes the queue; only clearly light subcommands (`fmt`, `metadata`, `tree`,
 `version`, `help` and similar) pass straight through, and a `cargo` run inside
