@@ -147,6 +147,9 @@ pub enum IssueAction {
         /// for the same result. The master cannot create any other.
         #[arg(long)]
         status: Option<String>,
+        /// Stable hosted retry ID. Repeat the same ID and arguments after a lost reply.
+        #[arg(long)]
+        request_id: Option<String>,
     },
     /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;

@@ -338,6 +338,7 @@ fn verb_for(
                     id,
                     file,
                     status,
+                    request_id,
                 },
         } => {
             // Every flag the hosted `issue_new` cannot honour is refused
@@ -364,6 +365,14 @@ fn verb_for(
                     "remote `issue new` does not support {} — nothing was sent",
                     unsupported.join(" ")
                 )));
+            }
+            if request_id
+                .as_ref()
+                .is_some_and(|key| key.trim().is_empty() || key.len() > 128)
+            {
+                return Err(Error::rejected(
+                    "--request-id must be nonblank and at most 128 UTF-8 bytes — nothing was sent",
+                ));
             }
             // `--file` is read client-side (an unmanaged remote caller
             // has no master confinement); `-` reads stdin — never a
@@ -410,6 +419,9 @@ fn verb_for(
             }
             if let Some(b) = body {
                 args.insert("body".into(), json!(b));
+            }
+            if let Some(key) = request_id {
+                args.insert("request_id".into(), json!(key));
             }
             "issue_new"
         }
@@ -3408,6 +3420,7 @@ where
         super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
     }
     let (verb, args) = verb_for(&command, command_path.as_deref())?;
+    let keyed_issue_create = verb == "issue_new" && args.contains_key("request_id");
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
     // the call was attempted — may have recorded the message anyway; the
@@ -3491,6 +3504,20 @@ where
                     Err(retry_err) => return remote_failure(retry_err),
                 }
             } else {
+                if verb == "issue_new" && error.kind() == "unknown" {
+                    if keyed_issue_create {
+                        eprint_line(
+                            "Issue creation was not confirmed. If the board supports retry IDs, \
+                             repeat the same command with the same --request-id and unchanged \
+                             arguments. Do not remove the ID after an unknown outcome.",
+                        );
+                    } else {
+                        eprint_line(
+                            "Issue creation was not confirmed. Inspect the board before \
+                             repeating the create; it may already have succeeded.",
+                        );
+                    }
+                }
                 if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
                     eprint_line(&format!(
                         "remote send `{id}` was not confirmed — it may or may not have \
@@ -5437,6 +5464,48 @@ mod read_contract_tests {
         .unwrap();
         assert_eq!(verb, "status");
         assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn issue_new_preserves_optional_retry_id() {
+        let parse = |key: &str| {
+            Cli::try_parse_from([
+                "cadence",
+                "issue",
+                "new",
+                "Synthetic issue",
+                "--project",
+                "demo",
+                "--request-id",
+                key,
+            ])
+            .expect("issue new accepts a retry ID")
+        };
+        let (verb, args) = outcome(&parse(" create-1 ").command).unwrap();
+        assert_eq!(verb, "issue_new");
+        assert_eq!(
+            args,
+            json!({
+                "project": "demo",
+                "title": "Synthetic issue",
+                "request_id": " create-1 "
+            })
+        );
+        for invalid in [" ", &"x".repeat(129)] {
+            let err = outcome(&parse(invalid).command).unwrap_err();
+            assert!(err.contains("--request-id"), "{err}");
+        }
+        let without_key = Cli::try_parse_from([
+            "cadence",
+            "issue",
+            "new",
+            "Synthetic issue",
+            "--project",
+            "demo",
+        ])
+        .unwrap();
+        let (_, args) = outcome(&without_key.command).unwrap();
+        assert!(args.get("request_id").is_none());
     }
 
     #[test]

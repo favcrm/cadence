@@ -3640,6 +3640,36 @@ fn cad2277_board_without_issue_ls_limit_gets_typed_refusal_only_when_limit_sent(
     assert_eq!(plain_err.kind(), "rejected");
 }
 
+#[test]
+fn issue_new_retry_id_is_not_downgraded_on_old_or_uncertain_board() {
+    let args = json!({
+        "project": "demo",
+        "title": "Synthetic issue",
+        "request_id": " stable-create-id "
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    for (status, code, kind) in [
+        (400, "invalid_request", "rejected"),
+        (503, "capability_unavailable", "unknown"),
+    ] {
+        let (out, requests) = run(
+            vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+            "issue_new",
+            args.clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), kind);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        let call = requests
+            .iter()
+            .find(|request| request["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!(args));
+    }
+}
+
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
 /// capability_unavailable) is a release-order refusal — never "no evidence"
 /// and never a fallback to the older repo-scoped verb. The matching write
