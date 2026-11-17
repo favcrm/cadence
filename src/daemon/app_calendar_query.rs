@@ -498,13 +498,12 @@ impl Shared {
     ) -> Result<Value> {
         let text = |key: &str| params.get(key).and_then(Value::as_str).unwrap_or("");
         let window = parse_window(text("from"), text("to"))?;
-        // No workspace zone exists yet: the first social connection's, else UTC.
+        // The company zone: the owner's setting, else the first social
+        // connection's zone, else UTC (CAD-2378).
         let zone: Tz = self
             .store
-            .app_binding_first_publish_zone()
-            .ok()
-            .flatten()
-            .and_then(|name| name.parse().ok())
+            .company_zone()
+            .map(|(zone, _)| zone)
             .unwrap_or(Tz::UTC);
         let (from, to) = (day_start(zone, window.from), day_start(zone, window.to));
         let now = Utc::now().timestamp();

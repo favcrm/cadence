@@ -1287,6 +1287,7 @@ pub(crate) fn write_route(
             }
             RouteId::ModelDefaults => model_defaults_post(&mut request, state_dir),
             RouteId::Locale => super::locale::post(&mut request, state_dir, opts),
+            RouteId::TimeZone => super::time_zone::post(&mut request, state_dir, opts),
             RouteId::Reports => match caller.as_ref() {
                 Some(caller) => post_report(&mut request, state_dir, pm_dir, caller.actor()),
                 None => err_response(500, "unadmitted write"),

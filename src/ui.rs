@@ -90,6 +90,7 @@ mod tailscale_serve;
 #[cfg(all(test, feature = "test-seam"))]
 mod team_assistants_http_refusal;
 mod threads;
+mod time_zone;
 mod topics;
 mod updates;
 mod whatsapp;
