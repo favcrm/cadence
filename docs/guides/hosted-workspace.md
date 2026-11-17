@@ -190,6 +190,18 @@ units of instructions and up to 32 declared skills. It is context only: it
 neither authenticates an agent nor grants capabilities. The host remains
 responsible for resolving the profile and authorizing every operation.
 
+**Workspace skills.** A host may supply `workspaceSkills()` on
+`HostedSessionOptions` (CAD-2395) to serve the skills a workspace owner has
+approved. Each entry is a name in the bundle tag grammar, a one-line
+description, a `SKILL.md` body, `references/<leaf>` text files and a version,
+within the bundle grammar's skill caps. The runtime reads it once when a
+conversation's harness opens and lists each kept skill as `ws-<name>` after the
+bundled skills, so a workspace skill never replaces a bundled procedure. Every
+body and reference it returns is framed as untrusted guidance. An entry that
+breaks a rule is dropped whole, and a host refusal leaves the bundled skills
+unchanged. Only approved revisions belong here; a draft never does, and a skill
+never grants, adds or selects a tool.
+
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
 turn: `{ installId, contextId? }`, with `contextId` absent for an

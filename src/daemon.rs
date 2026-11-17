@@ -54,6 +54,7 @@ mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad811_installed_crm_qa_fixture;
+mod company_zone_rpc;
 mod routines_rpc;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
@@ -4737,6 +4738,8 @@ impl Shared {
             "endpoint_enable" => self.rpc_endpoint_set_enabled(params, true, peer_pid),
             "endpoint_disable" => self.rpc_endpoint_set_enabled(params, false, peer_pid),
             "endpoint_remove" => self.rpc_endpoint_remove(params, peer_pid),
+            "company_zone_get" => self.rpc_company_zone_get(),
+            "company_zone_set" => self.rpc_company_zone_set(params, peer_pid),
             "routine_list" => self.rpc_routine_list(params, peer_pid),
             "routine_show" => self.rpc_routine_show(params, peer_pid),
             "routine_create" => self.rpc_routine_create(params, peer_pid),
