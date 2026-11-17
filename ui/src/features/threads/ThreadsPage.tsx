@@ -731,14 +731,20 @@ function SheetDialog({
 type IssueProjects = Map<string, string>;
 /** CAD-2387: the opener and known-id test for issue ids inside a Markdown
  *  turn. It is the refs row's path (OpenWorkItem + issueProjects), so an id
- *  the board has no card for stays plain text. */
+ *  the board has no card for stays plain text. Both are stable wrappers that
+ *  read the latest values from refs: a new opener or a refreshed issue map
+ *  must not change the Markdown component identity, or the turn would
+ *  remount and drop focus, selection and scroll. */
 function useIssueLinks(issueProjects: IssueProjects): {
   onOpenIssue: ((id: string) => void) | undefined;
   knownIssue: (id: string) => boolean;
 } {
   const open = useContext(OpenWorkItem);
-  const knownIssue = useCallback((id: string) => issueProjects.has(id), [issueProjects]);
-  return { onOpenIssue: open ?? undefined, knownIssue };
+  const latest = useRef({ open, issueProjects });
+  latest.current = { open, issueProjects };
+  const onOpenIssue = useCallback((id: string) => latest.current.open?.(id), []);
+  const knownIssue = useCallback((id: string) => latest.current.open !== null && latest.current.issueProjects.has(id), []);
+  return { onOpenIssue: open ? onOpenIssue : undefined, knownIssue };
 }
 function issueProjectMap(issues: { id: string; project: string }[]): IssueProjects {
   return new Map(issues.map((i) => [i.id, i.project]));

@@ -100,3 +100,7 @@ const rowHtml = (kind: string): string =>
   );
 check(rowHtml("agent").includes('<button class="lnk num">CAD-2380</button>'), "MessageRow links a known id in an agent message");
 check(!rowHtml("operator").includes("<button"), "MessageRow leaves an operator message alone");
+const unknownRow = renderToStaticMarkup(
+  createElement(OpenWorkItem.Provider, { value: () => undefined }, createElement(MessageRow, { message: message("unknown", "**x** CAD-2380") as never, issueProjects: projects, writeBlock: null })),
+);
+check(!unknownRow.includes("<strong>") && !unknownRow.includes("<button"), "MessageRow keeps a non-agent sender's text plain");

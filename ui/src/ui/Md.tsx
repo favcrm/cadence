@@ -424,13 +424,14 @@ function componentsFor(onOpen?: (id: string) => void, wikiPage?: string, ids = f
 
 // CAD-2387: the known-id variant, cached per (predicate, opener) so a stable
 // pair keeps one component set across renders.
-const knownHandlerComponents = new WeakMap<object, WeakMap<object, Components>>();
+const knownHandlerComponents = new WeakMap<object, WeakMap<object, [Components?, Components?]>>();
 function knownComponents(onOpen: (id: string) => void, known: (id: string) => boolean, ids: boolean): Components {
   let byOpen = knownHandlerComponents.get(known);
   if (!byOpen) knownHandlerComponents.set(known, (byOpen = new WeakMap()));
-  let built = byOpen.get(onOpen);
-  if (!built) byOpen.set(onOpen, (built = buildComponents(onOpen, undefined, ids, known)));
-  return built;
+  let pair = byOpen.get(onOpen);
+  if (!pair) byOpen.set(onOpen, (pair = []));
+  const slot = ids ? 1 : 0;
+  return (pair[slot] ??= buildComponents(onOpen, undefined, ids, known));
 }
 
 const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
