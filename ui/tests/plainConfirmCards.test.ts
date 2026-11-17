@@ -1,6 +1,7 @@
 import { recordServices } from "../src/features/workspace-apps/screen/screenServices";
 import type { MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import type { RecordCard } from "../src/features/workspace-apps/screen/screenSlot";
+import { translateUiText } from "../src/lib/locale";
 
 // CAD-2146: the send, content and test-send cards read plainly for both host
 // fact shapes, and the prepare-reply validation is unchanged.
@@ -9,7 +10,7 @@ const savedFetch = globalThis.fetch;
 const receipt: MountReceipt = {
   mount: `/api/app-screen/${"c".repeat(64)}`, bridge_nonce: "d".repeat(64), generation: 1,
   tag: "crm", action_token: "a".repeat(64), tools: [], host_contract: "screen-records.v1",
-  operations: ["sends.approve", "content.approve", "smtp.test-send", "works.review"], navigation: null, install_id: "own-install", context_id: "own-context",
+  operations: ["sends.approve", "content.approve", "smtp.test-send", "works.review", "catalog.confirm"], navigation: null, install_id: "own-install", context_id: "own-context",
   digest: `sha256:${"e".repeat(64)}`, display_scope_key: "f".repeat(64), display_session_key: "1".repeat(64), remote_images: [],
 };
 
@@ -63,6 +64,18 @@ async function main(): Promise<void> {
   // Any other operation keeps its card.
   const other = await card("works.review", { title: "Plan", revision: 3 }, { id: "doc-1", revision: 3 });
   check(typeof other !== "string" && !other.title && !other.details && labels(other.facts) === "Revision|Title|Revision|Decision", "other operations are untouched");
+  // Identical display names must not hide which host-verified tool is being authorized.
+  const quote = { tool: "Synthetic lookup", effect: "read", price: { currency: "USD", scale: 6, amount: "0.123456" }, input: { query: "sample" } };
+  const args = { slot: "lookup", request_id: "request-1", input: quote.input };
+  const first = await card("catalog.confirm", { ...quote, slug: "synthetic.lookup" }, args);
+  const second = await card("catalog.confirm", { ...quote, slug: "different.lookup" }, args);
+  check(typeof first !== "string" && typeof second !== "string", "catalog confirmations build");
+  if (typeof first !== "string" && typeof second !== "string") {
+    const firstId = first.facts.find(row => row.label === "Tool ID");
+    const secondId = second.facts.find(row => row.label === "Tool ID");
+    check(firstId?.value === "synthetic.lookup" && secondId?.value === "different.lookup", "the cards distinguish the exact verified tool IDs");
+    check(translateUiText(firstId?.label ?? "", "zh-TW") === "工具 ID", "the tool ID label is translated in zh-TW");
+  }
 }
 
 main().then(

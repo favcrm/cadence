@@ -200,6 +200,7 @@ Object.assign(zhTW, {
   "The listed input is sent to the selected tool. Charges use the workspace balance.": "以下輸入會傳送至所選工具。費用由工作區結餘支付。",
   "If the outcome is uncertain, check it before requesting another call.": "如結果未明，請先檢查結果，才要求再次呼叫。",
   "Tool": "工具",
+  "Tool ID": "工具 ID",
   "Effect": "作用",
   "Price": "價格",
   "Input": "輸入",
