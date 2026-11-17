@@ -144,7 +144,10 @@ fn flag_true_custom_policy_resolves_approved_and_is_evaluated() {
     assert_eq!(v["policy_source"], "approved", "{v}");
     assert_eq!(v["policy_note"], Value::Null, "{v}");
     assert_eq!(v["policy_digest"], json!(digest(&parsed(CUSTOM))), "{v}");
-    assert_eq!(v["requirements"]["policy_digest"], v["policy_digest"], "{v}");
+    assert_eq!(
+        v["requirements"]["policy_digest"], v["policy_digest"],
+        "{v}"
+    );
     assert_eq!(review_names(&v), vec!["gen", "qa"], "{v}");
     assert_eq!(v["requirements"]["class"], "consequential", "{v}");
     assert_eq!(v["requirements"]["browser_qa"], true, "{v}");
@@ -217,7 +220,8 @@ fn flag_true_with_a_malformed_policy_stays_strict() {
         "{v}"
     );
     assert!(v["requirements"].get("required_reviews").is_none(), "{v}");
-    assert_eq!(v["requirements"]["class"], "consequential", "{v}");
+    // A malformed section is the strict floor (CAD-2417 spec), flag or not.
+    assert_eq!(v["requirements"]["class"], "strict", "{v}");
     // The flag changes nothing at all.
     assert_eq!(answer(&input(Some(MALFORMED), &paths, flag())), plain);
 }
@@ -248,7 +252,11 @@ fn flag_absent_or_false_is_byte_identical() {
     ];
     for (policy, paths) in cases {
         let absent = raw(&input(policy, paths, json!({})));
-        let off = raw(&input(policy, paths, json!({"policy_owner_approved": false})));
+        let off = raw(&input(
+            policy,
+            paths,
+            json!({"policy_owner_approved": false}),
+        ));
         assert_eq!(absent, off, "policy {policy:?} paths {paths:?}");
     }
 }
