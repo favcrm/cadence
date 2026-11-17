@@ -8,7 +8,8 @@ import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import type { ToastMsg } from "../../ui/Toast";
 import DrawerShell from "../app-shell/shared/DrawerShell";
-import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile } from "../../lib/types";
+import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile, WorkspaceSkillRead, WorkspaceSkillSummary } from "../../lib/types";
+import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
@@ -25,6 +26,7 @@ import {
 } from "./agentTabModel";
 import { agentLocation } from "./agentView";
 import RoutinesTab from "./RoutinesTab";
+import { libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames, type SkillDeps } from "./workspaceSkills";
 
 export interface TabContext {
   alias: string;
@@ -33,6 +35,8 @@ export interface TabContext {
   detail: AgentDetail | null;
   role: AgentRole | null;
   hosted: boolean;
+  /** The board is hosted (its meta or its install says so). */
+  hostedBoard: boolean;
   resume: string | null | undefined;
   onOpenIssue: (id: string) => void;
   /** Set when this page is a profile with no runtime: nothing to read but itself. */
@@ -526,7 +530,9 @@ function Skills({ c }: { c: TabContext }) {
   const names = [...bundled, ...named.filter((name) => !bundled.includes(name))];
   const line = (name: string) =>
     BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
-  if (names.length === 0 && c.roleRead === "read") return <Note>{t("No skills are recorded for this agent.")}</Note>;
+  // CAD-2419: a hosted profile also has the workspace's own skill library.
+  const workspace = c.hired !== undefined && c.doc.kind === "hosted";
+  if (names.length === 0 && c.roleRead === "read" && !workspace) return <Note>{t("No skills are recorded for this agent.")}</Note>;
   return (
     <div className="ap-body">
       {names.length > 0 && (
@@ -537,19 +543,350 @@ function Skills({ c }: { c: TabContext }) {
         </Rows>
       )}
       <RoleRead c={c} />
+      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} />}
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
           <Facts
             items={[
               ["Source", t(bundled.includes(open) ? "Bundled" : "Role")],
-              ["Loaded", t(bundled.includes(open) ? "In every session" : "Not recorded")],
+              // Only a native host is known to load every bundled skill.
+              ["Loaded", t(bundled.includes(open) && !c.hostedBoard ? "In every session" : "Not recorded")],
               ["Named by its role", c.role ? t(named.includes(open) ? "Yes" : "No") : null],
             ]}
           />
         </ItemDrawer>
       )}
     </div>
+  );
+}
+
+type Library = { state: "reading" } | { state: "failed" } | { state: "absent" } | { state: "ready"; skills: WorkspaceSkillSummary[] };
+
+/** The status line of a library row, each part translated on its own. */
+function skillStatus(skill: WorkspaceSkillSummary, t: (english: string) => string): string {
+  return statusParts(skill)
+    .map((part) => t(part.text).replace("{n}", String(part.n)))
+    .join(" · ");
+}
+
+/**
+ * CAD-2419: the workspace skill library on a hosted profile. Any member sees
+ * it and which approved skills this profile lists; only the owner (`writable`)
+ * assigns them and decides approvals. A board without the library hides it.
+ */
+export function WorkspaceSkills({
+  doc,
+  writable,
+  toast,
+  deps = liveSkillDeps,
+}: {
+  doc: InstructionsDoc;
+  writable: boolean;
+  toast: TabContext["toast"];
+  deps?: SkillDeps;
+}) {
+  const t = useTranslate();
+  const [library, setLibrary] = useState<Library>({ state: "reading" });
+  const [attempt, setAttempt] = useState(0);
+  const [open, setOpen] = useState<string | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [stale, setStale] = useState<"conflict" | "unconfirmed" | null>(null);
+  useEffect(() => {
+    let live = true;
+    setLibrary((now) => (now.state === "ready" ? now : { state: "reading" }));
+    deps
+      .list()
+      .then((skills) => live && setLibrary({ state: "ready", skills }))
+      .catch((error: unknown) => live && setLibrary({ state: libraryAbsent(error) ? "absent" : "failed" }));
+    return () => {
+      live = false;
+    };
+  }, [deps, attempt]);
+  if (library.state === "absent") return null;
+
+  const assigned = doc.read === "ready" && doc.profile ? doc.profile.skills : null;
+  const canAssign = writable && assigned !== null && stale === null;
+  const skills = library.state === "ready" ? library.skills : [];
+  const replace = (skill: WorkspaceSkillSummary) =>
+    setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.map((s) => (s.name === skill.name ? skill : s)) } : now));
+  const drop = (name: string) =>
+    setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.filter((s) => s.name !== name) } : now));
+
+  const toggle = async (name: string, on: boolean) => {
+    if (!assigned || saving !== null) return;
+    setSaving(name);
+    const out = await doc.saveSkills(on ? [...assigned, name] : assigned.filter((n) => n !== name));
+    setSaving(null);
+    if (out.kind === "saved") {
+      toast("ok", `${t(on ? "Assigned {name}." : "Unassigned {name}.").replace("{name}", () => name)} ${t("It applies when a session next loads this profile.")}`);
+    } else if (out.kind === "conflict") {
+      setStale("conflict");
+      toast("warn", t("Someone else changed this agent, so nothing was saved. Reload to see the current skills."));
+    } else if (out.kind === "unconfirmed") {
+      setStale("unconfirmed");
+      toast("warn", t("Not confirmed: the connection dropped. Reload to see what the board holds."));
+    } else if (out.kind === "refused") toast("err", t(out.message));
+  };
+  const reload = () => {
+    // A reload shows the board's profile; an Instructions draft would then save over theirs.
+    if (doc.draft !== null) {
+      toast("warn", t("Save or discard the Instructions draft first, then reload."));
+      return;
+    }
+    setStale(null);
+    doc.retry();
+  };
+
+  const unlisted = assigned && library.state === "ready" ? unapprovedNames(assigned, skills) : [];
+  return (
+    <section data-work-panel="workspace-skills">
+      <div className="ap-panel-h">
+        <h3>{t("Workspace skills")}</h3>
+      </div>
+      {library.state === "reading" ? (
+        <Note>{t("Loading…")}</Note>
+      ) : library.state === "failed" ? (
+        <Failed text="Workspace skills couldn’t be read." onRetry={() => setAttempt((n) => n + 1)} />
+      ) : skills.length === 0 ? (
+        <Note>{t("No workspace skills yet. Agents draft them; an owner approves them.")}</Note>
+      ) : (
+        <Rows>
+          {skills.map((skill) => {
+            const on = assigned?.includes(skill.name) ?? false;
+            return (
+              <div key={skill.name} className="ap-skill">
+                <ManageRow
+                  id={`wskill-${skill.name}`}
+                  name={skill.name}
+                  line={[skill.description, skillStatus(skill, t)].filter(Boolean).join(" · ")}
+                  onOpen={() => setOpen(skill.name)}
+                />
+                {skill.approved && assigned !== null &&
+                  (canAssign ? (
+                    <label className="ap-skill-assign">
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        disabled={saving !== null}
+                        aria-label={`${t("Assigned")}: ${skill.name}`}
+                        onChange={(e) => void toggle(skill.name, e.target.checked)}
+                      />
+                      {t("Assigned")}
+                    </label>
+                  ) : (
+                    <small className="ap-skill-assign" data-assigned={on}>
+                      {t(on ? "Assigned" : "Not assigned")}
+                    </small>
+                  ))}
+              </div>
+            );
+          })}
+        </Rows>
+      )}
+      {stale && (
+        <p className="rc-note" role="alert">
+          {t(stale === "conflict" ? "Someone else changed this agent’s profile." : "The last change wasn’t confirmed.")}{" "}
+          <button type="button" className="lnk" onClick={reload}>
+            {t("Reload")}
+          </button>
+        </p>
+      )}
+      {doc.read === "failed" && <Failed text="This agent’s assigned skills couldn’t be read." onRetry={doc.retry} />}
+      {unlisted.length > 0 && (
+        <div className="mt-3">
+          <h4 className="slabel mb-2">{t("Listed on this agent")}</h4>
+          <Rows>
+            {unlisted.map((name) => (
+              <Row key={name} left={name} right={t("Not approved in this workspace")} />
+            ))}
+          </Rows>
+        </div>
+      )}
+      {open && (
+        <SkillDrawer
+          name={open}
+          writable={writable}
+          deps={deps}
+          toast={toast}
+          onChanged={replace}
+          onGone={(name) => {
+            drop(name);
+            setOpen(null);
+          }}
+          onClose={() => setOpen(null)}
+        />
+      )}
+    </section>
+  );
+}
+
+/** One library skill: what an agent would read, and the owner's decisions on it. */
+function SkillDrawer({
+  name,
+  writable,
+  deps,
+  toast,
+  onChanged,
+  onGone,
+  onClose,
+}: {
+  name: string;
+  writable: boolean;
+  deps: SkillDeps;
+  toast: TabContext["toast"];
+  onChanged: (skill: WorkspaceSkillSummary) => void;
+  onGone: (name: string) => void;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [shown, setShown] = useState<number | undefined>(undefined);
+  const [attempt, setAttempt] = useState(0);
+  const [read, setRead] = useState<WorkspaceSkillRead | null | "failed">(null);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setRead(null);
+    deps
+      .read(name, shown)
+      .then((data) => {
+        if (!live) return;
+        setRead(data);
+        onChanged(data.skill);
+      })
+      .catch((error: unknown) => {
+        if (!live) return;
+        if (refusal(error).code === "not_found") {
+          toast("warn", t("This skill no longer exists."));
+          onGone(name);
+        } else setRead("failed");
+      });
+    return () => {
+      live = false;
+    };
+    // Only what is asked starts a read; the callbacks are fresh each render.
+  }, [deps, name, shown, attempt]);
+
+  const decide = async (job: () => Promise<WorkspaceSkillSummary | null>, done: string, n = 0) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const skill = await job();
+      setConfirming(false);
+      toast("ok", t(done).replace("{name}", () => name).replace("{n}", String(n)));
+      if (skill) {
+        onChanged(skill);
+        setAttempt((n) => n + 1);
+      } else onGone(name);
+    } catch (error) {
+      const why = refusal(error);
+      setConfirming(false);
+      toast(why.unconfirmed ? "warn" : "err", t(why.text));
+      if (why.code === "not_found") onGone(name);
+      // The skill moved, or the answer was lost: show what the board holds now.
+      else if (why.unconfirmed || why.code === "digest_mismatch" || why.code === "revision_conflict" || why.code === "approved_skill") {
+        setShown(undefined);
+        setAttempt((n) => n + 1);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const body = () => {
+    if (read === null) return <Note>{t("Loading…")}</Note>;
+    if (read === "failed") return <Failed text="This skill couldn’t be read." onRetry={() => setAttempt((n) => n + 1)} />;
+    const { skill, revision } = read;
+    const approved = skill.approved;
+    return (
+      <>
+        <p className="ap-drawer-lead">{revision.description}</p>
+        <Facts
+          items={[
+            ["Status", skillStatus(skill, t)],
+            ["Shown", `${t("Revision {n}").replace("{n}", String(revision.revision))}${read.approved ? ` · ${t("approved")}` : ""}`],
+            ["Latest revision", String(skill.latest_revision)],
+            ["Approved revision", approved ? `${approved.revision} · ${approved.digest.slice(0, 12)}` : t("None")],
+            ["Author", revision.author ?? t("Not recorded")],
+            ["Saved by", revision.created_by],
+          ]}
+        />
+        {(approved && approved.revision !== revision.revision) || revision.revision !== skill.latest_revision ? (
+          <div className="flex flex-wrap gap-2">
+            {approved && approved.revision !== revision.revision && (
+              <Button size="sm" variant="ghost" onClick={() => setShown(approved.revision)}>
+                {t("Show the approved revision")}
+              </Button>
+            )}
+            {revision.revision !== skill.latest_revision && (
+              <Button size="sm" variant="ghost" onClick={() => setShown(undefined)}>
+                {t("Show the latest revision")}
+              </Button>
+            )}
+          </div>
+        ) : null}
+        {writable && (
+          <div className="flex flex-wrap gap-2">
+            {!read.approved && (
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={busy}
+                onClick={() =>
+                  void decide(() => deps.approve(name, revision.revision, revision.digest), "Approved revision {n} of {name}.", revision.revision)
+                }
+              >
+                {t("Approve revision {n}").replace("{n}", String(revision.revision))}
+              </Button>
+            )}
+            {approved && (
+              <Button size="sm" disabled={busy} onClick={() => void decide(() => deps.revoke(name, approved.digest), "Revoked {name}.")}>
+                {t("Revoke")}
+              </Button>
+            )}
+            {!approved && (
+              <Button size="sm" variant="danger" disabled={busy} onClick={() => setConfirming(true)}>
+                {t("Delete")}
+              </Button>
+            )}
+          </div>
+        )}
+        <h4 className="slabel">{t("Workspace guidance, shown as plain text")}</h4>
+        <Note>{t("An agent reads this as guidance from the workspace. Only an approved revision reaches an agent.")}</Note>
+        {skillFiles(revision.files).map(([path, text]) => (
+          <div key={path} className="grid gap-1">
+            <h4 className="slabel">{path === "SKILL.md" ? `${t("Instructions")} · ${path}` : path}</h4>
+            <pre className="ap-code">{text}</pre>
+          </div>
+        ))}
+      </>
+    );
+  };
+  const latest = read !== null && read !== "failed" ? read.skill.latest_revision : null;
+  return (
+    <>
+      <ItemDrawer title={name} onClose={onClose}>
+        {body()}
+      </ItemDrawer>
+      {/* Outside the drawer: its transform would pin a fixed dialog inside it. */}
+      {confirming && latest !== null && (
+        <ConfirmDialog
+          title={t("Delete {name}?").replace("{name}", () => name)}
+          body={t("This removes the skill and every revision of it. It is not approved, so no agent reads it.")}
+          confirmLabel={t("Delete")}
+          pending={busy}
+          error={null}
+          onConfirm={() =>
+            void decide(async () => {
+              await deps.remove(name, latest);
+              return null;
+            }, "Deleted {name}.")
+          }
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </>
   );
 }
 

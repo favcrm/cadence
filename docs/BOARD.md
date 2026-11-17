@@ -2923,10 +2923,26 @@ The control endpoint is on the fixture proxy's port:
     `{"documents":"available","document_refusals":[],"settings":"native","viewer":"member"}`,
     or as the owner with
     `{"viewer":"owner","settings":"hosted","documents":"available"}`.
-- `GET /__qa/state` returns the current state, including `viewer`, `settings`
-  and `documents` (`probe`, `refusals`, and in `changed` the documents
+- CAD-2419, the workspace skill library on the Skills tab of the hosted
+  profile `qa-writer` (`/agents/qa-writer?tab=skills`). The proxy adds that
+  profile to the sandbox's `GET /api/agents` roster. It answers
+  `/api/agent-profiles/ap_qa_writer` (GET, and POST at the stored revision)
+  and `/api/workspace-skills[/<name>[/approve|revoke|delete]]` from
+  `fixtures/workspace-skills.json` and `fixtures/skills-profile.json`.
+  Writes go to its own copy. The member is answered `403 owner_required`.
+  The QA board refuses an approval past `approved_max` (3) with
+  `approved_limit`. The same body takes:
+  - `skills`: `available` (the default), `not-served` (every library route
+    answers 404, so the section is hidden) or `failing` (the list answers
+    503). Any `skills` value restores the library and the profile from the
+    fixtures.
+  - `profile_changed: true`: another writer saved the profile. Its revision
+    moves on, so the page's next Assigned toggle is stale.
+- `GET /__qa/state` returns the current state, including `viewer`, `settings`,
+  `documents` (`probe`, `refusals`, and in `changed` the documents
   approved, archived or restored and the types written since the last
-  `documents` preset). `GET /__qa/counts` returns the requests per fixture
+  `documents` preset) and `skills` (`probe`, and the profile's `revision` and
+  `skills`). `GET /__qa/counts` returns the requests per fixture
   route, the live-view requests and the sandbox routes whose 401 was masked.
   Document writes count under templated keys
   (`POST /api/documents/:id/approve`, likewise `archive` and `restore`;
