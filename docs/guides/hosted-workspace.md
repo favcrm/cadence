@@ -5,14 +5,13 @@ agent uses an installed native daemon and an outbound authenticated WSS
 connection; hosted board and conversation access do not require a local daemon.
 An assignment is not proof that a worker ran or reported a result.
 
-The company-container fleet was retired by AgenticOS AOS-374. The tenant
-Worker serves the hosted board and supported CLI operations; older references
-below to waking a company container describe historical integration evidence,
-not a current execution path. Unsupported operations must report unavailable;
-do not fall back to a local tracker or claim they ran.
+The tenant
+Worker serves the hosted board and supported CLI operations. Unsupported
+operations must report unavailable; do not fall back to a local tracker or claim
+they ran.
 
-See [verification and rollout](#verification-and-rollout) for the scope of
-earlier checkpoints, [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
+See [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
+[Delivery](delivery.md) for how work is reviewed and approved,
 and [Workspace app catalog](app-catalog.md) for local package rules.
 
 ## Check your connection
@@ -58,7 +57,7 @@ does not confer platform capabilities or native execution authority.
 
 **Storage limit:** hosted ticket and wiki data are not a backup of every native
 SQLite database, Git tracker or local file. A stored reference, metadata record
-or historical checkpoint does not establish that the referenced content or a
+or earlier checkpoint does not establish that the referenced content or a
 native execution runtime is available.
 
 Sources: native [`local_assignment/events.rs`](../../src/local_assignment/events.rs),
@@ -646,7 +645,7 @@ scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
 
 `wiki cp` copies a file or a folder into the hosted wiki and out of it on a
-board released since 2026-11-12 (AOS-566); see "Recursive copy" in
+board that supports it; see "Recursive copy" in
 `docs/guides/wiki-knowledge.md` for the board's limits, the timeout and what each
 exit code of a stopped job means. An older
 board answers `not_implemented` and copies nothing; there, write pages one at a
@@ -681,7 +680,7 @@ cadence --org acme agent report <assignment-id> --state blocked --text "waiting 
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
+`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile: no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
 
 Profile claims depend on the deployed board and client versions. An older
@@ -705,7 +704,7 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
-`cadence --org <name> issue finish <ID> [--worktree <path>]` (CAD-2178) releases
+`cadence --org <name> issue finish <ID> [--worktree <path>]` releases
 the lane this machine started for that issue, and only that lane: it removes the
 worktree and deletes the local branch. It takes no other option; `--force`,
 `--keep-branch`, `--remote`, `--merged` and `--dry-run` are refused on a hosted
@@ -732,8 +731,8 @@ and the lane's `.env` while it is exactly what lane setup last wrote: when every
 line setup writes is its own (the cargo-shim `PATH`, the slot env), it records
 the file's sha256 in the worktree's own git dir, and one changed or extra line
 keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept
-(CAD-2290). Anything else ignored (for example `docs/*`, `claudedocs/`,
-`docs/target/`, or a lane's `.env` from before CAD-2290, which has no record)
+Anything else ignored (for example `docs/*`, `claudedocs/`,
+`docs/target/`, or a lane's `.env` from an older client, which has no record)
 refuses. Git reports an ignored directory as one entry, so a file kept inside
 one of those directories is deleted with it. When the
 refusal will not change (the ledger cannot identify the lane, or no PR or
@@ -744,7 +743,7 @@ refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays
 native-only.
 
 If the actor is gone but its assignment never ended, the assignment ID is shown
-by `cadence --org <name> agent assignments`. A client supporting CAD-2203 can
+by `cadence --org <name> agent assignments`. A client that supports it can
 cancel that exact assignment and attempt the same guarded release in one call:
 
 ```sh
@@ -824,7 +823,7 @@ longer registered with Git. It deletes no worktree or branch and does not verify
 merge evidence; its result reports those facts separately. A present, still
 registered, ambiguous or pending lane is refused.
 
-### Managing agent profiles from the CLI (CAD-2101)
+### Managing agent profiles from the CLI
 
 The owner can do from the CLI what the agent page does for a profile. Name the
 org with `--org` on every call. A saved default org or `CADENCE_ORG` does not
@@ -877,7 +876,7 @@ as the person whose login it uses. Treat the saved login as the person's, keep
 it out of agent environments, and have agents propose changes (`agent
 propose-hire`). The next paragraph is what a hosted kickoff adds.
 
-**A managed session has a credential of its own (CAD-2149, AOS-502).** On a
+**A managed session has a credential of its own.** On a
 hosted kickoff, the session's hosted CLI verbs are sent on an `agent` credential
 bound to its claim. A comment, an attachment and a review are recorded as the
 agent. `issue new`, `issue set` and `issue say` still record the member, as do
@@ -890,7 +889,7 @@ renewal is another mint, and the file goes when the assignment ends.
 
 Stays on the member's login: claim, daemon reports and `agent report`; every
 wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
-`audit_verdict_project`). `artifact types` and `artifact submit` (CAD-2286)
+`audit_verdict_project`). `artifact types` and `artifact submit`
 ride the agent credential like the other verbs. The credential carries the
 member's own subject, so the board's creator check still admits the member's
 files, and a reader or reviewer assignment's submit is refused by the board's
@@ -907,7 +906,7 @@ independence, and it still refuses the author's principal.
 
 **This is attribution and server-side refusal, not a security boundary.** The
 session runs as the same OS user and can still read the member's login file
-until CAD-2148 confines it.
+until the session is confined.
 
 What the client does when the credential is not available:
 
@@ -943,7 +942,7 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
 - `from` is a label. `sender_subject` is verified, and it is the member, not the
   session. A message approves nothing and changes nothing on the ticket.
 
-### Submitting a document for review (CAD-2286)
+### Submitting a document for review
 
 ```sh
 cadence --org acme artifact types
@@ -954,7 +953,7 @@ cadence --org acme artifact submit <art-id>
   type follows until the owner confirms it. `artifact submit` (`cli.write`)
   puts a file you created into review, under its label as the type. It prints
   `stage`, `type`, `typeConfirmed` and, for an unconfirmed type, `baseline`.
-  The review flow is in the cadence skill ("Deliverables and review handoff");
+  The lifecycle is in [Delivery](delivery.md#document-review-for-non-code-work);
   the board side is in `docs/BOARD.md`.
 - Submitting again answers the current stage and does not submit twice, so
   after a lost answer (exit 1) repeat the same command.
@@ -977,167 +976,19 @@ cadence --org acme artifact submit <art-id>
 
 ### Reviewing software changes
 
-Find out what a PR needs before starting reviews. The caller needs `gh` read
-access to the repository:
+The delivery gate, the policy and trusted lists, the evidence each review takes,
+the owner's approval and the refusals are in [Delivery](delivery.md). On a hosted
+org, check a PR before reviewing it, and read the gate again after:
 
 ```sh
 cadence --org acme delivery requirements --issue <issue-id> \
-  --pr https://github.com/<owner>/<name>/pull/<number> --head <full-sha>
-```
-
-`requirements.reviews`, `review_kind`, `operator_approval` and `browser_qa` are the
-requirement for that exact head, computed from the policy recorded on the board
-and the repository's path lists (`docs/roles/risk-paths.toml` and
-`docs/roles/one-review-paths.toml`), which are read at main's live tip (the PR's base for a
-non-main PR), so a PR cannot weaken its own rules. The merge gate can add an operator approval: when a
-head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
-(AGENTS.md "Review"). On a hosted org, an active `routine` class reports zero
-reviews and no approval here, but the merge gate also requires a pass from both
-review workflows, and those rows carry the auto-paths rule.
-
-The review standard (operator decision 2026-11-03) is a fresh-session review:
-a session that is not the author and inherits no conversation or context from
-the work. A fresh subagent qualifies; a fork or resumed authoring session does
-not. Record the reviewer/session, repository, full head, outcome, checks and
-limitations. A dispatcher posting the review under the PR author's login does
-not make the reviewer the author. Call it a fresh-session review, not an
-independent party.
-
-The gate counts hosted verdicts by attested principal and refuses the author's
-principal. A fresh session or a PR comment alone is not a gate-counted verdict.
-In the Cadence project in this workspace, agents file no hosted verdicts: the
-reviewer reports back and the dispatcher posts the findings. Workflow-issued
-Standards and Spec/security rows are a cheap first pass on gate, security,
-schema and release PRs; two rows
-satisfy the review requirement on other PRs (AGENTS.md "Review"). The computed
-class, path rules and any operator approval still apply.
-
-When hosted Browser QA is required, the fresh QA session exercises the actual
-change and reports the result and limitations to the dispatcher. The dispatcher
-posts the full report on the PR. Only for a pass, post a separate, unedited
-comment containing exactly these two lines, with the full current head:
-
-```text
-Browser QA: pass
-Head: <full-sha>
-```
-
-CAD-2383 counts a PR author's pass from an eligible repository member only
-alongside the operator's project-scoped per-head approval through an operator
-channel, after the operator reads the report. A scope, delegated or legacy
-repo-scoped approval does not satisfy this route. A counted Browser QA verdict
-or a non-author repository member's unedited exact-head pass is also accepted.
-An edited or old-head pass does not count; post new evidence for the new head.
-The gate checks the pass and approval, not whether QA ran.
-
-For the author-pass route, an agent can inspect readiness before approval, then
-check it again after the operator approves. `--browser-qa` on these commands
-requires Browser QA; it is a flag, not a report URL:
-
-```sh
+  --pr https://github.com/<owner>/<repo>/pull/<number> --head <full-sha>
 cadence --org acme delivery check --project <project-key> --issue <issue-id> \
-  --repo <owner/name> --pr <number> --head <full-sha> --browser-qa
-# Operator only, after reading the report:
-cadence --org acme audit approve --project <project-key> --issue <issue-id> \
-  --repo <owner/name> --pr <number> --head <full-sha> --source "<who, where>"
-# Agent re-runs delivery check; the operator then enqueues:
-cadence --org acme delivery enqueue --project <project-key> --issue <issue-id> \
-  --repo <owner/name> --pr <number> --head <full-sha> --browser-qa
+  --repo <owner>/<repo> --pr <number> --head <full-sha>
 ```
 
-`delivery check` reports `browser_qa_route`; an author pass awaiting approval
-is not a pass by itself. On 2026-11-16, the operator selected an interim route:
-after reading the report, the operator personally posts the non-author exact
-pass as `favcrm-dev`. CAD-2383 supersedes that requirement; it remains a
-fallback for older boards. The operator's two GitHub profiles are not two
-humans, and an agent must never switch to the operator's profile or impersonate
-them.
-
-The hosted wrapper refuses `--exception --advisory`; it is not a hosted
-fallback. The native evaluator cannot enqueue while local signing is retired;
-see AGENTS.md "Merging". A hosted `routine` PR has no readiness record: it
-takes both workflow passes and any approval the gate requires. Matching
-`docs/roles/workflow-auto-paths.toml` alone is not enough; protected paths,
-case variants and changes other than plain additions or modifications still
-require the operator. For the Cadence project in this workspace, agents run QA,
-post reports and run checks; the operator approves, enqueues and decides any
-deployment. Other projects follow their own applicable policies.
-
-```sh
-cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
-  --issue <issue-id> --pr <number> \
-  --head <full-sha> --kind standards --outcome pass --risk auto --file findings.md
-```
-
-`--project` is the issue's project and is required: the evidence is that
-project's, and the project is never inferred from `--repo` or the cwd. The org
-refuses a repo the project has not declared (`repo_not_bound`), an issue that
-resolves to another project (`project_mismatch`), a caller the owner has not
-made eligible for the project (`reviewer_not_bound`) and a caller with no
-attested login (`identity_unattested`). `--kind` is `standards`,
-`spec-security`, `combined` or `browser-qa` (the kinds the merge gate counts;
-`spec` is retired); `--outcome` is `pass` or `revise`, and `--title-outcome` /
-`--section-outcome` default to it. The reviewer is the authenticated caller,
-never an argument. A repeat of the same kind, head and findings returns the
-latest row with `duplicate: true`; a changed outcome appends a correction, and
-the gate reads the latest row per reviewer and kind.
-
-Read them back under the same org with `cadence --org acme audit verdicts
---project <project-key> --repo <owner/name> --issue <issue-id> --pr <number>
---head <full-sha>`; a hosted selection answers from the org, never from local
-notes, and refuses an answer naming another project, repository, issue or
-head. Add `--body` to also print each note's findings as `body` (with
-`body_truncated`), which is how a `REVISE` is read; the gate never passes it and
-the text never decides a count. The text is the reviewer's, so control
-characters, format characters (Unicode Cf), default-ignorable code points such
-as variation selectors, and line separators print as U+FFFD. Characters outside
-those sets that merely look blank, such as U+2800, and the note's `risk` print
-as sent. The text is bounded at 16 KiB per note and 128 KiB per answer on the
-board, with the newest notes' text kept first, so an older note can read empty
-with `body_truncated` set when the budget runs out. A board that predates the field still answers
-the rows, prints a line on stderr, and marks `bodies: "unavailable: …"`; local
-orgs refuse `--body` because their notes are files you can open. The merge
-gate also runs whichever `cadence` you point it at: set
-`CADENCE_BIN` when more than one build is on the host, or a stale client's
-missing hosted verb will read like a gate refusal.
-
-A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
-except a workflow-issued row (CAD-2081; the workflows are live), which
-has no login and counts only for a principal in
-`docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
-the workspace owner binds each principal's GitHub login once for the workspace,
-then admits principals to a project's review set. A code verdict needs both,
-because the gate counts a hosted document by principal and excludes the author
-by the attested login:
-
-```sh
-cadence --org acme audit identities set \
-  --identity <subject-id>=<github-login> [--identity ...]
-cadence --org acme audit reviewers set --project <project-key> \
-  --reviewer <subject-id> [--reviewer ...]
-cadence --org acme audit reviewers --project <project-key>   # read both joins back
-cadence --org acme audit identities                           # the workspace map
-```
-
-Both writes are the owner's own act: they need the opt-in `audit.approve`
-login (`cadence login --audit-approve`), and an agent's call is refused.
-Leaving a principal out of the project's set stops new verdicts for that
-project only; rows already filed keep their stored principal and login and
-stay countable for the head they reviewed. A principal listed with no attested
-login reads back with `github_login: null` and its verdicts cannot count yet.
-Never impersonate a reviewer: the verdict names the authenticated caller, and
-the owner's attestations are the only thing that makes that caller count.
-Where the org cannot answer, the gate refuses; a missing hosted read is not a
-pass, and the repository's approved merge path and any required operator
-decision remain in force.
-
-CAD-2001 release order: the tenant server must serve the project-scoped review
-verbs before this client sends them. An older tenant refuses the names
-(`not_implemented`/`invalid_request`/`container_required`/
-`capability_unavailable`) and the client says so — update the tenant server
-first, then this Cadence client. The client never falls back to the older
-repo-scoped evidence when the project is known, and the gate treats that
-refusal as a refusal, never as "no verdicts were filed".
+The caller needs `gh` read access to the repository. The owner's approval and
+enqueue are run from the owner's own terminal; an agent never runs them.
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:
@@ -1185,12 +1036,11 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
 - When the daemon's workspace worker picks up a kickoff from the board for a
   fenced default agent (`attention`, or holding an unknown message), it does not
   queue it: the assignment is reported `blocked` with that reason instead of
-  `running` (CAD-2259). Resume the agent (reconcile or `agent unfence` first if
+  `running` Resume the agent (reconcile or `agent unfence` first if
   it holds an unknown message) or connect another default, then run
   `cadence --org acme agent connect --local --alias <alias>` again (the saved
   checkout is kept) to pick the blocked work up. `issue start <id> --repo`
-  without `--profile` sends from the CLI and is not checked this way yet
-  (CAD-2274).
+  without `--profile` sends from the CLI and is not checked this way yet.
 - Native custody is bounded to 512 entries / 4 MiB. The server limits unacknowledged
   events to 64 with a 30-second progress deadline. Slow consumers are disconnected,
   not treated as successful execution. When the inbox is full, inspect it and use
@@ -1300,76 +1150,11 @@ metadata/database operations, package storage, actual runtime wakes and model wo
 still have costs; workloads/provider tariffs decide the result. Reason's product
 claims are not Cadence price or performance evidence.
 
-## Verification and rollout
+## Rollout boundary
 
-### Observed scope at consolidation (2026-10-22)
-
-- The release owner's actual native-process checkpoint exercised standalone
-  daemon/status/stop, a genuine Worker OTP+PKCE-issued `hct_`, 66 FYIs over one
-  verified-CA outbound WSS connection with continuous ACK-window progress,
-  durable inbox/offline replay after native restart, and no root work messages
-  or provider invocation. Public and lower-level stopped-daemon inbox/clear
-  variants refused without restarting the daemon or doing outbound work.
-  The private fixture imported the genuine issued credential: this was **not**
-  proof of the interactive CLI `login` UX.
-- The release owner's later full app CLI journey passed through a genuine
-  owner `hct_`, real Worker, signed runtime relay and actual native UI/kernel.
-  It exercised `release-check`, install, list/show and operation readback; an
-  exact-old-pin update to a synthetic immutable `0.10.1` release; replay of the
-  original install UUID without overwriting the updated digest; stale-generation
-  revoke refusal; exact revoke readback as unapproved; and receipt/read-only
-  reconcile. Published package/version metadata and release bytes were isolated
-  fixtures served by the actual local Worker, not a production catalogue rollout.
-  This is app-lifecycle evidence, not approval to execute a provider or deploy.
-- The retained [native public app acceptance](../../tests/cad1739_hosted_app_public_acceptance.rs)
-  exercised seven RPC/loopback-HTTP guard groups: operation correlation is not
-  operator authority; stale update/revoke preserves consent/scopes; active-run
-  refusal permits a later standalone upgrade; and journal/entered-writer
-  uncertainty remains explicit, on both transports. These use synthetic
-  test-seam caller/grant fixtures, not production authentication or a provider.
-- A throwaway two-state native smoke on `5ed960195af9beda4e974014dd4f11c324ee1e07`
-  passed 1/1: separate company/teammate native states performed real
-  selected-remote wiki create/read/revision update (with stale-revision refusal)
-  and ticket create/update (with stale refusal and standalone isolation); an
-  explicit assignment dispatched, was read by bare GET, claimed, ACKed and
-  delivered to the inbox while reporting truthfully `running`→`blocked`; a
-  daemon restart preserved the original claim without duplicate delivery, and an
-  explicit default switch afterwards retained the original claim, generation and
-  member pins. The harness was removed after the run, so the retained evidence is
-  the pass summary and asserted inbox contents — the runner suppressed console
-  logs. This is one explicit collaboration path, not interactive CLI `login`
-  UX, a production deployment, or a measured cost result.
-- The [historical POC](https://github.com/agenticos-stack/agenticos-v2/commit/0aaafd244adbbad854ca74c4208ffb16bd67b4ee)
-  exercised 13 synthetic-authority/loopback **plain WS** groups. It is not WSS,
-  genuine-auth or abrupt-power-loss durability proof. Pure-kernel native/WASM
-  parity is a separate check, not a substitute for the integrated native adapter
-  path exercised by the two-state smoke above.
-
-The persistence, pagination, generation, same-member renewal and revocation
-mechanisms described above are source contracts; these checkpoints do not claim
-that every capacity/gap, identity-rotation, held-context cancellation, concurrent
-reassignment or abrupt-loss/whole-company restore case passed. The two-state smoke
-covers one explicit collaboration path; it is not interactive login UX, production
-deployment or a multi-host capacity trial. Restart replay is not proof of
-zero-loss multi-store recovery. No startup/cost benchmark was run.
-
-### Source and release boundary
-
-Native source links in this guide resolve within the revision containing the
-guide. The companion hosted work is [PR #949](https://github.com/agenticos-stack/agenticos-v2/pull/949):
-`apps/api/src/hosted-cadence/{agent-directory,local-events,app-lifecycle}.ts`,
-`apps/api/src/hosted-app-lifecycle.ts`, `apps/api/src/hosted-app-installations.ts`,
-and `docs/architecture/company-data-boundary.md` (the CAD-1739 storage limitation).
-Use the final release PR heads, not the historical POC SHA, to identify the
-implemented native/hosted pair. The final canonical native Git revision and
-source/WASM artifact hashes belong to the hosted packaging pin; a native source
-freeze alone is not proof that its final pinned artifact checks passed.
-
-Before rollout, the release owner must bind the matching native, hosted contract,
-migration and kernel artifact versions to the release and satisfy the
-repository's exact-head checks/reviews/approval and remaining outcome acceptance.
-Metadata/event migration rollout must retain its writer fences; do not expose
-mixed unsupported writers or interpret a capability-unavailable response as a
-fallback grant. Local operators retain native journal/business-data recovery
-responsibility. Package consent and credential enrollment do not approve a
-production deployment, live data migration, live send or installed-daemon restart.
+Package consent and credential enrollment do not approve a production
+deployment, live data migration, live send or installed-daemon restart. Do not
+expose mixed unsupported writers, and do not read a capability-unavailable
+response as a fallback grant. Local operators keep responsibility for native
+journal and business-data recovery. Restart replay is not proof of zero-loss
+multi-store recovery.
