@@ -3105,7 +3105,15 @@ mod cad2376_private_refusal_tests {
     fn policy_put_private_answers_private_unavailable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pm_dir = tmp.path().join("pm");
+        let notes = tmp.path().join("notes");
         std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(
+            pm_dir.join("pm.yaml"),
+            format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+        )
+        .unwrap();
+        crate::issue::Pm::init(&pm_dir).unwrap();
         let before = std::fs::read_dir(&pm_dir).unwrap().count();
         let mut request: Request = tiny_http::TestRequest::new()
             .with_method(Method::Post)
