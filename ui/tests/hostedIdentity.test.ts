@@ -312,6 +312,35 @@ async function boundaryChecks() {
     assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a session-required event preserves the confirmation requirement");
     await continueWithCurrent();
 
+    // A hosted identity remembered on a local-classified origin must retain
+    // hosted recovery copy even before the first metadata request answers.
+    let answerEarlyProof: ((value: Response) => void) | undefined;
+    response = () => new Promise<Response>((resolve) => { answerEarlyProof = resolve; });
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    const hostedDuringCheck = host.textContent?.includes("Hosted workspace");
+    await React.act(async () => window.dispatchEvent(new Event("cadence:session-required")));
+    const hostedAfterEarlyEnd = host.textContent?.includes("Continue with AgenticOS") && !host.textContent.includes("cadence ui login");
+    assert(answerEarlyProof, "the first hosted metadata check is in flight");
+    answerEarlyProof(json(afterRequired));
+    await flush();
+    assert(hostedDuringCheck, "a remembered hosted identity keeps hosted checking copy before metadata answers");
+    assert(hostedAfterEarlyEnd, "an early session-ending event keeps the hosted sign-in action");
+    let answerPendingProof: ((value: Response) => void) | undefined;
+    response = () => new Promise<Response>((resolve) => { answerPendingProof = resolve; });
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    const hostedWithPendingChange = host.textContent?.includes("Hosted workspace");
+    assert(answerPendingProof, "the pending-confirmation metadata check is in flight");
+    answerPendingProof(json(afterRequired));
+    await flush();
+    assert(hostedWithPendingChange, "a pending hosted confirmation keeps hosted checking copy after reload");
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "the early session end still requires identity confirmation");
+    response = () => json(afterRequired);
+    await continueWithCurrent();
+
     // localhost is classified as local before the first response. A remembered
     // hosted identity must still survive a refusal on reload.
     response = () => json({ error: { code: "board_session_required", message: "Session required" } }, 401);

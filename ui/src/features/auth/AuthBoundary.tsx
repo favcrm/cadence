@@ -94,11 +94,14 @@ export default function AuthBoundary({ children }: {
       try { sessionStorage.setItem(RETURN_STORE, destination); } catch { /* Same-tab return is optional when storage is unavailable. */ }
     }
   }, [returnHref]);
-  const [state, setState] = useState<BoundaryState>({ status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(), hosted: hostedOrigin(typeof window === "undefined" ? null : window.location.hostname) });
-  const stateRef = useRef(state);
-  const [loginExchanged, setLoginExchanged] = useState(false);
   const identity = useRef<string | null>(rememberedIdentity());
   const pendingChange = useRef(pendingIdentityChange());
+  const [state, setState] = useState<BoundaryState>(() => ({
+    status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(),
+    hosted: hostedIdentity(identity.current) || pendingChange.current || hostedOrigin(typeof window === "undefined" ? null : window.location.hostname),
+  }));
+  const stateRef = useRef(state);
+  const [loginExchanged, setLoginExchanged] = useState(false);
   const proposedIdentity = useRef<string | null>(null);
   const approvedIdentity = useRef<string | null>(null);
   const credential = useRef(sessionKey());

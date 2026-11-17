@@ -1868,6 +1868,8 @@ downgraded to local or anonymous access by a contradictory metadata answer;
 the gate treats it as unavailable. A hosted signed-in answer must carry a public session,
 although older metadata may omit the optional `hosted` flag. A fresh tab
 still relies on the server and deployment floor to identify its first answer.
+The remembered marker also selects hosted recovery copy while the first
+verification is pending; it is a presentation hint, not server authority.
 A confirmed sign-out, expiry or identity change clears private observations
 and rejects stale in-flight responses. A session-required `401` supersedes
 older pending verification; a feature's ordinary role-based `403` does not
