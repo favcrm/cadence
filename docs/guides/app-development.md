@@ -239,6 +239,20 @@ Hosted boards read catalogue metadata from `api.internal`; the release document
 is proxied through the closed `catalogue-packages.internal` broker. Every
 install/update is operator-only.
 
+Hosted `screen-records.v1` apps can request a granted catalog tool with
+`catalog.call`, supplying `{slot, request_id, input}`. The host supplies the
+mount credential and the owner-selected connection; the frame cannot select
+either. A paid call returns `confirmation_required`: request the
+`catalog.confirm` **slot** with the same arguments, then the host shows the
+tool, effect, input and exact quoted price for the workspace owner to approve.
+An app cannot confirm the slot itself.
+
+Keep the original `request_id` and input until the outcome is known. If a reply
+is lost or reports `outcome_uncertain`, use `catalog.status` with those same
+arguments; do not automatically repeat an effect. Grant, membership and price
+are checked again by the hosted service. These operations require a host and
+worker that both support them; they are not a native-daemon fallback.
+
 ## 7. Existing apps
 
 **Social Content** (`0.13.0`) uses the pinned `@cadence/app-kit` through

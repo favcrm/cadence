@@ -8,15 +8,32 @@ import type { RecordCard, SlotPlan } from "./screenSlot";
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
+/** The frame supplies an intent, never a mount token or an account binding. */
+function catalogArgs(args: ActionArgs): boolean {
+  if (!exact(args, ["slot", "request_id", "input"]) ||
+      typeof args.slot !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$/.test(args.slot) ||
+      typeof args.request_id !== "string" || !/^[A-Za-z0-9_.:-]{8,160}$/.test(args.request_id) ||
+      !object(args.input) || !exact(args.input, ["query", "body", "units"])) return false;
+  const pending: unknown[] = [args.input];
+  while (pending.length) {
+    const value = pending.pop();
+    if (Array.isArray(value)) pending.push(...value);
+    else if (object(value)) for (const [key, nested] of Object.entries(value)) {
+      if (key === "connection_id" || key === "connectionId") return false;
+      pending.push(nested);
+    }
+  }
+  return true;
+}
 const WRITES = new Set([
   "records.create", "records.update", "records.batch", "segments.save", "exclusions.save",
   "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply",
   "proposals.discard", "sender-bindings.save", "whatsapp.broadcast.draft", "whatsapp.handoff.set",
   "whatsapp.draft.discard", "works.create", "works.patch", "works.trash", "works.restore",
-  "works.request_review", "campaign-work.save", "sends.cancel",
+  "works.request_review", "campaign-work.save", "sends.cancel", "catalog.call",
 ]);
 const SLOTS = new Set<string>(RECORD_SLOT_VERBS);
-/** Mirrors `ScreenOperation::is_screen_read` in `crates/cadence-core/src/app_screen_decl.rs`. */
+/** Native screen reads plus the hosted catalog's status reconciliation. */
 export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
   "records.list", "records.show", "segments.list", "segments.show",
   "exclusions.list", "exclusions.show", "suppressions.list", "audience.preview",
@@ -27,7 +44,7 @@ export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
   "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.status",
   "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
   "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate",
-  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show",
+  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "catalog.status",
 ]);
 const READ_ONLY_CALL_MESSAGE = "a read-only screen admits only read operations";
 
@@ -82,6 +99,12 @@ function sanitized(value: unknown): unknown {
 }
 function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
+  if (operation?.startsWith("catalog.") && error instanceof ApiError) {
+    if (error.code === "confirmation_required") return { code: "confirmation_required", text: "This tool requires the workspace owner's confirmation." };
+    if (error.code === "grant_changed") return { code: "grant_changed", text: "This tool's grant changed. Ask the workspace owner to review it." };
+    if (error.code === "quote_changed") return { code: "quote_changed", text: "The price changed. Review a new quote before confirming." };
+    if (error.code === "outcome_uncertain") return { code: "outcome_uncertain", text: "Check this request's status before trying again." };
+  }
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
   }
@@ -125,9 +148,10 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
   let latestShow: { id: string; revision: number } | null = null;
   const current = () => !retired && host.current();
   const permitted = (op: string) => current() && receipt.host_contract === "screen-records.v1" && receipt.operations?.includes(op) && receipt.action_token;
-  async function post(path: "call" | "slot-prepare" | "slot-confirm", body: ActionArgs): Promise<unknown> {
+  async function post(path: "call" | "slot-prepare" | "slot-confirm" | "catalog/call" | "catalog/status" | "catalog/prepare" | "catalog/confirm", body: ActionArgs): Promise<unknown> {
     if (!current()) throw new ApiError("Mount retired", 403);
-    const response = await fetch(`/api/app-screen-services/${path}`, {
+    const route = path.startsWith("catalog/") ? `/api/app-screen-catalog/${path.slice(8)}` : `/api/app-screen-services/${path}`;
+    const response = await fetch(route, {
       method: "POST", credentials: "same-origin", cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
       body: JSON.stringify({ action_token: receipt.action_token, ...body }),
@@ -175,6 +199,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     retire() { retired = true; csv.clear(); },
     async call(operation: RecordCallVerb, args: ActionArgs): Promise<ActionResult> {
       if (!permitted(operation) || !(RECORD_CALL_VERBS as readonly string[]).includes(operation)) return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
+      if (operation.startsWith("catalog.") && !catalogArgs(args)) return { ok: false, refusal: { code: "invalid", text: "This tool request is malformed." } };
       const epoch = displayEpoch(domain);
       const previewId = (operation === "screen.preview.show" || operation === "screen.preview.clear") && typeof args.preview_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(args.preview_id) ? args.preview_id : null;
       let revision = previewRevision;
@@ -183,22 +208,27 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         latestShow = { id: previewId, revision };
       } else if (previewId && operation === "screen.preview.clear" && latestShow?.id === previewId) latestShow = null;
       try {
-        const raw = await post("call", { operation, args });
+        const catalog = operation === "catalog.call" || operation === "catalog.status";
+        const raw = await (catalog ? post(operation === "catalog.call" ? "catalog/call" : "catalog/status", args) : post("call", { operation, args }));
         const stalePreview = !!previewId && ((operation === "screen.preview.show" && (latestShow?.id !== previewId || latestShow.revision !== revision)) || (operation === "screen.preview.clear" && latestShow?.id === previewId && latestShow.revision > revision));
-        const data = deliver(raw, !stalePreview);
+        // Provider data is never an instruction to the host.
+        const data = catalog ? sanitized(raw) : deliver(raw, !stalePreview);
         if (WRITES.has(operation)) invalidateDisplay(domain);
-        else if (receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
+        else if (!catalog && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
       } catch (error) {
         const refusal = failed(error, operation);
+        if (operation === "catalog.call" && current() && (!(error instanceof ApiError) || error.status >= 500))
+          return { ok: false, refusal: { code: "outcome_uncertain", text: "Check this request's status before trying again." } };
         if (current() && previewId && operation === "screen.preview.show" && latestShow?.id === previewId && latestShow.revision === revision) host.command({ operation: "screen.preview.clear", args: { preview_id: previewId } });
         return { ok: false, refusal };
       }
     },
     async planner(operation: RecordSlotVerb, args: ActionArgs): Promise<SlotPlan | ActionRefusal> {
       if (!permitted(operation) || !(RECORD_SLOT_VERBS as readonly string[]).includes(operation)) return { code: "forbidden", text: "This operation is unavailable." };
+      if (operation === "catalog.confirm" && !catalogArgs(args)) return { code: "invalid", text: "This tool request is malformed." };
       try {
-        const raw = await post("slot-prepare", { operation, args });
+        const raw = await (operation === "catalog.confirm" ? post("catalog/prepare", args) : post("slot-prepare", { operation, args }));
         if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" || operation === "whatsapp.handoff.release" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
         const facts = raw.card.facts;
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
@@ -221,18 +251,23 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
               if (!held || Date.now() >= held.expires) throw new ApiError("Confirm this exact CSV plan first", 409);
               confirmation.csv_confirm_token = held.token;
             }
-            const result = await post("slot-confirm", { confirmation_token: raw.confirmation_token, confirmation });
+            const result = await post(operation === "catalog.confirm" ? "catalog/confirm" : "slot-confirm", { confirmation_token: raw.confirmation_token, confirmation });
             if (operation === "records.csv.confirm") {
               if (!object(result) || typeof result.confirm_token !== "string" || !/^confirm-[a-f0-9]{32}$/.test(result.confirm_token)) throw new ApiError("Missing private CSV receipt", 502);
               for (const [key, held] of csv) if (Date.now() >= held.expires) csv.delete(key);
               if (csv.size >= 4) csv.clear();
               csv.set(displayPlanKey(args), { token: result.confirm_token, expires: Date.now() + 60000 });
             }
-            const data = deliver(operation === "records.csv.confirm" && object(result)
+            const data = operation === "catalog.confirm" ? sanitized(result) : deliver(operation === "records.csv.confirm" && object(result)
               ? { ...result, confirmation_required: result.state === "open" } : result);
             if (!["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "chat.whatsapp.brief", "records.csv.confirm"].includes(operation)) invalidateDisplay(domain);
             return { ok: true, data };
-          } catch (error) { return { ok: false, refusal: failed(error, operation) }; }
+          } catch (error) {
+            const denied = failed(error, operation);
+            if (operation === "catalog.confirm" && current() && (!(error instanceof ApiError) || error.status >= 500))
+              return { ok: false, refusal: { code: "outcome_uncertain", text: "Check this request's status before trying again." } };
+            return { ok: false, refusal: denied };
+          }
         } };
       } catch (error) { return failed(error, operation); }
     },
@@ -290,6 +325,25 @@ function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-s
 }
 
 function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
+  if (operation === "catalog.confirm") {
+    const price = object(facts.price) ? facts.price : null;
+    if (!exact(facts, ["tool", "slug", "effect", "price", "input", "account"]) ||
+        typeof facts.tool !== "string" || !facts.tool.trim() || facts.tool.length > 512 ||
+        typeof facts.slug !== "string" || !facts.slug.trim() || facts.slug.length > 512 ||
+        (facts.effect !== "read" && facts.effect !== "draft") ||
+        !price || !exact(price, ["currency", "scale", "amount"]) || price.currency !== "USD" || price.scale !== 6 ||
+        typeof price.amount !== "string" || !/^(0|[1-9]\d{0,9})\.\d{6}$/.test(price.amount) ||
+        !object(facts.input) || !exact(facts.input, ["query", "body", "units"]) ||
+        (facts.account !== undefined && (typeof facts.account !== "string" || !facts.account.trim())))
+      throw new ApiError("Incomplete catalog confirmation facts", 502);
+    const rows: RecordCard["facts"] = [
+      { label: "Tool", value: facts.tool }, { label: "Slug", value: facts.slug },
+      { label: "Effect", value: facts.effect }, { label: "Price", value: `USD ${price.amount}`, strong: true },
+      { label: "Input", value: JSON.stringify(facts.input) },
+    ];
+    if (typeof facts.account === "string") rows.push({ label: "Account", value: facts.account });
+    return { operation, title: "Run this tool?", note: "Review this exact tool, input and price before confirming.", retry: "If the result is unclear, check this request's status before trying again.", confirm: "Run tool", facts: rows };
+  }
   const rows: RecordCard["facts"] = [];
   const show = (label: string, value: unknown) => { if (value !== undefined && value !== null) rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
   const contentOuter = object(facts.content) ? facts.content : facts;
