@@ -1197,7 +1197,7 @@ Object.assign(zhTW, {
   "Still sending the previous message — wait for it to settle": "仍在傳送上一則訊息 — 請等待其完成",
   "This message is too long to send ({kb} KB, the limit is 32 KB). Attach it as a text file instead.": "此訊息太長，無法傳送（{kb} KB，上限 32 KB）。請改為附加文字檔。",
   "Please read the attached text.": "請閱讀附加的文字。",
-  "The long text ({kb} KB) is attached as {name}. Send again once it has uploaded.": "長文字（{kb} KB）已附加為 {name}。上傳完成後請再按傳送。",
+  "The long text ({kb} KB) will be sent as {name}. Press Send again once it has uploaded; the text stays here until then.": "長文字（{kb} KB）將以 {name} 傳送。上傳完成後請再按傳送；在此之前文字會保留在這裡。",
   "The draft changed while the latest version was loading. Your edits are kept; discard again to reload.": "載入最新版本期間草稿已變更。你的編輯會保留；請再次捨棄以重新載入。",
   "Reloaded latest saved version v{v}.": "已重新載入最新儲存版本 v{v}。",
   "Could not reload the latest saved email. Your edits are kept. ": "無法重新載入最新儲存的電子郵件。你的編輯會保留：",
