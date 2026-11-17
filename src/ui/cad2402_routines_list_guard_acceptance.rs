@@ -332,7 +332,7 @@ fn seed_routines(rig: &Rig, owner: &str) -> [&'static str; 2] {
             "routine_create",
             json!({"name": name, "agent_alias": alias, "trigger_kind": "schedule",
                 "interval_mins": 15, "timezone": "UTC",
-                "target_kind": "markdown", "markdown_path": WIKI_PATH}),
+                "target_kind": "markdown", "markdown_path": format!("wiki:{WIKI_PATH}")}),
         )
         .expect("operator creates a routine");
     }
