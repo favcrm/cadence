@@ -2784,6 +2784,30 @@ same app key. An existing conflicting pin refuses before redirect or app
 mount; it is never overwritten. The redirect replaces history and preserves
 the original query and fragment, adding only a missing installation pin.
 
+Installed apps use the board header for `Apps / App name / Section`; the
+version is secondary metadata, and a default section adds no duplicate leaf.
+Sections come only from the active app's declared `section_query`, using the
+verified installation declaration before screen readiness and in native outlets.
+Section labels use the same app-provided locale resolver as sidebar navigation.
+Parent navigation retains installation/context pins and unrelated query
+parameters while clearing record and segment selection. The aligned
+**Assistant** button controls the right-hand chat pane without remounting the
+conversation or app frame. A collapsed chat leaves no rail; on narrow screens
+the workspace and assistant share one pane. App-content navigation temporarily
+selects the narrow workspace; a conversation link reveals the assistant. Neither
+changes the saved Assistant preference. Context-only URL writes do not select a pane.
+Workflow launchers and developer
+tools live in the header's **More actions** menu. Narrow layouts keep account,
+board status, update, language and theme controls in the existing mobile navigation.
+App actions remain unavailable until the current installation receipt is verified.
+Pending approvals stay installation-scoped across cached app switches and
+override the untouched collapsed default; an explicit choice
+still wins. Canvas edit requests reveal the current composer; editable inputs
+receive focus without sending or replacing the draft.
+App-to-chat requests also clear a temporary narrow workspace selection.
+Non-modal app canvases start below the board header and end before the assistant.
+Expansion is disabled when it cannot add width.
+
 Every setup or Browser QA handover states these separately:
 
 - The actually served backend build and board address, with the existing

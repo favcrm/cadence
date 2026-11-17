@@ -51,6 +51,7 @@ let timerSeq = 0;
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
+const HomeComposer = require("../src/features/home/Composer").default as typeof import("../src/features/home/Composer").default;
 const { BrowserCard } = require("../src/features/canvas/BrowserPanel") as typeof import("../src/features/canvas/BrowserPanel");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
@@ -1340,9 +1341,17 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
 // ===== closing the last artifact with no session hands focus to the composer =====
 {
   const m = await start({ state: "none" });
-  const composer = document.createElement("textarea");
-  composer.id = "app-shell-chat-box";
-  document.body.append(composer);
+  const { composerDraftState, setComposerContent } = require("../src/features/app-shell/chat/composerStore") as typeof import("../src/features/app-shell/chat/composerStore");
+  const savedDraft = composerDraftState("home");
+  const composerHost = document.createElement("div");
+  document.body.append(composerHost);
+  const composerRoot = createRoot(composerHost);
+  await React.act(async () => {
+    composerRoot.render(React.createElement(LocaleProvider, null, React.createElement(HomeComposer, {
+      block: null, seed: { text: "", n: 0 }, onCommand: () => undefined, onSent: () => { throw new Error("Focus must not send"); },
+    })));
+  });
+  const composer = composerHost.querySelector("textarea")!;
   await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
   await settle();
   const closeBtn = el(m.host, ".cv-tab-close")!;
@@ -1358,7 +1367,21 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await click(el(m.host, '[aria-label="Close canvas"]')!);
   await raf();
   assert(document.activeElement === composer, "the header close too");
-  composer.remove();
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(composer, "Keep this Home draft");
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 });
+  });
+  await settle();
+  const ask = Array.from(m.host.querySelectorAll<HTMLButtonElement>(".cv-tools button")).find((button) => button.textContent === "Ask to change");
+  assert(ask && !ask.disabled, "Home's document offers an edit request");
+  await click(ask);
+  await raf();
+  assert(document.activeElement === composer, "Ask to change focuses the actual Home composer");
+  equal(composer.value, "Keep this Home draft", "Home's existing draft survives the edit request");
+  await React.act(async () => { setComposerContent("home", savedDraft.text, savedDraft.refs); });
+  await React.act(async () => { composerRoot.unmount(); });
+  composerHost.remove();
   await m.unmount();
 }
 
@@ -2041,6 +2064,42 @@ for (const next of ["ended", "none"] as const) {
   await advance(2000);
   assert(document.activeElement === document.body, "inactive Browser tab does not pull focus when viewOnly engages");
   await m.unmount();
+}
+
+// App canvases cannot expand past the workspace or cover the right assistant.
+{
+  reset({ body: { state: "active", signedIn: false, url: "https://portal.example.test/orders" } });
+  canvasStore.resetCanvas("c1", "app:c1", "app");
+  let room = canvasStore.MIN_WIDTH;
+  const workspace = document.createElement("section");
+  workspace.id = "app-shell-workspace";
+  workspace.getBoundingClientRect = () => new win.DOMRect(208, 40, room, 600);
+  document.body.append(workspace);
+  const m = await mount();
+  await React.act(async () => {
+    store.feedBrowser("c1");
+    canvasStore.openArtifact({ id: "capped-doc", version: 1, kind: "md", title: "Capped document", bytes: 12 });
+  });
+  await settle();
+  const artifactExpand = () => m.host.querySelector<HTMLButtonElement>('.cv-pane [aria-label="Expand canvas"]');
+  const browserExpand = () => m.host.querySelector<HTMLButtonElement>('.bz-head [aria-label="Expand canvas"]');
+  assert(artifactExpand()?.disabled && browserExpand()?.disabled, "both canvas headers disable expansion when the workspace is full");
+  assert(Number.parseFloat(drawer(m)!.style.top) >= workspace.getBoundingClientRect().top, "app cover mode leaves the board header above the canvas");
+  await React.act(async () => {
+    room = 1100;
+    Object.defineProperty(win, "innerWidth", { value: 2000, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await settle();
+  assert(artifactExpand() && !artifactExpand()!.disabled && browserExpand() && !browserExpand()!.disabled, "both headers offer expansion when there is room");
+  const normalWidth = Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w"));
+  await click(artifactExpand()!);
+  equal(Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w")), room, "expansion fills the available workspace");
+  assert(room > normalWidth, "expansion actually widens the canvas");
+  await click(browserExpand()!);
+  equal(Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w")), normalWidth, "the Browser control restores the shared canvas width");
+  await m.unmount();
+  workspace.remove();
 }
 
 console.log("browser canvas tests passed");

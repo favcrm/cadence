@@ -19,6 +19,7 @@ import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, 
 import { resources, threadReader } from "../../../lib/resources";
 import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
+import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
@@ -233,8 +234,9 @@ export interface AppPaneProps {
   /** Refresh the live projection after the native endpoint refuses upload. */
   onFileUploadUnavailable: () => void;
   collapsed: boolean;
-  /** A decision is waiting for this person; the shell keeps the rail visible. */
+  /** A decision is waiting for this person; the shell can reveal the assistant. */
   onPendingDecision?: (pending: boolean) => void;
+  onWaitingChange?: (waiting: boolean) => void;
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
@@ -674,7 +676,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
   const { locale, t, formatNumber } = useLocale();
   const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
@@ -687,6 +689,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const thread = useResource(store);
   const homeMasterState = useQuery(resources.masterState);
   const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  const entries = thread.data?.entries ?? [];
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
+  const onPendingDecision = useCallback(
+    (pending: boolean) => reportPendingDecision?.(pending || permissionPending),
+    [reportPendingDecision, permissionPending],
+  );
   // Hosted turn state belongs to the selected session, just like identity.
   // Native retains the install-wide coordinator queue.
   const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
@@ -1251,16 +1260,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ? t("The conversations could not be read — retry above")
           : t("No conversation yet — start one with + New");
   const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
-  // Waiting dot: the selected conversation grew while the rail was collapsed.
+  // Waiting dot: the selected conversation grew while chat was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
   const waiting = collapsed && items.length > seen.current;
+  useEffect(() => { onWaitingChange?.(waiting); }, [onWaitingChange, waiting]);
   // The turn bar (turnBar.ts, shared with Home): Stop carries this
   // conversation's own running message; Cancel its own queued message.
-  const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
-  const permissionPending = pendingPermission !== null;
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -1974,6 +1981,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const canReplyDraft = canSend && binding.error === null;
   const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const revealComposer = useCallback(() => onCollapsed(false), [onCollapsed]);
   const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
   const rejectAndReplyDraft = useCallback(
     (command: string) => {
@@ -1991,17 +1999,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
     <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
-      <button
-        type="button"
-        className="btn btn-ghost btn-sm app-chat-rail"
-        aria-label={t("Expand assistant chat")}
-        aria-expanded={!collapsed}
-        onClick={() => onCollapsed(false)}
-        data-waiting={waiting || undefined}
-      >
-        {waiting && <span className="app-chat-dot" role="status" aria-label={t("New reply waiting")} />}
-        <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
-      </button>
       <div className="app-chat-head">
         <div
           className="app-chat-title min-w-0"
@@ -2072,17 +2069,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
-            className="app-chat-iconbtn app-chat-collapse"
+            className="app-chat-iconbtn app-chat-close"
             aria-label={t("Collapse assistant chat")}
             title={t("Collapse assistant chat")}
-            aria-expanded={!collapsed}
             onClick={() => onCollapsed(true)}
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="3.5" y="4" width="17" height="16" rx="2.5" />
-              <path d="M9.5 4v16" />
-              <path d="m16 15-3-3 3-3" />
-            </svg>
+            <IconClose size={14} />
           </button>
         </div>
         {historyOpen && active.state === "ready" && (
@@ -2508,6 +2500,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         stop={canStop ? { onStop: () => { if (runningMessage) turnCommand("stop", runningMessage); } } : null}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
+        onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
         onCommand={(name, arg) => {
