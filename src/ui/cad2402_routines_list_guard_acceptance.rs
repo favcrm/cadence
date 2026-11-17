@@ -31,7 +31,7 @@ use crate::test_seam::{scoped, Asserted};
 
 const ORG: &str = "cad2402-synthetic-org";
 const KID: &str = "cad2402-synthetic-key";
-const WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\ninputs:\n  topic: { ask: \"About what?\" }\n---\n\nWhy.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n";
+const WORKFLOW: &str = "---\ntitle: \"Note: {{topic}}\"\ngoal: \"One short text note\"\ninputs:\n  topic: { ask: \"About what?\" }\n  writer: { ask: \"Registered writer\" }\n---\n\nWhy.\n\n## Write {{topic}}\nagent: {{writer}}\nsize: S\naction: local.text.produce\n\nDo it.\n\n### Acceptance\n- [ ] note written\n";
 const SECRET_BODY: &str = "# Triage\nReview new alerts: cad2402-secret-playbook-text.\n";
 const WIKI_PATH: &str = "global/playbooks/triage.md";
 
