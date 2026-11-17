@@ -25,8 +25,8 @@ for (const absent of ["Agents", "Memory", "Master permissions", "Advanced custod
   if (flat(OWNER).includes(absent)) throw new Error(`${absent} must be hidden on a hosted board`);
 equal(
   flat(null),
-  ["Preferences", "Agents", "Connections", "Email sending", "Memory", "Status", "Master permissions", "Advanced custody"],
-  "no list keeps every section a native board has",
+  ["Preferences", "Agents", "Connections", "Email sending", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
+  "no list keeps every section a native board has, General (company time zone) included",
 );
 equal(
   flat({ ...OWNER, platform_account_configured: true }).includes("Account"),
