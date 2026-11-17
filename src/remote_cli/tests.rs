@@ -9335,3 +9335,127 @@ fn cad2396_skill_write_without_a_matching_receipt_is_unknown() {
         assert!(out.is_ok(), "{verb}: {out:?}");
     }
 }
+
+// AOS-627: a staged connected effect is accepted only as the strict stage
+// answer, never as a provider result.
+#[test]
+fn hosted_connected_effect_answer_is_strict() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let ok = |data: Value| json!({"ok": true, "data": data});
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "pending", "replayed": false})
+    )));
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "applied", "replayed": true, "result": {}})
+    )));
+    for bad in [
+        json!({"action_id": id, "outcome": "pending"}),
+        json!({"action_id": "ABC", "outcome": "pending", "replayed": false}),
+        json!({"action_id": id, "outcome": "sent", "replayed": false}),
+        json!({"action_id": id, "outcome": "pending", "replayed": false, "price": {}}),
+    ] {
+        assert!(!connected_effect_stage_answer(&ok(bad)));
+    }
+    assert!(!connected_effect_stage_answer(&json!({"ok": false})));
+}
+
+// AOS-627: an uncertain stage never points at `platform status`, which cannot
+// see staged actions; repeating the same stage with the same key is the safe
+// retry.
+#[test]
+fn hosted_connected_effect_reconciles_by_replaying_the_same_stage() {
+    let arguments = json!({"operation": "connected_effect"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+    assert!(effect.is_mutation());
+    let note = effect.reconciliation().unwrap();
+    assert!(note.contains("same `--request`"), "{note}");
+    assert!(!note.contains("replaying `platform call`"), "{note}");
+}
+
+// AOS-627: a refused stage prints the board's code, including the 403/404/503
+// ones the generic classification drops.
+#[test]
+fn hosted_connected_effect_refusal_prints_its_code() {
+    let args = json!({
+        "operation": "connected_effect",
+        "tool": "gmail_send",
+        "connectionId": "con_synthetic",
+        "body": {},
+        "key": "synthetic-stage-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for (status, code) in [
+        (404, "not_allowlisted"),
+        (403, "connection_access_denied"),
+        (503, "capability_unavailable"),
+    ] {
+        let (listener, _requests, _server) = fake_worker(vec![(
+            status,
+            "",
+            json!({"ok": false, "error": {"code": code}}),
+        )]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a refused stage is not retried"),
+        )
+        .expect_err("a refused stage is an error");
+        assert!(err.to_string().contains(code), "{err}");
+        assert!(err.to_string().contains("nothing ran"), "{err}");
+    }
+}
+
+// AOS-627: a coded 5xx other than the two pre-staging 503s may follow a
+// committed stage, so it is an unknown outcome, never "nothing was staged".
+#[test]
+fn hosted_connected_effect_5xx_is_unknown_not_a_refusal() {
+    let args = json!({
+        "operation": "connected_effect",
+        "tool": "gmail_send",
+        "connectionId": "con_synthetic",
+        "body": {},
+        "key": "synthetic-stage-2"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let (listener, _requests, _server) = fake_worker(vec![(
+        500,
+        "",
+        json!({"ok": false, "error": {"code": "internal_error"}}),
+    )]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let err = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an uncertain stage is not retried"),
+    )
+    .expect_err("a 500 is not a success");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(!err.to_string().contains("nothing was staged"), "{err}");
+}

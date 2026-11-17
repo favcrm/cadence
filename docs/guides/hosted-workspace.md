@@ -537,6 +537,25 @@ A replay without a recorded result is not a successful report. Hosted and
 local-device clients refuse to present a missing result as success and do not
 automatically dispatch another read.
 
+### Staging a draft or send tool for owner approval
+
+A connected draft/send tool (for example a Gmail send) never runs when an agent
+asks. `platform stage` sends `operation: connected_effect` (`cli.write`) and the
+board records the exact call as an action for the owner to approve:
+
+```sh
+cadence --org acme platform stage gmail_send --connection con_example --input @message.json [--request <handle>]
+```
+
+The answer is the staged action (`action_id`, `outcome`, `replayed`), never a
+provider result. `outcome` `pending` means the call did **not** run and waits
+for an owner's approval on the board. The same `--request` (or, when omitted,
+the same tool, connection and input) replays the same action; the same handle
+with a different call is refused (`key_reused`). A refusal prints its code, for
+example `not_allowlisted`, `no_decider` or `connection_unavailable`. A local
+org refuses the subcommand, and `platform call --connection` still sends only
+`connected_read`.
+
 ### Owner enrollment from the CLI (Search Console first)
 
 An owner enrolls a provider account from a plain shell, in three steps. The

@@ -389,6 +389,7 @@ const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved �
 const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
@@ -545,6 +546,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 // link, so its lost or unusable answer is a possible mutation; the
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 _ => cli_effect(verb),
             }
         }
@@ -782,6 +784,38 @@ pub fn connection_providers_answer(answer: &Value) -> bool {
     connection_rows(answer, "providers", connection_provider_row)
 }
 
+/// AOS-627: the strict `connected_effect` answer: `data` is exactly
+/// `{action_id, outcome, replayed, result?}`. It is the staged action's state,
+/// never a provider result.
+pub fn connected_effect_stage_answer(answer: &Value) -> bool {
+    let Some(data) = answer
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|_| answer.get("ok").and_then(Value::as_bool) == Some(true))
+    else {
+        return false;
+    };
+    data.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action_id" | "outcome" | "replayed" | "result"
+        )
+    }) && data
+        .get("action_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && matches!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("pending" | "applied" | "failed" | "denied")
+        )
+        && data.get("replayed").is_some_and(Value::is_boolean)
+        && data.get("result").is_none_or(Value::is_object)
+}
 pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
 }
@@ -6270,6 +6304,14 @@ fn call_verb_until_retry(
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
+                Some("connected_effect")
+                    if !body.as_ref().is_some_and(connected_effect_stage_answer) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected-effect stage returned no usable answer — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
                 Some("status")
                     if !body.as_ref().is_some_and(|answer| {
                         answer.get("ok").and_then(Value::as_bool) == Some(true)
@@ -6611,6 +6653,39 @@ fn call_verb_until_retry(
                 "the connected read was refused: check the input and connection, or update \
                  the hosted tenant server if it predates connected-read support",
             ));
+        }
+        // AOS-627: the stage's refusals are named by the board (`not_allowlisted`,
+        // `connection_access_denied`, `capability_unavailable`, ...). The generic
+        // classification drops the code of a 403, 404 or 503, so print it here.
+        // A board that predates the operation refuses it as `invalid_request`.
+        // Only the stage's own pre-effect refusals are definite: 400/403/404/409,
+        // and the two 503 codes the board returns before staging. A 401 keeps its
+        // login remedy, a waking answer keeps its wake path, and any other 5xx
+        // stays an unknown outcome (the row may exist), reconciled by replaying
+        // the same stage.
+        if platform_operation == Some("connected_effect")
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+        {
+            let definite = match (status, refusal_code.as_deref()) {
+                (400 | 403 | 404 | 409, Some(code)) => Some(code),
+                (503, Some(code @ ("capability_unavailable" | "authority_unavailable"))) => {
+                    Some(code)
+                }
+                _ => None,
+            };
+            if let Some(code) = definite {
+                let hint = if code == "invalid_request" {
+                    " — check the input and connection, or update the hosted tenant server if \
+                     it predates connected-effect support"
+                } else {
+                    ""
+                };
+                return Err(reject(format!(
+                    "the stage was refused (HTTP {status}, {code}){hint}; nothing was staged \
+                     and nothing ran"
+                )));
+            }
         }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
