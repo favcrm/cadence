@@ -555,7 +555,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     {playbackUrl && typeof document !== "undefined" && createPortal(
       <WorkspaceDialog title={t("Meeting recording")} className="wa-confirm" onClose={() => setPlaybackUrl(null)}>
         <div className="wa-stack">
-          <audio controls preload="metadata" src={playbackUrl} aria-label={t("Meeting recording")} />
+          <audio controls preload="metadata" src={playbackUrl} aria-label={t("Meeting recording")} style={{ maxWidth: "100%" }} />
           <Button onClick={() => setPlaybackUrl(null)}>{t("Close")}</Button>
         </div>
       </WorkspaceDialog>,
