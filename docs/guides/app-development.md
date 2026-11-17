@@ -239,6 +239,12 @@ Hosted boards read catalogue metadata from `api.internal`; the release document
 is proxied through the closed `catalogue-packages.internal` broker. Every
 install/update is operator-only.
 
+Where private uploads are available, an owner can select **Add private app**
+in Apps, check the ZIP, review its declared access and explicitly install it.
+If the install or update result is unconfirmed, it may already have committed.
+Refresh Apps and inspect the installed version before checking the ZIP again;
+do not blindly resubmit it.
+
 ## 7. Existing apps
 
 **Social Content** (`0.13.0`) uses the pinned `@cadence/app-kit` through
