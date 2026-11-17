@@ -407,8 +407,7 @@ impl AgenticosExternalAdapter {
         &self,
         credential: &[u8],
         binding: &Value,
-    ) -> std::result::Result<(u64, String, Option<String>, Option<String>, Option<String>), String>
-    {
+    ) -> std::result::Result<AppCapabilityQuote, String> {
         let config = &binding["config"];
         let mapping = &config["mapping"];
         if config["provider"] != PLATFORM
@@ -468,8 +467,20 @@ impl AgenticosExternalAdapter {
             mapping["effect"].as_str().unwrap_or(""),
             &envelope["data"],
         )?;
-        if tool != POSTS_TOOL || protocol.is_none() {
-            return Ok((total, revision, protocol, model, None));
+        let mut quoted = AppCapabilityQuote {
+            schema: 1,
+            currency: "USD".into(),
+            unit_price_micros: total,
+            units: 1,
+            total_price_micros: total,
+            price_revision: revision,
+            model,
+            price_slug: None,
+            pricing_revision: None,
+            charge_protocol: protocol,
+        };
+        if tool != POSTS_TOOL || quoted.charge_protocol.is_none() {
+            return Ok(quoted);
         }
         let url = format!("{}/v1/runtime/tools/{tool}/quote", self.base);
         let mut response = authorized(self.http.post(&url), token)
@@ -504,13 +515,11 @@ impl AgenticosExternalAdapter {
         {
             return Err("AgenticOS tool quote is invalid".into());
         }
-        Ok((
-            amount,
-            revision.to_owned(),
-            protocol,
-            model,
-            Some(revision.to_owned()),
-        ))
+        quoted.unit_price_micros = amount;
+        quoted.total_price_micros = amount;
+        quoted.price_revision = revision.to_owned();
+        quoted.pricing_revision = Some(revision.to_owned());
+        Ok(quoted)
     }
 
     fn call_source(
@@ -1993,20 +2002,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         if binding["config"]["mapping"]["capability"] == "media.generate" {
             return self.quote_image(credential, binding);
         }
-        let (total, revision, charge_protocol, model, pricing_revision) =
-            self.quote_fixed(credential, binding)?;
-        Ok(AppCapabilityQuote {
-            schema: 1,
-            currency: "USD".into(),
-            unit_price_micros: total,
-            units: 1,
-            total_price_micros: total,
-            price_revision: revision,
-            model,
-            price_slug: None,
-            pricing_revision,
-            charge_protocol,
-        })
+        self.quote_fixed(credential, binding)
     }
 
     fn execute_app_capability(
