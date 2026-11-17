@@ -120,12 +120,12 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path.startsWith("/api/meta")) {
     const role = operatorSession ? "operator" : "member";
     return json({ read_only: false, operator: operatorSession, signed_in: true, actor: `${role} (ui)`,
-      session: { id: `refusal-session-${role}`, origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: role, role } } });
+      session: { id: `refusal-session-${role}`, origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: role, email: `${role}@example.test`, role } } });
   }
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
-  if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
+  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": `refusal-session-${operatorSession ? "operator" : "member"}` } });
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
   if (path === "/api/app-installations") { listCalls++; return json(INSTALLS); }
@@ -263,9 +263,9 @@ await React.act(async () => { root.unmount(); });
 // (5) A signed-in NON-operator (the `?operator=1` proof answers false)
 // lands on the same retired route. The route must NOT resolve the id,
 // must NEVER request the protected `/api/app-installations` list (that
-// read is operator-only), and no app may mount or be read for it. A fresh
-// root is a fresh page load: the member credential is what the proof
-// sees from the start — there is no stale operator answer to reuse.
+// read is operator-only), and no app may mount or be read for it. This
+// reload retains the previous hosted identity, so confirm the newly
+// verified member before exercising the member route.
 operatorSession = false;
 const listBefore = listCalls;
 const readsBeforeMember = appReads.length;
@@ -274,6 +274,10 @@ history.pushState(null, "", "/app-installations/install-ok?ctx=ctx-a&conversatio
 await React.act(async () => {
   root2.render(React.createElement(LocaleProvider, null, React.createElement(App)));
 });
+await settle(() => assert(host.querySelector("[data-auth-state='changed'] h1"), "changed hosted identity requires confirmation"));
+const confirmMember = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Continue with this sign-in");
+assert(confirmMember, "member confirmation is offered");
+await React.act(async () => confirmMember.click());
 await settle(() => assert(
   host.textContent?.includes("App link unavailable") || host.textContent?.includes("Sign in as the operator"),
   "non-operator gets the unavailable page on the retired route",

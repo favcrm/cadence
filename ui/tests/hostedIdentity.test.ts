@@ -76,6 +76,9 @@ async function boundaryChecks() {
   const signedIn = { ...base, hosted: false, operator: false, session: { id: "local-member", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: "member", name: "Member", email: "member@example.test", handle: "member", role: "member" } } };
   let response: () => Response | Promise<Response> = () => json(signedIn);
   let projectsResponse = () => json({ projects: [{ key: "private-project" }] });
+  let healthResponse = () => json({ ok: true, pm_present: true, projects: 2, issues: 9, daemon: "reachable", embedded: true });
+  let healthExpectedSession: string | null = null;
+  let healthValidator: string | null = null;
   const proofHeaders: (string | null)[] = [];
   let lateRead: ((response: Response) => void) | undefined;
   let pdfExpectedSession: string | null = null;
@@ -92,6 +95,11 @@ async function boundaryChecks() {
     if (url.pathname.startsWith("/api/chat/attachments/")) {
       pdfExpectedSession = new Headers(init?.headers).get("X-Cadence-Expected-Session");
       return new Response("synthetic PDF from an older host");
+    }
+    if (url.pathname === "/api/health") {
+      healthExpectedSession = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+      healthValidator = new Headers(init?.headers).get("If-None-Match");
+      return healthResponse();
     }
     if (url.pathname === "/api/projects") return projectsResponse();
     if (url.pathname === "/api/issues") return new Promise<Response>((resolve) => { lateRead = resolve; });
@@ -183,6 +191,50 @@ async function boundaryChecks() {
       win.open = oldOpen;
     }
     await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    healthResponse = () => new Response(JSON.stringify({ ok: true, pm_present: true, projects: 2, issues: 9, daemon: "reachable", embedded: true }), {
+      headers: { "Content-Type": "application/json", "ETag": '"health-v1"', "X-Cadence-Verified-Session": "hosted-session" },
+    });
+    let healthIssues = 0;
+    await React.act(async () => { healthIssues = (await api.health()).issues; });
+    assert(healthExpectedSession === "hosted-session" && healthIssues === 9, "hosted health is delivered only for the requesting tab's verified identity");
+    for (const { proof, status } of [
+      { proof: null, status: 304 },
+      { proof: null, status: 200 },
+      { proof: "different-session", status: 200 },
+    ]) {
+      let decoded = false;
+      healthResponse = () => {
+        const reply = new Response(status === 304 ? null : JSON.stringify({ issues: 777 }), {
+          status, headers: proof === null ? {} : { "X-Cadence-Verified-Session": proof },
+        });
+        const decode = reply.json.bind(reply);
+        reply.json = () => { decoded = true; return decode(); };
+        return reply;
+      };
+      let rejected = false;
+      await React.act(async () => { await api.health().catch(() => { rejected = true; }); });
+      if (status === 304) assert(healthValidator === '"health-v1"', "the unproved 304 attempts to reuse a cached health result");
+      assert(rejected && !decoded && !privateReadsAllowed(), "unproved hosted health is rejected before its body is decoded");
+      assert(host.querySelector(`[data-auth-state='${proof === null ? "updating" : "unavailable"}'] h1`), "unproved hosted health pauses the workspace with recovery guidance");
+      const checks = proofHeaders.length;
+      await focus();
+      assert(proofHeaders.length === checks, "an unproved health read does not repeatedly reopen the workspace on focus");
+      response = () => json(hostedSession);
+      await retry();
+      assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session health recovery retains the in-memory draft");
+    }
+    for (const { status, code, state } of [
+      { status: 409, code: "session_changed", state: "unavailable" },
+      { status: 401, code: "board_session_required", state: "unavailable" },
+      { status: 503, code: "sign_in_upgrade_required", state: "updating" },
+    ]) {
+      healthResponse = () => json({ error: { code, message: "Verification required." } }, status);
+      await React.act(async () => { await api.health().catch(() => undefined); });
+      assert(host.querySelector(`[data-auth-state='${state}'] h1`) && !privateReadsAllowed(), "unproved health refusal pauses private work until reverified");
+      response = () => json(hostedSession);
+      await retry();
+      assert(host.querySelector("output")?.textContent === "unsaved private draft", "session uncertainty does not discard a draft");
+    }
     const beforeUpgrade = privateSessionGeneration();
     response = () => json({ error: { code: "sign_in_upgrade_required", message: "Updating" } }, 503);
     await focus();

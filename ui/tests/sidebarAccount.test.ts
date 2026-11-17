@@ -49,7 +49,7 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
-  if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
+  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": validSession.id } });
   if (path === "/api/update/banner") return json(null);
   if (path === "/api/setup") return json({ checks: [], offers: [] });
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });

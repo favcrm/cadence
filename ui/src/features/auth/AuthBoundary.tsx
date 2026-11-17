@@ -111,6 +111,7 @@ export default function AuthBoundary({ children }: {
   const retryFocus = useRef(false);
   const privateFocus = useRef<HTMLElement | null>(null);
   const logoutPending = useRef(false);
+  const healthRecoveryPending = useRef(false);
 
   const publish = useCallback((next: BoundaryState) => {
     stateRef.current = next;
@@ -221,6 +222,7 @@ export default function AuthBoundary({ children }: {
         }
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;
+        healthRecoveryPending.current = false;
         try { sessionStorage.setItem(IDENTITY_STORE, nextIdentity); } catch { /* Same-page state still owns its drafts. */ }
         allowPrivateReads(hosted && session?.origin === "public" ? session.id : null);
         setSession(meta);
@@ -302,7 +304,18 @@ export default function AuthBoundary({ children }: {
       }
       publish({ ...previous, status: expired ? "expired" : "signedout", accepted: null, generation: privateSessionGeneration() });
     };
-    const focused = () => { if (!document.hidden) void recheck(); };
+    const healthUnverified = (event: Event) => {
+      const focused = document.activeElement;
+      if (stateRef.current.status === "ready" && focused instanceof HTMLElement && focused.closest("[data-app-shell]")) privateFocus.current = focused;
+      sequence.current += 1;
+      inFlight.current?.controller.abort();
+      inFlight.current = null;
+      healthRecoveryPending.current = true;
+      pausePrivateReads();
+      setSession(null);
+      publish({ ...stateRef.current, status: event.type === "cadence:hosted-health-updating" ? "updating" : "unavailable", hosted: true });
+    };
+    const focused = () => { if (!document.hidden && !healthRecoveryPending.current) void recheck(); };
     const online = () => { void recheck(); };
     const shared = (event: StorageEvent) => {
       // Another tab replaced or removed the shared key. Drop this tab's
@@ -317,6 +330,8 @@ export default function AuthBoundary({ children }: {
     window.addEventListener("cadence:session-ended", finished);
     window.addEventListener("cadence:session-logout-unavailable", logoutUnavailable);
     window.addEventListener("cadence:session-required", required);
+    window.addEventListener("cadence:hosted-health-updating", healthUnverified);
+    window.addEventListener("cadence:hosted-health-unverified", healthUnverified);
     window.addEventListener("focus", focused);
     document.addEventListener("visibilitychange", focused);
     const timer = window.setInterval(focused, 30_000);
@@ -332,19 +347,21 @@ export default function AuthBoundary({ children }: {
       window.removeEventListener("cadence:session-ended", finished);
       window.removeEventListener("cadence:session-logout-unavailable", logoutUnavailable);
       window.removeEventListener("cadence:session-required", required);
+      window.removeEventListener("cadence:hosted-health-updating", healthUnverified);
+      window.removeEventListener("cadence:hosted-health-unverified", healthUnverified);
       window.removeEventListener("focus", focused);
       window.removeEventListener("online", online);
       window.removeEventListener("storage", shared);
       document.removeEventListener("visibilitychange", focused);
     };
-  }, [discard, publish, recheck, requireHostedConfirmation]);
+  }, [discard, publish, recheck, requireHostedConfirmation, setSession]);
 
   // A local daemon restart or a brief identity outage leaves the session
   // intact (`unavailable` is not a sign-out). Retry on a short cadence so
   // the workspace comes back by itself instead of waiting for the 30 s
   // heartbeat or a manual click.
   useEffect(() => {
-    if (state.status !== "unavailable") return;
+    if (state.status !== "unavailable" || healthRecoveryPending.current) return;
     const timer = window.setInterval(() => { void recheck(); }, 3_000);
     return () => window.clearInterval(timer);
   }, [state.status, recheck]);

@@ -9,6 +9,7 @@ import {
   privateFetch,
   privateReadsAllowed,
   privateSessionGeneration,
+  verifiedHostedSessionId,
   usingPrivateOperation,
   type PrivateOperation,
 } from "./privateSession";
@@ -369,14 +370,33 @@ export interface MemberAssistSend {
 
 export { ApiError } from "./apiError";
 
+function hostedHealthUnverified(expected: string, signal: AbortSignal | null | undefined, updating: boolean): void {
+  if (!signal?.aborted && verifiedHostedSessionId() === expected && typeof window !== "undefined") {
+    window.dispatchEvent(new Event(updating ? "cadence:hosted-health-updating" : "cadence:hosted-health-unverified"));
+  }
+}
+
 const conditional = new ConditionalGet(
-  (input, init) => fetch(input, init),
-  () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`,
+  async (input, init) => {
+    const response = await fetch(input, init);
+    const expected = new Headers(init?.headers).get("X-Cadence-Expected-Session");
+    if (expected !== null && (response.ok || response.status === 304)) {
+      const proof = response.headers.get("X-Cadence-Verified-Session");
+      if (proof !== expected) {
+        hostedHealthUnverified(expected, init?.signal, proof === null);
+        void response.body?.cancel().catch(() => undefined);
+        throw new Error("Hosted health session proof is unavailable");
+      }
+    }
+    return response;
+  },
+  () => JSON.stringify([sessionKey(), privateSessionGeneration(), verifiedHostedSessionId()]),
 );
 
 async function readConditional<T>(path: string, signal: AbortSignal | undefined, operation: PrivateOperation | null): Promise<T> {
   const protectedRead = !path.startsWith("/api/meta");
   const generation = operation?.generation ?? privateSessionGeneration();
+  const expectedSession = path === "/api/health" ? verifiedHostedSessionId() : null;
   if (protectedRead) operation?.assertCurrent();
   const controller = new AbortController();
   const stopCaller = signal ? bindPrivateAbort(controller, signal) : () => {};
@@ -387,7 +407,9 @@ async function readConditional<T>(path: string, signal: AbortSignal | undefined,
   };
   try {
     if (controller.signal.aborted) throw new DOMException("The private session changed", "AbortError");
-    const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), controller.signal);
+    const headers = sessionHeaders();
+    if (expectedSession !== null) headers["X-Cadence-Expected-Session"] = expectedSession;
+    const { response: resp, value } = await conditional.get<T>(path, headers, controller.signal);
     if (operation) operation.assertCurrent();
     else if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
       throw new Error("Session changed during request");
@@ -397,7 +419,9 @@ async function readConditional<T>(path: string, signal: AbortSignal | undefined,
       if (operation) operation.assertCurrent();
       else if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
       const code = body?.code ?? body?.error?.code;
-      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
+      if (expectedSession !== null && [401, 403, 409, 503].includes(resp.status)) {
+        hostedHealthUnverified(expectedSession, controller.signal, resp.status === 503 && code === "sign_in_upgrade_required");
+      } else if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
         window.dispatchEvent(new Event("cadence:session-required"));
       }
       throw new ApiError(
