@@ -9372,3 +9372,45 @@ fn hosted_connected_effect_reconciles_by_replaying_the_same_stage() {
     assert!(note.contains("same `--request`"), "{note}");
     assert!(!note.contains("replaying `platform call`"), "{note}");
 }
+
+// AOS-627: a refused stage prints the board's code, including the 403/404/503
+// ones the generic classification drops.
+#[test]
+fn hosted_connected_effect_refusal_prints_its_code() {
+    let args = json!({
+        "operation": "connected_effect",
+        "tool": "gmail_send",
+        "connectionId": "con_synthetic",
+        "body": {},
+        "key": "synthetic-stage-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for (status, code) in [(404, "not_allowlisted"), (403, "connection_access_denied")] {
+        let (listener, _requests, _server) = fake_worker(vec![(
+            status,
+            "",
+            json!({"ok": false, "error": {"code": code}}),
+        )]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a refused stage is not retried"),
+        )
+        .expect_err("a refused stage is an error");
+        assert!(err.to_string().contains(code), "{err}");
+        assert!(err.to_string().contains("nothing ran"), "{err}");
+    }
+}

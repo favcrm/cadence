@@ -6654,6 +6654,28 @@ fn call_verb_until_retry(
                  the hosted tenant server if it predates connected-read support",
             ));
         }
+        // AOS-627: the stage's refusals are named by the board (`not_allowlisted`,
+        // `connection_access_denied`, `capability_unavailable`, ...). The generic
+        // classification drops the code of a 403, 404 or 503, so print it here.
+        // A board that predates the operation refuses it as `invalid_request`.
+        if platform_operation == Some("connected_effect") && !(200..300).contains(&status) {
+            if let Some(code) = refusal_code.as_deref().filter(|code| {
+                !board_gate_refused(body.as_ref())
+                    && !tracker_unavailable_before_verb(status, body.as_ref())
+                    && !matches!(*code, "uncertain" | "idempotency_in_progress")
+            }) {
+                let hint = if code == "invalid_request" {
+                    " — check the input and connection, or update the hosted tenant server if \
+                     it predates connected-effect support"
+                } else {
+                    ""
+                };
+                return Err(reject(format!(
+                    "the stage was refused (HTTP {status}, {code}){hint}; nothing was staged \
+                     and nothing ran"
+                )));
+            }
+        }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
                 || (status == 400
