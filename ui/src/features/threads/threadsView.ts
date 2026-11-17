@@ -205,3 +205,10 @@ export function contextualReplyText(
   const lines = quote.split("\n").map((line) => `> ${line}`).join("\n");
   return `${body}\n\n— Replying to your message ${original.id}:\n${lines}`;
 }
+
+/** CAD-2380: only an agent's prose and a system note render as Markdown.
+ *  Tool calls and results, turn results and every other kind keep their text
+ *  as written (shell output must not fold lines or turn `# x` into a heading). */
+export function rendersMarkdown(entry: { role: string; kind: string }): boolean {
+  return (entry.role === "agent" && (entry.kind === "message" || entry.kind === "assistant_text")) || entry.role === "system";
+}

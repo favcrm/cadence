@@ -2901,7 +2901,7 @@ Object.assign(zhTW, {
   "in the canvas": "已放到畫布",
   "Assistant could not finish this turn": "助理未能完成此回合",
   "Assistant could not finish this turn.": "助理未能完成此回合。",
-  "Assistant could not run: billing is not set up for this company. The company owner needs to set up billing.": "助理無法執行：此公司尚未設定帳單。需要由公司擁有者設定帳單。",
+  "Assistant could not run: billing is not set up for this company. The company owner needs to set up billing.": "助理無法執行：此公司尚未設定計費。需要由公司擁有者設定計費。",
   "Assistant settings": "助理設定",
   "Delivery unconfirmed": "未能確認是否已送達",
   "The send may still have been delivered — retry sends the same message once.": "訊息可能已經送達 — 重試只會再傳送同一則訊息一次。",
