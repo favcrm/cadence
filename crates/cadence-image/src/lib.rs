@@ -113,9 +113,6 @@ fn jpeg_error(error: libjpeg_turbo_rs::JpegError) -> ImageError {
 
 fn decode_jpeg(bytes: &[u8], max_side: u32, max_pixels: u64, native: bool) -> Result<Decoded> {
     let layout = jpeg::inspect(bytes)?;
-    if native && layout.end != bytes.len() {
-        return Err(ImageError::Invalid);
-    }
     dimensions(layout.width, layout.height, max_side, max_pixels)?;
     let scaled = cfg!(target_arch = "wasm32")
         && !native
@@ -388,8 +385,9 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
 }
 
 /// Validate an image under native prompt limits and return the bytes that may
-/// be delivered. PNG metadata is removed after applying orientation; callers
+/// be delivered. JPEG suffixes and unsafe PNG metadata are removed; callers
 /// must use the returned bytes rather than assuming the retained source is safe.
+/// A borrowed result is always a prefix of the input.
 pub fn validate_native<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>> {
     let format = Format::from_mime(mime).ok_or(ImageError::Unsupported)?;
     let decoded = decode(bytes, format, true)?;
@@ -437,7 +435,7 @@ pub fn validate_native<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>>
     }
     Ok(match decoded.clean_source {
         Some(clean) => Cow::Owned(clean),
-        None => Cow::Borrowed(bytes),
+        None => Cow::Borrowed(&bytes[..decoded.source_end]),
     })
 }
 

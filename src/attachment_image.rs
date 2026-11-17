@@ -141,10 +141,13 @@ pub fn validate_raster<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>>
     cadence_image::validate_native(bytes, mime).map_err(|error| Error::rejected(error.to_string()))
 }
 
-/// Keep the original allocation when validation did not need a derivative.
-pub fn prepare_raster(bytes: Vec<u8>, mime: &str) -> Result<Vec<u8>> {
+/// Keep the original allocation when validation only needs an input prefix.
+pub fn prepare_raster(mut bytes: Vec<u8>, mime: &str) -> Result<Vec<u8>> {
     match validate_raster(&bytes, mime)? {
-        Cow::Borrowed(_) => Ok(bytes),
+        Cow::Borrowed(clean) => {
+            bytes.truncate(clean.len());
+            Ok(bytes)
+        }
         Cow::Owned(clean) => Ok(clean),
     }
 }
@@ -626,3 +629,43 @@ fn apply_render_limits() -> std::io::Result<()> {
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+#[cfg(test)]
+mod cad2355_jpeg_suffix_acceptance {
+    use super::{prepare_raster, validate_raster};
+    use image::ExtendedColorType;
+
+    #[test]
+    fn native_jpeg_preserves_original_and_delivers_only_the_first_image() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85)
+            .encode(&[255, 0, 0, 0, 0, 255], 2, 1, ExtendedColorType::Rgb8)
+            .expect("encode a complete JPEG");
+        assert!(jpeg.ends_with(&[0xff, 0xd9]));
+        assert!(validate_raster(&jpeg, "image/jpeg").is_ok());
+
+        for tail in [&b"phone metadata\0\xff\xd9"[..], &b"\xff\xd8\xff\xd9\0"[..]] {
+            let mut retained = jpeg.clone();
+            retained.extend_from_slice(tail);
+            let original = retained.clone();
+            let checked = validate_raster(&retained, "image/jpeg")
+                .expect("a complete JPEG with a suffix must be accepted");
+            assert_eq!(checked.as_ref(), jpeg.as_slice());
+            assert_eq!(
+                retained, original,
+                "validation must not alter the retained upload"
+            );
+            let delivered = prepare_raster(retained.clone(), "image/jpeg")
+                .expect("prepare the first JPEG without its suffix");
+            assert_eq!(delivered, jpeg);
+            assert_eq!(
+                retained, original,
+                "preparation must leave the retained upload unchanged"
+            );
+        }
+
+        let incomplete = &jpeg[..jpeg.len() - 2];
+        assert!(validate_raster(incomplete, "image/jpeg").is_err());
+        assert!(prepare_raster(incomplete.to_vec(), "image/jpeg").is_err());
+    }
+}
