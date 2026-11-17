@@ -117,6 +117,36 @@ pub enum ReviewKind {
     /// Two verdicts — Standards and Spec/security — by distinct
     /// reviewers.
     StandardsAndSpec,
+    /// CAD-2413: an approved policy requires only the Standards review.
+    Standards,
+    /// CAD-2413: an approved policy requires only the Spec/security review.
+    SpecSecurity,
+}
+
+/// CAD-2413: one review an approved policy's applying rules require, so a
+/// gate can count it by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredReview {
+    /// The review's name in the policy's `reviews` map.
+    pub name: String,
+    /// `agent`, `check` or `operator`.
+    pub kind: String,
+    /// An `agent` review's focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// A `check` review's GitHub App.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A `check` review's mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// CAD-2413: a GitHub App check an approved policy requires on the head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredCheck {
+    pub name: String,
+    pub app: String,
 }
 
 /// What a delivery needs to merge, derived from the class.
@@ -144,6 +174,14 @@ pub struct Requirements {
     /// evidence binds to it and a policy change invalidates them.
     pub policy_digest: String,
     pub activation: Activation,
+    /// CAD-2413: the reviews an approved custom policy's applying rules
+    /// require, in rule order. Absent when no approved policy was evaluated,
+    /// so a gate can tell "the policy requires none" from "no policy".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_reviews: Option<Vec<RequiredReview>>,
+    /// CAD-2413: the GitHub App checks those rules require; absent likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_checks: Option<Vec<RequiredCheck>>,
 }
 
 // CAD-2386: this module carries no repository's path rules. The routine
@@ -476,6 +514,8 @@ fn strict_requirements(
         reasons,
         policy_digest: resolved.digest.clone(),
         activation,
+        required_reviews: None,
+        required_checks: None,
     }
 }
 
@@ -492,6 +532,15 @@ pub fn classify(
     let activation = activation_of(resolved);
     let parsed = parse_lists(lists);
     let mut reasons = Vec::new();
+
+    // CAD-2413: an owner-approved custom policy is evaluated (opt-in, operator
+    // decision 2026-11-17). Anything else not Active keeps the strict floor.
+    if activation == Activation::NoProfile
+        && resolved.source == "approved"
+        && resolved.policy.validate().is_ok()
+    {
+        return classify_approved(resolved, activation, changes, lines, parsed.as_ref());
+    }
 
     if activation != Activation::Active {
         reasons.push(format!(
@@ -624,6 +673,8 @@ pub fn classify(
             reasons,
             policy_digest: resolved.digest.clone(),
             activation,
+            required_reviews: None,
+            required_checks: None,
         };
     }
 
@@ -639,6 +690,204 @@ pub fn classify(
         reasons,
         policy_digest: resolved.digest.clone(),
         activation,
+        required_reviews: None,
+        required_checks: None,
+    }
+}
+
+/// Does one `risk.when` path glob match `path`? A trailing `/` covers
+/// everything under that directory (the `areas:` grammar).
+fn policy_path_match(glob: &str, path: &str) -> bool {
+    match glob.strip_suffix('/') {
+        Some(dir) => path.starts_with(&format!("{dir}/")),
+        None => crate::delivery_rules::glob_match(glob, path),
+    }
+}
+
+/// The reviews an approved policy's applying rules require, in rule order,
+/// each name once, with the reasons naming the rules that applied.
+fn applying_reviews(
+    policy: &crate::delivery::DeliveryPolicy,
+    changes: &[Change],
+    lines: u64,
+    reasons: &mut Vec<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (i, rule) in policy.risk.iter().enumerate() {
+        let why = match &rule.when {
+            None => Some("always".to_string()),
+            Some(when) => {
+                let path = changes
+                    .iter()
+                    .find(|c| when.paths.iter().any(|g| policy_path_match(g, &c.path)))
+                    .map(|c| format!("path {}", c.path));
+                let over_lines = when
+                    .lines_over
+                    .filter(|n| lines > *n)
+                    .map(|n| format!("{lines} changed lines over {n}"));
+                let over_files = when
+                    .files_over
+                    .filter(|n| changes.len() as u64 > *n)
+                    .map(|n| format!("{} changed files over {n}", changes.len()));
+                path.or(over_lines).or(over_files)
+            }
+        };
+        if let Some(why) = why {
+            reasons.push(format!("policy rule {i} applies: {why}"));
+            for name in &rule.require {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The rank of a review kind, to take the stricter of two.
+fn review_rank(kind: ReviewKind) -> u8 {
+    match kind {
+        ReviewKind::None => 0,
+        ReviewKind::Combined => 1,
+        ReviewKind::Standards | ReviewKind::SpecSecurity => 2,
+        ReviewKind::StandardsAndSpec => 3,
+    }
+}
+
+/// CAD-2413: requirements under an owner-approved custom policy. The policy's
+/// applying rules decide the reviews; the trusted lists' floor is applied on
+/// top and never lowered (operator decision 2026-11-17).
+fn classify_approved(
+    resolved: &Resolved,
+    activation: Activation,
+    changes: &[Change],
+    lines: u64,
+    lists: Option<&Lists>,
+) -> Requirements {
+    use crate::delivery::{CheckMode, Review};
+    let mut reasons = vec!["an approved delivery policy is in force".to_string()];
+    let names = applying_reviews(&resolved.policy, changes, lines, &mut reasons);
+    let (mut standards, mut spec, mut general) = (false, false, false);
+    let (mut operator, mut browser_qa) = (false, false);
+    let mut required_reviews = Vec::new();
+    let mut required_checks = Vec::new();
+    for name in &names {
+        let Some(review) = resolved.policy.reviews.get(name) else {
+            continue;
+        };
+        let mut entry = RequiredReview {
+            name: name.clone(),
+            kind: String::new(),
+            focus: None,
+            app: None,
+            mode: None,
+        };
+        match review {
+            Review::Agent { focus } => {
+                entry.kind = "agent".into();
+                entry.focus = Some(focus.clone());
+                match focus.as_str() {
+                    "standards" => standards = true,
+                    "spec-security" => spec = true,
+                    "browser-qa" => browser_qa = true,
+                    _ => general = true,
+                }
+            }
+            Review::Check { app, mode } => {
+                entry.kind = "check".into();
+                entry.app = Some(app.clone());
+                let required = matches!(mode, CheckMode::Required);
+                entry.mode = Some(if required { "required" } else { "advisory" }.into());
+                if required {
+                    required_checks.push(RequiredCheck {
+                        name: name.clone(),
+                        app: app.clone(),
+                    });
+                }
+            }
+            Review::Operator => {
+                entry.kind = "operator".into();
+                operator = true;
+            }
+        }
+        required_reviews.push(entry);
+    }
+    let (reviews, review_kind) = match (standards, spec, general) {
+        (true, true, _) => (2, ReviewKind::StandardsAndSpec),
+        (true, false, _) => (1, ReviewKind::Standards),
+        (false, true, _) => (1, ReviewKind::SpecSecurity),
+        (false, false, true) => (1, ReviewKind::Combined),
+        (false, false, false) => (0, ReviewKind::None),
+    };
+    // The repository's own `[browser_qa]` table applies on top of a policy.
+    browser_qa |= browser_qa_needed(changes, lists);
+
+    // The floor (operator decision D1): anything the trusted lists, the size
+    // limit or the diff evidence would make strict stays at least strict.
+    let floor = match lists {
+        None => true,
+        Some(l) => {
+            evidence_refusal(changes).is_some()
+                || changes.iter().any(|c| !reviewable_change(c))
+                || lines > HUMAN_LINES
+                || changes.iter().any(|c| {
+                    let p = c.path.as_str();
+                    human_path(p, Some(l))
+                        || l.sensitive
+                            .iter()
+                            .any(|g| crate::delivery_rules::glob_match(g, p))
+                        || l.one_review_exclude.iter().any(|g| one_glob(g, p))
+                })
+        }
+    };
+    if floor {
+        let mut floor_reasons = reasons.clone();
+        floor_reasons.push(
+            "the trusted-list floor applies: the policy cannot lower these requirements"
+                .to_string(),
+        );
+        let strict = strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            lists,
+            false,
+            floor_reasons,
+        );
+        let (reviews, review_kind) = if (strict.reviews, review_rank(strict.review_kind))
+            >= (reviews, review_rank(review_kind))
+        {
+            (strict.reviews, strict.review_kind)
+        } else {
+            (reviews, review_kind)
+        };
+        return Requirements {
+            class: DeliveryClass::Strict,
+            reviews,
+            review_kind,
+            browser_qa: strict.browser_qa || browser_qa,
+            operator_approval: strict.operator_approval || operator,
+            full_checks: true,
+            required_reviews: Some(required_reviews),
+            required_checks: Some(required_checks),
+            ..strict
+        };
+    }
+    reasons.push("the approved policy decides: no trusted-list floor applies".to_string());
+    Requirements {
+        class: DeliveryClass::Consequential,
+        reviews,
+        review_kind,
+        security_capable: false,
+        browser_qa,
+        operator_approval: operator,
+        full_checks: true,
+        reasons,
+        policy_digest: resolved.digest.clone(),
+        activation,
+        required_reviews: Some(required_reviews),
+        required_checks: Some(required_checks),
     }
 }
 
@@ -680,6 +929,8 @@ pub fn classify_without_lists(resolved: &Resolved, changes: &[Change], lines: u6
         reasons,
         policy_digest: resolved.digest.clone(),
         activation,
+        required_reviews: None,
+        required_checks: None,
     }
 }
 

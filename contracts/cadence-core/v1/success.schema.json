@@ -449,6 +449,61 @@
         "blocked"
       ]
     },
+    "RequiredCheck": {
+      "description": "CAD-2413: a GitHub App check an approved policy requires on the head.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "app"
+      ]
+    },
+    "RequiredReview": {
+      "description": "CAD-2413: one review an approved policy's applying rules require, so a\ngate can count it by kind.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "A `check` review's GitHub App.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focus": {
+          "description": "An `agent` review's focus.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`agent`, `check` or `operator`.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "A `check` review's mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The review's name in the policy's `reviews` map.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
     "RequirementCheck": {
       "description": "One requirement and whether the target met it.",
       "oneOf": [
@@ -571,6 +626,26 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "required_checks": {
+          "description": "CAD-2413: the GitHub App checks those rules require; absent likewise.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredCheck"
+          }
+        },
+        "required_reviews": {
+          "description": "CAD-2413: the reviews an approved custom policy's applying rules\nrequire, in rule order. Absent when no approved policy was evaluated,\nso a gate can tell \"the policy requires none\" from \"no policy\".",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredReview"
           }
         },
         "review_kind": {
@@ -772,6 +847,16 @@
           "description": "Two verdicts — Standards and Spec/security — by distinct\nreviewers.",
           "type": "string",
           "const": "standards_and_spec"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Standards review.",
+          "type": "string",
+          "const": "standards"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Spec/security review.",
+          "type": "string",
+          "const": "spec_security"
         }
       ]
     },

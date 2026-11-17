@@ -209,9 +209,18 @@ fn docs_path_needs_one_combined_review_only() {
     assert!(!r.security_capable, "{r:?}");
     assert_eq!(r.activation, Activation::NoProfile);
     assert_eq!(r.policy_digest, digest(&spec_policy()));
-    assert_eq!(checks(&r), Some(vec![]), "required_checks is present and empty: {r:?}");
+    assert_eq!(
+        checks(&r),
+        Some(vec![]),
+        "required_checks is present and empty: {r:?}"
+    );
     assert_eq!(review_names(&r), vec!["gen"], "{r:?}");
-    assert_eq!(rule_reasons(&r), 1, "only the unconditional rule applies: {:?}", r.reasons);
+    assert_eq!(
+        rule_reasons(&r),
+        1,
+        "only the unconditional rule applies: {:?}",
+        r.reasons
+    );
 }
 
 #[test]
@@ -232,7 +241,10 @@ fn infra_path_needs_the_operator() {
     assert_eq!(r.class, DeliveryClass::Consequential, "{r:?}");
     assert!(r.operator_approval, "{r:?}");
     assert!(!r.browser_qa, "{r:?}");
-    assert_eq!(r.reviews, 1, "the operator is not counted as a review: {r:?}");
+    assert_eq!(
+        r.reviews, 1,
+        "the operator is not counted as a review: {r:?}"
+    );
     assert_eq!(review_entry(&r, "ops")["kind"], "operator", "{r:?}");
 }
 
@@ -263,7 +275,10 @@ fn src_path_needs_standards_and_spec_and_the_required_check() {
 #[test]
 fn line_count_over_the_rule_threshold_needs_the_operator() {
     let at = classify(&approved(spec_policy()), &[m("docs/a.md")], 400, &synth());
-    assert!(!at.operator_approval, "lines == lines_over does not apply: {at:?}");
+    assert!(
+        !at.operator_approval,
+        "lines == lines_over does not apply: {at:?}"
+    );
     let over = classify(&approved(spec_policy()), &[m("docs/a.md")], 401, &synth());
     assert!(over.operator_approval, "{over:?}");
     assert_eq!(over.class, DeliveryClass::Consequential, "{over:?}");
@@ -299,9 +314,8 @@ fn a_rule_applies_on_any_of_its_conditions() {
       require: [ops]",
     );
     let rs = approved(p);
-    let ops = |changes: &[Change], lines: u64| {
-        classify(&rs, changes, lines, &synth()).operator_approval
-    };
+    let ops =
+        |changes: &[Change], lines: u64| classify(&rs, changes, lines, &synth()).operator_approval;
     assert!(!ops(&[m("docs/a.md")], 10), "no condition holds");
     assert!(ops(&[m("infra/x.tf")], 10), "path alone");
     assert!(ops(&[m("docs/a.md")], 51), "lines alone");
@@ -385,13 +399,22 @@ fn trigger3_path_is_strict_with_two_reviews_regardless_of_policy() {
     // trigger3 is not human-class: the operator comes only via a Risk line.
     assert!(!r.operator_approval, "{r:?}");
     assert!(r.full_checks, "{r:?}");
-    assert!(mentions_floor(&r), "reasons say the floor applied: {:?}", r.reasons);
+    assert!(
+        mentions_floor(&r),
+        "reasons say the floor applied: {:?}",
+        r.reasons
+    );
     assert_eq!(r.activation, Activation::NoProfile);
 }
 
 #[test]
 fn operator_table_path_is_strict_with_the_operator() {
-    let r = classify(&approved(spec_policy()), &[m("deploy/run.sh")], 10, &synth());
+    let r = classify(
+        &approved(spec_policy()),
+        &[m("deploy/run.sh")],
+        10,
+        &synth(),
+    );
     assert_eq!(r.class, DeliveryClass::Strict, "{r:?}");
     assert!(r.operator_approval, "{r:?}");
     assert!(r.full_checks, "{r:?}");
@@ -400,7 +423,12 @@ fn operator_table_path_is_strict_with_the_operator() {
 
 #[test]
 fn unreadable_lists_are_strict_with_the_operator() {
-    let r = classify(&approved(spec_policy()), &[m("docs/a.md")], 10, &unreadable());
+    let r = classify(
+        &approved(spec_policy()),
+        &[m("docs/a.md")],
+        10,
+        &unreadable(),
+    );
     assert_eq!(r.class, DeliveryClass::Strict, "{r:?}");
     assert!(r.operator_approval, "{r:?}");
     assert_eq!(r.reviews, 2, "{r:?}");
@@ -475,14 +503,8 @@ fn oversize_incomplete_and_unsafe_shapes_hit_the_floor() {
 
     let shapes: Vec<(&str, Vec<Change>)> = vec![
         ("empty diff", vec![]),
-        (
-            "delete",
-            vec![change("D", "100644", "000000", "docs/a.md")],
-        ),
-        (
-            "rename",
-            vec![change("R", "100644", "100644", "docs/a.md")],
-        ),
+        ("delete", vec![change("D", "100644", "000000", "docs/a.md")]),
+        ("rename", vec![change("R", "100644", "100644", "docs/a.md")]),
         (
             "mode change",
             vec![change("M", "100644", "100755", "docs/a.md")],
@@ -567,7 +589,11 @@ fn golden_custom_policy_evaluated_as_approved() {
     p.max_revise += 1;
     let custom = approved(p);
     let docs = classify(&custom, &[m("docs/a.md")], 10, &lists.trusted());
-    assert_eq!(docs.class, DeliveryClass::Consequential, "never routine: {docs:?}");
+    assert_eq!(
+        docs.class,
+        DeliveryClass::Consequential,
+        "never routine: {docs:?}"
+    );
     assert_eq!(docs.reviews, 1);
     assert_eq!(docs.review_kind, ReviewKind::Combined);
     let src = classify(&custom, &[m("src/foo.rs")], 10, &lists.trusted());
