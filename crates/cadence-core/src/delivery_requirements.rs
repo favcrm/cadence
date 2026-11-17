@@ -39,6 +39,13 @@
 //!   asks no Browser QA (operator decision 2026-11-17, CAD-2386): the
 //!   operator floor they force is the human check.
 //!
+//! An owner-approved custom delivery policy (CAD-2413) is evaluated instead:
+//! its applying `risk` rules name the reviews (`required_reviews`,
+//! `required_checks`) and the class is `consequential`, but every strict
+//! condition above except "outside the one-review include list" still
+//! applies as a floor that the policy cannot lower (operator decision D1,
+//! 2026-11-17).
+//!
 //! `DeliveryClass::Sensitive` exists in the type but `classify` does not
 //! currently return it: sensitive conditions resolve to `strict`. No class
 //! sets `security_capable` today.
@@ -153,8 +160,9 @@ pub struct RequiredCheck {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Requirements {
     pub class: DeliveryClass,
-    /// Independent verdict count on the exact head: `0` only for
-    /// routine under a valid default-equivalent policy.
+    /// Independent verdict count on the exact head: `0` for routine under a
+    /// valid default-equivalent policy, or when an approved policy's applying
+    /// rules name no code review (CAD-2413).
     pub reviews: u32,
     pub review_kind: ReviewKind,
     /// The combined review must be filed by a security-capable
@@ -535,10 +543,7 @@ pub fn classify(
 
     // CAD-2413: an owner-approved custom policy is evaluated (opt-in, operator
     // decision 2026-11-17). Anything else not Active keeps the strict floor.
-    if activation == Activation::NoProfile
-        && resolved.source == "approved"
-        && resolved.policy.validate().is_ok()
-    {
+    if activation == Activation::NoProfile && resolved.source == "approved" {
         return classify_approved(resolved, activation, changes, lines, parsed.as_ref());
     }
 
@@ -695,15 +700,6 @@ pub fn classify(
     }
 }
 
-/// Does one `risk.when` path glob match `path`? A trailing `/` covers
-/// everything under that directory (the `areas:` grammar).
-fn policy_path_match(glob: &str, path: &str) -> bool {
-    match glob.strip_suffix('/') {
-        Some(dir) => path.starts_with(&format!("{dir}/")),
-        None => crate::delivery_rules::glob_match(glob, path),
-    }
-}
-
 /// The reviews an approved policy's applying rules require, in rule order,
 /// each name once, with the reasons naming the rules that applied.
 fn applying_reviews(
@@ -719,7 +715,11 @@ fn applying_reviews(
             Some(when) => {
                 let path = changes
                     .iter()
-                    .find(|c| when.paths.iter().any(|g| policy_path_match(g, &c.path)))
+                    .find(|c| {
+                        when.paths
+                            .iter()
+                            .any(|g| crate::delivery_rules::area_match(g, &c.path))
+                    })
                     .map(|c| format!("path {}", c.path));
                 let over_lines = when
                     .lines_over
@@ -744,13 +744,24 @@ fn applying_reviews(
     names
 }
 
-/// The rank of a review kind, to take the stricter of two.
-fn review_rank(kind: ReviewKind) -> u8 {
+/// The review that satisfies both `a` and `b`. A single-axis review never
+/// stands in for `Combined` (one verdict covering both axes), so joining a
+/// single axis with anything other than itself or `None` needs both axes.
+fn review_join(a: ReviewKind, b: ReviewKind) -> ReviewKind {
+    use ReviewKind::*;
+    match (a, b) {
+        (x, None) | (None, x) => x,
+        (x, y) if x == y => x,
+        _ => StandardsAndSpec,
+    }
+}
+
+/// The verdict count a review kind needs.
+fn review_count(kind: ReviewKind) -> u32 {
     match kind {
         ReviewKind::None => 0,
-        ReviewKind::Combined => 1,
-        ReviewKind::Standards | ReviewKind::SpecSecurity => 2,
-        ReviewKind::StandardsAndSpec => 3,
+        ReviewKind::Combined | ReviewKind::Standards | ReviewKind::SpecSecurity => 1,
+        ReviewKind::StandardsAndSpec => 2,
     }
 }
 
@@ -790,7 +801,10 @@ fn classify_approved(
                     "standards" => standards = true,
                     "spec-security" => spec = true,
                     "browser-qa" => browser_qa = true,
-                    _ => general = true,
+                    "general" => general = true,
+                    // `parse` admits only `FOCI`; anything else fails closed
+                    // to both axes.
+                    _ => (standards, spec) = (true, true),
                 }
             }
             Review::Check { app, mode } => {
@@ -855,13 +869,8 @@ fn classify_approved(
             false,
             floor_reasons,
         );
-        let (reviews, review_kind) = if (strict.reviews, review_rank(strict.review_kind))
-            >= (reviews, review_rank(review_kind))
-        {
-            (strict.reviews, strict.review_kind)
-        } else {
-            (reviews, review_kind)
-        };
+        let review_kind = review_join(strict.review_kind, review_kind);
+        let reviews = review_count(review_kind).max(strict.reviews).max(reviews);
         return Requirements {
             class: DeliveryClass::Strict,
             reviews,
@@ -896,7 +905,7 @@ fn classify_approved(
 /// "not found", never a failed read). Under the default lean policy it is one
 /// combined review plus the operator's approval, with no path rules and no
 /// Browser QA. Anything else keeps the fail-closed strict floor: a custom or
-/// unapproved policy (its own rules are not evaluated yet) and incomplete diff
+/// unapproved policy (only an approved one's rules are evaluated, and only with lists) and incomplete diff
 /// evidence.
 pub fn classify_without_lists(resolved: &Resolved, changes: &[Change], lines: u64) -> Requirements {
     let activation = activation_of(resolved);

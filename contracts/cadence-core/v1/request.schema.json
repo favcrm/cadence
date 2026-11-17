@@ -581,7 +581,7 @@
           "minimum": 0
         },
         "paths": {
-          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it. Slice 3 matches them with\n`areas::matches`, so the two grammars must agree.",
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it, and a glob without wildcards\nis a file or a directory covering everything under it. Matched with\n[`crate::delivery_rules::area_match`], the same function as `areas:`.",
           "type": "array",
           "default": [],
           "items": {

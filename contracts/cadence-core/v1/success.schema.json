@@ -652,7 +652,7 @@
           "$ref": "#/$defs/ReviewKind"
         },
         "reviews": {
-          "description": "Independent verdict count on the exact head: `0` only for\nroutine under a valid default-equivalent policy.",
+          "description": "Independent verdict count on the exact head: `0` for routine under a\nvalid default-equivalent policy, or when an approved policy's applying\nrules name no code review (CAD-2413).",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -909,7 +909,7 @@
           "minimum": 0
         },
         "paths": {
-          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it. Slice 3 matches them with\n`areas::matches`, so the two grammars must agree.",
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it, and a glob without wildcards\nis a file or a directory covering everything under it. Matched with\n[`crate::delivery_rules::area_match`], the same function as `areas:`.",
           "type": "array",
           "default": [],
           "items": {

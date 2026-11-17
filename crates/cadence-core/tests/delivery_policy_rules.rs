@@ -708,3 +708,92 @@ fn default_equivalent_approved_policy_keeps_todays_lean_classes() {
         assert_eq!(outside.reviews, 2);
     }
 }
+
+// ---- review fixes (fresh-session review of d6eae984) -------------------
+
+fn single_axis(focus: &str) -> DeliveryPolicy {
+    policy(&format!(
+        "  reviews:
+    one: {{kind: agent, focus: {focus}}}
+  risk:
+    - require: [one]"
+    ))
+}
+
+/// A single-axis policy never replaces the strict floor's combined review
+/// (one verdict covering both axes): it needs both axes there instead.
+#[test]
+fn a_single_axis_policy_cannot_drop_an_axis_under_the_floor() {
+    let repo = repo_lists();
+    let synthetic = synth();
+    let cases: [(&str, &TrustedLists); 2] = [
+        ("Cargo.toml", &repo.trusted()),
+        ("src/ops/run.sh", &synthetic),
+    ];
+    for (path, lists) in cases {
+        let today = today_strict(&[m(path)], 10, lists);
+        assert_eq!(today.review_kind, ReviewKind::Combined, "{path}: {today:?}");
+        assert!(today.operator_approval, "{path}: {today:?}");
+        for focus in ["standards", "spec-security"] {
+            let r = classify(&approved(single_axis(focus)), &[m(path)], 10, lists);
+            assert_eq!(r.class, DeliveryClass::Strict, "{path} {focus}: {r:?}");
+            assert_eq!(
+                r.review_kind,
+                ReviewKind::StandardsAndSpec,
+                "{path} {focus}: {r:?}"
+            );
+            assert_eq!(r.reviews, 2, "{path} {focus}: {r:?}");
+            assert!(r.operator_approval, "{path} {focus}: {r:?}");
+        }
+    }
+}
+
+/// A wildcard-free `when.paths` entry is a file or a directory covering
+/// everything under it — the `areas:` grammar the policy docs promise.
+#[test]
+fn a_plain_directory_rule_covers_its_subtree() {
+    let p = policy(
+        "  reviews:
+    gen: {kind: agent, focus: general}
+    ops: {kind: operator}
+  risk:
+    - require: [gen]
+    - when: {paths: [\"infra\"]}
+      require: [ops]",
+    );
+    let r = classify(&approved(p.clone()), &[m("infra/main.tf")], 10, &synth());
+    assert!(r.operator_approval, "{r:?}");
+    assert_eq!(review_names(&r), vec!["gen", "ops"], "{r:?}");
+    let r = classify(&approved(p), &[m("infrastructure/main.tf")], 10, &synth());
+    assert!(
+        !r.operator_approval,
+        "a sibling prefix is not the directory: {r:?}"
+    );
+}
+
+/// A sensitive-table path that is neither human-class nor excluded still
+/// hits the floor (pins the `sensitive` clause on its own).
+#[test]
+fn a_trigger1_only_path_hits_the_floor() {
+    let path = "sys/auth.rs";
+    let today = today_strict(&[m(path)], 10, &synth());
+    assert_eq!(today.class, DeliveryClass::Strict, "{today:?}");
+    let r = classify(&approved(gen_only()), &[m(path)], 10, &synth());
+    assert_eq!(r.class, DeliveryClass::Strict, "{r:?}");
+    assert!(r.reviews >= today.reviews, "{r:?}");
+    assert!(mentions_floor(&r), "{:?}", r.reasons);
+}
+
+/// A one-review-exclude path that is in no trigger or operator table still
+/// hits the floor (pins the exclude clause on its own).
+#[test]
+fn an_exclude_only_path_hits_the_floor() {
+    let repo = repo_lists();
+    let path = "src/daemon/foo.rs";
+    let today = today_strict(&[m(path)], 10, &repo.trusted());
+    assert_eq!(today.class, DeliveryClass::Strict, "{today:?}");
+    let r = classify(&approved(gen_only()), &[m(path)], 10, &repo.trusted());
+    assert_eq!(r.class, DeliveryClass::Strict, "{r:?}");
+    assert_eq!(r.reviews, today.reviews.max(1), "{r:?}");
+    assert!(mentions_floor(&r), "{:?}", r.reasons);
+}
