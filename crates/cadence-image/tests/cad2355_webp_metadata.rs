@@ -92,3 +92,27 @@ fn converted_webp_preserves_upright_pixels_and_color_profile() {
     assert!(top[0] > top[2] + 80, "red marker must be above blue");
     assert!(bottom[2] > bottom[0] + 80, "blue marker must be below red");
 }
+
+#[test]
+fn conflicting_duplicate_webp_alpha_chunks_are_refused() {
+    let valid = include_bytes!("alpha-lossy.webp");
+    assert_eq!(
+        &valid[30..44],
+        &[65, 76, 80, 72, 5, 0, 0, 0, 0, 128, 128, 128, 128, 0]
+    );
+    assert!(
+        prepare(valid, Format::Webp).is_ok(),
+        "original image must be accepted"
+    );
+
+    let mut ambiguous = valid.to_vec();
+    let mut duplicate = valid[30..44].to_vec();
+    duplicate[9..13].fill(0);
+    ambiguous.splice(44..44, duplicate);
+    let riff_size = (ambiguous.len() - 8) as u32;
+    ambiguous[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    assert!(
+        prepare(&ambiguous, Format::Webp).is_err(),
+        "conflicting duplicate ALPH chunks must be refused"
+    );
+}

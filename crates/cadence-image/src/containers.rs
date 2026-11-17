@@ -476,6 +476,8 @@ pub(crate) fn webp(data: &[u8]) -> Result<Webp<'_>> {
     let mut extended = None;
     let mut still = None;
     let mut animated = false;
+    let mut alpha = false;
+    let mut lossless_alpha = false;
     let mut icc = None;
     let mut exif = None;
     while at.checked_add(8).is_some_and(|n| n <= data.len()) {
@@ -506,11 +508,21 @@ pub(crate) fn webp(data: &[u8]) -> Result<Webp<'_>> {
                 still = Some((u32::from(width), u32::from(height)));
             }
             b"VP8L" => {
-                if still.is_some() || size < 5 || payload[0] != 0x2f {
+                if still.is_some() || alpha || size < 5 || payload[0] != 0x2f {
                     return Err(ImageError::Invalid);
                 }
                 let bits = le32(payload, 1)?;
+                if bits >> 29 != 0 {
+                    return Err(ImageError::Invalid);
+                }
+                lossless_alpha = bits & (1 << 28) != 0;
                 still = Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1));
+            }
+            b"ALPH" => {
+                if extended.is_none() || alpha || still.is_some() || payload.is_empty() {
+                    return Err(ImageError::Invalid);
+                }
+                alpha = true;
             }
             b"ICCP" => {
                 if icc.is_some() || extended.is_none() || still.is_some() {
@@ -540,6 +552,7 @@ pub(crate) fn webp(data: &[u8]) -> Result<Webp<'_>> {
         || height == 0
         || extended.is_some_and(|(w, h, flags)| {
             (w, h) != (width, height)
+                || (flags & 0x10 != 0) != (alpha || lossless_alpha)
                 || (flags & 0x20 != 0) != icc.is_some()
                 || (flags & 0x08 != 0) != exif.is_some()
         })
