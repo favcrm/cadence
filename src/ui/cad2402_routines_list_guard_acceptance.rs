@@ -10,6 +10,7 @@
 //!    daemon's own session proof. A member mounts read-only, and
 //!    `routines.list` is not a read-allowlist operation.
 //! 3. Any arguments other than `{}` are refused.
+//!
 //! Every refusal carries no routine data, and each refusal case has a
 //! positive control on the same mount so it cannot pass on a blanket failure.
 
