@@ -1519,9 +1519,8 @@ mod tests {
             .unwrap();
         let out = child.wait_with_output().unwrap();
         let gd = git(repo, &["rev-parse", "--absolute-git-dir"]);
-        let receipt =
-            std::fs::read_to_string(Path::new(&gd).join("cadence-pre-push-receipt"))
-                .unwrap_or_default();
+        let receipt = std::fs::read_to_string(Path::new(&gd).join("cadence-pre-push-receipt"))
+            .unwrap_or_default();
         let last = receipt.lines().last().unwrap_or("").to_string();
         let rc = out.status.code().unwrap_or(-1);
         eprintln!(
@@ -1563,7 +1562,9 @@ mod tests {
         );
         // A customer script gets no Cadence flags (no --receipt, no --tests).
         assert_eq!(
-            std::fs::read_to_string(rec.path().join("argv")).unwrap().trim(),
+            std::fs::read_to_string(rec.path().join("argv"))
+                .unwrap()
+                .trim(),
             "",
             "repo-mode pre-push must receive no arguments"
         );
@@ -1604,6 +1605,10 @@ mod tests {
     fn pre_push_hook_repo_mode_clean_pass_is_not_rerun() {
         let repo = git_repo();
         let rec = TempDir::new().unwrap();
+        // Installing the hook writes the lane's `.env` (the cargo shim's PATH);
+        // a repository that ignores it keeps a clean tree, which the skip needs.
+        // Without the ignore the tree is dirty and the plan simply runs again.
+        std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
         commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
         let head = git(repo.path(), &["rev-parse", "HEAD"]);
         let (rc, receipt) = run_hook(repo.path(), &head);
