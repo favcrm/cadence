@@ -459,23 +459,26 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
             })
         }
         Format::Webp => {
-            let (width, height) = containers::webp(bytes)?;
+            let webp = containers::webp(bytes)?;
+            let (width, height) = (webp.width, webp.height);
             dimensions(width, height, max_side, max_pixels)?;
             let (pixels, channels) =
                 decode_image(bytes, ImageFormat::WebP, width, height, max_side)?;
+            let mut mapping = Mapping::new(width, height);
+            mapping.exif(webp.orientation)?;
             Ok(Decoded {
                 pixels,
                 width,
                 channels,
-                mapping: Mapping::new(width, height),
+                mapping,
                 source_end: bytes.len(),
                 clean_source: None,
                 native_png16: false,
                 png_custom_color: false,
                 gray_profile: false,
                 unconvertible_icc: false,
-                unchanged: true,
-                icc: None,
+                unchanged: webp.orientation == 1,
+                icc: webp.icc.map(<[u8]>::to_vec),
             })
         }
     }

@@ -455,9 +455,16 @@ pub(crate) fn png_stream(data: &[u8], width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct Webp<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub orientation: u8,
+    pub icc: Option<&'a [u8]>,
+}
+
 /// Refuse animated, concatenated or inconsistent WebP containers before
 /// decoding; the canvas dimensions must agree with the actual still image.
-pub(crate) fn webp(data: &[u8]) -> Result<(u32, u32)> {
+pub(crate) fn webp(data: &[u8]) -> Result<Webp<'_>> {
     if data.len() < 20
         || &data[..4] != b"RIFF"
         || &data[8..12] != b"WEBP"
@@ -469,6 +476,8 @@ pub(crate) fn webp(data: &[u8]) -> Result<(u32, u32)> {
     let mut extended = None;
     let mut still = None;
     let mut animated = false;
+    let mut icc = None;
+    let mut exif = None;
     while at.checked_add(8).is_some_and(|n| n <= data.len()) {
         let kind = &data[at..at + 4];
         let size = le32(data, at + 4)? as usize;
@@ -486,7 +495,7 @@ pub(crate) fn webp(data: &[u8]) -> Result<(u32, u32)> {
                 animated = payload[0] & 2 != 0;
                 let width = 1 + u32::from_le_bytes([payload[4], payload[5], payload[6], 0]);
                 let height = 1 + u32::from_le_bytes([payload[7], payload[8], payload[9], 0]);
-                extended = Some((width, height));
+                extended = Some((width, height, payload[0]));
             }
             b"VP8 " => {
                 if still.is_some() || size < 10 || payload[3..6] != [0x9d, 0x01, 0x2a] {
@@ -503,6 +512,22 @@ pub(crate) fn webp(data: &[u8]) -> Result<(u32, u32)> {
                 let bits = le32(payload, 1)?;
                 still = Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1));
             }
+            b"ICCP" => {
+                if icc.is_some() || extended.is_none() || still.is_some() {
+                    return Err(ImageError::Invalid);
+                }
+                if validate_icc(payload)? != moxcms::DataColorSpace::Rgb {
+                    return Err(ImageError::Unsupported);
+                }
+                icc = Some(payload);
+            }
+            b"EXIF" => {
+                if exif.is_some() || extended.is_none() || still.is_none() {
+                    return Err(ImageError::Invalid);
+                }
+                let tiff = payload.strip_prefix(b"Exif\0\0").unwrap_or(payload);
+                exif = Some(crate::jpeg::exif_orientation(tiff)?.unwrap_or(1));
+            }
             b"ANIM" | b"ANMF" => animated = true,
             _ => {}
         }
@@ -513,9 +538,18 @@ pub(crate) fn webp(data: &[u8]) -> Result<(u32, u32)> {
         || animated
         || width == 0
         || height == 0
-        || extended.is_some_and(|canvas| canvas != (width, height))
+        || extended.is_some_and(|(w, h, flags)| {
+            (w, h) != (width, height)
+                || (flags & 0x20 != 0) != icc.is_some()
+                || (flags & 0x08 != 0) != exif.is_some()
+        })
     {
         return Err(ImageError::Invalid);
     }
-    Ok((width, height))
+    Ok(Webp {
+        width,
+        height,
+        orientation: exif.unwrap_or(1),
+        icc,
+    })
 }
