@@ -141,6 +141,10 @@ async function boundaryChecks() {
     assert(!host.querySelector("[data-private-workspace]") && privateRequests === 0, "unknown initial identity starts no private work");
     assert(sessionKey() === "existing-local-key", "initial 503 retains the stored local credential");
     assert(privateSessionGeneration() === generation, "an outage is not confirmed identity loss");
+    response = () => json({ ...signedIn, hosted: true });
+    await retry();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "a hosted claim with a local session cannot bootstrap");
+    assert(host.textContent?.includes("Hosted workspace"), "a contradictory hosted claim keeps the hosted recovery path");
     response = () => json(signedIn);
     await retry();
     assert(host.querySelector("[data-private-workspace]"), "retry admits a verified local member");
@@ -193,6 +197,41 @@ async function boundaryChecks() {
     assert(privateSessionGeneration() === beforeRenewal, "hosted renewal keeps the same private session");
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "hosted renewal keeps the unsent draft");
 
+    // A once-hosted tab must never reinterpret a contradictory or incomplete
+    // metadata response as a local/anonymous admission.
+    for (const downgraded of [
+      { ...signedIn, signed_in: false, hosted: false, anonymous_reads: true, session: null },
+      { ...signedIn, hosted: false },
+      { ...signedIn, hosted: true },
+      { ...hostedSession, hosted: "invalid" },
+      { ...hostedSession, hosted: false },
+    ]) {
+      response = () => json(downgraded);
+      await focus();
+      assert(host.querySelector("[data-auth-state='unavailable'] h1"), "hosted metadata downgrade is verification unavailable");
+      assert(!privateReadsAllowed(), "a hosted metadata downgrade cannot admit private reads");
+      response = () => json(hostedSession);
+      await retry();
+      assert(host.querySelector("output")?.textContent === "unsaved private draft", "matching hosted recovery retains the same in-memory draft");
+    }
+
+    response = () => json({ ...hostedSession, hosted: undefined });
+    await focus();
+    assert(host.querySelector("[data-private-workspace]") && privateReadsAllowed(), "a valid public session remains compatible when an older server omits hosted");
+    response = () => json(hostedSession);
+    await focus();
+    const beforeDowngradeReload = privateSessionGeneration();
+    response = () => json({ ...signedIn, hosted: false });
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "reload cannot downgrade a remembered hosted identity to local");
+    assert(privateSessionGeneration() === beforeDowngradeReload, "an unanswered downgrade is not a confirmed identity loss");
+    response = () => json(hostedSession);
+    await retry();
+    assert(host.querySelector("[data-private-workspace]"), "the remembered hosted identity can recover after reload");
+
+
     // A different hosted identity must not silently replace the admitted one.
     const switched = { ...hostedSession, session: { ...hostedSession.session, id: "new-hosted-session", user: { ...hostedSession.session.user, sub: "second-user", email: "second@example.test" } } };
     response = () => json(switched);
@@ -201,6 +240,16 @@ async function boundaryChecks() {
     assert(!host.querySelector("[data-private-workspace]") && !privateReadsAllowed(), "the previous private tree is discarded before confirmation");
     assert(host.textContent?.includes("Unsent changes from the previous session may not have been saved."), "the confirmation warns that unsent changes may be lost");
     assert(host.textContent?.includes("second@example.test"), "the prompt names only the freshly verified account");
+    response = () => json({ ...signedIn, hosted: false });
+    await focus();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "a pending account change cannot be bypassed by local metadata");
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "reload retains the pending hosted confirmation during a downgrade");
+    response = () => json(switched);
+    await retry();
+    assert(host.querySelector("[data-auth-state='changed'] h1"), "a valid hosted answer still needs the pending confirmation");
     await focus();
     assert(host.querySelector("[data-auth-state='changed'] h1"), "automatic verification cannot bypass confirmation");
     response = () => json({ ...switched, session: { ...switched.session, user: { ...switched.session.user, email: { malformed: true } } } });
@@ -259,9 +308,15 @@ async function boundaryChecks() {
     await focus();
     assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a session-required event preserves the confirmation requirement");
     await continueWithCurrent();
+    // Start an independent fresh local-board scenario; a hosted tab cannot
+    // silently change into this identity on the same origin.
+    await React.act(async () => root.unmount());
+    sessionStorage.removeItem("cadence.privateSessionIdentity");
+    sessionStorage.removeItem("cadence.hostedIdentityConfirmationPending");
+    root = createRoot(host);
     response = () => json(signedIn);
-    await focus();
-    assert(host.querySelector("output")?.textContent === "", "changing identity clears the previous draft");
+    await render();
+    assert(host.querySelector("output")?.textContent === "", "a fresh local board starts with no previous draft");
     await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
 
     // A newer authoritative refusal supersedes an already validated but delayed

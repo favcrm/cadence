@@ -53,6 +53,15 @@ function returnDestination(): string {
 function rememberedIdentity(): string | null {
   try { return sessionStorage.getItem(IDENTITY_STORE); } catch { return null; }
 }
+function hostedIdentity(value: string | null): boolean {
+  if (value === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed[0] === true;
+  } catch {
+    return false;
+  }
+}
 function pendingIdentityChange(): boolean {
   try { return sessionStorage.getItem(IDENTITY_CHANGE_STORE) === "1"; } catch { return false; }
 }
@@ -141,17 +150,28 @@ export default function AuthBoundary({ children }: {
     // Routine successful revalidation never hides/remounts the workspace.
     if (previous.status !== "ready") publish({ ...previous, status: "checking" });
     const current = () => request === sequence.current && key === sessionKey();
-    const unavailable = (status: "unavailable" | "updating" = "unavailable") => {
+    const unavailable = (status: "unavailable" | "updating" = "unavailable", hosted = false) => {
       const focused = document.activeElement;
       if (stateRef.current.status === "ready" && focused instanceof HTMLElement && focused.closest("[data-app-shell]")) privateFocus.current = focused;
       pausePrivateReads();
       setSession(null);
-      publish({ ...stateRef.current, status, hosted: status === "updating" || stateRef.current.hosted });
+      publish({ ...stateRef.current, status, hosted: hosted || status === "updating" || stateRef.current.hosted });
     };
     const promise = api.meta(true, controller.signal).then((meta) => {
       if (!current()) return false;
-      const hosted = meta.hosted === true || meta.session?.origin === "public";
       const session = meta.session;
+      const wasHosted = pendingChange.current || hostedIdentity(identity.current);
+      const hosted = wasHosted || meta.hosted === true || session?.origin === "public";
+      // An established hosted identity cannot be downgraded to local or
+      // anonymous authority, even across a reload or pending confirmation.
+      // Public sessions from older metadata may omit the optional hosted flag.
+      if ((meta.hosted !== undefined && typeof meta.hosted !== "boolean") ||
+          (wasHosted && meta.hosted === false) ||
+          (meta.hosted === false && session?.origin === "public") ||
+          (hosted && session != null && session.origin !== "public")) {
+        unavailable("unavailable", hosted);
+        return false;
+      }
       const sessionValid = session !== null && session !== undefined
         && typeof session.id === "string" && session.id.trim().length > 0
         && ["loopback", "tailnet", "public"].includes(session.origin)
@@ -166,7 +186,7 @@ export default function AuthBoundary({ children }: {
       // A claimed sign-in without its verified identity is unanswered, not
       // authority. Explicit anonymous policy cannot rescue malformed identity.
       if (meta.signed_in === true && !sessionValid) {
-        unavailable();
+        unavailable("unavailable", hosted);
         return false;
       }
       const admitted = meta.signed_in === true || (!hosted && meta.anonymous_reads === true);
