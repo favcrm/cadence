@@ -149,10 +149,10 @@ The evaluator returns three classes:
   lines. It asks for one combined review on the one-review list, else two
   (Standards and Spec/security) as separate passes, and the operator floor on
   paths in the `operator` table or trigger tables 2, 4, 6 and 7, and over 1500
-  lines. Triggers 1 and 3 (trust boundary, security) force the strict class and
-  the two-review count; they add no operator floor by themselves. A reviewer who
-  sees one names it in `Risk: human (<n>)`, and any `Risk` that is not `auto`
-  forces the operator.
+  lines. Triggers 1 and 3 (trust boundary, security) reach the operator through
+  the reviewer: a reviewer who sees one names it in `Risk: human (<n>)`, and any
+  `Risk` that is not `auto` forces the operator. Their path lists alone force
+  only the strict class and the two-review count.
 
 Those are the evaluator's counts. On a hosted org the gate counts the review
 axes itself (below), so a hosted `routine` PR still wants the two workflow
@@ -433,8 +433,9 @@ substitute a comment or another identity for the required proof.
   accepts it for every in-scope PR of that ticket. Traps: the ticket body must
   declare its triggers (`Risk: human (4, 7)`); editing the body voids the
   approval (the digest changes); a ticket outside ready, doing or review gets no
-  scope approval; a diff touching a trigger 1 or 3 path, a one-review-excluded
-  path or an operator-only path always needs the per-head approval; and every counted verdict must carry `Scope: in-scope <ID>`.
+  scope approval; a scope approval never covers a trigger 1 or 3 path, a
+  one-review-excluded path or an operator-only path, so when the operator's
+  approval is needed there it is the per-head one; and every counted verdict must carry `Scope: in-scope <ID>`.
   `cadence audit revoke <id>` withdraws it.
 - `POST /api/approvals/:id/revoke` ("Stop merge") and
   `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
