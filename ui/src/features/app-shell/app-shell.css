@@ -380,6 +380,9 @@
 
 .app-chat-list {
   display: grid;
+  /* CAD-2363: one column that never grows past the pane — a long nowrap
+     line (a trace summary) truncates instead of widening the list. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.875rem;
   flex: 1;
   min-height: 0;

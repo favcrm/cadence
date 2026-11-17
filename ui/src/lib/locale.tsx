@@ -1682,6 +1682,12 @@ Object.assign(zhTW, {
   "This issue is no longer available to you — private details and any draft were cleared.": "你已無法存取此議題 — 私人詳細資料與草稿已清除。",
 });
 
+/** CAD-2363: the active locale where a provider may be absent (a test or an
+ *  isolated render): English then. Date formatting in a transcript uses it. */
+export function useLocaleTag(): Locale {
+  return useContext(LocaleContext)?.locale ?? "en";
+}
+
 export function useLocale(): LocaleContextValue {
   const value = useContext(LocaleContext);
   if (!value) throw new Error("useLocale must be used inside LocaleProvider");
@@ -2840,6 +2846,69 @@ Object.assign(zhTW, {
   "Document review isn’t available on this workspace any more.": "此工作區已無法再使用文件審查。",
 });
 
+// CAD-2363: assistant turns — tool labels, the elapsed clock, raw calls and ID tokens.
+Object.assign(zhTW, {
+  "Check account usage": "查看帳戶用量",
+  "Load a skill": "載入技能",
+  "Use an app": "使用應用程式",
+  "Read app details": "讀取應用程式資料",
+  "Find artifacts": "搜尋產物",
+  "Save an artifact": "儲存產物",
+  "Read an artifact": "讀取產物",
+  "Share an artifact": "分享產物",
+  "Show on the canvas": "在畫布顯示",
+  "Ask with a form": "以表單提問",
+  "Read the assistant profile": "讀取助理資料",
+  "Create a ticket": "建立工單",
+  "Read a review draft": "讀取審查草稿",
+  "List tickets": "列出工單",
+  "Check pending approvals": "查看待審批項目",
+  "Read the board": "讀取看板",
+  "Read a ticket": "讀取工單",
+  "Draft a review": "草擬審查",
+  "Use the browser": "操作瀏覽器",
+  "Run a tool": "執行工具",
+  "Read tool details": "讀取工具資料",
+  "Read a tool result": "讀取工具結果",
+  "Search tools": "搜尋工具",
+  "Read an attachment": "讀取附件",
+  "Render a document": "產生文件",
+  "Submit for approval": "提交審批",
+  "Propose a document type": "提議文件類型",
+  "Read document types": "讀取文件類型",
+  "Check a job": "查看工作狀態",
+  "List mail": "列出郵件",
+  "Read mail": "讀取郵件",
+  "Read from a connector": "從連接器讀取",
+  "List connector tools": "列出連接器工具",
+  "Generate media": "產生媒體",
+  "Propose a ticket": "提議工單",
+  "Attach to a ticket": "附加到工單",
+  "Comment on a ticket": "在工單留言",
+  "Send a ticket to review": "將工單送交審查",
+  "Read a web page": "讀取網頁",
+  "Search the web": "搜尋網頁",
+  "List wiki pages": "列出知識庫頁面",
+  "Read the wiki": "讀取知識庫",
+  "{s}s": "{s} 秒",
+  "{m}m {s}s": "{m} 分 {s} 秒",
+  "{h}h {m}m": "{h} 小時 {m} 分",
+  "Show raw calls": "顯示原始呼叫",
+  "Hide raw calls": "隱藏原始呼叫",
+  "Copy ID": "複製 ID",
+  "{n} results": "{n} 筆結果",
+  "1 result": "1 筆結果",
+  "in the canvas": "已放到畫布",
+  "Assistant could not finish this turn": "助理未能完成此回合",
+  "Assistant could not finish this turn.": "助理未能完成此回合。",
+  "Assistant could not run: billing is not set up for this company. The company owner needs to set up billing.": "助理無法執行：此公司尚未設定帳單。需要由公司擁有者設定帳單。",
+  "Assistant settings": "助理設定",
+  "Delivery unconfirmed": "未能確認是否已送達",
+  "The send may still have been delivered — retry sends the same message once.": "訊息可能已經送達 — 重試只會再傳送同一則訊息一次。",
+  "Turn in progress": "回合進行中",
+  "Today": "今天",
+  "Yesterday": "昨天",
+});
 
 // CAD-2362: the operator's own message (inline Markdown, folded pastes).
 Object.assign(zhTW, {

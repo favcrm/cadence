@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
@@ -18,6 +18,7 @@ import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
 import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
+import { elapsedSecs, errorReason, formatElapsed, resultCount, toolKey, toolLabel, toolSubject } from "./turnText";
 import {
   isArtifactPutCall,
   isCardItem,
@@ -53,7 +54,7 @@ export function time(created: string | null | undefined): string {
  *  standalone groups own the `steps-head`, a turn's trace lists them flat
  *  under its single head. A turn trace asks for newest-first so the row
  *  under "Reasoning" is the latest call, not the one that opened the turn. */
-function ToolRows({ entries, newestFirst = false }: { entries: ThreadEntry[]; newestFirst?: boolean }) {
+function ToolRows({ entries, newestFirst = false, raw = false }: { entries: ThreadEntry[]; newestFirst?: boolean; raw?: boolean }) {
   const t = useTranslate();
   const steps = useMemo(() => {
     const paired = toolSteps(entries);
@@ -77,14 +78,45 @@ function ToolRows({ entries, newestFirst = false }: { entries: ThreadEntry[]; ne
           >
             {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
           </span>
-          <span className="num min-w-0 flex-1 truncate" title={s.summary}>{s.summary}</span>
+          {(() => {
+            // CAD-2363: a known hosted tool reads as what it did and what it
+            // acted on; the raw call stays one toggle (and the title) away.
+            const label = !raw && s.call.kind === "tool_call" && !carriesSecret(s.summary) ? toolLabel(s.summary) : null;
+            if (label === null) return <span className="num min-w-0 flex-1 truncate" title={s.summary}>{s.summary}</span>;
+            const subject = toolSubject(s.call.text);
+            return (
+              <span className="step-what min-w-0 flex-1 truncate" title={s.summary}>
+                {t(label)}
+                {subject !== "" && <span className="step-subject"> · {subject}</span>}
+              </span>
+            );
+          })()}
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
-          {s.result && s.call.kind === "tool_call" && (
-            <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
-              {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
-            </span>
-          )}
+          {(() => {
+            // CAD-2363: what a result reads as. A saved artifact (native
+            // `cadence artifact put`, or the hosted `artifact_put`) and the raw
+            // view or an unknown tool read exactly as before; a known tool's
+            // error shows its reason, and its JSON result a count (a record
+            // with no list shows nothing — its row says what it did).
+            if (!s.result || s.call.kind !== "tool_call") return null;
+            const text = s.result.text;
+            const label = raw ? null : toolLabel(s.summary);
+            let shown: string | null;
+            if (!s.error && (isArtifactPutCall(s.call.text) || toolKey(s.summary) === "artifact_put")) shown = t("in the canvas");
+            else if (label === null) shown = stepSummary(text);
+            else if (s.error) shown = stepSummary(errorReason(text) ?? text);
+            else if (/^\s*[{[]/.test(text)) {
+              const count = resultCount(text);
+              shown = count === null ? null : count === 1 ? t("1 result") : t("{n} results").replace("{n}", String(count));
+            } else shown = stepSummary(text);
+            if (shown === null) return null;
+            return (
+              <span className="num truncate max-w-[40%] text-ink-500" title={text}>
+                {shown}
+              </span>
+            );
+          })()}
         </li>
       ))}
     </ul>
@@ -120,7 +152,14 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
         {refused > 0 && (
           <span className="text-warn shrink-0">· {refused === 1 ? t("refused") : `${refused} ${t("refused")}`}</span>
         )}
-        {last && <span className="num truncate min-w-0 text-ink-500">· {last.summary}</span>}
+        {last && (
+          <span className="num truncate min-w-0 text-ink-500">
+            · {(() => {
+              const label = last.call.kind === "tool_call" && !carriesSecret(last.summary) ? toolLabel(last.summary) : null;
+              return label !== null ? t(label) : last.summary;
+            })()}
+          </span>
+        )}
       </button>
       <div className="steps-body">
         <ToolRows entries={entries} />
@@ -727,17 +766,11 @@ export function entryRefs(payload: unknown): ThreadRef[] {
 // one folded trace (reasoning / worker notes / tool runs), the answer on its
 // own surface, then the artifact cards it produced.
 
-/** `9s` / `1m 4s` from two entry stamps; null when they do not measure. The
- *  trace never keeps a clock of its own — the dock's working row does. */
-function traceElapsed(from: string | null | undefined, to: string | null | undefined): string | null {
-  if (!from || !to) return null;
-  const start = Date.parse(from);
-  const end = Date.parse(to);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
-  const secs = Math.max(0, Math.round((end - start) / 1000));
-  if (secs < 1) return null;
-  if (secs < 60) return `${secs}s`;
-  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+/** An entry stamp (ISO string) as epoch ms, or null. */
+function stampMs(created: string | null | undefined): number | null {
+  if (!created) return null;
+  const ms = Date.parse(created);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 /** A tool call's plain name for the closed trace: `catalog_search: website`
@@ -752,11 +785,12 @@ function toolName(summary: string): string {
 
 /** Plain names of a tool run's calls, newest first. A result whose call has
  *  been paged out is not named: its summary is the tool's output. */
-function toolNames(entries: ThreadEntry[]): string[] {
+function toolNames(entries: ThreadEntry[], t: (english: string) => string): string[] {
   const names: string[] = [];
   for (const step of toolSteps(entries)) {
     if (step.call.kind !== "tool_call") continue;
-    const name = toolName(step.summary);
+    const label = carriesSecret(step.summary) ? null : toolLabel(step.summary);
+    const name = label !== null ? t(label) : toolName(step.summary);
     if (name !== "") names.unshift(name);
   }
   return names;
@@ -765,7 +799,7 @@ function toolNames(entries: ThreadEntry[]): string[] {
 /** The line after the trace title: up to three distinct tools the turn used,
  *  newest first. Never note text and never arguments: both stay in the open
  *  trace, because a closed summary is on screen for anyone to read. */
-function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
+function traceDigest(trace: ThreadItem[], t: (english: string) => string): { summary: string; errors: number } {
   let errors = 0;
   const names: string[] = [];
   for (const item of trace) {
@@ -773,7 +807,7 @@ function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
     for (const step of toolSteps(item.entries)) {
       if (step.error) errors += 1;
     }
-    names.unshift(...toolNames(item.entries));
+    names.unshift(...toolNames(item.entries, t));
   }
   return { summary: [...new Set(names)].slice(0, 3).join(", "), errors };
 }
@@ -781,13 +815,20 @@ function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
 /** The tool the turn is on right now, when the newest trace row is a tool.
  *  A later reasoning note means the tool has finished, so the bubble goes
  *  back to "Thinking…" instead of naming a call that already returned. */
-function runningTool(trace: ThreadItem[]): string {
+function runningTool(trace: ThreadItem[], t: (english: string) => string): string {
   for (let i = trace.length - 1; i >= 0; i--) {
     const item = trace[i];
     if (item.type === "tools") {
-      const [newest] = toolNames(item.entries);
-      if (newest !== undefined) return newest;
-      continue;
+      const calls = toolSteps(item.entries).filter((s) => s.call.kind === "tool_call");
+      const newest = calls[calls.length - 1];
+      if (newest === undefined) continue;
+      if (carriesSecret(newest.summary)) return "";
+      // CAD-2363: a known tool reads as its own label ("Search the web…");
+      // any other keeps "Running bash".
+      const label = toolLabel(newest.summary);
+      if (label !== null) return `${t(label)}…`;
+      const name = toolName(newest.summary);
+      return name === "" ? "" : `${t("Running")} ${name.charAt(0).toLowerCase()}${name.slice(1)}`;
     }
     if (item.type === "thinking" || item.type === "commentary") return "";
   }
@@ -856,7 +897,9 @@ function TurnTrace({
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState(false);
   const id = useId();
+  const hasTools = items.some((item) => item.type === "tools");
   const title = running
     ? t("Working")
     : failed
@@ -898,7 +941,7 @@ function TurnTrace({
               if (item.type === "tools") {
                 return (
                   <li key={item.key} className="turntrace-item" data-item-key={item.key}>
-                    <ToolRows entries={item.entries} newestFirst />
+                    <ToolRows entries={item.entries} newestFirst raw={raw} />
                   </li>
                 );
               }
@@ -916,9 +959,32 @@ function TurnTrace({
               );
             })}
           </ol>
+          {hasTools && (
+            <button type="button" className="lnk turntrace-raw" aria-pressed={raw} onClick={() => setRaw((r) => !r)}>
+              {raw ? t("Hide raw calls") : t("Show raw calls")}
+            </button>
+          )}
         </div>
       </div>
     </div>
+  );
+}
+
+/** CAD-2363: the running turn's one clock, beside the assistant's name. The
+ *  tick is decorative (CAD-1419: no elapsed-second screen-reader chatter);
+ *  the trace and the dock say the turn is working. */
+function TurnClock({ since }: { since: number }) {
+  const t = useTranslate();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return (
+    <span className="turn-clock num" data-turn-clock aria-hidden>
+      <span className="workdot live" />
+      {formatElapsed((now - since) / 1000, t)}
+    </span>
   );
 }
 
@@ -990,7 +1056,7 @@ function AnswerSurface({
             </div>
           )}
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
-            <Md text={entry.text} onOpen={onOpenIssue} />
+            <Md text={entry.text} onOpen={onOpenIssue} idTokens />
           </div>
         </section>
       )}
@@ -1046,8 +1112,17 @@ export function ThreadTurn({
   copy = true,
   previewConversation = null,
   previewTransform,
+  startedAt = null,
+  clock = true,
 }: {
   items: ThreadItem[];
+  /** CAD-2363: when this turn started (ms) — the stamp of the row just before
+   *  it, so a send queued behind another turn starts when that turn ended.
+   *  The live clock counts from it and the finished "Thought for" measures
+   *  from it, so the two agree. Absent: the trace's first entry. */
+  startedAt?: number | null;
+  /** False on a later segment of the same send (`clockRuns`): one clock per turn. */
+  clock?: boolean;
   running?: boolean;
   density?: Density;
   /** The conversation whose live preview text this turn may paint, when the
@@ -1105,18 +1180,24 @@ export function ThreadTurn({
   const intro = trace.find((item) => item.type === "thinking") ?? trace[0];
   const introEntry =
     intro === undefined ? undefined : intro.type === "tools" ? intro.entries[0] : intro.entry;
-  const digest = traceDigest(trace);
-  const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
+  const digest = traceDigest(trace, t);
+  const startMs = startedAt ?? stampMs(introEntry?.created);
+  const elapsedFor = streaming ? null : elapsedSecs(startMs, stampMs(shown?.entry.created));
+  const elapsed = elapsedFor === null ? null : formatElapsed(elapsedFor, t);
   const headAt = shown?.entry.created ?? lastCreated(items);
-  const tool = runningTool(trace);
-  const typingLabel = tool !== "" ? `${t("Running")} ${tool.charAt(0).toLowerCase()}${tool.slice(1)}` : t("Thinking…");
+  const tool = runningTool(trace, t);
+  const typingLabel = tool !== "" ? tool : t("Thinking…");
   return (
     <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
       {head && (
         <div className="turn-head">
           <AssistantFace size={16} />
           <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
-          <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+          {streaming && clock && startMs !== null ? (
+            <TurnClock since={startMs} />
+          ) : (
+            <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+          )}
           {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
         </div>
       )}
@@ -1138,7 +1219,7 @@ export function ThreadTurn({
       {hasPreview && previewText !== null && (
         <div className="answer" data-kind="preview" aria-live="off">
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
-            <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} />
+            <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} idTokens />
           </div>
         </div>
       )}

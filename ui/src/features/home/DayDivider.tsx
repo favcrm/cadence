@@ -1,4 +1,4 @@
-import { useTranslate } from "../../lib/locale";
+import { useLocaleTag, useTranslate } from "../../lib/locale";
 import type { ThreadItem } from "./thread";
 
 /** Local day key for an epoch-ms instant (the reader's own timezone). */
@@ -21,8 +21,9 @@ export function itemCreated(item: ThreadItem): number | null {
   return null;
 }
 
-/** "Today", "Yesterday", or a short local date (with the year when it differs). */
-export function dayText(ms: number, now: number, t: (key: string) => string): string {
+/** "Today", "Yesterday", or the local date with its weekday in the board's
+ *  language (CAD-2363), with the year when it differs. */
+export function dayText(ms: number, now: number, t: (key: string) => string, locale: string = "en"): string {
   const day = new Date(ms);
   const today = new Date(now);
   const diff = Math.round(
@@ -32,7 +33,8 @@ export function dayText(ms: number, now: number, t: (key: string) => string): st
   );
   if (diff === 0) return t("Today");
   if (diff === 1) return t("Yesterday");
-  return day.toLocaleDateString(undefined, {
+  return day.toLocaleDateString(locale, {
+    weekday: "short",
     month: "short",
     day: "numeric",
     ...(day.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }),
@@ -42,9 +44,10 @@ export function dayText(ms: number, now: number, t: (key: string) => string): st
 /** A quiet day rule between two days of a transcript (CAD-1886). */
 export function DayDivider({ ms, now = Date.now() }: { ms: number; now?: number }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   return (
     <li className="day-sep" data-day-sep>
-      <span>{dayText(ms, now, t)}</span>
+      <span>{dayText(ms, now, t, locale)}</span>
     </li>
   );
 }

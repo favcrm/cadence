@@ -546,6 +546,45 @@ export function itemMessage(item: ThreadItem): string | null {
   return item.entry.message ?? null;
 }
 
+/**
+ * CAD-2363: when a turn started (epoch ms) — the time of its own send, the
+ * operator or pending row whose message id the turn's rows carry. A queued
+ * row between the send and the turn, or inside it, is never the start, and a
+ * turn whose rows carry no message id (or whose send is out of the window)
+ * has none: its head then counts from its own first entry.
+ */
+export function turnStartMs(items: ThreadItem[], runItems: ThreadItem[]): number | null {
+  const message = runItems.map(itemMessage).find((m) => m !== null) ?? null;
+  if (message === null) return null;
+  for (let i = items.indexOf(runItems[0]) - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type !== "operator" && item.type !== "pending") || itemMessage(item) !== message) continue;
+    if (item.type === "pending") return Number.isFinite(item.pending.at) ? item.pending.at : null;
+    const ms = item.entry.created ? Date.parse(item.entry.created) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/**
+ * CAD-2363: the turn runs that carry a send's clock — the first run of each
+ * message. A queued row can split one turn into segments; only its first
+ * shows the live clock, so a turn never shows two. A run with no message id
+ * is its own first.
+ */
+export function clockRuns(runs: ThreadRun[]): Set<string> {
+  const seen = new Set<string>();
+  const out = new Set<string>();
+  for (const run of runs) {
+    if (!run.turn) continue;
+    const message = run.items.map(itemMessage).find((m) => m !== null) ?? null;
+    if (message !== null && seen.has(message)) continue;
+    if (message !== null) seen.add(message);
+    out.add(run.key);
+  }
+  return out;
+}
+
 /** React key for a user row. The optimistic pending row and the stored
  *  operator entry share one message id; one key keeps that row (and the
  *  typing block under it) from unmounting and rising in again when the

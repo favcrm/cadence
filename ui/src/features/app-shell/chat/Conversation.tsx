@@ -52,8 +52,10 @@ import {
   rowPaintKey,
   settlePending,
   stepSummary,
+  clockRuns,
   threadItems,
   threadRuns,
+  turnStartMs,
   visibleWindow,
   type PendingAttachment,
   type ThreadItem,
@@ -265,6 +267,7 @@ function HomeList({
 }: HomeListProps) {
   const { t } = useLocale();
   const runs = useMemo(() => threadRuns(items), [items]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
   // Only a transcript with no answer kind anywhere predates the mapper. A
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
@@ -445,6 +448,8 @@ function HomeList({
           <li className={`min-w-0 space-y-4${live && !turnKey.has(run.key) ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
+              startedAt={turnStartMs(items, run.items)}
+              clock={clocks.has(run.key)}
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
@@ -1758,6 +1763,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // last owns the typing dots, and only the segment carrying the answer says
   // anything about completion.
   const runs = useMemo(() => threadRuns(shown), [shown]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
   // A transcript with no answer kind anywhere predates the mapper: its last
   // worker note is what the operator read as the reply (same rule as Home).
   const legacyTranscript = useMemo(() => items.every((item) => item.type !== "answer"), [items]);
@@ -2242,6 +2248,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                           >
               <ThreadTurn
                 items={safe}
+                startedAt={turnStartMs(shown, view.run.items)}
+                clock={clocks.has(view.run.key)}
                 density={density}
                 head={view.head}
                 continued={view.continued}
