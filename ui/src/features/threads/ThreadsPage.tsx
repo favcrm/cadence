@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
@@ -729,6 +729,17 @@ function SheetDialog({
 
 /** Issue id -> project key, from the board's issue cards (the app's join). */
 type IssueProjects = Map<string, string>;
+/** CAD-2387: the opener and known-id test for issue ids inside a Markdown
+ *  turn. It is the refs row's path (OpenWorkItem + issueProjects), so an id
+ *  the board has no card for stays plain text. */
+function useIssueLinks(issueProjects: IssueProjects): {
+  onOpenIssue: ((id: string) => void) | undefined;
+  knownIssue: (id: string) => boolean;
+} {
+  const open = useContext(OpenWorkItem);
+  const knownIssue = useCallback((id: string) => issueProjects.has(id), [issueProjects]);
+  return { onOpenIssue: open ?? undefined, knownIssue };
+}
 function issueProjectMap(issues: { id: string; project: string }[]): IssueProjects {
   return new Map(issues.map((i) => [i.id, i.project]));
 }
@@ -1116,8 +1127,9 @@ const STAGES = new Set<string>(["queued", "claimed", "available", "running", "co
  *  unlinked entry or an unknown state shows no stage. `payload.refs` are
  *  the cited subjects the send carried, and a verified `payload.human`
  *  the recorded owner behind an owner write — both shown, never inferred. */
-function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects: IssueProjects }) {
+export function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects: IssueProjects }) {
   const t = useTranslate();
+  const issueLinks = useIssueLinks(issueProjects);
   const delivery = entry.payload?.delivery as { state?: unknown } | undefined;
   const stage = typeof delivery?.state === "string" && STAGES.has(delivery.state) ? delivery.state : null;
   const refs = Array.isArray(entry.payload?.refs)
@@ -1135,7 +1147,7 @@ function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects:
     : entry.role === "agent" ? t("Agent") : t("System");
   return (
     <article className="threads-msg" data-role={entry.role}>
-      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} showName markdown={rendersMarkdown(entry)} state={stage}>
+      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} showName markdown={rendersMarkdown(entry)} {...issueLinks} state={stage}>
         {entry.text}
       </Turn>
       {refs.length > 0 && (
@@ -1155,7 +1167,7 @@ function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects:
   );
 }
 
-function MessageRow({
+export function MessageRow({
   message,
   issueProjects,
   writeBlock,
@@ -1168,6 +1180,7 @@ function MessageRow({
   onReply?: () => void;
 }) {
   const t = useTranslate();
+  const issueLinks = useIssueLinks(issueProjects);
   const issueProject = message.issue ? issueProjects.get(message.issue) : undefined;
   const routed = (message.routed ?? []).filter((r) => typeof r.id === "string");
   const recipient =
@@ -1184,6 +1197,7 @@ function MessageRow({
         at={fmtTime(message.created)}
         me={message.sender.kind === "operator"}
         markdown={message.sender.kind === "agent" || message.sender.kind === "daemon"}
+        {...issueLinks}
         state={message.state}
       >
         {message.cloud_withheld ? (
