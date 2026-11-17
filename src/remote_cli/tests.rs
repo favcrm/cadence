@@ -9334,6 +9334,8 @@ fn cad2396_skill_write_without_a_matching_receipt_is_unknown() {
         let (out, _) = run(vec![(200, "", receipt)], verb, args, 10);
         assert!(out.is_ok(), "{verb}: {out:?}");
     }
+}
+
 // AOS-627: a staged connected effect is accepted only as the strict stage
 // answer, never as a provider result.
 #[test]
