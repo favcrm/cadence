@@ -191,7 +191,7 @@ def main(argv=None):
               "CADENCE_PRE_PUSH_LOCAL=1 for the explicit local path)",
               file=sys.stderr)
         return 1
-    if os.environ.get("CADENCE_PRE_PUSH_MODE") == "repo":
+    if os.environ.pop("CADENCE_PRE_PUSH_MODE", None) == "repo":
         argv = []  # git's remote and URL, not this script's options
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tests", action="store_true",
