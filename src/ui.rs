@@ -65,6 +65,8 @@ mod crm_smtp;
 pub mod delivery_sync;
 mod endpoints;
 mod home;
+#[cfg(all(test, feature = "test-seam"))]
+mod hosted_health_session_test;
 mod human_threads;
 mod lane;
 mod lifecycle;
