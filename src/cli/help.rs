@@ -79,6 +79,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
             ("memory", "Reviewed, scoped project facts"),
             ("wiki", "Shared, scoped knowledge pages"),
             ("skill", "Read or install bundled public guidance"),
+            (
+                "workspace-skill",
+                "A hosted workspace's own skills: draft, check, owner approval",
+            ),
         ],
     ),
 ];

@@ -182,6 +182,13 @@ fn verb_for(
             args = built;
             verb
         }
+        // CAD-2396: a hosted workspace's own skills. The board owns the
+        // package rules, the revision fence and who may approve.
+        Commands::WorkspaceSkill { action } => {
+            let (verb, built) = super::workspace_skill::request(action)?;
+            args = built;
+            verb
+        }
         Commands::Agent {
             action: AgentAction::Context { id },
         } => {
@@ -3393,6 +3400,12 @@ where
         // owner (docs/guides/hosted-workspace.md).
         super::agent_profile::refuse_managed_write(action, target.identity.is_some())?;
         super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
+    }
+    if let Commands::WorkspaceSkill { action } = &command {
+        // CAD-2396: approve and revoke are an owner's decision, refused for a
+        // managed caller before any request exists; the board cannot tell a
+        // managed agent on its owner's login from the owner.
+        super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
     }
     let (verb, args) = verb_for(&command, command_path.as_deref())?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
