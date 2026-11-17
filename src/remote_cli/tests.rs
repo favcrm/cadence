@@ -2407,6 +2407,25 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     assert!(!text.contains("retry later"), "{text}");
 }
 
+#[test]
+fn issue_new_keyed_receipt_correlates_after_the_issue_is_edited() {
+    let args = json!({"project": "original", "title": "Original", "request_id": "retry-1"});
+    let args = args.as_object().unwrap();
+    let current = json!({
+        "request_id": "retry-1",
+        "issue": {"id": "SYN-1"},
+        "card": {"id": "SYN-1", "project": "new-project", "title": "Edited"}
+    });
+    assert!(issue_receipt_correlates("issue_new", &current, args));
+    for receipt in [
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}}),
+        json!({"request_id": "other", "issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}}),
+        json!({"request_id": "retry-1", "issue": {"id": "SYN-1"}, "card": {"id": "SYN-2"}}),
+    ] {
+        assert!(!issue_receipt_correlates("issue_new", &receipt, args));
+    }
+}
+
 /// AOS-528: a link write answers the card it changed. A 200 naming another
 /// ticket, or naming none, cannot prove this link landed, so it is an unknown
 /// outcome rather than a success the caller would trust.
@@ -3638,6 +3657,36 @@ fn cad2277_board_without_issue_ls_limit_gets_typed_refusal_only_when_limit_sent(
     let plain_err = plain_result.unwrap_err();
     assert_eq!(plain_err.code(), None);
     assert_eq!(plain_err.kind(), "rejected");
+}
+
+#[test]
+fn issue_new_retry_id_is_not_downgraded_on_old_or_uncertain_board() {
+    let args = json!({
+        "project": "demo",
+        "title": "Synthetic issue",
+        "request_id": " stable-create-id "
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    for (status, code, kind) in [
+        (400, "invalid_request", "rejected"),
+        (503, "capability_unavailable", "unknown"),
+    ] {
+        let (out, requests) = run(
+            vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+            "issue_new",
+            args.clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), kind);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        let call = requests
+            .iter()
+            .find(|request| request["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!(args));
+    }
 }
 
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
@@ -8638,6 +8687,7 @@ mod agent_credential_refusals {
             200 => "200 OK",
             401 => "401 Unauthorized",
             403 => "403 Forbidden",
+            404 => "404 Not Found",
             409 => "409 Conflict",
             500 => "500 Internal Server Error",
             _ => "400 Bad Request",
@@ -8887,6 +8937,39 @@ mod agent_credential_refusals {
             vec![MINT, "authorize:A", "call:A", "authorize:A"],
             "a policy 401 was re-minted"
         );
+    }
+
+    #[test]
+    fn keyed_create_never_falls_back_to_the_member_identity() {
+        for stage in ["agent-credential", "authorize", "call"] {
+            let r = rig(8, move |route, req| {
+                if route == "agent-credential" && stage == route {
+                    return Some(Reply::Json(404, refused("not_found")));
+                }
+                (agent(req) && route == stage)
+                    .then(|| Reply::Json(403, refused("human_session_required")))
+            });
+            let slot = r.slot(CLAIM, 1);
+            let error = r
+                .send(
+                    Some(&slot),
+                    "issue_new",
+                    json!({"project": "demo", "title": "Synthetic", "request_id": "retry-1"}),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("same acting identity"),
+                "{error}"
+            );
+            let mut expected = vec![MINT];
+            if stage != "agent-credential" {
+                expected.push("authorize:A");
+            }
+            if stage == "call" {
+                expected.push("call:A");
+            }
+            assert_eq!(r.trail(), expected, "fallback at {stage}");
+        }
     }
 
     // 2. Exactly `human_session_required` falls back, once; nothing else does.

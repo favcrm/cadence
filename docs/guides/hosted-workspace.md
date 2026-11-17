@@ -692,6 +692,18 @@ cadence --org acme issue set <issue-id> status=doing --if-rev <issue-rev>
 cadence --org acme issue project timeline demo --since 7d
 ```
 
+On a board that supports retryable issue creation, add a stable caller-chosen
+`--request-id` to `issue new`. If the reply is lost, repeat the same command
+with the same ID and unchanged arguments, from the same user, assistant client,
+and acting agent or human identity; the board returns the same issue, not a
+duplicate. A changed request under the same ID is refused. A managed agent
+cannot fall back to its member's login for a keyed create. If the original
+acting identity is no longer available, inspect the board instead of retrying
+under a different one. An older board may reject the ID or omit the receipt.
+Never remove the ID and resend an ambiguous create: check the board or wait
+for the board upgrade instead. Without an ID, inspect the board before
+retrying. Local/native issue creation refuses this hosted-only option.
+
 Use the exact revision returned by each corresponding read, not a guessed one.
 To create a new wiki page, pass the create-only sentinel `--if-rev none`, which
 refuses the write if the path already exists; to update an existing page, pass
