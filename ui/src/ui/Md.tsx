@@ -319,7 +319,8 @@ function IdCode({ className, children }: { className?: string; children?: ReactN
   const linked = useContext(InLinkContext);
   const staged = useContext(StagedSourceContext);
   const plain = <code className={className}>{children}</code>;
-  if (className || linked || typeof children !== "string") return plain;
+  // A fenced block without a language arrives here too, ending in a newline: it stays code.
+  if (className || linked || typeof children !== "string" || children.includes("\n")) return plain;
   const fallback = isIdToken(children) ? <IdToken id={children} /> : plain;
   return staged !== null && stagedRefKey(children) !== null ? (
     <StagedChip source={staged} token={children} fallback={fallback} />

@@ -205,21 +205,22 @@ export default function NeedsRail({
     },
     ask: (lead) => ask(need, lead),
   });
-  const reviewStaged = (queue: string[], at: number) => {
-    stagedOpener.current = document.activeElement;
+  const reviewStaged = (queue: string[], at: number, opener: Element | null = document.activeElement) => {
+    stagedOpener.current = opener;
     homeDecisions.clearNotice();
     reviewOpening.current = true;
     setDrawer(false);
     setReview({ queue, at });
   };
   // CAD-2364: a chip in the thread opens the same review card, over what is waiting now.
-  const openStaged = useRef<(id: string) => void>(() => {});
-  openStaged.current = (id: string) => {
+  // The chip is the opener: a click does not focus a button in every browser.
+  const openStaged = useRef<(id: string, opener: HTMLElement) => void>(() => {});
+  openStaged.current = (id: string, opener: HTMLElement) => {
     const queue = staged.pending.map((w) => w.id);
     const at = queue.indexOf(id);
-    if (at >= 0) reviewStaged(queue, at);
+    if (at >= 0) reviewStaged(queue, at, opener);
   };
-  useEffect(() => homeDecisions.onReviewRequest((id) => openStaged.current(id)), []);
+  useEffect(() => homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener)), []);
   const openDecision = (key: string) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
     if (stagedCard) {

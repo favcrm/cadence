@@ -8,6 +8,7 @@ export {};
  *    unknown id, an ambiguous or a too-short prefix;
  *  - the answer: a known id is a chip; an unknown full id stays the copy
  *    token and an ambiguous prefix stays plain code, naming no other write;
+ *    a known id in a fenced block stays code;
  *  - the chip opens the rail's review card and sends nothing itself;
  *  - deciding on the card changes the chip's status without a reload;
  *  - written Chinese.
@@ -122,6 +123,10 @@ const ANSWER = [
   "Please **deny** action `828c1018a5…` rather than approve it.",
   "",
   "Unknown: `deadbeef00112233deadbeef00112233`. Shared start: `828c1018…`.",
+  "",
+  "```",
+  GIA,
+  "```",
 ].join("\n");
 
 /** The rail and an answer in one tree, the way Home renders them. */
@@ -177,6 +182,8 @@ actions = [row(GIA, "Add contact Gia"), row(SF, "Add contact San Francisco"), ro
   const plain = Array.from(v.answer().querySelectorAll("code")).map((c) => c.textContent);
   assert(plain.includes("828c1018…"), "a shared prefix stays plain code");
   assert(!text(v.answer()).includes("Ohm") && !text(v.answer()).includes("CRM"), "the answer names no write it did not match");
+  const fence = v.answer().querySelector("pre > code");
+  assert(fence?.textContent?.trim() === GIA && !fence.closest("pre")!.querySelector("[data-staged-chip]"), "a fenced block without a language stays code, never a chip");
   await v.done();
 }
 

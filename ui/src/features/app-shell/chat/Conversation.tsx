@@ -106,7 +106,7 @@ import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
 import ConversationDecisions from "./ConversationDecisions";
-import { conversationDecisions } from "../../decisions/useDecisions";
+import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 import { StagedSourceContext } from "../../../ui/StagedChip";
 import {
   AssistantAboutButton,
@@ -718,7 +718,17 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const operationPending = operationState?.scope === operationScope && operationState.pending;
   const decisionsOn = hosted && viewer.operator === true && !viewer.readOnly && convId !== null;
   // CAD-2364: one store for this conversation's decisions and its answers' chips.
-  const decisionStore = useMemo(() => (decisionsOn && convId !== null ? conversationDecisions(convId) : null), [decisionsOn, convId]);
+  // Held in state, not a memo React may drop: a new conversation gets a new store, a re-render never does.
+  const [decisionHold, setDecisionHold] = useState<{ conversation: string; store: DecisionsStore } | null>(null);
+  const decisionStore = !decisionsOn || convId === null
+    ? null
+    : decisionHold?.conversation === convId
+      ? decisionHold.store
+      : null;
+  useEffect(() => {
+    if (decisionsOn && convId !== null && decisionHold?.conversation !== convId)
+      setDecisionHold({ conversation: convId, store: conversationDecisions(convId) });
+  }, [decisionsOn, convId, decisionHold]);
   const stagedPending = decisionsOn && stagedState?.conversation === convId && stagedState.pending;
   useEffect(() => {
     onPendingDecision?.(operationPending || stagedPending);
