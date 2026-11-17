@@ -669,7 +669,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision, onWaitingChange }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
   const { locale, t, formatNumber } = useLocale();
   const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
@@ -682,6 +682,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const thread = useResource(store);
   const homeMasterState = useQuery(resources.masterState);
   const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  const entries = thread.data?.entries ?? [];
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
+  const onPendingDecision = useCallback(
+    (pending: boolean) => reportPendingDecision?.(pending || permissionPending),
+    [reportPendingDecision, permissionPending],
+  );
   // Hosted turn state belongs to the selected session, just like identity.
   // Native retains the install-wide coordinator queue.
   const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
@@ -713,6 +720,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const operationPending = operationState?.scope === operationScope && operationState.pending;
   const stagedPending = hosted && viewer.operator === true && !viewer.readOnly && convId !== null &&
     stagedState?.conversation === convId && stagedState.pending;
+  useEffect(() => {
+    onPendingDecision?.(operationPending || stagedPending);
+  }, [onPendingDecision, operationPending, stagedPending]);
   const streamDown = streamLink !== "live" || !operationsCurrent;
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
@@ -1238,13 +1248,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   useEffect(() => { onWaitingChange?.(waiting); }, [onWaitingChange, waiting]);
   // The turn bar (turnBar.ts, shared with Home): Stop carries this
   // conversation's own running message; Cancel its own queued message.
-  const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
-  const permissionPending = pendingPermission !== null;
-  useEffect(() => {
-    onPendingDecision?.(operationPending || stagedPending || permissionPending);
-  }, [onPendingDecision, operationPending, stagedPending, permissionPending]);
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
