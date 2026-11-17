@@ -69,16 +69,18 @@ reviews only for a PR based on `main`.
 
 | Table | Meaning |
 | --- | --- |
-| `operator` | Paths that always need the owner's approval of the exact head. |
+| `operator` | Paths that always need the owner's approval. |
 | `browser_qa` | A change to any of these paths needs a Browser QA pass. |
 | `routine` | Ordinary documentation that may merge with no mandatory review (regular files only, never a sensitive path). |
-| `schema`, `trigger1`, `trigger3`, `trigger4`, `trigger6`, `trigger7` | Sensitive areas: schema, trust and identity, secrets, supply chain and CI, outward actions, the rules themselves. A change here keeps two reviews. |
+| `schema`, `trigger1`, `trigger3`, `trigger4`, `trigger6`, `trigger7` | Sensitive areas: schema, trust and identity, secrets, supply chain and CI, outward actions, the rules themselves. A change here is `strict`: two reviews unless every changed path is on the one-review include list and off its exclude list. List these paths in `one_review_exclude` to always keep two. |
 | `delegable` | The only paths a delegated approval can cover (see [What the human approval does](#what-the-human-approval-does)). |
 
 `operator`, `schema`, `trigger4`, `trigger6` and `trigger7` paths are
-human-class: they need the owner's approval of the exact head. A `trigger1` or
-`trigger3` path, or a path the one-review list excludes, keeps two reviews, and
-needs the owner's approval only when a verdict's Risk is not `auto`.
+human-class: they need the owner's approval (of the exact head, or a scope
+approval that declares them; see below). A `trigger1` or `trigger3` path, or a
+path the one-review list excludes, is `strict` without that floor: it needs the
+owner's approval only for another reason, for example a verdict whose Risk is not
+`auto`, more than 1500 changed lines, or the workflow rule below.
 
 `docs/roles/workflow-auto-paths.toml` has an `[auto]` table with `paths`. When a
 review workflow's result is counted, a path outside `[auto] paths` forces the
@@ -323,7 +325,7 @@ refuses.
 | Review evidence | Review notes in a notes directory, counted by their declared reviewer. | Verdicts counted by attested principal; the author's principal is refused. |
 | Delivery policy | `PROJECT.md` plus `issue project approve-work`. | `issue project delivery` by the owner. |
 | Lane release | `issue finish`. | `issue finish` with a narrower set of options; see [Hosted workspace](hosted-workspace.md). |
-| Exception routes | The native gate has a local exception route that waives missing reviewer attestation until `EXCEPTION_ENDS`. | None. Hosted refuses it. |
+| Exception routes | The native gate has a local exception route that waives missing reviewer attestation until `EXCEPTION_ENDS`; it cannot land a PR while local signing is retired. | None. Hosted refuses it. |
 
 A hosted `routine` PR has no readiness record, so it takes both review workflow
 passes and any approval the gate requires. Whenever a workflow review is counted,
