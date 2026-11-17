@@ -113,6 +113,22 @@ pub fn digest(credential: &str) -> String {
     hex(&Sha256::digest(credential.as_bytes()))
 }
 
+/// A non-credential public consistency binding, distinct from the stored token
+/// digest. The token is independently random for every public sign-in.
+pub(crate) fn public_session_binding(token: &str) -> String {
+    use std::fmt::Write as _;
+    let mut hash = Sha256::new();
+    hash.update(b"cadence-public-session-binding/v1\0");
+    hash.update(token.as_bytes());
+    let digest = hash.finalize();
+    let mut binding = String::with_capacity(36);
+    binding.push_str("nsb_");
+    for byte in &digest[..16] {
+        write!(&mut binding, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    binding
+}
+
 /// Does `presented` equal `expected`? Compared as sha256 digests, every
 /// byte visited, so the time taken says nothing about where they differ.
 pub fn same_credential(presented: &str, expected: &str) -> bool {

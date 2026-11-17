@@ -108,6 +108,7 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
 /** This session is a member, not the operator: the `?operator=1` proof
  *  answers false and no protected app read may ever be issued for it. */
 let operatorSession = true;
+const sessionBinding = () => operatorSession ? "bsi_11111111-1111-4111-8111-111111111111" : "bsi_22222222-1111-4111-8111-111111111111";
 let listCalls = 0;
 const appReads: string[] = [];
 const requested: string[] = [];
@@ -120,12 +121,12 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path.startsWith("/api/meta")) {
     const role = operatorSession ? "operator" : "member";
     return json({ read_only: false, operator: operatorSession, signed_in: true, actor: `${role} (ui)`,
-      session: { id: `refusal-session-${role}`, origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: role, email: `${role}@example.test`, role } } });
+      session: { id: `refusal-session-${role}`, binding: sessionBinding(), origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: role, email: `${role}@example.test`, role } } });
   }
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
-  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": `refusal-session-${operatorSession ? "operator" : "member"}` } });
+  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": sessionBinding() } });
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
   if (path === "/api/app-installations") { listCalls++; return json(INSTALLS); }

@@ -610,6 +610,9 @@ pub struct ServeOpts {
     /// Test-only barrier between member agent-show and agent-events reads.
     #[cfg(test)]
     pub(crate) agent_detail_show_hook: Option<std::sync::Arc<AgentDetailReadHook>>,
+    /// Test-only barrier after a bound response is assembled, before final proof.
+    #[cfg(test)]
+    pub(crate) before_session_proof: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// An in-process owner's startup notification: success follows binding
     /// and initialization; a bind failure carries its I/O kind. Never set
     /// from the command line. Other startup failures disconnect the channel.
@@ -1241,6 +1244,8 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         agent_detail_read_hook: None,
         #[cfg(test)]
         agent_detail_show_hook: None,
+        #[cfg(test)]
+        before_session_proof: None,
         startup: None,
         // `ui run` reads `CADENCE_UI_READY_NONCE` itself; nothing here
         // copies a caller's env into the field.

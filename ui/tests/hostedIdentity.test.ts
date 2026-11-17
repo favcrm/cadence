@@ -73,6 +73,7 @@ async function boundaryChecks() {
   const { openAttachmentInTab } = require("../src/features/home/AttachmentMedia") as typeof import("../src/features/home/AttachmentMedia");
   const { privateSessionGeneration, privateReadsAllowed } = require("../src/lib/privateSession") as typeof PrivateSessionModule;
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const binding = (digit: string) => `bsi_${digit.repeat(8)}-1111-4111-8111-111111111111`;
   const signedIn = { ...base, hosted: false, operator: false, session: { id: "local-member", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: "member", name: "Member", email: "member@example.test", handle: "member", role: "member" } } };
   let response: () => Response | Promise<Response> = () => json(signedIn);
   let projectsResponse = () => json({ projects: [{ key: "private-project" }] });
@@ -174,7 +175,7 @@ async function boundaryChecks() {
     assert(effects > 1, "private effects resume after recovery");
 
     // A hosted renewal changes its deadline, not the owner of an unsent draft.
-    const hostedSession = { ...signedIn, hosted: true, session: { ...signedIn.session, id: "hosted-session", origin: "public" } };
+    const hostedSession = { ...signedIn, hosted: true, session: { ...signedIn.session, id: "hosted-session", binding: binding("1"), origin: "public" } };
     response = () => json(hostedSession);
     await focus();
     const oldOpen = win.open;
@@ -185,18 +186,30 @@ async function boundaryChecks() {
         openAttachmentInTab("synthetic-pdf", "synthetic-conversation");
         for (let i = 0; i < 20; i++) await Promise.resolve();
       });
-      assert(pdfExpectedSession === "hosted-session", "verified metadata pins the hosted PDF request");
+      assert(pdfExpectedSession === binding("1"), "verified metadata pins the hosted PDF request");
       assert(pdfClosed, "an older host without the session proof cannot open the PDF");
     } finally {
       win.open = oldOpen;
     }
     await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    response = () => json({ ...hostedSession, session: { ...hostedSession.session, binding: undefined } });
+    await focus();
+    assert(host.querySelector("[data-auth-state='updating'] h1") && !privateReadsAllowed(), "a hosted session without a strong binding cannot open the workspace");
+    response = () => json(hostedSession);
+    await retry();
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "restoring the same binding retains the draft");
+    response = () => json({ ...hostedSession, session: { ...hostedSession.session, binding: "short-id" } });
+    await focus();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "a malformed binding is not an older-server upgrade");
+    response = () => json(hostedSession);
+    await retry();
+    assert(host.querySelector("output")?.textContent === "unsaved private draft", "malformed metadata does not destroy the same-session draft");
     healthResponse = () => new Response(JSON.stringify({ ok: true, pm_present: true, projects: 2, issues: 9, daemon: "reachable", embedded: true }), {
-      headers: { "Content-Type": "application/json", "ETag": '"health-v1"', "X-Cadence-Verified-Session": "hosted-session" },
+      headers: { "Content-Type": "application/json", "ETag": '"health-v1"', "X-Cadence-Verified-Session": binding("1") },
     });
     let healthIssues = 0;
     await React.act(async () => { healthIssues = (await api.health()).issues; });
-    assert(healthExpectedSession === "hosted-session" && healthIssues === 9, "hosted health is delivered only for the requesting tab's verified identity");
+    assert(healthExpectedSession === binding("1") && healthIssues === 9, "hosted health is delivered only for the requesting tab's verified identity");
     for (const { proof, status } of [
       { proof: null, status: 304 },
       { proof: null, status: 200 },
@@ -285,10 +298,22 @@ async function boundaryChecks() {
     response = () => json(hostedSession);
     await retry();
     assert(host.querySelector("[data-private-workspace]"), "the remembered hosted identity can recover after reload");
+    // A native display id can collide: a changed strong binding alone is a
+    // new session even when the display id, user and creation time match.
+    response = () => json({ ...hostedSession, session: { ...hostedSession.session, binding: binding("8") } });
+    await focus();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a changed binding never resumes the previous session");
+    response = () => json(hostedSession);
+    await focus();
+    const confirmBinding = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Continue with this sign-in");
+    assert(confirmBinding, "returning to the original binding still requires confirmation");
+    await React.act(async () => confirmBinding.click());
+    await flush();
+    assert(host.querySelector("[data-private-workspace]") && host.querySelector("output")?.textContent === "", "confirmed replacement starts without the former draft");
 
 
     // A different hosted identity must not silently replace the admitted one.
-    const switched = { ...hostedSession, session: { ...hostedSession.session, id: "new-hosted-session", user: { ...hostedSession.session.user, sub: "second-user", email: "second@example.test" } } };
+    const switched = { ...hostedSession, session: { ...hostedSession.session, id: "new-hosted-session", binding: binding("2"), user: { ...hostedSession.session.user, sub: "second-user", email: "second@example.test" } } };
     response = () => json(switched);
     await focus();
     assert(host.querySelector("[data-auth-state='changed'] h1"), "a changed hosted identity requires confirmation");
@@ -329,7 +354,7 @@ async function boundaryChecks() {
       await React.act(async () => button.click());
       await flush();
     };
-    const changedAgain = { ...switched, session: { ...switched.session, id: "third-hosted-session", user: { ...switched.session.user, sub: "third-user", email: "third@example.test" } } };
+    const changedAgain = { ...switched, session: { ...switched.session, id: "third-hosted-session", binding: binding("3"), user: { ...switched.session.user, sub: "third-user", email: "third@example.test" } } };
     response = () => json(changedAgain);
     await continueWithCurrent();
     assert(host.querySelector("[data-auth-state='changed'] h1"), "a different identity arriving during confirmation needs a new confirmation");
@@ -344,20 +369,20 @@ async function boundaryChecks() {
     assert(host.querySelector("[data-auth-state='expired'] h1"), "a confirmed hosted refusal ends the admitted session");
     await React.act(async () => root.unmount());
     root = createRoot(host);
-    const afterRefusal = { ...changedAgain, session: { ...changedAgain.session, id: "fourth-hosted-session", user: { ...changedAgain.session.user, sub: "fourth-user", email: "fourth@example.test" } } };
+    const afterRefusal = { ...changedAgain, session: { ...changedAgain.session, id: "fourth-hosted-session", binding: binding("4"), user: { ...changedAgain.session.user, sub: "fourth-user", email: "fourth@example.test" } } };
     response = () => json(afterRefusal);
     await render();
     assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a new hosted identity after refusal and reload still requires confirmation");
     assert(host.textContent?.includes("fourth@example.test"), "the confirmation reflects the new verified identity");
     await continueWithCurrent();
     assert(host.querySelector("[data-private-workspace]"), "the newly verified identity opens only after confirmation");
-    const afterKeyChange = { ...afterRefusal, session: { ...afterRefusal.session, id: "fifth-hosted-session", user: { ...afterRefusal.session.user, sub: "fifth-user", email: "fifth@example.test" } } };
+    const afterKeyChange = { ...afterRefusal, session: { ...afterRefusal.session, id: "fifth-hosted-session", binding: binding("5"), user: { ...afterRefusal.session.user, sub: "fifth-user", email: "fifth@example.test" } } };
     response = () => json(afterKeyChange);
     await React.act(async () => setSessionKey("hosted-rotated-key"));
     await flush();
     assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a credential change cannot bypass hosted identity confirmation");
     await continueWithCurrent();
-    const afterRequired = { ...afterKeyChange, session: { ...afterKeyChange.session, id: "sixth-hosted-session", user: { ...afterKeyChange.session.user, sub: "sixth-user", email: "sixth@example.test" } } };
+    const afterRequired = { ...afterKeyChange, session: { ...afterKeyChange.session, id: "sixth-hosted-session", binding: binding("6"), user: { ...afterKeyChange.session.user, sub: "sixth-user", email: "sixth@example.test" } } };
     response = () => json(afterRequired);
     await React.act(async () => window.dispatchEvent(new Event("cadence:session-required")));
     await focus();
@@ -411,7 +436,7 @@ async function boundaryChecks() {
 
     // A different public identity on the very first response after reload
     // cannot be admitted just because the hostname hint is local.
-    const afterReloadSwitch = { ...afterRequired, session: { ...afterRequired.session, id: "seventh-hosted-session", user: { ...afterRequired.session.user, sub: "seventh-user", email: "seventh@example.test" } } };
+    const afterReloadSwitch = { ...afterRequired, session: { ...afterRequired.session, id: "seventh-hosted-session", binding: binding("7"), user: { ...afterRequired.session.user, sub: "seventh-user", email: "seventh@example.test" } } };
     response = () => json(afterReloadSwitch);
     await React.act(async () => root.unmount());
     root = createRoot(host);
@@ -520,6 +545,19 @@ async function boundaryChecks() {
     await focus();
     assert(location.pathname + location.search + location.hash === intendedPath, "only verified same-tab return restores the safe anchor");
     assert(sessionStorage.getItem("cadence.auth.hostedReturnTo") === null, "the hosted return marker is single-use");
+
+    // The old Worker marker already named the same full-entropy witness.
+    await React.act(async () => root.unmount());
+    sessionStorage.clear();
+    const workerSession = { ...hostedSession, session: { ...hostedSession.session, id: binding("9"), binding: binding("9") } };
+    sessionStorage.setItem("cadence.privateSessionIdentity", JSON.stringify([
+      true, workerSession.session.id, "public", workerSession.session.created, null,
+      workerSession.session.user.sub, workerSession.session.user.role,
+    ]));
+    response = () => json(workerSession);
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-private-workspace]") && !host.querySelector("[data-auth-state='changed']"), "the same strong Worker witness upgrades without a needless account confirmation");
 
     // Exercise the actual Login nonce exchange. A returned key is not admission:
     // the /login route cannot redirect or mount private content before metadata.

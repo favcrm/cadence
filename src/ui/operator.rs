@@ -1159,6 +1159,49 @@ fn cookie_value(request: &Request, names: &[String]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Public cookies must name at most one credential, including the local-dev
+/// spelling. Ambiguity is not absence: sign-in and logout must not mutate it.
+fn public_cookie(request: &Request) -> std::result::Result<Option<&str>, ()> {
+    let mut found = None;
+    for header in request.headers().iter().filter(|h| h.field.equiv("Cookie")) {
+        let value = header.value.as_str();
+        if value.contains(',') {
+            return Err(());
+        }
+        for part in value.split(';') {
+            let part = part.trim();
+            let Some((name, value)) = part.split_once('=') else {
+                if matches!(part, PUBLIC_COOKIE | PUBLIC_COOKIE_INSECURE) {
+                    return Err(());
+                }
+                continue;
+            };
+            if !matches!(name.trim(), PUBLIC_COOKIE | PUBLIC_COOKIE_INSECURE) {
+                continue;
+            }
+            let value = value.trim();
+            if found.is_some()
+                || value.is_empty()
+                || value.len() > 512
+                || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            {
+                return Err(());
+            }
+            found = Some(value);
+        }
+    }
+    Ok(found)
+}
+
+fn ambiguous_session() -> HttpResp {
+    coded_response(
+        400,
+        "ambiguous_session",
+        "The browser sent conflicting board sessions.",
+        None,
+    )
+}
+
 /// CAD-1006: the request's session origin for the screen credential
 /// relay — the `Origin` `request_origin` resolves to, or `None` when the
 /// request names no session-bearing host. Read-only; the daemon re-verifies
@@ -1201,17 +1244,20 @@ pub(super) fn chat_upload_session_proof(request: &Request, opts: &ServeOpts) -> 
 
 /// The session token the request presents for `origin`, if any.
 fn session_cookie(request: &Request, opts: &ServeOpts, origin: Origin) -> Option<String> {
-    // The public surface reads both the `__Host-` name and the worker's
-    // unprefixed local-dev allowance (contract §7); the minted name
-    // wins when a request carries both.
-    let names = match origin {
-        Origin::Public => vec![
-            PUBLIC_COOKIE.to_string(),
-            PUBLIC_COOKIE_INSECURE.to_string(),
-        ],
-        _ => vec![cookie_name(opts, origin)],
-    };
-    cookie_value(request, &names)
+    checked_session_cookie(request, opts, origin).ok().flatten()
+}
+
+fn checked_session_cookie(
+    request: &Request,
+    opts: &ServeOpts,
+    origin: Origin,
+) -> Result<Option<String>, HttpResp> {
+    if origin == Origin::Public {
+        return public_cookie(request)
+            .map(|token| token.map(str::to_owned))
+            .map_err(|()| ambiguous_session());
+    }
+    Ok(cookie_value(request, &[cookie_name(opts, origin)]))
 }
 
 /// This request's own origin, as a browser on it would send `Origin`.
@@ -1383,14 +1429,23 @@ pub(super) fn public_session(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<Option<Value>, HttpResp> {
+    let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+    public_session_with_budget(request, state_dir, opts, &budget)
+}
+
+pub(super) fn public_session_with_budget(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    budget: &client::MetaBudget,
+) -> Result<Option<Value>, HttpResp> {
     match request_origin(request, opts) {
-        ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
-            Some(token) => {
-                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-                check_session(state_dir, &token, "", Origin::Public, Some(&budget))
+        ReqOrigin::Known(Origin::Public) => {
+            match public_cookie(request).map_err(|()| ambiguous_session())? {
+                Some(token) => check_session(state_dir, token, "", Origin::Public, Some(budget)),
+                None => Ok(None),
             }
-            None => Ok(None),
-        },
+        }
         _ => Ok(None),
     }
 }
@@ -1411,6 +1466,7 @@ pub(super) struct ReadAdmission {
     proof: Option<(String, String, SessionScope)>,
     checked_at: std::time::Instant,
     held: Option<Held>,
+    public_binding: Option<String>,
 }
 
 /// Reader proof sent only over the board-to-daemon connection.
@@ -1466,6 +1522,10 @@ pub(super) fn caller_spelling(caller: &Caller) -> String {
 }
 
 impl ReadAdmission {
+    pub(super) fn public_binding(&self) -> Option<&str> {
+        self.public_binding.as_deref()
+    }
+
     pub(super) fn relay_proof(&self) -> ReadRelayProof {
         match &self.proof {
             Some((token, _, SessionScope::Origin(Origin::Public))) => {
@@ -1516,6 +1576,13 @@ impl ReadAdmission {
         };
         match live {
             Ok(Some(session)) => {
+                if self
+                    .public_binding
+                    .as_deref()
+                    .is_some_and(|binding| session["binding"].as_str() != Some(binding))
+                {
+                    return false;
+                }
                 let held = match origin {
                     SessionScope::Origin(origin) => held_of(*origin, &session),
                     SessionScope::Entry(_) => Some(Held::Operator),
@@ -1547,11 +1614,30 @@ pub(super) fn admit_read(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<ReadAdmission, HttpResp> {
+    admit_read_inner(request, state_dir, opts, false)
+}
+
+/// Capture the public binding only for reads that require its final proof.
+pub(super) fn admit_read_with_public_binding(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<ReadAdmission, HttpResp> {
+    admit_read_inner(request, state_dir, opts, true)
+}
+
+fn admit_read_inner(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    capture_public_binding: bool,
+) -> Result<ReadAdmission, HttpResp> {
     let checked_at = std::time::Instant::now();
-    let admission = |proof, held| ReadAdmission {
+    let admission = |proof, held, public_binding| ReadAdmission {
         proof,
         checked_at,
         held,
+        public_binding,
     };
     let scope = match request_origin(request, opts) {
         ReqOrigin::Known(origin) => Some(SessionScope::Origin(origin)),
@@ -1560,7 +1646,7 @@ pub(super) fn admit_read(
     };
     match &scope {
         Some(SessionScope::Origin(origin)) => {
-            if let Some(token) = session_cookie(request, opts, *origin) {
+            if let Some(token) = checked_session_cookie(request, opts, *origin)? {
                 let key = session_key(request);
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
                 if let Some(session) =
@@ -1570,6 +1656,11 @@ pub(super) fn admit_read(
                         return Ok(admission(
                             Some((token, key, SessionScope::Origin(*origin))),
                             Some(held),
+                            if capture_public_binding && *origin == Origin::Public {
+                                session["binding"].as_str().map(str::to_owned)
+                            } else {
+                                None
+                            },
                         ));
                     }
                 }
@@ -1585,6 +1676,7 @@ pub(super) fn admit_read(
                     return Ok(admission(
                         Some((token, key, SessionScope::Entry(entry.clone()))),
                         Some(Held::Operator),
+                        None,
                     ));
                 }
             }
@@ -1595,7 +1687,7 @@ pub(super) fn admit_read(
     // fallback so a stream retains its real identity and role.
     if let Some(SessionScope::Origin(origin)) = &scope {
         if anonymous_reads_on(opts, Some(*origin)) {
-            return Ok(admission(None, None));
+            return Ok(admission(None, None, None));
         }
     }
     let (code, message) = match &scope {
@@ -1985,7 +2077,7 @@ pub(super) fn board_caller(
 ) -> Result<Caller, HttpResp> {
     let origin = request_origin(request, opts);
     let (held, token) = match &origin {
-        ReqOrigin::Known(o) => match session_cookie(request, opts, *o) {
+        ReqOrigin::Known(o) => match checked_session_cookie(request, opts, *o)? {
             Some(token) => {
                 if write {
                     require_own_origin(request, *o)?;
@@ -2411,7 +2503,11 @@ pub(super) fn logout(request: &Request, state_dir: &std::path::Path, opts: &Serv
             return guard_fail("session_origin", "logout: no session lives on this Host")
         }
     };
-    if let Some(token) = session_cookie(request, opts, origin) {
+    let token = match checked_session_cookie(request, opts, origin) {
+        Ok(token) => token,
+        Err(resp) => return resp,
+    };
+    if let Some(token) = token {
         if let Err(resp) = require_own_origin(request, origin) {
             return resp;
         }
@@ -2943,6 +3039,18 @@ pub(super) fn platform_session(
     if opts.public.is_none() {
         return platform_fail(404, "not_found", "Unknown route.");
     }
+    // Parse a prior session before reading the assertion so ambiguity cannot
+    // affect consent state or consume a single-use assertion.
+    let prior_session = match public_cookie(request) {
+        Ok(token) => token.map(str::to_owned),
+        Err(()) => {
+            return platform_fail(
+                400,
+                "ambiguous_session",
+                "The browser sent conflicting board sessions.",
+            )
+        }
+    };
     let ct = header_value(request, "Content-Type").unwrap_or_default();
     if ct.trim() != "application/json" {
         return platform_fail(
@@ -2982,9 +3090,6 @@ pub(super) fn platform_session(
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
     }
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
-    // Only relay a prior session the browser actually presented. The daemon
-    // verifies this opaque proof before allowing it to affect consent state.
-    let prior_session = session_cookie(request, opts, Origin::Public);
     match client::rpc(
         state_dir,
         "board_session_open",

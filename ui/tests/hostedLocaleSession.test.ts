@@ -67,7 +67,7 @@ async function main(): Promise<void> {
         read_only: false, signed_in: true, actor, hosted: true, operator: false,
         tailnet_url: null, version: "0", build_commit: "x", build_time: "t",
         session: {
-          id: `session-${actor}`, origin: "public", created: 1700000000, last_used: 1700000000,
+          id: `session-${actor}`, binding: actor === "first-member" ? "bsi_11111111-1111-4111-8111-111111111111" : "bsi_22222222-1111-4111-8111-111111111111", origin: "public", created: 1700000000, last_used: 1700000000,
           idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "synthetic",
           user: { sub: actor, name: actor, email: `${actor}@example.test`, handle: actor, role: "member" },
         },

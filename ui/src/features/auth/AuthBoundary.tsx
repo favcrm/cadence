@@ -195,13 +195,28 @@ export default function AuthBoundary({ children }: {
         unavailable("unavailable", hosted);
         return false;
       }
+      const binding = session?.origin === "public" && typeof session.binding === "string"
+        && /^(?:bsi_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|nsb_[0-9a-f]{32})$/.test(session.binding)
+        ? session.binding : null;
+      if (hosted && meta.signed_in === true && sessionValid && binding === null) {
+        unavailable(session?.binding == null ? "updating" : "unavailable", true);
+        return false;
+      }
       const admitted = meta.signed_in === true || (!hosted && meta.anonymous_reads === true);
       if (admitted) {
         // Hosted sessions use a stable server-issued id; their expiry slides
         // without changing identity. Local sessions retain the expiry fence.
         const nextIdentity = meta.signed_in === true && session
-          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
+          ? JSON.stringify([hosted, session.id, binding, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
+        // The previous marker already held the Worker's full witness id.
+        // Native display ids are short, so they must not take this migration.
+        const previousIdentity = meta.signed_in === true && session
+          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
+          : null;
+        if (binding?.startsWith("bsi_") && binding === session?.id && identity.current === previousIdentity) {
+          identity.current = nextIdentity;
+        }
         if (hosted && (stateRef.current.hosted || hostedIdentity(identity.current)) && identity.current !== null && identity.current !== nextIdentity) {
           requireHostedConfirmation();
           discard();
@@ -224,7 +239,7 @@ export default function AuthBoundary({ children }: {
         identity.current = nextIdentity;
         healthRecoveryPending.current = false;
         try { sessionStorage.setItem(IDENTITY_STORE, nextIdentity); } catch { /* Same-page state still owns its drafts. */ }
-        allowPrivateReads(hosted && session?.origin === "public" ? session.id : null);
+        allowPrivateReads(hosted && session?.origin === "public" ? binding : null);
         setSession(meta);
         publish({ status: "ready", meta, accepted: meta, generation: privateSessionGeneration(), hosted });
         return true;

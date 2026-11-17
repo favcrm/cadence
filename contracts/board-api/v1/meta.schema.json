@@ -169,6 +169,13 @@
             "null"
           ]
         },
+        "binding": {
+          "description": "Non-secret per-login consistency binding; absent on older or local sessions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "created": {
           "type": "integer",
           "format": "int64"

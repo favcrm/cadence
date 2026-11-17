@@ -640,6 +640,8 @@ export interface RunningMessage {
 export interface SessionInfo {
   /** Non-secret durable account handle; null on legacy sessions. */
   account_id: string | null;
+  /** Non-secret per-login consistency binding; absent on older or local sessions. */
+  binding?: string | null;
   created: number;
   expires_at: number;
   id: string;

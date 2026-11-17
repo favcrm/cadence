@@ -447,6 +447,9 @@ fn require_quota_keys(schema: &mut schemars::Schema) {
 #[schemars(transform = require_session_keys)]
 pub struct SessionInfo {
     pub id: String,
+    /// Non-secret per-login consistency binding; absent on older or local sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     pub origin: SessionOrigin,
     pub created: i64,
     pub last_used: i64,

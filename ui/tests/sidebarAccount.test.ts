@@ -36,7 +36,7 @@ const AppComponent = (require("../src/App") as typeof import("../src/App")).defa
 const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
 
 const user = { name: "Fable Chen", email: "fable@example.com", role: "member", handle: "fable", sub: "s" };
-const validSession = { id: "s1", origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user };
+const validSession = { id: "s1", binding: "bsi_11111111-1111-4111-8111-111111111111", origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user };
 let meta: unknown = null;
 let privateReads = 0;
 let pendingMeta: ((response: Response) => void)[] = [];
@@ -49,7 +49,7 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
-  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": validSession.id } });
+  if (path === "/api/health") return new Response(JSON.stringify({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true }), { headers: { "Content-Type": "application/json", "X-Cadence-Verified-Session": validSession.binding } });
   if (path === "/api/update/banner") return json(null);
   if (path === "/api/setup") return json({ checks: [], offers: [] });
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });

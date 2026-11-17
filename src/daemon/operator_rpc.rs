@@ -1194,7 +1194,11 @@ impl Shared {
     pub(super) fn rpc_board_session_check(&self, params: &Value) -> Result<Value> {
         let token = required_str(params, "token")?;
         let session = match self.current_public_session(token)? {
-            public_membership::Authority::Granted { view, .. } => Some(*view),
+            public_membership::Authority::Granted { view, .. } => {
+                let mut session = serde_json::to_value(*view)?;
+                session["binding"] = json!(crate::operator_auth::public_session_binding(token));
+                Some(session)
+            }
             public_membership::Authority::Denied => None,
         };
         Ok(json!({"valid": session.is_some(), "session": session}))

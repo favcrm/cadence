@@ -2341,6 +2341,33 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             };
             let anonymous_reads_allowed =
                 operator::anonymous_reads_on(opts, operator::request_origin_kind(&request, opts));
+            #[cfg(test)]
+            if public_host && session.session["binding"].is_string() {
+                if let Some(hook) = &opts.before_session_proof {
+                    hook();
+                }
+            }
+            if public_host && session.session["binding"].is_string() {
+                let current =
+                    operator::public_session_with_budget(&request, state_dir, opts, &budget);
+                let matches = current.ok().flatten().is_some_and(|live| {
+                    live["binding"] == session.session["binding"]
+                        && live["id"] == session.session["id"]
+                        && live["user"] == session.session["user"]
+                });
+                if !matches {
+                    send(
+                        request,
+                        coded_response(
+                            503,
+                            "capability_unavailable",
+                            "The board session could not be verified.",
+                            None,
+                        ),
+                    );
+                    return;
+                }
+            }
             send(
                 request,
                 json_response(
@@ -2455,20 +2482,69 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // Health probes are public, but the workspace projection is
             // not. Keep authenticated status chips truthful without
             // leaking tracker paths/counts to an unsigned probe.
-            let admitted = match operator::admit_read(&request, state_dir, opts) {
-                Ok(_) => true,
-                Err(resp) if resp.status_code().0 == 401 => false,
+            let mut expected_headers = request
+                .headers()
+                .iter()
+                .filter(|header| header.field.equiv("X-Cadence-Expected-Session"));
+            let expected = expected_headers.next().map(|header| header.value.as_str());
+            if expected_headers.next().is_some() {
+                send(
+                    request,
+                    coded_response(
+                        409,
+                        "session_changed",
+                        "The verified board session changed.",
+                        None,
+                    ),
+                );
+                return;
+            }
+            let proof = if expected.is_some() {
+                operator::admit_read_with_public_binding(&request, state_dir, opts)
+            } else {
+                operator::admit_read(&request, state_dir, opts)
+            };
+            let mut admission = match proof {
+                Ok(admission) => Some(admission),
+                Err(resp) if resp.status_code().0 == 401 && expected.is_none() => None,
                 Err(resp) => {
                     send(request, resp);
                     return;
                 }
             };
+            if let Some(expected) = expected {
+                let binding = admission
+                    .as_ref()
+                    .and_then(|admission| admission.public_binding());
+                let Some(binding) = binding.filter(|value| {
+                    value.len() == 36
+                        && value.starts_with("nsb_")
+                        && value[4..]
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                }) else {
+                    send(request, coded_response(503, "sign_in_upgrade_required", "This workspace is updating its sign-in verification. Try again shortly.", None));
+                    return;
+                };
+                if binding != expected {
+                    send(
+                        request,
+                        coded_response(
+                            409,
+                            "session_changed",
+                            "The verified board session changed.",
+                            None,
+                        ),
+                    );
+                    return;
+                }
+            }
             let mut health = json!({
                 "ok": true,
                 "embedded": cfg!(feature = "ui"),
                 "build": crate::overview::BUILD_COMMIT,
             });
-            if admitted {
+            if admission.is_some() {
                 let pm = Pm::at(pm_dir).ok();
                 let (projects, issues) = match &pm {
                     Some(pm) => (
@@ -2491,7 +2567,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 health["issues"] = json!(issues);
                 health["daemon"] = json!(daemon);
             }
-            send(request, json_response(health));
+            if let Some(expected) = expected {
+                #[cfg(test)]
+                if let Some(hook) = &opts.before_session_proof {
+                    hook();
+                }
+                if !admission
+                    .as_mut()
+                    .is_some_and(|admission| admission.still_live_before_frame(state_dir))
+                {
+                    send(
+                        request,
+                        coded_response(
+                            503,
+                            "capability_unavailable",
+                            "The board session could not be verified.",
+                            None,
+                        ),
+                    );
+                    return;
+                }
+                let mut response = json_response(health);
+                response.add_header(
+                    Header::from_bytes("X-Cadence-Verified-Session", expected)
+                        .expect("verified binding is a valid header"),
+                );
+                send(request, response);
+            } else {
+                send(request, json_response(health));
+            }
         }
         "/api/setup" => {
             // Refused before anything runs: no probe for a viewer.

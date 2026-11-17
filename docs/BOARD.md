@@ -1856,13 +1856,22 @@ upgrade and offers Retry instead of describing a connection outage or asking
 the user to switch accounts. The hidden in-memory workspace resumes only after
 the same session is verified again.
 
-Hosted health reads carry the verified tab's session ID and accept a successful
-response, including a cached `304`, only with the matching server proof. Missing
-proof shows the updating state; a mismatch or unresolved refusal conceals the
-workspace until Retry or a network-restored check re-verifies the identity. Focus
-does not repeatedly reopen the workspace while this health proof is unresolved.
-Ship the server proof before the client: an older Worker cannot satisfy it.
-This check protects health reads only, not every private endpoint or WebSocket.
+Hosted metadata includes a non-secret `session.binding` for consistency checks.
+The Worker uses its full witness ID; a native public board derives a separate,
+domain-separated 128-bit value from its random session token, not the short
+display ID or the stored credential digest. It is not an authentication
+credential. Missing binding reports an upgrade; malformed binding is
+unavailable. Health reads carry the verified binding and accept a successful
+response, including a cached `304`, only with the matching server proof.
+On native public boards, metadata and health recheck the session before
+returning its binding or counts. Conflicting public session cookies are
+refused without selecting, clearing, or replacing either credential.
+Missing proof shows the updating state; a mismatch or unresolved refusal
+conceals the workspace until Retry or a network-restored check re-verifies the
+identity. Focus does not repeatedly reopen it while health proof is unresolved.
+Ship the server support before the client: older Workers and daemons cannot
+satisfy it. This check protects health reads only; it is not a paired browser
+credential, an anti-rollback floor, or a fence for every private endpoint.
 
 When this tab verifies a different hosted session, it discards the previous
 private tree and requires confirmation before opening the new one. The button
