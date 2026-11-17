@@ -6658,12 +6658,23 @@ fn call_verb_until_retry(
         // `connection_access_denied`, `capability_unavailable`, ...). The generic
         // classification drops the code of a 403, 404 or 503, so print it here.
         // A board that predates the operation refuses it as `invalid_request`.
-        if platform_operation == Some("connected_effect") && !(200..300).contains(&status) {
-            if let Some(code) = refusal_code.as_deref().filter(|code| {
-                !board_gate_refused(body.as_ref())
-                    && !tracker_unavailable_before_verb(status, body.as_ref())
-                    && !matches!(*code, "uncertain" | "idempotency_in_progress")
-            }) {
+        // Only the stage's own pre-effect refusals are definite: 400/403/404/409,
+        // and the two 503 codes the board returns before staging. A 401 keeps its
+        // login remedy, a waking answer keeps its wake path, and any other 5xx
+        // stays an unknown outcome (the row may exist), reconciled by replaying
+        // the same stage.
+        if platform_operation == Some("connected_effect")
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+        {
+            let definite = match (status, refusal_code.as_deref()) {
+                (400 | 403 | 404 | 409, Some(code)) => Some(code),
+                (503, Some(code @ ("capability_unavailable" | "authority_unavailable"))) => {
+                    Some(code)
+                }
+                _ => None,
+            };
+            if let Some(code) = definite {
                 let hint = if code == "invalid_request" {
                     " — check the input and connection, or update the hosted tenant server if \
                      it predates connected-effect support"
