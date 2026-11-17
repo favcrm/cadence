@@ -3,6 +3,8 @@ import {
   ATTACH_MAX_FILES,
   attachFits,
   attachMeta,
+  attachStatus,
+  displayAttachError,
   isPermanentUploadFailure,
   userUploadError,
   attachRefusal,
@@ -10,6 +12,7 @@ import {
   unresolvedHint,
   type AttachItem,
 } from "../src/features/app-shell/chat/attach";
+import { translateUiText } from "../src/lib/locale";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -33,6 +36,10 @@ equal(attachFits(ATTACH_MAX_FILES, 1) !== null, true, "the sixth refuses");
 
 const item = (key: string, status: AttachItem["status"], id?: string): AttachItem =>
   ({ key, name: `${key}.txt`, size: 1, status, file: null as unknown as File, id, generation: 0 });
+equal(attachStatus(item("pending", "uploading")), "Uploading and processing…", "pending work is visible");
+equal(attachStatus({ ...item("photo", "ready"), modelInput: { kind: "vision", converted: true } }), "Image ready for vision · converted", "converted pixels are described without claiming delivery");
+equal(attachStatus({ ...item("video", "ready"), modelInput: { kind: "none", converted: false } }), "Stored only · assistant cannot read content", "stored-only files are not described as readable");
+equal(attachStatus(item("legacy", "ready")), "Ready", "legacy receipts remain neutral");
 
 // ---- the send gate: unresolved rows hold the send ---------------------
 
@@ -58,6 +65,38 @@ equal(
   "A '.txt' file must sniff as its declared kind — the bytes did not",
   "the RPC name and file prefix never reach the operator",
 );
+equal(
+  userUploadError("chat upload refused: photo conversion is unavailable — try again later"),
+  "Photo conversion is unavailable — try again later",
+  "hosted conversion failures show the actionable reason",
+);
+const heicFailure = userUploadError(
+  "chat upload refused: HEIC and HEIF photos aren't supported. Export as JPEG or PNG, then attach again.",
+);
+equal(
+  displayAttachError(heicFailure, (text) => translateUiText(text, "zh-TW")),
+  "不支援 HEIC 或 HEIF 相片。請匯出為 JPEG 或 PNG，然後重新附加。",
+  "an unsupported HEIC upload explains how to attach a supported image",
+);
+const photoFailure = userUploadError("chat upload refused: the photo could not be processed — retry or choose another image");
+equal(
+  displayAttachError(photoFailure, (text) => translateUiText(text, "zh-TW")),
+  "無法處理此相片，請重試或選擇另一張圖片",
+  "an unknown conversion failure gives actionable Chinese guidance",
+);
+for (const [reason, chinese] of [
+  ["the image is malformed or incomplete — try another image", "圖片格式有誤或不完整，請選擇另一張圖片"],
+  ["the image exceeds the supported size — choose a smaller image", "圖片超出支援大小，請選擇較小的圖片"],
+  ["this image encoding is not supported — export it as JPEG or PNG", "不支援此圖片編碼，請匯出為 JPEG 或 PNG"],
+  ["the image could not be reduced under the model image budget", "無法將圖片縮小至模型的圖片大小限制內"],
+  ["the image could not be reduced enough — choose a smaller image", "無法將圖片縮小至支援大小，請選擇較小的圖片"],
+]) {
+  equal(
+    displayAttachError(userUploadError(`chat upload refused: ${reason}`), (text) => translateUiText(text, "zh-TW")),
+    chinese,
+    "hosted photo refusals are actionable in Chinese",
+  );
+}
 equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
 equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");
 equal(isPermanentUploadFailure(413), true, "an oversize refusal is permanent");

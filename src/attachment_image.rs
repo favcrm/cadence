@@ -4,8 +4,8 @@
 //! Two responsibilities, kept out of `store::chat_files` so the custody
 //! module stays about provenance:
 //!
-//! - **Raster validation.** PNG/JPEG/WebP bytes are decoded under hard
-//!   dimension, pixel and allocation limits. The compressed size is
+//! - **Raster validation.** PNG/JPEG/WebP bytes are decoded under
+//!   dimension and pixel bounds, with decoder allocation limits. Compressed size is
 //!   bounded separately ([`IMAGE_MAX_BYTES`]) by the native prompt bound
 //!   the Pi adapter enforces, so an image accepted here can actually be
 //!   delivered as native image pixels instead of failing later.
@@ -19,11 +19,11 @@
 //!   under a Landlock ruleset built before fork, RLIMIT_CPU/AS/FSIZE/CORE/
 //!   NOFILE/NPROC and a process-group deadline.
 //!
-//! Neither function mutates custody. They answer "may this be delivered
-//! as visual input?" for the exact bytes the caller already digest-
-//! checked. A rasterized SVG is a derived turn image; the retained
-//! source stays the original attachment.
+//! Neither function mutates custody. Callers prove the retained source's
+//! digest and use the returned visual bytes: PNG metadata not checked by the
+//! decoder is removed, and an SVG render is a separate turn image.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -99,19 +99,6 @@ fn image_format(mime: &str) -> Option<image::ImageFormat> {
     }
 }
 
-/// The byte-sniffed raster MIME, independent of any caller claim.
-pub fn sniff_raster(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]) {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
@@ -148,25 +135,21 @@ fn decode_raster(bytes: &[u8], mime: &str) -> Result<image::DynamicImage> {
     Ok(decoded)
 }
 
-/// Prove raster bytes are exactly their declared kind and decode within
-/// the delivery bound. The caller passes bytes whose size and digest it
-/// already checked; this never opens a path.
-pub fn validate_raster(bytes: &[u8], mime: &str) -> Result<()> {
-    if bytes.len() > IMAGE_MAX_BYTES {
-        return Err(Error::rejected(format!(
-            "the image is {} bytes — over the {IMAGE_MAX_BYTES}-byte native image \
-             prompt bound",
-            bytes.len()
-        )));
+/// Prove a raster's kind and bounds, returning the bytes safe to deliver.
+/// The retained source was already size- and digest-checked by the caller.
+pub fn validate_raster<'a>(bytes: &'a [u8], mime: &str) -> Result<Cow<'a, [u8]>> {
+    cadence_image::validate_native(bytes, mime).map_err(|error| Error::rejected(error.to_string()))
+}
+
+/// Keep the original allocation when validation only needs an input prefix.
+pub fn prepare_raster(mut bytes: Vec<u8>, mime: &str) -> Result<Vec<u8>> {
+    match validate_raster(&bytes, mime)? {
+        Cow::Borrowed(clean) => {
+            bytes.truncate(clean.len());
+            Ok(bytes)
+        }
+        Cow::Owned(clean) => Ok(clean),
     }
-    let sniffed = sniff_raster(bytes)
-        .ok_or_else(|| Error::rejected("the bytes carry no supported image signature"))?;
-    if sniffed != mime {
-        return Err(Error::rejected(format!(
-            "the image declares '{mime}' but its bytes sniff as '{sniffed}'"
-        )));
-    }
-    decode_raster(bytes, mime).map(|_| ())
 }
 
 /// The most nodes one document may decode into. A source small enough to
@@ -494,7 +477,7 @@ pub fn rasterize_svg(source: &[u8]) -> Result<(&'static str, Vec<u8>)> {
     // re-encoded, not silently accepted or truncated, so the byte cap
     // applies to the delivered bytes rather than the intermediate.
     if png.len() <= IMAGE_MAX_BYTES {
-        validate_raster(&png, "image/png")
+        let png = prepare_raster(png, "image/png")
             .map_err(|e| Error::rejected(format!("the rasterized SVG is unusable: {e}")))?;
         return Ok(("image/png", png));
     }
@@ -519,8 +502,7 @@ fn shrink_to_prompt_bound(png: &[u8]) -> Result<Vec<u8>> {
             out.len()
         )));
     }
-    validate_raster(&out, "image/jpeg")?;
-    Ok(out)
+    prepare_raster(out, "image/jpeg")
 }
 
 fn converter_missing() -> String {
@@ -647,3 +629,43 @@ fn apply_render_limits() -> std::io::Result<()> {
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+#[cfg(test)]
+mod cad2355_jpeg_suffix_acceptance {
+    use super::{prepare_raster, validate_raster};
+    use image::ExtendedColorType;
+
+    #[test]
+    fn native_jpeg_preserves_original_and_delivers_only_the_first_image() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85)
+            .encode(&[255, 0, 0, 0, 0, 255], 2, 1, ExtendedColorType::Rgb8)
+            .expect("encode a complete JPEG");
+        assert!(jpeg.ends_with(&[0xff, 0xd9]));
+        assert!(validate_raster(&jpeg, "image/jpeg").is_ok());
+
+        for tail in [&b"phone metadata\0\xff\xd9"[..], &b"\xff\xd8\xff\xd9\0"[..]] {
+            let mut retained = jpeg.clone();
+            retained.extend_from_slice(tail);
+            let original = retained.clone();
+            let checked = validate_raster(&retained, "image/jpeg")
+                .expect("a complete JPEG with a suffix must be accepted");
+            assert_eq!(checked.as_ref(), jpeg.as_slice());
+            assert_eq!(
+                retained, original,
+                "validation must not alter the retained upload"
+            );
+            let delivered = prepare_raster(retained.clone(), "image/jpeg")
+                .expect("prepare the first JPEG without its suffix");
+            assert_eq!(delivered, jpeg);
+            assert_eq!(
+                retained, original,
+                "preparation must leave the retained upload unchanged"
+            );
+        }
+
+        let incomplete = &jpeg[..jpeg.len() - 2];
+        assert!(validate_raster(incomplete, "image/jpeg").is_err());
+        assert!(prepare_raster(incomplete.to_vec(), "image/jpeg").is_err());
+    }
+}

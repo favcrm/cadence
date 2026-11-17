@@ -51,9 +51,10 @@ quota are described in [Quota admission contract](#quota-admission-contract).
     missing tool rather than as a bad file, and the `tests` workflow installs it
     on its runner.
   - **`.png`, `.jpg`, `.jpeg`, `.webp`**, admitted only after a real decoder
-    accepts the whole file within the dimension, pixel and allocation bounds.
-    The extension must match the sniffed bytes and the decoded dimensions must
-    match the header's.
+    accepts the image within the dimension, pixel and allocation bounds. The
+    extension must match the sniffed bytes and the decoded dimensions must
+    match the header's. A JPEG may have trailing bytes: the original is retained,
+    but only the validated first JPEG is delivered to the model.
   - **`.svg`**, retained as inert source and rendered to a bounded raster for
     the model. The source is parsed with `roxmltree` (document types disabled)
     and refused whole if it carries script, embedded markup, animation, an

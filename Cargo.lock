@@ -216,6 +216,7 @@ dependencies = [
  "ammonia",
  "base64",
  "cadence-core",
+ "cadence-image",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -263,6 +264,18 @@ dependencies = [
  "sha2",
  "toml",
  "zeroize",
+]
+
+[[package]]
+name = "cadence-image"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "image",
+ "libjpeg-turbo-rs",
+ "moxcms",
+ "png",
 ]
 
 [[package]]
@@ -1107,6 +1120,15 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libjpeg-turbo-rs"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "083fece5e695fd3678ab4ec206f6beb23cc511c1f65e797812dc88f5502591fa"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "libsqlite3-sys"

@@ -13,7 +13,7 @@ import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
 import type { PendingAttachment } from "../../home/thread";
-import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
+import { attachMeta, attachStatus, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
   addFiles,
@@ -195,10 +195,10 @@ function AttachChips({
         <div
           key={a.key}
           role="group"
-          className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
+          className={`app-chat-filerow${a.status === "failed" ? " failed" : a.status === "uploading" || a.modelInput ? " with-status" : ""}`}
           data-attach-status={a.status}
           data-attach-key={a.key}
-          aria-label={`${a.name}: ${t(a.status === "uploading" ? "Uploading…" : a.status === "failed" ? "Failed" : "Ready")}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
+          aria-label={`${a.name}: ${attachStatus(a, t)}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
           title={a.name}
         >
           <span className="app-chat-chip-slot">
@@ -241,11 +241,14 @@ function AttachChips({
               <span className="app-chat-chip-name">{a.name}</span>
               <small>
                 {attachMeta(a.name, a.size, t)}
-                {a.status !== "ready" && (
-                  <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
+                {a.status === "failed" && (
+                  <span className="app-chat-touch-status">{` · ${attachStatus(a, t)}`}</span>
                 )}
               </small>
             </span>
+            {(a.status === "uploading" || (a.status === "ready" && a.modelInput)) && (
+              <small className="app-chat-file-status" role="status">{attachStatus(a, t)}</small>
+            )}
             {a.status === "failed" && a.error && (
               <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
                 {displayAttachError(a.error, t)}
@@ -756,7 +759,7 @@ export default function Composer({
       className="app-chat-attach"
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : t("unavailable")}`}
       title={attachEnabled
-        ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
+        ? t("Attach files (10 MiB; video 20 MiB). Supported types depend on the workspace.")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}
