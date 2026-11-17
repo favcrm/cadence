@@ -1,105 +1,33 @@
 #!/usr/bin/env python3
-"""CAD-959: enqueue a PR only when the AGENTS.md review and merge rules hold.
+"""Evaluate or enqueue a PR using Cadence's delivery rules.
 
-    scripts/enqueue-reviewed <pr> --head <full-40-hex-sha> [--repo owner/name]
-                             [--notes-dir DIR] [--author ALIAS ...]
-                             [--dry-run] [--poll-secs N] [--poll-interval N]
+For a hosted org, select it with --org or CADENCE_ORG. --dry-run delegates to
+`cadence delivery check`; an enqueue delegates to `cadence delivery enqueue`.
+In this workspace the operator performs hosted enqueue. Use --project and
+--issue to identify the ticket and --head to pin the reviewed commit.
+`--exception --advisory` is refused for hosted orgs.
 
-Every `cadence` call uses the build named by CADENCE_BIN (default: `cadence` on
-PATH), so a host that also carries a newer build can point the gate at it
-instead of seeing hosted verbs reported as unavailable.
+When Browser QA is required, the hosted gate accepts a counted QA verdict, an
+unedited exact-head pass from a non-author repository member, or an eligible
+PR author's unedited exact-head pass with the operator's project-scoped
+per-head approval (CAD-2383). The gate cannot prove that QA actually ran.
+--browser-qa URL also validates that specific pass comment and requires QA;
+--require-browser-qa requires QA without naming a comment URL.
 
-Refuses (exit 1, one reason per line on stderr, every failing rule listed)
-unless ALL of these hold for the pinned head:
+Without a hosted org selector, the native evaluator can run with --dry-run.
+Native local v1 signing is retired, so neither ordinary native enqueue nor the
+native --exception evaluator can land a PR. Do not treat either as a fallback
+for an unavailable hosted gate.
 
-  * the PR is OPEN, its head equals --head, mergeStateStatus is not DIRTY and
-    auto-merge is off;
-  * every required status check of the base branch (branch protection AND
-    rulesets) is PRESENT and SUCCESS at that head. Missing or pending fails,
-    and so does a base branch for which no required check can be read: an
-    invalid workflow yields zero checks, and "nothing failed" is not a pass;
-  * the verdict notes in the notes dir, parsed by `cadence audit verdicts`
-    (the audit's own note parser; reviewer = first token of `From:`), give the
-    required count of PASS verdicts pinned to this exact head from distinct
-    reviewers, none of them the PR author: two (Standards plus Spec/security),
-    or one (`Review (standards+spec)`) when every change is on the one-review
-    list (docs/roles/one-review-paths.toml, CAD-957, read with the diff's anchor:
-    main's live tip for a PR based on main, else the PR's base commit, so a PR
-    cannot widen its own list). A `ui/` change also needs a
-    Browser QA pass. AOS-473: a document whose `origin` is `hosted` is counted
-    by the owner's attestation instead — the row must name this repo and carry
-    a reviewer_id and a github_login (except a CAD-2081 workflow-issued row,
-    which carries no login and counts under its own rules; see AGENTS.md
-    "Review"), distinct reviewers are principals, the
-    author check compares the attested login, and one login fills at most one
-    slot (two counted principals behind one login refuse the set). Two hosted
-    rows of one reviewer and kind that share a stamp are refused unless they
-    carry the same evidence, login included. A local document (or one from an
-    older client, which has no marker) counts exactly as before. CAD-2001: the
-    hosted reads are project-scoped. `cadence delivery requirements` says
-    where its answer came from (`origin: "hosted"`), and the gate then passes
-    the ticket's project — the one the requirements binding already names and
-    this script already checks against the ticket — to `cadence audit
-    verdicts --project` and `cadence audit approval --project --issue`. The
-    project is never derived from the repo or the cwd, and a hosted read that
-    cannot name it is refused rather than answered from repo-scoped evidence;
-  * this gate is main's (CAD-2108): its own bytes and the sibling delivery-gate
-    equal origin/main:scripts/<name>, read by local git from the current
-    directory with no network. Differing, or a file unreadable on either side
-    while origin/main exists, refuses (--dry-run warns and runs). No origin/main
-    in the current directory means no check. A stale local origin/main is not
-    detected. The first stdout line names the gate's content hash;
-  * a ticket comment for this head lists those verdict notes (created after
-    the other gates pass; dry-run only checks an existing comment);
-  * for a human-class diff (a path trigger, more than 1500 changed lines, any
-    head-pinned note whose Risk is not exactly `auto`, or a workflow-issued
-    review on a change workflow_auto_reasons refuses; the rule is
-    docs/roles/risk-classes.md trigger 7),
-    `cadence audit approval` reports an approval in
-    force for exactly this head. This script never records an approval.
+The wrapper compares its own and delivery-gate's bytes with origin/main before
+running: a real enqueue refuses a mismatch, while --dry-run warns. This check
+uses the local ref and does not fetch it; if origin/main is absent, it cannot
+compare. Every `cadence` call uses CADENCE_BIN when set, else `cadence` on PATH.
+See AGENTS.md "Review" and "Merging" and docs/guides/hosted-workspace.md for
+the applicable evidence and approval rules.
 
-Review standard (operator decision 2026-11-03, CAD-1946): a valid review is a
-fresh-context session that is not the author, a subagent included (AGENTS.md
-"Review"). This gate does not enforce that: hosted verdicts count by attested
-principal and the author's is refused, local notes count by their self-declared
-`From:` alias (not attested), so it cannot tell a fresh session from the author
-under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); their
-workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
-gate, security, schema and release PRs, and two of them satisfy other PRs. A
-hosted board has no readiness record, so a hosted `routine` PR takes those two
-workflow reviews and the operator approval they carry (CAD-2135), unless this
-gate's dry run reports `class: auto` (CAD-2254: workflow_auto_reasons enforces
-docs/roles/risk-classes.md trigger 7; being on the list is not enough). A hosted `ui/**`
-PR takes those two workflow reviews, operator approval, and `--browser-qa <url>`
-naming a comment on this PR that is exactly the lines `Browser QA: pass` and
-`Head: <full sha>` (CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
-operator's approval accepts that. The temporary exception below also still serves
-until it ends on 2026-12-31.
-
-CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
-spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
-missing authenticated reviewer attestation, and on a hosted routine PR the readiness
-proof hosted can't produce yet, which the evidence names. Every other rule still
-holds, a filed non-pass verdict still refuses, the operator must have approved this exact head
-(no scope fallback), and the signature and evidence say it is an exception. The
-advisory links are findings from separately assigned sessions, not verdicts: the
-gate cannot prove they are fresh sessions, and the operator accepts that. The
-exception only checks that the links are separate https URLs: it proves neither
-head binding nor that Browser QA ran. Ends at
-`EXCEPTION_ENDS` in scripts/delivery-gate.
-
-CAD-2001 release order: the tenant server must serve the project-scoped gate
-verbs before this client sends them. An older tenant refuses the verb names
-(HTTP 501/400/409/503) and the client says so — "update the tenant server
-first, then this Cadence client" — which this gate reports as a refusal, never
-as "no evidence was filed" and never by falling back to the repo-scoped reads.
-
-Then it signs (repo, pr, head) with the delivery-gate key (--gate-key) and posts
-the signature on the PR (CAD-1925: the merge queue's `delivery-gate` job holds
-any PR without it), runs `gh pr merge --auto --squash --match-head-commit <sha>`, polls
-isInMergeQueue for up to --poll-secs (default 30), and when the PR is not
-queued runs --disable-auto and exits 1. --dry-run runs every check and
-enqueues nothing. Exit: 0 enqueued (or dry-run clean) / 1 refused / 2 usage.
+Exit 0 means evaluation passed or enqueue was accepted, not that the PR
+merged. A refusal, invalid arguments or an upstream failure exits nonzero.
 """
 
 import argparse
@@ -2704,7 +2632,10 @@ def run_hosted_gate(args, repo):
 def main(argv):
     if "--self-test" in argv:
         return self_test()
-    ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
+    ap = argparse.ArgumentParser(
+        prog=ME,
+        description="Check or enqueue through Cadence; this workspace's hosted enqueue is operator-only.",
+    )
     ap.add_argument("pr", type=int)
     ap.add_argument("--head", help="the full 40-hex head SHA the review covered")
     ap.add_argument("--repo")
@@ -2715,13 +2646,13 @@ def main(argv):
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
-                    help="the delivery-gate SSH signing key (CAD-1925)")
+                    help="legacy native signing key (local v1 signing is retired)")
     ap.add_argument("--exception", action="store_true",
-                    help="CAD-1946: waive only the missing reviewer attestation; needs --advisory")
+                    help="native evaluation only; refused on hosted orgs and cannot enqueue with retired v1 signing")
     ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
-                    help="a separate advisory review: standards, spec-security or browser-qa")
+                    help="advisory review for native exception evaluation; refused on hosted orgs")
     ap.add_argument("--browser-qa", metavar="URL",
-                    help="a ui/ change on a hosted org: the PR comment recording its Browser QA")
+                    help="hosted: validate this exact-head pass comment and require Browser QA")
     ap.add_argument("--require-browser-qa", action="store_true",
                     help="force hosted delivery check/enqueue to require Browser QA")
     ap.add_argument("--poll-secs", type=float, default=30)
