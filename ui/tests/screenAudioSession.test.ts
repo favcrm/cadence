@@ -73,6 +73,12 @@ void (async () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (url === "/api/app-screen-recordings/delete") {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       return new Response("Not found", { status: 404 });
     }) as typeof fetch;
 
@@ -157,6 +163,28 @@ void (async () => {
     check(fetchCalls.length === 0, "missing or declined consent never calls quote or recording storage");
     check(events.length === 0, "missing or declined consent does not start a session");
     decliningSession.dispose();
+
+    const deletion = { v: 2, op: "audio-recording", id: "delete-test", action: "delete", record_id: "meeting-1" } as const;
+    const noDeleteConfirmation = await session.recording(deletion, callAbort.signal);
+    check(!noDeleteConfirmation.ok && noDeleteConfirmation.refusal.code === "cancelled", "missing delete confirmation refuses");
+    let deleteConfirmations = 0;
+    const deleteDecision = createScreenAudioSession({
+      actionToken: "f".repeat(64),
+      signal: mountAbort.signal,
+      getLocale: () => "en",
+      onEvent: () => {},
+      confirmDelete: () => { deleteConfirmations += 1; return deleteConfirmations > 1; },
+    });
+    const declinedDelete = await deleteDecision.recording(deletion, callAbort.signal);
+    check(!declinedDelete.ok && declinedDelete.refusal.code === "cancelled", "declined delete confirmation refuses");
+    check(deleteConfirmations === 1 && fetchCalls.length === 0, "missing or declined delete confirmation sends no request");
+    const confirmedDelete = await deleteDecision.recording(deletion, callAbort.signal);
+    check(confirmedDelete.ok && Number(deleteConfirmations) === 2, "confirmed deletion succeeds");
+    check(Number(fetchCalls.length) === 1 && fetchCalls[0]?.url === "/api/app-screen-recordings/delete" &&
+      fetchCalls[0]?.body.record_id === "meeting-1" && fetchCalls[0]?.body.action_token === "f".repeat(64),
+      "confirmed deletion sends the selected record with the host-held token");
+    deleteDecision.dispose();
+    fetchCalls.length = 0;
 
     // 1. Quote preflight 402 refusal transitions phase to error.
     const refusedStart = await session.dispatch(
