@@ -995,40 +995,73 @@ head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
 reviews and no approval here, but the merge gate also requires a pass from both
 review workflows, and those rows carry the auto-paths rule.
 
-The review standard (operator decision 2026-11-03) is a
-fresh-session review: a session that is not the author and inherits no
-conversation or context from the work, including a subagent (a fork or a
-resumed authoring session does not count). Record the actual reviewer/session,
-repository, full head, outcome, checks and limitations, and call it a
-fresh-session review, never an independent party. The gate does not enforce
-that standard yet: it counts hosted verdicts by attested principal and refuses
-the author's principal (local notes count by their self-declared `From:`
-alias, which is not attested), so a profile or separate session alone does not make a
-gate-counted verdict, and in-chat findings are not one either. Until the gate
-can tell a fresh session from the author (the workflow-issued reviews of
-CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
-schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
-`ui/**` PR takes two workflow passes, the operator's approval and `--browser-qa <url>`,
-naming an unedited comment on the PR by a repository member that is exactly the two lines
-`Browser QA: pass` and `Head: <full sha>`, with the report in another comment (CAD-2173). That binds the claim to the head but cannot prove the QA ran, which is
-what the approval accepts. Until it ends, it can instead merge with the temporary
-`--exception --advisory ...` path (exact-head operator approval and two
-advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change, even where the board asks for fewer or no approval; ends at
-`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
-A hosted `routine` PR has no readiness record, because a hosted board has no
-delivery record to prove it from. It takes a pass from both review workflows at
-its head and the operator approval a workflow row needs, unless the gate's dry run
-reports `class: auto`. Matching `docs/roles/workflow-auto-paths.toml` is not enough
-on its own: a path that is human-class (for example `docs/INSTALL-AGENT.md` and
-`docs/REMOTE-AUTH.md`, CAD-2256), never eligible, a case variant of a protected
-path, or not a plain add or modify still needs the operator
-(`docs/roles/risk-classes.md` trigger 7 states the rule). The gate's refusal names
-what to dispatch. The exception also still waives this until it ends. The exception
-only checks that the advisory links are separate https URLs; it proves neither
-head binding nor that Browser QA ran. Agents in this workspace do
-not run `audit verdict` below: they post findings as a PR comment and use it as
-the advisory link (AGENTS.md "Review"). The command is documented for what it does.
+The review standard (operator decision 2026-11-03) is a fresh-session review:
+a session that is not the author and inherits no conversation or context from
+the work. A fresh subagent qualifies; a fork or resumed authoring session does
+not. Record the reviewer/session, repository, full head, outcome, checks and
+limitations. A dispatcher posting the review under the PR author's login does
+not make the reviewer the author. Call it a fresh-session review, not an
+independent party.
+
+The gate counts hosted verdicts by attested principal and refuses the author's
+principal. A fresh session or a PR comment alone is not a gate-counted verdict.
+In the Cadence project in this workspace, agents file no hosted verdicts: the
+reviewer reports back and the dispatcher posts the findings. Workflow-issued
+Standards and Spec/security rows are a cheap first pass on gate, security,
+schema and release PRs; two rows
+satisfy the review requirement on other PRs (AGENTS.md "Review"). The computed
+class, path rules and any operator approval still apply.
+
+When hosted Browser QA is required, the fresh QA session exercises the actual
+change and reports the result and limitations to the dispatcher. The dispatcher
+posts the full report on the PR. Only for a pass, post a separate, unedited
+comment containing exactly these two lines, with the full current head:
+
+```text
+Browser QA: pass
+Head: <full-sha>
+```
+
+CAD-2383 counts a PR author's pass from an eligible repository member only
+alongside the operator's project-scoped per-head approval through an operator
+channel, after the operator reads the report. A scope, delegated or legacy
+repo-scoped approval does not satisfy this route. A counted Browser QA verdict
+or a non-author repository member's unedited exact-head pass is also accepted.
+An edited or old-head pass does not count; post new evidence for the new head.
+The gate checks the pass and approval, not whether QA ran.
+
+For the author-pass route, an agent can inspect readiness before approval, then
+check it again after the operator approves. `--browser-qa` on these commands
+requires Browser QA; it is a flag, not a report URL:
+
+```sh
+cadence --org acme delivery check --project <project-key> --issue <issue-id> \
+  --repo <owner/name> --pr <number> --head <full-sha> --browser-qa
+# Operator only, after reading the report:
+cadence --org acme audit approve --project <project-key> --issue <issue-id> \
+  --repo <owner/name> --pr <number> --head <full-sha> --source "<who, where>"
+# Agent re-runs delivery check; the operator then enqueues:
+cadence --org acme delivery enqueue --project <project-key> --issue <issue-id> \
+  --repo <owner/name> --pr <number> --head <full-sha> --browser-qa
+```
+
+`delivery check` reports `browser_qa_route`; an author pass awaiting approval
+is not a pass by itself. On 2026-11-16, the operator selected an interim route:
+after reading the report, the operator personally posts the non-author exact
+pass as `favcrm-dev`. CAD-2383 supersedes that requirement; it remains a
+fallback for older boards. The operator's two GitHub profiles are not two
+humans, and an agent must never switch to the operator's profile or impersonate
+them.
+
+The hosted wrapper refuses `--exception --advisory`; it is not a hosted
+fallback. The native evaluator cannot enqueue while local signing is retired;
+see AGENTS.md "Merging". A hosted `routine` PR has no readiness record: it
+takes both workflow passes and any approval the gate requires. Matching
+`docs/roles/workflow-auto-paths.toml` alone is not enough; protected paths,
+case variants and changes other than plain additions or modifications still
+require the operator. For the Cadence project in this workspace, agents run QA,
+post reports and run checks; the operator approves, enqueues and decides any
+deployment. Other projects follow their own applicable policies.
 
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
