@@ -242,7 +242,8 @@ var RECORD_CALL_VERBS = [
 	"works.patch",
 	"works.trash",
 	"works.restore",
-	"works.request_review"
+	"works.request_review",
+	"calendar.query"
 ];
 var RECORD_SLOT_VERBS = [
 	"records.csv.import",

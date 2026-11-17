@@ -1009,6 +1009,23 @@ impl Store {
         )?)
     }
 
+    /// CAD-2379: every routine's runs whose slot falls in `[from_epoch,
+    /// to_epoch)`, oldest first. The calendar read bounds it by `limit`.
+    pub fn routine_runs_between(
+        &self,
+        from_epoch: i64,
+        to_epoch: i64,
+        limit: usize,
+    ) -> Result<Vec<RoutineRun>> {
+        let conn = self.conn();
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(conn.query_vec(
+            "SELECT * FROM routine_runs WHERE due_instant >= ?1 AND due_instant < ?2 ORDER BY due_instant ASC, id ASC LIMIT ?3",
+            params![from_epoch, to_epoch, cap],
+            row_routine_run,
+        )?)
+    }
+
     pub fn routine_update(&self, id: &str, patch: RoutineUpdate) -> Result<Routine> {
         let id = id.to_string();
         self.write_tx(move |tx| {

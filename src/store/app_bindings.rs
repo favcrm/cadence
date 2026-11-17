@@ -481,6 +481,21 @@ impl Store {
         Ok(json!({"bindings":bindings,"truncated":truncated}))
     }
 
+    /// CAD-2379: the IANA zone of the oldest configured publish binding that
+    /// carries a valid one. The calendar read uses it as its zone until the
+    /// workspace has a company zone of its own.
+    pub fn app_binding_first_publish_zone(&self) -> Result<Option<String>> {
+        let conn = self.conn();
+        let zones = conn.query_vec(
+            "SELECT json_extract(config,'$.publish.timezone') FROM app_bindings WHERE state='configured' AND json_extract(config,'$.publish.timezone') IS NOT NULL ORDER BY created ASC,id ASC LIMIT 20",
+            [],
+            |r| r.get::<_, String>(0),
+        )?;
+        Ok(zones
+            .into_iter()
+            .find(|zone| zone.parse::<chrono_tz::Tz>().is_ok()))
+    }
+
     /// Upgrade compatibility must inspect every configured binding, including
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
