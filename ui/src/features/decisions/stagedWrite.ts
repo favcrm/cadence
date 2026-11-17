@@ -310,9 +310,9 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
-  if (write.status === "denied") return "denied";
-  // The provider may have acted: that is not a failure and not a success.
+  // The provider may have acted: that is not a failure, not a success, and not "nothing ran" even if denied after.
   if (write.connected !== null && write.result?.ok === false && write.result.code === "uncertain") return "unconfirmed";
+  if (write.status === "denied") return "denied";
   if (write.result?.ok === false) return "failed";
   // Success is only ever what the row says: ok === true (or the ticket a create made).
   if (write.result?.ok === true || (write.kind === "create_issue" && write.result?.ticket)) return "applied";

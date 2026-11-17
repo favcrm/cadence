@@ -436,7 +436,9 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
                   ) : receipt.record?.id ? (
                     <B>{receipt.record.id}</B>
                   ) : receipt.ok === false ? (
-                    `${t("Did not apply")}: ${t(failureReason(write))}`
+                    outcomeOf(write) === "unconfirmed"
+                      ? `${t("Result not confirmed")}: ${reasonText(failureReason(write), t)}`
+                      : `${t("Did not apply")}: ${reasonText(failureReason(write), t)}`
                   ) : receipt.ok ? (
                     t("Applied")
                   ) : (

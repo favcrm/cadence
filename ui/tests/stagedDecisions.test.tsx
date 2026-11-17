@@ -1137,6 +1137,8 @@ listStatus = 200;
   // The server leaves an uncertain send pending, carrying the result.
   const stuck = parseStagedRow(effect("u1", { result: { ok: false, code: "uncertain", retry: true } }));
   assert(stuck !== null && outcomeOf(stuck) === "pending" && stuck.result?.code === "uncertain", "a pending row keeps its uncertain result");
+  const denied = parseStagedRow(effect("u2", { status: "denied", decidedAt: Date.now(), result: { ok: false, code: "uncertain", retry: true } }));
+  assert(denied !== null && outcomeOf(denied) === "unconfirmed", "denied after an uncertain attempt is not 'nothing ran'");
   actions = [effect("u1", { result: { ok: false, code: "uncertain", retry: true } })];
   {
     const w = await render();
