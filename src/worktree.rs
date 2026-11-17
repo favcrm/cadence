@@ -266,7 +266,8 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// `scripts/boat-build` both resolve per-lane. With `scripts/boat-build` the
 /// check plan runs in this worktree's Boat sandbox so the shared host does not
 /// compile; a repository without it runs its own `scripts/pre-push` on the
-/// host with no arguments (CAD-2403). The receipt
+/// host like a git hook — git's arguments, the ref lines on stdin and
+/// `CADENCE_PRE_PUSH_MODE=repo` (CAD-2403). The receipt
 /// records the checked head, base, sandbox and result under this
 /// worktree's git dir. Required CI, review and approval remain
 /// authoritative. A `--no-verify` push leaves no receipt, which is the
@@ -278,7 +279,8 @@ const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
 # the shared host does not compile. A missing Boat CLI refuses the push rather
 # than falling back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit
 # emergency path and runs the same plan on this host. CAD-2403: a repository
-# without scripts/boat-build runs its own scripts/pre-push here instead.
+# without scripts/boat-build runs its own scripts/pre-push here instead, as a
+# git hook would (CADENCE_PRE_PUSH_MODE=repo).
 top=$(git rev-parse --show-toplevel) || exit 1
 gd=$(git rev-parse --absolute-git-dir) || exit 1
 cd "$top" || exit 1
@@ -296,8 +298,11 @@ lane=${CADENCE_ALIAS:-$USER}
 # refuse a multi-head push rather than checking only one of them.
 pushed=
 saw_ref=
+refs=
 while read -r local_ref local_sha remote_ref remote_sha; do
     saw_ref=1
+    refs="$refs$local_ref $local_sha $remote_ref $remote_sha
+"
     case "$local_sha" in
         *[!0]*) ;;
         *) continue ;;
@@ -311,6 +316,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     esac
 done
 if [ "$pushed" = multiple ]; then
+    echo "pre-push: refusing a push of several heads at once; push one branch at a time" >&2
     printf 'head=%s lane=%s mode=boat steps=refused:multiple-heads rc=1 at=%s\n' \
         "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 1
@@ -355,8 +361,25 @@ if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -n "$tree_clean"
             exit 0 ;;
     esac
 fi
-if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
+if [ ! -x scripts/boat-build ]; then
+    # CAD-2403: a repository without a sandbox helper runs its own
+    # scripts/pre-push here, like a git hook: git's remote name and URL as
+    # arguments and the ref lines on stdin, plus CADENCE_PRE_PUSH_MODE=repo.
+    # It checks the working tree, so the pushed commit must be HEAD. The hook
+    # writes the receipt itself.
+    commit=$(git rev-parse --verify -q "$pushed^{commit}" 2>/dev/null) || commit=$pushed
+    if [ "$commit" != "$head" ]; then
+        echo "pre-push: the pushed commit is not HEAD; check out the commit you push and push again" >&2
+        printf 'head=%s lane=%s mode=repo steps=refused:head-mismatch rc=1 at=%s\n' \
+            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+        exit 1
+    fi
+    printf '%s' "$refs" | CADENCE_PRE_PUSH_MODE=repo scripts/pre-push "$@"
+    rc=$?
+    line="head=$head lane=$lane mode=repo rc=$rc at=$(date +%s)"
+elif [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     if [ "$pushed" != "$head" ]; then
+        echo "pre-push: the pushed commit is not HEAD; check out the commit you push and push again" >&2
         printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
             "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
         exit 1
@@ -368,25 +391,10 @@ if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     printf '%s\n' "$output" >&2
     line=$(printf '%s\n' "$output" | tail -n 1)
 else
-    if [ ! -x scripts/boat-build ]; then
-        # CAD-2403: a repository without a sandbox helper runs its own
-        # scripts/pre-push here, with no arguments (its interface is its own),
-        # against the working tree, so the pushed commit must be HEAD. The
-        # hook writes the receipt itself.
-        if [ "$pushed" != "$head" ]; then
-            printf 'head=%s lane=%s mode=repo steps=refused:head-mismatch rc=1 at=%s\n' \
-                "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
-            exit 1
-        fi
-        scripts/pre-push
-        rc=$?
-        line="head=$head lane=$lane mode=repo rc=$rc at=$(date +%s)"
-    else
     output=$(scripts/boat-build --receipt --head "$pushed" ${PRE_PUSH_TESTS:+--tests})
     rc=$?
     line=$(printf '%s\n' "$output" | tail -n 1)
     [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
-    fi
 fi
 # CAD-2341: a clean pass names the head the plan started on. A commit or
 # branch switch during the run (local mode reads HEAD when it ends) leaves
