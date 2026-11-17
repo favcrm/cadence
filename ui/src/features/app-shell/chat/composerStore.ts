@@ -42,6 +42,7 @@ import {
   type AttachDestination,
   type AttachItem,
 } from "./attach";
+import { preparePhoto } from "./photoPreparation";
 
 const EMPTY: AttachItem[] = [];
 const EMPTY_REFS: ThreadRef[] = [];
@@ -583,6 +584,7 @@ function startUpload(
   file: File,
   generation: number,
   capturedDestination?: AttachDestination,
+  hosted = false,
 ): void {
   const controller = new AbortController();
   controllers.set(itemKey, controller);
@@ -626,15 +628,20 @@ function startUpload(
       // concurrent upload instead of waiting, so a multi-file drop must
       // queue here. A row removed while it waits never starts.
       operation.assertCurrent();
-      const row: ChatFileRow | null = await oneAtATime(() =>
-        stillOwned() && !operation.signal.aborted
-          ? api.chatFileUpload(file, operation.signal, uploadDestination(destination))
-          : Promise.resolve(null),
-      );
+      const result: { row: ChatFileRow; converted: boolean; decoderLicenseUrl?: string; decoderNoticesUrl?: string } | null = await oneAtATime(async () => {
+        if (!stillOwned() || operation.signal.aborted) return null;
+        const prepared = await preparePhoto(file, operation.signal, () => patch(itemKey, generation, { status: "uploading", converting: true }), hosted);
+        operation.assertCurrent();
+        if (!stillOwned() || operation.signal.aborted) return null;
+        patch(itemKey, generation, { status: "uploading", converting: false });
+        const row = await api.chatFileUpload(prepared.file, operation.signal, uploadDestination(destination));
+        return { row, converted: prepared.converted, decoderLicenseUrl: prepared.decoderLicenseUrl, decoderNoticesUrl: prepared.decoderNoticesUrl };
+      });
       operation.assertCurrent();
-      if (row === null || !stillOwned() || operation.generation !== privateSessionGeneration()) return;
+      if (result === null || !stillOwned() || operation.generation !== privateSessionGeneration()) return;
+      const { row, converted, decoderLicenseUrl, decoderNoticesUrl } = result;
       controllers.delete(itemKey);
-      patch(itemKey, generation, { status: "ready", id: row.id, name: row.name, mime: row.mime, destination });
+      patch(itemKey, generation, { status: "ready", id: row.id, name: row.name, size: row.size, mime: row.mime, converted, decoderLicenseUrl, decoderNoticesUrl, destination });
       try {
         destination?.refreshCapability?.();
       } catch {
@@ -650,6 +657,7 @@ function startUpload(
       if (operation.signal.aborted || operation.generation !== privateSessionGeneration()) {
         patch(itemKey, generation, {
           status: "failed",
+          converting: false,
           error: "The private session changed",
           permanent: false,
         });
@@ -664,6 +672,7 @@ function startUpload(
       }
       patch(itemKey, generation, {
         status: "failed",
+        converting: false,
         error: userUploadError(e instanceof Error ? e.message : String(e)),
         permanent: e instanceof ApiError && isPermanentUploadFailure(e.status),
       });
@@ -676,14 +685,14 @@ function startUpload(
 /** Queue files picked or dropped: each lands as its own row and uploads
  *  immediately; a pre-flight refusal lands as a failed row (never
  *  silently dropped). */
-export function addFiles(key: string, files: Iterable<File>, destination?: AttachDestination): void {
+export function addFiles(key: string, files: Iterable<File>, destination?: AttachDestination, hosted = false): void {
   const cell = activeOf(familyFor(key));
   const q = queueOf(cell.id);
   let have = q.items.length;
   const added: AttachItem[] = [];
   for (const file of files) {
     const itemKey = `a${++nextItemKey}`;
-    const problem = attachRefusal(file.size, file.name) ?? attachFits(have, 1);
+    const problem = attachRefusal(file.size, file.name, hosted) ?? attachFits(have, 1);
     have += 1;
     if (problem !== null) {
       added.push({
@@ -692,6 +701,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
         size: file.size,
         status: "failed",
         file,
+        hosted,
         error: problem,
         permanent: true,
         generation: 0,
@@ -706,6 +716,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
       size: file.size,
       status: "uploading",
       file,
+      hosted,
       generation,
       destination: cloneDestination(destination),
     });
@@ -715,7 +726,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
   captureBinding(cell);
   publish(cell);
   for (const a of added) {
-    if (a.status === "uploading") startUpload(a.key, a.file, a.generation, a.destination);
+    if (a.status === "uploading") startUpload(a.key, a.file, a.generation, a.destination, a.hosted);
   }
 }
 
@@ -739,7 +750,7 @@ export function retryAttach(key: string, itemKey: string): void {
   if (!item || item.status !== "failed" || item.permanent) return;
   // The same pre-flight checks as a fresh pick: a retry never admits a
   // file addition would have refused (size, count).
-  const problem = attachRefusal(item.size, item.name) ?? attachFits(q.items.length - 1, 1);
+  const problem = attachRefusal(item.file.size, item.file.name, item.hosted) ?? attachFits(q.items.length - 1, 1);
   if (problem !== null) {
     q.items = q.items.map((a) => (a.key === itemKey ? { ...a, error: problem, permanent: true } : a));
     publish(cell);
@@ -747,10 +758,10 @@ export function retryAttach(key: string, itemKey: string): void {
   }
   const generation = ++nextGeneration;
   q.items = q.items.map((a) =>
-    a.key === itemKey ? { ...a, status: "uploading" as const, error: undefined, permanent: undefined, generation } : a,
+    a.key === itemKey ? { ...a, status: "uploading" as const, converting: false, error: undefined, permanent: undefined, generation } : a,
   );
   publish(cell);
-  startUpload(itemKey, item.file, generation, item.destination);
+  startUpload(itemKey, item.file, generation, item.destination, item.hosted);
 }
 
 /** Remove one row. Its upload, if any, is now orphaned: a late

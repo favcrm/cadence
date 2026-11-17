@@ -34,6 +34,9 @@ quota are described in [Quota admission contract](#quota-admission-contract).
 
 ## What an operator can attach
 
+The following daemon limits describe a native board. Hosted boards have their
+own upload and preview limits; see [Reading an attachment back](#reading-an-attachment-back-to-the-board-cad-2219).
+
 - Kinds, decided by the daemon from the bytes rather than the name:
   - **UTF-8 text**, at any extension the composer offers except the names the
     daemon refuses outright: executables, archives and packages (`.exe`,
@@ -73,8 +76,8 @@ quota are described in [Quota admission contract](#quota-admission-contract).
   (a library image pin plus the attachments).
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.
-- The composer pre-checks only the size and count caps and its file picker
-  offers every kind; the daemon's byte checks are the enforcement. A visual
+- The native composer pre-checks size and count, and its picker offers every
+  kind; the daemon's byte checks are the enforcement. A visual
   attachment is proved at upload, not only at send: an SVG must screen and
   render, a raster must decode inside the bounds, and the selected model must
   admit image input (native) or publish an image policy (hosted). A refusal
@@ -370,7 +373,20 @@ shown, when one exists. A PDF is served `inline` with no sandbox policy so the
 browser's own viewer opens it in a new tab; every other kind carries `nosniff`,
 `Content-Security-Policy: sandbox; default-src 'none'` and `private, no-store`.
 
-Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
-10 MiB). A video is stored and played, never decoded: the model still receives
-its name, size and type only. A local board has no such route, and the client
-keeps the metadata chips there without requesting attachment bytes.
+Hosted boards containing the 25 MiB upload change accept up to **25 MiB** per
+file; older hosted boards and native boards can enforce smaller limits. Raster
+decoding, SVG, workbook expansion and extracted-text limits still apply. A video
+is stored and played, never decoded: the model receives its name, size and type
+only. A local board has no hosted preview route, and the client keeps metadata
+chips there without requesting attachment bytes.
+
+For a hosted session, selecting, dropping or pasting a HEIC/HEIF photo prepares
+a JPEG locally before upload. The original stays on the device; the server
+receives and validates only the derivative. The conversion runs in a worker,
+checks the source dimensions before decoding, limits the source to 32
+megapixels, and scales the result to the hosted 4-megapixel image budget.
+When needed, local `libheif` and `libde265` WebAssembly decoders load on demand;
+their license, notices and source links appear beside the converted attachment. If conversion
+fails or is unsafe, the draft remains and the user can retry, remove the file,
+or export it as JPEG or PNG. Conversion and an upload receipt do not establish
+that the model has read the photo.

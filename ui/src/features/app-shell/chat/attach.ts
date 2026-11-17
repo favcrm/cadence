@@ -8,6 +8,7 @@
 type Translate = (english: string) => string;
 const identity: Translate = (english) => english;
 export const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+const HOSTED_ATTACH_MAX_BYTES = 25 * 1024 * 1024;
 export const ATTACH_MAX_FILES = 5;
 
 export interface AttachDestination {
@@ -29,6 +30,12 @@ export interface AttachItem {
   file: File;
   id?: string;
   mime?: string;
+  /** Captured when selected; a different session may not adopt its work. */
+  hosted?: boolean;
+  converting?: boolean;
+  converted?: boolean;
+  decoderLicenseUrl?: string;
+  decoderNoticesUrl?: string;
   error?: string;
   /** A refusal a retry cannot change (size, count, daemon 4xx):
    *  the row offers Remove only. Transient failures keep Retry. */
@@ -45,11 +52,12 @@ const VIDEO_EXTS: Record<string, true> = { mp4: true, webm: true };
 export const ATTACH_VIDEO_MAX_BYTES = 20 * 1024 * 1024;
 
 /** The client checks the size; the server decides whether the bytes are usable. */
-export function attachRefusal(size: number, name = ""): string | null {
+export function attachRefusal(size: number, name = "", hosted = false): string | null {
   if (size === 0) return "empty file — nothing to attach";
   const ext = name.toLowerCase().split(".").pop() ?? "";
   const video = VIDEO_EXTS[ext] === true;
-  if (size > (video ? ATTACH_VIDEO_MAX_BYTES : ATTACH_MAX_BYTES))
+  if (hosted && size > HOSTED_ATTACH_MAX_BYTES) return "over 25 MiB — rejected";
+  if (!hosted && size > (video ? ATTACH_VIDEO_MAX_BYTES : ATTACH_MAX_BYTES))
     return video ? "over 20 MiB — rejected" : "over 10 MiB — rejected";
   return null;
 }
@@ -176,6 +184,10 @@ export function unresolvedHint(items: AttachItem[], t: Translate = identity): st
   const notice = unresolvedHintNotice(items);
   if (notice === null) return null;
   let text = t(notice.key);
-  for (const [name, value] of Object.entries(notice.slots)) text = text.replace(`{${name}}`, () => value);
+  const reasons = [...new Set(items.filter((item) => item.status === "failed").map((item) => item.error).filter((reason): reason is string => !!reason))]
+    .map((reason) => displayAttachError(reason, t)).join("; ");
+  for (const [name, value] of Object.entries(notice.slots)) {
+    text = text.replace(`{${name}}`, () => name === "reasonSuffix" && reasons ? ` — ${reasons}` : value);
+  }
   return text;
 }

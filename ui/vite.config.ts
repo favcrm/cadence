@@ -126,9 +126,11 @@ export default defineConfig(({ command, isPreview }) => ({
         entryFileNames: "assets/index.js",
         chunkFileNames: "assets/[name].js",
         assetFileNames: (asset) =>
-          asset.names?.some((n) => n.endsWith(".css"))
-            ? "assets/index.css"
-            : "assets/[name].[ext]",
+          asset.names?.some((n) => /(?:^|\/)heif-(?:dec|info)$/.test(n))
+            ? "assets/[name].js"
+            : asset.names?.some((n) => n.endsWith(".css"))
+              ? "assets/index.css"
+              : "assets/[name].[ext]",
       },
     },
   },
