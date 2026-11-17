@@ -493,7 +493,8 @@ export default function Composer({
   }, [draft, block, blockedPlaceholder, placeholder, compact, t, hasArtifactRef, resizeBox]);
   useEffect(() => {
     const el = box.current;
-    if (!el) return;
+    // No observer where the API is missing; the initial measure above stays.
+    if (!el || typeof ResizeObserver === "undefined") return;
     let width = el.clientWidth;
     const observer = new ResizeObserver(() => {
       if (el.clientWidth === width) return;
