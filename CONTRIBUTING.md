@@ -50,14 +50,11 @@ Boat:
 scripts/boat-build -- cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 1
 ```
 
-`scripts/boat-build` keeps one sandbox for this worktree. The first command
-sends a shallow git snapshot and compiles cold. A later command within 30
-minutes sends the tracked patch only, and Cargo reuses `target/`.
-`scripts/boat-build --down` deletes that sandbox. When 30 minutes pass
-with no further command, the sandbox stops and is erased, and the next
-command starts cold. Required CI, review and operator approval stay
-authoritative. Untracked files are not copied; `git add` them first. Prefer `cargo check` when you only need a
-compile. Inside the sandbox the helper sets `CARGO_BUILD_JOBS=1`.
+`scripts/boat-build` keeps one sandbox for this worktree and sends the tracked
+patch only; `git add` new files first. Prefer `cargo check` when you only need a
+compile. The sandbox lifecycle, snapshot and quota are in
+[DEV-CYCLE.md](docs/DEV-CYCLE.md) ("One entry point, executed on Boat").
+Required CI, review and operator approval stay authoritative.
 
 A local compile is the exception, for a binary that has to run here (`cargo
 run`, a board smoke, a release artifact). It still takes a build slot and
@@ -93,13 +90,10 @@ every script check is compilation-free.
 
 ## Fixture isolation and test tiers
 
-For ordinary hosted feedback on one retained case, run that case through the
-live suite instead: `scripts/cadence-nextest -E 'test(=name)'` locally, or the
-`stress` workflow on ephemeral runners for repeated runs. The former
-`test-feedback` workflow and its CAD-663/CAD-650 allowlist are gone — those two
-cases' cargo test targets were retired with the legacy integration suite, so
-the workflow could not have run. This route does not retry required CI or
-replace local build admission; the separate mutation workflow still requires a
+For feedback on one retained case, run it through the live suite:
+`scripts/cadence-nextest -E 'test(=name)'` locally, or the `stress` workflow on
+ephemeral runners for repeated runs. This does not retry required CI or replace
+local build admission; the separate mutation workflow still requires a
 deliberate assertion failure.
 
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
@@ -209,19 +203,15 @@ an ignored local document cannot satisfy a link. It checks paths, not external
 sites or heading fragments.
 
 Post the six-field reflection (expected, evidence, cause, correction, lesson,
-next) to the ticket. Hand a fresh-session review (a non-author session with no inherited context,
-including a subagent; AGENTS.md "Review") the exact committed head and PR,
-with a brief that points at the change and not at your conclusions.
-Only a passing review pinned to that head permits merge-queue enrollment:
-`gh pr merge <PR> -R favcrm/cadence --auto --squash --match-head-commit <REVIEWED-SHA>`.
-Disable auto-merge before changing a queued head. The full delivery and
-production-safety rules remain in [AGENTS.md](AGENTS.md).
+next) to the ticket. Hand a fresh-session review (a non-author session with no
+inherited context, including a subagent; AGENTS.md "Review") the exact committed
+head and PR, with a brief that points at the change and not at your conclusions.
 
-After your PR merges, preview recorded merged lanes with
-`cadence issue finish --merged --dry-run`; the preview removes nothing. Finish
-only your recorded lane with `cadence issue finish <ID> --worktree <path>`.
-Its activity, clean-tree and commit-survival guards may refuse cleanup. An
-unrecorded lane needs its owner's review; its directory name is not ownership
-proof. To clear local `origin/*` tracking refs for branches gone from the
-remote, run `git fetch --prune origin`. This does not remove local branches or
-worktrees, or prove that either is safe to remove.
+Delivery is the operator's act. You check readiness with
+`cadence --org <org> delivery check` and hand the PR over; you never approve,
+enqueue or run `gh pr merge`. The route, the Browser QA rule and the
+auto-merge precaution before changing a queued head are in AGENTS.md "Review"
+and "Merging".
+
+After your PR merges, finish the ticket and release your lane as AGENTS.md
+"Finish" describes. That is the one procedure; do not follow another copy.

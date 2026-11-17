@@ -1,4 +1,8 @@
-# Native review evidence and GitHub enforcement (CAD-120)
+# Native review evidence and GitHub enforcement (open design, CAD-120)
+
+This is an open design, not shipped enforcement. The shipped delivery route is
+AGENTS.md "Review". What exists today is the export verb below and the
+observation module; the GitHub App-bound required check does not.
 
 ## Available increment
 
@@ -41,8 +45,7 @@ future publisher must read GitHub and recheck those heads itself.
 The current shared GitHub credential and manual `qa-verdict` status cannot
 authenticate a reviewer. (The review standard itself is a fresh-session review,
 AGENTS.md "Review": a non-author session with no inherited context. Nothing
-here enforces it; merges use the temporary exception until `EXCEPTION_ENDS`
-in `scripts/delivery-gate`.) Repository writers can publish
+here enforces it.) Repository writers can publish
 ordinary statuses, so the eventual required check must be bound to a
 dedicated GitHub App identity, with its publishing credential confined to
 a trusted bridge process outside worker/reviewer environments. The daemon

@@ -1,8 +1,9 @@
-# A shorter, honest development loop (CAD-1088)
+# The development loop
 
-## The loop today
+## The loop
 
-The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
+The day-to-day loop for one ticket. AGENTS.md holds the rules; this page is the
+order of work and the mechanics.
 
 1. Requirement and plan: state the user outcome, observable acceptance,
    non-goals and material unknowns in the ticket. Resolve consequential
@@ -17,80 +18,50 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    `code-simplifier` skill can help; it is not another approval stage.
    Adjacent refactors and polish go to a follow-up ticket.
 3. The worktree hook runs `scripts/pre-push` on Boat before every push; show
-   the ticket's outcome. A missing Boat CLI or helper refuses the push rather
-   than compiling locally (`CADENCE_PRE_PUSH_LOCAL=1` is the explicit
-   emergency path). For a bug fix, show the failing case once, then fixed.
-   Add checks only under AGENTS.md's behavior-first and gates/security rules;
+   the ticket's outcome. For a bug fix, show the failing case once, then fixed.
+   Add checks only under AGENTS.md's behaviour-first and gates/security rules;
    do not restore retired tests or routinely repeat suites. `--tests` is a
-   focused diagnostic, not a blanket pre-review prerequisite; required CI
-   (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is
-   not yet required) is unchanged, and the suite runs in
-   `tests.yml` on a schedule and on demand (CAD-1970).
-4. Under strict requirements, one fresh-session review; two separate passes
-   (Standards and Spec/security) for auth, identity, secrets, the daemon trees
-   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one). A
-   fresh-session review is a non-author session with no inherited context,
-   including a subagent (AGENTS.md "Review standard"). The merge gate does not
-   enforce that yet, so it counts GitHub-attested workflow rows instead
-   (Standards and Spec/security, CAD-2088). A `ui/` change also needs a
-   non-author repository member's comment whose whole body is the two lines
-   `Browser QA: pass` and `Head: <head>`, named with `--browser-qa <url>`
-   (CAD-2173); the report goes in another comment. The temporary `--exception`
-   (exact-head operator approval plus two advisory links) remains for a head
-   that cannot produce the workflow rows, and ends at `EXCEPTION_ENDS`
-   (2026-12-31).
-5. The version-one delivery tiers apply to clean default-equivalent policies
-   by default after the reviewed implementation is installed; the introducing
-   PR must still satisfy the current trusted-base gates. Routine changes need
-   green exact-head CI and genuine
-   ticket-outcome evidence, with no mandatory review; consequential changes
-   need one fresh-session combined standards/spec review. Sensitive changes
-   keep the existing strict review, operator, Browser QA and full-check
-   requirements. Unknown, incomplete, protected-mode, deletion and mixed
-   sensitive cases retain strict legacy floors. Explicitly approved custom
-   policies remain in force and strict; malformed or unapproved policy changes
-   fail closed. Approved version-one profiles remain readable for compatibility.
-   Mandatory protection checks, required CI (the suite runs in `tests.yml`, CAD-1970), credential
-   isolation and operator-owned deployment remain unchanged. No fabricated
-   verdict/readiness counts as review or outcome evidence; dry-run is read-only
-   and requirements must be freshly bound before queueing.
-6. Required read-only code review may overlap CI on a stable head; pending
-   CI is not readiness and all required exact-head checks must be green
-   before enqueue. Rebase onto current main before requesting review, as
-   AGENTS.md requires; after approval, rebase only for conflicts. Review
-   correctness, security and ticket acceptance. Preserve independent refusal
-   acceptance for enforced rules and desktop/narrow Browser QA for `ui/**`.
-   REVISE only for correctness, security or ticket-requirement gaps. Other
-   findings are notes: one follow-up ticket or a recorded reason to drop them,
-   not another polish round on the reviewed head.
-7. Operator approval: for a `human`-class PR the operator may record one scope
+   focused diagnostic, not a blanket pre-review prerequisite.
+4. Review: the evaluator computes the class and the count, and AGENTS.md
+   "Review" is the one description of the reviews, Browser QA and the hosted
+   route. Open the PR as a draft and iterate there: a draft starts no review
+   workflows.
+5. Required read-only code review may overlap CI on a stable head; pending CI is
+   not readiness and all required exact-head checks must be green before the
+   operator enqueues. Rebase onto current main before requesting review; after
+   approval, rebase only for conflicts. Review correctness, security and ticket
+   acceptance. Preserve independent refusal acceptance for enforced rules and
+   desktop and narrow Browser QA for `ui/**`. REVISE only for correctness,
+   security or ticket-requirement gaps. Other findings are notes: one follow-up
+   ticket or a recorded reason to drop them, not another polish round on the
+   reviewed head.
+6. Operator approval: for a `human`-class PR the operator may record one scope
    approval per ticket with
    `cadence audit approve --issue <ID> --action scope`. It covers the ticket
    only while it is ready, doing or review, and its body declares its risk
    triggers on exactly one `Risk:` line. It is bound to the ticket body, so
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
-   Scope approval is optional and valid only when every AGENTS.md condition
-   holds. Triggers 1/3, two-review paths, uncovered scope or invalid bindings
-   require per-head approval; conversation text is never approval evidence.
-8. Post the required exact-head ticket evidence and enqueue with
-   `scripts/enqueue-reviewed <n> --head <full-sha>`. Use the merge queue, not
-   routine `--admin` merges or duplicate local integration trains. Disable
-   auto-merge before editing an enqueued PR; a new head voids old verdicts.
-9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
+   Scope approval is optional. A diff on a trigger 1 or 3 path, an uncovered
+   scope or an invalid binding requires the per-head approval; conversation text
+   is never approval evidence.
+7. Hand off: run `cadence --org <org> delivery check`, post the exact-head ticket
+   evidence and give the operator the PR. The operator approves and enqueues;
+   agents never do either (AGENTS.md "Review"). Use the merge queue, not routine
+   `--admin` merges or duplicate local integration trains. Disable auto-merge
+   before editing an enqueued PR; a new head voids old verdicts.
+8. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
    and [host release cycle](RELEASING.md). For a native host:
    merged → attested main CI artifact → staged → manually promoted with GitHub
    `production` approval → published (`promotion-completion`) →
    operator-installed → operationally verified.
    **Automatic staging is not production promotion.** Check the successful
    manual `staging.yml` run, its `production-candidate` receipt and the
-   successful `promotion-completion` run before
-   handing over the default update commands; a green CI/staging run alone
-   cannot advance the updater's candidate. Public version tags use the
-   separate numbered-release path, not a tag on every merge.
-   Production deployment is operator-owned; agents never restart the live
-   daemon. After merge, reconcile the ticket, leave the worktree to the sweep,
-   and clean up only your own scratch and processes. Record installation and
-   verification separately; reconciliation is merge evidence, not deployment.
+   successful `promotion-completion` run before handing over the default update
+   commands. Public version tags use the separate numbered-release path, not a
+   tag on every merge. Production deployment is operator-owned; agents never
+   restart the live daemon. After merge, finish as AGENTS.md "Finish" says and
+   record installation and verification separately; reconciliation is merge
+   evidence, not deployment.
 
 ## Pragmatic design and cycle time
 
@@ -188,36 +159,6 @@ This applies the convergence lessons from
 [How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/):
 reduce repeated review and human waiting, not the safeguards.
 
-## What #738 taught us
-
-PR #738 took more than four hours to deliver. It was not just a small update:
-it retired roughly 180,000 lines of legacy test/fixture coverage, including
-originally protected controls. That deserved a human scope decision. But
-much of the elapsed time was avoidable coordination and author error.
-
-Evidence: PR CI runs 37098191418 and 37103055285, staging rehearsals
-37098191451 and 37103055272, queue run 37103466054; final merge
-`c4f55f8ec899dd9f431a4cc4884da9bd3b72bfc7`. Required PR jobs on the reconciled
-head took fmt 18s, clippy 1m31s, build 3m21s, test 2m21s, UI 3m45s. Jobs overlap;
-do not add their durations and call that PR latency. These are baseline
-observations, not a controlled performance comparison.
-
-| Friction | Cause | Correction |
-| --- | --- | --- |
-| Repeated failed CI | Author sent child-wrapper, fixture and format-placeholder bugs to CI without a working local floor run | Make `pre-push --tests` actually execute the floor for every explicit request; run before review |
-| False expanded-scope approval | `duplicate: true` returned the approval for the original prohibitive ticket body | Amend scope text first; compute its digest; check the returned digest, not only exit 0 |
-| Repeated full reviews | Fresh reviewer contexts and failure to reuse unchanged-head assessments | Keep the same reviewer handles and ask only for delta/evidence revalidation |
-| Moving-main conflicts | Retirement PR overlapped newly merged test edits | Resolve only approved-scope conflicts; preserve main production changes; show delta and recheck it |
-| Failed paste commands | Interactive `read` in a noninteractive runner; source over 200 characters | Provide direct noninteractive commands, short source text and pinned SHA |
-| Confusing green checks | Retired shard/installer journeys retained old tooling descriptions | Label reduced/dormant consumers explicitly; keep required names but never imply restored coverage |
-| Tracker contention | Shared PM writer was busy | Treat exit 75 as bounded retry; do not invent an approval/comment or bypass the lock |
-
-The author owns these mistakes. Deleting reviews or approvals would hide the
-failure, not fix it. One correctly bound scope approval, the exact-head
-verdicts AGENTS.md "Review" requires (one by default, two for triggers 1/3),
-one correctly bound merge approval and a queue enqueue
-should be the normal path—not repeated requests for the same decision.
-
 ## Change-dependent PR feedback
 
 A classifier read from the **base revision** selects cheap PR feedback:
@@ -242,8 +183,7 @@ Required contexts explicitly report not-applicable commands, never 'built' or
 'passed tests' when they did not execute. Merge groups do not take the fast
 path: this keeps final integration coverage even when docs are read indirectly
 by source/tests. Fast-path timings measure PR feedback, not total landing
-latency. #758 bootstraps the policy with a full run because its base lacks it.
-
+latency.
 ## One entry point, executed on Boat
 
 ```sh
@@ -299,15 +239,6 @@ The hook's result gates the push, but required CI, review and operator
 approval remain authoritative. Commands and their output may be retained in
 Boat's command history; never put secrets in command arguments or output.
 
-The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
-health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
-`AddrInUse` starts a fresh state/realm on the next candidate from
-`test_ports::reserve_board_port`. That helper's saturating per-process cursor
-bounds attempts but is not a cross-process lease. Other startup errors and
-missing receipts remain blocked. CAD-1838's competing-listener check proves the
-original listener stays owned while a fresh real board preserves Native owner
-attribution over HTTP; the retired-reviewer refusal is unchanged.
-
 ### Queueing without a pane (subagents, operator shells)
 
 A caller with no registered pane or managed endpoint queues through the same
@@ -337,13 +268,13 @@ PR description. Write explicit deletions/exceptions into the issue body
 through `cadence issue` before requesting approval. Verify the current digest:
 
 ```sh
-cadence issue show CAD-1088 --json | python3 -c 'import hashlib,json,sys; d=json.load(sys.stdin); print(hashlib.sha256(d["body"].strip().encode()).hexdigest())'
+cadence issue show <ID> --json | python3 -c 'import hashlib,json,sys; d=json.load(sys.stdin); print(hashlib.sha256(d["body"].strip().encode()).hexdigest())'
 ```
 
 If scope approval is required, the operator runs from their own connection:
 
 ```sh
-cadence audit approve --issue CAD-1088 --action scope --source "Operator in chat: approves CAD-1088 scope as currently written."
+cadence audit approve --issue <ID> --action scope --source "<who approved, where>"
 ```
 
 Compare the response's digest to the computed digest. A duplicate record is
@@ -370,85 +301,21 @@ zero unintended production delta against new main. Never rebase merely
 because main moved: the merge queue already tests the integration tree.
 Do not force-push a branch with auto-merge enabled; disable it first.
 
-## One final operator handoff
+## The operator handoff
 
-Finish fresh-session review and CI, post the ticket evidence, then run
-`scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run`. If it
-reports `class: auto` and every rule holds, enqueue without asking: the gate
-needs no approval (AGENTS.md "Merging", CAD-2254). If it reports
-`class: human` or names a missing operator approval, request a
-merge approval on the **literal full SHA** just reviewed. Example syntax
-(the example SHA must be replaced with the actual reviewed head before use):
-
-```sh
-cadence audit approve --project <key> --issue <ID> --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
-```
-
-On a hosted org the approval is project-scoped and names the ticket it
-authorizes, hence `--project <key> --issue <ID>` (CAD-2001); a hosted approval
-without them is refused rather than inferred from the repo. A local approval
-stays repo-scoped: a local operator drops `--project` and `--issue`, and
-`--repo favcrm/cadence` is optional (docs/AUDIT.md).
-
-Provide the operator a concrete paste-ready version with no placeholders,
-`read`, guessed SHA, or source over 200 characters. The agent never executes
-the approval itself. Record the returned approval id on the ticket, then:
-
-```sh
-scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
-scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
-```
-
-The gate refuses (dry run: warns) when `scripts/enqueue-reviewed` or
-`scripts/delivery-gate` differs from `origin/main`'s (CAD-2108), and its first
-line names the gate's content hash. Recover by writing both files from
-`git show origin/main:scripts/<name>` into a scratch directory and running that
-copy from inside the repo; fetch `origin/main` first, since a stale ref is not
-detected. With `origin/main` present, a gate file missing or unreadable on either
-side refuses; with no `origin/main` there is no check. A PR that edits the gate is
-enqueued from main's copy.
-
-Temporary path (CAD-1946; remove this note when it ends): while the hosted
-reviewer attestation cannot be produced, add `--exception --advisory
-standards=<url> --advisory spec-security=<url>` (`--advisory browser-qa=<url>`
-additionally covers a `ui/` change) to the enqueue. It waives only the
-missing reviewer attestation and, on a hosted routine PR, the readiness proof
-hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
-separately assigned sessions, and the operator approves each exact head. The
-path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31).
-
-The advisory links are the exception's own evidence. They are not the
-`--browser-qa` route in step 4, which names a pinned two-line pass comment and
-needs no exception.
+Finish fresh-session review and CI, post the ticket evidence for the exact head,
+run `cadence --org <org> delivery check --project <key> --issue <ID> --pr <n>
+--head <full-sha>` and hand the PR to the operator with a message the operator
+can paste with no placeholders, no interactive `read`, no guessed SHA and no
+source over 200 characters. The operator's approval and enqueue, the Browser QA
+route and the native-only exception are AGENTS.md "Review". The agent never runs
+the approval or the enqueue itself. Record the approval id the operator returns on
+the ticket.
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
-position is not merge evidence: watch the merge-group run and verify the
-merged commit on `origin/main`. No `--admin`. Prioritization must not strand
-other PRs or cancel another entry until this PR itself can enqueue.
-
-## Targets and follow-up decisions
-
-Immediate targets: one local feedback command, no skipped explicit floor,
-no ghost contract discovery, no interactive approval prompts, no false scope
-digest, no fresh full review for unchanged code, and no duplicate Node setup
-for cargo-only retired journeys. Measure failure-before-review rate and
-number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
-
-Review count follows AGENTS.md "Review" and the effective delivery policy:
-eligible routine changes need no mandatory review, consequential changes one
-combined review, and sensitive/unknown cases retain strict floors. Under the
-strict path, use one fresh-session review by default, two separate passes for excluded
-paths in `docs/roles/one-review-paths.toml`, and operator approval for human
-risk. Automating evidence collection,
-reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
-implementation—not a license to self-approve. Likewise, consolidating required
-build/UI checks or changing branch protection requires baseline measurements
-and an operator decision. Do not change names in YAML before migrating the
-required-check policy safely.
-
-CAD-1102 ended the reduced window: the current gate is permanent and releases
-are no longer frozen. New behavior checks follow AGENTS.md (CAD-1099), one
-acceptance check per enforced rule, not restoration of the retired suites.
+position is not merge evidence: watch the merge-group run and verify the merged
+commit on `origin/main`. No `--admin`. Prioritization must not strand other PRs
+or cancel another entry until this PR itself can enqueue.
 
 ## Emergency clean-slate transition
 

@@ -1,49 +1,36 @@
 # Integration and production candidates
 
-## Current state: the permanent gate (CAD-1102; window history below)
+## Current state
 
-CAD-1073 / PR #738 retired the legacy integration suite, and CAD-1970 took the
-suite off the pull-request path: `ci.yml` has no `test` job and no
-`safety_floor` gate. Live branch protection requires `fmt`, `clippy`, `build`,
-`ui` and `delivery-gate`; `enqueue-reviewed` reads the live set. `cross-build (required)` always runs
-on PRs and merge groups but is not yet a required context (an operator step, ci.yml CAD-1540). The CI jobs prove the code
-compiles, lints and builds the release seam, **not** behavior coverage; the
-suite runs in `tests.yml` on a schedule and on demand, and is not a required
-check. CAD-1088 selects PR feedback from a classifier loaded from the base
-commit: isolated docs use no compilation; isolated UI code runs UI validation
-but not unrelated default Rust gates; edits confined to pre-existing
-independent top-level `tests/<name>.rs` targets run the rust gates.
-Required contexts explicitly report not-applicable commands rather than
-claiming to build. Governance, workflow, scripts, dependency manifests, mixed
-or unknown changes run all gates. Merge groups always run the full current
-validation; the narrowed `tests` scope is pull_request feedback only and the
-runner refuses it on any other event.
-Fast PR feedback is not evidence for skipping integration validation. `scripts/require-full-gates` refuses
-release artifacts, candidate staging and promotion from any source SHA that
-commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
-re-declaring the current gate as permanent, and removed the marker; a future
-transition window may add it again under an operator-approved declaration.
-Never remove a marker as a CI-speed optimization.
+Branch protection requires `fmt`, `clippy`, `build`, `ui` and `delivery-gate`;
+`enqueue-reviewed` reads the live set. The CI jobs prove the code compiles, lints
+and builds the release seam, **not** behaviour coverage. The suite runs in
+`tests.yml` on a schedule and on demand and is not a required check;
+`changed-tests.yml` runs only the tests a PR adds or changes. A classifier loaded
+from the base commit selects PR feedback: isolated docs use no compilation;
+isolated UI code runs UI validation but not unrelated default Rust gates; edits
+confined to pre-existing independent top-level `tests/<name>.rs` targets run the
+Rust gates. Required contexts report not-applicable commands rather than claiming
+to build. Governance, workflow, scripts, dependency manifests, mixed or unknown
+changes run all gates. Merge groups always run the full current validation; the
+narrowed `tests` scope is pull_request feedback only, and the runner refuses it on
+any other event.
 
-The shard/inventory benchmarks and old fixture journeys described below are
-historical full-gate design, not current measurements or restored coverage.
-See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
-current local check recipe and approval handoff.
+Fast PR feedback is not evidence for skipping integration validation.
+`scripts/require-full-gates` refuses release artifacts, candidate staging and
+promotion from any source SHA that commits `.github/reduced-gates`; an
+operator-approved reduced-gate window may add that marker (`docs/DEV-CYCLE.md`,
+"Emergency clean-slate transition"). Never remove a marker as a CI-speed
+optimisation.
 
-For diagnosing slow shards and the rust-cache/sccache split, see
-[CI wall-time](guides/ci-performance.md).
-
-## Full-gate delivery design (historical, before CAD-1073)
-
-PRs continue to target main. The merge queue keeps the full fmt, clippy,
-test, build and UI gates. Main CI reuses exact-SHA queue evidence and
-builds an attested artifact. A successful main build is available for
-staging; it is not automatically a production candidate.
+See [the development loop](DEV-CYCLE.md) for the local check recipe and the
+operator handoff, and [CI wall-time](guides/ci-performance.md) for diagnosing slow
+jobs and the rust-cache/sccache split. Shard-era benchmarks and design notes are in
+[design/ci-history-and-benchmarks.md](design/ci-history-and-benchmarks.md).
 
 ## Stage a selected batch
 
-After this workflow lands on main, select the successful main CI run
-that holds the desired artifact and dispatch:
+Select the successful main CI run that holds the desired artifact and dispatch:
 
 ```sh
 gh workflow run staging.yml -R favcrm/cadence --ref main \
@@ -83,12 +70,6 @@ an unapproved green build. A rerun that changes the artifact requires
 new staging and approval. Existing attestation, ancestry, backward-move,
 operator, backup, drain, health and rollback checks remain in force.
 
-Bootstrap requires staging and approving the first candidate before
-using the new default updater. Older installed updaters still select
-green main until the rollout owner installs this change. Explicit
-`cadence upgrade --sha <sha>` remains an operator recovery path using its
-existing attestation/CI checks; it does not claim production approval.
-
 ## GitHub environment setup
 
 Before enabling production promotion, configure `staging` to admit main
@@ -98,86 +79,60 @@ The workflow uses read-only repository/Actions permissions and holds no
 production deployment credentials. The rollout owner remains the sole
 installer. A separate staging branch is unnecessary.
 
-## Shared sccache on Cloudflare R2 (CAD-904)
+## Shared sccache on Cloudflare R2
 
-Rust jobs (`test-shard`, `test-once`, `build`, `ui`) can share
-compiled artifacts through an sccache backend on the R2 bucket
-`cadence-ci-sccache` (30-day object expiry). GitHub caches are scoped per
-branch, so merge-queue refs could not read each other's rust-cache; R2 is
-not. rust-cache stays: it caches the registry, git dependencies and the
-compiled dependency artifacts in `target/`, and is not changed here (its
-save scope is a separate ticket). Expect a modest gain: the `cadence`
-crate and the test binaries depend on the changed library, so they always
-miss on a PR. The win is dependency crates when rust-cache misses, mainly
-`merge_group` runs. The real number comes from the post-merge measurement
-(the ticket's acceptance), not from this change. `clippy` is left out: its
-calls go through clippy-driver and are all non-cacheable.
+Rust jobs (`build`, `ui`) can share compiled artifacts through an sccache backend
+on the R2 bucket `cadence-ci-sccache` (30-day object expiry). GitHub caches are
+scoped per branch, so merge-queue refs could not read each other's rust-cache; R2
+is not. rust-cache stays: it caches the registry, git dependencies and the
+compiled dependency artifacts in `target/`. Expect a modest gain: the `cadence`
+crate depends on the changed library, so it always misses on a PR. The win is
+dependency crates when rust-cache misses, mainly `merge_group` runs. `clippy` is
+left out: its calls go through clippy-driver and are all non-cacheable.
 
-The feature is a strict no-op without credentials. With no secrets (fork
-PRs, or before setup) `scripts/ci-sccache enable` exits 0 without touching
-the job, `RUSTC_WRAPPER` stays unset and the job compiles exactly as
-before. Any failure after credentials resolve (download, checksum mismatch,
-unreachable bucket, bad token) also fails open to the same state.
-`release-artifact` (the attested build) never uses the cache.
+The feature is a strict no-op without credentials. With no secrets (fork PRs, or
+before setup) `scripts/ci-sccache enable` exits 0 without touching the job,
+`RUSTC_WRAPPER` stays unset and the job compiles exactly as before. Any failure
+after credentials resolve (download, checksum mismatch, unreachable bucket, bad
+token) also fails open to the same state. `release-artifact` (the attested build)
+never uses the cache.
 
-Who may write (CI-SEC-2): **only the `cache-warm` job, on `push` to
-`refs/heads/main`, holds the read-write key.** A queued PR's build scripts
-and tests run in the merge_group gate jobs, so a read-write key there would
-let that code poison the cache or exfiltrate the key. Therefore:
+Who may write: **only the `cache-warm` job, on `push` to `refs/heads/main`, holds
+the read-write key.** A queued PR's build scripts and tests run in the
+merge_group gate jobs, so a read-write key there would let that code poison the
+cache or exfiltrate the key. Therefore:
 
 - `cache-warm` has `if: push && ref == refs/heads/main`, the static
-  `environment: sccache-writer`, `continue-on-error: true`, and nothing
-  `needs` it. It builds the profiles the gates use (the feature-on test
-  profile and the release profile) so main fills the
-  cache. It skips the builds when sccache did not enable.
-- `cache-warm-cross` (CAD-1480) is the same pattern for the cross-build
-  gates: `push` to `refs/heads/main` only, one leg per cross target, and
-  it writes only the `cross-<target>` rust-cache keys the cross-build
-  matrix restores with `save-if: false`. It holds no secrets and no
-  environment.
-- Every other job, including all gate jobs on `pull_request` and
-  `merge_group` and on main pushes, gets only the read-only pair and no
-  `environment:`.
-- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under
-  CAD-1073) compared strings case-insensitively like GitHub and supported
-  `==` and `!=`; any other expression form (functions, `!`) was rejected.
-  The test also rejected `secrets[...]`, `toJSON(secrets)` and any computed
-  `environment:`.
-- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073, formerly run
-  in `fmt`) failed if an RW secret appeared anywhere but `cache-warm`, if
-  its `if` admitted any event but push to main, if the writer environment
-  was attached to another job, or if any job waited on it.
+  `environment: sccache-writer`, `continue-on-error: true`, and nothing `needs`
+  it. It builds the profiles the gates use so main fills the cache, and skips
+  the builds when sccache did not enable.
+- `cache-warm-cross` is the same pattern for the cross-build gates: `push` to
+  `refs/heads/main` only, one leg per cross target, writing only the
+  `cross-<target>` rust-cache keys the cross-build matrix restores with
+  `save-if: false`. It holds no secrets and no environment.
+- Every other job, including all gate jobs on `pull_request` and `merge_group`
+  and on main pushes, gets only the read-only pair and no `environment:`.
 
 How it works:
 
-- sccache 0.18.0 is pinned by version and archive SHA-256
-  (`.config/sccache.sha256`, same shape as `.config/cargo-nextest.sha256`).
-  It installs into `$CARGO_HOME/bin`, which the Landlock worker confinement
-  test already grants.
+- sccache 0.18.0 is pinned by version and archive SHA-256 (`.config/sccache.sha256`).
+  It installs into `$CARGO_HOME/bin`, which the Landlock worker confinement test
+  already grants.
 - Read-only is enforced twice: a read-only bucket-scoped token, and
-  `SCCACHE_S3_RW_MODE=READ_ONLY` (sccache `docs/S3.md`, v0.18.0).
-  `SCCACHE_S3_NO_CREDENTIALS` means anonymous public access, not read-only,
-  so it is not used. In read-only mode sccache's stats still count every
-  miss as a "cache write error"; that is the local refusal to write, not
-  a failed upload.
+  `SCCACHE_S3_RW_MODE=READ_ONLY`. `SCCACHE_S3_NO_CREDENTIALS` means anonymous public
+  access, not read-only, so it is not used. In read-only mode sccache's stats still
+  count every miss as a "cache write error"; that is the local refusal to write,
+  not a failed upload.
 - Settings: `SCCACHE_BUCKET=cadence-ci-sccache`, `SCCACHE_REGION=auto`,
   `SCCACHE_ENDPOINT` from the repo variable `SCCACHE_R2_ENDPOINT`,
-  `SCCACHE_S3_KEY_PREFIX=v1/rustc-<version>`, `CARGO_INCREMENTAL=0`.
-  Each Rust job prints `sccache --show-stats` (and to the step summary),
-  plus the tail of `SCCACHE_ERROR_LOG` when it is non-empty.
-- `enable` runs before the first compiling step of every job (a contract
-  test checks the order): in `test-shard` the inventory build is the shard's
-  only compile.
-- Credentials are exported to later steps of the job as `AWS_ACCESS_KEY_ID`
-  and `AWS_SECRET_ACCESS_KEY` through `GITHUB_ENV`. That is the one way a
-  restarted sccache server can still authenticate, but it means test
-  processes inherit those names, and cadence treats `AWS_*` as provider
-  credentials. The cadence tests plant their own values and pass; remember
-  it when debugging an env-leak test.
-- Live read-only proof: `test-once` runs `scripts/ci-sccache verify-ro`, one
-  SigV4 `PutObject` of a throwaway key with the read-only credentials. R2
-  must answer 403; a 2xx fails the job, an inconclusive answer only warns.
-  It is a no-op without credentials or in read-write mode.
+  `SCCACHE_S3_KEY_PREFIX=v1/rustc-<version>`, `CARGO_INCREMENTAL=0`. Each Rust job
+  prints `sccache --show-stats` (and to the step summary), plus the tail of
+  `SCCACHE_ERROR_LOG` when it is non-empty.
+- `enable` runs before the first compiling step of every job.
+- Credentials are exported to later steps of the job as `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY` through `GITHUB_ENV`, so test processes inherit those
+  names, and cadence treats `AWS_*` as provider credentials. Remember it when
+  debugging an env-leak test.
 - Residual risk: PR jobs run PR code with the read-only token in their
   environment; the token is scoped to this one bucket and cannot write.
 
@@ -213,11 +168,10 @@ main pushes, so the environment never affects which jobs run on which event.
 Because the job is skipped (not failed) on every other event, a missing or
 misconfigured environment cannot block a PR or the merge queue.
 
+
 ## Mutation experiments
 
-Feature-branch pushes no longer trigger the entire ordinary CI suite.
-Deliverable PRs and merge groups still do. Dispatch a deliberate guard
-removal separately:
+Dispatch a deliberate guard removal separately from ordinary CI:
 
 ```sh
 gh workflow run mutation.yml -R favcrm/cadence --ref main \
@@ -232,223 +186,30 @@ one failed test. Compilation/setup failure, zero tests, a skipped test,
 an error or a different failed test makes the experiment fail. Ordinary
 CI must still prove the original implementation passes the test.
 
-## PR test selection and review coverage (historical pre-transition policy)
 
-The required `test` job reads its selection policy from the PR base.
-A missing base policy or any uncertainty runs the full suite. Documentation
-edits, even alongside isolated test edits, also run the full Rust scope:
-Rust can read Markdown contents through a directory walk or constructed
-path without a literal filename reference. Benchmark run 36298074797
-measured 9 seconds for docs-selected versus 797 seconds for docs-full in
-this test job; this change gives up that fast path, not a measured whole-PR
-wall-clock saving. Fmt, clippy, build and UI remain required.
-
-An isolated top-level integration test edit runs its Cargo target plus
-all lib/bin tests and the split-map inventory contract. A reference from
-another tracked source makes the file shared. Production source, shared
-fixtures, manifests, workflows, tools and unknown paths run all targets.
-The selection is deliberately conservative, not a Rust dependency graph.
-
-CAD-1727 collapsed those targets into one `suite` binary and set
-`autotests = false`, so the trusted-base classifier refuses target
-narrowing for that shape and PRs run the full Rust scope. That is
-intentional: the six shards partition the one binary's tests, and a full
-build is now a single link.
-Non-PR events retain all targets; exact-SHA main queue-evidence reuse is
-unchanged. Inventory parity, pinned nextest, zero retries, default-feature
-refusal proofs and doctests remain for every Rust selection. Each run
-keeps its plan beside its JUnit timing artifact.
-
-`cadence review` runs the configured lib/bin/board baseline once, plus
-the existing gates, new-test stress and isolated failure comparisons.
-Reports label this `review-baseline`; it is not full CI coverage. The
-legacy `full_suite` key and `--no-full` option remain compatible; the
-option now skips that configured baseline. Older project recipes default
-to `full`. Recipes still come from the base revision.
-
-The manually dispatched `CI selection benchmark` compares full and
-selected jobs against identical source for two supplied existing paths
-(an eligible isolated integration test and ordinary documentation).
-Its artifacts explicitly label these as replay scenarios, not live PR
-before/after measurements. Job start/end timestamps measure wall time;
-sum job durations for runner minutes. Add unchanged required-job costs
-and a full merge-group run when estimating a landing. Do not describe
-replay timings as measurements of a production-code PR: those changes
-currently receive the full fallback.
-
-## Local pre-push recipe (CAD-905, CAD-922)
+## Local pre-push recipe
 
 `scripts/pre-push` is the one command to run before pushing. It stops at
 the first failing step, judges every step by its exit code alone and prints
 one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
 
 1. `cargo fmt --all -- --check` (always);
-2. `scripts/split-doctor-host --check` (live source inventory); legacy
-   `scripts/split-map-sync --check` only when its inventory exists;
+2. `scripts/split-doctor-host --check` (live source inventory);
 3. `cargo clippy --all-targets --locked -- -D warnings`, then the same with
    `--features test-seam`, when Rust or Cargo files changed;
 4. `bun run --cwd ui typecheck` when `ui/` changed;
-5. the active Python test commands that CI's `fmt` job runs, including
-   review-recipe and release-freeze regressions, when `scripts/`, `.github/`
-   or `tests/scripts/` changed;
+5. the active Python test commands that CI's `fmt` job runs, when `scripts/`,
+   `.github/` or `tests/scripts/` changed;
 6. with `--tests`, `scripts/run-result-tests` (every test target, then the
-   lib and binary-target unit tests)
+   lib and binary-target unit tests).
 
-"Changed" is the union of commits since `origin/main`, working-tree edits
-and untracked files; use `--base REF` to override and `--list` to print the
-plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
-does not run the full suite. During CAD-1073 the merge queue ran the same
-reduced floor, not a hidden full integration suite.
+"Changed" is the union of commits since `origin/main`, working-tree edits and
+untracked files; use `--base REF` to override and `--list` to print the plan
+without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and does not
+run the full suite. See [SPLIT-MANIFESTS.md](SPLIT-MANIFESTS.md) for the doctor
+source guard.
 
-The legacy `tests/split-map*.toml` and `split_map_inventory` contract were
-retired. Do not run `split-map-sync` against missing inputs; see
-[SPLIT-MANIFESTS.md](SPLIT-MANIFESTS.md) for the retained doctor source guard.
-
-## Shared CI contracts
-
-The required `fmt` job runs the shared scope/runner, shard-coverage,
-nextest-cost, delivery/staging/review-observation contracts and doctor/host
-split-map check once. Their failures still block the required gate and
-release evidence. They no longer repeat in every Rust test shard.
-`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checked
-that each command remained once-only and blocking, including early failures
-in multi-command steps.
-
-The enqueue consumer checks run through
-`python3 scripts/test_enqueue_requirements.py` in `fmt`. Its
-`RequirementsConsumer` inherits all 18 evidence-posting checks and adds
-10 requirements cases, so one command runs both sets without duplicating
-the inherited checks. Local pre-push discovers that same command from the
-workflow. These checks drive the real enqueue consumer with synthetic
-external transports; they do not establish daemon identity or live
-GitHub/merge-queue acceptance.
-
-Each `test-shard` job selects the scope from the base policy, proves
-Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
-SPA, executes its assigned tests and uploads assignment/cost artifacts.
-The `test` aggregate (historical: removed from `ci.yml` by CAD-1970) verified complete, disjoint coverage from the
-assignment receipts (eight automatically; four or eight on a manual
-benchmark). Default-feature refusal proofs and doctests
-remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
-
-Uploads are named `test-shard-<n>-attempt-<run_attempt>` (CAD-1745). A
-failed-job-only rerun copies an untouched green partition into the new
-attempt without re-running or re-uploading it, so the aggregate resolves
-each copied row to the unique earlier execution it aliases (identical
-start/completion timestamps and runner, later `created_at`). It then takes
-every partition's latest *actual* execution and downloads exactly those
-six artifact IDs. Earlier reports remain on the run as evidence, and a
-non-green latest execution, missing or ambiguous provenance, or a missing,
-expired or foreign-run artifact fails the aggregate instead of falling
-back to an older success.
-
-An indexed `queued`/`in_progress` shard row is reconciled once by immutable
-job ID (CAD-1758): a successful matrix dependency can precede publication
-of its terminal state in the jobs index. The current record must match
-the row's ID, run, attempt, head and name before the same provenance and
-latest-execution checks apply. Terminal indexed failures are never
-refreshed into success. An unreadable, malformed, foreign or still
-nonterminal record refuses the aggregate; there is no sleep, retry loop
-or fallback to older evidence.
-
-## Why shards compile themselves (CAD-869)
-
-CAD-858 (#603) tried a serial `test-build` producer that archived the
-compiled tests once and handed a 2.5 GB nextest archive to eight consumers.
-Measured, it doubled the critical path: shards could not start until the
-~5 min producer finished (run 36795228728: `test-build` 00:15:23-00:20:14Z,
-shards 00:20:16-00:24:47Z, 10 min total), and each shard still spent 3.5-4.3
-min on archive download, verification, extraction and the tests themselves.
-Before it, shards started at t=0 and compiled against a warm rust-cache for
-a 5-6 min run (merge-group run 36794979053, ~5.5 min). Compile-once saves
-little when the dependency cache already makes each shard's compile cheap,
-and the serial producer plus transfer costs more than it saves.
-
-CAD-869 removed the producer, the archive/bundle scripts, the pinned
-container runtime and their contract tests. Shards compile in parallel as
-before; the CAD-854 move of the shared contracts into `fmt` is kept. Test
-sets are unchanged: the same LPT weights, filter equality, eight disjoint
-assignment receipts and zero retries, enforced by `scripts/ci-shard-check.py`
-in the `test` aggregate. Revisit build-once distribution only with a
-producer that is not serial on the critical path and a measured win over a
-cache-hit shard.
-
-CAD-1727 changed that cost shape: 83 of the per-file test binaries are now
-modules of one `suite` target, so a full test profile is 4.9 GiB (27
-executables) instead of 16.8 GiB (109), and a shard links the suite once
-plus the 15 explicitly declared targets. The CAD-869 measurement stands
-for the tree it was taken on; an archive producer's size and transfer cost
-are now different, so re-measure before reviving that flow.
-
-## CI throughput benchmark (CAD-840)
-
-The suite width is fixed: six `test-shards` partitions (`hash:k/6`,
-`--jobs 4`). CAD-1073 retired the shard-suite benchmark, and the old
-`workflow_dispatch` input `test_shards` (4 or 8) did not change that
-matrix, so it is gone. A manual `ci.yml` dispatch runs the same suite as
-a pull request. It does not publish a release or reuse a main push's
-queue evidence. Cross-build runs only on pull_request and merge_group,
-and the secrets scan only on pull_request, so a dispatch skips both.
-Dispatch concurrency is its own group, so it does not cancel a pull
-request or a main push. Dispatching still consumes a full CI run.
-
-```sh
-gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref>
-```
-
-The workflow must be on the default branch before GitHub accepts a
-manual dispatch. Freeze the ref, then verify the returned run's
-`head_sha`. A moving main is not a controlled comparison.
-
-Read timing evidence (requires read-only Actions access via `gh`):
-
-```sh
-python3 scripts/ci-throughput.py --run-id <run-id>
-python3 scripts/ci-throughput.py --run-id <run-id> \
-  --compare-run-id <other-run-id> --json > throughput-comparison.json
-```
-
-The report separates **dispatch-to-start delay** from job execution.
-Dispatch-to-start includes dependency wait and scheduling; it is not pure
-runner queue time. Job `created_at` can change on reruns, so subtracting
-it from `started_at` may produce a negative, false queue duration.
-Workflow elapsed uses the run's completion observation (`updated_at`);
-gates elapsed ends at the latest required gate. Summed runner-minutes are
-executed job wall time, not CPU time or GitHub billed minutes. Skipped jobs
-add no time. Inventory/build and test step times expose repeated compilation.
-
-Single-run reports can describe failed/incomplete evidence, clearly marked
-as partial. Comparisons refuse incomplete/red runs, missing or duplicate
-gates, malformed timing, unknown shard layouts, reruns, different SHAs,
-non-manual runs or a same-width pair. The reporter uses the exact attempt's
-paginated job inventory; it never mixes attempts, posts statuses or changes
-runner/repository settings. It is observational evidence, not merge approval
-or an independent replacement for the assignment coverage gate.
-
-For offline review, provide raw API responses with `--run run.json --jobs
-jobs.json`; compare a second pair using `--compare-run other-run.json
---compare-jobs other-jobs.json`. The jobs file has the shape
-`{"jobs": [...]}`. Keep the raw responses with the report. Every job must
-carry the run's `run_id`, `head_sha` and `run_attempt`, and a run cannot be
-compared with itself. Offline reports are labelled `source:
-offline-unverified`: the files are only as trustworthy as their provenance.
-
-Do not claim a saving from one noisy run. There is no width switch left
-to choose: the gate is six shards. Build-once nextest distribution and a
-separate merge-queue runner pool remain follow-ups; neither is deployed.
-
-## Remaining delivery work
-
-CAD-479 tracks measurement of affected-test selection; the queue retains
-the full suite. Timing artifacts from CAD-638 provide evidence for balanced
-shards. Neither optimization is a reason to reduce required coverage.
-Fresh-session review remains required by AGENTS.md; a required GitHub
-review bridge must report both PR-head and merge-group checks before
-activating it in branch protection. CAD-120 tracks reviewer identity
-integration. Real-provider acceptance remains CAD-434; the fake-provider
-MVP journey cannot prove provider compatibility or real fleet continuity.
-
-## Rust toolchain pin (CAD-927)
+## Rust toolchain pin
 
 `rust-toolchain.toml` pins an exact Rust release (`channel = "x.y.z"`, never
 `stable`). It is the only place the version is written. Every workflow
@@ -457,8 +218,7 @@ from that file and runs `rustup toolchain install <channel>` with the
 profile and components the job passes. `--export` also sets
 `RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
 `candidate-source`). Local `cargo` follows the file too, so a local
-`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) failed
-if a workflow installs a literal or floating channel.
+`cargo clippy` matches CI.
 
 A new stable release can no longer turn the queue red: lints and
 `-D warnings` change only when the pin changes. Because the cache keys
@@ -476,7 +236,8 @@ To bump the pin, in one PR:
 3. Run `scripts/pre-push`. The PR touches `rust-toolchain.toml`, so expect
    it to be reviewed like any other CI change.
 
-## PR-gate `ci` profile and fast linker (CAD-1103)
+
+## PR-gate `ci` profile and fast linker
 
 The `build` and `ui` jobs compile with `cargo build --profile ci` (inherits
 `release`; opt-level 1, 256 codegen units, no debuginfo, no incremental, no
@@ -491,7 +252,7 @@ and the `cargo check --release --features test-seam` refusal probe. The
 compiles (default features vs `--features ui`, different path scopes), and the
 two clippy passes stay (default vs `test-seam` lint different cfg code).
 
-## Build once per tree (CAD-1131)
+## Build once per tree
 
 A queue entry's `merge_group` run builds the shipping binary
 (`--release --features ui`) in `release-queue-build`, in parallel with the
@@ -513,12 +274,11 @@ selected main CI run (`delivery-candidate.py prepare`: run, SHA, attempt,
 digest, attestation) and never rebuilds it; only its PR-only `rehearsal-check`
 compiles PR bytes, and those are never promoted. The `release-full` leg of
 `cache-warm` warms the release profile that `release-queue-build` restores.
-`scripts/test_release_reuse.py` proves a different tree never reuses an
-artifact. Residual: the artifact crosses jobs of the queue run, which also
+Residual: the artifact crosses jobs of the queue run, which also
 runs the entry's tests; the upload never overwrites, but the main attestation
 vouches for bytes the queue run built.
 
-## Live staging candidate (CAD-833)
+## Live staging candidate
 
 The staging deploy candidate polls the **latest successful** `ci.yml` push run
 on main every five minutes, verifies its attested release with
@@ -533,15 +293,13 @@ tracker and registers two inbox agents once. The timer uses a dedicated clone
 checked out at `origin/main`; its state and release cache are under
 `~/.local/share/cadence-staging`.
 
-**Operator decision — source refresh only; do not install or enable the timer.**
-The operator chose board port 3150, within the permitted 3110–3199 range. The
-board URL is `http://cadence-3150.localhost:3150`; tailnet HTTPS remains on
-`:9460`. This authorizes the source configuration only, not a runtime deploy,
-state-directory migration, unit installation, or timer enablement.
-
-The tailnet URL is `https://ip-172-31-1-32.tail9fcf30.ts.net:9460`. Tailnet
-publishing is through `cadence ui tailscale` under the sandbox opt-in, not
-through sudo or nginx. The deploy code must revalidate an absent/foreign/live
-mapping on ordinary and known-bad healthy ticks, refuse to overwrite foreign
-routes, and keep a healthy loopback board available if a tailnet publish
-restarts it. Tailnet reachability is observed separately from loopback health.
+The timer is not installed or enabled by source changes; installing the unit or
+the timer, a runtime deploy and a state-directory migration each need their own
+operator authorization. The board listens on loopback port 3150 (inside the
+permitted 3110-3199 range) with tailnet HTTPS on `:9460` (`PORT` and `TS_PORT` in
+`scripts/staging-deploy.py`). Tailnet publishing is through `cadence ui tailscale`
+under the sandbox opt-in, not through sudo or nginx. The deploy code revalidates
+an absent, foreign or live mapping on ordinary and known-bad healthy ticks,
+refuses to overwrite foreign routes, and keeps a healthy loopback board available
+if a tailnet publish restarts it. Tailnet reachability is observed separately
+from loopback health.
