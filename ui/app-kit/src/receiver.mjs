@@ -299,6 +299,7 @@ function inert(reason) {
     tool: refuse,
     audioCapture: refuse,
     audioSession: refuse,
+    audioRecording: refuse,
     asset: refuse,
     assetAdmitted: () => false,
     state: () => false,
@@ -519,6 +520,7 @@ export function createScreenReceiver(options = {}) {
     tool: "tool-reply",
     audio: "audio-reply",
     "audio-session": "audio-session-reply",
+    "audio-recording": "audio-recording-reply",
   };
 
   /** A reply whose outcome is well-formed for its op. A late/replayed reply
@@ -535,6 +537,11 @@ export function createScreenReceiver(options = {}) {
     if (message.op === "audio-session-reply") {
       return (message.ok === true && validAudioSessionSnapshot(message.data) !== null) ||
         (message.ok === false && readRefusal(message.refusal) !== null);
+    }
+    if (message.op === "audio-recording-reply" && message.ok === true) {
+      const data = message.data;
+      return isPlain(data) && ((exactKeys(data, ["available"]) && typeof data.available === "boolean") ||
+        (exactKeys(data, ["ok"]) && data.ok === true));
     }
     return message.ok === true || (message.ok === false && readRefusal(message.refusal) !== null);
   };
@@ -598,7 +605,8 @@ export function createScreenReceiver(options = {}) {
     if (
       (message.ok !== true && !(message.ok === false && refusal)) ||
       (message.op === "audio-reply" && message.ok === true && !audioData) ||
-      (message.op === "audio-session-reply" && message.ok === true && !audioSessionData)
+      (message.op === "audio-session-reply" && message.ok === true && !audioSessionData) ||
+      (message.op === "audio-recording-reply" && !validOutcome(message))
     ) {
       // Throw before removal: teardown then rejects this entry with the rest.
       throw new Error(`malformed ${message.op} reply`);
@@ -651,6 +659,7 @@ export function createScreenReceiver(options = {}) {
         message.op === "tool-reply" ||
         message.op === "audio-reply" ||
         message.op === "audio-session-reply" ||
+        message.op === "audio-recording-reply" ||
         message.op === "slot-state"
       ) {
         if (!settle(message)) fail(`reply for an id this mount never sent: ${message.id}`);
@@ -893,8 +902,9 @@ export function createScreenReceiver(options = {}) {
       const validLanguage = (lang) => lang === "" || lang === "en" || lang === "zh";
       let body = null;
       if (action === "start") {
-        if (!exactKeys(command, ["action", "language", "timeoutMs"])) {
-          return Promise.reject(new TypeError("audioSession start accepts only action, language and timeoutMs"));
+        if (!exactKeys(command, ["action", "language", "retain_audio", "timeoutMs"]) ||
+            (command.retain_audio !== undefined && command.retain_audio !== true)) {
+          return Promise.reject(new TypeError("audioSession start accepts action, language, retain_audio and timeoutMs"));
         }
         if (command.language !== undefined && !validLanguage(command.language)) {
           return Promise.reject(new TypeError('audioSession language must be "", "en" or "zh"'));
@@ -902,6 +912,7 @@ export function createScreenReceiver(options = {}) {
         body = {
           action: "start",
           ...(command.language !== undefined ? { language: command.language } : {}),
+          ...(command.retain_audio === true ? { retain_audio: true } : {}),
         };
       } else if (
         action === "pause" ||
@@ -948,6 +959,25 @@ export function createScreenReceiver(options = {}) {
       if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
       if (!liveV2) return Promise.reject(new ScreenClosedError("the action channel opens only after a screen.v2 PUSH"));
       return request("audio-session", body, undefined, wait ?? null);
+    },
+    audioRecording(command = {}) {
+      if (!audioV2Accepted) return Promise.reject(new ScreenClosedError("recordings require screen-audio.v2"));
+      if (!isPlain(command)) return Promise.reject(new TypeError("audioRecording command must be a plain object"));
+      const wait = command.timeoutMs;
+      if (wait !== undefined && !(Number.isSafeInteger(wait) && wait > 0 && wait <= 2147483647)) {
+        return Promise.reject(new TypeError("audioRecording timeoutMs must be a positive integer"));
+      }
+      const action = command.action;
+      if (action === "cancel") {
+        if (!exactKeys(command, ["action", "timeoutMs"])) return Promise.reject(new TypeError("invalid recording command"));
+        return request("audio-recording", { action }, undefined, wait ?? null);
+      }
+      if (!["commit", "exists", "play", "delete"].includes(action) ||
+          !exactKeys(command, ["action", "record_id", "timeoutMs"]) ||
+          typeof command.record_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(command.record_id)) {
+        return Promise.reject(new TypeError("invalid recording command"));
+      }
+      return request("audio-recording", { action, record_id: command.record_id }, undefined, wait ?? null);
     },
     /** True once a call reply named `ref` as served now; an older host never says so. It
      *  stays true: decide from the latest reply's own data (e.g. a draft still has an image). */
@@ -1158,6 +1188,7 @@ export function createScreenBridge(options = {}) {
     return Array.isArray(list) && declaredSet.has(verb) && list.includes(verb);
   };
   const canAudioCapture = (snap = currentState.snapshot) => Boolean(audio && snap?.audioCapture === true);
+  const canAudioRetention = (snap = currentState.snapshot) => Boolean(audio === "v2" && snap?.audioRetention === true);
 
   const acceptPush = (push) => {
     let serialized;
@@ -1225,6 +1256,7 @@ export function createScreenBridge(options = {}) {
     const snapshot = Object.freeze({
       scope, digest: push.digest, actions: pushActions,
       audioCapture: Boolean(audio && push.audio_capture === 1),
+      audioRetention: Boolean(audio === "v2" && rawActions.includes("audio.retention")),
       presentationLocale: push.presentation_locale === "zh-TW" ? "zh-TW" : "en",
       route: parseRoute(push.route), observations: Object.freeze(parsedObservations),
       contexts: Object.freeze(contexts), installation: Object.freeze({ ...push.installation }), raw: push,
@@ -1399,6 +1431,7 @@ export function createScreenBridge(options = {}) {
     getSnapshot: () => currentState.snapshot,
     can,
     canAudioCapture,
+    canAudioRetention,
     assertScope,
     start(runtime = {}) {
       if (receiver || retired) return;
@@ -1496,6 +1529,7 @@ export function createScreenBridge(options = {}) {
       try {
         assertScope(scope);
         if (!canAudioCapture()) throw makeError("This workspace doesn't offer audio capture.", 403, { code: "forbidden" });
+        if (command.retain_audio === true && !canAudioRetention()) throw makeError("This workspace doesn't offer recording storage.", 403, { code: "unavailable" });
       } catch (syncError) {
         return Promise.reject(syncError);
       }
@@ -1511,6 +1545,24 @@ export function createScreenBridge(options = {}) {
             throw mapped;
           }
         },
+        (err) => {
+          const mapped = mapError(err);
+          if (mapped.status === 401 || mapped.status === 502) retire(mapped);
+          throw mapped;
+        },
+      );
+    },
+    audioRecording(scope, command = {}) {
+      const live = receiver;
+      if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      try {
+        assertScope(scope);
+        if (!canAudioRetention()) throw makeError("This workspace doesn't offer recording storage.", 403, { code: "unavailable" });
+      } catch (syncError) {
+        return Promise.reject(syncError);
+      }
+      return live.audioRecording(command).then(
+        (value) => { try { return guardData(value); } catch (err) { const mapped = mapError(err); retire(mapped); throw mapped; } },
         (err) => {
           const mapped = mapError(err);
           if (mapped.status === 401 || mapped.status === 502) retire(mapped);

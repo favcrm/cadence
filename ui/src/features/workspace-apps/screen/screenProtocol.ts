@@ -55,6 +55,7 @@ export type ChildToHost =
   | { v: 2; op: "asset"; ref: string }
   | AudioRequest
   | AudioSessionRequest
+  | AudioRecordingRequest
   | CallRequest
   | SlotRequest
   | ToolRequest;
@@ -222,6 +223,8 @@ export const SCREEN_LOCALE_V1 = "screen-locale.v1";
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
 /** Headless inline host-mediated audio capture/upload session streaming (`screen-audio.v2`). */
 export const SCREEN_AUDIO_V2 = "screen-audio.v2";
+/** Backward-compatible host feature marker, not a records operation or permission. */
+export const AUDIO_RETENTION_ACTION = "audio.retention";
 export type ScreenAudioMode = "record" | "upload";
 export type ScreenAudioSource = "recording" | "upload";
 export type ScreenAudioLanguage = "" | "en" | "zh";
@@ -236,7 +239,7 @@ export type ScreenAudioSessionPhase =
   | "error";
 export interface AudioRequest { v: 2; op: "audio"; id: string; mode: ScreenAudioMode }
 export type AudioSessionRequest =
-  | { v: 2; op: "audio-session"; id: string; action: "start"; language?: ScreenAudioLanguage }
+  | { v: 2; op: "audio-session"; id: string; action: "start"; language?: ScreenAudioLanguage; retain_audio?: true }
   | { v: 2; op: "audio-session"; id: string; action: "pause" | "resume" | "stop" | "retry" | "cancel" }
   | {
       v: 2;
@@ -249,6 +252,9 @@ export type AudioSessionRequest =
       last_modified?: number;
       language?: ScreenAudioLanguage;
     };
+export type AudioRecordingRequest =
+  | { v: 2; op: "audio-recording"; id: string; action: "cancel" }
+  | { v: 2; op: "audio-recording"; id: string; action: "commit" | "exists" | "play" | "delete"; record_id: string };
 export interface ScreenAudioCapture {
   transcript: string;
   duration_seconds: number;
@@ -450,6 +456,8 @@ export type ReplyMessage =
   | { v: 2; op: "audio-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "audio-session-reply"; id: string; ok: true; data: ScreenAudioSessionSnapshot }
   | { v: 2; op: "audio-session-reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "audio-recording-reply"; id: string; ok: true; data: { available: boolean } | { ok: true } }
+  | { v: 2; op: "audio-recording-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt; data?: never }
   | { v: 2; op: "slot-state"; id: string; state: "done"; data: unknown; receipt?: never }
   | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
@@ -903,14 +911,29 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   ) {
     return { v: 2, op: "audio", id: d.id, mode: d.mode };
   }
+  if (d.v === 2 && d.op === "audio-recording" && typeof d.id === "string" && ACTION_ID.test(d.id)) {
+    const keys = Object.keys(d).sort().join();
+    if (d.action === "cancel" && keys === "action,id,op,v")
+      return { v: 2, op: "audio-recording", id: d.id, action: "cancel" };
+    if ((d.action === "commit" || d.action === "exists" || d.action === "play" || d.action === "delete") &&
+        keys === "action,id,op,record_id,v" &&
+        typeof d.record_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(d.record_id))
+      return { v: 2, op: "audio-recording", id: d.id, action: d.action, record_id: d.record_id };
+    return null;
+  }
   if (d.v === 2 && d.op === "audio-session" && typeof d.id === "string" && ACTION_ID.test(d.id)) {
     const keys = Object.keys(d).sort().join();
     const validLanguage = (lang: unknown): lang is ScreenAudioLanguage =>
       lang === "" || lang === "en" || lang === "zh";
-    if (d.action === "start" && (keys === "action,id,op,v" || (keys === "action,id,language,op,v" && validLanguage(d.language)))) {
-      return d.language !== undefined
-        ? { v: 2, op: "audio-session", id: d.id, action: "start", language: d.language as ScreenAudioLanguage }
-        : { v: 2, op: "audio-session", id: d.id, action: "start" };
+    if (d.action === "start" &&
+        (keys === "action,id,op,v" || (keys === "action,id,language,op,v" && validLanguage(d.language)) ||
+         (keys === "action,id,op,retain_audio,v" && d.retain_audio === true) ||
+         (keys === "action,id,language,op,retain_audio,v" && d.retain_audio === true && validLanguage(d.language)))) {
+      return {
+        v: 2, op: "audio-session", id: d.id, action: "start",
+        ...(d.language !== undefined ? { language: d.language as ScreenAudioLanguage } : {}),
+        ...(d.retain_audio === true ? { retain_audio: true as const } : {}),
+      };
     }
     if (
       (d.action === "pause" || d.action === "resume" || d.action === "stop" || d.action === "retry" || d.action === "cancel") &&

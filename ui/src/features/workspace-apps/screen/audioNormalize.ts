@@ -583,6 +583,7 @@ export async function startLiveMicrophoneCapture(options: {
   onLevel?: (level: number) => void;
   onElapsedMs?: (elapsedMs: number) => void;
   onSegment: (chunk: WavAudioChunk) => void;
+  onRetentionTail?: (chunk: WavAudioChunk) => void;
 }): Promise<LiveMicrophoneCapture> {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("microphone_unsupported");
@@ -652,7 +653,7 @@ export async function startLiveMicrophoneCapture(options: {
     const step = inputRate / AUDIO_SAMPLE_RATE;
     let sourceCursor = 0;
 
-    const emitBuffer = (count: number) => {
+    const emitBuffer = (count: number, retentionOnly = false) => {
       if (count <= 0) return;
       const samples = buffered.subarray(0, count);
       const wavBytes = encodeWav16kMonoPcm16(samples);
@@ -665,7 +666,8 @@ export async function startLiveMicrophoneCapture(options: {
       };
       buffered = new Int16Array(segmentFrames);
       bufferedOffset = 0;
-      options.onSegment(chunk);
+      if (retentionOnly) options.onRetentionTail?.(chunk);
+      else options.onSegment(chunk);
     };
 
     const pushMonoSamples = (mono: Float32Array) => {
@@ -793,6 +795,8 @@ export async function startLiveMicrophoneCapture(options: {
           const minTailFrames = segmentIndex === 0 ? 1 : Math.floor(0.15 * AUDIO_SAMPLE_RATE);
           if (bufferedOffset >= minTailFrames) {
             emitBuffer(bufferedOffset);
+          } else if (bufferedOffset > 0 && options.onRetentionTail) {
+            emitBuffer(bufferedOffset, true);
           }
         }
         await teardown();

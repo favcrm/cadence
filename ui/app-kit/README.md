@@ -199,6 +199,18 @@ a wall-clock RPC timeout unless `timeoutMs` is passed explicitly, and refusals
 (`cancelled`, `owner_required`, `conflict`, `unavailable`, `mic_unavailable`)
 leave the open screen bridge intact.
 
+Records screens can additionally check `bridge.canAudioRetention()` before
+offering optional recording replay. With explicit user consent, start a live
+session using `{ action: "start", retain_audio: true }`; after stopping and
+creating the record, call `bridge.audioRecording(scope, { action: "commit",
+record_id })`. A failed commit can be retried, or the pending audio discarded
+with `{ action: "cancel" }`. For an existing record, `exists` reports
+`{ available }`, while `play` opens the host's player and `delete` requires host
+confirmation. These calls never return audio bytes to the app frame. Hosts
+without retention do not advertise it, so ordinary transcription remains usable.
+The retained live capture is browser-processed 16 kHz mono, not a
+source-quality archive.
+
 A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
 host then sends the records projection, which the app validates in `onPush` (or
 delegates to `createScreenBridge`). Records CSV calls are larger than the

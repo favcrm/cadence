@@ -81,7 +81,7 @@ export interface ScreenAudioSessionSnapshot {
 }
 
 export type ScreenAudioSessionCommand =
-  | { action: "start"; language?: ScreenAudioLanguage; timeoutMs?: number }
+  | { action: "start"; language?: ScreenAudioLanguage; retain_audio?: true; timeoutMs?: number }
   | { action: "pause" | "resume" | "stop" | "retry" | "cancel"; timeoutMs?: number }
   | {
       action: "upload";
@@ -92,6 +92,11 @@ export type ScreenAudioSessionCommand =
       language?: ScreenAudioLanguage;
       timeoutMs?: number;
     };
+
+export type ScreenAudioRecordingCommand =
+  | { action: "cancel"; timeoutMs?: number }
+  | { action: "commit" | "exists" | "play" | "delete"; record_id: string; timeoutMs?: number };
+export type ScreenAudioRecordingResult = { readonly available: boolean } | { readonly ok: true };
 
 export type SlotAnchor = "footer" | { x: number; y: number; w: number; h: number };
 
@@ -146,6 +151,7 @@ export interface ScreenReceiver {
   tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
   audioCapture(options?: ScreenAudioCaptureOptions): Promise<ScreenAudioCapture>;
   audioSession(command: ScreenAudioSessionCommand): Promise<ScreenAudioSessionSnapshot>;
+  audioRecording(command: ScreenAudioRecordingCommand): Promise<ScreenAudioRecordingResult>;
   asset(ref: string, options?: { timeoutMs?: number }): Promise<string>;
   assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
@@ -200,6 +206,7 @@ export interface ScreenScopeSnapshot<
   readonly digest: string;
   readonly actions: readonly string[];
   readonly audioCapture: boolean;
+  readonly audioRetention: boolean;
   readonly presentationLocale: ScreenLocale;
   readonly route: ScreenRoute<Section, View> | null;
   readonly observations: readonly ScreenReadObservation[];
@@ -289,6 +296,7 @@ export interface ScreenBridge<
   getSnapshot(): ScreenScopeSnapshot<Section, View> | null;
   can(verb: string, actions?: readonly string[]): boolean;
   canAudioCapture(snapshot?: ScreenScopeSnapshot<Section, View> | null): boolean;
+  canAudioRetention(snapshot?: ScreenScopeSnapshot<Section, View> | null): boolean;
   assertScope(scope: ScreenScope): void;
   start(runtime?: ScreenBridgeRuntimeOverrides): void;
   call<T = unknown>(
@@ -332,6 +340,7 @@ export interface ScreenBridge<
     scope: ScreenScope,
     command: ScreenAudioSessionCommand,
   ): Promise<ScreenAudioSessionSnapshot>;
+  audioRecording(scope: ScreenScope, command: ScreenAudioRecordingCommand): Promise<ScreenAudioRecordingResult>;
   getAudioSession(): ScreenAudioSessionSnapshot | null;
   onAudioSession(listener: (state: ScreenAudioSessionSnapshot) => void): () => void;
   asset(scope: ScreenScope, ref: string, options?: { timeoutMs?: number }): Promise<string>;
