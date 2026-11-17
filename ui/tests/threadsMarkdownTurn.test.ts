@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type * as PartsModule from "../src/features/threads/ThreadChatParts";
 import type * as BarModule from "../src/features/app-shell/chat/TurnBar";
 import { LocaleTextProvider } from "../src/lib/localeText";
+import { rendersMarkdown } from "../src/features/threads/threadsView";
 import { translateUiText } from "../src/lib/locale";
 declare function require(name: string): any;
 
@@ -27,11 +28,12 @@ const body = "**done** and `code`\n\n<script>alert(1)</script> <b>raw</b>";
 const agent = renderToStaticMarkup(createElement(Turn, { who: "Agent", markdown: true, children: body }));
 check(agent.includes("<strong>done</strong>"), "bold renders as Markdown");
 check(agent.includes("<code") && agent.includes("code</code>"), "inline code renders as Markdown");
-check(agent.includes('class="answer answer-body issue-reader"'), "the Home answer styles wrap the body");
+check(agent.includes('class="answer"><div class="answer-body issue-reader"'), "the body nests as Home does, so the descendant .answer rules match");
 check(!agent.includes("<script") && !agent.includes("<b>"), "raw HTML never becomes an element");
 check(agent.includes("&lt;script&gt;") || agent.includes("&lt;b&gt;"), "raw HTML stays as text");
-const idTurn = renderToStaticMarkup(createElement(Turn, { who: "Agent", markdown: true, children: "see CAD-2380 now" }));
-check(idTurn.includes("CAD-2380") && idTurn.includes("<a") || idTurn.includes("<span"), "an issue id renders as a token");
+const sha = "0123456789abcdef0123456789abcdef01234567";
+const idTurn = renderToStaticMarkup(createElement(Turn, { who: "Agent", markdown: true, children: `built ${sha} ok` }));
+check(idTurn.includes('data-id-token="true"'), "a 40-hex id renders as an id token");
 
 // Without `markdown` the body stays plain text; an operator turn keeps OperatorText.
 const plain = renderToStaticMarkup(createElement(Turn, { who: "Someone", children: "**not bold**" }));
@@ -53,3 +55,14 @@ check(bar("upstream 503: provider exploded").includes("upstream 503: provider ex
 check(translateUiText("not in the table", "zh-TW") === "not in the table", "t() returns an unknown key unchanged");
 const billing = translateUiText("Assistant could not run: billing is not set up for this company. The company owner needs to set up billing.", "zh-TW");
 check(billing.includes("計費") && !billing.includes("帳單"), "the billing sentence says 計費, not 帳單");
+
+// Only agent prose and system notes are Markdown; tool rows stay plain.
+check(rendersMarkdown({ role: "agent", kind: "message" }) && rendersMarkdown({ role: "agent", kind: "assistant_text" }), "agent prose is Markdown");
+check(rendersMarkdown({ role: "system", kind: "message" }), "a system note is Markdown");
+for (const kind of ["tool_call", "tool_result", "turn_result"]) {
+  check(!rendersMarkdown({ role: "agent", kind }), `an agent ${kind} stays plain`);
+}
+check(!rendersMarkdown({ role: "operator", kind: "message" }), "an operator message is not the Markdown path");
+const shell = "# comment\nline two\nline three";
+const toolRow = renderToStaticMarkup(createElement(Turn, { who: "Agent", markdown: rendersMarkdown({ role: "agent", kind: "tool_result" }), children: shell }));
+check(!toolRow.includes("<h1") && toolRow.includes("# comment\nline two"), "a tool_result keeps its lines and its # line as text");

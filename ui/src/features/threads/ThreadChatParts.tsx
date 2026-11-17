@@ -52,8 +52,10 @@ export function Turn({
         {me && typeof children === "string" ? (
           <OperatorText text={readableAnswer(children)} />
         ) : markdown && typeof children === "string" ? (
-          <div className="answer answer-body issue-reader">
-            <Md text={children} idTokens />
+          <div className="answer">
+            <div className="answer-body issue-reader">
+              <Md text={children} idTokens />
+            </div>
           </div>
         ) : (
           children
