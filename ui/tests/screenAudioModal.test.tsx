@@ -139,6 +139,7 @@ async function main() {
 
   const fetchCalls: { url: string; body: Record<string, unknown> }[] = [];
   let quoteAttempt = 0;
+  let legacyBinding = false;
   let transcribeAttempt = 0;
 
   Object.defineProperty(globalThis, "fetch", {
@@ -158,7 +159,14 @@ async function main() {
           );
         }
         return new Response(
-          JSON.stringify({ available: true, max_duration_seconds: 60, unavailable_reason: null }),
+          JSON.stringify({
+            available: true,
+            max_duration_seconds: 60,
+            unavailable_reason: null,
+            ...(typeof parsed.session_request_id === "string" && !legacyBinding
+              ? { session_binding: "b".repeat(64) }
+              : {}),
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -228,6 +236,21 @@ async function main() {
   assert(fileInput, "Upload mode renders file input once quote is ready");
 
   const wavFile = makeCanonicalWavFile("memo.wav", 1, heldEpoch);
+  legacyBinding = true;
+  await React.act(async () => {
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [wavFile] });
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await flush(React, 10);
+  assert(
+    (host.textContent ?? "").includes("Audio transcription is currently unavailable."),
+    "an older host without a binding refuses the upload",
+  );
+  assert(
+    !fetchCalls.some((call) => call.url === "/api/app-screen-audio/transcribe"),
+    "an unbound upload never transcribes",
+  );
+  legacyBinding = false;
   await React.act(async () => {
     Object.defineProperty(fileInput, "files", {
       configurable: true,
@@ -251,9 +274,17 @@ async function main() {
   );
   assert(
     Object.keys(firstTranscribeCalls[0]!.body).sort().join(",") ===
-      "action_token,audio_base64,request_id",
+      "action_token,audio_base64,request_id,session_binding",
     "transcribe payload sends exact closed keys when language hint is omitted",
   );
+  const boundQuote = fetchCalls.findLast(
+    (call) => call.url === "/api/app-screen-audio/quote" && typeof call.body.session_request_id === "string",
+  );
+  assert(
+    boundQuote && firstRequestId.startsWith(`aud_${String(boundQuote.body.session_request_id)}_`),
+    "upload obtains a binding for its own recording session",
+  );
+  assert(firstTranscribeCalls[0]!.body.session_binding === "b".repeat(64), "upload forwards the binding");
 
   // Retry failed segments must reuse the exact same request_id
   const retrySegBtn = Array.from(host.querySelectorAll("button")).find(
@@ -271,6 +302,7 @@ async function main() {
     allTranscribeCalls[1]!.body.request_id === firstRequestId,
     "segment retry preserves the exact same request_id for idempotency",
   );
+  assert(allTranscribeCalls[1]!.body.session_binding === "b".repeat(64), "segment retry preserves the binding");
 
   const useBtn = Array.from(host.querySelectorAll("button")).find(
     (b) => b.textContent?.trim() === "Use transcript",

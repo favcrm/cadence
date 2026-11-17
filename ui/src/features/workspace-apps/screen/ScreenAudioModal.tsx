@@ -29,6 +29,7 @@ interface QuoteReply {
   available: boolean;
   max_duration_seconds: number;
   unavailable_reason: string | null;
+  session_binding?: string;
 }
 
 interface TranscribeReply {
@@ -92,6 +93,7 @@ export default function ScreenAudioModal({
   const [bannerError, setBannerError] = useState<string | null>(null);
 
   const sessionNonceRef = useRef<string>(randomAudioSessionId());
+  const sessionBindingRef = useRef<string | null>(null);
   const recorderRef = useRef<LiveMicrophoneCapture | null>(null);
   const resolvedRef = useRef(false);
   const pumpingRef = useRef(false);
@@ -204,6 +206,45 @@ export default function ScreenAudioModal({
     };
   }, [actionToken, signal, quoteAttempt]);
 
+  const beginBoundSession = async (sessionId: string): Promise<boolean> => {
+    let op: PrivateOperation | null = null;
+    try {
+      op = beginPrivateOperation(signal);
+      const res = await op.fetch("/api/app-screen-audio/quote", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Cadence-Board": "1",
+          ...sessionHeaders(),
+        },
+        body: JSON.stringify({ action_token: actionToken, session_request_id: sessionId }),
+      });
+      const body = (await res.json().catch(() => null)) as QuoteReply | Record<string, unknown> | null;
+      if (signal.aborted || resolvedRef.current || sessionNonceRef.current !== sessionId) return false;
+      const quote = body as QuoteReply | null;
+      if (
+        !res.ok ||
+        !quote ||
+        quote.available !== true ||
+        typeof quote.session_binding !== "string" ||
+        !/^[a-f0-9]{64}$/.test(quote.session_binding)
+      ) {
+        setBannerError(unavailableMessage(readErrorCode(body), res.status, t));
+        return false;
+      }
+      sessionBindingRef.current = quote.session_binding;
+      return true;
+    } catch {
+      if (!signal.aborted && !resolvedRef.current && sessionNonceRef.current === sessionId)
+        setBannerError(t("Could not reach the audio transcription service. Check your connection and retry."));
+      return false;
+    } finally {
+      op?.dispose();
+    }
+  };
+
   // Sequential segment transcription pump
   const pumpSegments = () => {
     if (pumpingRef.current || signal.aborted || resolvedRef.current) return;
@@ -211,6 +252,14 @@ export default function ScreenAudioModal({
     if (!next) return;
 
     const activeSession = sessionNonceRef.current;
+    const activeBinding = sessionBindingRef.current;
+    if (!activeBinding) {
+      setSegments((prev) =>
+        prev.map((item) => item.status === "queued" ? { ...item, status: "failed", errorCode: "unavailable" } : item),
+      );
+      setBannerError(transcribeFailureMessage("unavailable", t));
+      return;
+    }
     pumpingRef.current = true;
     setSegments((prev) =>
       prev.map((item) =>
@@ -234,6 +283,7 @@ export default function ScreenAudioModal({
           body: JSON.stringify({
             action_token: actionToken,
             request_id: next.requestId,
+            session_binding: activeBinding,
             audio_base64: next.chunk.base64,
             ...(languageRef.current ? { language: languageRef.current } : {}),
           }),
@@ -325,6 +375,7 @@ export default function ScreenAudioModal({
       return;
     }
     sessionNonceRef.current = randomAudioSessionId();
+    sessionBindingRef.current = null;
     setActiveMode(nextMode);
     setRecordPhase("idle");
     setElapsedMs(0);
@@ -342,9 +393,15 @@ export default function ScreenAudioModal({
     setEditedTranscript(null);
     setSegments([]);
     sessionNonceRef.current = randomAudioSessionId();
+    sessionBindingRef.current = null;
     const recordSession = sessionNonceRef.current;
     setRecordPhase("starting");
     try {
+      if (!(await beginBoundSession(recordSession))) {
+        if (!signal.aborted && !resolvedRef.current && sessionNonceRef.current === recordSession)
+          setRecordPhase("idle");
+        return;
+      }
       const capture = await startLiveMicrophoneCapture({
         onLevel: (lvl) => setMicLevel(lvl),
         onElapsedMs: (ms) => setElapsedMs(ms),
@@ -411,11 +468,17 @@ export default function ScreenAudioModal({
     setEditedTranscript(null);
     setSegments([]);
     sessionNonceRef.current = randomAudioSessionId();
+    sessionBindingRef.current = null;
     const uploadSession = sessionNonceRef.current;
     setSelectedFileName(file.name);
     setNormalizing({ fileName: file.name, done: 0, total: 1 });
 
     try {
+      if (!(await beginBoundSession(uploadSession))) {
+        if (!signal.aborted && !resolvedRef.current && sessionNonceRef.current === uploadSession)
+          setNormalizing(null);
+        return;
+      }
       const normalized = await normalizeAudioFile(file, {
         signal,
         onChunkNormalized: (done, total) => {
