@@ -113,6 +113,10 @@ fn start() -> Rig {
         ),
         ..crate::daemon::ServeOptions::default()
     };
+    // The daemon resolves the wiki and tracker from this rig's PM dir, not the
+    // runner's HOME (as the CAD-2317 rig does).
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     let daemon_state = state.clone();
     threads.push(std::thread::spawn(move || {
         crate::daemon::serve_with(&daemon_state, opts).unwrap()
