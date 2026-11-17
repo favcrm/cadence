@@ -1173,6 +1173,17 @@ export function ThreadTurn({
   const previewText =
     preview === null || previewTransform === undefined ? preview : previewTransform(preview);
   const hasPreview = previewText !== null && previewText.trim() !== "";
+  // CAD-2411: a step's words commit as a note and fold into the trace when
+  // its tool call starts. Until the next step has live text, the latest note
+  // stays where the preview was, so the words do not vanish between steps.
+  const interim =
+    streaming && !hasPreview
+      ? [...trace].reverse().find((item) => item.type === "commentary")
+      : undefined;
+  const interimText =
+    interim && interim.entry.text.trim() !== "" && !carriesSecret(interim.entry.text)
+      ? interim.entry.text
+      : null;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -1220,6 +1231,13 @@ export function ThreadTurn({
         <div className="answer" data-kind="preview" aria-live="off">
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
             <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} idTokens />
+          </div>
+        </div>
+      )}
+      {interimText !== null && (
+        <div className="answer turn-interim" data-kind="interim" aria-live="off">
+          <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
+            <Md text={interimText} onOpen={onOpenIssue} idTokens />
           </div>
         </div>
       )}
