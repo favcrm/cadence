@@ -68,28 +68,34 @@ fn unknown_operation_is_refused_as_an_invalid_command() {
     assert_eq!(response["ok"], true, "{response}");
 }
 
-// CAD-2081 acceptance, authored from the ticket by someone other than the implementer:
-// the shared evaluator keeps `src/delivery/` human even when the trusted lists forget it,
-// like the script's own prefix list does.
+// CAD-2386 (operator decision 2026-11-17) supersedes CAD-2081's in-code floor for
+// `src/delivery/`: product code names no repository's paths. The trusted lists
+// protect themselves instead. Editing them is operator-class, so dropping a gate
+// path from them needs an operator-approved change, and a list that loses a
+// required table fails closed.
 #[test]
-fn the_gates_own_directory_needs_the_operator_even_when_the_lists_forget_it() {
+fn the_trusted_lists_protect_themselves() {
     use crate::delivery_requirements::{change, classify, default_resolved, TrustedLists};
     let roles = root().join("../../docs/roles");
     let risk = std::fs::read_to_string(roles.join("risk-paths.toml")).unwrap();
-    assert!(
-        risk.contains("\"src/delivery/**\", "),
-        "the real list names it"
-    );
-    let risk = risk.replace("\"src/delivery/**\", ", "");
     let one = std::fs::read_to_string(roles.join("one-review-paths.toml")).unwrap();
-    let lists = TrustedLists {
-        risk_paths: Some(&risk),
-        one_review: Some(&one),
-    };
-    let needs_operator = |path: &str| {
+    let requirements = |risk: &str, path: &str| {
+        let lists = TrustedLists {
+            risk_paths: Some(risk),
+            one_review: Some(&one),
+        };
         let changes = [change("M", "100644", "100644", path)];
-        classify(&default_resolved(), &changes, 1, &lists).operator_approval
+        classify(&default_resolved(), &changes, 1, &lists)
     };
-    assert!(needs_operator("src/delivery/hosted_gate.rs"));
-    assert!(!needs_operator("docs/guides/x.md"));
+    // The lists and the gate's own directory need the operator under the real lists.
+    assert!(requirements(&risk, "docs/roles/risk-paths.toml").operator_approval);
+    assert!(requirements(&risk, "docs/roles/one-review-paths.toml").operator_approval);
+    assert!(requirements(&risk, "src/delivery/hosted_gate.rs").operator_approval);
+    assert!(!requirements(&risk, "docs/guides/x.md").operator_approval);
+    // A list without its `operator` table fails closed: every path needs the operator.
+    let cut = risk.split("\n[operator]").next().unwrap().to_string();
+    assert_ne!(cut, risk, "the real list has an operator table");
+    let r = requirements(&cut, "docs/guides/x.md");
+    assert!(r.operator_approval);
+    assert_eq!(r.reviews, 2);
 }

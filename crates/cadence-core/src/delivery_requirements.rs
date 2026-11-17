@@ -130,7 +130,7 @@ pub struct Requirements {
     /// reviewer (sensitive class).
     pub security_capable: bool,
     /// A change to a path in the repository's `browser_qa` table needs a
-    /// Browser QA pass (always, when the lists are unreadable).
+    /// Browser QA pass (never when the lists are unreadable).
     pub browser_qa: bool,
     /// An exact-head operator-connection approval is required.
     pub operator_approval: bool,
@@ -370,10 +370,12 @@ fn human_path(path: &str, lists: Option<&Lists>) -> bool {
 }
 
 /// Does any change need a Browser QA pass? The repository's `browser_qa`
-/// table decides; unreadable lists fail closed and require it.
+/// table decides. Unreadable lists require none (operator decision
+/// 2026-11-17, CAD-2386): they already force the operator's approval, which
+/// is the human check there.
 fn browser_qa_needed(changes: &[Change], lists: Option<&Lists>) -> bool {
     match lists {
-        None => true,
+        None => false,
         Some(l) => changes.iter().any(|c| {
             l.browser_qa
                 .iter()
