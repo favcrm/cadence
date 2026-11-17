@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, failureReason, isolate, outcomeOf, sentFields, stagedDomain, stagedDomainLabel, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
+import { ageText, failureReason, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -72,14 +72,15 @@ const iso = (text: string) => `\u2068${isolate(text)}\u2069`;
 export function noticeText(n: DecisionNotice, t: Say): string {
   switch (n.outcome) {
     case "applied":
-      return `${t("Applied")} · ${iso(n.title)}`;
+      return `${t(n.effect === "send" ? "Sent" : n.effect === "draft" ? "Drafted" : "Applied")} · ${iso(n.title)}`;
     case "denied":
       return `${t("Denied")} · ${iso(n.title)} · ${t("nothing ran")}`;
     case "failed":
       return t("{title} was approved but did not apply: {reason}. See Updates.")
         .replace("{title}", iso(n.title))
-        .replace("{reason}", t(n.reason ?? "the reason is not recognised"));
+        .replace("{reason}", reasonText(n.reason ?? "the reason is not recognised", t));
     case "unconfirmed":
+      if (n.effect !== undefined) return t("{title}: the result is unconfirmed. The provider may have acted, so do not assume it did not. See Updates.").replace("{title}", iso(n.title));
       return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
     case "still-waiting":
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
@@ -118,7 +119,7 @@ function ApprovalsTab({
   const [raw, setRaw] = useState(!write.changesComplete);
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
   const update = write.target !== null && write.changesComplete;
-  const heading = update ? t("Changes compared with the current record") : write.target !== null ? t("Values sent") : t("Fields");
+  const heading = update ? t("Changes compared with the current record") : write.connected !== null ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
   const name = write.origin?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
@@ -135,6 +136,11 @@ function ApprovalsTab({
         </p>
       )}
       {state}
+      {write.connected !== null && write.status === "pending" && (
+        <p className="rv-note m-0">
+          {t(write.connected.effect === "send" ? "Approving sends this once. Nothing has been sent yet." : "Approving drafts this once. Nothing has been drafted yet.")}
+        </p>
+      )}
       {!write.changesComplete && (
         <p className="issue-peek-note warn m-0" role="status">
           {t("This summary may be incomplete. Check the raw call.")}
@@ -668,7 +674,7 @@ export default function StagedWriteDetail({
       modal
       scrim="board"
       label={label}
-      title={<B>{write.title}</B>}
+      title={<B>{titleOf(write, t)}</B>}
       subtitle={
         <>
           <B>{where}</B>

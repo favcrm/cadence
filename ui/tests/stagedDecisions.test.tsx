@@ -1078,6 +1078,72 @@ listStatus = 200;
   await f.done();
 }
 
+// ---- 18. CAD-2406: a connected draft or send is decidable; args are plain text; every outcome is honest ----
+{
+  const ARGS = { to: "<b>Ana</b>@example.com", subject: "Quote", body: "Line one\n<img src=x onerror=alert(1)>", cc: null, n: 3, opts: { a: [1] } };
+  const effect = (id: string, extra: Record<string, unknown> = {}, input: Record<string, unknown> = {}) => ({
+    id, tool: "connected_effect", status: "pending", createdAt: Date.now() - AGO, decidedAt: null,
+    origin: { via: "mcp", kind: "agent", label: "Atlas" },
+    input: { slug: "gmail_send_email", toolkit: "gmail", effect: "send", connection_id: "ca_1", account: "ops@example.com", args: JSON.stringify(ARGS), ...input },
+    ...extra,
+  });
+  const good = parseStagedRow(effect("e1"));
+  assert(good !== null && good.kind === "connected_effect" && good.connected?.effect === "send", "a good row parses");
+  assert(good.changes.length === 6 && good.changes.find((c) => c.field === "opts")?.after === '{"a":[1]}', "every argument is kept, nested ones as JSON text");
+  for (const [why, row] of [
+    ["no input", { ...effect("e"), input: undefined }],
+    ["args not JSON", effect("e", {}, { args: "{nope" })],
+    ["args not an object", effect("e", {}, { args: "[1]" })],
+    ["args not text", effect("e", {}, { args: { to: "x" } })],
+    ["unknown effect", effect("e", {}, { effect: "delete" })],
+    ["no account", effect("e", {}, { account: " " })],
+    ["no slug", effect("e", {}, { slug: undefined })],
+    ["no connection", effect("e", {}, { connection_id: undefined })],
+  ] as const) assert(parseStagedRow(row) === null, `${why}: the row is dropped`);
+
+  actions = [effect("e1"), effect("e2", {}, { effect: "draft", slug: "gmail_create_email_draft" }), effect("bad", {}, { args: "{" })];
+  onDecide = (id, verb) => {
+    actions = actions.map((a: any) => a.id !== id ? a : {
+      ...a, status: verb === "approve" ? "approved" : "denied", decidedAt: Date.now(),
+      result: verb === "approve" ? (id === "e1" ? { ok: true } : { ok: false, code: "uncertain" }) : null,
+    });
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 2, "two cards; the unparseable row is not one"));
+  assert(text(v.cards()[0].querySelector(".todo-title")) === "Send · gmail_send_email", `verb and tool (got ${text(v.cards()[0].querySelector(".todo-title"))})`);
+  assert(text(v.cards()[1].querySelector(".todo-title")) === "Draft · gmail_create_email_draft", "the draft verb");
+  assert(text(v.cards()[0].querySelector(".todo-meta")).startsWith("ops@example.com (gmail) · Atlas (agent)"), "account, toolkit, asker");
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const d = drawerEl()!;
+  const rows = Array.from(d.querySelectorAll(".dx-row")).map((r) => `${text(r.querySelector("dt"))}: ${text(r.querySelector("dd"))}`);
+  assert(rows.includes("to: <b>Ana</b>@example.com") && rows.some((r) => r.startsWith("body: Line one") && r.includes("<img src=x onerror=alert(1)>")), `values are text (${rows.join("|")})`);
+  assert(!d.querySelector("b, img"), "no argument became markup");
+  assert(rows.includes("cc: Empty") && rows.includes("n: 3"), "null and numbers read as data");
+  assert(text(d.querySelector(".crm-drawer-sub")).includes("ops@example.com (gmail)") && /Asked by Atlas \(agent\), via mcp/.test(text(d)), "account, toolkit and asker in the detail");
+  assert(text(d).includes("Nothing has been sent yet"), "pending says nothing was sent");
+  await click(labelled(d, "Approve"));
+  await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Draft · gmail_create_email_draft", "advanced"));
+  assert(text(drawerEl()!).includes("Sent · gmail_send_email"), "ok:true reads Sent");
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(!drawerEl(), "closed"));
+  assert(/unconfirmed/.test(text(v.host)) && /may have acted/.test(text(v.host)) && !/Drafted/.test(text(v.host)), `uncertain is not success (${text(v.host)})`);
+  await click(labelled(v.host, "Updates"));
+  const lines = Array.from(v.host.querySelectorAll("[data-todo-decisions] li")).map((l) => text(l));
+  assert(lines.some((l) => l.includes("Sent") && l.includes("gmail_send_email")) && lines.some((l) => l.includes("Result not confirmed") && l.includes("do not assume it did not")), `Updates (${lines.join("|")})`);
+  onDecide = null;
+  await v.done();
+
+  for (const [code, words] of [["expired", "expired"], ["insufficient_funds", "not enough funds"], ["toolkit_disabled", "turned off"], ["mystery", "refused (mystery)"]] as const) {
+    actions = [effect("f1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code } })];
+    const w = await render();
+    await settle(() => assert(listCalls > 0, "read"));
+    await click(labelled(w.host, "Updates"));
+    assert(text(w.host.querySelector("[data-fail]")).includes(words), `${code} reads in plain words`);
+    await w.done();
+  }
+}
+
 console.log("staged decision checks passed");
 }
 void main();

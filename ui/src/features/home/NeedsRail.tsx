@@ -4,7 +4,7 @@ import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
@@ -604,12 +604,12 @@ function DecidedLine({ write }: { write: StagedWrite }) {
   if (outcome === "failed") {
     return (
       <li data-fail>
-        <span><bdi>{isolate(write.title)}</bdi></span>
+        <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
         <span className="text-ink-500">
           <span className="dx-bad">{t("Did not apply")}</span> · {when}
         </span>
         <span className="dx-why">
-          {t(failureReason(write))}
+          {reasonText(failureReason(write), t)}
           <button type="button" className="lnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
             {raw ? t("Hide raw") : t("Show raw")}
           </button>
@@ -630,13 +630,18 @@ function DecidedLine({ write }: { write: StagedWrite }) {
       ? t("Denied")
       : write.kind === "create_issue" && write.result?.ticket
         ? `${t("Created")} ${write.result.ticket}`
-        : t("Applied");
+        : write.connected !== null
+          ? t(write.connected.effect === "send" ? "Sent" : "Drafted")
+          : t("Applied");
   return (
     <li>
-      <span><bdi>{isolate(write.title)}</bdi></span>
+      <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
       <span className="text-ink-500">
         {label} · {when}
       </span>
+      {outcome === "unconfirmed" && write.connected !== null && (
+        <span className="dx-why">{reasonText(failureReason(write), t)}</span>
+      )}
     </li>
   );
 }

@@ -42,7 +42,7 @@ export interface StagedResult {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue";
+  kind: "app_call" | "create_issue" | "connected_effect";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -65,6 +65,8 @@ export interface StagedWrite {
   decisionReason?: string | null;
   /** The record behind "Open record", when the API names a link. */
   recordLink: string | null;
+  /** `connected_effect`: the draft or send a connected tool would make. */
+  connected: { effect: "draft" | "send"; slug: string; toolkit: string; account: string } | null;
 }
 
 const STATUSES: readonly string[] = ["pending", "approved", "denied"];
@@ -175,6 +177,7 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
       origin,
       result,
       recordLink: null,
+      connected: null,
     };
   }
   if (!Array.isArray(row.changes)) return null;
@@ -202,6 +205,7 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
     origin,
     result,
     recordLink: str(row.record_link),
+    connected: null,
   };
 }
 
@@ -234,6 +238,46 @@ function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" 
     origin: parseOrigin(row.origin),
     result,
     recordLink: null,
+    connected: null,
+  };
+}
+
+/** A connected tool's staged draft or send. Any malformed part drops the row: it is never approvable. */
+function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+  const input = isRecord(row.input) ? row.input : null;
+  if (input === null) return null;
+  const slug = str(input.slug);
+  const toolkit = str(input.toolkit);
+  const account = str(input.account);
+  const effect = input.effect;
+  if (slug === null || toolkit === null || account === null || str(input.connection_id) === null) return null;
+  if (effect !== "draft" && effect !== "send") return null;
+  if (typeof input.args !== "string") return null;
+  let args: unknown;
+  try {
+    args = JSON.parse(input.args);
+  } catch {
+    return null;
+  }
+  if (!isRecord(args)) return null;
+  return {
+    ...base,
+    kind: "connected_effect",
+    title: slug,
+    app: `${account} (${toolkit})`,
+    target: null,
+    // Every key and value the call carries, as text: nothing is summarised away.
+    changes: Object.entries(args).map(([field, v]) => ({ field, label: field, kind: "added", after: valueText(v) })),
+    unchangedCount: 0,
+    changesComplete: true,
+    reason: null,
+    consent: null,
+    effects: [],
+    raw: rawText(input.args),
+    origin: parseOrigin(row.origin),
+    result,
+    recordLink: null,
+    connected: { effect, slug, toolkit, account },
   };
 }
 
@@ -255,6 +299,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   };
   if (row.tool === "app_call") return parseAppCall(base, row, result);
   if (row.tool === "board_create_issue") return parseCreateIssue(base, row, result);
+  if (row.tool === "connected_effect") return parseConnectedEffect(base, row, result);
   return null;
 }
 
@@ -266,6 +311,8 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
   if (write.status === "denied") return "denied";
+  // The provider may have acted: that is not a failure and not a success.
+  if (write.connected !== null && write.result?.ok === false && write.result.code === "uncertain") return "unconfirmed";
   if (write.result?.ok === false) return "failed";
   // Success is only ever what the row says: ok === true (or the ticket a create made).
   if (write.result?.ok === true || (write.kind === "create_issue" && write.result?.ticket)) return "applied";
@@ -288,9 +335,37 @@ const REASONS: Readonly<Record<string, string>> = {
   refused: "the app refused it",
 };
 
+const CONNECTED_REASONS: Readonly<Record<string, string>> = {
+  expired: "it was staged more than 7 days ago and has expired",
+  owner_required: "only the workspace owner can run this",
+  invalid: "the request was not valid",
+  unavailable: "the tool is no longer published or priced",
+  not_allowlisted: "the tool is not on the allowed list",
+  toolkit_disabled: "this kind of connection is turned off",
+  foreign_connection: "the connection belongs to someone else",
+  connection_inactive: "the connection is no longer active",
+  connection_access_denied: "the connection does not allow this",
+  insufficient_funds: "there are not enough funds to run it",
+  invalid_provider_response: "the provider's reply could not be understood",
+  upstream_error: "the provider reported an error",
+  uncertain: "the provider may have acted, so do not assume it did not",
+};
+
 export function failureReason(write: StagedWrite): string {
   const code = write.result?.code;
+  if (write.connected !== null) return (code && CONNECTED_REASONS[code]) || `refused (${code ?? "unknown"})`;
   return (code && REASONS[code]) || "the reason is not recognised";
+}
+
+/** A failure reason in the viewer's language; an unlisted connected code keeps its code, as data. */
+export function reasonText(reason: string, t: (english: string) => string): string {
+  const code = /^refused \((.*)\)$/s.exec(reason)?.[1];
+  return code === undefined ? t(reason) : t("refused ({code})").replace("{code}", () => isolate(code));
+}
+
+/** The row's own heading: a connected effect leads with its verb. */
+export function titleOf(write: StagedWrite, t: (english: string) => string): string {
+  return write.connected === null ? write.title : `${t(write.connected.effect === "send" ? "Send" : "Draft")} · ${write.title}`;
 }
 
 type Say = (english: string) => string;
