@@ -9,10 +9,14 @@ const HEIF_BRANDS = new Set([
   "j2ki", "j2is", "avci", "avcs",
 ].map(brandCode));
 
+function assertActive(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException("Photo conversion canceled", "AbortError");
+}
+
 /** Identify HEIF by its ftyp bytes, not by the browser's declared MIME. */
 export async function isHeif(file: File, signal: AbortSignal): Promise<boolean> {
   const head = new Uint8Array(await file.slice(0, 24).arrayBuffer());
-  signal.throwIfAborted();
+  assertActive(signal);
   if (head.length < 12 || head[4] !== 0x66 || head[5] !== 0x74 || head[6] !== 0x79 || head[7] !== 0x70) return false;
   const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
   let size = view.getUint32(0);
@@ -34,7 +38,7 @@ export async function isHeif(file: File, signal: AbortSignal): Promise<boolean> 
   if (size < header + 8 || size > file.size || (size - header - 8) % 4 !== 0) return false;
   for (let start = header + 8; start < size; start += 64 * 1024) {
     const compatible = new DataView(await file.slice(start, Math.min(size, start + 64 * 1024)).arrayBuffer());
-    signal.throwIfAborted();
+    assertActive(signal);
     for (let offset = 0; offset < compatible.byteLength; offset += 4) {
       if (HEIF_BRANDS.has(compatible.getUint32(offset))) return true;
     }

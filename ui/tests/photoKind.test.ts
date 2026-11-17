@@ -21,6 +21,11 @@ async function main(): Promise<void> {
   }
   if (!await isHeif(bmff("new1"), signal)) throw new Error("unknown image-labelled BMFF was sent unchanged");
   if (await isHeif(bmff("isom", ["mp41", "mp42"], false, "clip.mp4", "video/mp4"), signal)) throw new Error("ordinary MP4 was mistaken for a photo");
+  const olderSignal = { aborted: false } as AbortSignal;
+  if (await isHeif(new File(["notes"], "notes.txt"), olderSignal))
+    throw new Error("ordinary attachments must work without AbortSignal.throwIfAborted");
+  if (!await isHeif(bmff("isom", ["heic"], false, "renamed.bin", "application/octet-stream"), olderSignal))
+    throw new Error("compatible HEIF brands must work without AbortSignal.throwIfAborted");
   console.log("photoKind.test.ts: passed");
 }
 void main();
