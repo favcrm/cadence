@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AppScope, AskResult, HostedSessionOptions, HostedState, PendingOperation, ThreadEntry } from "./contract.js";
+import type { AppScope, AskResult, HostedSessionOptions, HostedState, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
 /**
  * One agent conversation, one Durable Object.
  *
@@ -35,9 +35,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     private resolvedModel;
     constructor(ctx: DurableObjectState, env: Env, options: HostedSessionOptions);
     /**
-     * SSE for this conversation: the engine's snapshot, then one batch per
-     * committed change. The stream lives in memory, so a client that reconnects
-     * gets a fresh snapshot rather than a cursor.
+     * Board transcript SSE and owner-only diagnostic views. Diagnostic reconnects
+     * get a fresh full view; board reconnects resume from a transcript cursor.
      */
     fetch(request: Request): Promise<Response>;
     /**
@@ -196,6 +195,11 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * call resolves the platform default.
      */
     state(): Promise<HostedState>;
+    /**
+     * Inspect durable settlement without opening the engine or waking work.
+     * Absence is evidence only; the host must separately fence admission.
+     */
+    settledOperation(operationId: string): Promise<OperationSettlement>;
     /**
      * Stop the turn with this id. The id is required: the engine reads a missing
      * one as "abort this session" even when nothing has been asked to stop.

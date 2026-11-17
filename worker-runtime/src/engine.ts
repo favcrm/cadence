@@ -4,6 +4,8 @@ import {
   type Extension,
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
+import { compile } from "@earendil-works/pi-schema";
+import { formats } from "@earendil-works/pi-schema/formats";
 import type {
   AppScope,
   RuntimeTool,
@@ -84,11 +86,20 @@ function registration(
   resolveApp: AppScopeResolver | undefined,
   acceptsImages: boolean,
 ): ToolRegistration {
+  let validator: ReturnType<typeof compile> | undefined;
   return {
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters as ToolRegistration["parameters"],
     ...(tool.replay === undefined ? {} : { replay: tool.replay }),
+    prepareArguments(input) {
+      // Pi coerces arguments after this hook; enforce the host's original
+      // schema before a value such as a fractional revision can be changed.
+      validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
+      if (!validator.check(input))
+        throw new Error("Tool arguments do not match the declared schema.");
+      return input;
+    },
     execute(input, api, context) {
       const run = async () => {
         // The scope belongs to the operation, so it is read from the engine's

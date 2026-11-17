@@ -121,7 +121,7 @@ export interface ToolResult {
  *
  * `execute` is a method, so a typed handler (`RuntimeTool<{issueId: string}>`)
  * assigns to `RuntimeTool` without a cast. `parameters` is a plain JSON
- * schema; the engine validates arguments against it before `execute`.
+ * schema; the engine validates the original arguments without coercion before `execute`.
  */
 export interface RuntimeTool<Input = unknown> {
   readonly name: string;
@@ -362,6 +362,25 @@ export interface PendingOperation {
   readonly status: "queued" | "running" | "parked";
 }
 
+/**
+ * Read-only evidence from the engine's durable records. A settled or absent
+ * result also requires the entire session to be at rest. Absence is not a
+ * dispatch fence; callers must separately prevent or await admission.
+ */
+export type OperationSettlement =
+  | {
+      readonly state: "settled";
+      readonly operationId: string;
+      readonly conversation: string;
+      readonly submission: string;
+      readonly status: "done" | "unanswered";
+    }
+  | {
+      readonly state: "absent" | "unknown";
+      readonly operationId: string;
+      readonly conversation: string;
+    };
+
 /** Cheap header state for a conversation. */
 export interface HostedState {
   readonly running: boolean;
@@ -389,9 +408,8 @@ export const COMPACTION_FAILURE_TEXT =
 export const BOARD_MESSAGE_KIND = "tenant.board.message";
 
 /**
- * Version of the bundled operational skill catalog. An application stamps its
- * domain drafts with it; the runtime's skill manifest uses the same value as
- * its fingerprint.
+ * Version of the bundled operational skill catalog that applications stamp
+ * onto domain drafts. The engine fingerprints its rendered catalog separately.
  */
 export const OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 

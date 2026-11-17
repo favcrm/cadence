@@ -114,6 +114,28 @@ parts with an explicit notice to the model. The count defaults to one; a host
 may set `maxImagesPerRequest` from one to four only when every model its alias
 may resolve to permits that many. The private durable history is not changed.
 
+The owner-only diagnostic route `/api/assist/events` (forwarded to the
+runtime's `/events`) sends SSE data frames containing
+`{"type":"snapshot","version":1,"view":...}` followed by
+`{"type":"view","version":1,"view":...}`. Each view replaces the previous
+one; these are not the individual engine events sent by the older protocol.
+The host must authorize the owner on every connection. Views may contain
+private conversation, reasoning and tool data even though image bytes are
+redacted; they are not a member-facing feed.
+
+Pi Durable 1.5 upgrades stored conversation and task formats. A 1.4 runtime
+cannot read that upgraded state: before deploying, stop writes and take a
+consistent, restorable backup. Roll forward or restore the backup rather than
+starting 1.4 against upgraded data.
+
+`HostedSession.settledOperation(id)` inspects durable records without opening or
+waking the engine. It returns `settled`, `absent` or `unknown`; positive
+evidence requires all conversations and background tasks to be at rest.
+Malformed or inconsistent records return `unknown`, and failed reads throw.
+Absence is not a fence: the host must separately prevent or await admission
+before relying on it. The result is a point-in-time proof, not evidence of
+external effects or of another deployment's state.
+
 A gateway refuses image input for a model that cannot take it with a JSON error
 whose `error.code` is `image_input_unavailable`. A turn whose newest message holds
 the image fails with that named reason. A later request whose images are all older
@@ -197,10 +219,11 @@ description, a `SKILL.md` body, `references/<leaf>` text files and a version,
 within the bundle grammar's skill caps. The runtime reads it once when a
 conversation's harness opens and lists each kept skill as `ws-<name>` after the
 bundled skills, so a workspace skill never replaces a bundled procedure. Every
-body and reference it returns is framed as untrusted guidance. An entry that
-breaks a rule is dropped whole, and a host refusal leaves the bundled skills
-unchanged. Only approved revisions belong here; a draft never does, and a skill
-never grants, adds or selects a tool.
+catalog description, body and reference it returns is framed as untrusted
+guidance; references are always served as text. An entry that breaks a rule is
+dropped whole, and a host refusal leaves the bundled skills unchanged. Only
+approved revisions belong here; a draft never does, and a skill never grants,
+adds or selects a tool.
 
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
@@ -309,11 +332,14 @@ The thread stream also sends `preview` events with `{ "text": string | null }`
 for in-flight assistant text. They have no `id` and are not transcript
 entries: retry, cancellation or reconnect can replace them, while the committed
 entry and its `seq` remain authoritative. Thinking and tool arguments are not
-previewed. The preview stops at the first `{` or sensitive confirmation key
-anywhere in a message, including across text blocks; that suffix stays withheld
-until commit. This conservative rule also stops previews at benign braces.
-Preview text and tracked content blocks are bounded; an oversized partial is not
-a substitute for the final answer.
+previewed. After the connection's observer attaches, the preview stops at the
+first `{` or sensitive confirmation key anywhere in a message, including
+across text blocks; that suffix stays withheld until the generation or attempt changes.
+This conservative rule also stops previews at benign braces. A reconnect
+previews the current snapshot and cannot detect a sensitive marker overwritten
+before it attached; the operator accepted that tradeoff. Preview text and tracked
+content blocks are bounded; an oversized partial is not a substitute for the
+final answer.
 The run's first engine submission must resolve to the operation in the current
 `master` turn; an older snapshot or buffered batch is suppressed when they
 differ or the submission cannot be resolved. A turn change clears the previous
