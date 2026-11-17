@@ -9334,4 +9334,25 @@ fn cad2396_skill_write_without_a_matching_receipt_is_unknown() {
         let (out, _) = run(vec![(200, "", receipt)], verb, args, 10);
         assert!(out.is_ok(), "{verb}: {out:?}");
     }
+// AOS-627: a staged connected effect is accepted only as the strict stage
+// answer, never as a provider result.
+#[test]
+fn hosted_connected_effect_answer_is_strict() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let ok = |data: Value| json!({"ok": true, "data": data});
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "pending", "replayed": false})
+    )));
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "applied", "replayed": true, "result": {}})
+    )));
+    for bad in [
+        json!({"action_id": id, "outcome": "pending"}),
+        json!({"action_id": "ABC", "outcome": "pending", "replayed": false}),
+        json!({"action_id": id, "outcome": "sent", "replayed": false}),
+        json!({"action_id": id, "outcome": "pending", "replayed": false, "price": {}}),
+    ] {
+        assert!(!connected_effect_stage_answer(&ok(bad)));
+    }
+    assert!(!connected_effect_stage_answer(&json!({"ok": false})));
 }
