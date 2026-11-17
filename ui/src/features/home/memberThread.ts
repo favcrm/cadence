@@ -65,7 +65,7 @@ interface MemberPage {
 }
 
 /** The relay must answer an opaque page; an old numeric page is unavailable. */
-function memberPage(page: MemberAssistHistory): MemberPage {
+export function memberPage(page: MemberAssistHistory): MemberPage {
   if (page === null || typeof page !== "object" || Array.isArray(page)) {
     throw new ApiError("member history answered an unexpected shape", 0);
   }
