@@ -176,28 +176,31 @@ the code you just wrote.
   takes those two workflow rows and the operator approval they carry (CAD-2135),
   unless the gate's dry run reports `class: auto` (the auto-paths rule below;
   being on the list is not enough).
-  A hosted `ui/**` PR takes those two rows, operator approval and `--browser-qa
-  <url>`, naming an unedited comment on this PR by a repository member that is exactly the lines `Browser QA: pass` and
-  `Head: <full sha>` (CAD-2173). Until it ends, a `ui/**` PR can instead take
-  the temporary exception (`--exception --advisory standards=<url> --advisory
-  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); the Browser
-  QA session posts a PR comment, and that comment is the `browser-qa=<url>`
-  advisory. Of the advisory links, it checks
-  only that they are separate https URLs; it proves neither head binding nor
-  that Browser QA ran. A second attested human is not required.
+  A hosted `ui/**` PR also needs Browser QA. The fresh QA session reports to
+  the dispatcher, who posts the full report and, only on a pass, a separate
+  unedited PR comment containing exactly `Browser QA: pass` and
+  `Head: <full sha>` on two lines. A counted Browser QA verdict or an unedited
+  exact-head pass from a non-author repository member satisfies the gate.
+  Since CAD-2383, an eligible PR author's exact-head pass also counts once the
+  operator reads the report and records a project-scoped per-head approval
+  through an operator channel. A scope, delegated or legacy repo-scoped
+  approval, an edited pass or a pass for another head does not satisfy that
+  route. The gate checks the comment and approval, not whether QA actually ran.
+  On an older board, the operator may personally post the non-author pass as
+  an interim fallback; an agent never switches credentials or impersonates
+  the operator. A second human is not required.
 - **Agents file no hosted verdict in this workspace.** A reviewer reports its
-  findings back; the dispatcher posts them as a PR comment, and that comment is
-  the advisory link for `standards`, `spec-security` or `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
-  refuses every owner-attested row while the author's login has no attested
-  principal. A filed row has no retraction verb and is head-pinned; a
-  same-person row refuses, `--exception` included, and moving the head voids
-  every other row. Changing reviewer identities is the operator's decision
-  alone, never a way to make a row count. Workflow-issued rows
-  (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
-  first pass on gate, security, schema and release PRs, where fresh-session Opus
-  reviews stay the real review; two rows satisfy other PRs, with the operator
-  check still applying unless the gate's dry run reports `class: auto`.
+  findings back; the dispatcher posts them as a PR comment. That report is not
+  itself a gate-counted verdict. `favcrm-dev` and `cc-syntax` are one person,
+  and the gate refuses every owner-attested row while the author's login has no
+  attested principal. A filed row has no retraction verb and is head-pinned; a
+  same-person row refuses, and moving the head voids every other row. Changing
+  reviewer identities is the operator's decision alone, never a way to make a
+  row count. Workflow-issued rows (`review-standards.yml` and `review-spec.yml`;
+  no login or person) are a cheap first pass on gate, security, schema and
+  release PRs, where fresh-session Opus reviews stay the real review; two rows
+  satisfy other PRs, with the operator check still applying unless the gate's
+  dry run reports `class: auto`.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -269,10 +272,9 @@ the code you just wrote.
   The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
   session holding admin can still rewrite the workflow or sign directly until
-  agents lose admin. There is no Browser QA workflow: off the exception a `ui/` PR
-  needs a countable Browser QA verdict, which no agent here files, or the
-  `--browser-qa` comment above, and refuses without one. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
-  too.
+  agents lose admin. There is no Browser QA workflow: a hosted `ui/` PR needs
+  one of the Browser QA routes above. Hosted orgs refuse `--exception`; the
+  native exception does not make a non-pass workflow row count.
 - Under `strict`, one fresh-session review covering standards and spec when
   every changed path qualifies under `docs/roles/one-review-paths.toml`; a
   path that does not (trust boundary, identity, secrets, `ui/**`) needs two,
@@ -325,11 +327,10 @@ the code you just wrote.
   `Risk:` is `auto` or `human (<triggers>)`. The
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
-  thing. Link the note from the ticket. Hosted: the dispatcher posts one PR comment per
-  review axis from the reviewer's report, linked in the ticket comment (no
-  verdict note); under the temporary
-  `--exception` the gate wants `standards=` and `spec-security=` as two
-  distinct PR comment URLs even when one review is required.
+  thing. Link the note from the ticket. Hosted: the dispatcher posts one PR
+  comment per review axis from the reviewer's report, linked in the ticket
+  comment (no verdict note). These reports do not themselves count as verdicts.
+  The native exception's advisory links are described under "Merging".
 - Before enqueueing, post one ticket comment for that head: every required
   verdict note, the green CI run and, for a `human` PR, the approval id. A
   new head voids every verdict on the old head.
@@ -507,12 +508,13 @@ Do not substitute a comment or another identity for the required proof.
   records an immutable `tenant_delivery_evidence` row plus `human` approval,
   enqueues the PR for merge, and posts a `cadence-delivery-gate/v2` SSHSIG comment
   backed by GitHub Actions OIDC (`POST /__platform/delivery-gate/verify`).
-  Use `cadence --org <org> delivery check` to inspect gate readiness and
-  `cadence --org <org> delivery enqueue` for operator CLI enqueue (no local daemon
-  required). `delivery enqueue --approve "<source>"` records the operator's
-  per-head approval in the same call, so one command approves and enqueues;
-  it records nothing when any other gate rule fails (CAD-2047). `POST /api/approvals/:id/revoke` ("Stop merge") and
-  `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
+  Agents use `cadence --org <org> delivery check` to inspect readiness.
+  The operator records any required project-scoped per-head approval and
+  personally runs `cadence --org <org> delivery enqueue`; enqueue records
+  owner approval and delivery evidence. The operator can instead use the
+  board's approval and merge flow. `POST /api/approvals/:id/revoke` ("Stop
+  merge") and `POST /api/approvals/send-back` ("Send back…") withdraw or
+  return queued work.
 
 ### Merging
 
@@ -520,22 +522,20 @@ The following is the native reviewed-enqueue path, not a claim that a selected
 hosted workspace can run it. If the gate cannot run, stop and report the
 limitation; only an authorized operator can decide an exception.
 
-- Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>` (or pass
-  `--org <hosted-org>` or `CADENCE_ORG` with optional `--project <key>`,
-  `--issue <ID>`, and `--browser-qa <url> | --require-browser-qa` on a hosted
-  org so it delegates to `cadence delivery check` and `cadence delivery enqueue`;
-  `--exception` is refused on hosted orgs). It
-  refuses unless the PR is open at that head, every required check is
-  present and green, the required verdicts are pinned to the head, a ticket
-  comment lists them and, for a `human` diff, an operator approval is
-  recorded. It never records an approval. On native checkouts it signs the head
-  with the operator's delivery-gate key (`~/.config/cadence/delivery-gate/`) and posts
-  the signature on the PR; on hosted orgs the tenant DO signs
-  `cadence-delivery-gate/v2` SSHSIG and `scripts/delivery-gate` in `merge_group`
-  verifies both the signature and GitHub Actions OIDC via
-  `POST https://<host>/__platform/delivery-gate/verify`. The queue's required
-  `delivery-gate` check holds any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
-  queue re-tests on the newest main, so you do not have to rebase first.
+- On a native org, enqueue with `scripts/enqueue-reviewed <n> --head
+  <full-reviewed-sha>`. It refuses unless the PR is open at that head,
+  required checks and verdicts hold, the ticket comment lists them and any
+  required operator approval is recorded. The native script never records
+  an approval; it signs the head with the operator's delivery-gate key and
+  posts the signature on the PR.
+- With `--org <hosted-org>` or `CADENCE_ORG`, the wrapper delegates to
+  `cadence delivery check` and `cadence delivery enqueue`; it refuses
+  `--exception`. Agents check readiness, and the operator runs the hosted
+  enqueue. The tenant Durable Object signs `cadence-delivery-gate/v2` SSHSIG;
+  `scripts/delivery-gate` in `merge_group` verifies the signature and GitHub
+  Actions OIDC. The queue's required `delivery-gate` check holds a PR without
+  one, so a direct `gh pr merge` never lands (CAD-1925). The queue re-tests on
+  the newest main, so you do not have to rebase first.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the
   cause is often a semantic clash with a PR that just landed. Fix it on the
   branch, show a `git range-diff` against the reviewed head, enqueue again.
@@ -544,7 +544,7 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
-- Ask the operator only when the gate does (CAD-2254). Run
+- On a native org, ask the operator only when the gate does (CAD-2254). Run
   `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
   `class:` line:
   - `class: auto` and the dry run ends with every rule holding: enqueue the
@@ -555,16 +555,15 @@ limitation; only an authorized operator can decide an exception.
   - A workflow review that says revise: fix the finding, push, and let the
     new head be reviewed. Ask for `cadence audit accept-revise` only when
     the finding is wrong, and say why it is wrong.
-- Temporary path (CAD-1946, remove this note when it ends): while the hosted
-  reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
+- Native-only temporary path (CAD-1946): `scripts/enqueue-reviewed <pr>
   --head <sha> --exception --advisory standards=<url> --advisory
-  spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
-  waives only the missing reviewer attestation and, on a hosted routine PR, the
-  readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
-  comments from fresh-session reviews (see the review standard above); the gate
-  cannot prove freshness, and the operator accepts that and approves each
-  exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
-  (2026-12-31).
+  spec-security=<url>` (plus `--advisory browser-qa=<url>` when QA is
+  required) waives only the missing reviewer attestation under its own gate
+  conditions. The advisory links must be distinct HTTPS URLs; that proves
+  neither head binding nor that a review ran. The operator approves the exact
+  head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`. The
+  wrapper refuses `--exception` for a hosted org; do not offer it as a hosted
+  fallback.
 
 ### Checks: trust exit codes, not filtered text
 

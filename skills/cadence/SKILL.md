@@ -752,26 +752,25 @@ During implementation and handoff:
   context from the work (a subagent qualifies; a fork or a resumed authoring
   session does not). Brief it with the PR, the exact head and the ticket, not
   your conclusions, and call it a fresh-session review, never independent
-  parties. In the Cadence repository the merge gate does not enforce this yet: hosted
-  verdicts count by attested principal (the author's is refused) and local notes by
-  their self-declared `From:` alias. On hosted, agents file no verdict: the
-  reviewer reports back and the dispatcher posts the findings as a PR comment
-  (AGENTS.md "Review"); a local note's alias proves nothing. In the Cadence
-  repository itself, the enqueue counts GitHub-attested workflow rows for Standards and
-  Spec/security (CAD-2088); a `ui/` change also needs a non-author member's comment whose
-  whole body is `Browser QA: pass` and `Head: <head>`, named with `--browser-qa <url>`.
-  The temporary `--exception --advisory ...` path (exact-head operator approval and two
-  advisory links) remains for a head that cannot produce the workflow rows and ends at
-  `EXCEPTION_ENDS` (2026-12-31); it checks only that the links are separate https URLs.
-  A second attested human is not required.
-- In the Cadence repository, ask a person only when the gate does: run
-  `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
-  `class:` line. On `class: auto` with every rule holding, enqueue the PR
-  yourself and report the merge. On `class: human (...)`, or a refusal that
-  names a missing operator approval, ask the operator once and name the
-  trigger the gate gives. When a workflow review says revise, fix the finding, push
-  and let the new head be reviewed; ask the operator to accept a revise only
-  when the finding is wrong, and say why (CAD-2254).
+  parties. In the Cadence repository, gate-counted evidence is separate from
+  session freshness: hosted verdicts count by attested principal and local
+  notes by self-declared alias. On hosted, agents file no verdict: the reviewer
+  reports back and the dispatcher posts the findings. For Browser QA, the
+  dispatcher posts the full report and an unedited exact-head pass; an author's
+  pass needs the operator's project-scoped per-head approval. A non-author
+  member's pass or a counted QA verdict is another route. An older board may
+  need the operator to post the non-author pass personally; never switch
+  credentials. Hosted orgs refuse `--exception --advisory`. See AGENTS.md
+  "Review" and `docs/guides/hosted-workspace.md` for the current gate.
+- On hosted workspaces, agents run QA, post reports and check readiness; the
+  operator approves and enqueues. On a native org, ask a person only when the
+  gate does: run `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run`
+  and read its `class:` line. On `class: auto` with every rule holding, enqueue
+  the PR yourself and report the merge. On `class: human (...)`, or a refusal
+  that names a missing operator approval, ask the operator once and name the
+  trigger the gate gives. When a workflow review says revise, fix the finding,
+  push and let the new head be reviewed; ask the operator to accept a revise
+  only when the finding is wrong, and say why (CAD-2254).
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
