@@ -468,6 +468,8 @@ jobs:
               only(u, ['prompt_tokens', 'completion_tokens', 'total_tokens', 'cost', 'cost_details', 'is_byok',
                 'prompt_tokens_details', 'completion_tokens_details', 'server_tool_use_details', 'deferred_tools_details']) &&
               ['prompt_tokens', 'completion_tokens', 'total_tokens'].every((key) => count(u[key])) &&
+              Number.isSafeInteger(u.prompt_tokens + u.completion_tokens) &&
+              u.total_tokens === u.prompt_tokens + u.completion_tokens &&
               (u.cost === undefined || numberOrNull(u.cost)) && (u.is_byok === undefined || typeof u.is_byok === 'boolean') &&
               details(u.cost_details, ['server_tool_cost', 'upstream_inference_cost', 'upstream_inference_prompt_cost', 'upstream_inference_completions_cost'], numberOrNull) &&
               details(u.prompt_tokens_details, ['audio_tokens', 'cache_write_tokens', 'cached_tokens', 'video_tokens'], countOrNull) &&
@@ -501,7 +503,7 @@ jobs:
                 }
                 const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
                 if (data === '[DONE]') {
-                  if (largeInput && (!sawMetadata || sawDone || !sawModel)) fail('sequence');
+                  if (largeInput && (!sawMetadata || !sawAccounting || sawDone || !sawModel)) fail('sequence');
                   sawDone = true;
                   continue;
                 }
@@ -516,10 +518,16 @@ jobs:
                 }
                 const choices = Array.isArray(d.choices) ? d.choices : [];
                 if (largeInput && choices.length > 0 && d.model !== E.REVIEW_MODEL) fail('model');
-                if (largeInput && stop !== null && !validAccountingFrame(d)) fail('framing');
+                if (largeInput && stop !== null) {
+                  if (!validAccountingFrame(d)) fail('framing');
+                  if (Object.hasOwn(d, 'usage') && d.usage == null) fail('accounting');
+                  if (choices.length === 0 && d.usage === undefined && !Object.hasOwn(d, 'openrouter_metadata')) fail('sequence');
+                }
                 const usage = largeInput && d.usage != null;
                 if (usage) {
                   if (sawAccounting || !validUsage(d.usage) || !validAccountingFrame(d) ||
+                      choices.some((c) => !record(c) || !only(c, ['index', 'delta', 'finish_reason', 'native_finish_reason', 'logprobs']) ||
+                        (c.logprobs !== undefined && c.logprobs !== null)) ||
                       (stop === null && (choices.length !== 1 || choices[0]?.finish_reason !== 'stop'))) fail('accounting');
                   sawAccounting = true;
                 }

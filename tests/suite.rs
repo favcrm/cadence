@@ -12978,9 +12978,14 @@ if (mode === 'keys') {
             w["cmp"]["files_n"] = json!(1);
             let (input, _prepare_run) = prepared_from(&wf, &w);
             assert_eq!(input["diff"], w["diff"]);
+            let mut output = good_output(&wf);
+            for check in output["checks"].as_array_mut().unwrap() {
+                check["citations"] = json!([{ "file": "big.txt", "line": 1 }]);
+            }
+            let output_text = output.to_string();
 
             for (content, should_succeed) in [("", true), ("unexpected output", false)] {
-                let mut events = model_events("{}", Some("stop"));
+                let mut events = model_events(&output_text, Some("stop"));
                 // Replace the ordinary empty-choice usage fixture and DONE.
                 events.pop().unwrap();
                 events.pop().unwrap();
@@ -13005,11 +13010,23 @@ if (mode === 'keys') {
                 assert!(r.hits("/verdict").is_empty(), "{}: {}", wf.file, r.out);
                 if should_succeed {
                     assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
-                    assert!(
-                        r.read("out/review-output.json").is_some(),
+                    let sealed = r
+                        .read("out/review-output.json")
+                        .expect("successful review must seal its output");
+                    let filed = run_file(
+                        &wf,
+                        &file_input(&w),
+                        Some(&sealed),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    );
+                    assert_eq!(filed.code, Some(0), "{}: {}", wf.file, filed.out);
+                    assert_eq!(
+                        filed.hits("/__platform/review-jobs/verdict").len(),
+                        1,
                         "{}: {}",
                         wf.file,
-                        r.out
+                        filed.out
                     );
                 } else {
                     assert!(r.failed(), "{}: post-stop content was accepted", wf.file);
@@ -13071,6 +13088,88 @@ if (mode === 'keys') {
                         "openrouter_metadata": metadata
                     }));
                 }
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_hidden_choice_message_and_null_usage() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            for name in [
+                "message on first stop",
+                "null post-stop usage",
+                "missing usage",
+                "inconsistent token counts",
+            ] {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                if name == "message on first stop" {
+                    let stop = events.last_mut().unwrap();
+                    stop["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    });
+                    stop["choices"][0]["message"] = json!({
+                        "role": "assistant",
+                        "content": "hidden output"
+                    });
+                } else if name == "null post-stop usage" {
+                    events.push(json!({ "type": "usage", "choices": [], "usage": null }));
+                } else if name == "inconsistent token counts" {
+                    let mut usage =
+                        or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                    usage["choices"][0]["native_finish_reason"] = json!("stop");
+                    usage["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 999
+                    });
+                    events.push(usage);
+                }
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
                 events.push(json!({ "type": "done", "raw": "[DONE]" }));
                 let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
                 assert_eq!(
