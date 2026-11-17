@@ -838,6 +838,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, []);
   const openIssue = useCallback((id: string) => openWorkItem(id, "issue"), [openWorkItem]);
   const openHomeWork = useCallback((id: string) => openWorkItem(id, "home"), [openWorkItem]);
+  const openThreadsWork = useCallback((id: string) => openWorkItem(id, "threads"), [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
@@ -1681,7 +1682,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <ThreadsPage
               key={meta.session?.id ?? ""}
               operator={meta.operator === true}
-              onOpenWorkItem={(id) => openWorkItem(id, "threads")}
+              onOpenWorkItem={openThreadsWork}
               workConversationsEnabled={workConversationsOn}
               humanThreadsEnabled={humanThreadsOn}
             />
