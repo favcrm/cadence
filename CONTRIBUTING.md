@@ -212,8 +212,8 @@ evidence. Judge check exit codes through `rtk proxy`, not filtered output.
 Editing `skills/cadence/SKILL.md` goes through review like any rule file.
 `src/skill.rs` embeds it; daemon startup and `cadence update` sync it to hosts and
 `cadence skill install` repairs a host. Verify the source, installed and embedded
-copies, since an older binary can overwrite a local edit. Agents reload it at a
-task boundary.
+copies, since an older binary can overwrite a local edit. Notify affected agents
+at their next task boundary; a running session does not reload it.
 
 Update the owning contract and examples with behavior changes. Check navigation
 with `python3 scripts/check-doc-links.py`; it uses Git's tracked inventory, so

@@ -229,8 +229,9 @@ workflow code for a live head, not good judgement. The tenant stops re-filing,
 not re-rolling: cancel and re-dispatch, or push a commit, for a new verdict. An
 owner-attested row naming a listed workflow principal counts for nothing, and a
 non-pass workflow row refuses in every class. There is no Browser QA workflow.
-A session holding admin can still rewrite a workflow or sign directly until
-agents lose admin.
+Agent sessions act as `cc-syntax`, which holds repository admin and can bypass
+the merge-queue ruleset; an admin session can change the workflows, rulesets and
+branch protection the gate relies on, so treat those as trigger-7 changes.
 
 **Native only.** `scripts/enqueue-reviewed <n> --head <sha> --dry-run`
 evaluates the native path and reports the class and refusals. A native enqueue
@@ -372,8 +373,8 @@ operator; do not reopen it in plans or reviews.
   hand-made worktree does not: its push runs no gate, so run
   `scripts/boat-build --receipt -- scripts/pre-push --base origin/main` yourself
   and say so. Do not report a gate result you did not run.
-- First login on a fresh machine: `docs/REMOTE-AUTH.md`, "First login on a fresh
-  machine".
+- First login on a fresh machine: `docs/REMOTE-AUTH.md`, "Hosted login and remote
+  org transport".
 - A local connected agent has its own native daemon; hosted board access does
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
@@ -480,7 +481,7 @@ are in `docs/DEV-CYCLE.md`; the rules are these.
   the release seam, the UI typecheck and the script contracts for what you
   changed. A missing Boat CLI or helper refuses the push rather than compiling
   locally; `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency path. Required CI
-  (fmt, clippy, build, ui, delivery-gate) is unchanged, and neither a remote run
+  (fmt, clippy, build, ui, delivery-gate, changed-tests) is unchanged, and neither a remote run
   nor a green suite proves the ticket's outcome.
 - Run the plan yourself before `git push`: `scripts/pre-push-check`. GitHub drops
   an SSH push whose hook runs for minutes (rc=141); the hook accepts a

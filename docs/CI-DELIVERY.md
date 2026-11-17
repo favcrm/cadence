@@ -2,7 +2,8 @@
 
 ## Current state
 
-Branch protection requires `fmt`, `clippy`, `build`, `ui` and `delivery-gate`;
+Branch protection requires `fmt`, `clippy`, `build`, `ui`, `delivery-gate` and
+`changed-tests`;
 `enqueue-reviewed` reads the live set. The CI jobs prove the code compiles, lints
 and builds the release seam, **not** behaviour coverage. The suite runs in
 `tests.yml` on a schedule and on demand and is not a required check;
