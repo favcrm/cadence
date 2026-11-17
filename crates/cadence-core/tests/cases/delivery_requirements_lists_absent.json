@@ -1,0 +1,75 @@
+{
+  "input": {
+    "v": 1,
+    "op": "delivery.requirements.evaluate",
+    "input": {
+      "policy": null,
+      "approval": null,
+      "changes": [
+        {
+          "status": "M",
+          "old_mode": "100644",
+          "new_mode": "100644",
+          "path": "ui/App.tsx"
+        }
+      ],
+      "lines": 10,
+      "risk_paths": null,
+      "one_review_paths": null,
+      "lists_absent": true
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "delivery.requirements.evaluate",
+    "value": {
+      "policy": {
+        "heavy": {
+          "files_over": 10,
+          "lines_over": 800
+        },
+        "max_revise": 2,
+        "merge": {
+          "method": "squash",
+          "queue": true
+        },
+        "oversized": {
+          "files_over": 40,
+          "lines_over": 3000
+        },
+        "reviews": {
+          "review": {
+            "focus": "general",
+            "kind": "agent"
+          }
+        },
+        "risk": [
+          {
+            "require": [
+              "review"
+            ],
+            "when": null
+          }
+        ]
+      },
+      "policy_digest": "sha256:ed80e0f0a334e81c0563d0c61af879f8be5e60ce0c864d3da9b9784feb6d6066",
+      "policy_note": null,
+      "policy_source": "default",
+      "requirements": {
+        "activation": "active",
+        "browser_qa": false,
+        "class": "consequential",
+        "full_checks": true,
+        "operator_approval": true,
+        "policy_digest": "sha256:ed80e0f0a334e81c0563d0c61af879f8be5e60ce0c864d3da9b9784feb6d6066",
+        "reasons": [
+          "default lean delivery policy in force",
+          "the repository declares no trusted lists — the product default applies: one combined review and the operator's approval"
+        ],
+        "review_kind": "combined",
+        "reviews": 1,
+        "security_capable": false
+      }
+    }
+  }
+}
