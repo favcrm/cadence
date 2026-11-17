@@ -1,4 +1,3 @@
-import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Window } from "happy-dom";
 import { LocaleProvider } from "../src/lib/locale";
