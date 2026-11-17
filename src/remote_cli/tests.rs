@@ -9109,3 +9109,229 @@ mod agent_credential_refusals {
         assert!(r.notes().is_empty());
     }
 }
+
+const SKILL_VERBS: [&str; 6] = [
+    "workspace_skill_list",
+    "workspace_skill_show",
+    "workspace_skill_check",
+    "workspace_skill_draft",
+    "workspace_skill_approve",
+    "workspace_skill_revoke",
+];
+
+fn skill_args(value: Value) -> Map<String, Value> {
+    value.as_object().unwrap().clone()
+}
+
+#[test]
+fn cad2396_skill_verbs_are_registered_with_their_scopes() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+    for verb in SKILL_VERBS {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+    }
+    for verb in [
+        "workspace_skill_list",
+        "workspace_skill_show",
+        "workspace_skill_check",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.read"], "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+        assert!(super::mutation_reconcile(verb).is_none(), "{verb}");
+    }
+    for verb in [
+        "workspace_skill_draft",
+        "workspace_skill_approve",
+        "workspace_skill_revoke",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.write"], "{verb}");
+        assert!(mutating_cli_verb(verb), "{verb}");
+        assert!(
+            lost_mutation_note(verb).contains("workspace-skill show"),
+            "{verb}"
+        );
+    }
+}
+
+#[test]
+fn cad2396_a_refused_package_shows_its_reason_and_never_its_text() {
+    for verb in ["workspace_skill_check", "workspace_skill_draft"] {
+        let (out, requests) = run(
+            vec![(
+                400,
+                "",
+                json!({"ok": false, "error": {"code": "skill_refused", "reason": "package_too_large",
+                    "message": "server-text /private"}}),
+            )],
+            verb,
+            skill_args(
+                json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 0}),
+            ),
+            10,
+        );
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some("skill_refused"), "{verb}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb}: {shown}");
+        assert!(shown.contains("package_too_large"), "{verb}: {shown}");
+        assert!(
+            !shown.contains("server-text") && !shown.contains("/private"),
+            "{shown}"
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+    }
+}
+
+#[test]
+fn cad2396_skill_refusals_keep_their_code_and_are_never_retried() {
+    let refusal = |code: &str| json!({"error": {"code": code, "message": "server-text /private"}});
+    for (verb, status, code, shown_code) in [
+        (
+            "workspace_skill_approve",
+            403u16,
+            "not_permitted",
+            "not_permitted",
+        ),
+        (
+            "workspace_skill_approve",
+            403,
+            "owner_required",
+            "not_permitted",
+        ),
+        (
+            "workspace_skill_revoke",
+            401,
+            "unauthorized",
+            "not_permitted",
+        ),
+        ("workspace_skill_show", 404, "not_found", "not_found"),
+        ("workspace_skill_approve", 404, "not_found", "not_found"),
+        (
+            "workspace_skill_approve",
+            409,
+            "digest_mismatch",
+            "digest_mismatch",
+        ),
+        (
+            "workspace_skill_revoke",
+            409,
+            "digest_mismatch",
+            "digest_mismatch",
+        ),
+        (
+            "workspace_skill_approve",
+            409,
+            "approved_limit",
+            "approved_limit",
+        ),
+        (
+            "workspace_skill_draft",
+            400,
+            "invalid_request",
+            "invalid_request",
+        ),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some(shown_code), "{verb} {code}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb} {code}: {shown}");
+        assert!(!shown.contains("server-text"), "{shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} {code}");
+    }
+}
+
+#[test]
+fn cad2396_stale_draft_revision_is_a_conflict_answer() {
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "workspace_skill_draft",
+        skill_args(json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 1})),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2396_a_board_without_skill_verbs_says_to_update_it() {
+    for verb in SKILL_VERBS {
+        let (out, requests) = run(
+            vec![(501, "", json!({"error": {"code": "not_implemented"}}))],
+            verb,
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("update the board first"), "{verb}: {shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn cad2396_skill_write_without_a_matching_receipt_is_unknown() {
+    let draft =
+        || skill_args(json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 0}));
+    let approve = || skill_args(json!({"name": "weekly", "revision": 2, "digest": "sha256:aa"}));
+    let revoke = || skill_args(json!({"name": "weekly", "digest": "sha256:aa"}));
+    for (verb, args, receipt) in [
+        ("workspace_skill_draft", draft(), json!({"ok": true})),
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "other"}, "revision": 1}),
+        ),
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "weekly"}}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 1, "digest": "sha256:aa"}}}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": null}}),
+        ),
+        (
+            "workspace_skill_revoke",
+            revoke(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 2, "digest": "sha256:aa"}}}),
+        ),
+    ] {
+        let (out, requests) = run(vec![(200, "", receipt.clone())], verb, args, 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{verb} {receipt}: {err}");
+        assert!(err.to_string().contains("workspace-skill show"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    for (verb, args, receipt) in [
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "weekly"}, "revision": 1, "created": true}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 2, "digest": "sha256:aa", "by": "u", "at": 1}}}),
+        ),
+        (
+            "workspace_skill_revoke",
+            revoke(),
+            json!({"skill": {"name": "weekly", "approved": null}}),
+        ),
+    ] {
+        let (out, _) = run(vec![(200, "", receipt)], verb, args, 10);
+        assert!(out.is_ok(), "{verb}: {out:?}");
+    }
+}
