@@ -22,7 +22,9 @@
 //! - `routine` — the narrow allowlist: required base CI plus ticket
 //!   outcome evidence, zero mandatory reviews, no fabricated PASS.
 //! - `consequential` — known ordinary paths: one independent combined
-//!   review and the full check floor, no operator approval.
+//!   review and the full check floor, no operator approval. A repository
+//!   that declares no trusted lists gets this class plus the operator's
+//!   approval ([`classify_without_lists`], the product default).
 //! - `strict` — the fail-closed floor: an activation other than the
 //!   default lean policy (a malformed section, a custom section that is
 //!   not operator-approved or was removed after approval, or a policy that
@@ -127,7 +129,8 @@ pub struct Requirements {
     /// The combined review must be filed by a security-capable
     /// reviewer (sensitive class).
     pub security_capable: bool,
-    /// A `ui/` change additionally needs a Browser QA pass.
+    /// A change to a path in the repository's `browser_qa` table needs a
+    /// Browser QA pass (always, when the lists are unreadable).
     pub browser_qa: bool,
     /// An exact-head operator-connection approval is required.
     pub operator_approval: bool,
@@ -142,86 +145,12 @@ pub struct Requirements {
     pub activation: Activation,
 }
 
-/// The initial routine allowlist (CAD-1298, deliberately narrow):
-/// ordinary `docs/**/*.md` plus the two top-level project docs. Every
-/// routine path must additionally be a regular file (`100644`, never
-/// `100755` — an executable doc is not routine), status `A`/`M` with no
-/// mode change, and survive the sensitive check (policy/role/security
-/// docs are in `risk-paths.toml` `trigger7` and excluded before they
-/// can read as routine).
-const ROUTINE_EXACT: &[&str] = &["README.md", "CONTRIBUTING.md"];
+// CAD-2386: this module carries no repository's path rules. The routine
+// allowlist, the operator floor and the Browser QA paths are tables of the
+// repository's own trusted `risk-paths.toml` (`routine`, `operator`,
+// `browser_qa`), read at the anchor like the trigger tables. A missing or
+// malformed table fails closed.
 
-/// Legacy human-class path triggers — the same lists
-/// `scripts/enqueue-reviewed` encodes (AGENTS.md and
-/// `docs/roles/risk-classes.md` triggers 4/6/7). This module is the one
-/// Rust home for them; the script keeps its copy until it consumes the
-/// shared evaluator.
-const HUMAN_PREFIXES: &[&str] = &[
-    ".github/",
-    "scripts/",
-    "docs/roles/",
-    ".config/",
-    ".cargo/",
-    "src/audit/",
-    "src/delegation/",
-    "src/delivery/",
-    "tests/common/",
-    "config/",
-];
-const HUMAN_EXACT: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "ui/package.json",
-    "cadence-review.toml",
-    "src/review.rs",
-    "docs/TEAM.md",
-    "docs/CHARTER.md",
-    "AGENTS.md",
-    "build.rs",
-    "rust-toolchain.toml",
-    "clippy.toml",
-    "src/rollout.rs",
-    "src/update.rs",
-    "src/upgrade.rs",
-    "src/cli/rollout.rs",
-    "src/cli/daemon.rs",
-    "src/cli/update.rs",
-    "src/cli/upgrade.rs",
-    "src/delegation.rs",
-    "src/issue/delivery_policy.rs",
-    "src/issue/delivery_requirements.rs",
-    // The classifier itself (CAD-2117): `src/issue/delivery_requirements.rs`
-    // is now a re-export shim, so name the files that hold the rules.
-    "crates/cadence-core/src/delivery_requirements.rs",
-    "crates/cadence-core/src/delivery_rules.rs",
-    "src/daemon/delivery_requirements_rpc.rs",
-    // Also CAD-2117: the policy, the crate root, the hosted evaluator entry
-    // and the unattended-landing gate.
-    "crates/cadence-core/src/delivery.rs",
-    "crates/cadence-core/src/lib.rs",
-    "crates/cadence-core/src/evaluate.rs",
-    "src/daemon/unattended_landing.rs",
-    // Module roots that can redirect `delivery_requirements`, the hosted
-    // wrapper of `evaluate`, and the approve route. A floor, not a complete list.
-    "src/issue/mod.rs",
-    "src/lib.rs",
-    "crates/cadence-core/src/wasm.rs",
-    "src/daemon/delivery_rpc.rs",
-    "docs/AUDIT.md",
-    "tests/safety_floor.rs",
-];
-const HUMAN_BASENAMES: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "package.json",
-    "pnpm-lock.yaml",
-    "package-lock.json",
-    ".npmrc",
-    "yarn.lock",
-    "bun.lockb",
-    "build.rs",
-    "rust-toolchain.toml",
-];
 /// risk-classes trigger 5: a diff over this many changed lines is
 /// human-class.
 const HUMAN_LINES: u64 = 1500;
@@ -234,6 +163,12 @@ const SENSITIVE_TABLES: &[&str] = &[
     "schema", "trigger1", "trigger3", "trigger4", "trigger6", "trigger7",
 ];
 
+/// CAD-2386: the repository's operator floor, Browser QA and routine tables.
+/// Required like [`SENSITIVE_TABLES`]: a missing one refuses the parse.
+const OPERATOR_TABLE: &str = "operator";
+const BROWSER_QA_TABLE: &str = "browser_qa";
+const ROUTINE_TABLE: &str = "routine";
+
 /// The parsed trusted lists (read at the diff's anchor: main's live tip for a
 /// main-based PR, else the PR's base). `None` anywhere refuses the parse —
 /// a partial list is never matched as if complete.
@@ -242,6 +177,12 @@ struct Lists {
     /// [`crate::delivery_rules::glob_match`], the grammar that file declares).
     sensitive: Vec<String>,
     human: Vec<String>,
+    /// The `operator` table: human-class paths beyond the trigger tables.
+    operator: Vec<String>,
+    /// The `browser_qa` table: paths whose change needs a Browser QA pass.
+    browser_qa: Vec<String>,
+    /// The `routine` table: ordinary documentation the routine class admits.
+    routine: Vec<String>,
     one_review_include: Vec<String>,
     one_review_exclude: Vec<String>,
 }
@@ -271,6 +212,16 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
         }
         sensitive.extend(paths);
     }
+    let table = |name: &str| -> Option<Vec<String>> {
+        let paths = strings(&risk, &[name, "paths"])?;
+        for path in &paths {
+            crate::delivery_rules::check_path(path).ok()?;
+        }
+        Some(paths)
+    };
+    let operator = table(OPERATOR_TABLE)?;
+    let browser_qa = table(BROWSER_QA_TABLE)?;
+    let routine = table(ROUTINE_TABLE)?;
     let include = strings(&one, &["one_review_include"])?;
     let exclude = strings(&one, &["one_review_exclude"])?;
     for path in include.iter().chain(&exclude) {
@@ -279,6 +230,9 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
     Some(Lists {
         sensitive,
         human,
+        operator,
+        browser_qa,
+        routine,
         one_review_include: include,
         one_review_exclude: exclude,
     })
@@ -400,34 +354,40 @@ fn one_review_qualifies(changes: &[Change], lists: &Lists) -> bool {
         })
 }
 
-/// Legacy human-class by path: the prefix/exact/basename lists plus the
-/// sensitive `risk-paths` globs (matched with that file's own grammar,
+/// Human-class by path: the repository's `operator` table plus its human
+/// trigger tables (matched with that file's own grammar,
 /// `crate::delivery_rules::glob_match`).
 fn human_path(path: &str, lists: Option<&Lists>) -> bool {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    let segs: Vec<&str> = path.split('/').collect();
-    if HUMAN_EXACT.contains(&path)
-        || HUMAN_PREFIXES.iter().any(|p| path.starts_with(p))
-        || HUMAN_BASENAMES.contains(&base)
-        || segs[..segs.len() - 1]
-            .iter()
-            .any(|s| *s == ".github" || *s == ".cargo")
-    {
-        return true;
-    }
     match lists {
         // Unreadable lists fail closed: treat the path as human.
         None => true,
         Some(l) => l
-            .human
+            .operator
             .iter()
+            .chain(&l.human)
             .any(|g| crate::delivery_rules::glob_match(g, path)),
     }
 }
 
-/// The `docs/**` ordinary-markdown admit rule of the routine allowlist.
-fn routine_path(path: &str) -> bool {
-    (path.starts_with("docs/") || ROUTINE_EXACT.contains(&path)) && path.ends_with(".md")
+/// Does any change need a Browser QA pass? The repository's `browser_qa`
+/// table decides; unreadable lists fail closed and require it.
+fn browser_qa_needed(changes: &[Change], lists: Option<&Lists>) -> bool {
+    match lists {
+        None => true,
+        Some(l) => changes.iter().any(|c| {
+            l.browser_qa
+                .iter()
+                .any(|g| crate::delivery_rules::glob_match(g, &c.path))
+        }),
+    }
+}
+
+/// The repository's `routine` table: ordinary documentation.
+fn routine_path(path: &str, lists: &Lists) -> bool {
+    lists
+        .routine
+        .iter()
+        .any(|g| crate::delivery_rules::glob_match(g, path))
 }
 
 pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
@@ -507,7 +467,7 @@ fn strict_requirements(
             ReviewKind::StandardsAndSpec
         },
         security_capable: false,
-        browser_qa: changes.iter().any(|c| c.path.starts_with("ui/")),
+        browser_qa: browser_qa_needed(changes, lists),
         operator_approval: operator,
         full_checks: true,
         reasons,
@@ -613,7 +573,7 @@ pub fn classify(
     // extension is consequential, never routine.
     if changes
         .iter()
-        .all(|c| reviewable_change(c) && c.new_mode == "100644" && routine_path(&c.path))
+        .all(|c| reviewable_change(c) && c.new_mode == "100644" && routine_path(&c.path, &lists))
     {
         reasons.push("every change is ordinary documentation on the routine allowlist".to_string());
         return Requirements {
@@ -636,8 +596,49 @@ pub fn classify(
         reviews: 1,
         review_kind: ReviewKind::Combined,
         security_capable: false,
-        browser_qa: changes.iter().any(|c| c.path.starts_with("ui/")),
+        browser_qa: browser_qa_needed(changes, Some(&lists)),
         operator_approval: false,
+        full_checks: true,
+        reasons,
+        policy_digest: resolved.digest.clone(),
+        activation,
+    }
+}
+
+/// CAD-2386: the product default for a repository that declares no trusted
+/// lists — the caller proved both files are absent at the anchor (a definite
+/// "not found", never a failed read). Under the default lean policy it is one
+/// combined review plus the operator's approval, with no path rules and no
+/// Browser QA. Anything else keeps the fail-closed strict floor: a custom or
+/// unapproved policy (its own rules are not evaluated yet) and incomplete diff
+/// evidence.
+pub fn classify_without_lists(resolved: &Resolved, changes: &[Change], lines: u64) -> Requirements {
+    let activation = activation_of(resolved);
+    let mut reasons = Vec::new();
+    if activation != Activation::Active {
+        reasons.push(format!(
+            "default lean classification does not apply ({activation:?}) — \
+             the strict requirements apply"
+        ));
+        return strict_requirements(resolved, activation, changes, lines, None, reasons);
+    }
+    if let Some(why) = evidence_refusal(changes) {
+        reasons.push(format!("incomplete diff evidence: {why}"));
+        return strict_requirements(resolved, activation, changes, lines, None, reasons);
+    }
+    reasons.push("default lean delivery policy in force".to_string());
+    reasons.push(
+        "the repository declares no trusted lists — the product default applies: \
+         one combined review and the operator's approval"
+            .to_string(),
+    );
+    Requirements {
+        class: DeliveryClass::Consequential,
+        reviews: 1,
+        review_kind: ReviewKind::Combined,
+        security_capable: false,
+        browser_qa: false,
+        operator_approval: true,
         full_checks: true,
         reasons,
         policy_digest: resolved.digest.clone(),

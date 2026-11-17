@@ -96,3 +96,44 @@ paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
 [scripts_allowlist]
 paths = ["scripts/measurements/README.md", "scripts/measurements/board-live.mjs",
   "scripts/test-dup-report", "scripts/auto-stage.py"]
+
+# CAD-2386: this repository's own requirement rules, as data the shared
+# requirements engine (crates/cadence-core/src/delivery_requirements.rs) reads
+# from this file at the anchor instead of carrying them in product code.
+# Globs use this file's grammar. Each table is required: a missing or malformed
+# one fails closed, exactly like a trigger table.
+#
+# `operator`: the operator floor for this repository's build, release, rule
+# and gate files (formerly the engine's HUMAN_* lists). Every path here is
+# also sensitive.
+[operator]
+paths = [".github/**", "scripts/**", "docs/roles/**", ".config/**", ".cargo/**",
+  "src/audit/**", "src/delegation/**", "src/delivery/**", "tests/common/**",
+  "config/**",
+  "Cargo.toml", "Cargo.lock", "ui/package.json", "cadence-review.toml",
+  "src/review.rs", "docs/TEAM.md", "docs/CHARTER.md", "AGENTS.md", "build.rs",
+  "rust-toolchain.toml", "clippy.toml", "src/rollout.rs", "src/update.rs",
+  "src/upgrade.rs", "src/cli/rollout.rs", "src/cli/daemon.rs", "src/cli/update.rs",
+  "src/cli/upgrade.rs", "src/delegation.rs", "src/issue/delivery_policy.rs",
+  "src/issue/delivery_requirements.rs",
+  "crates/cadence-core/src/delivery_requirements.rs",
+  "crates/cadence-core/src/delivery_rules.rs",
+  "src/daemon/delivery_requirements_rpc.rs", "crates/cadence-core/src/delivery.rs",
+  "crates/cadence-core/src/lib.rs", "crates/cadence-core/src/evaluate.rs",
+  "src/daemon/unattended_landing.rs", "src/issue/mod.rs", "src/lib.rs",
+  "crates/cadence-core/src/wasm.rs", "src/daemon/delivery_rpc.rs", "docs/AUDIT.md",
+  "tests/safety_floor.rs",
+  "**/Cargo.toml", "**/Cargo.lock", "**/package.json", "**/pnpm-lock.yaml",
+  "**/package-lock.json", "**/.npmrc", "**/yarn.lock", "**/bun.lockb", "**/build.rs",
+  "**/rust-toolchain.toml",
+  "**/.github/**", "**/.cargo/**"]
+
+# `browser_qa`: a change to any of these paths needs a Browser QA pass.
+[browser_qa]
+paths = ["ui/**"]
+
+# `routine`: ordinary documentation that may merge on the routine class when
+# the default lean policy is in force (still only regular 100644 files, and
+# never a sensitive path).
+[routine]
+paths = ["docs/**/*.md", "README.md", "CONTRIBUTING.md"]
