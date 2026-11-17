@@ -3552,7 +3552,9 @@ where
                         target.org
                     ));
                 }
-                if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+                if let Some(key) =
+                    platform_key.filter(|_| error.kind() == "unknown" && !stage_operation)
+                {
                     eprint_line(&format!(
                         "remote platform call `{key}` on org `{}` was not confirmed — \
                          reconcile read-only with `cadence --org {} platform status --request {key}` \

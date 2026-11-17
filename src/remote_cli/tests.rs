@@ -9356,3 +9356,19 @@ fn hosted_connected_effect_answer_is_strict() {
     }
     assert!(!connected_effect_stage_answer(&json!({"ok": false})));
 }
+
+// AOS-627: an uncertain stage never points at `platform status`, which cannot
+// see staged actions; repeating the same stage with the same key is the safe
+// retry.
+#[test]
+fn hosted_connected_effect_reconciles_by_replaying_the_same_stage() {
+    let arguments = json!({"operation": "connected_effect"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+    assert!(effect.is_mutation());
+    let note = effect.reconciliation().unwrap();
+    assert!(note.contains("same `--request`"), "{note}");
+    assert!(!note.contains("replaying `platform call`"), "{note}");
+}

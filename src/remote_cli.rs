@@ -389,6 +389,7 @@ const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved �
 const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
@@ -545,6 +546,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 // link, so its lost or unusable answer is a possible mutation; the
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 _ => cli_effect(verb),
             }
         }
