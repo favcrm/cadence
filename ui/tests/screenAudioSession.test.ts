@@ -77,6 +77,7 @@ void (async () => {
     }) as typeof fetch;
 
     let micTrackStops = 0;
+    let micStarts = 0;
     let closedAudioContexts = 0;
     let processorFn: ((ev: { inputBuffer: { getChannelData: (ch: number) => Float32Array } }) => void) | null = null;
 
@@ -85,6 +86,7 @@ void (async () => {
       value: {
         mediaDevices: {
           async getUserMedia() {
+            micStarts += 1;
             return {
               getTracks: () => [{ stop: () => { micTrackStops += 1; } }],
             };
@@ -131,6 +133,31 @@ void (async () => {
       onEvent: (snap) => events.push(snap),
     });
 
+    // A request to retain audio must be refused before any quote, microphone,
+    // session event, or recording-storage operation without explicit consent.
+    const missingConfirmation = await session.dispatch(
+      { v: 2, op: "audio-session", id: "consent-missing", action: "start", retain_audio: true },
+      callAbort.signal,
+    );
+    check(!missingConfirmation.ok && missingConfirmation.refusal.code === "cancelled", "missing retention confirmation refuses");
+    let confirmations = 0;
+    const decliningSession = createScreenAudioSession({
+      actionToken: "f".repeat(64),
+      signal: mountAbort.signal,
+      getLocale: () => "en",
+      onEvent: (snap) => events.push(snap),
+      confirmRetention: () => { confirmations += 1; return false; },
+    });
+    const declined = await decliningSession.dispatch(
+      { v: 2, op: "audio-session", id: "consent-declined", action: "start", retain_audio: true },
+      callAbort.signal,
+    );
+    check(confirmations === 1 && !declined.ok && declined.refusal.code === "cancelled", "declined retention confirmation refuses");
+    check(micStarts === 0, "missing or declined consent never opens the microphone");
+    check(fetchCalls.length === 0, "missing or declined consent never calls quote or recording storage");
+    check(events.length === 0, "missing or declined consent does not start a session");
+    decliningSession.dispose();
+
     // 1. Quote preflight 402 refusal transitions phase to error.
     const refusedStart = await session.dispatch(
       { v: 2, op: "audio-session", id: "s1", action: "start" },
@@ -145,6 +172,8 @@ void (async () => {
       callAbort.signal,
     );
     check(started.ok && (started.data as ScreenAudioSessionSnapshot).phase === "recording", "start enters recording phase");
+    check(Number(micStarts) === 1, "without retention, the same fixture starts microphone capture");
+    check(!fetchCalls.some((call) => call.url.startsWith("/api/app-screen-recordings/")), "non-retained capture does not start recording storage");
 
     const oneSecBlock = new Float32Array(16_000).fill(0.35);
     const invokeProcessor = processorFn as
@@ -174,6 +203,7 @@ void (async () => {
     check(stopSnap.phase === "ready" && stopSnap.segments_done === 1 && stopSnap.transcript.startsWith("Transcribed aud_"),
       "stop drains tail segment into ready transcript");
     check(micTrackStops === 1 && closedAudioContexts === 1, "stop frees microphone track and AudioContext");
+    check(!fetchCalls.some((call) => call.url.startsWith("/api/app-screen-recordings/")), "non-retained capture and stop never call recording storage");
 
     const firstLiveTranscribe = fetchCalls.find((c) => c.url === "/api/app-screen-audio/transcribe");
     check(firstLiveTranscribe?.body.language === "zh", "language hint forwarded to transcribe endpoint");
