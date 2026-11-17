@@ -4,7 +4,7 @@ import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
@@ -639,7 +639,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
       <span className="text-ink-500">
         {label} · {when}
       </span>
-      {outcome === "unconfirmed" && write.connected !== null && write.result?.code === "uncertain" && (
+      {outcome === "unconfirmed" && write.connected !== null && isUncertain(write) && (
         <span className="dx-why">{reasonText(failureReason(write), t)}</span>
       )}
     </li>

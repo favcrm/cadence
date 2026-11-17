@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, failureReason, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
+import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -436,7 +436,7 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
                   ) : receipt.record?.id ? (
                     <B>{receipt.record.id}</B>
                   ) : receipt.ok === false ? (
-                    outcomeOf(write) === "unconfirmed"
+                    isUncertain(write)
                       ? `${t("Result not confirmed")}: ${reasonText(failureReason(write), t)}`
                       : `${t("Did not apply")}: ${reasonText(failureReason(write), t)}`
                   ) : receipt.ok ? (

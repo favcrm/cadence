@@ -1147,8 +1147,33 @@ listStatus = 200;
     await settle(() => assert(drawerEl(), "open"));
     const body = text(drawerEl());
     assert(!body.includes("Nothing has been sent yet") && body.includes("may have acted"), `a pending uncertain row never says nothing was sent (${body.slice(0, 300)})`);
+    await click(labelled(drawerEl()!, "Audit"));
+    assert(text(drawerEl()!).includes("Result not confirmed: the provider may have acted") && !text(drawerEl()!).includes("Did not apply"), `the Audit receipt of a pending uncertain row (${text(drawerEl()!).slice(0, 400)})`);
     await w.done();
   }
+  {
+    actions = [effect("u3", { status: "denied", decidedAt: Date.now(), result: { ok: false, code: "uncertain", retry: true } }), effect("u4")];
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "the denied row is not waiting"));
+    await w.done();
+  }
+  // The real approve: the reply is fine, the row stays pending carrying the uncertain result.
+  actions = [effect("u5")];
+  onDecide = (id) => { actions = actions.map((a: any) => a.id === id ? { ...a, result: { ok: false, code: "uncertain", retry: true } } : a); };
+  {
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "one card"));
+    await click(labelled(w.cards()[0], "Review"));
+    await settle(() => assert(drawerEl(), "open"));
+    await click(labelled(drawerEl()!, "Approve"));
+    await settle(() => assert(labelled(drawerEl()!, "Check again"), "unsure after a pending reply"));
+    assert(sent() === 1, "one submit");
+    await click(labelled(drawerEl()!, "Check again"));
+    const n = text(drawerEl()!);
+    assert(sent() === 1 && n.includes("did not finish") && n.includes("may have acted") && !n.includes("Nothing was recorded"), `Check again does not claim nothing was recorded (${n.slice(0, 400)})`);
+    await w.done();
+  }
+  onDecide = null;
 
   for (const [code, words] of [["expired", "expired"], ["insufficient_funds", "not enough funds"], ["toolkit_disabled", "turned off"], ["mystery", "refused (mystery)"]] as const) {
     actions = [effect("f1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code } })];

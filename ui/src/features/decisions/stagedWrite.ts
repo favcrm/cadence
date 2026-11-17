@@ -308,10 +308,12 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
   return body.actions.map(parseStagedRow).filter((r): r is StagedWrite => r !== null);
 }
 
+/** The provider may have acted: not a failure, not a success, and not "nothing ran", whatever the row's status. */
+export const isUncertain = (write: StagedWrite): boolean => write.connected !== null && write.result?.ok === false && write.result.code === "uncertain";
+
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
-  // The provider may have acted: that is not a failure, not a success, and not "nothing ran" even if denied after.
-  if (write.connected !== null && write.result?.ok === false && write.result.code === "uncertain") return "unconfirmed";
+  if (isUncertain(write)) return "unconfirmed";
   if (write.status === "denied") return "denied";
   if (write.result?.ok === false) return "failed";
   // Success is only ever what the row says: ok === true (or the ticket a create made).
