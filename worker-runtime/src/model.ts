@@ -23,17 +23,27 @@ export const MODEL_CONTEXT_WINDOW = 128_000;
 
 /**
  * CAD-2414: Pi's compaction thresholds for hosted sessions. The binding limit
- * is the gateway's 256 KiB request body, not the model's window: at about 4.5
- * bytes per token for JSON-heavy English (fewer for Chinese), 256 KiB is
- * roughly 58k tokens, so the engine's default reserve (window − 16,384 ≈
- * 112k) never fired before the gateway refused. The reserve moves blocking
- * compaction to 128,000 − 80,000 = 48k tokens (about 216 KiB at 4.5 bytes a
- * token) and background compaction 16,384 tokens earlier (about 31.6k). The
- * summary's own output stays capped by the model's 8,192 output tokens.
+ * is the gateway's 256 KiB request body, not the model's window. The engine
+ * counts tokens from the last reply's reported usage, and estimates the rest
+ * (the first request, the first request after a compaction, and the newest
+ * step's results) at 3.5 characters a token. For English JSON that estimate
+ * is about 3.5–4.5 bytes a token, so 256 KiB is roughly 58–75k; Chinese is
+ * three bytes a character, about 10.5 bytes an estimated token. The default
+ * reserve (window − 16,384 ≈ 112k) therefore never fired before the gateway
+ * refused.
+ *
+ * - Blocking compaction at 128,000 − 80,000 = 48k tokens (about 216 KiB at
+ *   4.5 bytes a token), background 16,384 tokens earlier (about 31.6k).
+ * - The kept tail is 8,000 tokens, so the first request after a compaction
+ *   stays far under the budget even when the tail is estimated Chinese text
+ *   (8,000 × 10.5 ≈ 84 KB).
+ * - Estimated Chinese tool results in one operation are kept in budget by
+ *   `boundActiveToolResults`, not by these thresholds.
+ * - The summary's output stays capped by the model's 8,192 output tokens.
  */
 export const HOSTED_COMPACTION_POLICY = {
   reserveTokens: 80_000,
-  keepRecentTokens: 20_000,
+  keepRecentTokens: 8_000,
   backgroundTokens: 16_384,
 } as const;
 
@@ -236,8 +246,10 @@ const HISTORICAL_TOOL_RESULT_NOTICE =
 /**
  * Bound old tool results only in the model request. A completed assistant
  * answer proves the preceding results belong to earlier work; everything
- * after the latest such answer stays whole, including all pages of a file the
- * active operation is editing. The durable transcript is never changed.
+ * after the latest such answer stays whole here, including all pages of a
+ * file the active operation is editing. Only a request over the gateway
+ * budget shortens more (`boundActiveToolResults`). The durable transcript is
+ * never changed.
  */
 function boundToolHistory(input: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(input.messages)) return input;
@@ -298,12 +310,10 @@ function boundToolHistory(input: Record<string, unknown>): Record<string, unknow
  */
 const REQUEST_TEXT_BYTES = 256 * 1024;
 const REQUEST_TEXT_TARGET = REQUEST_TEXT_BYTES - 16 * 1024;
-/** The newest tool results a request keeps whole while it is shortened. */
+/** At least this many newest tool results stay whole, and the newest round. */
 const ACTIVE_TOOL_RESULTS_KEPT = 2;
 /** Each pass shortens the oldest results first, to this many characters. */
 const ACTIVE_TOOL_RESULT_PASSES = [HISTORICAL_TOOL_RESULT_CHARS, 2_000] as const;
-const ACTIVE_TOOL_RESULT_NOTICE =
-  "\n\n[Tool result shortened to keep this request within the context limit. This excerpt is incomplete; read the source again before relying on or editing its full contents.]";
 
 const encoder = new TextEncoder();
 
@@ -327,10 +337,11 @@ function cutText(text: string, end: number): string {
  * cannot compact the operation it is running (`hosted-preserve-active-
  * operation`), so once its own tool results pass 256 KiB every request would
  * be refused. Only then, and only in the model request, shorten tool results
- * oldest first, keeping the newest `ACTIVE_TOOL_RESULTS_KEPT` whole, until
- * the request fits. The durable transcript is never changed. A request that
- * still does not fit is sent as it is, and the gateway's refusal takes the
- * existing context-limit path.
+ * oldest first, earlier history included, keeping the newest round and at
+ * least `ACTIVE_TOOL_RESULTS_KEPT` results whole, until the request fits.
+ * The durable transcript is never changed. A request that still does not fit
+ * is sent as it is, and the gateway's refusal takes the existing
+ * context-limit path.
  */
 function boundActiveToolResults(input: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(input.messages)) return input;
@@ -338,25 +349,28 @@ function boundActiveToolResults(input: Record<string, unknown>): Record<string, 
   if (bytes <= REQUEST_TEXT_TARGET) return input;
   const messages: unknown[] = input.messages.slice();
   const results: number[] = [];
+  let lastCall = -1;
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index];
-    if (
-      typeof message === "object" &&
-      message !== null &&
-      !Array.isArray(message) &&
-      "role" in message &&
-      message.role === "tool" &&
-      "content" in message &&
-      typeof message.content === "string"
-    )
+    if (typeof message !== "object" || message === null || Array.isArray(message) || !("role" in message))
+      continue;
+    if (message.role === "assistant") lastCall = index;
+    else if (message.role === "tool" && "content" in message && typeof message.content === "string")
       results.push(index);
   }
-  const shortenable = results.slice(0, Math.max(0, results.length - ACTIVE_TOOL_RESULTS_KEPT));
+  // The newest round's results (parallel calls answer one assistant turn)
+  // have not been seen whole by the model yet; never cut them.
+  const newestRound = results.findIndex((index) => index > lastCall);
+  const keepFrom = Math.min(
+    results.length - ACTIVE_TOOL_RESULTS_KEPT,
+    newestRound < 0 ? results.length : newestRound,
+  );
+  const shortenable = results.slice(0, Math.max(0, keepFrom));
   for (const limit of ACTIVE_TOOL_RESULT_PASSES) {
     for (const index of shortenable) {
       const message = messages[index] as { content: string };
       if (message.content.length <= limit) continue;
-      const content = cutText(message.content, limit) + ACTIVE_TOOL_RESULT_NOTICE;
+      const content = cutText(message.content, limit) + HISTORICAL_TOOL_RESULT_NOTICE;
       bytes -= textBytes(message.content) - textBytes(content);
       messages[index] = { ...message, content };
       if (bytes <= REQUEST_TEXT_TARGET) return { ...input, messages };

@@ -334,7 +334,7 @@ describe("CAD-2414: one long operation within the gateway budget", () => {
     const sent = tools(request);
     expect(sent.at(-1)?.content).toBe(results.at(-1));
     expect(sent.at(-2)?.content).toBe(results.at(-2));
-    expect(sent[0]?.content).toContain("shortened to keep this request within the context limit");
+    expect(sent[0]?.content).toContain("shortened to save context");
     expect(input.messages[2]?.content).toBe(results[0]);
   });
 
@@ -343,20 +343,54 @@ describe("CAD-2414: one long operation within the gateway budget", () => {
     expect(await send(input)).toEqual(input);
   });
 
-  it("sends a request that cannot fit, keeping the newest results whole", async () => {
-    const huge = "x".repeat(200_000);
-    const input = operation(["older", huge, huge]);
-    const request = await send(input);
-    expect(bytes(request)).toBeGreaterThan(budget);
-    expect(tools(request).at(-1)?.content).toBe(huge);
-    expect(tools(request).at(-2)?.content).toBe(huge);
+  it("keeps every result of the newest parallel round whole", async () => {
+    const big = "資料".repeat(15_000);
+    const input = {
+      messages: [
+        { role: "user", content: "Compare the five sources." },
+        { role: "assistant", content: null, tool_calls: [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }] },
+        ...["a", "b", "c", "d"].map((id) => ({ role: "tool", tool_call_id: id, content: big })),
+      ],
+    };
+    expect(bytes(input)).toBeGreaterThan(budget);
+    const sent = tools(await send(input));
+    expect(sent.every((message) => message.content === big)).toBe(true);
   });
 
-  it("tells the engine a window whose compaction thresholds sit under the budget", () => {
-    // 4.5 bytes a token is the JSON-heavy English case; Chinese uses fewer.
+  it("still relays the context-limit refusal for a request that cannot fit", async () => {
+    const huge = "x".repeat(200_000);
+    const input = operation(["older", huge, huge]);
+    let received: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      {
+        async requestModel(request) {
+          received = request;
+          return Response.json(
+            { error: { type: "invalid_request_error", code: CONTEXT_BUDGET_EXCEEDED, message: "too large" } },
+            { status: 400 },
+          );
+        },
+      },
+      () => identity,
+      undefined,
+      1,
+      { clear: () => {}, issue: () => "hosted_context_budget_0123456789abcdef0123456789abcdef" },
+    );
+    const response = (await binding.run("default", input, { returnRawResponse: true })) as Response;
+    expect(bytes(received)).toBeGreaterThan(budget);
+    expect(tools(received!).at(-1)?.content).toBe(huge);
+    expect(tools(received!).at(-2)?.content).toBe(huge);
+    expect(response.status).toBe(400);
+    expect(JSON.stringify(await response.json())).toContain(CONTEXT_BUDGET_EXCEEDED);
+  });
+
+  it("sets compaction thresholds that sit under the budget", () => {
+    // The engine estimates 3.5 characters a token where it has no usage:
+    // English JSON is up to about 4.5 bytes a token, Chinese 10.5.
     const blocking = MODEL_CONTEXT_WINDOW - HOSTED_COMPACTION_POLICY.reserveTokens;
     const background = blocking - HOSTED_COMPACTION_POLICY.backgroundTokens;
     expect(blocking * 4.5).toBeLessThan(budget);
+    expect(HOSTED_COMPACTION_POLICY.keepRecentTokens * 10.5).toBeLessThan(budget / 2);
     expect(background).toBeGreaterThan(HOSTED_COMPACTION_POLICY.keepRecentTokens);
   });
 });
