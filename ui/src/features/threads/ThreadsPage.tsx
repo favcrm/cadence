@@ -1134,7 +1134,7 @@ function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects:
     : entry.role === "agent" ? t("Agent") : t("System");
   return (
     <article className="threads-msg" data-role={entry.role}>
-      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} showName state={stage}>
+      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} showName markdown={entry.role !== "operator"} state={stage}>
         {entry.text}
       </Turn>
       {refs.length > 0 && (
@@ -1182,6 +1182,7 @@ function MessageRow({
         who={participantLabel(message.sender, t)}
         at={fmtTime(message.created)}
         me={message.sender.kind === "operator"}
+        markdown={message.sender.kind === "agent" || message.sender.kind === "daemon"}
         state={message.state}
       >
         {message.cloud_withheld ? (
