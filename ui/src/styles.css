@@ -821,7 +821,7 @@ pre {
 .turn-name {
   color: var(--color-ink-200);
   font-size: var(--text-label);
-  font-weight: 500;
+  font-weight: 600;
 }
 .turn-time {
   font-family: "IBM Plex Mono", monospace;
@@ -841,7 +841,7 @@ pre {
   padding: .15rem .5rem .15rem .3rem;
   border-radius: .375rem;
   background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
 }
 .turntrace-head:hover,
 .turntrace[data-open] .turntrace-head {
@@ -856,7 +856,7 @@ pre {
 .turntrace-summary {
   min-width: 0;
   overflow: hidden;
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1454,11 +1454,11 @@ textarea.agentform-input { height: auto; width: 100%; }
 [data-chat-message="user"] .chat-bubble,
 [data-chat-message="user"] .chat-bubble.text-body {
   max-width: min(100%, 34rem);
-  padding: 0.7rem 1rem;
+  padding: .5625rem .875rem;
   border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
   background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-850));
   color: var(--color-ink-100);
-  line-height: 1.55;
+  line-height: 1.6;
 }
 [data-chat-message] .refsrow {
   margin-top: 0.5rem;
@@ -1632,39 +1632,50 @@ textarea.agentform-input { height: auto; width: 100%; }
 .issue-reader table {
   margin-block: .6rem;
 }
+/* CAD-2408: chat answers follow the approved chat-polish mockup's rhythm
+   (2026-11-16): 1.6 lines, .85em between paragraphs, .2em between list
+   items. Wiki, issue and document readers keep the base reader rules. */
 .answer .issue-reader,
 .chat-bubble.issue-reader {
-  line-height: 1.7;
+  line-height: 1.6;
 }
 .answer .issue-reader p,
 .chat-bubble.issue-reader p {
-  margin-block: .9rem;
+  margin-block: .85em;
   text-wrap: pretty;
 }
 .answer .issue-reader ul,
 .answer .issue-reader ol,
 .chat-bubble.issue-reader ul,
 .chat-bubble.issue-reader ol {
-  margin-block: .6rem 1rem;
+  margin-block: .85em;
   padding-inline-start: 1.25rem;
 }
-.answer .issue-reader ul + p,
-.answer .issue-reader ol + p,
-.chat-bubble.issue-reader ul + p,
-.chat-bubble.issue-reader ol + p {
-  margin-top: 1.25rem;
+.answer .issue-reader li + li,
+.chat-bubble.issue-reader li + li {
+  margin-top: .2em;
 }
+/* A real Markdown heading keeps its reader size and weight; only the
+   spacing is the mockup's. */
 .answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child) {
+  margin: 1.3em 0 .45em;
+}
+/* A paragraph that is only bold text is a section label, not a heading:
+   small, muted and without a rule (the mockup's `.answer .sect`). */
 .answer .issue-reader > p:has(> strong:only-child):not(:first-child),
-.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
 .chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) {
-  margin: 1.75rem 0 .75rem;
-  padding-top: 1.35rem;
-  border-top: 1px solid color-mix(in srgb, var(--color-ink-700) 60%, transparent);
-  color: var(--color-ink-100);
-  font-size: .9375rem;
-  font-weight: 600;
+  margin: 1.2em 0 .5em;
+  color: var(--color-ink-500);
+  font-size: .6875rem;
+  font-weight: 500;
+  letter-spacing: .04em;
   line-height: 1.4;
+}
+.answer .issue-reader > p:has(> strong:only-child):not(:first-child) > strong,
+.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) > strong {
+  color: inherit;
+  font-weight: inherit;
 }
 .answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
 .answer .issue-reader > p:has(> strong:only-child):last-child,
@@ -2437,7 +2448,7 @@ button.refchip:hover {
 }
 .home-workspace .chatdock { left: 0; right: 0; }
 .home-workspace .chat-scroll { scrollbar-gutter: stable; }
-.home-workspace .issue-reader { line-height: 1.7; }
+.home-workspace .issue-reader:not(.answer-body, .chat-bubble) { line-height: 1.7; }
 .home-workspace .issue-reader p { text-wrap: pretty; }
 .home-workspace .master-heading { padding-block: .25rem .75rem; }
 .home-workspace [data-composer][data-blocked] { background: var(--color-ink-875); border-style: solid; }
@@ -2944,13 +2955,6 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .answer .issue-reader strong {
   font-weight: 600;
   color: var(--color-ink-100);
-}
-/* A section heading right after a rule already has its line: no second one. */
-.answer .issue-reader > hr + :is(h1, h2, h3, h4, h5, h6, p:has(> strong:only-child)):not(:first-child),
-.chat-bubble.issue-reader > hr + :is(h1, h2, h3, h4, h5, h6, p:has(> strong:only-child)):not(:first-child) {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
 }
 .answer .issue-reader .md-table-wrap {
   margin: .25rem 0 .85rem;
