@@ -186,7 +186,7 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
     // CAD-1950: the visibility choice is part of creating the project, so it
     // is validated here — before the lock and before anything is written.
     if req.visibility == project::Visibility::Private && !write::private_available() {
-        return Err(Error::rejected(write::PRIVATE_UNAVAILABLE));
+        return Err(Error::invalid("private_unavailable", write::PRIVATE_UNAVAILABLE));
     }
     if !req.grants.is_empty() && req.visibility != project::Visibility::Private {
         return Err(Error::rejected(
@@ -811,9 +811,9 @@ mod tests {
             "operator",
             &[],
         )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(err, write::PRIVATE_UNAVAILABLE, "{err}");
+        .unwrap_err();
+        assert_eq!(err.code(), Some("private_unavailable"), "{err}");
+        assert_eq!(err.to_string(), write::PRIVATE_UNAVAILABLE, "{err}");
         assert_eq!(commits(&pm), before, "a refusal commits nothing");
         assert!(!pm.dir.join("pay").exists());
     }

@@ -301,8 +301,8 @@ pub fn project_add(
 /// The one refusal sentence for private, shared by every writer so the CLI,
 /// the daemon and the board cannot describe the gate differently.
 pub const PRIVATE_UNAVAILABLE: &str =
-    "private projects are not available yet — the isolation gate \
-     has not passed; only workspace-visible can be recorded";
+    "private projects are not available on this install: local agents can \
+     read every project's files on disk, so only workspace-visible can be recorded";
 
 /// May this build record `private` (CAD-1950, AOS-274 / SEC-006)?
 ///
@@ -338,7 +338,7 @@ pub fn set_project_policy(
     // slash must never become a path outside the tracker.
     let key = crate::issue::model::check_key(key)?;
     if visibility == project::Visibility::Private && !private_available() {
-        return Err(Error::rejected(PRIVATE_UNAVAILABLE));
+        return Err(Error::invalid("private_unavailable", PRIVATE_UNAVAILABLE));
     }
     let dir = project_dir(pm, &key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;

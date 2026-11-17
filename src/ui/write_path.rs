@@ -484,6 +484,11 @@ pub(crate) fn write_err(e: &Error) -> HttpResp {
     match e {
         Error::Rejected(m) if m.starts_with("Unknown issue") => err_response(404, m),
         Error::Rejected(m) => err_response(400, m),
+        // A coded refusal (`Error::invalid`) keeps its stable code on the wire
+        // so the board can branch on it instead of showing raw text.
+        Error::Structured(_) if e.kind() == "rejected" && e.code().is_some() => {
+            coded_response(400, e.code().unwrap_or_default(), &e.to_string(), None)
+        }
         other => err_response(500, &other.to_string()),
     }
 }
@@ -3086,5 +3091,33 @@ mod cad2009_settings_rpc_error_tests {
             assert_eq!(body["code"], expected_code);
             assert_eq!(body["error"], expected_message);
         }
+    }
+}
+
+#[cfg(test)]
+mod cad2376_private_refusal_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// The board's policy write answers a private request with 400 and the
+    /// stable `private_unavailable` code, and writes nothing.
+    #[test]
+    fn policy_put_private_answers_private_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm_dir = tmp.path().join("pm");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        let before = std::fs::read_dir(&pm_dir).unwrap().count();
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_body(r#"{"visibility":"private","members":[]}"#)
+            .into();
+        let resp = project_policy_write(&mut request, &pm_dir, "pay", "operator");
+        assert_eq!(resp.status_code().0, 400);
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let body: Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body["code"], "private_unavailable", "{body}");
+        assert_eq!(body["error"], issue_write::PRIVATE_UNAVAILABLE);
+        assert_eq!(std::fs::read_dir(&pm_dir).unwrap().count(), before);
     }
 }
