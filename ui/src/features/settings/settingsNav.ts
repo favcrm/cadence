@@ -36,7 +36,8 @@ export type SettingsMeta = {
  * Which sections to offer. A board that sends `settings_sections` has said what
  * it serves, so only those appear. One that doesn't (a native board, or a hosted
  * board that predates the field) keeps the full list — which has no `members`:
- * a native board has no tenant member list to show.
+ * a native board has no tenant member list to show. CAD-2397: it does have
+ * General, which holds the company time zone.
  */
 export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   const account = meta?.platform_account_configured ? [ENTRIES.account] : [];
@@ -44,7 +45,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   if (!listed) {
     return [
       { label: "You", items: [ENTRIES.preferences] },
-      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ENTRIES.memory] },
+      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ENTRIES.general, ENTRIES.memory] },
       { label: "System", items: [ENTRIES.status, ...account, ENTRIES.permissions, ENTRIES.custody] },
     ];
   }

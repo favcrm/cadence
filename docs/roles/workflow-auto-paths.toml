@@ -32,7 +32,7 @@
 # change to one now merges on two workflow reviews. They include docs/DEV-CYCLE.md
 # (the approval handoff), docs/RELEASING.md and docs/guides/rollout-checklist.md
 # (production handover), docs/guides/hosted-workspace.md, docs/CLEAN-INSTALL.md,
-# docs/FIRST-RUN.md, docs/CI-DELIVERY.md, docs/REVIEW-EVIDENCE.md and
+# docs/FIRST-RUN.md, docs/CI-DELIVERY.md and
 # docs/TRUSTED-TEAM-ACTIVITY.md. Rule 7's "any change to who approves what" is
 # enforced for them only by the review's Risk line. Moving one to the operator
 # means adding it to risk-paths.toml trigger 7 AND to the trigger 7 list line in
