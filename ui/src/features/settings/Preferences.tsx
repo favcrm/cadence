@@ -2,6 +2,8 @@ import { useId, useState } from "react";
 import { useLocale } from "../../lib/locale";
 import { setThemePref, type ThemePref } from "../../lib/theme";
 import Select from "../../ui/Select";
+import { setDisplayTimeZone, useTimeZones } from "../../lib/timeZone";
+import TimeZoneRow from "./TimeZoneRow";
 
 export default function Preferences({ organizationDefault = true }: { organizationDefault?: boolean }) {
   const id = useId();
@@ -13,6 +15,7 @@ export default function Preferences({ organizationDefault = true }: { organizati
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
   const [saved, setSaved] = useState(false);
+  const zones = useTimeZones();
 
   const saveLocale = async (scope: "user" | "organization", value: "en" | "zh-TW" | null) => {
     setBusy(true);
@@ -65,6 +68,16 @@ export default function Preferences({ organizationDefault = true }: { organizati
           </div>
         </div>
       </section>
+      {zones.company && <section className="border-t border-ink-700">
+        <TimeZoneRow
+          title={t("Display time zone")}
+          hint={t("Times are shown in this zone, with its name. Schedules still run in the company zone.")}
+          value={zones.display}
+          current={zones.company}
+          followLabel={t("Follow company time zone")}
+          onSave={setDisplayTimeZone}
+        />
+      </section>}
       {organizationDefault && canSetOrganizationLocale && <section className="border-t border-ink-700" aria-labelledby={`${id}-org-heading`}>
         <div className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] sm:items-start sm:gap-8">
           <div>

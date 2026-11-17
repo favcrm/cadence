@@ -1,6 +1,8 @@
 import { useId, useState } from "react";
 import { useLocale } from "../../lib/locale";
 import Select from "../../ui/Select";
+import { setCompanyTimeZone, useTimeZones } from "../../lib/timeZone";
+import TimeZoneRow from "./TimeZoneRow";
 
 /** Settings that apply to everyone in the workspace. */
 export default function General() {
@@ -8,6 +10,7 @@ export default function General() {
   const { organizationLocale, canSetOrganizationLocale, t, setPreference } = useLocale();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
+  const zones = useTimeZones();
 
   const save = async (value: "en" | "zh-TW") => {
     setBusy(true);
@@ -47,6 +50,16 @@ export default function General() {
             {error && <p role="alert" className="mt-2 text-label text-fail">{t("Could not save language preference.")}</p>}
           </div>
         </div>
+        {zones.company && (
+          <TimeZoneRow
+            title={t("Company time zone")}
+            hint={t("Every schedule runs in this zone. Members can choose another zone to see times in.")}
+            value={zones.source === "workspace" ? zones.company : null}
+            current={zones.company}
+            disabled={!zones.canSetCompany}
+            onSave={(zone) => (zone ? setCompanyTimeZone(zone) : Promise.resolve())}
+          />
+        )}
       </section>
     </main>
   );

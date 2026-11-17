@@ -30,7 +30,7 @@ use super::{
     app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
     business_templates, cli_route, connections, credential_entry, crm_send, delivery_sync,
     endpoints, home, lane, locale, member_assist, my_work, operator, platform_account, read_model,
-    routines, social_publish, stages, threads, topics, updates, wiki, wiki_envelope,
+    routines, social_publish, stages, threads, time_zone, topics, updates, wiki, wiki_envelope,
     work_conversations, workflows,
 };
 use super::{
@@ -2311,6 +2311,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
+            send(request, response);
+        }
+        "/api/time-zone" => {
+            let response = time_zone::get(&request, state_dir, opts);
             send(request, response);
         }
         // What the SPA needs to render itself correctly for this
