@@ -11128,11 +11128,13 @@ childProcess.execFileSync = (program, args, options = {}) => {
     case 6: expected = [...p,'apply','--cached','--whitespace=nowarn','-']; break;
     case 7: expected = [...p,'write-tree','--missing-ok']; break;
     case 8: expected = [...p,'rev-parse',sc.git_head+'^{tree}']; break;
+    case 9: expected = [...p,'diff','--no-ext-diff','--no-textconv','--no-color','--no-renames','--full-index',sc.git_base,sc.git_head,'--']; break;
     default: return failGit();
   }
   if (!eq(args, expected) || (current === 6 && options.input !== sc.git_diff)) return failGit();
   if (current === 7) return Buffer.from(treeA+'\n');
   if (current === 8) return Buffer.from((sc.git_mismatch ? treeB : treeA)+'\n');
+  if (current === 9) return Buffer.from(sc.git_canonical_diff, 'utf8');
   return Buffer.alloc(0);
 };
 syncBuiltinESMExports();
@@ -11651,6 +11653,7 @@ if (mode === 'keys') {
             "git_base": cmp["merge_base"],
             "git_head": HEAD,
             "git_diff": w["diff"],
+            "git_canonical_diff": w.get("canonical_diff").unwrap_or(&w["diff"]),
             "git_failure": w.get("git_failure").cloned().unwrap_or(Value::Null),
             "git_mismatch": w.get("git_mismatch").cloned().unwrap_or(json!(false)),
         })
@@ -12394,7 +12397,7 @@ if (mode === 'keys') {
                 assert_eq!(r.code, Some(0), "{} {name}: {}", wf.file, r.out);
                 assert_eq!(
                     r.git_calls.len(),
-                    9,
+                    10,
                     "{} {name}: {:?}",
                     wf.file,
                     r.git_calls
@@ -12407,9 +12410,31 @@ if (mode === 'keys') {
     }
 
     #[test]
+    fn prepare_uses_the_git_generated_diff_in_both_artifacts() {
+        for wf in all() {
+            let mut w = world(&wf);
+            let canonical = DIFF.replace("+hello\n", "+canonical hello\n");
+            assert_ne!(canonical, DIFF);
+            w["canonical_diff"] = json!(canonical);
+            let r = prepare(&wf, &w, &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert_eq!(r.git_calls.len(), 10, "{}: {:?}", wf.file, r.git_calls);
+            assert_eq!(r.git_calls[6]["input_matches"], json!(true));
+            assert_eq!(
+                r.read("out/review-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+            assert_eq!(
+                r.read("out/file-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+        }
+    }
+
+    #[test]
     fn prepare_refuses_each_git_failure_and_a_tree_mismatch() {
         for wf in all() {
-            for step in 0..9 {
+            for step in 0..10 {
                 let mut w = world(&wf);
                 w["git_failure"] = json!(step);
                 let r = prepare(&wf, &w, &[]);

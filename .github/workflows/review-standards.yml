@@ -137,7 +137,10 @@ jobs:
             for (const line of lines) {
               if (o > 0 || n > 0) {
                 const c = line[0];
-                if (c === '\\') continue;
+                if (c === '\\') {
+                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
+                  continue;
+                }
                 if (c === '+') { cur?.add(nl); nl++; n--; continue; }
                 if (c === '-') { o--; continue; }
                 if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
@@ -155,14 +158,18 @@ jobs:
               if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
               if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
                 o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+                continue;
               }
+              if (line === '\\ No newline at end of file' ||
+                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
+              throw new Refusal('the diff has unexpected text');
             }
             if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
             return { files, sections };
           }
-          // A complete hunk boundary is not proof of a complete patch, even below the size limit.
-          // Apply the exact bytes to the pinned base index and require the pinned head tree.
-          function matchesHeadTree(diff, base, head) {
+          // Apply the supplied patch to the pinned base and verify the head tree.
+          // Review only Git's own bounded diff of those trees, not unbound patch metadata.
+          function verifiedDiff(diff, base, head) {
             const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cadence-review-')), repo = path.join(dir, 'repo.git');
             const env = {
               PATH: E.PATH, HOME: dir, LANG: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
@@ -170,7 +177,7 @@ jobs:
               GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
               GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${E.GH_TOKEN}`).toString('base64')}`,
             };
-            const git = (args, input) => execFileSync('git', args, { env, input, timeout: 120000, maxBuffer: 1024 * 1024, stdio: 'pipe' });
+            const git = (args, input, maxBuffer = 1024 * 1024) => execFileSync('git', args, { env, input, timeout: 120000, maxBuffer, stdio: 'pipe' });
             try {
               git(['init', '--bare', '--quiet', '--template=', repo]);
               git(['-C', repo, 'remote', 'add', 'origin', `https://github.com/${REPO}.git`]);
@@ -181,8 +188,11 @@ jobs:
               git(['-C', repo, 'apply', '--cached', '--whitespace=nowarn', '-'], diff);
               const actual = git(['-C', repo, 'write-tree', '--missing-ok']).toString('utf8').trim();
               const expected = git(['-C', repo, 'rev-parse', `${head}^{tree}`]).toString('utf8').trim();
-              return /^[0-9a-f]{40}$/.test(actual) && actual === expected;
-            } catch { return false; } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+              if (!/^[0-9a-f]{40}$/.test(actual) || actual !== expected) return null;
+              const bytes = git(['-C', repo, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--full-index', base, head, '--'], undefined, 2500001);
+              if (bytes.length > 2500000) return null;
+              return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            } catch { return null; } finally { fs.rmSync(dir, { recursive: true, force: true }); }
           }
           if (E.GITHUB_REF !== 'refs/heads/main') die('this workflow only runs from main: dispatch it with --ref main');
           const pub = publicKey(); // before any token is minted or context read
@@ -268,14 +278,18 @@ jobs:
           if (!d.ok) die(`cannot read the diff: HTTP ${d.status}`);
           const diff = await d.text();
           if (Buffer.byteLength(diff) > 2500000) die('diff is over 2.5 MB: too large to review, nothing filed');
+          if (listed < 1) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
           let sections;
           try { sections = parseDiff(diff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the diff cannot be read'); }
           // Coverage is judged against the file list of this same comparison, never the PR's changed_files. The
           // list is complete (under the 300 cap), so a different section count means the diff was cut short by
           // GitHub or padded; that is the one case that refuses.
-          if (listed < 1 || sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
-          if (!matchesHeadTree(diff, mergeBase, HEAD))
-            die('the diff cannot be bound to the compared Git trees; nothing filed');
+          if (sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
+          const reviewedDiff = verifiedDiff(diff, mergeBase, HEAD);
+          if (reviewedDiff === null) die('the diff cannot be bound to the compared Git trees; nothing filed');
+          let reviewedSections;
+          try { reviewedSections = parseDiff(reviewedDiff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the verified diff cannot be read'); }
+          if (reviewedSections < 1 || reviewedSections >= 300) die('the verified diff changes too many files or has nothing to review; nothing filed');
           // The standard the reviewer applies is read at the pinned main (the rules in force when this merges),
           // never from the PR; the PR cannot change main.
           const doc = async (p) => {
@@ -291,10 +305,10 @@ jobs:
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(`${dir}/review-input.json`, JSON.stringify({
             repo: REPO, pr: Number(PR), head: HEAD, main: mainSha, merge_base: mergeBase, issue, pull: ctx.pull,
-            sealed_ticket, diff,
+            sealed_ticket, diff: reviewedDiff,
             agents_md: await doc('AGENTS.md'), risk_classes: await doc('docs/roles/risk-classes.md'),
           }));
-          fs.writeFileSync(`${dir}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, issue, diff }));
+          fs.writeFileSync(`${dir}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, issue, diff: reviewedDiff }));
           out(`prepared ${issue} PR ${PR} head ${HEAD.slice(0, 12)} main ${mainSha.slice(0, 12)}`);
           JS
       # A public repo's artifacts are downloadable by any signed-in GitHub user, so
@@ -435,6 +449,7 @@ jobs:
               headers: { authorization: `Bearer ${E.OPENROUTER_API_KEY}`, 'content-type': 'application/json', ...(largeInput ? { 'X-OpenRouter-Metadata': 'enabled' } : {}) },
             });
             if (!r.ok) return { status: r.status };
+            let sawModel = false;
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
             let sawMetadata = false, sawDone = false;
             const dec = new TextDecoder();
@@ -454,7 +469,7 @@ jobs:
                 }
                 const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
                 if (data === '[DONE]') {
-                  if (largeInput && (!sawMetadata || sawDone)) failed = true;
+                  if (largeInput && (!sawMetadata || sawDone || !sawModel)) failed = true;
                   sawDone = true;
                   continue;
                 }
@@ -463,8 +478,21 @@ jobs:
                 // A provider error inside a 200 stream is a chunk with a top-level error.
                 if (d === null || typeof d !== 'object' || Array.isArray(d) || d.error !== undefined ||
                     (d.choices !== undefined && !Array.isArray(d.choices))) { failed = true; continue; }
+                if (largeInput && d.model !== undefined) {
+                  if (d.model !== E.REVIEW_MODEL) failed = true; else sawModel = true;
+                }
+                if (largeInput && Array.isArray(d.choices) && d.choices.length > 0 && d.model !== E.REVIEW_MODEL) failed = true;
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
                   if (largeInput && stop !== null) { failed = true; continue; }
+                  if (largeInput && (!c || typeof c !== 'object' || Array.isArray(c) ||
+                      !c.delta || typeof c.delta !== 'object' || Array.isArray(c.delta))) { failed = true; continue; }
+                  if (largeInput && (
+                      Object.keys(c.delta).some((key) => !['role', 'content', 'refusal', 'reasoning', 'reasoning_details'].includes(key)) ||
+                      (c.delta.role != null && c.delta.role !== 'assistant') ||
+                      (c.delta.reasoning != null && typeof c.delta.reasoning !== 'string') ||
+                      (c.delta.reasoning_details != null && !Array.isArray(c.delta.reasoning_details)) ||
+                      !Object.hasOwn(c, 'finish_reason') || (c.finish_reason !== null && typeof c.finish_reason !== 'string')
+                    )) { failed = true; continue; }
                   if (c.index !== 0) { failed = true; continue; }
                   if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
                   if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { failed = true; continue; }
@@ -572,7 +600,10 @@ jobs:
             for (const line of lines) {
               if (o > 0 || n > 0) {
                 const c = line[0];
-                if (c === '\\') continue;
+                if (c === '\\') {
+                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
+                  continue;
+                }
                 if (c === '+') { cur?.add(nl); nl++; n--; continue; }
                 if (c === '-') { o--; continue; }
                 if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
@@ -590,7 +621,11 @@ jobs:
               if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
               if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
                 o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+                continue;
               }
+              if (line === '\\ No newline at end of file' ||
+                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
+              throw new Refusal('the diff has unexpected text');
             }
             if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
             return { files, sections };
