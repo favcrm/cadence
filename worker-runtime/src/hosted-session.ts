@@ -69,12 +69,8 @@ import {
   type OperationEnvelope,
   type OperationScopeSql,
 } from "./operation-scope.ts";
-import {
-  companyOutputSkills,
-  operationalSkills,
-  runtimeHealthSkills,
-  runtimeProfile,
-} from "./profile.ts";
+import { runtimeProfile } from "./profile.ts";
+import { runtimeSkillSources } from "./workspace-skills.ts";
 import { ThreadPreview } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
@@ -327,12 +323,12 @@ export class HostedSession<
       harness: async ({ storage, context, onWake }) => {
         // The bundled skills are engine-owned, so they are wrapped here with
         // the same refusal and live authorization an application tool gets.
-        this.registry.install(
-          authorizeExtension(
-            await skills([operationalSkills, runtimeHealthSkills, companyOutputSkills]),
-            authority,
-          ),
+        // CAD-2395: a workspace's approved skills come last, so a bundled
+        // skill of the same name always wins.
+        const sources = await runtimeSkillSources(
+          options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills!(),
         );
+        this.registry.install(authorizeExtension(await skills(sources), authority));
         return Harness.open(
           storage,
           {

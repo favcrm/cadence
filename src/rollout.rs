@@ -157,7 +157,9 @@ pub use migration::{
 ///
 /// v68 (CAD-2317) adds `routines`, `routine_runs`, `connection_policies`, and
 /// `staged_routine_proposals`.
-pub const SCHEMA_VERSION: i64 = 68;
+///
+/// v69 (CAD-2378) adds `workspace_settings`, the company time zone.
+pub const SCHEMA_VERSION: i64 = 69;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

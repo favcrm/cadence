@@ -730,6 +730,19 @@ hosted CLI login is deferred to CAD-1592. Managing agents running on the local
 or hosted runtime use that runtime's local daemon and exact grants instead.
 
 
+## Company time zone (CAD-2378)
+
+A workspace has one company time zone, an IANA name such as `Asia/Hong_Kong`.
+Every schedule runs in it. The owner sets it in Settings > General. When it is
+unset it is the first social connection's zone, else UTC. `cadence routine
+create` without `--tz` stores the company zone; an explicit `--tz` is kept, and
+an invalid name is refused. Existing routines keep their stored zone.
+
+A person can pick a display zone in Settings > Preferences. It changes only how
+the board shows times to that person, always with the zone's name; it never
+changes when a routine runs. The board serves both at `/api/time-zone`; a board
+that predates it answers 404 and the UI shows times in UTC.
+
 ## Connected-read recovery
 
 A local `platform call` for a connected read uses `--request` as its stable

@@ -97,6 +97,7 @@ docs/guides/*
 !docs/guides/chat-attachments.md
 !docs/guides/ci-performance.md
 !docs/guides/connections.md
+!docs/guides/delivery.md
 !docs/guides/crm-package-setup.md
 !docs/guides/external-agents-social.md
 !docs/guides/hosted-image-media.md
