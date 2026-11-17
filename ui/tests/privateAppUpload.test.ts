@@ -32,6 +32,15 @@ async function main() {
   responses = [{ status: 200, body: { ...review, compatibility: { ...review.compatibility, checks: [{ kind: "contract" }] } } }];
   await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.status === 502,
     "an incomplete compatibility check cannot become install consent");
+  const failedCheck = { kind: "core", required: "2", host: "1", ok: false };
+  responses = [{ status: 200, body: { ...review, compatibility: { ...review.compatibility, checks: [failedCheck] } } }];
+  await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.status === 502,
+    "a failed compatibility check cannot be presented as compatible");
+  responses = [{ status: 200, body: { ...review, compatibility: { ...review.compatibility, ok: false, compatible: false, checks: [{ ...failedCheck, ok: true }] } } }];
+  await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.status === 502,
+    "a contradictory incompatible verdict cannot become a review");
+  responses = [{ status: 200, body: { ...review, compatibility: { ...review.compatibility, ok: false, compatible: false, checks: [failedCheck] } } }];
+  equal((await checkPrivateApp(file, null)).compatible, false, "a consistent incompatible review remains visible");
   responses = [{ status: 409, body: { ok: false, error: { code: "host_incompatible", message: "Unsupported tool." } } }];
   await rejected(checkPrivateApp(file, null), (error: unknown) => error instanceof ApiError && error.code === "host_incompatible",
     "a nested host refusal retains its explanation");

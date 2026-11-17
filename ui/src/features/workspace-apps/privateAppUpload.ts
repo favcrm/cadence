@@ -70,15 +70,20 @@ function declaredAccess(value: unknown): value is PrivateReview["declared"] {
     Object.values(value.capabilities).every(slot);
 }
 function compatibility(value: unknown): value is { compatible: boolean } {
-  return object(value) && value.schema === 1 && typeof value.declared === "boolean" &&
-    typeof value.ok === "boolean" && typeof value.compatible === "boolean" &&
-    value.ok === value.compatible && Array.isArray(value.checks) &&
-    value.checks.every((check) => object(check) && typeof check.ok === "boolean" &&
-      (check.kind === "core"
-        ? typeof check.required === "string" && typeof check.host === "string"
-        : check.kind === "contract" && typeof check.contract === "string" &&
-          Array.isArray(check.required) && check.required.every(Number.isInteger) &&
-          Array.isArray(check.supported) && check.supported.every(Number.isInteger)));
+  if (!object(value) || value.schema !== 1 || typeof value.declared !== "boolean" ||
+      typeof value.ok !== "boolean" || typeof value.compatible !== "boolean" ||
+      value.ok !== value.compatible || !Array.isArray(value.checks)) return false;
+  let allPassed = true;
+  for (const check of value.checks) {
+    if (!object(check) || typeof check.ok !== "boolean" ||
+        !(check.kind === "core"
+          ? typeof check.required === "string" && typeof check.host === "string"
+          : check.kind === "contract" && typeof check.contract === "string" &&
+            Array.isArray(check.required) && check.required.every(Number.isInteger) &&
+            Array.isArray(check.supported) && check.supported.every(Number.isInteger))) return false;
+    if (!check.ok) allPassed = false;
+  }
+  return value.compatible === allPassed;
 }
 function refusalCode(value: unknown): string | undefined {
   const reason = object(value) && object(value.error) ? value.error : value;
