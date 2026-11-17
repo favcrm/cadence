@@ -40,6 +40,7 @@ mod hosted_assignments;
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_calendar_query;
 mod app_records_rpc;
+mod app_routines_list;
 mod app_runs_rpc;
 mod app_screen_services_rpc;
 #[cfg(feature = "test-seam")]
