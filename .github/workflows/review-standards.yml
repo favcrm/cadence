@@ -464,7 +464,7 @@ jobs:
                 if (d === null || typeof d !== 'object' || Array.isArray(d) || d.error !== undefined ||
                     (d.choices !== undefined && !Array.isArray(d.choices))) { failed = true; continue; }
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
-                  if (stop !== null) { failed = true; continue; }
+                  if (largeInput && stop !== null) { failed = true; continue; }
                   if (c.index !== 0) { failed = true; continue; }
                   if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
                   if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { failed = true; continue; }
