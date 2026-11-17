@@ -643,3 +643,4 @@ mod app_works;
 mod cad1962_media_asset_detail;
 mod effect_lifecycle;
 mod social_publish;
+mod workspace_settings;

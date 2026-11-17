@@ -509,6 +509,10 @@ const CATALOG: &[(&str, &[&str])] = &[
     ),
     ("app_update_preferences", &["install_id", "automatic"]),
     (
+        "workspace_settings",
+        &["name", "value", "updated", "updated_by"],
+    ),
+    (
         "artifacts",
         &[
             "id",

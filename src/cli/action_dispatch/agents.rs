@@ -215,6 +215,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             exec_max_failures,
         ),
         Commands::Skill { action } => skill::run(state_dir, action),
+        Commands::WorkspaceSkill { action } => workspace_skill::run_native(&action),
         Commands::Events {
             alias,
             job,

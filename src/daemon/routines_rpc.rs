@@ -484,7 +484,11 @@ impl Shared {
             .to_string();
         let cron = optional_str(params, "cron").map(str::to_string);
         let interval_mins = params.get("interval_mins").and_then(Value::as_i64);
-        let timezone = optional_str(params, "timezone").map(str::to_string);
+        let mut timezone = optional_str(params, "timezone").map(str::to_string);
+        if trigger_kind == "schedule" {
+            // CAD-2378: a schedule that names no zone runs in the company zone.
+            timezone = Some(self.store.schedule_zone_or_company(timezone)?);
+        }
         let event_source = optional_str(params, "event_source").map(str::to_string);
         let target_kind = required_str(params, "target_kind")?.to_string();
         let markdown_path = optional_str(params, "markdown_path").map(str::to_string);

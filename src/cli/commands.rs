@@ -1241,6 +1241,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// A hosted workspace's own skills (CAD-2396): list, show, check and draft
+    /// a SKILL.md package; a workspace owner approves or revokes one exact
+    /// revision. Needs `--org`. Not `cadence skill`, which installs this
+    /// build's bundled guidance on this machine.
+    WorkspaceSkill {
+        #[command(subcommand)]
+        action: super::workspace_skill::WorkspaceSkillAction,
+    },
     /// Read the durable event log for an agent.
     Events {
         /// Agent alias or provider-native id (Devin slug, Codex thread).
