@@ -181,6 +181,33 @@ other apps' records. It is a read, so members and read-only mounts may call it.
   text, caption or recipient. The consent page shows the host's own sentence
   for an app that declares it; the bundle cannot reword it.
 
+### Routines: `routines.list`
+
+A `screen-records.v1` screen that declares `routines.list` (with the
+`records.call` permission) can list the workspace's routines without reading
+their content. Routines are an operator read today, so only an operator session
+may call it; a member or a read-only mount is refused with the same forbidden
+refusal as any other operator-only call, and no row is returned.
+
+- Request `{}`: no arguments. Any key is refused.
+- Reply exactly `{routines: [row]}`, at most 500 rows, ordered by agent then
+  name. A row has exactly these keys:
+  - `id`: the routine id.
+  - `name`: at most 200 characters.
+  - `agent`: the owning agent alias, at most 120 characters.
+  - `schedule_text`: a plain summary of the trigger, at most 300 characters,
+    such as "Weekdays at 09:00 (Asia/Hong_Kong)", "Every 15 min" or
+    "When <event>". A schedule is written in the company time zone; a routine
+    that names a different zone is written in its own zone, named in the text.
+  - `next_run_at`: optional, an RFC 3339 UTC instant of the next due time.
+    Omitted when there is none.
+  - `status`: `on`, `paused` or `repoint`.
+  - `asks_first`: true when any checklist step requires approval.
+- It never carries routine markdown or script content, paths, digests, inputs,
+  the destination thread, the connection account or run output. The consent
+  page shows the host's own row, "Lists your routines: names, schedules and
+  status only", for an app that declares it.
+
 ## 4. Local loop
 
 ```sh

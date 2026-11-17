@@ -244,6 +244,7 @@ var RECORD_CALL_VERBS = [
 	"works.restore",
 	"works.request_review",
 	"calendar.query",
+	"routines.list",
 	"catalog.call",
 	"catalog.status"
 ];

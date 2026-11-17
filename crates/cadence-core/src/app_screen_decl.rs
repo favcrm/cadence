@@ -398,6 +398,10 @@ pub enum ScreenOperation {
     // and it carries titles, instants and states only.
     #[serde(rename = "calendar.query")]
     CalendarQuery,
+    // CAD-2402: the workspace's routines as names, schedules and status. An
+    // operator-session CALL; deliberately not a read-only-mount operation.
+    #[serde(rename = "routines.list")]
+    RoutinesList,
 }
 
 impl ScreenOperation {
@@ -1976,6 +1980,21 @@ mod tests {
 
         let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["calendar.update"]);
         assert!(validate_map(&unknown, &bodies).is_err());
+    }
+
+    /// CAD-2402: `routines.list` is a CALL that parses with `records.call`
+    /// alone. It is not a SLOT and not a read-only-mount operation, so only an
+    /// operator session can call it.
+    #[test]
+    fn routines_list_is_an_operator_call_that_parses() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &["routines.list"]);
+        let checked = validate_map(&call, &bodies).expect("routines.list validates");
+        assert_eq!(checked.operations(), &[ScreenOperation::RoutinesList]);
+        assert!(!ScreenOperation::RoutinesList.is_slot());
+        assert!(!ScreenOperation::RoutinesList.is_screen_read());
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["routines.list"]);
+        assert!(validate_map(&slot_only, &bodies).is_err());
     }
 
     /// The seam this operation exists for: a host-only operation passes the
