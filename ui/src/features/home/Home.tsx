@@ -42,6 +42,8 @@ import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
+import { homeDecisions } from "../decisions/useDecisions";
+import { StagedSourceContext } from "../../ui/StagedChip";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
@@ -1526,6 +1528,8 @@ function MasterHome({
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
+    <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1773,6 +1777,7 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </StagedSourceContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

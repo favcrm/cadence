@@ -106,6 +106,8 @@ import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
 import ConversationDecisions from "./ConversationDecisions";
+import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
+import { StagedSourceContext } from "../../../ui/StagedChip";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -714,8 +716,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   }, []);
   const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
   const operationPending = operationState?.scope === operationScope && operationState.pending;
-  const stagedPending = hosted && viewer.operator === true && !viewer.readOnly && convId !== null &&
-    stagedState?.conversation === convId && stagedState.pending;
+  const decisionsOn = hosted && viewer.operator === true && !viewer.readOnly && convId !== null;
+  // CAD-2364: one store for this conversation's decisions and its answers' chips.
+  // Held in state, not a memo React may drop: a new conversation gets a new store, a re-render never does.
+  const [decisionHold, setDecisionHold] = useState<{ conversation: string; store: DecisionsStore } | null>(null);
+  const decisionStore = !decisionsOn || convId === null
+    ? null
+    : decisionHold?.conversation === convId
+      ? decisionHold.store
+      : null;
+  useEffect(() => {
+    if (decisionsOn && convId !== null && decisionHold?.conversation !== convId)
+      setDecisionHold({ conversation: convId, store: conversationDecisions(convId) });
+  }, [decisionsOn, convId, decisionHold]);
+  const stagedPending = decisionsOn && stagedState?.conversation === convId && stagedState.pending;
   useEffect(() => {
     onPendingDecision?.(operationPending || stagedPending);
   }, [onPendingDecision, operationPending, stagedPending]);
@@ -2188,6 +2202,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
+      <StagedSourceContext.Provider value={decisionStore}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2335,9 +2350,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </StagedSourceContext.Provider>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
-      {hosted && convId !== null && viewer.operator === true && !viewer.readOnly && (
-        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
+      {decisionsOn && convId !== null && decisionStore !== null && (
+        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
