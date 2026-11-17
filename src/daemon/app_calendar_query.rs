@@ -277,14 +277,82 @@ pub(super) struct RoutineFacts {
     pub thread_live: bool,
 }
 
+/// Most slots a routine may put in one day and still be shown per slot.
+const SLOTS_PER_DAY_MAX: usize = 4;
+/// A hard stop on one routine's expansion; far above any 62-day schedule
+/// the engine admits at its 15-minute floor.
+const SLOTS_EXPAND_MAX: usize = 10_000;
+
+/// Every slot strictly after `after` and before `to`, oldest first.
+fn slots_between(routine: &Routine, after: i64, to: i64) -> Vec<i64> {
+    let zone = routine.timezone.as_deref().unwrap_or("UTC");
+    let mut out = Vec::new();
+    let mut after = after;
+    // `next_due_instant` answers strictly after its argument. An error (no
+    // instant in the next year, an invalid schedule) ends the expansion.
+    while let Ok(slot) =
+        next_due_instant(routine.cron.as_deref(), routine.interval_mins, zone, after)
+    {
+        if slot >= to || out.len() >= SLOTS_EXPAND_MAX {
+            break;
+        }
+        out.push(slot);
+        after = slot;
+    }
+    out
+}
+
+fn local_day(zone: Tz, epoch: i64) -> NaiveDate {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .unwrap_or_default()
+        .with_timezone(&zone)
+        .date_naive()
+}
+
+/// The title suffix of a routine that fires more than
+/// [`SLOTS_PER_DAY_MAX`] times in a day, else `None`. Judged from the
+/// schedule alone (two days from the window start), not from what is left
+/// of the window, so a past window collapses the same way.
+fn frequent_suffix(routine: &Routine, zone: Tz, from: i64) -> Option<String> {
+    if routine.trigger_kind != "schedule" {
+        return None;
+    }
+    let probe = slots_between(routine, from - 1, from + 2 * 86_400);
+    let mut per_day: BTreeMap<NaiveDate, usize> = BTreeMap::new();
+    for slot in probe {
+        *per_day.entry(local_day(zone, slot)).or_default() += 1;
+    }
+    if per_day.values().all(|n| *n <= SLOTS_PER_DAY_MAX) {
+        return None;
+    }
+    Some(match (routine.cron.as_deref(), routine.interval_mins) {
+        (None, Some(mins)) => format!("every {mins} min"),
+        _ => "several times a day".to_string(),
+    })
+}
+
+/// How bad a run's state is for the day's summary: failed or skipped beats
+/// ran, and ran beats planned.
+fn state_rank(state: &str) -> u8 {
+    if state.starts_with("fail") || state.starts_with("skipped") || state.contains("error") {
+        3
+    } else if state == "scheduled" || state == "repoint_required" {
+        1
+    } else {
+        2
+    }
+}
+
 /// Routine slots and runs in `[from, to)` as `routine` entries. A run in the
 /// window is its recorded state; a future slot in a routine that is on (or
 /// waiting for a new thread) is expanded from its cron or interval in the
 /// routine's own zone and takes its run's place when one exists at that
 /// instant. `needs_you` is a routine whose thread is gone (`repoint_required`).
-/// A schedule the engine cannot expand (no instant in the next year) adds no
-/// slots; it is not a failed source. Past the per-source bound the whole
-/// source fails.
+/// A routine that fires more than four times a day is one all-day entry per
+/// day instead (title `<name> · every N min` or `· several times a day`),
+/// whose state is the worst of that day's runs and planned slots. A schedule
+/// the engine cannot expand adds no slots; it is not a failed source. Past
+/// the per-source bound the whole source fails.
 pub(super) fn routine_entries(
     routines: &[RoutineFacts],
     runs: &[RoutineRun],
@@ -293,65 +361,86 @@ pub(super) fn routine_entries(
     now: i64,
 ) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    let mut seen: HashSet<(String, i64)> = HashSet::new();
-    let by_id: BTreeMap<&str, &RoutineFacts> = routines
-        .iter()
-        .map(|facts| (facts.routine.id.as_str(), facts))
-        .collect();
-    for run in runs {
-        let Some(facts) = by_id.get(run.routine_id.as_str()) else {
-            continue;
-        };
-        seen.insert((run.routine_id.clone(), run.due_instant));
-        out.push(Entry {
-            source: "routine",
-            id: entry_id(&["routine", &run.routine_id, &run.due_instant.to_string()]),
-            when: When::At(run.due_instant),
-            title: title_of(&facts.routine.name, "Routine"),
-            state: state_word(&run.state),
-            needs_you: false,
-        });
-        if out.len() > SOURCE_MAX {
-            return Err(Error::rejected("routine entries exceed the calendar bound"));
-        }
-    }
     for facts in routines {
         let routine = &facts.routine;
+        let zone: Tz = routine
+            .timezone
+            .as_deref()
+            .and_then(|name| name.parse().ok())
+            .unwrap_or(Tz::UTC);
         let repoint = routine.status == "repoint_required"
             || (routine.destination_thread.is_some() && !facts.thread_live);
-        if routine.trigger_kind != "schedule" || !(routine.status == "on" || repoint) {
-            continue;
-        }
-        let zone = routine.timezone.as_deref().unwrap_or("UTC");
-        // `next_due_instant` answers strictly after its argument, so a slot
-        // exactly at the window start is reached from one second before.
-        let mut after = (from - 1).max(now);
-        while let Ok(slot) =
-            next_due_instant(routine.cron.as_deref(), routine.interval_mins, zone, after)
-        {
-            if slot >= to {
-                break;
-            }
-            after = slot;
-            if seen.contains(&(routine.id.clone(), slot)) {
-                continue;
-            }
-            out.push(Entry {
-                source: "routine",
-                id: entry_id(&["routine", &routine.id, &slot.to_string()]),
-                when: When::At(slot),
-                title: title_of(&routine.name, "Routine"),
-                state: if repoint {
-                    "repoint_required"
-                } else {
-                    "scheduled"
+        let live = routine.trigger_kind == "schedule" && (routine.status == "on" || repoint);
+        let mine: Vec<&RoutineRun> = runs.iter().filter(|r| r.routine_id == routine.id).collect();
+        let upcoming = if live {
+            slots_between(routine, (from - 1).max(now), to)
+        } else {
+            Vec::new()
+        };
+        let planned = if repoint {
+            "repoint_required"
+        } else {
+            "scheduled"
+        };
+        if let Some(suffix) = frequent_suffix(routine, zone, from) {
+            // (rank, state, has a planned slot) of each local day.
+            let mut days: BTreeMap<NaiveDate, (u8, String, bool)> = BTreeMap::new();
+            let mut note = |day: NaiveDate, state: &str, is_plan: bool| {
+                let rank = state_rank(state);
+                let slot = days.entry(day).or_insert((0, String::new(), false));
+                if rank > slot.0 {
+                    slot.0 = rank;
+                    slot.1 = state.to_string();
                 }
-                .to_string(),
-                needs_you: repoint,
-            });
-            if out.len() > SOURCE_MAX {
-                return Err(Error::rejected("routine entries exceed the calendar bound"));
+                slot.2 |= is_plan;
+            };
+            for run in &mine {
+                note(
+                    local_day(zone, run.due_instant),
+                    &state_word(&run.state),
+                    false,
+                );
             }
+            for slot in &upcoming {
+                note(local_day(zone, *slot), planned, true);
+            }
+            let title = format!("{} · {suffix}", title_of(&routine.name, "Routine"));
+            for (day, (_, state, has_plan)) in days {
+                out.push(Entry {
+                    source: "routine",
+                    id: entry_id(&["routine", &routine.id, "day", &day.to_string()]),
+                    when: When::Day(day),
+                    title: title.chars().take(TITLE_MAX).collect(),
+                    state,
+                    needs_you: repoint && has_plan,
+                });
+            }
+        } else {
+            let mut seen: HashSet<i64> = HashSet::new();
+            for run in &mine {
+                seen.insert(run.due_instant);
+                out.push(Entry {
+                    source: "routine",
+                    id: entry_id(&["routine", &routine.id, &run.due_instant.to_string()]),
+                    when: When::At(run.due_instant),
+                    title: title_of(&routine.name, "Routine"),
+                    state: state_word(&run.state),
+                    needs_you: false,
+                });
+            }
+            for slot in upcoming.into_iter().filter(|s| !seen.contains(s)) {
+                out.push(Entry {
+                    source: "routine",
+                    id: entry_id(&["routine", &routine.id, &slot.to_string()]),
+                    when: When::At(slot),
+                    title: title_of(&routine.name, "Routine"),
+                    state: planned.to_string(),
+                    needs_you: repoint,
+                });
+            }
+        }
+        if out.len() > SOURCE_MAX {
+            return Err(Error::rejected("routine entries exceed the calendar bound"));
         }
     }
     Ok(out)
@@ -880,25 +969,85 @@ mod tests {
     }
 
     #[test]
-    fn expanding_past_the_bound_fails_the_source() {
-        // Every fifteen minutes for a week is 672 slots, over the bound.
+    fn a_frequent_routine_is_one_all_day_entry_per_day() {
         let mut busy = routine("rt_5", "on", None, "UTC");
         busy.interval_mins = Some(15);
         let (from, to) = (
             day_start(Tz::UTC, week().from),
             day_start(Tz::UTC, week().to),
         );
-        let result = routine_entries(
+        // A failed run on Tuesday outranks that day's planned slots.
+        let tue = epoch("2026-11-17T10:00:00Z");
+        let entries = routine_entries(
             &[RoutineFacts {
                 routine: busy,
                 thread_live: true,
             }],
-            &[],
+            &[run("rt_5", tue, "failed")],
             from,
             to,
             from - 1,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 7);
+        assert!(entries.iter().all(|e| matches!(e.when, When::Day(_))));
+        assert!(entries
+            .iter()
+            .all(|e| e.title == "Weekly outline · every 15 min"));
+        let tuesday = entries
+            .iter()
+            .find(|e| e.when == When::Day(day("2026-11-17")))
+            .unwrap();
+        assert_eq!(tuesday.state, "failed");
+        assert_eq!(entries[0].state, "scheduled");
+        let reply = assemble(
+            Tz::UTC,
+            vec![SourceResult::from_result("routine", Ok(entries))],
         );
-        assert!(result.is_err());
+        assert_eq!(reply["sources"], json!([{"source": "routine", "ok": true}]));
+        assert_eq!(reply["entries"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn a_four_a_day_cron_keeps_timed_slots_and_a_busier_one_collapses() {
+        let (from, to) = (
+            day_start(Tz::UTC, week().from),
+            day_start(Tz::UTC, week().to),
+        );
+        let entries = |cron: &str| {
+            routine_entries(
+                &[RoutineFacts {
+                    routine: routine("rt_6", "on", Some(cron), "UTC"),
+                    thread_live: true,
+                }],
+                &[],
+                from,
+                to,
+                from - 1,
+            )
+            .unwrap()
+        };
+        let four = entries("0 6,10,14,18 * * *");
+        assert_eq!(four.len(), 28);
+        assert!(four.iter().all(|e| matches!(e.when, When::At(_))));
+        let five = entries("0 6,9,12,15,18 * * *");
+        assert_eq!(five.len(), 7);
+        assert!(five
+            .iter()
+            .all(|e| e.title.ends_with("· several times a day")));
+    }
+
+    #[test]
+    fn the_source_bound_still_fails_closed_across_many_routines() {
+        let from = day_start(Tz::UTC, week().from);
+        // Each is one timed daily slot; together they pass the bound.
+        let many: Vec<RoutineFacts> = (0..=SOURCE_MAX)
+            .map(|n| RoutineFacts {
+                routine: routine(&format!("rt_{n}"), "on", Some("0 9 * * *"), "UTC"),
+                thread_live: true,
+            })
+            .collect();
+        assert!(routine_entries(&many, &[], from, from + 86_400, from - 1).is_err());
     }
 
     #[test]
