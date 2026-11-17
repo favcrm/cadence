@@ -70,6 +70,14 @@ equal(
   "Photo conversion is unavailable — try again later",
   "hosted conversion failures show the actionable reason",
 );
+const heicFailure = userUploadError(
+  "chat upload refused: HEIC and HEIF photos aren't supported. Export as JPEG or PNG, then attach again.",
+);
+equal(
+  displayAttachError(heicFailure, (text) => translateUiText(text, "zh-TW")),
+  "不支援 HEIC 或 HEIF 相片。請匯出為 JPEG 或 PNG，然後重新附加。",
+  "an unsupported HEIC upload explains how to attach a supported image",
+);
 const photoFailure = userUploadError("chat upload refused: the photo could not be processed — retry or choose another image");
 equal(
   displayAttachError(photoFailure, (text) => translateUiText(text, "zh-TW")),

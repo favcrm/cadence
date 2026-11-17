@@ -32,7 +32,6 @@ pub enum Format {
     Jpeg = 1,
     Png = 2,
     Webp = 3,
-    Heic = 4,
 }
 
 impl Format {
@@ -41,7 +40,6 @@ impl Format {
             "image/jpeg" => Some(Self::Jpeg),
             "image/png" => Some(Self::Png),
             "image/webp" => Some(Self::Webp),
-            "image/heic" | "image/heif" => Some(Self::Heic),
             _ => None,
         }
     }
@@ -299,99 +297,6 @@ fn decode_png16(bytes: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, usize
     Ok((pixels, channels))
 }
 
-fn decode_heic(bytes: &[u8], max_side: u32, max_pixels: u64) -> Result<Decoded> {
-    let context = heic_rs::context::Context::open(bytes).map_err(|_| ImageError::Invalid)?;
-    let id = context.meta.primary;
-    let props = context.props(id).map_err(|_| ImageError::Invalid)?;
-    if props.nclx.is_some_and(|color| {
-        matches!(color.transfer, 16 | 18)
-            || matches!(
-                color.matrix,
-                heic_rs::props::colr::MatrixCoefficients::Other(_)
-            )
-    }) {
-        return Err(ImageError::Unsupported);
-    }
-    let mut gray_profile = false;
-    let icc = match (props.icc, props.nclx) {
-        (Some(profile), _) => {
-            match containers::validate_icc(profile)? {
-                moxcms::DataColorSpace::Rgb => {}
-                moxcms::DataColorSpace::Gray => gray_profile = true,
-                _ => return Err(ImageError::Unsupported),
-            }
-            Some(profile.to_vec())
-        }
-        // The P3/sRGB-transfer profile is CC0 1.0 from heic.fyi's sample files.
-        (None, Some(color)) if color.primaries == 12 && color.transfer == 13 => {
-            Some(include_bytes!("display-p3.icc").to_vec())
-        }
-        (None, Some(color))
-            if matches!(color.primaries, 1 | 2) && matches!(color.transfer, 1 | 2 | 13) =>
-        {
-            None
-        }
-        (None, None) => None,
-        _ => return Err(ImageError::Unsupported),
-    };
-    let (width, height) = context
-        .coded_size(id, &props)
-        .map_err(|_| ImageError::Invalid)?;
-    dimensions(width, height, max_side, max_pixels)?;
-    let info = heic_rs::probe(bytes).map_err(|_| ImageError::Invalid)?;
-    dimensions(info.width, info.height, max_side, max_pixels)?;
-    let mut mapping = Mapping::new(width, height);
-    for transform in &props.transforms {
-        mapping.push(*transform)?;
-    }
-    if props.transforms.is_empty() {
-        if let Some(tiff) = context.exif(id).map_err(|_| ImageError::Invalid)? {
-            mapping.exif(jpeg::exif_orientation(tiff)?.unwrap_or(1))?;
-        }
-    }
-    let channels = if info.has_alpha { 4 } else { 3 };
-    let layout = if channels == 4 {
-        heic_rs::PixelLayout::Rgba8
-    } else {
-        heic_rs::PixelLayout::Rgb8
-    };
-    let options = heic_rs::DecodeOptions::default()
-        .with_layout(layout)
-        .with_max_pixels(Some(max_pixels))
-        .with_transforms(false)
-        .with_strict(true);
-    let image = heic_rs::decode(bytes, &options).map_err(|error| match error {
-        heic_rs::Error::Unsupported(_) => ImageError::Unsupported,
-        heic_rs::Error::PixelLimit { .. } => ImageError::TooLarge,
-        _ => ImageError::Invalid,
-    })?;
-    if image.width != width || image.height != height {
-        return Err(ImageError::Invalid);
-    }
-    if gray_profile
-        && image
-            .data
-            .chunks_exact(channels)
-            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2])
-    {
-        return Err(ImageError::Invalid);
-    }
-    Ok(Decoded {
-        pixels: image.data,
-        width,
-        channels,
-        mapping,
-        source_end: bytes.len(),
-        clean_source: None,
-        native_png16: false,
-        png_custom_color: false,
-        gray_profile,
-        unconvertible_icc: false,
-        unchanged: false,
-        icc,
-    })
-}
-
 fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
     let max_size = if native {
         NATIVE_INPUT_MAX
@@ -409,15 +314,13 @@ fn decode(bytes: &[u8], format: Format, native: bool) -> Result<Decoded> {
     } else {
         PHOTO_MAX_SIDE
     };
-    let max_pixels = if native || matches!(format, Format::Jpeg | Format::Heic) {
+    let max_pixels = if native || matches!(format, Format::Jpeg) {
         PHOTO_MAX_PIXELS
     } else {
         OTHER_MAX_PIXELS
     };
     match format {
         Format::Jpeg => decode_jpeg(bytes, max_side, max_pixels, native),
-        Format::Heic if !native => decode_heic(bytes, max_side, max_pixels),
-        Format::Heic => Err(ImageError::Unsupported),
         Format::Png => {
             let containers::Png {
                 width,

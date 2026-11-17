@@ -117,6 +117,7 @@ const zhTW: Record<string, string> = {
   "Stored only · assistant cannot read content": "僅已儲存 · 助理無法讀取內容",
   "Photo conversion is unavailable — try again later": "相片轉換功能暫時無法使用，請稍後重試",
   "The photo could not be processed — retry or choose another image": "無法處理此相片，請重試或選擇另一張圖片",
+  "HEIC and HEIF photos aren't supported. Export as JPEG or PNG, then attach again.": "不支援 HEIC 或 HEIF 相片。請匯出為 JPEG 或 PNG，然後重新附加。",
   "The photo could not be read safely — try another image": "無法安全讀取此相片，請選擇另一張圖片",
   "The photo exceeds the supported dimensions — choose a smaller image": "相片尺寸超出支援範圍，請選擇較小的圖片",
   "The image is malformed or incomplete — try another image": "圖片格式有誤或不完整，請選擇另一張圖片",

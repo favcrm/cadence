@@ -15,4 +15,3 @@ flate2 = "=1.1.10"
 png = "=0.18.1"
 libjpeg-turbo-rs = { version = "=0.9.0", default-features = false }
 moxcms = { version = "=0.8.1", default-features = false }
-heic-rs = { version = "=0.1.4", default-features = false }

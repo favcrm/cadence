@@ -1,19 +1,11 @@
-use heic_rs::props::simple::{Mirror, Rotation};
-use heic_rs::Transform;
-
 use crate::{ImageError, Result};
-
-#[derive(Clone, Copy)]
-enum Inverse {
-    Crop(u32, u32),
-    Rotate(Rotation, u32, u32),
-    Mirror(Mirror, u32, u32),
-}
 
 /// Map upright coordinates back to the unrotated decoder output. Doing this
 /// while downsampling avoids another full-sized allocation for phone photos.
 pub(crate) struct Mapping {
-    steps: Vec<Inverse>,
+    orientation: u8,
+    source_width: u32,
+    source_height: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -21,78 +13,41 @@ pub(crate) struct Mapping {
 impl Mapping {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            steps: Vec::new(),
+            orientation: 1,
+            source_width: width,
+            source_height: height,
             width,
             height,
         }
     }
 
-    pub fn push(&mut self, transform: Transform) -> Result<()> {
-        if self.steps.len() >= 16 {
+    pub fn exif(&mut self, orientation: u8) -> Result<()> {
+        if !(1..=8).contains(&orientation) {
             return Err(ImageError::Invalid);
         }
-        match transform {
-            Transform::Crop(crop) => {
-                let (x, y, width, height) =
-                    heic_rs::transform::crop_rect(self.width, self.height, crop)
-                        .map_err(|_| ImageError::Invalid)?;
-                self.steps.push(Inverse::Crop(x, y));
-                self.width = width;
-                self.height = height;
-            }
-            Transform::Rotate(rotation) => {
-                if rotation != Rotation::None {
-                    self.steps
-                        .push(Inverse::Rotate(rotation, self.width, self.height));
-                    if rotation.swaps_axes() {
-                        core::mem::swap(&mut self.width, &mut self.height);
-                    }
-                }
-            }
-            Transform::Mirror(mirror) => {
-                self.steps
-                    .push(Inverse::Mirror(mirror, self.width, self.height));
-            }
-        }
+        self.orientation = orientation;
+        (self.width, self.height) = if orientation >= 5 {
+            (self.source_height, self.source_width)
+        } else {
+            (self.source_width, self.source_height)
+        };
         Ok(())
     }
 
-    pub fn exif(&mut self, orientation: u8) -> Result<()> {
-        use Mirror::{LeftRight, TopBottom};
-        use Rotation::{Ccw180, Ccw270, Ccw90};
-        match orientation {
-            1 => {}
-            2 => self.push(Transform::Mirror(LeftRight))?,
-            3 => self.push(Transform::Rotate(Ccw180))?,
-            4 => self.push(Transform::Mirror(TopBottom))?,
-            5 => {
-                self.push(Transform::Mirror(LeftRight))?;
-                self.push(Transform::Rotate(Ccw90))?;
-            }
-            6 => self.push(Transform::Rotate(Ccw270))?,
-            7 => {
-                self.push(Transform::Mirror(LeftRight))?;
-                self.push(Transform::Rotate(Ccw270))?;
-            }
-            8 => self.push(Transform::Rotate(Ccw90))?,
-            _ => return Err(ImageError::Invalid),
+    pub(crate) fn source(&self, x: u32, y: u32) -> (u32, u32) {
+        let width = self.source_width;
+        let height = self.source_height;
+        match self.orientation {
+            1 => (x, y),
+            2 => (width - 1 - x, y),
+            3 => (width - 1 - x, height - 1 - y),
+            4 => (x, height - 1 - y),
+            5 => (y, x),
+            6 => (y, height - 1 - x),
+            7 => (width - 1 - y, height - 1 - x),
+            8 => (width - 1 - y, x),
+            _ => unreachable!("orientation is validated in exif"),
         }
-        Ok(())
-    }
-
-    pub(crate) fn source(&self, mut x: u32, mut y: u32) -> (u32, u32) {
-        for step in self.steps.iter().rev() {
-            (x, y) = match *step {
-                Inverse::Crop(left, top) => (x + left, y + top),
-                Inverse::Rotate(Rotation::Ccw90, width, _) => (width - 1 - y, x),
-                Inverse::Rotate(Rotation::Ccw180, width, height) => (width - 1 - x, height - 1 - y),
-                Inverse::Rotate(Rotation::Ccw270, _, height) => (y, height - 1 - x),
-                Inverse::Rotate(Rotation::None, _, _) => (x, y),
-                Inverse::Mirror(Mirror::LeftRight, width, _) => (width - 1 - x, y),
-                Inverse::Mirror(Mirror::TopBottom, _, height) => (x, height - 1 - y),
-            };
-        }
-        (x, y)
     }
 }
 

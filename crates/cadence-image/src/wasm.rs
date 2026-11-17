@@ -29,7 +29,6 @@ pub unsafe extern "C" fn photo_prepare(pointer: *const u8, length: usize, format
         1 => Some(Format::Jpeg),
         2 => Some(Format::Png),
         3 => Some(Format::Webp),
-        4 => Some(Format::Heic),
         _ => None,
     };
     let result = if pointer.is_null() || length == 0 || length > PHOTO_INPUT_MAX {

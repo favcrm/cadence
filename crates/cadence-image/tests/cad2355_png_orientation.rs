@@ -4,11 +4,15 @@ use cadence_image::{prepare, validate_native, Format};
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageReader};
 
 fn png_with_orientation(orientation: u16) -> Vec<u8> {
-    // An asymmetric 32x16 image: red on the left, blue on the right.
+    // Red on the left, blue on the right; green distinguishes top from bottom.
     let mut pixels = Vec::new();
-    for _ in 0..16 {
+    for y in 0..16 {
         for x in 0..32 {
-            pixels.extend_from_slice(if x < 16 { &[255, 0, 0] } else { &[0, 0, 255] });
+            pixels.extend_from_slice(&[
+                if x < 16 { 255 } else { 0 },
+                if y < 8 { 0 } else { 128 },
+                if x < 16 { 0 } else { 255 },
+            ]);
         }
     }
     let mut png = Vec::new();
@@ -81,6 +85,38 @@ fn png_exif_orientation_is_preserved_or_applied() {
         native_refused && hosted_refused,
         "invalid orientation: native_refused={native_refused}, hosted_refused={hosted_refused}"
     );
+}
+
+#[test]
+fn all_exif_orientations_keep_the_same_visible_pixels() {
+    fn upright(bytes: &[u8]) -> image::RgbImage {
+        let mut decoder = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .expect("identify PNG")
+            .into_decoder()
+            .expect("open PNG");
+        let orientation = decoder.orientation().expect("read orientation");
+        let mut image = DynamicImage::from_decoder(decoder).expect("decode pixels");
+        image.apply_orientation(orientation);
+        image.to_rgb8()
+    }
+
+    for orientation in 1..=8 {
+        let source = png_with_orientation(orientation);
+        let expected = upright(&source);
+        let native = validate_native(&source, "image/png").expect("prepare native PNG");
+        assert_eq!(
+            upright(native.as_ref()),
+            expected,
+            "native orientation {orientation}"
+        );
+        let hosted = prepare(&source, Format::Png).expect("prepare hosted PNG");
+        assert_eq!(
+            upright(&hosted.bytes),
+            expected,
+            "hosted orientation {orientation}"
+        );
+    }
 }
 
 #[test]
