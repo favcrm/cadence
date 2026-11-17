@@ -1,0 +1,110 @@
+{
+  "synthetic": "SYNTHETIC member history pages",
+  "empty_tail": {
+    "conversation": {
+      "id": "tc_00000000-0000-4000-8000-000000000001",
+      "alias": "master",
+      "created": "2026-01-01T00:00:00.000Z",
+      "updated": "2026-01-01T00:00:00.000Z"
+    },
+    "entries": [],
+    "cursor": null,
+    "before_cursor": null,
+    "more_before": false,
+    "more_after": false
+  },
+  "tail": {
+    "conversation": {
+      "id": "tc_00000000-0000-4000-8000-000000000001",
+      "alias": "master",
+      "created": "2026-01-01T00:00:00.000Z",
+      "updated": "2026-01-01T00:00:00.000Z"
+    },
+    "entries": [
+      {
+        "role": "operator",
+        "kind": "message",
+        "text": "third",
+        "message": "m-3",
+        "id": "csrid_3"
+      },
+      {
+        "role": "assistant",
+        "kind": "message",
+        "text": "fifth",
+        "id": "csrid_5"
+      }
+    ],
+    "cursor": "csc1_5",
+    "before_cursor": "csc1_3",
+    "more_before": true,
+    "more_after": false
+  },
+  "before": {
+    "conversation": {
+      "id": "tc_00000000-0000-4000-8000-000000000001",
+      "alias": "master",
+      "created": "2026-01-01T00:00:00.000Z",
+      "updated": "2026-01-01T00:00:00.000Z"
+    },
+    "entries": [
+      {
+        "role": "operator",
+        "kind": "message",
+        "text": "first",
+        "message": "m-1",
+        "id": "csrid_1"
+      },
+      {
+        "role": "assistant",
+        "kind": "message",
+        "text": "second",
+        "id": "csrid_2"
+      }
+    ],
+    "cursor": "csc1_2",
+    "before_cursor": "csc1_1",
+    "more_before": false,
+    "more_after": true
+  },
+  "forward": {
+    "conversation": {
+      "id": "tc_00000000-0000-4000-8000-000000000001",
+      "alias": "master",
+      "created": "2026-01-01T00:00:00.000Z",
+      "updated": "2026-01-01T00:00:00.000Z"
+    },
+    "entries": [
+      {
+        "role": "operator",
+        "kind": "message",
+        "text": "third",
+        "message": "m-3",
+        "id": "csrid_3"
+      },
+      {
+        "role": "assistant",
+        "kind": "message",
+        "text": "fifth",
+        "id": "csrid_5"
+      }
+    ],
+    "cursor": "csc1_5",
+    "before_cursor": "csc1_3",
+    "more_before": true,
+    "more_after": false
+  },
+  "caught_up": {
+    "conversation": {
+      "id": "tc_00000000-0000-4000-8000-000000000001",
+      "alias": "master",
+      "created": "2026-01-01T00:00:00.000Z",
+      "updated": "2026-01-01T00:00:00.000Z"
+    },
+    "entries": [],
+    "cursor": "csc1_5",
+    "before_cursor": null,
+    "more_before": true,
+    "more_after": false
+  }
+}
