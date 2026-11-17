@@ -73,6 +73,16 @@ pub(crate) enum WorkspaceSkillAction {
         #[arg(long)]
         digest: String,
     },
+    /// Delete an unapproved skill and all its revisions (revoke an approved one
+    /// first). The owner's act: a managed agent is refused before anything is
+    /// sent. A stale revision exits 5 and deletes nothing.
+    Delete {
+        /// The skill name.
+        name: String,
+        /// The latest revision you read (`show` or `list`).
+        #[arg(long)]
+        expect_rev: u64,
+    },
 }
 
 impl WorkspaceSkillAction {
@@ -84,11 +94,15 @@ impl WorkspaceSkillAction {
             Self::Draft { .. } => "workspace-skill draft",
             Self::Approve { .. } => "workspace-skill approve",
             Self::Revoke { .. } => "workspace-skill revoke",
+            Self::Delete { .. } => "workspace-skill delete",
         }
     }
-    /// Approve and revoke decide what every agent in the workspace reads.
+    /// Approve, revoke and delete decide what every agent in the workspace reads.
     fn is_owner_decision(&self) -> bool {
-        matches!(self, Self::Approve { .. } | Self::Revoke { .. })
+        matches!(
+            self,
+            Self::Approve { .. } | Self::Revoke { .. } | Self::Delete { .. }
+        )
     }
 }
 
@@ -107,9 +121,9 @@ pub(crate) fn refuse_managed_decision(
         return Err(Error::invalid(
             "managed_caller_refused",
             format!(
-                "`cadence {}` is refused for a managed agent: approving or revoking a \
-                 workspace skill is a workspace owner's decision. Save a draft and ask the \
-                 owner to review it. Nothing was sent.",
+                "`cadence {}` is refused for a managed agent: approving, revoking or \
+                 deleting a workspace skill is a workspace owner's decision. Save a draft and \
+                 ask the owner to review it. Nothing was sent.",
                 action.verb()
             ),
         ));
@@ -276,6 +290,11 @@ pub(crate) fn request_with(
             args.insert("digest".into(), json!(digest));
             "workspace_skill_revoke"
         }
+        WorkspaceSkillAction::Delete { name, expect_rev } => {
+            args.insert("name".into(), json!(name));
+            args.insert("expectedRevision".into(), json!(expect_rev));
+            "workspace_skill_delete"
+        }
     };
     Ok((verb, args))
 }
@@ -412,6 +431,14 @@ mod tests {
                 "workspace_skill_revoke",
                 json!({"name": "weekly", "digest": "sha256:ab"}),
             ),
+            (
+                WorkspaceSkillAction::Delete {
+                    name: "weekly".into(),
+                    expect_rev: 3,
+                },
+                "workspace_skill_delete",
+                json!({"name": "weekly", "expectedRevision": 3}),
+            ),
         ];
         for (action, verb, args) in cases {
             let (got_verb, got_args) = request_with(&action, &mut read).unwrap();
@@ -440,8 +467,12 @@ mod tests {
             dir: "pkg".into(),
             expect_rev: 0,
         };
+        let delete = WorkspaceSkillAction::Delete {
+            name: "weekly".into(),
+            expect_rev: 1,
+        };
         // A pinned identity is a managed caller whatever the environment says.
-        for action in [&approve, &revoke] {
+        for action in [&approve, &revoke, &delete] {
             let err = refuse_managed_decision(action, true).unwrap_err();
             assert_eq!(err.kind(), "rejected", "{err}");
             assert!(err.to_string().contains("managed agent"), "{err}");
