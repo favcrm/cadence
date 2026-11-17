@@ -337,6 +337,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "lists_absent": {
+          "description": "CAD-2386: the caller proved both list files are absent at the anchor\n(a definite \"not found\", never a failed read), so the product default\napplies. Absent or `false` keeps today's reading: a missing text is\nunreadable and fails closed. `true` with either text present refuses.",
+          "type": "boolean",
+          "default": false
+        },
         "one_review_paths": {
           "description": "The trusted base's `docs/roles/one-review-paths.toml` text.",
           "type": [
