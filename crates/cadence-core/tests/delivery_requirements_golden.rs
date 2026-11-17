@@ -1,5 +1,5 @@
 //! CAD-2386: golden acceptance corpus for `delivery_requirements::classify`.
-//! The fixture (`tests/cases/delivery_requirements_golden.json`) was recorded
+//! The fixture (`tests/golden/delivery_requirements.json`) was recorded
 //! from the hard-coded rules against this repository's own
 //! `docs/roles/{risk-paths,one-review-paths}.toml`; the test re-reads those
 //! lists, recomputes every case and asserts exact `Requirements` equality.
@@ -43,7 +43,7 @@ fn classify_matches_golden_corpus() {
     let fx: Value = serde_json::from_str(
         &std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/cases/delivery_requirements_golden.json"),
+                .join("tests/golden/delivery_requirements.json"),
         )
         .unwrap(),
     )
