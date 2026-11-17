@@ -9,7 +9,7 @@ import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import ScreenAudioModal from "./ScreenAudioModal";
 import { createScreenAudioSession, type ScreenAudioSessionController } from "./screenAudioSession";
-import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type AudioSessionRequest, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type AudioRecordingRequest, type AudioSessionRequest, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
 import { DrawerRestorer } from "./drawerRestore";
 import { SourcesInvalidator } from "./sourcesInvalidation";
 import { workspaceApps } from "../workspaceApps";
@@ -24,6 +24,7 @@ import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
+import { WorkspaceDialog } from "../WorkspaceDialog";
 
 /** The pane renderer: the outlet's typed failure and a retry that re-mounts
  *  this same projection without a reload. */
@@ -125,6 +126,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     signal: AbortSignal;
     resolve: (result: ActionResult) => void;
   } | null>(null);
+  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
+  useEffect(() => () => { if (playbackUrl) URL.revokeObjectURL(playbackUrl); }, [playbackUrl]);
   const audioKeyRef = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   // The board's applied pick, carried on the frame URL: a sandboxed frame is
@@ -237,7 +240,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   useLayoutEffect(() => {
     const generation = privateSessionGeneration();
     const controller = new AbortController();
-    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    const unsubscribe = onPrivateReadsPaused(() => { controller.abort(); setPlaybackUrl(null); });
     let operation: PrivateOperation | null = null;
     try {
       operation = beginPrivateOperation(controller.signal);
@@ -289,7 +292,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     };
     setState("loading");
     setFailure(null);
-    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]); setAudioModal(null);
+    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]); setAudioModal(null); setPlaybackUrl(null);
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
@@ -369,6 +372,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             actionToken,
             signal: session.signal,
             getLocale: () => presentationLocale.current,
+            confirmRetention: () => window.confirm(translateUiText("Save this recording in your workspace until you delete it?", presentationLocale.current)),
+            confirmDelete: () => window.confirm(translateUiText("Delete this recording? The transcript will stay.", presentationLocale.current)),
+            playRecording: audio => { if (isCurrent()) setPlaybackUrl(URL.createObjectURL(audio)); },
             onEvent: nextState => {
               if (isCurrent()) owned?.sendAudioSessionEvent(nextState);
             },
@@ -451,6 +457,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 !isCurrent() || !inlineAudio || ui.signal.aborted
                   ? Promise.resolve({ ok: false as const, refusal: { code: "cancelled", text: "Audio capture was cancelled." } })
                   : inlineAudio.dispatch(req, ui.signal),
+              audioRecording: (req: AudioRecordingRequest, ui: { actionToken: string; signal: AbortSignal }) =>
+                !isCurrent() || !inlineAudio || ui.signal.aborted
+                  ? Promise.resolve({ ok: false as const, refusal: { code: "cancelled", text: "Recording action was cancelled." } })
+                  : inlineAudio.recording(req, ui.signal),
               disposeAudioSession: () => inlineAudio?.dispose(),
             } : {}),
           } : undefined, undefined, unsaved => {
@@ -494,7 +504,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
-      setSlot(null); setLink(null); setPreview(null); setAudioModal(null);
+      setSlot(null); setLink(null); setPreview(null); setAudioModal(null); setPlaybackUrl(null);
       container.current?.replaceChildren();
       // A primary's retirement takes its child drawer with it; the shell
       // overlay closes so no blank blocking panel can remain.
@@ -540,6 +550,15 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         signal={audioModal.signal}
         onResolve={audioModal.resolve}
       />,
+      document.body,
+    )}
+    {playbackUrl && typeof document !== "undefined" && createPortal(
+      <WorkspaceDialog title={t("Meeting recording")} className="wa-confirm" onClose={() => setPlaybackUrl(null)}>
+        <div className="wa-stack">
+          <audio controls preload="metadata" src={playbackUrl} aria-label={t("Meeting recording")} style={{ maxWidth: "100%" }} />
+          <Button onClick={() => setPlaybackUrl(null)}>{t("Close")}</Button>
+        </div>
+      </WorkspaceDialog>,
       document.body,
     )}
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}

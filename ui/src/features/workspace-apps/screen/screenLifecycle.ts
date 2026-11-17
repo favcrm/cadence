@@ -1,9 +1,9 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, AUDIO_RETENTION_ACTION, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ScreenSection,
   type ScreenSectionI18n,
-  type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
+  type ActionResult, type AssetReply, type AudioRequest, type AudioRecordingRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
@@ -72,6 +72,7 @@ export interface ScreenActions {
   captureAudio?(mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
   /** CAD-2281: dispatch a headless inline audio session command (`screen-audio.v2`). */
   audioSession?(request: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  audioRecording?(request: AudioRecordingRequest, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
   disposeAudioSession?(): void;
 }
 /** Most calls one frame may have outstanding; one more closes it. */
@@ -251,6 +252,7 @@ export abstract class FrameChannel {
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
   protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
+  protected audioRecording(_request: AudioRecordingRequest): void { this.close(true); }
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -291,6 +293,10 @@ export abstract class FrameChannel {
       if (child.op === "audio-session") {
         if (!this.ready) { this.close(true); return; }
         this.audioSession(child);
+      }
+      if (child.op === "audio-recording") {
+        if (!this.ready) { this.close(true); return; }
+        this.audioRecording(child);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -591,6 +597,43 @@ export class ScreenChannel extends FrameChannel {
         reply({ v: 2, op: "audio-session-reply", id: request.id, ok: true, data: parsed });
       });
   }
+  protected audioRecording(request: AudioRecordingRequest): void {
+    if (this.shape !== "v2" || !this.records || !this.wantsAudioV2) { this.close(true); return; }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const dispatch = this.actions?.audioRecording;
+    const token = this.receipt.action_token;
+    if (!dispatch || !token || !this.hasBaseActions()) {
+      reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Recording storage is unavailable." } });
+      return;
+    }
+    if (this.audioSessionRetire.size >= CALL_QUEUE_MAX) { this.close(true); return; }
+    const retire = new AbortController();
+    this.audioSessionRetire.add(retire);
+    void dispatch(request, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "Recording storage failed." } }))
+      .then(result => {
+        this.audioSessionRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          const refusal = parseActionRefusal(result.refusal) ?? { code: "failed", text: "Recording storage failed." };
+          reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: false, refusal });
+          return;
+        }
+        const data = result.data;
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Recording storage returned an invalid result." } });
+          return;
+        }
+        const value = data as Record<string, unknown>;
+        if (request.action === "exists" && Object.keys(value).join() === "available" && typeof value.available === "boolean") {
+          reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: true, data: { available: value.available } });
+        } else if (request.action !== "exists" && Object.keys(value).join() === "ok" && value.ok === true) {
+          reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: true, data: { ok: true } });
+        } else {
+          reply({ v: 2, op: "audio-recording-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Recording storage returned an invalid result." } });
+        }
+      });
+  }
   protected audio(request: AudioRequest): void {
     if (this.shape !== "v2" || !this.wantsAudio) {
       this.close(true); return;
@@ -796,6 +839,11 @@ export class ScreenChannel extends FrameChannel {
     if (this.shape === "v2" && this.mediaAdmits("media.read")) projection.media_previews = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.chat.attach")) projection.media_chat_references = 1;
     if (this.shape === "v2" && ((this.wantsAudio && this.actions?.captureAudio) || (this.wantsAudioV2 && this.actions?.audioSession)) && this.receipt.action_token && hasBaseActions) projection.audio_capture = 1;
+    if (this.records && this.shape === "v2" && this.wantsAudioV2 && this.actions?.audioRecording &&
+        this.actions.audioSession && this.receipt.action_token && hasBaseActions && projection.actions &&
+        !projection.actions.includes(AUDIO_RETENTION_ACTION)) {
+      projection.actions = [...projection.actions, AUDIO_RETENTION_ACTION];
+    }
     const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
