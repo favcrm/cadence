@@ -9,6 +9,16 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "Run this tool?": "執行此工具？",
+  "Review this exact tool, input and price before confirming.": "確認前請檢查此工具、輸入內容及確切價格。",
+  "Tool": "工具",
+  "Slug": "工具識別碼",
+  "Price": "價格",
+  "Input": "輸入內容",
+  "Read data": "讀取資料",
+  "Create a draft": "建立草稿",
+  "If the result is unclear, check this request's status before trying again.": "如果結果不明，請先檢查此請求的狀態，再決定是否重試。",
+  "Run tool": "執行工具",
   "Member": "成員",
   "Expires {date}": "{date} 到期",
   "Only a workspace owner can manage members.": "只有工作區擁有者可以管理成員。",

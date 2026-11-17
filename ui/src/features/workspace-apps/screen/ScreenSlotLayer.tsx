@@ -7,6 +7,13 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
 }) {
   const [input, setInput] = useState(card.input?.value ?? "");
   const pressed = useRef(0);
+  const t = useTranslate();
+  const catalog = card.operation === "catalog.confirm";
+  const label = (text: string) => catalog ? t(text) : text;
+  const factValue = (fact: RecordCard["facts"][number]) =>
+    catalog && fact.label === "Effect" && (fact.value === "read" || fact.value === "draft")
+      ? `${t(fact.value === "read" ? "Read data" : "Create a draft")} (${fact.value})`
+      : fact.value;
   const titles: Record<string, string> = {
     "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?",
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
@@ -19,10 +26,10 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;
-  return <WorkspaceDialog title={card.title ?? titles[card.operation] ?? "Confirm app action?"} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+  return <WorkspaceDialog title={label(card.title ?? titles[card.operation] ?? "Confirm app action?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
     <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
-      {card.note ? <p>{card.note}</p> : <p>This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.</p>}
-      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.strong ? <strong style={{ fontSize: "1.25em" }}>{fact.value}</strong> : fact.value}</dd></div>)}</dl>
+      {card.note ? <p>{label(card.note)}</p> : <p>This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.</p>}
+      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{label(fact.label)}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.strong ? <strong style={{ fontSize: "1.25em" }}>{factValue(fact)}</strong> : factValue(fact)}</dd></div>)}</dl>
       {!!card.details?.length && <details><summary>Technical details</summary>
         <dl>{card.details.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd className="num" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.value}</dd></div>)}</dl>
       </details>}
@@ -31,14 +38,14 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
           : field.field === "brief" ? <textarea value={input} readOnly rows={6} />
           : <input className="wa-input" type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
       </label>}
-      <p>{card.retry ?? "No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect."}</p>
+      <p>{label(card.retry ?? "No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect.")}</p>
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-        <Button disabled={view.pending} onClick={() => onCancel(view.token)}>Cancel</Button>
+        <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{label("Cancel")}</Button>
         <button type="button" className="btn btn-primary" disabled={view.pending || invalid} aria-busy={view.pending}
           onPointerDown={e => { pressed.current = e.timeStamp; }} onClick={e => {
             const at = e.detail === 0 ? performance.now() : pressed.current; pressed.current = 0;
             onTap(view.token, e.isTrusted, at, input);
-          }}>{view.pending ? "Working…" : view.label}</button>
+          }}>{view.pending ? label("Working…") : label(view.label)}</button>
       </div>
     </div>
   </WorkspaceDialog>;
