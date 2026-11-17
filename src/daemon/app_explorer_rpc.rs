@@ -895,7 +895,18 @@ impl Shared {
             &bundle.files,
             crate::issue::app_screen_decl::ScreenOperation::CalendarQuery,
         );
-        let access = app_access::access_rows(&manifest, None, holds_records, personal, dated_reads);
+        let routines_list = crate::issue::app_screen_pkg::bundle_declares(
+            &bundle.files,
+            crate::issue::app_screen_decl::ScreenOperation::RoutinesList,
+        );
+        let access = app_access::access_rows(
+            &manifest,
+            None,
+            holds_records,
+            personal,
+            dated_reads,
+            routines_list,
+        );
         Ok(json!({
             "found": true,
             "name": manifest.app,
@@ -1888,7 +1899,7 @@ mod data_access_rows {
     fn records_without_personal_data_still_show_the_row() {
         let m = manifest("  data:\n    stores:\n      - Your orders\n    personal: false\n");
         assert_eq!(data_flags(&m), (true, false));
-        let rows = app_access::access_rows(&m, None, true, false, false);
+        let rows = app_access::access_rows(&m, None, true, false, false, false);
         let text = rows["access"].to_string();
         assert!(text.contains("Its own data"), "{text}");
         assert!(!text.contains("Personal data"), "{text}");
