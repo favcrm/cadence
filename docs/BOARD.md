@@ -1866,6 +1866,10 @@ response, including a cached `304`, only with the matching server proof.
 On native public boards, metadata and health recheck the session before
 returning its binding or counts. Conflicting public session cookies are
 refused without selecting, clearing, or replacing either credential.
+An explicit invalid-cookie metadata refusal explains the browser sign-in
+problem and warns that clearing site data may discard unsent changes. It pauses
+private reads and retains same-session in-memory drafts until Retry verifies
+the same identity; it does not clear cookies or promise saved work.
 Missing proof shows the updating state; a mismatch or unresolved refusal
 conceals the workspace until Retry or a network-restored check re-verifies the
 identity. Focus does not repeatedly reopen it while health proof is unresolved.

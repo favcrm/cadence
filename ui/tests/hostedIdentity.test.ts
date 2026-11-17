@@ -204,6 +204,21 @@ async function boundaryChecks() {
     response = () => json(hostedSession);
     await retry();
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "malformed metadata does not destroy the same-session draft");
+    for (const code of ["ambiguous_session", "invalid_session_cookie"]) {
+      const beforeConflict = privateSessionGeneration();
+      response = () => json({ code, error: "Browser session cannot be verified." }, 400);
+      await focus();
+      assert(host.querySelector("[data-auth-state='browser-session'] h1")?.textContent === "We can’t verify this browser’s sign-in.", "conflicting browser sessions explain the actual problem");
+      assert(host.textContent?.includes("Clearing this site’s data may discard unsent changes."), "recovery warns before site data is cleared");
+      assert(!privateReadsAllowed() && privateSessionGeneration() === beforeConflict, "cookie uncertainty pauses private reads without discarding the draft");
+      assert(!host.textContent?.includes("Use another account"), "another sign-in cannot resolve conflicting HttpOnly cookies");
+      const checks = proofHeaders.length;
+      await focus();
+      assert(proofHeaders.length === checks, "persistent browser-session errors do not repeatedly retry on focus");
+      response = () => json(hostedSession);
+      await retry();
+      assert(host.querySelector("output")?.textContent === "unsaved private draft", "retrying the verified same session restores the draft");
+    }
     healthResponse = () => new Response(JSON.stringify({ ok: true, pm_present: true, projects: 2, issues: 9, daemon: "reachable", embedded: true }), {
       headers: { "Content-Type": "application/json", "ETag": '"health-v1"', "X-Cadence-Verified-Session": binding("1") },
     });

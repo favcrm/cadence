@@ -17,7 +17,7 @@ import { hostedOrigin } from "./hosted";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
 
-type Status = "checking" | "signedout" | "unavailable" | "updating" | "expired" | "refused" | "changed" | "ready";
+type Status = "checking" | "signedout" | "unavailable" | "updating" | "browser-session" | "expired" | "refused" | "changed" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
 const IDENTITY_STORE = "cadence.privateSessionIdentity";
 const IDENTITY_CHANGE_STORE = "cadence.hostedIdentityConfirmationPending";
@@ -154,7 +154,7 @@ export default function AuthBoundary({ children }: {
     // Routine successful revalidation never hides/remounts the workspace.
     if (previous.status !== "ready") publish({ ...previous, status: "checking" });
     const current = () => request === sequence.current && key === sessionKey();
-    const unavailable = (status: "unavailable" | "updating" = "unavailable", hosted = false) => {
+    const unavailable = (status: "unavailable" | "updating" | "browser-session" = "unavailable", hosted = false) => {
       const focused = document.activeElement;
       if (stateRef.current.status === "ready" && focused instanceof HTMLElement && focused.closest("[data-app-shell]")) privateFocus.current = focused;
       pausePrivateReads();
@@ -260,7 +260,9 @@ export default function AuthBoundary({ children }: {
       return false;
     }).catch((error: unknown) => {
       if (!current()) return false;
-      if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
+      if (error instanceof ApiError && error.status === 400 && (error.code === "ambiguous_session" || error.code === "invalid_session_cookie")) {
+        unavailable("browser-session", true);
+      } else if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
         const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
         requireHostedConfirmation();
         discard();
@@ -330,8 +332,8 @@ export default function AuthBoundary({ children }: {
       setSession(null);
       publish({ ...stateRef.current, status: event.type === "cadence:hosted-health-updating" ? "updating" : "unavailable", hosted: true });
     };
-    const focused = () => { if (!document.hidden && !healthRecoveryPending.current) void recheck(); };
-    const online = () => { void recheck(); };
+    const focused = () => { if (!document.hidden && !healthRecoveryPending.current && stateRef.current.status !== "browser-session") void recheck(); };
+    const online = () => { if (stateRef.current.status !== "browser-session") void recheck(); };
     const shared = (event: StorageEvent) => {
       // Another tab replaced or removed the shared key. Drop this tab's
       // fallback copy and let `changed` re-verify (or sign out) before any
@@ -444,6 +446,7 @@ export default function AuthBoundary({ children }: {
     signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Sign in to Cadence." : "Sign in to your local board.", text: hosted ? "Use your AgenticOS account to open this workspace." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
     updating: { eyebrow: "Sign-in updating", heading: "Sign-in verification is updating.", text: "This workspace is updating its sign-in verification. Try again shortly.", icon: "alert" },
+    "browser-session": { eyebrow: "Browser sign-in needs attention", heading: "We can’t verify this browser’s sign-in.", text: "This browser sent invalid or conflicting sign-in information. Retry verification, or contact your workspace administrator. Clearing this site’s data may discard unsent changes.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
     changed: { eyebrow: "Sign-in changed", heading: "Confirm your current sign-in.", text: "Your sign-in changed. Unsent changes from the previous session may not have been saved. Review the current account before reopening this workspace.", icon: "shield" },
     expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: hosted ? "Your session ended. Unsent changes may not have been saved. Continue with AgenticOS to reopen your workspace." : "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
@@ -459,7 +462,7 @@ export default function AuthBoundary({ children }: {
         </header>
         <main className="auth-stage">
           {loginRoute && !loginExchanged ? <Login onSignedIn={onSignedIn} /> : <section className="auth-card" aria-labelledby="auth-title" aria-busy={checking}>
-            <div className={`auth-state-icon${state.status === "unavailable" || state.status === "updating" ? " auth-warn" : ""}`} aria-hidden="true">{checking ? <span className="auth-loader" /> : <GateIcon kind={gate.icon} />}</div>
+            <div className={`auth-state-icon${state.status === "unavailable" || state.status === "updating" || state.status === "browser-session" ? " auth-warn" : ""}`} aria-hidden="true">{checking ? <span className="auth-loader" /> : <GateIcon kind={gate.icon} />}</div>
             <p className="auth-eyebrow">{t(gate.eyebrow)}</p>
             <h1 id="auth-title" ref={title} tabIndex={-1}>{t(gate.heading)}</h1>
             <p className="auth-intro">{t(gate.text)}</p>
@@ -468,9 +471,9 @@ export default function AuthBoundary({ children }: {
                 <p className="auth-quiet auth-centered">{t("Current sign-in")}: <strong>{accountLabel ?? t("Account details unavailable")}</strong></p>
                 <Button variant="primary" full onClick={() => { approvedIdentity.current = proposedIdentity.current; retryFocus.current = true; void recheck(); }}>{t("Continue with this sign-in")}</Button>
                 <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a>
-              </> : state.status === "unavailable" || state.status === "updating" ? <>
+              </> : state.status === "unavailable" || state.status === "updating" || state.status === "browser-session" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
-                {state.status === "updating" ? null : hosted ? <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a> : <details className="auth-new-signin">
+                {state.status === "updating" || state.status === "browser-session" ? null : hosted ? <a className="auth-back-link" href={hostedLogin} onClick={rememberHostedReturn}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>
                   <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
                   <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
