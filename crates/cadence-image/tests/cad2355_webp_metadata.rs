@@ -42,8 +42,7 @@ fn fixture() -> Vec<u8> {
 
     // Orientation 6 rotates the red left half above the blue right half.
     let tiff: &[u8] = &[
-        b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0,
-        0, 0, 0,
+        b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
     ];
     let mut webp = b"RIFF\0\0\0\0WEBP".to_vec();
     let canvas = [
@@ -77,7 +76,10 @@ fn converted_webp_preserves_upright_pixels_and_color_profile() {
     let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&prepared.bytes))
         .expect("decode prepared JPEG");
     assert_eq!(
-        decoder.icc_profile().expect("read color profile").as_deref(),
+        decoder
+            .icc_profile()
+            .expect("read color profile")
+            .as_deref(),
         Some(PROFILE)
     );
     let image = image::DynamicImage::from_decoder(decoder)
