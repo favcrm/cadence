@@ -854,6 +854,21 @@ function lastCreated(items: ThreadItem[]): string | null {
  *  entries, never token deltas, so there is no skeleton and no fabricated
  *  answer body. The row is not its own live region: it mounts inside the
  *  thread's `role="log"` list, which already announces the addition. */
+/** CAD-2411: the interim line is a note's first block as one run of prose,
+ *  so a three-line clamp holds: heading, list and quote markers are
+ *  dropped and line breaks become spaces. A note that opens with a code
+ *  fence has no prose line; the dots stay alone. */
+function interimLine(text: string): string | null {
+  const first = text.trim().split(/\n\s*\n/)[0] ?? "";
+  if (first.startsWith("```") || first.startsWith("~~~")) return null;
+  const line = first
+    .split("\n")
+    .map((row) => row.trim().replace(/^(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/, ""))
+    .filter((row) => row !== "")
+    .join(" ");
+  return line === "" ? null : line;
+}
+
 function TypingDots({ label }: { label: string }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -1173,6 +1188,15 @@ export function ThreadTurn({
   const previewText =
     preview === null || previewTransform === undefined ? preview : previewTransform(preview);
   const hasPreview = previewText !== null && previewText.trim() !== "";
+  // CAD-2411: a step's words commit as a note and fold into the trace when
+  // its tool call starts. Until the next step has live text, the latest note
+  // stays where the preview was, so the words do not vanish between steps.
+  const interim =
+    streaming && !hasPreview
+      ? [...trace].reverse().find((item) => item.type === "commentary")
+      : undefined;
+  const interimText =
+    interim && !carriesSecret(interim.entry.text) ? interimLine(interim.entry.text) : null;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -1220,6 +1244,13 @@ export function ThreadTurn({
         <div className="answer" data-kind="preview" aria-live="off">
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
             <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} idTokens />
+          </div>
+        </div>
+      )}
+      {interimText !== null && (
+        <div className="answer turn-interim" data-kind="interim" aria-live="off">
+          <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
+            <Md text={interimText} onOpen={onOpenIssue} idTokens />
           </div>
         </div>
       )}

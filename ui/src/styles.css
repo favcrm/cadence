@@ -1156,6 +1156,28 @@ textarea.agentform-input { height: auto; width: 100%; }
 .agentform-foot .btn { max-width: none; }
 .agentform[data-form-state="sent"] .agentform-body, .agentform[data-form-state="closed"] .agentform-body { background: color-mix(in srgb, var(--color-ink-900) 45%, transparent); }
 .agentform-fallback { max-width: min(100%, 40rem); }
+/* CAD-2411: a running turn's latest committed note, held between steps.
+   Quiet and short; the trace keeps the whole note. */
+.answer.turn-interim .answer-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  color: var(--color-ink-400);
+}
+/* One paragraph (see `interimLine`). Beat the answer's section-label and
+   heading rules, which would otherwise restyle it. */
+.answer.turn-interim .answer-body.issue-reader > * {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: normal;
+}
+.answer.turn-interim .answer-body.issue-reader strong {
+  color: inherit;
+}
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
    made-up answer body. */
 .typing {
