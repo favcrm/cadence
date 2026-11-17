@@ -15,7 +15,8 @@ import Login from "./Login";
 import { SIGN_IN_COMMAND } from "./gate";
 import { hostedOrigin } from "./hosted";
 import "./auth.css";
-import { captureLoginNonce } from "./session";
+import { captureLoginNonce, resumeHostedSession } from "./session";
+import { clearHostedPresence, hostedPresence, markHostedPresence } from "./presence";
 
 type Status = "checking" | "signedout" | "unavailable" | "updating" | "browser-session" | "expired" | "refused" | "changed" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
@@ -112,6 +113,8 @@ export default function AuthBoundary({ children }: {
   const privateFocus = useRef<HTMLElement | null>(null);
   const logoutPending = useRef(false);
   const healthRecoveryPending = useRef(false);
+  const resumeAttempted = useRef(false);
+  const [restoring, setRestoring] = useState(false);
 
   const publish = useCallback((next: BoundaryState) => {
     stateRef.current = next;
@@ -240,6 +243,7 @@ export default function AuthBoundary({ children }: {
         healthRecoveryPending.current = false;
         try { sessionStorage.setItem(IDENTITY_STORE, nextIdentity); } catch { /* Same-page state still owns its drafts. */ }
         allowPrivateReads(hosted && session?.origin === "public" ? binding : null);
+        if (hosted) markHostedPresence();
         setSession(meta);
         publish({ status: "ready", meta, accepted: meta, generation: privateSessionGeneration(), hosted });
         return true;
@@ -248,7 +252,12 @@ export default function AuthBoundary({ children }: {
         unavailable();
         return false;
       }
-      const expired = stateRef.current.accepted !== null || identity.current !== null || key !== null || stateRef.current.status === "expired";
+      const expired =
+        stateRef.current.accepted !== null ||
+        identity.current !== null ||
+        key !== null ||
+        stateRef.current.status === "expired" ||
+        (hosted && hostedPresence());
       requireHostedConfirmation();
       discard();
       // Only a positive refusal of this exact tab credential removes it.
@@ -263,9 +272,14 @@ export default function AuthBoundary({ children }: {
       if (error instanceof ApiError && error.status === 400 && (error.code === "ambiguous_session" || error.code === "invalid_session_cookie")) {
         unavailable("browser-session", true);
       } else if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
-        const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
+        const expired =
+          stateRef.current.accepted !== null ||
+          identity.current !== null ||
+          stateRef.current.status === "expired" ||
+          hostedPresence();
         requireHostedConfirmation();
         discard();
+        if (error.status === 403) clearHostedPresence();
         publish({ ...stateRef.current, status: error.status === 403 ? "refused" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
       } else if (error instanceof ApiError && error.status === 503 && error.code === "sign_in_upgrade_required") unavailable("updating");
       else unavailable();
@@ -294,6 +308,7 @@ export default function AuthBoundary({ children }: {
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
+      clearHostedPresence();
       requireHostedConfirmation();
       discard();
       publish({ ...stateRef.current, status: "signedout", accepted: null, generation: privateSessionGeneration() });
@@ -309,7 +324,12 @@ export default function AuthBoundary({ children }: {
       // A confirmed refusal supersedes even an older successful proof still
       // in flight. Recovery must verify anew, never join that stale probe.
       const previous = stateRef.current;
-      const expired = previous.accepted !== null || identity.current !== null || sessionKey() !== null || previous.status === "expired";
+      const expired =
+        previous.accepted !== null ||
+        identity.current !== null ||
+        sessionKey() !== null ||
+        previous.status === "expired" ||
+        hostedPresence();
       sequence.current += 1;
       inFlight.current?.controller.abort();
       inFlight.current = null;
@@ -372,6 +392,29 @@ export default function AuthBoundary({ children }: {
       document.removeEventListener("visibilitychange", focused);
     };
   }, [discard, publish, recheck, requireHostedConfirmation, setSession]);
+
+  // An expired hosted session is re-established from this browser's paired
+  // credential, without sending the person through AgenticOS again. One
+  // attempt per mount: a refusal is the gate, and the manual Continue button
+  // stays. The gate shows the verifying state while the attempt runs.
+  useEffect(() => {
+    if (state.status !== "expired" || !state.hosted || resumeAttempted.current) return;
+    resumeAttempted.current = true;
+    let cancelled = false;
+    setRestoring(true);
+    void resumeHostedSession()
+      .then((ok) => {
+        if (!cancelled && ok) return recheck();
+        return undefined;
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+    return () => {
+      cancelled = true;
+      setRestoring(false);
+    };
+  }, [state.status, state.hosted, recheck]);
 
   // A local daemon restart or a brief identity outage leaves the session
   // intact (`unavailable` is not a sign-out). Retry on a short cadence so
@@ -438,7 +481,7 @@ export default function AuthBoundary({ children }: {
   const rememberHostedReturn = () => {
     try { sessionStorage.setItem(HOSTED_RETURN_STORE, hostedDestination); } catch { /* Same-tab return is optional. */ }
   };
-  const checking = state.status === "checking";
+  const checking = state.status === "checking" || restoring;
   const accountLabel = [state.meta?.session?.user?.email, state.meta?.session?.user?.name]
     .find((value): value is string => typeof value === "string" && value.trim().length > 0);
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
@@ -451,7 +494,7 @@ export default function AuthBoundary({ children }: {
     changed: { eyebrow: "Sign-in changed", heading: "Confirm your current sign-in.", text: "Your sign-in changed. Unsent changes from the previous session may not have been saved. Review the current account before reopening this workspace.", icon: "shield" },
     expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: hosted ? "Your session ended. Unsent changes may not have been saved. Continue with AgenticOS to reopen your workspace." : "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
   };
-  const gate = copy[state.status === "ready" ? "checking" : state.status];
+  const gate = copy[restoring ? "checking" : state.status === "ready" ? "checking" : state.status];
   const showGate = state.status !== "ready" || loginRoute;
   return (
     <div data-auth-state={state.status}>

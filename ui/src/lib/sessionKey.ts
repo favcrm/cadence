@@ -14,6 +14,8 @@
  * signing out. Clearing the key is what ends this browser's session.
  */
 
+import { activityHeaders } from "./activity";
+
 export const SESSION_KEY_STORE = "cadence.sessionKey";
 export const SESSION_HEADER = "X-Cadence-Session";
 
@@ -123,5 +125,7 @@ export function applySharedSessionChange(event: Pick<StorageEvent, "key" | "newV
 /** The header to add to a board request, when this browser holds a key. */
 export function sessionHeaders(): Record<string, string> {
   const key = sessionKey();
-  return key ? { [SESSION_HEADER]: key } : {};
+  // The activity mark rides the first request after a user gesture; the server
+  // ignores it on anything but a GET it may renew.
+  return { ...(key ? { [SESSION_HEADER]: key } : {}), ...activityHeaders() };
 }

@@ -134,3 +134,22 @@ export async function closeSession(): Promise<void> {
     }
   }
 }
+
+/**
+ * Re-establish a hosted board session from the paired browser credential, with
+ * no platform round trip. The credential is not authority by itself: the
+ * server rereads membership, rotates the credential and returns a fresh board
+ * cookie, or refuses. The caller re-verifies with `GET /api/meta` either way.
+ */
+export async function resumeHostedSession(signal?: AbortSignal): Promise<boolean> {
+  try {
+    const response = await fetch("/__platform/session/resume", {
+      method: "POST",
+      credentials: "same-origin",
+      ...(signal ? { signal } : {}),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
