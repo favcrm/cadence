@@ -263,8 +263,10 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
 /// Git runs pre-push hooks with GIT_DIR already pointed at the
 /// worktree's git dir and cwd at the worktree root, so the receipt and
-/// `scripts/boat-build` both resolve per-lane. The check plan runs in
-/// this worktree's Boat sandbox so the shared host does not compile; the receipt
+/// `scripts/boat-build` both resolve per-lane. With `scripts/boat-build` the
+/// check plan runs in this worktree's Boat sandbox so the shared host does not
+/// compile; a repository without it runs its own `scripts/pre-push` on the
+/// host with no arguments (CAD-2403). The receipt
 /// records the checked head, base, sandbox and result under this
 /// worktree's git dir. Required CI, review and approval remain
 /// authoritative. A `--no-verify` push leaves no receipt, which is the
@@ -272,10 +274,11 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// pushed HEAD on a clean tree when the last receipt says rc=0 and
 /// `tree=clean` for it (CAD-2341); any other receipt runs the plan.
 const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
-# CAD-1909: run scripts/pre-push in a Boat sandbox; the shared host does not
-# compile. A missing Boat CLI or helper refuses the push rather than falling
-# back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit emergency
-# path and runs the same plan on this host.
+# CAD-1909: run scripts/pre-push in a Boat sandbox through scripts/boat-build;
+# the shared host does not compile. A missing Boat CLI refuses the push rather
+# than falling back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit
+# emergency path and runs the same plan on this host. CAD-2403: a repository
+# without scripts/boat-build runs its own scripts/pre-push here instead.
 top=$(git rev-parse --show-toplevel) || exit 1
 gd=$(git rev-parse --absolute-git-dir) || exit 1
 cd "$top" || exit 1
@@ -347,7 +350,7 @@ if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -n "$tree_clean"
     prev=$(tail -n 1 "$out" 2>/dev/null)
     case "$prev" in
         *steps=skipped*|*steps=refused*) ;;
-        "head=$head "*" patch=$EMPTY_PATCH "*" rc=0 "*" tree=clean" | "head=$head lane="*" kind="*" rc=0 "*" tree=clean")
+        "head=$head "*" patch=$EMPTY_PATCH "*" rc=0 "*" tree=clean" | "head=$head lane="*" kind="*" rc=0 "*" tree=clean" | "head=$head lane="*" mode=repo rc=0 "*" tree=clean")
             echo "pre-push: recorded clean pass for $head; not re-running the plan"
             exit 0 ;;
     esac
@@ -366,14 +369,24 @@ if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     line=$(printf '%s\n' "$output" | tail -n 1)
 else
     if [ ! -x scripts/boat-build ]; then
-        printf 'head=%s lane=%s mode=boat steps=refused:no-boat-build rc=1 at=%s\n' \
-            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
-        exit 1
-    fi
+        # CAD-2403: a repository without a sandbox helper runs its own
+        # scripts/pre-push here, with no arguments (its interface is its own),
+        # against the working tree, so the pushed commit must be HEAD. The
+        # hook writes the receipt itself.
+        if [ "$pushed" != "$head" ]; then
+            printf 'head=%s lane=%s mode=repo steps=refused:head-mismatch rc=1 at=%s\n' \
+                "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+            exit 1
+        fi
+        scripts/pre-push
+        rc=$?
+        line="head=$head lane=$lane mode=repo rc=$rc at=$(date +%s)"
+    else
     output=$(scripts/boat-build --receipt --head "$pushed" ${PRE_PUSH_TESTS:+--tests})
     rc=$?
     line=$(printf '%s\n' "$output" | tail -n 1)
     [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
+    fi
 fi
 # CAD-2341: a clean pass names the head the plan started on. A commit or
 # branch switch during the run (local mode reads HEAD when it ends) leaves
