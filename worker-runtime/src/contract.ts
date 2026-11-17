@@ -121,7 +121,7 @@ export interface ToolResult {
  *
  * `execute` is a method, so a typed handler (`RuntimeTool<{issueId: string}>`)
  * assigns to `RuntimeTool` without a cast. `parameters` is a plain JSON
- * schema; the engine validates arguments against it before `execute`.
+ * schema; the engine validates the original arguments without coercion before `execute`.
  */
 export interface RuntimeTool<Input = unknown> {
   readonly name: string;

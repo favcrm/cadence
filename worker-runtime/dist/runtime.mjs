@@ -54443,11 +54443,18 @@ function invocation(api, app) {
   };
 }
 function registration(tool, authority, resolveApp, acceptsImages) {
+  let validator;
   return {
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
     ...tool.replay === undefined ? {} : { replay: tool.replay },
+    prepareArguments(input) {
+      validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
+      if (!validator.check(input))
+        throw new Error("Tool arguments do not match the declared schema.");
+      return input;
+    },
     execute(input, api, context) {
       const run = async () => {
         const app = resolveApp === undefined ? null : await resolveApp(api, context);
