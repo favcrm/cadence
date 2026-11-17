@@ -220,10 +220,11 @@ description, a `SKILL.md` body, `references/<leaf>` text files and a version,
 within the bundle grammar's skill caps. The runtime reads it once when a
 conversation's harness opens and lists each kept skill as `ws-<name>` after the
 bundled skills, so a workspace skill never replaces a bundled procedure. Every
-body and reference it returns is framed as untrusted guidance. An entry that
-breaks a rule is dropped whole, and a host refusal leaves the bundled skills
-unchanged. Only approved revisions belong here; a draft never does, and a skill
-never grants, adds or selects a tool.
+catalog description, body and reference it returns is framed as untrusted
+guidance; references are always served as text. An entry that breaks a rule is
+dropped whole, and a host refusal leaves the bundled skills unchanged. Only
+approved revisions belong here; a draft never does, and a skill never grants,
+adds or selects a tool.
 
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the

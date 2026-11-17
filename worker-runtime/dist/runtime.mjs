@@ -56028,6 +56028,7 @@ function checkWorkspaceSkill(entry) {
     total += bytes2(content);
     resources.push({
       kind: "reference",
+      encoding: "text",
       path,
       content: `${WORKSPACE_SKILL_FRAME}
 
@@ -56038,7 +56039,7 @@ ${content}`
     return null;
   return {
     name: `${WORKSPACE_SKILL_PREFIX}${name}`,
-    description: `Workspace skill. ${line}`,
+    description: `Workspace skill. ${WORKSPACE_SKILL_FRAME} ${line}`,
     version,
     body: `${WORKSPACE_SKILL_FRAME}
 
