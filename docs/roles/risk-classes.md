@@ -1,9 +1,9 @@
-# Merge risk classes — operator decision 2026-09-19
+# Merge risk classes
 
-The aim: routine PRs merge without a human, and only substantial changes wait for the operator. `cadence delivery requirements` and `scripts/enqueue-reviewed` compute what a PR needs.
+The aim: routine PRs need the least evidence, and only substantial changes wait for the operator's approval. On a hosted org the operator always runs the enqueue. `cadence delivery requirements` computes what a PR needs; the review and delivery route is AGENTS.md "Review".
 
 ## Class `human` — the operator approves (any ONE trigger is enough)
-When unsure whether a trigger applies, `human`.
+When unsure whether a trigger applies, `human`. A reviewer names the triggers it finds in `Risk: human (<n>, …)`, and any `Risk:` that is not `auto` forces the operator. The shared evaluator also enforces the path and size triggers mechanically: paths in the `operator` table and triggers 2, 4, 6 and 7, and a diff over 1500 changed lines, force the operator. Triggers 1 and 3 reach the operator through the reviewer: a reviewer who sees one writes `Risk: human (1)` or `(3)`, which forces the operator. Their path lists alone put the PR in the strict class (two separate reviews) without a mechanical operator floor, and a scope approval never covers them.
 1. **Trust boundary:** turn tokens, generations, session binding or ownership proofs, adoption/recovery (`recover()`, `open_adopted`, `verify_ownership`, `resolve_session`), the approval broker, permission modes, bypass handling, auth or identity (`request_identity`, `write_caller`, `tailnet_proof`, tailnet).
 2. **Data and deletion:** schema migrations or any change to the store version; code that deletes or rewrites user data (worktree/branch removal, `issue finish`, `agent gc`, tracker write path, memory writes); anything that can lose commits.
 3. **Security:** fixes for a leak or vulnerability, secret handling, redaction logic.
@@ -11,7 +11,7 @@ When unsure whether a trigger applies, `human`.
 5. **Size or contention:** more than 1500 changed lines (excluding fixtures and lockfile churn), a third review round, or an unresolved reviewer–author disagreement.
 6. **Outward or fleet-wide actions** (see also `docs/CHARTER.md` non-goals): releases, tags, repo settings, anything posted publicly other than the PR merge itself; a `daemon restart` that is not `--when-idle`; killing processes cadence did not start; any `--force`.
 
-7. **The rules and the gates themselves:** `docs/roles/*`, `docs/CHARTER.md`, `cadence-review.toml`, `src/review.rs`, `scripts/**`, and any change to who approves what, to a gate, or to this file. `docs/roles/review-workflow-principals.toml` is the allowlist of workflow review principals the gate counts (CAD-2081); it is read from the live tip of `main`, so a PR can never add its own reviewer. A workflow review row may say `Risk: auto` (a prompt-injected model can write that), so a PR with a workflow review needs the operator's approval unless every changed path is a plain add or modify matching `docs/roles/workflow-auto-paths.toml` (read from the live tip of `main`; a positive allowlist that names Markdown documentation only since CAD-2254 (the glob is in that file), so a PR wholly on it and on no human-class path, with both workflow reviews passing, merges without the operator unless the size trigger or a Risk line that is not `auto` applies (the gate's dry run reporting `class: auto` is the test; being on the list is not enough), and every other PR still takes the operator's approval; the rule-7 documents above stay human; adding a path is a deliberate, reviewed change; whatever the list says, a hidden path, an agent-instruction file name (agents., claude., gemini., agent., warp., qwen., crush. or copilot-instructions. as a basename prefix), an odd path name (a control, format or line separator character, a space other than the ASCII space, or a segment ending in a dot or a space), a path the one-review list excludes, a trigger 1 or 3 path, and a name that differs only by case from a protected path are never eligible, and an unreadable list means the operator; an empty one-review exclude, trigger 1 or trigger 3 list counts as unreadable, here and for a ticket scope approval). `src/delivery/**` is trigger 7. So are `docs/INSTALL-AGENT.md` (the install command and the attestation trust root) and `docs/REMOTE-AUTH.md` (the credential diagnosis the binary points to), by operator decision (CAD-2256): a wrong edit to either misleads an install or exposes a credential, so neither merges on workflow reviews alone. A PR that rewrites the rules can never approve itself. Scripts stay human by default; the only path exceptions are in [Script allowlist (auto-eligible)](#script-allowlist-auto-eligible).
+7. **The rules and the gates themselves:** `docs/roles/*`, `docs/CHARTER.md`, `cadence-review.toml`, `src/review.rs`, `scripts/**`, and any change to who approves what, to a gate, or to this file. `docs/roles/review-workflow-principals.toml` lists the workflow review principals the gate counts, and `docs/roles/workflow-auto-paths.toml` the only paths on which workflow reviews alone may merge. The gate reads both from the live tip of `main`, so a PR can never add its own reviewer or path. A workflow review row may say `Risk: auto` (a prompt-injected model can write that), so a PR with a workflow review needs the operator's approval unless every changed path is a plain add or modify on `docs/roles/workflow-auto-paths.toml` (Markdown documentation under docs/), is on no human-class path, has both workflow reviews passing and trips no size or non-`auto` `Risk:` trigger. The gate's dry run reporting `class: auto` is the test; being on the list is not enough. Whatever the list says, these are never eligible: a hidden path, an agent-instruction file name (a basename starting `agents.`, `claude.`, `gemini.`, `agent.`, `warp.`, `qwen.`, `crush.` or `copilot-instructions.`), an odd path name (a control, format or line separator character, a space other than the ASCII space, or a segment ending in a dot or a space), a path the one-review list excludes, a trigger 1 or 3 path, and a name that differs only by case from a protected path. An unreadable list means the operator, and an empty one-review exclude, trigger 1 or trigger 3 list counts as unreadable, here and for a ticket scope approval. `src/delivery/**` is trigger 7. So are `docs/INSTALL-AGENT.md` (the install command and the attestation trust root) and `docs/REMOTE-AUTH.md` (the credential diagnosis the binary points to): a wrong edit to either misleads an install or exposes a credential, so neither merges on workflow reviews alone. A PR that rewrites the rules can never approve itself. Scripts stay human by default; the only path exceptions are in [Script allowlist (auto-eligible)](#script-allowlist-auto-eligible).
 
 ### Script allowlist (auto-eligible)
 
@@ -29,7 +29,7 @@ Each path must satisfy ALL four criteria:
 3. It cannot touch production, the installed binary, the tracker, secrets or credentials, or install software on a host.
 4. Any effect is behind a human-class control downstream: diagnostics do not authorize delivery, and changes to gates, releases or production still require operator approval.
 
-A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The review count follows AGENTS.md "Review" (CAD-1104): one fresh-session review plus the operator's approval for `human` diffs, and two separate passes only for triggers 1 and 3.
+A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). Review counts follow AGENTS.md "Review".
 
 ### Mechanical path lists
 
@@ -43,49 +43,27 @@ A PR is auto-eligible under this allowlist only when every `scripts/**` path it 
 - **trigger6**: `src/rollout.rs`, `src/update.rs`, `src/upgrade.rs`, `src/cli/rollout.rs`, `src/cli/daemon.rs`, `src/cli/update.rs`, `src/cli/upgrade.rs`
 - **trigger7**: `docs/roles/**`, `docs/CHARTER.md`, `docs/AUDIT.md`, `docs/design/**`, `docs/cadence/**`, `docs/START-HERE.md`, `docs/ARCHITECTURE.md`, `docs/BOARD.md`, `docs/INSTALL-AGENT.md`, `docs/REMOTE-AUTH.md`, `AGENTS.md`, `cadence-review.toml`, `clippy.toml`, `src/review.rs`, `src/review/**`, `src/audit/**`, `src/delegation.rs`, `src/delegation/**`, `src/daemon/approvals_rpc.rs`, `src/store/events.rs`, `src/overview.rs`, `src/delivery.rs`, `src/delivery/**`, `src/issue/delivery_policy.rs`, `src/issue/delivery_requirements.rs`, `src/issue/model.rs`, `src/issue/board.rs`, `src/issue/parse.rs`, `src/cli/audit.rs`, `src/cli/mod.rs`, `scripts/**`, `tests/**`
 
-The shared requirements engine also reads three tables of `risk-paths.toml` that hold this repository's own rules as data (CAD-2386; the engine names no repository's paths): `operator` (further operator-class build, release, rule and gate files), `browser_qa` (paths whose change needs a Browser QA pass) and `routine` (ordinary documentation the routine class admits). Each is required; a missing or malformed one fails closed. Editing them is trigger 7 like the rest of `docs/roles/**`.
+The shared requirements engine also reads three tables of `risk-paths.toml` that hold this repository's own rules as data (the engine names no repository's paths): `operator` (further operator-class build, release, rule and gate files), `browser_qa` (paths whose change needs a Browser QA pass) and `routine` (ordinary documentation the routine class admits). Each is required; a missing or malformed one fails closed to the strict floor with no Browser QA. Editing them is trigger 7 like the rest of `docs/roles/**`.
+
+The evaluator reads these lists at the PR's anchor, never the PR's own copy (AGENTS.md "Where the rules live"). The copy compiled into the binary serves only the daemon's `--delegated` approval check, and a test pins it to this file.
 
 ## Class `auto`
 Everything else.
 
-## Who counts as a reviewer: the fresh-session review standard
-Operator decision 2026-11-03 (CAD-1946). A review is valid when a fresh-context
-session that is not the author does it; a subagent qualifies. Fresh means it
-inherits no conversation or context from the work: a forked subagent or a
-resumed authoring session does not count, and its brief points at the change
-without the author's conclusions. A second model vendor is optional, and a
-separate human or account is not required. Records say "fresh-session review"
-and never claim independent parties. For a two-review PR (AGENTS.md "Review",
-CAD-1099) Standards and Spec/security remain two separate passes by two fresh
-sessions; one pass never covers both. The operator's approval of the exact head
-(`cadence audit approve --pr <n> --head <full sha> --action merge`,
-operator-connection-only, an `approval_recorded` event on the `audit:approvals`
-stream bound to the head; a ticket comment or note is never approval evidence)
-still applies on `human`-class paths; this decision changes no approval rule
-for send, publish, spend or deploy. It never stands in for a review pass and never lowers Browser QA, the
-`qa-verdict` status binding or the risk class. A change to this rule is class
+## Who counts as a reviewer
+
+The review standard (fresh-session review), the hosted route and what the gate
+enforces are AGENTS.md "Review", the one home. The operator's approval of the
+exact head (`cadence audit approve`, operator-connection-only, an
+`approval_recorded` event on the `audit:approvals` stream bound to the head; a
+ticket comment or note is never approval evidence) never stands in for a review
+pass and never lowers the risk class. It does not waive Browser QA: it can accept
+the PR author's exact-head Browser QA pass. A change to the review rule is class
 `human` (trigger 7) and can never approve itself.
 
-**Not yet enforced.** `scripts/enqueue-reviewed` counts hosted verdicts by
-attested principal and, since CAD-2049, refuses the author's principal; local
-notes count by their self-declared `From:` alias, which is not attested. It
-cannot tell a fresh session from the author under one login. A hosted `routine` PR
-takes two workflow reviews, and operator approval unless the gate's dry run reports `class: auto`, because a hosted board has no readiness record (CAD-2135); being on `workflow-auto-paths.toml` is not enough. That list names
-Markdown documentation only (`docs/**/*.md`); trigger 7 above names the paths that are
-never eligible, whatever the list says (CAD-2254). A hosted `ui/**` PR takes those two reviews, operator
-approval and a `--browser-qa` comment naming its exact head (CAD-2173), or until it ends, the
-temporary exception (`--exception --advisory ...`: exact-head
-operator approval and two advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change; ends at
-`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31). The exception only
-checks that the advisory links are separate https URLs; it proves neither head
-binding nor that Browser QA ran. Agents file no hosted verdict (AGENTS.md "Review"). The `solo_operator` delivery-profile
-field still exists in code; it is not this standard. A workflow-issued reviewer
-identity (CAD-2081) is counted by the gate and its workflows are live; their role is
-in AGENTS.md "Review".
-
-## Review count by diff (CAD-957)
-Under the default lean policy, a PR whose every change qualifies under the one-review allowlist
+## Review count by diff
+A PR whose every change qualifies under the one-review allowlist
 (`docs/roles/one-review-paths.toml`, match rules in its header) needs
-one fresh-session review covering standards and spec. Under `strict`, everything else keeps two. This changes only the count:
-a `human` trigger still needs the operator, and the file is itself trigger 7.
+one fresh-session review covering standards and spec; everything else in the
+strict class needs two separate passes (Standards and Spec/security). The
+evaluator counts zero reviews for `routine` and one for `consequential`. This changes only the count; the operator floor is separate, and the file is itself trigger 7.
