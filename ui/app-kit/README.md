@@ -203,11 +203,17 @@ Records screens can additionally check `bridge.canAudioRetention()` before
 offering optional recording replay. With explicit user consent, start a live
 session using `{ action: "start", retain_audio: true }`; after stopping and
 creating the record, call `bridge.audioRecording(scope, { action: "commit",
-record_id })`. A failed commit can be retried, or the pending audio discarded
-with `{ action: "cancel" }`. For an existing record, `exists` reports
-`{ available }`, while `play` opens the host's player and `delete` requires host
-confirmation. These calls never return audio bytes to the app frame. Hosts
-without retention do not advertise it, so ordinary transcription remains usable.
+record_id })`. If live retention fails, the session reports
+`error.code: "recording_not_saved"`; transcription continues, but that capture
+cannot be saved for replay. Discard its pending audio with `{ action: "cancel" }`
+and preserve the transcript. Other failed commits may be retried, but a lost
+commit response means the recording may already be saved. If cancellation is
+unconfirmed, report that uncertainty: pending audio is scheduled for cleanup,
+while saved audio remains until deleted. Do not claim deletion succeeded.
+For an existing record, `exists` reports `{ available }`, while `play` opens the host's
+player and `delete` requires host confirmation. These calls never return audio
+bytes to the app frame. Hosts without retention do not advertise it, so ordinary
+transcription remains usable.
 The retained live capture is browser-processed 16 kHz mono, not a
 source-quality archive.
 

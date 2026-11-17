@@ -217,11 +217,13 @@ export function createScreenAudioSession({
   let lastLevelEmitAt = 0;
   let drainWaiters: Array<() => void> = [];
   let retainedRecordingId = "";
+  let retentionBegan = false;
   let committedRecordId = "";
   let retentionTail: SessionSegment | null = null;
   let retentionTask: Promise<void> | null = null;
   let committingRetention = false;
   let retentionError: ActionRefusal | null = null;
+  let unresolvedCancellation: ActionRefusal | null = null;
 
   const buildSnapshot = (): ScreenAudioSessionSnapshot => {
     const done = segments.filter((s) => s.status === "done").length;
@@ -368,7 +370,8 @@ export function createScreenAudioSession({
     let timeoutId: number | undefined;
     try {
       op = beginPrivateOperation(signal);
-      if (action === "part") timeoutId = window.setTimeout(() => op?.dispose(), 20_000);
+      if (action === "begin" || action === "part" || action === "commit" || action === "cancel")
+        timeoutId = window.setTimeout(() => op?.dispose(), 20_000);
       const response = await op.fetch(`/api/app-screen-recordings/${action}`, {
         method: "POST",
         credentials: "same-origin",
@@ -405,6 +408,22 @@ export function createScreenAudioSession({
     }
   };
 
+  const abandonRetention = (): ActionRefusal => {
+    retentionError = {
+      code: "recording_not_saved",
+      text: t("Audio could not be saved. Transcription will continue without a recording."),
+    };
+    lastError = retentionError;
+    retentionTail = null;
+    for (const segment of segments) {
+      if (segment.status === "done") {
+        segment.chunk = { ...segment.chunk, wavBytes: new Uint8Array(0), base64: "" };
+      }
+    }
+    emit();
+    return retentionError;
+  };
+
   const retainPart = async (segment: SessionSegment, signal: AbortSignal): Promise<ActionRefusal | null> => {
     if (!retainedRecordingId || segment.retained) return null;
     const result = await recordingRequest("part", {
@@ -426,11 +445,7 @@ export function createScreenAudioSession({
     if (!next || !activeAbort || activeAbort.signal.aborted) return;
     const task = retainPart(next, activeAbort.signal).then((failure) => {
       if (disposed || activeAbort.signal.aborted || sessionId !== activeSessionId) return;
-      if (failure) {
-        retentionError = failure;
-        lastError = failure;
-        emit();
-      }
+      if (failure) abandonRetention();
     });
     retentionTask = task;
     void task.finally(() => {
@@ -490,7 +505,7 @@ export function createScreenAudioSession({
           next.status = "done";
           next.text = (body as TranscribeReply).text.trim();
           next.errorCode = null;
-          if (!retainedRecordingId || next.retained) {
+          if (!retainedRecordingId || next.retained || retentionError?.code === "recording_not_saved") {
             next.chunk = { ...next.chunk, wavBytes: new Uint8Array(0), base64: "" };
           }
           if (!segments.some((s) => s.status === "failed")) {
@@ -557,6 +572,7 @@ export function createScreenAudioSession({
     segments = [];
     lastError = null;
     retentionError = null;
+    retentionBegan = false;
     committedRecordId = "";
     retentionTail = null;
     retentionTask = null;
@@ -571,14 +587,30 @@ export function createScreenAudioSession({
     }
 
     if (request.action === "cancel") {
+      if (!sessionId && unresolvedCancellation)
+        return { ok: false, refusal: unresolvedCancellation };
       abortActiveWork();
+      const retentionFailure = retentionBegan ? retentionError : null;
       if (retainedRecordingId) {
-        const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
-        if (!cancelled.ok) return cancelled;
+        if (retentionBegan && !retentionFailure) {
+          const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+          if (!cancelled.ok) return cancelled;
+        } else {
+          void recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+        }
         retainedRecordingId = "";
       }
       resetSessionState({ id: "", mode: "record", phase: "idle", heldAt: "" });
       emit();
+      if (retentionFailure) {
+        unresolvedCancellation = {
+          code: "cleanup_pending",
+          text: retentionFailure.code === "recording_not_saved"
+            ? t("Audio deletion is not confirmed. Incomplete audio remains private and is scheduled for cleanup.")
+            : t("Recording status is unknown. Saved audio remains private until deleted; incomplete audio is scheduled for cleanup."),
+        };
+        return { ok: false, refusal: unresolvedCancellation };
+      }
       return { ok: true, data: buildSnapshot() };
     }
 
@@ -593,14 +625,19 @@ export function createScreenAudioSession({
         if (phase !== "error") {
           return { ok: false, refusal: { code: "conflict", text: t("Save or discard the previous recording first.") } };
         }
-        const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
-        if (!cancelled.ok) return cancelled;
+        if (retentionBegan && (segments.length > 0 || retentionTail)) {
+          const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+          if (!cancelled.ok) return cancelled;
+        } else {
+          void recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+        }
         retainedRecordingId = "";
       }
       if (request.retain_audio && (!confirmRetention || !confirmRetention())) {
         return { ok: false, refusal: { code: "cancelled", text: t("Recording was not saved.") } };
       }
       abortActiveWork();
+      unresolvedCancellation = null;
       const currentSession = randomAudioSessionId();
       const ctrl = new AbortController();
       const onCallAbort = () => {
@@ -632,14 +669,21 @@ export function createScreenAudioSession({
           return { ok: false, refusal: quoteRefusal };
         }
         if (request.retain_audio) {
-          const begin = await recordingRequest("begin", { recording_id: currentSession }, ctrl.signal);
-          if (!begin.ok) {
-            phase = "error";
-            lastError = begin.refusal;
-            emit();
-            return begin;
-          }
           retainedRecordingId = currentSession;
+          const task = recordingRequest("begin", { recording_id: currentSession }, ctrl.signal).then((result) => {
+            if (disposed || ctrl.signal.aborted || sessionId !== currentSession || retainedRecordingId !== currentSession) return;
+            if (result.ok) {
+              retentionBegan = true;
+            } else {
+              abandonRetention();
+            }
+          });
+          retentionTask = task;
+          void task.finally(() => {
+            if (retentionTask !== task) return;
+            retentionTask = null;
+            pumpRetention();
+          });
         }
 
         const capture = await startLiveMicrophoneCapture({
@@ -672,7 +716,7 @@ export function createScreenAudioSession({
             pumpSegments();
           },
           onRetentionTail: request.retain_audio ? (chunk) => {
-            if (sessionId !== currentSession || ctrl.signal.aborted) return;
+            if (sessionId !== currentSession || ctrl.signal.aborted || retentionError?.code === "recording_not_saved") return;
             retentionTail = { chunk, requestId: "", status: "done", text: "", errorCode: null };
           } : undefined,
         });
@@ -800,6 +844,7 @@ export function createScreenAudioSession({
         return { ok: false, refusal: { code: "conflict", text: t("Save or discard the previous recording first.") } };
       }
       abortActiveWork();
+      unresolvedCancellation = null;
       const currentSession = randomAudioSessionId();
       const ctrl = new AbortController();
       const onCallAbort = () => {
@@ -932,15 +977,22 @@ export function createScreenAudioSession({
       return { ok: false, refusal: { code: "cancelled", text: t("Recording action was cancelled.") } };
     if (request.action === "cancel") {
       if (!retainedRecordingId) {
+        if (!sessionId && unresolvedCancellation)
+          return { ok: false, refusal: unresolvedCancellation };
         if (committedRecordId) return { ok: false, refusal: {
           code: "conflict",
           text: t("This recording is already saved. Retry saving, then delete it from the meeting if needed."),
         } };
         return { ok: true, data: { ok: true } };
       }
-      const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
-      if (!cancelled.ok) return cancelled;
+      if (retentionBegan) {
+        const cancelled = await recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+        if (!cancelled.ok) return cancelled;
+      } else {
+        void recordingRequest("cancel", { recording_id: retainedRecordingId }, callSignal);
+      }
       retainedRecordingId = "";
+      retentionBegan = false;
       retentionError = null;
       return { ok: true, data: { ok: true } };
     }
@@ -960,11 +1012,21 @@ export function createScreenAudioSession({
       }
       if (disposed || mountSignal.aborted || callSignal.aborted || retainedRecordingId !== recordingId)
         return { ok: false, refusal: { code: "cancelled", text: t("Recording action was cancelled.") } };
+      if (retentionError?.code === "recording_not_saved") {
+        lastError = retentionError;
+        emit();
+        return { ok: false, refusal: retentionError };
+      }
+      if (!retentionBegan) {
+        return { ok: false, refusal: abandonRetention() };
+      }
       retentionError = null;
       const partCount = segments.length + (retentionTail ? 1 : 0);
       for (let index = 0; index < partCount; index++) {
         const segment = segments[index] ?? retentionTail!;
         const failure = await retainPart(segment, callSignal);
+        if (disposed || mountSignal.aborted || callSignal.aborted || retainedRecordingId !== recordingId)
+          return { ok: false, refusal: { code: "cancelled", text: t("Recording action was cancelled.") } };
         if (failure) {
           retentionError = failure;
           lastError = failure;
@@ -973,12 +1035,20 @@ export function createScreenAudioSession({
         }
       }
       const committed = await recordingRequest("commit", {
-        recording_id: retainedRecordingId,
+        recording_id: recordingId,
         record_id: request.record_id,
         part_count: partCount,
       }, callSignal);
-      if (!committed.ok) return committed;
+      if (disposed || mountSignal.aborted || callSignal.aborted || retainedRecordingId !== recordingId)
+        return { ok: false, refusal: { code: "cancelled", text: t("Recording action was cancelled.") } };
+      if (!committed.ok) {
+        retentionError = committed.refusal;
+        lastError = committed.refusal;
+        emit();
+        return committed;
+      }
       committedRecordId = request.record_id;
+      retentionBegan = false;
       retainedRecordingId = "";
       return { ok: true, data: { ok: true } };
     }
