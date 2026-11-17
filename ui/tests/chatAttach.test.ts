@@ -22,6 +22,8 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 equal(attachRefusal(0) !== null, true, "an empty file refuses");
 equal(attachRefusal(ATTACH_MAX_BYTES), null, "exactly at the cap goes");
 equal(attachRefusal(ATTACH_MAX_BYTES + 1) !== null, true, "one byte over refuses");
+equal(attachRefusal(25 * 1024 * 1024, "notes.txt", true), null, "hosted 25 MiB reaches the server");
+equal(attachRefusal(25 * 1024 * 1024 + 1, "notes.txt", true), "over 25 MiB — rejected", "hosted files above 25 MiB refuse");
 
 // ---- the count cap --------------------------------------------------------
 
@@ -49,6 +51,12 @@ equal(
   (unresolvedHint([item("a", "failed")]) ?? "").includes("failed"),
   true,
   "the hold reason names the failed file",
+);
+const heifError = "Could not convert this HEIC/HEIF photo. Export it as JPEG or PNG and attach again.";
+equal(
+  (unresolvedHint([{ ...item("photo", "failed"), error: heifError }], (text) => text === heifError ? "相片轉換失敗" : text) ?? "").includes("相片轉換失敗"),
+  true,
+  "the send hold translates a known conversion failure",
 );
 
 // ---- visible, specific refusal reasons (CAD-1168 fix 1) ---------------------

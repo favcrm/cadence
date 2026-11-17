@@ -436,6 +436,11 @@
   margin-bottom: 0.375rem;
 }
 
+.app-chat-decoder-credits {
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+
 .app-chat-filerow {
   display: inline-flex;
   align-items: center;

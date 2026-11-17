@@ -189,6 +189,7 @@ function AttachChips({
   // so, and the failure is named on it.
   const hiddenFailed = hidden.some((a) => a.status === "failed");
   const hiddenPending = hidden.some((a) => a.status === "uploading");
+  const decoder = ordered.find((item) => item.converted && item.decoderLicenseUrl);
   return (
     <div className="app-chat-attachrow" data-composer-attachments>
       {visible.map((a, i) => (
@@ -198,7 +199,7 @@ function AttachChips({
           className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
           data-attach-status={a.status}
           data-attach-key={a.key}
-          aria-label={`${a.name}: ${t(a.status === "uploading" ? "Uploading…" : a.status === "failed" ? "Failed" : "Ready")}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
+          aria-label={`${a.name}: ${t(a.status === "uploading" ? (a.converting ? "Converting photo…" : "Uploading…") : a.status === "failed" ? "Failed" : "Ready")}${a.converted ? ` · ${t("Converted to JPEG")}` : ""}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
           title={a.name}
         >
           <span className="app-chat-chip-slot">
@@ -240,8 +241,8 @@ function AttachChips({
             <span className="app-chat-filename">
               <span className="app-chat-chip-name">{a.name}</span>
               <small>
-                {attachMeta(a.name, a.size, t)}
-                {a.status !== "ready" && (
+                {a.converting ? t("Converting photo…") : a.converted ? t("Converted to JPEG") : attachMeta(a.name, a.size, t)}
+                {a.status !== "ready" && !a.converting && (
                   <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
                 )}
               </small>
@@ -292,6 +293,14 @@ function AttachChips({
         <button type="button" className="app-chat-more lnk" aria-expanded={expanded} onClick={() => setExpanded(false)}>
           {t("Show less")}
         </button>
+      )}
+      {decoder?.decoderLicenseUrl && (
+        <span className="app-chat-decoder-credits">
+          <a href={decoder.decoderLicenseUrl} download="heif-decoder-license.txt">{t("libheif license")}</a>
+          {decoder.decoderNoticesUrl && <>{" · "}<a href={decoder.decoderNoticesUrl} download="heif-decoder-notices.txt">{t("third-party notices")}</a></>}
+          {" · "}
+          <a href="https://github.com/ai-ecoverse/homescoop/tree/715e12b3460820d58aa79d3892bde89a740c1d8a/packages/libheif" target="_blank" rel="noopener noreferrer">{t("decoder source")}</a>
+        </span>
       )}
     </div>
   );
@@ -409,7 +418,7 @@ export default function Composer({
   stop = null,
   onArrowUpEmpty,
 }: ComposerProps) {
-  const { t } = useLocale();
+  const { t, isHostedUser } = useLocale();
   const compact = density === "compact";
   const translateAttachText = t;
   const key = storeKey ?? "composer";
@@ -686,7 +695,7 @@ export default function Composer({
   const attachEnabled = typeof attach === "boolean" ? attach : (attach?.enabled ?? false);
   const attachDestination = typeof attach === "object" ? attach?.destination : undefined;
   const addSelected = (files: Iterable<File>) => {
-    if (attachEnabled) addFiles(key, files, attachDestination);
+    if (attachEnabled) addFiles(key, files, attachDestination, isHostedUser);
   };
 
   const attachChips =
@@ -723,6 +732,11 @@ export default function Composer({
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onKeyDown={onKey}
+      onPaste={(e) => {
+        if (!attachEnabled || block || e.clipboardData.files.length === 0) return;
+        addSelected(Array.from(e.clipboardData.files));
+        if (!e.clipboardData.getData("text/plain")) e.preventDefault();
+      }}
       rows={compact ? 1 : 2}
       disabled={!!block}
       placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
@@ -757,7 +771,7 @@ export default function Composer({
       className="app-chat-attach"
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : t("unavailable")}`}
       title={attachEnabled
-        ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
+        ? t(isHostedUser ? "Attach files (up to 25 MiB; limits vary by host)" : "Attach files (text or PDF 10 MiB, video 20 MiB)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}

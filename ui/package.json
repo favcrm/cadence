@@ -16,6 +16,7 @@
     "test:app-kit": "node --test app-kit/tests/*.test.mjs"
   },
   "dependencies": {
+    "@ai-ecoverse/wasm-libheif": "1.23.7-1",
     "@fontsource/ibm-plex-mono": "5.3.0",
     "@fontsource/ibm-plex-sans": "5.3.0",
     "@hugeicons/core-free-icons": "4.3.0",
