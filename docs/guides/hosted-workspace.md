@@ -1005,9 +1005,10 @@ independent party.
 
 The gate counts hosted verdicts by attested principal and refuses the author's
 principal. A fresh session or a PR comment alone is not a gate-counted verdict.
-In this workspace agents file no hosted verdicts: the reviewer reports back and
-the dispatcher posts the findings. Workflow-issued Standards and Spec/security
-rows are a cheap first pass on gate, security, schema and release PRs; two rows
+In the Cadence project in this workspace, agents file no hosted verdicts: the
+reviewer reports back and the dispatcher posts the findings. Workflow-issued
+Standards and Spec/security rows are a cheap first pass on gate, security,
+schema and release PRs; two rows
 satisfy the review requirement on other PRs (AGENTS.md "Review"). The computed
 class, path rules and any operator approval still apply.
 
@@ -1051,13 +1052,14 @@ two GitHub profiles are not two humans, and an agent must never switch to the
 operator's profile or impersonate them.
 
 The hosted wrapper refuses `--exception --advisory`; it is not a hosted
-fallback. The native-only exception and its limits are in AGENTS.md "Merging".
-A hosted `routine` PR has no readiness record: it takes both workflow passes
-and any approval the gate requires. Matching `docs/roles/workflow-auto-paths.toml`
-alone is not enough; protected paths, case variants and changes other than
-plain additions or modifications still require the operator. Agents run QA,
+fallback. The native evaluator cannot enqueue while local signing is retired;
+see AGENTS.md "Merging". A hosted `routine` PR has no readiness record: it
+takes both workflow passes and any approval the gate requires. Matching
+`docs/roles/workflow-auto-paths.toml` alone is not enough; protected paths,
+case variants and changes other than plain additions or modifications still
+require the operator. For the Cadence project in this workspace, agents run QA,
 post reports and run checks; the operator approves, enqueues and decides any
-deployment.
+deployment. Other projects follow their own applicable policies.
 
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner/name> \

@@ -510,24 +510,23 @@ Do not substitute a comment or another identity for the required proof.
   backed by GitHub Actions OIDC (`POST /__platform/delivery-gate/verify`).
   Agents use `cadence --org <org> delivery check` to inspect readiness.
   The operator records any required project-scoped per-head approval and
-  personally runs `cadence --org <org> delivery enqueue`; enqueue records
-  owner approval and delivery evidence. The operator can instead use the
-  board's approval and merge flow. `POST /api/approvals/:id/revoke` ("Stop
-  merge") and `POST /api/approvals/send-back` ("Send back…") withdraw or
-  return queued work.
+  personally runs `cadence --org <org> delivery enqueue`, which records
+  delivery evidence. Plain enqueue does not itself record a per-head approval;
+  a client that supports `--approve <source>` can record one in the enqueue
+  call. The operator can instead use the board's approval and merge flow.
+  `POST /api/approvals/:id/revoke` ("Stop merge") and
+  `POST /api/approvals/send-back` ("Send back…") withdraw or return queued work.
 
 ### Merging
 
-The following is the native reviewed-enqueue path, not a claim that a selected
-hosted workspace can run it. If the gate cannot run, stop and report the
-limitation; only an authorized operator can decide an exception.
+The hosted board is this repository's supported delivery route. If it cannot
+run, stop and report the limitation; do not change identities or bypass a gate.
 
-- On a native org, enqueue with `scripts/enqueue-reviewed <n> --head
-  <full-reviewed-sha>`. It refuses unless the PR is open at that head,
-  required checks and verdicts hold, the ticket comment lists them and any
-  required operator approval is recorded. The native script never records
-  an approval; it signs the head with the operator's delivery-gate key and
-  posts the signature on the PR.
+- `scripts/enqueue-reviewed <n> --head <full-reviewed-sha> --dry-run` can
+  evaluate the native path, but a native enqueue cannot land in this repository:
+  `scripts/delivery-gate sign` unconditionally refuses retired local v1
+  signing, and the queue refuses v1 signatures. Do not treat a native dry run
+  or exception as an enqueue route.
 - With `--org <hosted-org>` or `CADENCE_ORG`, the wrapper delegates to
   `cadence delivery check` and `cadence delivery enqueue`; it refuses
   `--exception`. Agents check readiness, and the operator runs the hosted
@@ -544,26 +543,18 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
-- On a native org, ask the operator only when the gate does (CAD-2254). Run
-  `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
-  `class:` line:
-  - `class: auto` and the dry run ends with every rule holding: enqueue the
-    PR yourself and report the merge. Do not ask for an approval the gate
-    does not need.
-  - `class: human (...)`, or a refusal that names a missing operator
-    approval: ask the operator once, and name the trigger the gate gives.
-  - A workflow review that says revise: fix the finding, push, and let the
-    new head be reviewed. Ask for `cadence audit accept-revise` only when
-    the finding is wrong, and say why it is wrong.
-- Native-only temporary path (CAD-1946): `scripts/enqueue-reviewed <pr>
-  --head <sha> --exception --advisory standards=<url> --advisory
-  spec-security=<url>` (plus `--advisory browser-qa=<url>` when QA is
-  required) waives only the missing reviewer attestation under its own gate
-  conditions. The advisory links must be distinct HTTPS URLs; that proves
-  neither head binding nor that a review ran. The operator approves the exact
-  head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`. The
-  wrapper refuses `--exception` for a hosted org; do not offer it as a hosted
-  fallback.
+- On a native org, `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run`
+  reports the class and refusals but does not make the retired native signing
+  route usable. On a hosted org, the operator enqueues after the required
+  checks, reviews and approval; agents do not enqueue.
+- A workflow review that says revise: fix the finding, push, and let the new
+  head be reviewed. Ask for `cadence audit accept-revise` only when the
+  finding is wrong, and say why it is wrong.
+- The native-only temporary `--exception --advisory` evaluator checks its own
+  review, Browser QA and operator conditions until `EXCEPTION_ENDS` in
+  `scripts/delivery-gate`. It cannot make a native enqueue land while local
+  signing is retired. The wrapper refuses `--exception` for a hosted org; do
+  not offer it as a hosted fallback.
 
 ### Checks: trust exit codes, not filtered text
 

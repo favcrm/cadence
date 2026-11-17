@@ -132,8 +132,9 @@ screenshots of what you judged, named `NN-<what>-<width>.png`.
 1. Give the full report to the dispatcher if your review role is read-only;
    otherwise post it as one PR comment, first line
    `Browser QA of PR <n> at <full sha>: PASS` (or `: FAIL`).
-2. Only on a pass, the dispatcher posts a second, separate comment whose whole
-   body is exactly these two lines and nothing else, and never edits it:
+2. Only on a pass, the authorized filer posts a second, separate comment
+   whose whole body is exactly these two lines and never edits it. A read-only
+   reviewer sends the result to the dispatcher to post:
 
    ```
    Browser QA: pass

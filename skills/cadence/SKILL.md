@@ -762,15 +762,14 @@ During implementation and handoff:
   need the operator to post the non-author pass personally; never switch
   credentials. Hosted orgs refuse `--exception --advisory`. See AGENTS.md
   "Review" and `docs/guides/hosted-workspace.md` for the current gate.
-- On hosted workspaces, agents run QA, post reports and check readiness; the
-  operator approves and enqueues. On a native org, ask a person only when the
-  gate does: run `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run`
-  and read its `class:` line. On `class: auto` with every rule holding, enqueue
-  the PR yourself and report the merge. On `class: human (...)`, or a refusal
-  that names a missing operator approval, ask the operator once and name the
-  trigger the gate gives. When a workflow review says revise, fix the finding,
-  push and let the new head be reviewed; ask the operator to accept a revise
-  only when the finding is wrong, and say why (CAD-2254).
+- In the Cadence project in this workspace, agents run QA, post reports and
+  check readiness; the operator approves and enqueues. Other projects follow
+  their applicable policies. This repository's native
+  `scripts/enqueue-reviewed --dry-run` can report the class and refusals, but
+  native enqueue cannot land while local signing is retired. See AGENTS.md
+  "Merging" for the hosted route. When a workflow review says revise, fix the
+  finding, push and let the new head be reviewed; ask the operator to accept a
+  revise only when the finding is wrong, and say why (CAD-2254).
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
