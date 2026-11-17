@@ -532,7 +532,8 @@ function Skills({ c }: { c: TabContext }) {
     BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
   // CAD-2419: a hosted profile also has the workspace's own skill library.
   const workspace = c.hired !== undefined && c.doc.kind === "hosted";
-  if (names.length === 0 && c.roleRead === "read" && !workspace) return <Note>{t("No skills are recorded for this agent.")}</Note>;
+  const none = names.length === 0 && c.roleRead === "read" ? <Note>{t("No skills are recorded for this agent.")}</Note> : null;
+  if (none && !workspace) return none;
   return (
     <div className="ap-body">
       {names.length > 0 && (
@@ -543,7 +544,7 @@ function Skills({ c }: { c: TabContext }) {
         </Rows>
       )}
       <RoleRead c={c} />
-      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} />}
+      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} absent={none} />}
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
@@ -579,11 +580,14 @@ export function WorkspaceSkills({
   doc,
   writable,
   toast,
+  absent = null,
   deps = liveSkillDeps,
 }: {
   doc: InstructionsDoc;
   writable: boolean;
   toast: TabContext["toast"];
+  /** Shown instead when the board does not serve the library. */
+  absent?: React.ReactNode;
   deps?: SkillDeps;
 }) {
   const t = useTranslate();
@@ -604,7 +608,9 @@ export function WorkspaceSkills({
       live = false;
     };
   }, [deps, attempt]);
-  if (library.state === "absent") return null;
+  if (library.state === "absent") return <>{absent}</>;
+  // A control that goes away when it is used hands focus to the section, not the page.
+  const toHeading = () => setTimeout(() => heading.current?.focus(), 0);
 
   const assigned = doc.read === "ready" && doc.profile ? doc.profile.skills : null;
   const canAssign = writable && assigned !== null && stale === null;
@@ -637,6 +643,7 @@ export function WorkspaceSkills({
     }
     setStale(null);
     doc.retry();
+    toHeading();
   };
 
   const unlisted = assigned && library.state === "ready" ? unapprovedNames(assigned, skills) : [];
@@ -650,7 +657,13 @@ export function WorkspaceSkills({
       {library.state === "reading" ? (
         <Note>{t("Loading…")}</Note>
       ) : library.state === "failed" ? (
-        <Failed text="Workspace skills couldn’t be read." onRetry={() => setAttempt((n) => n + 1)} />
+        <Failed
+          text="Workspace skills couldn’t be read."
+          onRetry={() => {
+            setAttempt((n) => n + 1);
+            toHeading();
+          }}
+        />
       ) : skills.length === 0 ? (
         <Note>{t("No workspace skills yet. Agents draft them; an owner approves them.")}</Note>
       ) : (
@@ -671,7 +684,8 @@ export function WorkspaceSkills({
                       <input
                         type="checkbox"
                         checked={on}
-                        disabled={saving !== null}
+                        // Not `disabled`: that would drop the focus while the save runs.
+                        aria-disabled={saving !== null}
                         aria-label={`${t("Assigned")}: ${skill.name}`}
                         onChange={(e) => void toggle(skill.name, e.target.checked)}
                       />
@@ -695,7 +709,15 @@ export function WorkspaceSkills({
           </button>
         </p>
       )}
-      {doc.read === "failed" && <Failed text="This agent’s assigned skills couldn’t be read." onRetry={doc.retry} />}
+      {doc.read === "failed" && (
+        <Failed
+          text="This agent’s assigned skills couldn’t be read."
+          onRetry={() => {
+            doc.retry();
+            toHeading();
+          }}
+        />
+      )}
       {unlisted.length > 0 && (
         <div className="mt-3">
           <h4 className="slabel mb-2">{t("Listed on this agent")}</h4>
@@ -708,6 +730,7 @@ export function WorkspaceSkills({
       )}
       {open && (
         <SkillDrawer
+          key={open}
           name={open}
           writable={writable}
           deps={deps}
@@ -717,7 +740,7 @@ export function WorkspaceSkills({
             drop(name);
             setOpen(null);
             // The drawer and its opener row are gone: focus lands on the section, not the page.
-            setTimeout(() => heading.current?.focus(), 0);
+            toHeading();
           }}
           onClose={() => setOpen(null)}
         />
@@ -750,9 +773,14 @@ function SkillDrawer({
   const [read, setRead] = useState<WorkspaceSkillRead | null | "failed">(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  // Where focus goes once the next read lands: a decision swaps its button
+  // (Approve for Revoke), and Retry or a revision switch replaces its own.
+  const focusNext = useRef<"approve" | "revoke" | "top" | null>(null);
+  const top = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let live = true;
-    setRead(null);
+    // The last answer stays on screen until the next one lands, so the
+    // focused control is not unmounted under a reload.
     deps
       .read(name, shown)
       .then((data) => {
@@ -772,8 +800,19 @@ function SkillDrawer({
     };
     // Only what is asked starts a read; the callbacks are fresh each render.
   }, [deps, name, shown, attempt]);
+  useEffect(() => {
+    const want = focusNext.current;
+    if (want === null || read === null || read === "failed") return;
+    focusNext.current = null;
+    (want === "top" ? top.current : (document.getElementById(`wskill-${want}`) ?? top.current))?.focus();
+  }, [read]);
 
-  const decide = async (job: () => Promise<WorkspaceSkillSummary | null>, done: string, n = 0) => {
+  const decide = async (
+    job: () => Promise<WorkspaceSkillSummary | null>,
+    done: string,
+    n: number,
+    focus: { done: "approve" | "revoke" | null; failed: "approve" | "revoke" | null },
+  ) => {
     if (busy) return;
     setBusy(true);
     try {
@@ -782,6 +821,7 @@ function SkillDrawer({
       toast("ok", t(done).replace("{name}", () => name).replace("{n}", String(n)));
       if (skill) {
         onChanged(skill);
+        focusNext.current = focus.done;
         setAttempt((n) => n + 1);
       } else onGone(name);
     } catch (error) {
@@ -791,6 +831,7 @@ function SkillDrawer({
       if (why.code === "not_found") onGone(name);
       // The skill moved, or the answer was lost: show what the board holds now.
       else if (why.unconfirmed || why.code === "digest_mismatch" || why.code === "revision_conflict" || why.code === "approved_skill") {
+        focusNext.current = focus.failed;
         setShown(undefined);
         setAttempt((n) => n + 1);
       }
@@ -801,7 +842,17 @@ function SkillDrawer({
 
   const body = () => {
     if (read === null) return <Note>{t("Loading…")}</Note>;
-    if (read === "failed") return <Failed text="This skill couldn’t be read." onRetry={() => setAttempt((n) => n + 1)} />;
+    if (read === "failed") {
+      return (
+        <Failed
+          text="This skill couldn’t be read."
+          onRetry={() => {
+            focusNext.current = "top";
+            setAttempt((n) => n + 1);
+          }}
+        />
+      );
+    }
     const { skill, revision } = read;
     const approved = skill.approved;
     return (
@@ -820,38 +871,60 @@ function SkillDrawer({
         {(approved && approved.revision !== revision.revision) || revision.revision !== skill.latest_revision ? (
           <div className="flex flex-wrap gap-2">
             {approved && approved.revision !== revision.revision && (
-              <Button size="sm" variant="ghost" onClick={() => setShown(approved.revision)}>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  focusNext.current = "top";
+                  setShown(approved.revision);
+                }}
+              >
                 {t("Show the approved revision")}
               </Button>
             )}
             {revision.revision !== skill.latest_revision && (
-              <Button size="sm" variant="ghost" onClick={() => setShown(undefined)}>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  focusNext.current = "top";
+                  setShown(undefined);
+                }}
+              >
                 {t("Show the latest revision")}
               </Button>
             )}
           </div>
         ) : null}
+        {/* No `disabled` while a decision runs: it would drop the focus. `decide` ignores a second click. */}
         {writable && (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-2" aria-busy={busy}>
             {!read.approved && (
               <Button
                 size="sm"
                 variant="primary"
-                disabled={busy}
+                id="wskill-approve"
                 onClick={() =>
-                  void decide(() => deps.approve(name, revision.revision, revision.digest), "Approved revision {n} of {name}.", revision.revision)
+                  void decide(() => deps.approve(name, revision.revision, revision.digest), "Approved revision {n} of {name}.", revision.revision, {
+                    done: "revoke",
+                    failed: "approve",
+                  })
                 }
               >
                 {t("Approve revision {n}").replace("{n}", String(revision.revision))}
               </Button>
             )}
             {approved && (
-              <Button size="sm" disabled={busy} onClick={() => void decide(() => deps.revoke(name, approved.digest), "Revoked {name}.")}>
+              <Button
+                size="sm"
+                id="wskill-revoke"
+                onClick={() => void decide(() => deps.revoke(name, approved.digest), "Revoked {name}.", 0, { done: "approve", failed: "revoke" })}
+              >
                 {t("Revoke")}
               </Button>
             )}
             {!approved && (
-              <Button size="sm" variant="danger" disabled={busy} onClick={() => setConfirming(true)}>
+              <Button size="sm" variant="danger" onClick={() => !busy && setConfirming(true)}>
                 {t("Delete")}
               </Button>
             )}
@@ -872,7 +945,9 @@ function SkillDrawer({
   return (
     <>
       <ItemDrawer title={name} onClose={onClose}>
-        {body()}
+        <div ref={top} tabIndex={-1} className="ap-body focus:outline-none">
+          {body()}
+        </div>
       </ItemDrawer>
       {/* Outside the drawer: its transform would pin a fixed dialog inside it. */}
       {confirming && latest !== null && (
@@ -886,7 +961,7 @@ function SkillDrawer({
             void decide(async () => {
               await deps.remove(name, latest);
               return null;
-            }, "Deleted {name}.")
+            }, "Deleted {name}.", 0, { done: null, failed: null })
           }
           onCancel={() => setConfirming(false)}
         />

@@ -14,6 +14,7 @@ import type { StoredAgentProfile, WorkspaceSkillRead, WorkspaceSkillSummary } fr
 import type { DocDeps } from "../src/features/agents/instructionsDoc";
 import type { SkillDeps } from "../src/features/agents/workspaceSkills";
 import type * as TabsModule from "../src/features/agents/AgentTabs";
+import type { TabContext } from "../src/features/agents/AgentTabs";
 import type * as HookModule from "../src/features/agents/useInstructionsDoc";
 
 declare function require(name: string): unknown;
@@ -44,10 +45,12 @@ async function main() {
   const React = require("react") as typeof ReactNs;
   const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
   const { ApiError } = require("../src/lib/apiError") as { ApiError: typeof ApiErrorType };
-  const { WorkspaceSkills } = require("../src/features/agents/AgentTabs") as typeof TabsModule;
+  const { WorkspaceSkills, default: AgentTabBody } = require("../src/features/agents/AgentTabs") as typeof TabsModule;
+  const { allowPrivateReads } = require("../src/lib/privateSession") as { allowPrivateReads: () => void };
   const { useInstructionsDoc } = require("../src/features/agents/useInstructionsDoc") as typeof HookModule;
 
   // ---- a fake board: one profile and a three-skill library ----
+  let holdWrite: Promise<void> | null = null;
   let stored: StoredAgentProfile = {
     id: "ap_1", name: "ads-agent", role: "Ads", responsibilities: "# Ads", skills: ["weekly-report", "copywriting"], status: "active",
     revision: 4, created_at: 1, updated_at: 2, created_by: "owner", catalogue: null, model: "inherit",
@@ -57,6 +60,7 @@ async function main() {
     readProfile: async () => stored,
     writeProfile: async (_id, body) => {
       profileWrites.push(body as Record<string, unknown>);
+      if (holdWrite) await holdWrite;
       const b = body as { expectedRevision: number; skills: string[] };
       if (b.expectedRevision !== stored.revision) throw new ApiError("Reload the agent profile.", 409, { code: "revision_conflict" });
       stored = { ...stored, skills: b.skills, revision: stored.revision + 1 };
@@ -145,6 +149,7 @@ async function main() {
     await React.act(async () => { (el as HTMLElement).click(); });
     await flush();
   };
+  const focusedId = (): string => document.activeElement?.id ?? "";
   const row = (name: string) => host.querySelector(`[data-record-id="wskill-${name}"]`);
   const toggle = (name: string) => host.querySelector<HTMLInputElement>(`input[aria-label="Assigned: ${name}"]`);
   const closeDrawer = async () => {
@@ -160,6 +165,34 @@ async function main() {
     await mount(true);
     assert(!/Workspace skills/.test(host.textContent ?? "") && host.textContent === "", `a ${status} list hides the section`);
   }
+  // The whole tab on such a board: a profile whose role names nothing still
+  // says so, as before the library, instead of rendering nothing.
+  allowPrivateReads();
+  let served: { status: number; body: unknown } = { status: 404, body: { error: { code: "not_found", message: "Not found." } } };
+  globalThis.fetch = (async (input: unknown) => {
+    assert(String(input).includes("/api/workspace-skills"), `the tab read only the library, not ${String(input)}`);
+    return new Response(JSON.stringify(served.body), { status: served.status, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  const tab = async () => {
+    const c = {
+      hired: { id: "ap_1", alias: "ads-agent" }, role: null, roleRead: "read", writable: false, hostedBoard: true, toast,
+      doc: { kind: "hosted", read: "ready", profile: stored, draft: null, retry: () => {}, saveSkills: async () => ({ kind: "busy" }) },
+    } as unknown as TabContext;
+    await React.act(async () => { root.unmount(); });
+    root = createRoot(host);
+    await React.act(async () => { root.render(React.createElement(AgentTabBody, { tab: "skills", c })); });
+    await flush();
+    return host.textContent ?? "";
+  };
+  for (const status of [404, 501]) {
+    served = { status, body: { error: { code: status === 404 ? "not_found" : "not_implemented", message: "Not here." } } };
+    const text = await tab();
+    assert(text === "No skills are recorded for this agent.", `a ${status} library leaves the tab's own empty note: ${text}`);
+  }
+  served = { status: 200, body: { skills: [] } };
+  const listed = await tab();
+  assert(/Workspace skills/.test(listed) && /No workspace skills yet/.test(listed), "a served library shows the section");
+
   // A read failure says so, and Retry reads again.
   listFails = () => new ApiError("unavailable", 503);
   await mount(false);
@@ -195,7 +228,16 @@ async function main() {
   const before = stored.revision;
   assert(toggle("weekly-report")?.checked === true && toggle("tone-guide")?.checked === false, "the toggles show the profile's assignments");
   assert(!toggle("pricing-check"), "a draft has no toggle");
-  await click(toggle("tone-guide"), "the tone-guide toggle");
+  let release = () => {};
+  holdWrite = new Promise<void>((resolve) => { release = resolve; });
+  const box = toggle("tone-guide")!;
+  box.focus();
+  await click(box, "the tone-guide toggle");
+  assert(!box.disabled && box.getAttribute("aria-disabled") === "true" && document.activeElement === box, "a saving toggle stays focusable and focused");
+  holdWrite = null;
+  release();
+  await flush();
+  assert(document.activeElement === toggle("tone-guide"), "the toggle keeps focus after the save");
   const assign = profileWrites[profileWrites.length - 1] as { skills: string[]; expectedRevision: number; responsibilities: string };
   assert(JSON.stringify(assign.skills) === JSON.stringify(["weekly-report", "copywriting", "tone-guide"]), "assigning appends the skill");
   assert(assign.expectedRevision === before && assign.responsibilities === "# Ads", "it saves at the page's revision, keeping the stored text");
@@ -212,6 +254,7 @@ async function main() {
   assert(/Someone else changed this agent’s profile\./.test(all()) && button("Reload"), "a stale revision asks for a reload");
   assert(host.querySelectorAll("input[type=checkbox]").length === 0, "toggles wait for the reload");
   await click(button("Reload"), "the Reload button");
+  assert(document.activeElement?.textContent === "Workspace skills", "Reload hands focus to the section");
   assert(toggle("tone-guide")?.checked === false && toggle("weekly-report")?.checked === false, "the reload shows the board's assignments");
 
   // ---- owner decisions ----
@@ -219,6 +262,9 @@ async function main() {
   await click(button("Approve revision 1"), "an Approve button on a draft");
   assert(JSON.stringify(calls[calls.length - 1]) === JSON.stringify(["approve", "pricing-check", 1, "pricing-check-d1"]), "Approve sends the shown revision and its digest");
   assert(/Approved revision 1 of pricing-check\./.test(lastToast()) && !button("Delete") && button("Revoke"), "an approved skill offers Revoke, not Delete");
+  assert(focusedId() === "wskill-revoke", "focus moves from Approve to the Revoke that replaced it");
+  await click(button("Revoke"), "Revoke on pricing-check");
+  assert(focusedId() === "wskill-approve", "focus moves from Revoke to the Approve that replaced it");
   await closeDrawer();
 
   // A draft newer than the approval: Approve names and sends that revision.
