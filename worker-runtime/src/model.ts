@@ -26,14 +26,19 @@ export const MODEL_CONTEXT_WINDOW = 128_000;
  * is the gateway's 256 KiB request body, not the model's window. The engine
  * counts tokens from the last reply's reported usage, and estimates the rest
  * (the first request, the first request after a compaction, and the newest
- * step's results) at 3.5 characters a token. For English JSON that estimate
- * is about 3.5–4.5 bytes a token, so 256 KiB is roughly 58–75k; Chinese is
- * three bytes a character, about 10.5 bytes an estimated token. The default
- * reserve (window − 16,384 ≈ 112k) therefore never fired before the gateway
- * refused.
+ * step's results) at 3.5 characters a token.
  *
- * - Blocking compaction at 128,000 − 80,000 = 48k tokens (about 216 KiB at
- *   4.5 bytes a token), background 16,384 tokens earlier (about 31.6k).
+ * - Measured on the hosted default model (deepseek-v4.1-flash, 2026-11-17)
+ *   with requests shaped like hosted traffic: English JSON, HTML and prose
+ *   at 3.45 bytes a reported token, Chinese JSON and prose at 3.85. So
+ *   256 KiB holds about 68–76k reported tokens, and the default reserve
+ *   (window − 16,384 ≈ 112k) never fired before the gateway refused.
+ * - Where the engine estimates instead, Chinese (3 bytes a character, about
+ *   2 characters a real token) costs about 10.5 bytes an estimated token.
+ *
+ * - Blocking compaction at 128,000 − 80,000 = 48k tokens (about 185 KB at
+ *   3.85 bytes a token), background 16,384 tokens earlier (about 31.6k,
+ *   about 122 KB).
  * - The kept tail is 8,000 tokens, so the first request after a compaction
  *   stays far under the budget even when the tail is estimated Chinese text
  *   (8,000 × 10.5 ≈ 84 KB).

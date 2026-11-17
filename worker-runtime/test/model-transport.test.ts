@@ -385,8 +385,9 @@ describe("CAD-2414: one long operation within the gateway budget", () => {
   });
 
   it("sets compaction thresholds that sit under the budget", () => {
-    // The engine estimates 3.5 characters a token where it has no usage:
-    // English JSON is up to about 4.5 bytes a token, Chinese 10.5.
+    // Measured on the hosted default: 3.45 bytes a reported token for
+    // English, 3.85 for Chinese; 4.5 is that with a margin. Where the engine
+    // estimates (3.5 characters a token), Chinese costs about 10.5.
     const blocking = MODEL_CONTEXT_WINDOW - HOSTED_COMPACTION_POLICY.reserveTokens;
     const background = blocking - HOSTED_COMPACTION_POLICY.backgroundTokens;
     expect(blocking * 4.5).toBeLessThan(budget);
