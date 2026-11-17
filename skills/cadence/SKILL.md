@@ -457,10 +457,9 @@ agreed hand-over (recorded on the issue).
 Every lane `issue start` mints, in any repository, carries two guards. A
 per-worktree `pre-push` hook records a receipt for the head. A repository
 without an executable `scripts/pre-push` records that and lets the push through.
-When the repository has one, the hook currently also needs a `scripts/boat-build`
-helper and refuses the push without it (`refused:no-boat-build`);
-`CADENCE_PRE_PUSH_LOCAL=1` runs `scripts/pre-push` on the host instead. Report a
-refusal; do not bypass the hook. `--no-verify` still pushes, but the missing
+When the repository has one, the hook currently also needs the repository's
+own build helper and refuses the push without it; the refusal names what is
+missing. Report a refusal; do not bypass the hook. `--no-verify` still pushes, but the missing
 receipt is the detectable signal. A `cargo` shim on the lane's PATH
 sends every compiling subcommand through a build slot, so no local compile
 escapes the queue; only clearly light subcommands (`fmt`, `metadata`, `tree`,
@@ -779,9 +778,8 @@ policy that needs no review may still need both review workflows. Then:
    the approval. Never record or simulate the human's approval, and never act
    under another identity or switch credentials. Approval, `delivery
    enqueue`/`delivery merge` and `audit accept-revise` are the approver's;
-   Cadence refuses them from an agent. An agent the owner has designated may
-   record a delegated approval within its designation. If a gate refuses,
-   report the exact refusal.
+   Cadence refuses them from an agent. If a gate refuses, report the exact
+   refusal.
 
 When a review says revise, fix the finding on the same branch, push, and let
 the new head be reviewed. Ask the approver to accept a revise only when the
