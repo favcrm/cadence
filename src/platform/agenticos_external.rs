@@ -407,7 +407,8 @@ impl AgenticosExternalAdapter {
         &self,
         credential: &[u8],
         binding: &Value,
-    ) -> std::result::Result<(u64, String, Option<String>, Option<String>), String> {
+    ) -> std::result::Result<(u64, String, Option<String>, Option<String>, Option<String>), String>
+    {
         let config = &binding["config"];
         let mapping = &config["mapping"];
         if config["provider"] != PLATFORM
@@ -462,11 +463,54 @@ impl AgenticosExternalAdapter {
                 .unwrap_or("unavailable");
             return Err(format!("AgenticOS provider quote refused: {code}"));
         }
-        quote_view(
+        let (total, revision, protocol, model) = quote_view(
             tool,
             mapping["effect"].as_str().unwrap_or(""),
             &envelope["data"],
-        )
+        )?;
+        if tool != POSTS_TOOL || protocol.is_none() {
+            return Ok((total, revision, protocol, model, None));
+        }
+        let url = format!("{}/v1/runtime/tools/{tool}/quote", self.base);
+        let mut response = authorized(self.http.post(&url), token)
+            .send_json(json!({"units":1}))
+            .map_err(|_| "AgenticOS tool quote could not reach the provider")?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024)
+            .read_to_vec()
+            .map_err(|_| "AgenticOS tool quote exceeds the supported bound")?;
+        let envelope: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "AgenticOS tool quote is not JSON")?;
+        let quote = &envelope["data"];
+        let amount = quote["chargeMinor"]
+            .as_u64()
+            .filter(|amount| *amount > 0 && *amount <= MAX_SAFE_JSON_INTEGER)
+            .ok_or("AgenticOS tool quote has an invalid charge")?;
+        let revision = quote["pricingRevision"]
+            .as_str()
+            .filter(|revision| valid_pricing_revision(revision))
+            .ok_or("AgenticOS tool quote has an invalid pricing revision")?;
+        if status != 200
+            || envelope["ok"] != true
+            || quote.as_object().is_none_or(|object| object.len() != 7)
+            || quote["slug"] != tool
+            || quote["units"] != 1
+            || quote["chargeProtocol"] != "quote@2"
+            || quote["currency"] != "USD"
+            || quote["scale"] != 6
+        {
+            return Err("AgenticOS tool quote is invalid".into());
+        }
+        Ok((
+            amount,
+            revision.to_owned(),
+            protocol,
+            model,
+            Some(revision.to_owned()),
+        ))
     }
 
     fn call_source(
@@ -492,14 +536,28 @@ impl AgenticosExternalAdapter {
             ));
         }
         let url = format!("{}{CALL_PATH}", self.base);
-        let ceiling = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
+        let quote = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
+        let mut request = json!({
+            "slug": POSTS_TOOL,
+            "query": {"handle": handle, "count": POSTS_COUNT},
+            "max_charge_minor": quote,
+        });
+        if authority["quote"]["charge_protocol"] == "quote@2" {
+            let revision = authority["quote"]["pricing_revision"]
+                .as_str()
+                .filter(|revision| valid_pricing_revision(revision))
+                .ok_or_else(|| {
+                    AppCapabilityError::Refused("run has no valid tool pricing revision".into())
+                })?;
+            request["charge_protocol"] = json!("quote@2");
+            request["tool_quote"] = json!({
+                "slug":POSTS_TOOL,"units":1,"chargeProtocol":"quote@2",
+                "currency":"USD","scale":6,"chargeMinor":quote,"pricingRevision":revision
+            });
+        }
         let mut response = authorized(self.http.post(&url), token)
             .header("idempotency-key", idempotency_key)
-            .send_json(json!({
-                "slug": POSTS_TOOL,
-                "query": {"handle": handle, "count": POSTS_COUNT},
-                "max_charge_minor": ceiling,
-            }))
+            .send_json(request)
             .map_err(|_| {
                 AppCapabilityError::Uncertain(
                     "AgenticOS source request outcome is uncertain; retry requires the same key"
@@ -1935,7 +1993,8 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         if binding["config"]["mapping"]["capability"] == "media.generate" {
             return self.quote_image(credential, binding);
         }
-        let (total, revision, charge_protocol, model) = self.quote_fixed(credential, binding)?;
+        let (total, revision, charge_protocol, model, pricing_revision) =
+            self.quote_fixed(credential, binding)?;
         Ok(AppCapabilityQuote {
             schema: 1,
             currency: "USD".into(),
@@ -1945,7 +2004,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             price_revision: revision,
             model,
             price_slug: None,
-            pricing_revision: None,
+            pricing_revision,
             charge_protocol,
         })
     }
@@ -2861,6 +2920,51 @@ mod tests {
         assert_eq!(seen.len(), 4);
         assert_eq!(seen[1].body["body"]["model"], "synthetic/default");
         assert_eq!(seen[3].body["body"]["model"], "synthetic/selected");
+    }
+
+    #[test]
+    fn source_uses_the_live_uncapped_tool_quote() {
+        let revision = format!("sha256:{}", "a".repeat(64));
+        let expected = revision.clone();
+        let (base, seen, worker) = media_door(move |request| match request.url.as_str() {
+            "/v1/runtime/tools/read_instagram_posts" => json_response(
+                200,
+                json!({"ok":true,"data":{"slug":POSTS_TOOL,"effect":"read",
+                    "chargePrecondition":"quote@2","price":{"currency":"USD","scale":6,"amount":"0.002000"},
+                    "unitPrice":null}}),
+            ),
+            "/v1/runtime/tools/read_instagram_posts/quote" => json_response(
+                200,
+                json!({"ok":true,"data":{"slug":POSTS_TOOL,"units":1,"chargeProtocol":"quote@2",
+                    "currency":"USD","scale":6,"chargeMinor":3000,"pricingRevision":expected}}),
+            ),
+            CALL_PATH => {
+                assert_eq!(request.body["max_charge_minor"], 3000);
+                assert_eq!(request.body["charge_protocol"], "quote@2");
+                assert_eq!(request.body["tool_quote"]["pricingRevision"], expected);
+                json_response(
+                    200,
+                    json!({"ok":true,"data":{"slug":POSTS_TOOL,"repeated":false,
+                    "price":{"currency":"USD","scale":6,"amount":"0.003000"},
+                    "result":{"success":true,"status":"ok","items":[],"more_available":false}}}),
+                )
+            }
+            _ => panic!("unexpected source request {}", request.url),
+        });
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        let mut proof = authority();
+        let quote = adapter
+            .quote_app_capability(b"token", &proof["binding"])
+            .unwrap();
+        assert_eq!(quote.total_price_micros, 3000);
+        assert_eq!(quote.pricing_revision.as_deref(), Some(revision.as_str()));
+        proof["quote"] = serde_json::to_value(quote).unwrap();
+        adapter
+            .execute_app_capability_outcome(b"token", &proof, &json!({}), "source-quote-key-1")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     fn hosted_adapter() -> AgenticosExternalAdapter {
