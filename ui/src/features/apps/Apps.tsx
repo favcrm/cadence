@@ -10,6 +10,7 @@ import { homeNeeds, type HomeNeed } from "../home/needs";
 import { appApprovalChip, appHref, appPurpose, installedAppHref, installationAppHref, runsSummary, screenInstallHref } from "./appViewModel";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { useInstallations } from "../workspace-apps/useInstallations";
+import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
 import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
@@ -55,6 +56,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [privateOpen, setPrivateOpen] = useState(false);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
 
@@ -221,7 +223,10 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
             loadError !== null && loadError !== UNVERIFIED_APPS_COPY ? (
               <Button onClick={retryAll}>{t("Retry")}</Button>
             ) : (
-              <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
+              <>
+                <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
+                {isOp && loadError === null && <Button onClick={() => setPrivateOpen(true)}>{t("Add private app")}</Button>}
+              </>
             )
           }
         >
@@ -239,6 +244,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
         <h1 className="text-section font-semibold text-ink-100">{t("Apps")}</h1>
         <span className="grow" />
         {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>}
+        {isOp && <Button onClick={() => setPrivateOpen(true)}>{t("Add private app")}</Button>}
       </div>
 
       {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
@@ -437,6 +443,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
       )}
         </>
       )}
+      {privateOpen && <PrivateAppDialog onClose={() => setPrivateOpen(false)} onInstalled={() => setRevision((r) => r + 1)} />}
     </main>
   );
 }

@@ -29,6 +29,14 @@ export interface DeclaredSlot {
   declaration: SlotDeclaration | null;
 }
 
+/** A catalogue slot selects a platform tool, not an enrolled connection. */
+export function isCatalogSlot(slot: DeclaredSlot): boolean {
+  const need = slot.declaration;
+  return !!need && need.schema === 1 && need.capability === "catalog.tool" && need.version === 1 &&
+    need.action === "invoke" && need.resource_kind === "connection_account" &&
+    (need.effect === "read" || need.effect === "draft");
+}
+
 /** Every slot the app declares: typed capability slots, then untyped legacy ones. */
 export function declaredSlots(installation: Installation): DeclaredSlot[] {
   const capabilities = installation.capabilities ?? {};
@@ -213,7 +221,7 @@ export function readinessFor(
   t: (english: string) => string = (english) => english,
 ): SlotReadiness[] {
   return declaredSlots(installation)
-    .filter((slot) => slot.declaration !== null)
+    .filter((slot) => slot.declaration !== null && !(installation.source_kind === "private" && isCatalogSlot(slot)))
     .map((slot) => {
       const binding = bindingForSlot(bindings, contextId, slot.slot, installation.digest);
       const health = bindingHealth(binding, installation.digest, connections);

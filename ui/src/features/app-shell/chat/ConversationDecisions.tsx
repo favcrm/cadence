@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "../../../lib/locale";
 import StagedWriteDetail, { noticeText } from "../../decisions/StagedWriteDetail";
 import { failureReason, isolate, outcomeOf } from "../../decisions/stagedWrite";
-import { conversationDecisions, useDecisions } from "../../decisions/useDecisions";
+import { conversationDecisions, useDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 
 /** The caller keys this component by the selected, server-proven conversation. */
 export default function ConversationDecisions({
@@ -10,17 +10,20 @@ export default function ConversationDecisions({
   revision,
   onPendingChange,
   onReview,
+  store: shared,
 }: {
   conversation: string;
   revision: number;
   onPendingChange: (conversation: string, pending: boolean) => void;
   onReview: () => void;
+  /** CAD-2364: the pane's store for this conversation, so its answers' chips read the same list. */
+  store?: DecisionsStore;
 }) {
   const t = useTranslate();
-  const [store] = useState(() => conversationDecisions(conversation));
+  const [store] = useState(() => shared ?? conversationDecisions(conversation));
   const decisions = useDecisions(true, store);
   const [review, setReview] = useState<{ queue: string[]; at: number } | null>(null);
-  const opener = useRef<HTMLButtonElement | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
   const activity = useRef<HTMLElement | null>(null);
   const previousRevision = useRef(revision);
 
@@ -33,7 +36,7 @@ export default function ConversationDecisions({
     previousRevision.current = revision;
   }, [revision, store]);
 
-  const open = (id: string, button: HTMLButtonElement) => {
+  const open = (id: string, button: HTMLElement) => {
     const queue = decisions.pending.map((row) => row.id);
     const at = queue.indexOf(id);
     if (at < 0) return;
@@ -42,6 +45,10 @@ export default function ConversationDecisions({
     store.clearNotice();
     setReview({ queue, at });
   };
+  // CAD-2364: a chip in an answer opens the same review card.
+  const openRef = useRef(open);
+  openRef.current = open;
+  useEffect(() => store.onReviewRequest((id, button) => openRef.current(id, button)), [store]);
   const close = () => {
     setReview(null);
     window.requestAnimationFrame(() => {

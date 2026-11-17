@@ -111,7 +111,13 @@ mod tests {
         let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
 
         // Private is refused until the isolation gate passes.
-        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+        let err = set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+        assert_eq!(err.code(), Some("private_unavailable"), "{err}");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a refused private writes nothing"
+        );
 
         // Reserved grantee kinds and unknown projects are refused.
         set_project_policy(

@@ -350,10 +350,21 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     if (holders > 0) void reloadDecisions();
   }
 
+  // CAD-2364: a chat chip asks whoever shows this store's review card to
+  // open one. A request only opens a card; it never decides anything.
+  const reviewers = new Set<(id: string, opener: HTMLElement) => void>();
+  function requestReview(id: string, opener: HTMLElement) {
+    for (const fn of reviewers) fn(id, opener);
+  }
+  function onReviewRequest(fn: (id: string, opener: HTMLElement) => void) {
+    reviewers.add(fn);
+    return () => { reviewers.delete(fn); };
+  }
+
   return {
     conversation,
     acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, checkDecision,
-    clearNotice, markFailedSeen, resetDecisions,
+    clearNotice, markFailedSeen, resetDecisions, requestReview, onReviewRequest,
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => { listeners.delete(listener); };

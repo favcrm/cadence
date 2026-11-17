@@ -23,13 +23,14 @@ The ordinary Vite scripts and files remain app-owned; this package adds no lifec
 
 ## Starter template
 
-The Cadence repository's [`template/`](template/README.md) is a minimal working
-app: the `cadence` package contract, an `app-screens/v2` package, an app-kit
-receiver with presentation and drawer helpers, a build that bundles the kit,
-a loopback surface preview, and `cadence app check` in the pre-push. The next
-toolchain archive packages it; until then, copy it from the Cadence checkout
-and point `CADENCE_APP_KIT` at this archive's `app-kit/` (or keep them
-siblings). See the [Cadence app development guide](https://github.com/favcrm/cadence/blob/main/docs/guides/app-development.md).
+The archive's [`template/`](template/README.md) is a working screen app:
+the `cadence` package contract, an `app-screens/v2` package, an app-kit
+receiver, a loopback surface preview, and a ZIP packager for private hosted
+workspaces. Copy `template/` and `app-kit/` together; each template source is
+pinned in `toolchain.json`. See the [Cadence app development guide](https://github.com/favcrm/cadence/blob/main/docs/guides/app-development.md).
+The [`checklist/`](checklist/README.md) example uses hosted records and
+shows the declared operations agents can discover through `app_describe`.
+Its source files are also pinned in `toolchain.json`.
 
 ## Canonical host frame
 
@@ -93,3 +94,11 @@ Do not edit the packaged receiver and do not treat it as the protocol's
 source: the wire contract is the Cadence `screenProtocol` document for this
 release. What a PUSH means, the app's closed verb set, and payload validation
 stay app-owned.
+
+Hosted private uploads currently refuse screen-declared platform tools: the
+existing Social-specific broker does not yet provide a host-owned consent
+step for an untrusted private frame. Records screens and tool screens also
+use mutually exclusive host contracts. Do not embed provider credentials or
+assume that a tool alias or an installed app grants access to the platform's
+general tool catalog. `app_describe`/`app_call` expose supported declared
+record operations; agent writes remain subject to the owner's decision.

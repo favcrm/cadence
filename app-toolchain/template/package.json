@@ -11,6 +11,7 @@
   "scripts": {
     "build": "bun scripts/build.mjs",
     "check": "bun scripts/build.mjs && cadence app check app",
+    "package": "bun scripts/build.mjs && bun scripts/package.mjs",
     "dev": "node scripts/dev-preview.mjs",
     "test": "node --test tests/*.test.mjs",
     "pre-push": "sh scripts/pre-push"

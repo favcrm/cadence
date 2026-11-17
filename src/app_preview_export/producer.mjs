@@ -243,7 +243,9 @@ var RECORD_CALL_VERBS = [
 	"works.trash",
 	"works.restore",
 	"works.request_review",
-	"calendar.query"
+	"calendar.query",
+	"catalog.call",
+	"catalog.status"
 ];
 var RECORD_SLOT_VERBS = [
 	"records.csv.import",
@@ -267,7 +269,8 @@ var RECORD_SLOT_VERBS = [
 	"whatsapp.handoff.release",
 	"chat.whatsapp.brief",
 	"works.review",
-	"works.export"
+	"works.export",
+	"catalog.confirm"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;

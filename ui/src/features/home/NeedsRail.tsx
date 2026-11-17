@@ -205,16 +205,28 @@ export default function NeedsRail({
     },
     ask: (lead) => ask(need, lead),
   });
+  const reviewStaged = (queue: string[], at: number, opener: Element | null = document.activeElement) => {
+    stagedOpener.current = opener;
+    homeDecisions.clearNotice();
+    reviewOpening.current = true;
+    setDrawer(false);
+    setReview({ queue, at });
+  };
+  // CAD-2364: a chip in the thread opens the same review card, over what is waiting now.
+  // The chip is the opener: a click does not focus a button in every browser.
+  const openStaged = useRef<(id: string, opener: HTMLElement) => void>(() => {});
+  openStaged.current = (id: string, opener: HTMLElement) => {
+    const queue = staged.pending.map((w) => w.id);
+    const at = queue.indexOf(id);
+    if (at >= 0) reviewStaged(queue, at, opener);
+  };
+  useEffect(() => homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener)), []);
   const openDecision = (key: string) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
     if (stagedCard) {
       // Not an issue-backed item: the staged detail is the rail's own, on the same shell.
       const queue = cards.flatMap((n) => (n.action.type === "staged" ? [n.action.id] : []));
-      stagedOpener.current = document.activeElement;
-      homeDecisions.clearNotice();
-      reviewOpening.current = true;
-      setDrawer(false);
-      setReview({ queue, at: Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0) });
+      reviewStaged(queue, Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0));
       return;
     }
     const need = readers.find((n) => n.key === key);
