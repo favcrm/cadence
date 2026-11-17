@@ -186,9 +186,11 @@ the code you just wrote.
   through an operator channel. A scope, delegated or legacy repo-scoped
   approval, an edited pass or a pass for another head does not satisfy that
   route. The gate checks the comment and approval, not whether QA actually ran.
-  On an older board, the operator may personally post the non-author pass as
-  an interim fallback; an agent never switches credentials or impersonates
-  the operator. A second human is not required.
+  On 2026-11-16 the operator selected the interim route: after reading the
+  report, the operator personally posts the non-author pass as `favcrm-dev`.
+  CAD-2383 supersedes that requirement; it remains a fallback on older boards.
+  An agent never switches credentials or impersonates the operator. A second
+  human is not required.
 - **Agents file no hosted verdict in this workspace.** A reviewer reports its
   findings back; the dispatcher posts them as a PR comment. That report is not
   itself a gate-counted verdict. `favcrm-dev` and `cc-syntax` are one person,

@@ -1046,10 +1046,12 @@ cadence --org acme delivery enqueue --project <project-key> --issue <issue-id> \
 ```
 
 `delivery check` reports `browser_qa_route`; an author pass awaiting approval
-is not a pass by itself. On a board that predates CAD-2383, the operator may
-personally post the non-author exact pass as an interim fallback. The operator's
-two GitHub profiles are not two humans, and an agent must never switch to the
-operator's profile or impersonate them.
+is not a pass by itself. On 2026-11-16, the operator selected an interim route:
+after reading the report, the operator personally posts the non-author exact
+pass as `favcrm-dev`. CAD-2383 supersedes that requirement; it remains a
+fallback for older boards. The operator's two GitHub profiles are not two
+humans, and an agent must never switch to the operator's profile or impersonate
+them.
 
 The hosted wrapper refuses `--exception --advisory`; it is not a hosted
 fallback. The native evaluator cannot enqueue while local signing is retired;
