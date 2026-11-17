@@ -43,7 +43,7 @@ const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import(".
 const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
+const { parseStagedRow, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
 
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
@@ -1133,6 +1133,20 @@ listStatus = 200;
   assert(lines.some((l) => l.includes("Sent") && l.includes("gmail_send_email")) && lines.some((l) => l.includes("Result not confirmed") && l.includes("do not assume it did not")), `Updates (${lines.join("|")})`);
   onDecide = null;
   await v.done();
+
+  // The server leaves an uncertain send pending, carrying the result.
+  const stuck = parseStagedRow(effect("u1", { result: { ok: false, code: "uncertain", retry: true } }));
+  assert(stuck !== null && outcomeOf(stuck) === "pending" && stuck.result?.code === "uncertain", "a pending row keeps its uncertain result");
+  actions = [effect("u1", { result: { ok: false, code: "uncertain", retry: true } })];
+  {
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "still a card"));
+    await click(labelled(w.cards()[0], "Review"));
+    await settle(() => assert(drawerEl(), "open"));
+    const body = text(drawerEl());
+    assert(!body.includes("Nothing has been sent yet") && body.includes("may have acted"), `a pending uncertain row never says nothing was sent (${body.slice(0, 300)})`);
+    await w.done();
+  }
 
   for (const [code, words] of [["expired", "expired"], ["insufficient_funds", "not enough funds"], ["toolkit_disabled", "turned off"], ["mystery", "refused (mystery)"]] as const) {
     actions = [effect("f1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code } })];

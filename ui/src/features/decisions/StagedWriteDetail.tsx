@@ -83,6 +83,7 @@ export function noticeText(n: DecisionNotice, t: Say): string {
       if (n.effect !== undefined) return t("{title}: the result is unconfirmed. The provider may have acted, so do not assume it did not. See Updates.").replace("{title}", iso(n.title));
       return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
     case "still-waiting":
+      if (n.effect !== undefined && n.reason !== undefined) return t("It is still waiting. The last attempt did not finish ({reason}), so check before approving again.").replace("{reason}", reasonText(n.reason, t));
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
     default:
       return t("Already decided elsewhere. See Updates.");
@@ -136,9 +137,14 @@ function ApprovalsTab({
         </p>
       )}
       {state}
-      {write.connected !== null && write.status === "pending" && (
+      {write.connected !== null && write.status === "pending" && write.result === null && (
         <p className="rv-note m-0">
           {t(write.connected.effect === "send" ? "Approving sends this once. Nothing has been sent yet." : "Approving drafts this once. Nothing has been drafted yet.")}
+        </p>
+      )}
+      {write.connected !== null && write.status === "pending" && write.result?.ok === false && (
+        <p className="issue-peek-note warn m-0" role="status">
+          {t("The last approval attempt did not finish: {reason}. It is still waiting; check before approving again.").replace("{reason}", reasonText(failureReason(write), t))}
         </p>
       )}
       {!write.changesComplete && (

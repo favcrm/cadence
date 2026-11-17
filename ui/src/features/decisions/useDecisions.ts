@@ -315,7 +315,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     if (row.status === "pending") {
       const attempts = new Map(state.attempts);
       attempts.delete(id);
-      patch({ attempts, notice: { outcome: "still-waiting", title: row.title } });
+      patch({ attempts, notice: { outcome: "still-waiting", title: row.title, ...(row.connected !== null && row.result?.ok === false ? { effect: row.connected.effect, reason: failureReason(row) } : {}) } });
       return "unconfirmed";
     }
     const attempts = new Map(state.attempts);

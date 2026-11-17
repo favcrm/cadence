@@ -639,7 +639,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
       <span className="text-ink-500">
         {label} · {when}
       </span>
-      {outcome === "unconfirmed" && write.connected !== null && (
+      {outcome === "unconfirmed" && write.connected !== null && write.result?.code === "uncertain" && (
         <span className="dx-why">{reasonText(failureReason(write), t)}</span>
       )}
     </li>
