@@ -2916,3 +2916,9 @@ Object.assign(zhTW, {
   "lines": "行",
   "Copy message": "複製訊息",
 });
+
+// CAD-2364: a staged write named in an answer, as a chip that opens its review card.
+Object.assign(zhTW, {
+  "Open its review card": "開啟審查卡",
+  "Decided on the board": "已在看板上決定",
+});

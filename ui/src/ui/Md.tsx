@@ -6,6 +6,8 @@ import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
 import IdToken from "./IdToken";
+import StagedChip, { StagedSourceContext } from "./StagedChip";
+import { stagedRefKey } from "../features/decisions/stagedRef";
 import { isIdToken, splitIds } from "../features/home/turnText";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
@@ -311,13 +313,18 @@ let pageComponents: { page: string; components: Components } | null = null;
  *  types on every thread update would make React unmount and reinsert old
  *  code, links and images, which a live log would announce as new content. */
 /** CAD-2363: inline code that is exactly one identifier is a copy token —
- *  except inside a link, where a button would both copy and navigate. */
+ *  except inside a link, where a button would both copy and navigate.
+ *  CAD-2364: one that names a staged write this surface shows is its chip. */
 function IdCode({ className, children }: { className?: string; children?: ReactNode }) {
   const linked = useContext(InLinkContext);
-  return !className && !linked && typeof children === "string" && isIdToken(children) ? (
-    <IdToken id={children} />
+  const staged = useContext(StagedSourceContext);
+  const plain = <code className={className}>{children}</code>;
+  if (className || linked || typeof children !== "string") return plain;
+  const fallback = isIdToken(children) ? <IdToken id={children} /> : plain;
+  return staged !== null && stagedRefKey(children) !== null ? (
+    <StagedChip source={staged} token={children} fallback={fallback} />
   ) : (
-    <code className={className}>{children}</code>
+    fallback
   );
 }
 
