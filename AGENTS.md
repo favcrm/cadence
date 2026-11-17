@@ -481,7 +481,7 @@ are in `docs/DEV-CYCLE.md`; the rules are these.
   `scripts/boat-build`: fmt, the doctor split check, clippy on both feature sets,
   the release seam, the UI typecheck and the script contracts for what you
   changed. A missing Boat CLI or helper refuses the push rather than compiling
-  locally; `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency path. Required CI
+  locally (without the helper, our `scripts/pre-push` itself refuses); `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency path. Required CI
   (fmt, clippy, build, ui, delivery-gate, changed-tests) is unchanged, and neither a remote run
   nor a green suite proves the ticket's outcome.
 - Run the plan yourself before `git push`: `scripts/pre-push-check`. GitHub drops

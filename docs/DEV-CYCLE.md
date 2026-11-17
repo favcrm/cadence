@@ -197,9 +197,11 @@ scripts/boat-build --down            # delete this worktree's sandbox now
 ```
 
 The worktree hook uses `scripts/boat-build` by default, so the shared host does
-not compile. A missing Boat CLI or helper refuses the push; it never falls
-back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency
-path and runs the same plan on this host.
+not compile. A missing Boat CLI refuses the push. Without `scripts/boat-build`
+the hook runs a repository's own `scripts/pre-push` on the host (CAD-2403, for
+repositories that have no helper); this repository's script refuses in that mode,
+so it never falls back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the
+explicit emergency path and runs the same plan on this host.
 
 The diff selects Rust/UI/active script checks. The live doctor source
 inventory always runs. `--tests` always executes the safety floor (two test
