@@ -490,7 +490,7 @@ fn assert_served(reply: &Value, names: &[&str]) {
         );
         assert!(matches!(
             row["status"].as_str(),
-            Some("on" | "paused" | "repoint")
+            Some("on" | "paused" | "waiting" | "repoint")
         ));
         assert!(row["asks_first"].is_boolean());
     }

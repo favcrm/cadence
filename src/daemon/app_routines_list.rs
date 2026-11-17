@@ -26,11 +26,13 @@ fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// `on`, `paused` or `repoint`, from the stored `on`, `paused` and
-/// `repoint_required`. Anything else reads as paused: it is not running.
+/// `on`, `paused`, `waiting` or `repoint`, from the stored `on`, `paused`,
+/// `waiting_approval` and `repoint_required`. Anything else reads as paused:
+/// it is not running.
 fn status_word(stored: &str) -> &'static str {
     match stored {
         "on" => "on",
+        "waiting_approval" => "waiting",
         "repoint_required" => "repoint",
         _ => "paused",
     }
@@ -219,7 +221,9 @@ mod tests {
     fn status_words_and_trigger_text_follow_the_stored_values() {
         assert_eq!(status_word("on"), "on");
         assert_eq!(status_word("paused"), "paused");
+        assert_eq!(status_word("waiting_approval"), "waiting");
         assert_eq!(status_word("repoint_required"), "repoint");
+        assert_eq!(status_word("something_new"), "paused");
         let mut event = routine("r-event", "On mail", "alpha");
         event.trigger_kind = "event".into();
         event.event_source = Some("mail.received".into());
