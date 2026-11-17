@@ -197,6 +197,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "workspace_skill_draft",
     "workspace_skill_approve",
     "workspace_skill_revoke",
+    // agenticos-v2 #2147: owner-only, removes an unapproved skill.
+    "workspace_skill_delete",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
@@ -301,9 +303,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
         "project_new" | "agent_profile_create" | "agent_profile_update" => &["cli.write"],
-        "workspace_skill_draft" | "workspace_skill_approve" | "workspace_skill_revoke" => {
-            &["cli.write"]
-        }
+        "workspace_skill_draft"
+        | "workspace_skill_approve"
+        | "workspace_skill_revoke"
+        | "workspace_skill_delete" => &["cli.write"],
         // CAD-2001: attesting project eligibility or a principal's GitHub
         // identity decides whose verdicts count, so both writes need the same
         // `audit.approve` login as the merge approval — and the tenant admits
@@ -483,7 +486,9 @@ fn cli_effect(verb: &str) -> Effect {
         "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
         "agent_profile_update" => mutation(RECONCILE_PROFILE_UPDATE),
         "workspace_skill_draft" => mutation(RECONCILE_SKILL_DRAFT),
-        "workspace_skill_approve" | "workspace_skill_revoke" => mutation(RECONCILE_SKILL_DECISION),
+        "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete" => {
+            mutation(RECONCILE_SKILL_DECISION)
+        }
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
         // `settings_agents` is refined per operation by [`call_effect`]; without
@@ -4706,15 +4711,18 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
         // CAD-2396: workspace skills. A package refusal (`skill_refused`) is
         // answered with its reason by `skill_refusal`, before this table.
         (
-            "workspace_skill_approve" | "workspace_skill_revoke",
+            "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete",
             Some("not_permitted" | "unauthorized" | "owner_required"),
         ) => Some((
             "not_permitted",
-            "approving or revoking a workspace skill is a live human workspace owner's \
-             decision; this login is not one. Nothing was changed",
+            "approving, revoking or deleting a workspace skill is a live human workspace \
+             owner's decision; this login is not one. Nothing was changed",
         )),
         (
-            "workspace_skill_show" | "workspace_skill_approve" | "workspace_skill_revoke",
+            "workspace_skill_show"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
             Some("not_found"),
         ) => Some((
             "not_found",
@@ -4725,6 +4733,16 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "digest_mismatch",
             "the digest is not the one this decision needs — read `workspace-skill show` again \
              and pass the digest it prints. Nothing was changed",
+        )),
+        ("workspace_skill_delete", Some("approved_skill")) => Some((
+            "approved_skill",
+            "that skill is approved, so agents may be reading it — revoke it first, then \
+             delete. Nothing was changed",
+        )),
+        ("workspace_skill_draft", Some("skill_limit")) => Some((
+            "skill_limit",
+            "this workspace holds the most skills it can; the owner deletes an unused one to \
+             make room, or draft a new revision of an existing skill. Nothing was written",
         )),
         ("workspace_skill_approve", Some("approved_limit")) => Some((
             "approved_limit",
@@ -4737,7 +4755,8 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             | "workspace_skill_check"
             | "workspace_skill_draft"
             | "workspace_skill_approve"
-            | "workspace_skill_revoke",
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
             Some("invalid_request"),
         ) => Some((
             "invalid_request",
@@ -5671,6 +5690,12 @@ fn skill_refusal(
 /// carries the revision it saved; an approve carries exactly the approved
 /// revision and digest that were asked for; a revoke carries no approval.
 fn skill_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    // A delete answers `{name, deleted: true}` for exactly the skill it removed.
+    if verb == "workspace_skill_delete" {
+        return arguments.get("name").and_then(Value::as_str).is_some()
+            && reply.get("name") == arguments.get("name")
+            && reply.get("deleted") == Some(&Value::Bool(true));
+    }
     let Some(skill) = reply.get("skill") else {
         return false;
     };
@@ -6489,9 +6514,10 @@ fn call_verb_until_retry(
                 "agent_profile_create" | "agent_profile_update" => {
                     !profile_receipt_correlates(verb, reply, &arguments)
                 }
-                "workspace_skill_draft" | "workspace_skill_approve" | "workspace_skill_revoke" => {
-                    !skill_receipt_correlates(verb, reply, &arguments)
-                }
+                "workspace_skill_draft"
+                | "workspace_skill_approve"
+                | "workspace_skill_revoke"
+                | "workspace_skill_delete" => !skill_receipt_correlates(verb, reply, &arguments),
                 "document_submit" => !document_submit_receipt(reply),
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)

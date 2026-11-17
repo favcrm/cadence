@@ -990,6 +990,7 @@ cadence --org acme workspace-skill list
 cadence --org acme workspace-skill show weekly-report [--revision 2]
 cadence --org acme workspace-skill approve weekly-report --revision 2 --digest sha256:<hex>
 cadence --org acme workspace-skill revoke weekly-report --digest sha256:<hex>
+cadence --org acme workspace-skill delete weekly-report --expect-rev 3
 ```
 
 - The package directory holds `SKILL.md` and, optionally, `references/` with
@@ -1008,7 +1009,11 @@ cadence --org acme workspace-skill revoke weekly-report --digest sha256:<hex>
 - `approve` names the revision and the digest `show` printed, and `revoke` the
   approved digest; a different one is `digest_mismatch` and changes nothing. A
   workspace can have at most 32 approved skills (`approved_limit`).
-- **Approve and revoke are the owner's decision.** A managed agent
+- `delete` removes an unapproved skill and all its revisions, fenced on the
+  latest revision (a stale one exits 5). An approved skill is `approved_skill`
+  until it is revoked. A workspace holds at most 200 skills (`skill_limit` on a
+  new name) and keeps each skill's newest 10 revisions plus the approved one.
+- **Approve, revoke and delete are the owner's decision.** A managed agent
   (`CADENCE_ALIAS`, a grant, or a pinned agent identity) is refused by the
   client before any request (`managed_caller_refused`); drafting stays open to
   it. As with profiles, this is a client check: the board refuses an agent or

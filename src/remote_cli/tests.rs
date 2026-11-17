@@ -9110,13 +9110,14 @@ mod agent_credential_refusals {
     }
 }
 
-const SKILL_VERBS: [&str; 6] = [
+const SKILL_VERBS: [&str; 7] = [
     "workspace_skill_list",
     "workspace_skill_show",
     "workspace_skill_check",
     "workspace_skill_draft",
     "workspace_skill_approve",
     "workspace_skill_revoke",
+    "workspace_skill_delete",
 ];
 
 fn skill_args(value: Value) -> Map<String, Value> {
@@ -9142,6 +9143,7 @@ fn cad2396_skill_verbs_are_registered_with_their_scopes() {
         "workspace_skill_draft",
         "workspace_skill_approve",
         "workspace_skill_revoke",
+        "workspace_skill_delete",
     ] {
         assert_eq!(cli_requested_scopes(verb), &["cli.write"], "{verb}");
         assert!(mutating_cli_verb(verb), "{verb}");
@@ -9191,6 +9193,20 @@ fn cad2396_skill_refusals_keep_their_code_and_are_never_retried() {
             "not_permitted",
             "not_permitted",
         ),
+        (
+            "workspace_skill_delete",
+            403,
+            "not_permitted",
+            "not_permitted",
+        ),
+        ("workspace_skill_delete", 404, "not_found", "not_found"),
+        (
+            "workspace_skill_delete",
+            409,
+            "approved_skill",
+            "approved_skill",
+        ),
+        ("workspace_skill_draft", 409, "skill_limit", "skill_limit"),
         (
             "workspace_skill_approve",
             403,
@@ -9458,4 +9474,50 @@ fn hosted_connected_effect_5xx_is_unknown_not_a_refusal() {
     .expect_err("a 500 is not a success");
     assert_eq!(err.kind(), "unknown", "{err}");
     assert!(!err.to_string().contains("nothing was staged"), "{err}");
+}
+
+#[test]
+fn cad2415_skill_delete_needs_its_own_receipt() {
+    let args = || skill_args(json!({"name": "weekly", "expectedRevision": 2}));
+    for receipt in [
+        json!({"ok": true}),
+        json!({"name": "other", "deleted": true}),
+        json!({"name": "weekly", "deleted": false}),
+        json!({"skill": {"name": "weekly"}}),
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "workspace_skill_delete",
+            args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{receipt}: {err}");
+        assert!(err.to_string().contains("workspace-skill show"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    let (out, _) = run(
+        vec![(200, "", json!({"name": "weekly", "deleted": true}))],
+        "workspace_skill_delete",
+        args(),
+        10,
+    );
+    assert!(out.is_ok(), "{out:?}");
+}
+
+#[test]
+fn cad2415_stale_delete_revision_is_a_conflict_answer() {
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "workspace_skill_delete",
+        skill_args(json!({"name": "weekly", "expectedRevision": 1})),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
 }
