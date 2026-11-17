@@ -35,6 +35,8 @@ export interface StagedResult {
   ok: boolean;
   created?: boolean;
   code?: string;
+  /** The board kept the row pending because the attempt did not settle. */
+  retry?: boolean;
   record?: { id?: string; revision?: number };
   /** `board_create_issue`: the ticket it made. */
   ticket?: string;
@@ -123,6 +125,7 @@ function parseResult(v: unknown): StagedResult | null | "invalid" {
     ok: v.ok,
     ...(typeof v.created === "boolean" ? { created: v.created } : {}),
     ...(str(v.code) ? { code: str(v.code)! } : {}),
+    ...(v.retry === true ? { retry: true } : {}),
     ...(record ? { record } : {}),
     ...(ticket ? { ticket } : {}),
   };
@@ -309,7 +312,7 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 }
 
 /** The provider may have acted: not a failure, not a success, and not "nothing ran", whatever the row's status. */
-export const isUncertain = (write: StagedWrite): boolean => write.connected !== null && write.result?.ok === false && write.result.code === "uncertain";
+export const isUncertain = (write: StagedWrite): boolean => write.connected !== null && write.result?.ok === false && (write.result.code === "uncertain" || write.result.retry === true);
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
