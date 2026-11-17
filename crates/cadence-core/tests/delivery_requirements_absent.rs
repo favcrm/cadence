@@ -81,8 +81,9 @@ fn incomplete_evidence_is_strict() {
     }
 }
 
-// Unreadable lists (not proven absent) still fail closed, and browser_qa stays
-// false for a ui/ path exactly as before.
+// Unreadable lists (not proven absent) still fail closed with the operator,
+// and ask no Browser QA even for a ui/ path (operator decision 2026-11-17;
+// before CAD-2386 a hard-coded ui/ rule asked it).
 #[test]
 fn unreadable_lists_fail_closed_without_browser_qa() {
     let r = classify(

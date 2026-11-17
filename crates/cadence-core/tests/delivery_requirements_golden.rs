@@ -3,7 +3,10 @@
 //! from the hard-coded rules against this repository's own
 //! `docs/roles/{risk-paths,one-review-paths}.toml`; the test re-reads those
 //! lists, recomputes every case and asserts exact `Requirements` equality.
-//! Moving the rules into role data must not change a single output.
+//! Moving the rules into role data changes no output, except the 11
+//! unreadable-list `ui/` cases amended for the operator decision of
+//! 2026-11-17 (`browser_qa` false). It reads the live lists, so a later
+//! deliberate list edit updates the affected cases with it.
 use cadence_core::delivery::{default_policy, digest, Resolved};
 use cadence_core::delivery_requirements::{
     classify, default_resolved, Change, Requirements, TrustedLists,

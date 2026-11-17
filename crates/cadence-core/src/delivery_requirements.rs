@@ -32,11 +32,12 @@
 //!   fields are cleared), lists unreadable, incomplete or unsafe diff
 //!   evidence, a delete/rename/type/mode change, a path or change shape
 //!   outside the known one-review include list, or a risk-trigger,
-//!   human-class, excluded or oversize path. It reports exactly today's
-//!   legacy requirements and never fewer: one combined review on the
-//!   one-review list else two (Standards + Spec/security), and the
-//!   operator floor on human-class paths and over `HUMAN_LINES` changed
-//!   lines.
+//!   human-class, excluded or oversize path. It reports the legacy
+//!   requirements: one combined review on the one-review list else two
+//!   (Standards + Spec/security), and the operator floor on human-class
+//!   paths and over `HUMAN_LINES` changed lines. With unreadable lists it
+//!   asks no Browser QA (operator decision 2026-11-17, CAD-2386): the
+//!   operator floor they force is the human check.
 //!
 //! `DeliveryClass::Sensitive` exists in the type but `classify` does not
 //! currently return it: sensitive conditions resolve to `strict`. No class
@@ -63,7 +64,7 @@ pub struct Change {
 /// The trusted list texts, read at the PR's anchor commit (the same
 /// reads `scripts/enqueue-reviewed` makes through
 /// `gh api repos/<repo>/contents/<file>?ref=<anchor>`). `None` means
-/// unreadable — which fails closed, never to a weaker requirement.
+/// unreadable — which fails closed to the strict floor with the operator.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrustedLists<'a> {
     pub risk_paths: Option<&'a str>,
@@ -101,7 +102,7 @@ pub enum DeliveryClass {
     Sensitive,
     /// No relaxation applies: the profile is not in force, the trusted
     /// lists are unavailable, or the diff evidence is incomplete. The
-    /// requirements are exactly the legacy ones.
+    /// requirements are the legacy ones (see the module header).
     Strict,
 }
 
@@ -177,7 +178,8 @@ struct Lists {
     /// [`crate::delivery_rules::glob_match`], the grammar that file declares).
     sensitive: Vec<String>,
     human: Vec<String>,
-    /// The `operator` table: human-class paths beyond the trigger tables.
+    /// The `operator` table: the repository's operator-class paths. It may
+    /// repeat trigger-table entries; both are human-class.
     operator: Vec<String>,
     /// The `browser_qa` table: paths whose change needs a Browser QA pass.
     browser_qa: Vec<String>,
@@ -200,18 +202,7 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
             .map(|v| v.as_str().map(str::to_string))
             .collect()
     };
-    let mut sensitive = Vec::new();
-    let mut human = Vec::new();
-    for table in SENSITIVE_TABLES {
-        let paths = strings(&risk, &[table, "paths"])?;
-        for path in &paths {
-            crate::delivery_rules::check_path(path).ok()?;
-        }
-        if matches!(*table, "schema" | "trigger4" | "trigger6" | "trigger7") {
-            human.extend(paths.iter().cloned());
-        }
-        sensitive.extend(paths);
-    }
+    // One `risk-paths.toml` table's checked globs; any defect refuses.
     let table = |name: &str| -> Option<Vec<String>> {
         let paths = strings(&risk, &[name, "paths"])?;
         for path in &paths {
@@ -219,6 +210,15 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
         }
         Some(paths)
     };
+    let mut sensitive = Vec::new();
+    let mut human = Vec::new();
+    for name in SENSITIVE_TABLES {
+        let paths = table(name)?;
+        if matches!(*name, "schema" | "trigger4" | "trigger6" | "trigger7") {
+            human.extend(paths.iter().cloned());
+        }
+        sensitive.extend(paths);
+    }
     let operator = table(OPERATOR_TABLE)?;
     let browser_qa = table(BROWSER_QA_TABLE)?;
     let routine = table(ROUTINE_TABLE)?;
@@ -354,6 +354,11 @@ fn one_review_qualifies(changes: &[Change], lists: &Lists) -> bool {
         })
 }
 
+/// Does any glob of `globs` (this file's grammar) match `path`?
+fn any_glob<'a>(mut globs: impl Iterator<Item = &'a String>, path: &str) -> bool {
+    globs.any(|g| crate::delivery_rules::glob_match(g, path))
+}
+
 /// Human-class by path: the repository's `operator` table plus its human
 /// trigger tables (matched with that file's own grammar,
 /// `crate::delivery_rules::glob_match`).
@@ -361,11 +366,7 @@ fn human_path(path: &str, lists: Option<&Lists>) -> bool {
     match lists {
         // Unreadable lists fail closed: treat the path as human.
         None => true,
-        Some(l) => l
-            .operator
-            .iter()
-            .chain(&l.human)
-            .any(|g| crate::delivery_rules::glob_match(g, path)),
+        Some(l) => any_glob(l.operator.iter().chain(&l.human), path),
     }
 }
 
@@ -376,20 +377,13 @@ fn human_path(path: &str, lists: Option<&Lists>) -> bool {
 fn browser_qa_needed(changes: &[Change], lists: Option<&Lists>) -> bool {
     match lists {
         None => false,
-        Some(l) => changes.iter().any(|c| {
-            l.browser_qa
-                .iter()
-                .any(|g| crate::delivery_rules::glob_match(g, &c.path))
-        }),
+        Some(l) => changes.iter().any(|c| any_glob(l.browser_qa.iter(), &c.path)),
     }
 }
 
 /// The repository's `routine` table: ordinary documentation.
 fn routine_path(path: &str, lists: &Lists) -> bool {
-    lists
-        .routine
-        .iter()
-        .any(|g| crate::delivery_rules::glob_match(g, path))
+    any_glob(lists.routine.iter(), path)
 }
 
 pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
@@ -420,25 +414,31 @@ pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
 }
 
 /// The requirements today's loop demands — the `strict` answer. `lists`
-/// may be partially absent: each absent input fails closed the same way
-/// `scripts/enqueue-reviewed` does (an unreadable one-review list keeps
-/// two reviews; unreadable risk lists make every path human; verdict
-/// notes declaring `Risk: human` still add the operator check
-/// downstream, noted in `reasons`).
+/// may be unreadable: an unreadable one-review list keeps two reviews and
+/// unreadable risk lists make every path human, like
+/// `scripts/enqueue-reviewed` (which, unlike this engine, still asks Browser
+/// QA for `ui/` then). `absent` says the caller proved the repository
+/// declares no lists, which the reasons report instead of "unreadable".
+/// Verdict notes declaring `Risk: human` still add the operator check
+/// downstream, noted in `reasons`.
 fn strict_requirements(
     resolved: &Resolved,
     activation: Activation,
     changes: &[Change],
     lines: u64,
     lists: Option<&Lists>,
+    absent: bool,
     mut reasons: Vec<String>,
 ) -> Requirements {
     let qualifies = lists.is_some_and(|l| one_review_qualifies(changes, l));
     if lists.is_none() {
-        reasons.push(
+        reasons.push(if absent {
+            "the repository declares no trusted lists — two reviews and the operator floor hold"
+                .to_string()
+        } else {
             "the trusted lists are unreadable — two reviews and the operator floor hold"
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     let human_paths: Vec<&str> = changes
         .iter()
@@ -502,7 +502,7 @@ pub fn classify(
             activation,
             changes,
             lines,
-            parsed.as_ref(),
+            parsed.as_ref(), false,
             reasons,
         );
     }
@@ -515,20 +515,20 @@ pub fn classify(
             activation,
             changes,
             lines,
-            parsed.as_ref(),
+            parsed.as_ref(), false,
             reasons,
         );
     };
     if let Some(why) = evidence_refusal(changes) {
         reasons.push(format!("incomplete diff evidence: {why}"));
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
     }
 
     if changes.iter().any(|c| !reviewable_change(c)) {
         reasons.push(
             "deletion, rename, type or mode change requires legacy strict review".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
     }
 
     // Sensitive wins over everything: risk triggers, the human lists,
@@ -557,7 +557,7 @@ pub fn classify(
             reasons.push(format!("{lines} changed lines is over {HUMAN_LINES}"));
         }
         reasons.push("sensitive or policy-triggering changes retain the existing strict review, operator, Browser QA and full-check floors".to_string());
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
     }
 
     // Anything outside the known include list — or a change shape the
@@ -567,7 +567,7 @@ pub fn classify(
         reasons.push(
             "a path or change shape is outside the known one-review include list".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
     }
 
     // Routine: every change a regular 100644 `A`/`M` ordinary-doc
@@ -622,13 +622,13 @@ pub fn classify_without_lists(resolved: &Resolved, changes: &[Change], lines: u6
             "default lean classification does not apply ({activation:?}) — \
              the strict requirements apply"
         ));
-        return strict_requirements(resolved, activation, changes, lines, None, reasons);
-    }
-    if let Some(why) = evidence_refusal(changes) {
-        reasons.push(format!("incomplete diff evidence: {why}"));
-        return strict_requirements(resolved, activation, changes, lines, None, reasons);
+        return strict_requirements(resolved, activation, changes, lines, None, true, reasons);
     }
     reasons.push("default lean delivery policy in force".to_string());
+    if let Some(why) = evidence_refusal(changes) {
+        reasons.push(format!("incomplete diff evidence: {why}"));
+        return strict_requirements(resolved, activation, changes, lines, None, true, reasons);
+    }
     reasons.push(
         "the repository declares no trusted lists — the product default applies: \
          one combined review and the operator's approval"

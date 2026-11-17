@@ -92,10 +92,15 @@ fn the_trusted_lists_protect_themselves() {
     assert!(requirements(&risk, "docs/roles/one-review-paths.toml").operator_approval);
     assert!(requirements(&risk, "src/delivery/hosted_gate.rs").operator_approval);
     assert!(!requirements(&risk, "docs/guides/x.md").operator_approval);
-    // A list without its `operator` table fails closed: every path needs the operator.
-    let cut = risk.split("\n[operator]").next().unwrap().to_string();
-    assert_ne!(cut, risk, "the real list has an operator table");
-    let r = requirements(&cut, "docs/guides/x.md");
-    assert!(r.operator_approval);
-    assert_eq!(r.reviews, 2);
+    // A list missing any one required table fails closed: every path needs
+    // the operator and two reviews. Each table is renamed on its own, so
+    // making any single one optional fails this test.
+    for name in ["operator", "browser_qa", "routine"] {
+        let header = format!("\n[{name}]\n");
+        assert!(risk.contains(&header), "the real list has a {name} table");
+        let cut = risk.replace(&header, &format!("\n[{name}_renamed]\n"));
+        let r = requirements(&cut, "docs/guides/x.md");
+        assert!(r.operator_approval, "{name} missing must need the operator");
+        assert_eq!(r.reviews, 2, "{name} missing must keep two reviews");
+    }
 }
