@@ -854,6 +854,21 @@ function lastCreated(items: ThreadItem[]): string | null {
  *  entries, never token deltas, so there is no skeleton and no fabricated
  *  answer body. The row is not its own live region: it mounts inside the
  *  thread's `role="log"` list, which already announces the addition. */
+/** CAD-2411: the interim line is a note's first block as one run of prose,
+ *  so a three-line clamp holds: heading, list and quote markers are
+ *  dropped and line breaks become spaces. A note that opens with a code
+ *  fence has no prose line; the dots stay alone. */
+function interimLine(text: string): string | null {
+  const first = text.trim().split(/\n\s*\n/)[0] ?? "";
+  if (first.startsWith("```") || first.startsWith("~~~")) return null;
+  const line = first
+    .split("\n")
+    .map((row) => row.trim().replace(/^(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/, ""))
+    .filter((row) => row !== "")
+    .join(" ");
+  return line === "" ? null : line;
+}
+
 function TypingDots({ label }: { label: string }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -1181,9 +1196,7 @@ export function ThreadTurn({
       ? [...trace].reverse().find((item) => item.type === "commentary")
       : undefined;
   const interimText =
-    interim && interim.entry.text.trim() !== "" && !carriesSecret(interim.entry.text)
-      ? interim.entry.text
-      : null;
+    interim && !carriesSecret(interim.entry.text) ? interimLine(interim.entry.text) : null;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,

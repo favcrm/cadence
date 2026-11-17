@@ -1165,12 +1165,17 @@ textarea.agentform-input { height: auto; width: 100%; }
   overflow: hidden;
   color: var(--color-ink-400);
 }
-.answer.turn-interim .answer-body :is(h1, h2, h3, h4, h5, h6) {
+/* One paragraph (see `interimLine`). Beat the answer's section-label and
+   heading rules, which would otherwise restyle it. */
+.answer.turn-interim .answer-body.issue-reader > * {
   margin: 0;
+  padding: 0;
+  border: 0;
   color: inherit;
   font: inherit;
+  letter-spacing: normal;
 }
-.answer.turn-interim .answer-body :is(p, li, strong) {
+.answer.turn-interim .answer-body.issue-reader strong {
   color: inherit;
 }
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
