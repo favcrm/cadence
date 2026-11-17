@@ -377,7 +377,9 @@ fn human_path(path: &str, lists: Option<&Lists>) -> bool {
 fn browser_qa_needed(changes: &[Change], lists: Option<&Lists>) -> bool {
     match lists {
         None => false,
-        Some(l) => changes.iter().any(|c| any_glob(l.browser_qa.iter(), &c.path)),
+        Some(l) => changes
+            .iter()
+            .any(|c| any_glob(l.browser_qa.iter(), &c.path)),
     }
 }
 
@@ -436,8 +438,7 @@ fn strict_requirements(
             "the repository declares no trusted lists — two reviews and the operator floor hold"
                 .to_string()
         } else {
-            "the trusted lists are unreadable — two reviews and the operator floor hold"
-                .to_string()
+            "the trusted lists are unreadable — two reviews and the operator floor hold".to_string()
         });
     }
     let human_paths: Vec<&str> = changes
@@ -502,7 +503,8 @@ pub fn classify(
             activation,
             changes,
             lines,
-            parsed.as_ref(), false,
+            parsed.as_ref(),
+            false,
             reasons,
         );
     }
@@ -515,20 +517,37 @@ pub fn classify(
             activation,
             changes,
             lines,
-            parsed.as_ref(), false,
+            parsed.as_ref(),
+            false,
             reasons,
         );
     };
     if let Some(why) = evidence_refusal(changes) {
         reasons.push(format!("incomplete diff evidence: {why}"));
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     if changes.iter().any(|c| !reviewable_change(c)) {
         reasons.push(
             "deletion, rename, type or mode change requires legacy strict review".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Sensitive wins over everything: risk triggers, the human lists,
@@ -557,7 +576,15 @@ pub fn classify(
             reasons.push(format!("{lines} changed lines is over {HUMAN_LINES}"));
         }
         reasons.push("sensitive or policy-triggering changes retain the existing strict review, operator, Browser QA and full-check floors".to_string());
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Anything outside the known include list — or a change shape the
@@ -567,7 +594,15 @@ pub fn classify(
         reasons.push(
             "a path or change shape is outside the known one-review include list".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), false, reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Routine: every change a regular 100644 `A`/`M` ordinary-doc
