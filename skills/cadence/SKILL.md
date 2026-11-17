@@ -34,7 +34,9 @@ subcommands, and `cadence help <verb>` is one verb's own help.
 
 `issue` is the one public unit of work. A plan is an epic in the
 `proposed` stage; the operator approves it before its tickets dispatch.
-`job`, `delivery` and `monitor` are PM-internal.
+`job` and `monitor` are PM-internal, and so are `delivery`'s write verbs;
+`delivery requirements` and `delivery check` are read-only and any agent may
+run them.
 
 ## Hosted profile session
 
@@ -116,8 +118,8 @@ verdict --file <f>`, frontmatter `verdict: pass` or `verdict: revise` and
 `sha: <the head you reviewed>`, the findings as the body. Only the
 assigned reviewer can file it, and only for the head under review. This job
 report is not what a project's delivery gate counts. On a hosted org, agents
-file no verdict: the reviewer reports back and whoever dispatched it posts the
-findings.
+file no verdict unless the workspace owner has attested them as reviewers:
+the reviewer reports back and whoever dispatched it posts the findings.
 
 ## Peers and your group
 
@@ -440,17 +442,36 @@ cadence inbox obs --wait 30                         # drain; each completes
 Issue dispatch and claims:
 
 ```bash
-cadence dispatch ACME-31 --to <w> --note <kickoff>   # issue start + one kickoff;
+cadence dispatch ACME-31 --to <w> --note <kickoff>  # issue start + one kickoff;
                                                     #  records you as claimant
-cadence issue claim ACME-31 --note "<lane/branch>"   # lanes outside cadence:
+cadence issue claim ACME-31 --note "<lane/branch>"  # lanes outside cadence:
                                                     #  claim before starting
-cadence issue release ACME-31                        # give the claim up
+cadence issue release ACME-31                       # give the claim up
 ```
 
 `dispatch` and `issue start` refuse a doing/review issue another PM or lane
 holds, naming the holder and the claim age. Do not route around it with a
 second lane: ask the holder, or pass `--take-over "<reason>"` for a stale or
 agreed hand-over (recorded on the issue).
+
+Every lane `issue start` mints, in any repository, carries two guards. A
+per-worktree `pre-push` hook runs the repository's own `scripts/pre-push` when
+it exists and records a receipt for the head (a repository without that script
+records that and lets the push through; `--no-verify` still pushes, but the
+missing receipt is the detectable signal). A `cargo` shim on the lane's PATH
+sends every compiling subcommand through a build slot, so no local compile
+escapes the queue; only clearly light subcommands (`fmt`, `metadata`, `tree`,
+`version`, `help` and similar) pass straight through, and a `cargo` run inside
+a held slot (`CADENCE_BUILD_SLOT_PID` naming a live holder) does not re-queue
+on itself. Take a slot yourself with `cadence build-slot run build|test --
+<cmd>`, or run a project-declared recipe with `cadence build-slot launch
+<recipe>`. A caller with no registered pane or endpoint (a subagent, an
+operator shell) queues as `unregistered:<uid>`: a position behind registered
+lanes and no authority. `cadence build-slot status` shows each waiter's
+`wait_reason` (`capacity`, `memory` or `disk`); a request waits when the host
+falls below the `[host]` memory or disk floors rather than failing. A `check`
+recipe runs only its declared argv, and a different trailing command is
+refused. A run that skipped admission is never an admitted gate.
 
 Job work (the work axis over messages):
 
@@ -730,34 +751,42 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 ## Review and delivery
 
-Each project owns its delivery policy. Read what it requires for your change
-(on a hosted org: `cadence --org <org> delivery requirements --issue <ID> --pr
-<url> --head <sha>`), then:
+Each project owns its delivery policy. Read what it requires for your change:
+natively `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`;
+on a hosted org read the gate itself, read-only, before handing over:
+`cadence --org <org> delivery check --project <p> --issue <ID> --repo
+<owner/name> --pr <n> --head <sha>` (exit 0 only when every rule passes). The
+hosted gate counts the `standards` and `spec-security` review axes itself, so a
+policy that needs no review may still need both review workflows. Then:
 
 1. **Do the agent reviews the policy requires.** A reviewer is a fresh
    session: not the author, inheriting no conversation or context from the work
    (a subagent qualifies; a fork or a resumed authoring session does not).
    Brief it with the PR, the exact head and the ticket, not your conclusions.
-   A reviewer is read-only and reports back; on a hosted org no agent files a
-   verdict row. Reviews bind to the exact head: a new head voids them, so
-   re-review after any push.
+   A reviewer is read-only and reports back; agents file no hosted verdict
+   unless the workspace owner has attested them as reviewers. Reviews bind to
+   the exact head: a new head voids them, so re-review after any push.
 2. **Post the reports.** Whoever dispatched the reviewer posts each report on
-   the PR or ticket, naming the head, the checks run and the limitations.
-   Post any other report the policy names, such as Browser QA, exactly as the
-   policy specifies.
+   the PR or ticket, naming the head, the checks run and the limitations. For
+   Browser QA, the `deliverable-qa` skill has the comment format and routes.
 3. **Move the issue to `review`.** Attach the evidence, then set
    `status=review` with a comment saying what was verified and what decision
    is needed.
 4. **Hand over for approval.** A human approves at review; delivery follows
-   the approval. Never record, simulate or request an approval under another
-   identity, never switch credentials, and do not enqueue or merge unless the
-   project's rules give you that authority. If a gate refuses, report the exact
-   refusal.
+   the approval. Never record or simulate the human's approval, and never act
+   under another identity or switch credentials. Approval, `delivery
+   enqueue`/`delivery merge` and `audit accept-revise` are the approver's;
+   Cadence refuses them from an agent. An agent the owner has designated may
+   record a delegated approval within its designation. If a gate refuses,
+   report the exact refusal.
 
 When a review says revise, fix the finding on the same branch, push, and let
 the new head be reviewed. Ask the approver to accept a revise only when the
 finding is wrong, and say why. A passing check or review does not itself
-authorize a merge, deployment or send.
+authorize a merge, deployment or send. Never restart the daemon: `cadence
+update` refuses an agent session, so an update is the operator's to run. An
+existing session does not reload guidance; reread this skill at a task
+boundary.
 
 ## Improve memory and this skill
 
