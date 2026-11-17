@@ -201,7 +201,10 @@ refusal as any other operator-only call, and no row is returned.
     that names a different zone is written in its own zone, named in the text.
   - `next_run_at`: optional, an RFC 3339 UTC instant of the next due time.
     Omitted when there is none.
-  - `status`: `on`, `paused` or `repoint`.
+  - `status`: `on`, `paused`, `waiting` or `repoint`. `waiting` is a routine
+    waiting for the owner's approval; any other status the host does not
+    recognise reads as `paused`. An app on an older parser sees `waiting` as an
+    unrecognised status, so ship the app after or with the host.
   - `asks_first`: true when any checklist step requires approval.
 - It never carries routine markdown or script content, paths, digests, inputs,
   the destination thread, the connection account or run output. The consent
