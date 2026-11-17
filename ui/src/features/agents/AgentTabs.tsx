@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
@@ -592,6 +592,7 @@ export function WorkspaceSkills({
   const [open, setOpen] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [stale, setStale] = useState<"conflict" | "unconfirmed" | null>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     let live = true;
     setLibrary((now) => (now.state === "ready" ? now : { state: "reading" }));
@@ -642,7 +643,9 @@ export function WorkspaceSkills({
   return (
     <section data-work-panel="workspace-skills">
       <div className="ap-panel-h">
-        <h3>{t("Workspace skills")}</h3>
+        <h3 ref={heading} tabIndex={-1}>
+          {t("Workspace skills")}
+        </h3>
       </div>
       {library.state === "reading" ? (
         <Note>{t("Loading…")}</Note>
@@ -713,6 +716,8 @@ export function WorkspaceSkills({
           onGone={(name) => {
             drop(name);
             setOpen(null);
+            // The drawer and its opener row are gone: focus lands on the section, not the page.
+            setTimeout(() => heading.current?.focus(), 0);
           }}
           onClose={() => setOpen(null)}
         />

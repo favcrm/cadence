@@ -252,6 +252,7 @@ async function main() {
   await click(button("Delete"), "Delete again");
   await click([...document.body.querySelectorAll(".s-confirm button")].find((b) => b.textContent === "Delete"), "confirm again");
   assert(!row("draft-only") && /Deleted draft-only\./.test(lastToast()), "a deleted skill leaves the list");
+  assert(document.activeElement?.textContent === "Workspace skills", "focus lands on the section, not the page");
 
   await React.act(async () => { root.unmount(); });
   console.log("workspaceSkills checks passed");
