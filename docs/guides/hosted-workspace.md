@@ -161,9 +161,16 @@ their separate `acceptsToolImages` opt-in.
 
 **Context budget.** The runtime shortens long tool results from completed
 earlier turns in model requests, with an explicit incomplete-content notice.
-This shaping leaves the stored transcript and current operation's tool results
-unchanged. Artifact reads may be paged; use the returned continuation rather
-than assuming an earlier excerpt is complete.
+When one operation's own request would still exceed the gateway's 256 KiB text
+budget, it also shortens that operation's tool results, oldest first, keeping
+the two newest whole, until the request fits (CAD-2414). This shaping never
+changes the stored transcript. Artifact reads may be paged; use the returned
+continuation rather than assuming an earlier excerpt is complete.
+
+Hosted sessions compact before that budget: the runtime sets Pi's compaction
+reserve so blocking compaction is due at about 48k tokens and background
+compaction at about 31.6k, below the roughly 58k tokens that 256 KiB holds
+(CAD-2414).
 
 When the gateway refuses its byte budget with a JSON 400 whose `error.type` is
 `invalid_request_error` and `error.code` is `context_budget_exceeded`, the

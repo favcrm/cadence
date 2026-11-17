@@ -3,6 +3,8 @@ import type { GenerationIdentity } from "../src/contract.ts";
 import {
   CONTEXT_BUDGET_EXCEEDED,
   CONTEXT_BUDGET_EXCEEDED_TEXT,
+  HOSTED_COMPACTION_POLICY,
+  MODEL_CONTEXT_WINDOW,
   meteredBinding,
 } from "../src/model.ts";
 
@@ -294,6 +296,68 @@ describe("model transport", () => {
     expect(parts[0]).toBe("a".repeat(63_999));
     expect(parts.join("")).toBe(source);
     expect(input.messages[1]?.content).toEqual([{ type: "text", text: source }]);
+  });
+});
+
+describe("CAD-2414: one long operation within the gateway budget", () => {
+  const budget = 256 * 1024;
+  const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+  /** One operation: no completed answer, so nothing counts as earlier work. */
+  const operation = (results: string[]) => ({
+    messages: [
+      { role: "user", content: "Build the template from these sources." },
+      ...results.flatMap((content, index) => [
+        { role: "assistant", content: null, tool_calls: [{ id: `call-${index}` }] },
+        { role: "tool", tool_call_id: `call-${index}`, content },
+      ]),
+    ],
+  });
+  const send = async (input: Record<string, unknown>) => {
+    let received: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      { async requestModel(request) { received = request; return new Response("ok"); } },
+      () => identity,
+    );
+    await binding.run("default", input);
+    return received!;
+  };
+  const tools = (request: Record<string, unknown>) =>
+    (request.messages as Array<{ role: string; content: string }>).filter((m) => m.role === "tool");
+
+  it("shortens the operation's older results, oldest first, until the request fits", async () => {
+    // Chinese text: three bytes a character, so 20 results pass 256 KiB.
+    const results = Array.from({ length: 20 }, (_, i) => `第${i}份資料：${"發票內容".repeat(1_500)}`);
+    const input = operation(results);
+    expect(bytes(input)).toBeGreaterThan(budget);
+    const request = await send(input);
+    expect(bytes(request)).toBeLessThanOrEqual(budget);
+    const sent = tools(request);
+    expect(sent.at(-1)?.content).toBe(results.at(-1));
+    expect(sent.at(-2)?.content).toBe(results.at(-2));
+    expect(sent[0]?.content).toContain("shortened to keep this request within the context limit");
+    expect(input.messages[2]?.content).toBe(results[0]);
+  });
+
+  it("leaves a request under the budget unchanged", async () => {
+    const input = operation(["small result", "another"]);
+    expect(await send(input)).toEqual(input);
+  });
+
+  it("sends a request that cannot fit, keeping the newest results whole", async () => {
+    const huge = "x".repeat(200_000);
+    const input = operation(["older", huge, huge]);
+    const request = await send(input);
+    expect(bytes(request)).toBeGreaterThan(budget);
+    expect(tools(request).at(-1)?.content).toBe(huge);
+    expect(tools(request).at(-2)?.content).toBe(huge);
+  });
+
+  it("tells the engine a window whose compaction thresholds sit under the budget", () => {
+    // 4.5 bytes a token is the JSON-heavy English case; Chinese uses fewer.
+    const blocking = MODEL_CONTEXT_WINDOW - HOSTED_COMPACTION_POLICY.reserveTokens;
+    const background = blocking - HOSTED_COMPACTION_POLICY.backgroundTokens;
+    expect(blocking * 4.5).toBeLessThan(budget);
+    expect(background).toBeGreaterThan(HOSTED_COMPACTION_POLICY.keepRecentTokens);
   });
 });
 

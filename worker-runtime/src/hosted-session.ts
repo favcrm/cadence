@@ -57,7 +57,7 @@ import {
   type IdentitySnapshotSql,
 } from "./identity-snapshots.ts";
 import { masterState, operationStatus } from "./master.ts";
-import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
+import { defaultModel, HOSTED_COMPACTION_POLICY, meteredBinding, withDefaultModel } from "./model.ts";
 import { ModelTaskContext } from "./model-task-context.ts";
 import {
   guardOperationRequests,
@@ -308,7 +308,8 @@ export class HostedSession<
             onWake,
             // Keep the deferred progress window at zero, rather than adopting
             // the new one-second default for hosted conversation state.
-            settings: { progress: { persistWithinMs: 0 } },
+            // CAD-2414: compact before the gateway's 256 KiB request limit.
+            settings: { progress: { persistWithinMs: 0 }, compaction: HOSTED_COMPACTION_POLICY },
             telemetry: this.modelTaskContext.telemetry,
           },
           context,

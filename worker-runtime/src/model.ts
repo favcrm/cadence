@@ -19,7 +19,24 @@ import {
  */
 
 /** Context budget handed to the engine; the resolved model's real window is not exposed. */
-const MODEL_CONTEXT_WINDOW = 128_000;
+export const MODEL_CONTEXT_WINDOW = 128_000;
+
+/**
+ * CAD-2414: Pi's compaction thresholds for hosted sessions. The binding limit
+ * is the gateway's 256 KiB request body, not the model's window: at about 4.5
+ * bytes per token for JSON-heavy English (fewer for Chinese), 256 KiB is
+ * roughly 58k tokens, so the engine's default reserve (window − 16,384 ≈
+ * 112k) never fired before the gateway refused. The reserve moves blocking
+ * compaction to 128,000 − 80,000 = 48k tokens (about 216 KiB at 4.5 bytes a
+ * token) and background compaction 16,384 tokens earlier (about 31.6k). The
+ * summary's own output stays capped by the model's 8,192 output tokens.
+ */
+export const HOSTED_COMPACTION_POLICY = {
+  reserveTokens: 80_000,
+  keepRecentTokens: 20_000,
+  backgroundTokens: 16_384,
+} as const;
+
 const MODEL_MAX_OUTPUT_TOKENS = 8192;
 
 /**
@@ -275,6 +292,80 @@ function boundToolHistory(input: Record<string, unknown>): Record<string, unknow
 }
 
 /**
+ * CAD-2414: the gateway's text budget for one request (prompt, host context,
+ * tool schemas). Image data has its own headroom and is not counted here.
+ * The target leaves room for the gateway's own framing.
+ */
+const REQUEST_TEXT_BYTES = 256 * 1024;
+const REQUEST_TEXT_TARGET = REQUEST_TEXT_BYTES - 16 * 1024;
+/** The newest tool results a request keeps whole while it is shortened. */
+const ACTIVE_TOOL_RESULTS_KEPT = 2;
+/** Each pass shortens the oldest results first, to this many characters. */
+const ACTIVE_TOOL_RESULT_PASSES = [HISTORICAL_TOOL_RESULT_CHARS, 2_000] as const;
+const ACTIVE_TOOL_RESULT_NOTICE =
+  "\n\n[Tool result shortened to keep this request within the context limit. This excerpt is incomplete; read the source again before relying on or editing its full contents.]";
+
+const encoder = new TextEncoder();
+
+/** The request's bytes against the gateway's text budget, images excluded. */
+function textBytes(input: unknown): number {
+  return encoder.encode(
+    JSON.stringify(input, (key, value: unknown) => (key === "image_url" ? null : value)),
+  ).length;
+}
+
+/** `text` cut to at most `end` characters, never inside a surrogate pair. */
+function cutText(text: string, end: number): string {
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
+}
+
+/**
+ * Keep one long operation's request inside the gateway budget. The engine
+ * cannot compact the operation it is running (`hosted-preserve-active-
+ * operation`), so once its own tool results pass 256 KiB every request would
+ * be refused. Only then, and only in the model request, shorten tool results
+ * oldest first, keeping the newest `ACTIVE_TOOL_RESULTS_KEPT` whole, until
+ * the request fits. The durable transcript is never changed. A request that
+ * still does not fit is sent as it is, and the gateway's refusal takes the
+ * existing context-limit path.
+ */
+function boundActiveToolResults(input: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(input.messages)) return input;
+  let bytes = textBytes(input);
+  if (bytes <= REQUEST_TEXT_TARGET) return input;
+  const messages: unknown[] = input.messages.slice();
+  const results: number[] = [];
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      !Array.isArray(message) &&
+      "role" in message &&
+      message.role === "tool" &&
+      "content" in message &&
+      typeof message.content === "string"
+    )
+      results.push(index);
+  }
+  const shortenable = results.slice(0, Math.max(0, results.length - ACTIVE_TOOL_RESULTS_KEPT));
+  for (const limit of ACTIVE_TOOL_RESULT_PASSES) {
+    for (const index of shortenable) {
+      const message = messages[index] as { content: string };
+      if (message.content.length <= limit) continue;
+      const content = cutText(message.content, limit) + ACTIVE_TOOL_RESULT_NOTICE;
+      bytes -= textBytes(message.content) - textBytes(content);
+      messages[index] = { ...message, content };
+      if (bytes <= REQUEST_TEXT_TARGET) return { ...input, messages };
+    }
+  }
+  return { ...input, messages };
+}
+
+/**
  * Retain the newest image parts that fit one gateway request. Durable session
  * history is untouched; each omitted image is named in the model input.
  */
@@ -502,7 +593,8 @@ export function meteredBinding(
       }
       const compacting = isCompaction?.(options?.signal) === true;
       const summary = compacting ? splitSummaryMessages(input) : input;
-      const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
         // A refused summary is terminal, and it must not leave an earlier
         // attempt's evidence behind: nothing was dispatched under it.
