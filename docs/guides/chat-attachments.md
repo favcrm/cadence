@@ -380,13 +380,16 @@ is stored and played, never decoded: the model receives its name, size and type
 only. A local board has no hosted preview route, and the client keeps metadata
 chips there without requesting attachment bytes.
 
-For a hosted session, selecting, dropping or pasting a HEIC/HEIF photo prepares
-a JPEG locally before upload. The original stays on the device; the server
-receives and validates only the derivative. The conversion runs in a worker,
-checks the source dimensions before decoding, limits the source to 32
-megapixels, and scales the result to the hosted 4-megapixel image budget.
-When needed, local `libheif` and `libde265` WebAssembly decoders load on demand;
-their license, notices and source links appear beside the converted attachment. If conversion
-fails or is unsafe, the draft remains and the user can retry, remove the file,
-or export it as JPEG or PNG. Conversion and an upload receipt do not establish
-that the model has read the photo.
+For a hosted session, selecting, dropping or pasting a HEIC/HEIF or AVIF photo
+prepares a JPEG locally before upload. The original stays on the device; the
+server receives and validates only the derivative. Conversion uses on-demand
+`libheif` and `libde265` WebAssembly decoders in isolated workers; native HEIF
+decoding is not used because it cannot enforce the same memory limit. The
+decoder's linear memory is limited to 256 MiB, and up to 16 displayed images
+totaling 32 megapixels are accepted before the primary image is scaled to the
+hosted 4-megapixel image budget. The decoder's license, notices and source links
+appear beside the converted attachment. If conversion fails or is unsafe, the
+draft remains and the user can retry, remove the file, or export it as JPEG or
+PNG.
+Conversion and an upload receipt do not establish that the model has read the
+photo.
