@@ -37,10 +37,13 @@ repository's paths and no team's rules.
   method, the review names, the risk rules and the size limits. The schema is in
   [BOARD.md](../BOARD.md#projectmd-delivery--the-per-project-delivery-policy). It
   takes effect once the owner approves it. Without a section the default policy
-  applies: one general agent review, squash merge through the queue.
+  applies: one general agent review, squash merge through the queue. What the
+  hosted gate counts today is described under
+  [Trusted lists](#trusted-lists).
 - **The repository's trusted lists** say which paths need what. They live in the
-  repository, in `docs/roles/risk-paths.toml` and
-  `docs/roles/one-review-paths.toml`.
+  repository, in `docs/roles/risk-paths.toml`, `docs/roles/one-review-paths.toml`
+  and, for review workflows, `docs/roles/workflow-auto-paths.toml` and
+  `docs/roles/review-workflow-principals.toml`.
 
 On a hosted org the owner records a project's repositories and its `delivery:`
 section with `issue project delivery` (needs a login made with
@@ -57,7 +60,10 @@ The gate refuses a project with no recorded repository.
 
 The lists are read from the pull request's anchor, never from the pull request
 itself, so a change cannot weaken its own rules. The anchor is the default
-branch's live tip for a PR based on it, otherwise the PR's base.
+branch's live tip for a PR based on it, otherwise the PR's base. A hosted board
+resolves the default branch as `main` literally, and reads the review-workflow
+principals and `workflow-auto-paths.toml` at main's tip. It counts workflow
+reviews only for a PR based on `main`.
 
 `docs/roles/risk-paths.toml` holds these tables, each `paths = [ ... ]`:
 
@@ -66,7 +72,17 @@ branch's live tip for a PR based on it, otherwise the PR's base.
 | `operator` | Paths that always need the owner's approval of the exact head. |
 | `browser_qa` | A change to any of these paths needs a Browser QA pass. |
 | `routine` | Ordinary documentation that may merge with no mandatory review (regular files only, never a sensitive path). |
-| `schema`, `trigger1`, `trigger3`, `trigger4`, `trigger6`, `trigger7` | Sensitive areas: trust and identity, secrets, supply chain and CI, outward actions, the rules themselves, schema. A change here keeps two reviews and the owner's approval. |
+| `schema`, `trigger1`, `trigger3`, `trigger4`, `trigger6`, `trigger7` | Sensitive areas: schema, trust and identity, secrets, supply chain and CI, outward actions, the rules themselves. A change here keeps two reviews. |
+| `delegable` | The only paths a delegated approval can cover (see [What the human approval does](#what-the-human-approval-does)). |
+
+`operator`, `schema`, `trigger4`, `trigger6` and `trigger7` paths are
+human-class: they need the owner's approval of the exact head. A `trigger1` or
+`trigger3` path, or a path the one-review list excludes, keeps two reviews, and
+needs the owner's approval only when a verdict's Risk is not `auto`.
+
+`docs/roles/workflow-auto-paths.toml` has an `[auto]` table with `paths`. When a
+review workflow's result is counted, a path outside `[auto] paths` forces the
+owner's approval, and an unreadable file fails closed.
 
 `docs/roles/one-review-paths.toml` has `one_review_include` and
 `one_review_exclude`: the paths where one combined review is enough. A path must
@@ -82,9 +98,9 @@ Cadence evaluates a PR into one of three classes:
 
 | Class | Reviews | Owner approval | Browser QA |
 | --- | --- | --- | --- |
-| `routine` | None mandatory; the required checks and ticket outcome evidence still apply. | No | No |
+| `routine` | None mandatory; the required checks and ticket outcome evidence still apply (hosted: both review workflows; see below). | No | No |
 | `consequential` | One combined review (standards and spec/security together). | No | If a path matches `browser_qa`. |
-| `strict` | Two reviews (standards, spec/security), or one when every path is on the one-review list. | Yes, for operator or sensitive paths, over 1500 changed lines, or when the lists are unusable. | If a path matches `browser_qa`. |
+| `strict` | Two reviews (standards, spec/security), or one when every path is on the one-review list. | Yes, for `operator`, `schema`, `trigger4`, `trigger6` or `trigger7` paths, over 1500 changed lines, or when the lists are unusable. | If a path matches `browser_qa`. |
 
 Anything the evaluator cannot place safely lands on `strict`: a custom or
 unapproved `delivery:` section, a malformed section, unreadable or unusable
@@ -95,8 +111,8 @@ The strict floor when the lists are unusable is two reviews and the owner's
 approval, and no Browser QA (the owner's approval is the human check there). A
 repository that declares neither file gets the same floor today. The evaluator
 also has a lighter default for a repository proven to declare none (one combined
-review and the owner's approval, no path rules, no Browser QA), but the hosted
-gate does not apply it yet.
+review and the owner's approval, no path rules, no Browser QA), but neither the
+hosted gate nor the native evaluator applies it yet.
 
 Ask the board what a PR needs for its exact head:
 
@@ -158,16 +174,20 @@ project's review set. Both are the owner's own act and need a login made with
 `--audit-approve`; an agent's call is refused.
 
 ```sh
-cadence --org acme audit identities set --identity <subject-id>=<github-login>
-cadence --org acme audit reviewers set --project <project-key> --reviewer <subject-id>
+cadence --org acme audit identities set \
+  --identity <subject-id>=<github-login> [--identity ...]
+cadence --org acme audit reviewers set --project <project-key> \
+  --reviewer <subject-id> [--reviewer ...]
 cadence --org acme audit reviewers --project <project-key>   # read both joins back
 cadence --org acme audit identities                           # the workspace map
 ```
 
-Leaving a principal out of a project's set stops new verdicts for that project.
-Rows already filed keep their stored principal and login and stay countable for
-the head they reviewed. A principal with no attested login reads back with
-`github_login: null`, and its verdicts cannot count yet. Never impersonate a
+Both `set` verbs replace the whole map, so repeat the flag for every entry you
+want to keep. A filed row counts only while its principal is in the project's
+current reviewer set and has a matching attested login. Leaving a principal out
+stops new verdicts and stops its earlier rows counting. A principal with no
+attested login reads back with `github_login: null`, and its verdicts cannot
+count. Never impersonate a
 reviewer: the verdict names the authenticated caller.
 
 ### Browser QA
@@ -216,10 +236,16 @@ exact head. It is the one thing an agent cannot supply.
   `daemon`.
 - It grants only the action it names, a merge. It does not accept a failed
   review, and it never substitutes for a missing required check.
-- A scope approval (pre-approving a ticket's scope) or a delegated approval
-  (recorded by a designated agent) covers only the lower-risk work they were
-  written for. Neither covers paths in the operator or sensitive lists, and
-  neither accepts Browser QA.
+- A scope approval pre-approves a ticket's scope. It refuses `trigger1` and
+  `trigger3` paths, paths the one-review list excludes, `operator` paths that are
+  in no trigger table, and triggers the ticket does not declare. It covers
+  `schema`, `trigger4`, `trigger6` and `trigger7` paths that the ticket's
+  `Risk: human (...)` line declares.
+- A delegated approval (recorded by a designated agent) covers only paths in the
+  `[delegable]` table of `risk-paths.toml`, and a `schema` path only under a live
+  scope approval. Both kinds read that table, so a file without it is unusable
+  for them.
+- Neither kind accepts Browser QA.
 
 When a review workflow says `revise` and the owner judges it wrong, the owner
 reads the findings and settles it for that head only:
@@ -280,7 +306,9 @@ a `reasons` list. `delivery enqueue` answers `state: enqueued` or refuses. Read 
 | `project_mismatch` | The issue belongs to another project. |
 | `reviewer_not_bound` | The caller is not made eligible for the project. The owner runs `audit reviewers set`. |
 | `identity_unattested` | The caller has no attested GitHub login. The owner runs `audit identities set`. |
-| `not_implemented`, `invalid_request`, `container_required` or `capability_unavailable` on a gate verb | The tenant server is older than this client. Update the tenant server first, then the client. The gate treats this as a refusal, never as "no evidence was filed", and the client never falls back to older repository-scoped evidence. |
+| `409 container_required`, or a read-side `not_implemented`, `invalid_request` or 503 `capability_unavailable` on a gate verb | The board cannot serve the verb: the tenant server is older than this client. Update the tenant server first, then the client. The gate treats this as a refusal, never as "no evidence was filed", and the client never falls back to older repository-scoped evidence. |
+| A write-side 503 `capability_unavailable` | The outcome is unknown. Read the evidence back (`audit approval`, `audit verdicts`) before retrying. |
+| `gate_refused`, `head_moved`, `not_permitted` | The gate refused a rule (read its `reasons`), the PR head moved since you read it (check again at the new head), or the caller may not do this (owner verbs are owner-only). |
 | An agent's call to an owner verb is refused | By design: approval, enqueue, `accept-revise`, identities and reviewers are owner-only. |
 
 A missing hosted read is never a pass. If the board cannot answer, the gate
@@ -295,12 +323,13 @@ refuses.
 | Review evidence | Review notes in a notes directory, counted by their declared reviewer. | Verdicts counted by attested principal; the author's principal is refused. |
 | Delivery policy | `PROJECT.md` plus `issue project approve-work`. | `issue project delivery` by the owner. |
 | Lane release | `issue finish`. | `issue finish` with a narrower set of options; see [Hosted workspace](hosted-workspace.md). |
-| Exception routes | A native-only route may waive missing reviewer attestation for a limited time. | None. Hosted refuses it. |
+| Exception routes | The native gate has a local exception route that waives missing reviewer attestation until `EXCEPTION_ENDS`. | None. Hosted refuses it. |
 
 A hosted `routine` PR has no readiness record, so it takes both review workflow
-passes and any approval the gate requires. Matching a routine path alone is not
-enough: protected paths, case variants of them, and anything other than a plain
-add or modify still need the owner.
+passes and any approval the gate requires. Whenever a workflow review is counted,
+`docs/roles/workflow-auto-paths.toml` decides: a path outside `[auto] paths`
+needs the owner, and so do protected paths, case variants of them, and anything
+other than a plain add or modify. An unreadable file fails closed.
 
 ## Document review for non-code work
 

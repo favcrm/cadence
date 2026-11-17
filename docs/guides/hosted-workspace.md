@@ -730,7 +730,7 @@ because removal deletes them. It may delete top-level `target/`, any
 and the lane's `.env` while it is exactly what lane setup last wrote: when every
 line setup writes is its own (the cargo-shim `PATH`, the slot env), it records
 the file's sha256 in the worktree's own git dir, and one changed or extra line
-keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept
+keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept.
 Anything else ignored (for example `docs/*`, `claudedocs/`,
 `docs/target/`, or a lane's `.env` from an older client, which has no record)
 refuses. Git reports an ignored directory as one entry, so a file kept inside
@@ -1036,7 +1036,7 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
 - When the daemon's workspace worker picks up a kickoff from the board for a
   fenced default agent (`attention`, or holding an unknown message), it does not
   queue it: the assignment is reported `blocked` with that reason instead of
-  `running` Resume the agent (reconcile or `agent unfence` first if
+  `running`. Resume the agent (reconcile or `agent unfence` first if
   it holds an unknown message) or connect another default, then run
   `cadence --org acme agent connect --local --alias <alias>` again (the saved
   checkout is kept) to pick the blocked work up. `issue start <id> --repo`
