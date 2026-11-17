@@ -443,17 +443,50 @@ jobs:
           // has one 15-minute deadline. A second request is made only after an explicit 429 or 5xx status
           // (nothing was generated); a timeout, a dropped stream or a mid-stream error fails closed, so one
           // run never pays for two generations.
+          const streamProblems = new Set();
           async function ask() {
+            streamProblems.clear();
             const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
               method: 'POST', body, redirect: 'error', signal: AbortSignal.timeout(900000),
               headers: { authorization: `Bearer ${E.OPENROUTER_API_KEY}`, 'content-type': 'application/json', ...(largeInput ? { 'X-OpenRouter-Metadata': 'enabled' } : {}) },
             });
             if (!r.ok) return { status: r.status };
             let sawModel = false;
+            let sawAccounting = false, nativeStop = null;
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
             let nonStringContent = false;
             let sawMetadata = false, sawDone = false;
             const dec = new TextDecoder();
+            const fail = (category) => { failed = true; streamProblems.add(category); };
+            const record = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+            const only = (v, keys) => Object.keys(v).every((key) => keys.includes(key));
+            const count = (v) => Number.isSafeInteger(v) && v >= 0;
+            const countOrNull = (v) => v === null || count(v);
+            const numberOrNull = (v) => v === null || (typeof v === 'number' && Number.isFinite(v));
+            const details = (v, keys, check) => v == null || (record(v) && only(v, keys) && Object.values(v).every(check));
+            const validUsage = (u) => record(u) &&
+              only(u, ['prompt_tokens', 'completion_tokens', 'total_tokens', 'cost', 'cost_details', 'is_byok',
+                'prompt_tokens_details', 'completion_tokens_details', 'server_tool_use_details', 'deferred_tools_details']) &&
+              ['prompt_tokens', 'completion_tokens', 'total_tokens'].every((key) => count(u[key])) &&
+              Number.isSafeInteger(u.prompt_tokens + u.completion_tokens) &&
+              u.total_tokens === u.prompt_tokens + u.completion_tokens &&
+              (u.cost === undefined || numberOrNull(u.cost)) && (u.is_byok === undefined || typeof u.is_byok === 'boolean') &&
+              details(u.cost_details, ['server_tool_cost', 'upstream_inference_cost', 'upstream_inference_prompt_cost', 'upstream_inference_completions_cost'], numberOrNull) &&
+              details(u.prompt_tokens_details, ['audio_tokens', 'cache_write_tokens', 'cached_tokens', 'video_tokens'], countOrNull) &&
+              details(u.completion_tokens_details, ['accepted_prediction_tokens', 'audio_tokens', 'image_tokens', 'reasoning_tokens', 'rejected_prediction_tokens'], countOrNull) &&
+              details(u.server_tool_use_details, ['tool_calls_executed', 'tool_calls_requested', 'web_search_requests'], countOrNull) &&
+              (u.server_tool_use_details == null || Object.values(u.server_tool_use_details).every((v) => v == null || v === 0)) &&
+              u.deferred_tools_details == null;
+            const validAccountingFrame = (d) =>
+              only(d, ['type', 'id', 'object', 'created', 'model', 'provider', 'choices', 'usage',
+                'openrouter_metadata', 'service_tier', 'system_fingerprint']) &&
+              (d.type === undefined || ['chunk', 'usage', 'metadata'].includes(d.type)) &&
+              (d.id === undefined || typeof d.id === 'string') &&
+              (d.object === undefined || d.object === 'chat.completion.chunk') &&
+              (d.created === undefined || count(d.created)) &&
+              (d.provider === undefined || typeof d.provider === 'string') &&
+              (d.service_tier == null || typeof d.service_tier === 'string') &&
+              (d.system_fingerprint == null || typeof d.system_fingerprint === 'string');
             for await (const chunk of r.body) {
               buf += dec.decode(chunk, { stream: true });
               let i;
@@ -462,51 +495,83 @@ jobs:
                 const lines = ev.split('\n');
                 const fields = lines.filter((l) => l === 'data' || l.startsWith('data:'));
                 if (largeInput && lines.some((l) => l && !l.startsWith(':') && l !== 'data' &&
-                    !['data:', 'event:', 'id:', 'retry:'].some((p) => l.startsWith(p)))) failed = true;
-                if (largeInput && lines.some((l) => l.startsWith('event:') && l.slice(6).trim() === 'error')) failed = true;
+                    !['data:', 'event:', 'id:', 'retry:'].some((p) => l.startsWith(p)))) fail('framing');
+                if (largeInput && lines.some((l) => l.startsWith('event:') && l.slice(6).trim() === 'error')) fail('provider');
                 if (!fields.length) {
-                  if (largeInput && lines.some((l) => l && !l.startsWith(':'))) failed = true;
+                  if (largeInput && lines.some((l) => l && !l.startsWith(':'))) fail('framing');
                   continue; // comment-only keep-alives carry no data
                 }
                 const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
                 if (data === '[DONE]') {
-                  if (largeInput && (!sawMetadata || sawDone || !sawModel)) failed = true;
+                  if (largeInput && (!sawMetadata || !sawAccounting || sawDone || !sawModel)) fail('sequence');
                   sawDone = true;
                   continue;
                 }
-                if (largeInput && (sawMetadata || sawDone)) { failed = true; continue; }
-                let d; try { d = JSON.parse(data); } catch { failed = true; continue; }
+                if (largeInput && (sawMetadata || sawDone)) { fail('sequence'); continue; }
+                let d; try { d = JSON.parse(data); } catch { fail('framing'); continue; }
                 // A provider error inside a 200 stream is a chunk with a top-level error.
-                if (d === null || typeof d !== 'object' || Array.isArray(d) || d.error !== undefined ||
-                    (d.choices !== undefined && !Array.isArray(d.choices))) { failed = true; continue; }
+                if (d === null || typeof d !== 'object' || Array.isArray(d) ||
+                    (d.choices !== undefined && !Array.isArray(d.choices))) { fail('framing'); continue; }
+                if (d.error !== undefined) { fail('provider'); continue; }
                 if (largeInput && d.model !== undefined) {
-                  if (d.model !== E.REVIEW_MODEL) failed = true; else sawModel = true;
+                  if (d.model !== E.REVIEW_MODEL) fail('model'); else sawModel = true;
                 }
-                if (largeInput && Array.isArray(d.choices) && d.choices.length > 0 && d.model !== E.REVIEW_MODEL) failed = true;
-                for (const c of Array.isArray(d.choices) ? d.choices : []) {
-                  if (largeInput && stop !== null) { failed = true; continue; }
+                const choices = Array.isArray(d.choices) ? d.choices : [];
+                if (largeInput && choices.length > 0 && d.model !== E.REVIEW_MODEL) fail('model');
+                if (largeInput && stop !== null) {
+                  if (!validAccountingFrame(d)) fail('framing');
+                  if (Object.hasOwn(d, 'usage') && d.usage == null) fail('accounting');
+                  if (choices.length === 0 && d.usage === undefined && !Object.hasOwn(d, 'openrouter_metadata')) fail('sequence');
+                }
+                const usage = largeInput && d.usage != null;
+                if (usage) {
+                  if (sawAccounting || !validUsage(d.usage) || !validAccountingFrame(d) ||
+                      choices.some((c) => !record(c) || !only(c, ['index', 'delta', 'finish_reason', 'native_finish_reason', 'logprobs']) ||
+                        (c.logprobs !== undefined && c.logprobs !== null)) ||
+                      (stop === null && (choices.length !== 1 || choices[0]?.finish_reason !== 'stop'))) fail('accounting');
+                  sawAccounting = true;
+                }
+                // OpenRouter repeats stop in a content-free final usage choice.
+                for (const c of choices) {
+                  if (largeInput && stop !== null) {
+                    if (!usage || choices.length !== 1 || d.model !== E.REVIEW_MODEL ||
+                        !c || typeof c !== 'object' || Array.isArray(c) || c.index !== 0 ||
+                        !only(c, ['index', 'delta', 'finish_reason', 'native_finish_reason', 'logprobs']) ||
+                        (c.logprobs !== undefined && c.logprobs !== null) ||
+                        c.finish_reason !== 'stop' || stop !== 'stop' ||
+                        !c.delta || typeof c.delta !== 'object' || Array.isArray(c.delta) ||
+                        Object.keys(c.delta).length !== 2 || c.delta.role !== 'assistant' || c.delta.content !== '' ||
+                        (c.native_finish_reason != null && (typeof c.native_finish_reason !== 'string' ||
+                          (nativeStop === null ? c.native_finish_reason !== 'stop' : c.native_finish_reason !== nativeStop)))) fail('post-stop');
+                    continue;
+                  }
                   if (largeInput && (!c || typeof c !== 'object' || Array.isArray(c) ||
-                      !c.delta || typeof c.delta !== 'object' || Array.isArray(c.delta))) { failed = true; continue; }
+                      !c.delta || typeof c.delta !== 'object' || Array.isArray(c.delta))) { fail('choice'); continue; }
                   if (largeInput && (
                       Object.keys(c.delta).some((key) => !['role', 'content', 'refusal', 'reasoning', 'reasoning_details'].includes(key)) ||
                       (c.delta.role != null && c.delta.role !== 'assistant') ||
                       (c.delta.reasoning != null && typeof c.delta.reasoning !== 'string') ||
                       (c.delta.reasoning_details != null && !Array.isArray(c.delta.reasoning_details)) ||
-                      !Object.hasOwn(c, 'finish_reason') || (c.finish_reason !== null && typeof c.finish_reason !== 'string')
-                    )) { failed = true; continue; }
-                  if (c.index !== 0) { failed = true; continue; }
-                  if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
-                  if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { failed = true; continue; }
+                      !Object.hasOwn(c, 'finish_reason') || (c.finish_reason !== null && typeof c.finish_reason !== 'string') ||
+                      (c.finish_reason !== null && c.native_finish_reason != null && typeof c.native_finish_reason !== 'string')
+                    )) { fail('choice'); continue; }
+                  if (c.index !== 0) { fail('choice'); continue; }
+                  if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { fail('choice'); continue; }
+                  if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { fail('choice'); continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
                   else if (c.delta?.content != null) nonStringContent = true;
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
-                  if (typeof c.finish_reason === 'string') { if (stop === null) stop = c.finish_reason; else if (stop !== c.finish_reason) failed = true; }
+                  if (typeof c.finish_reason === 'string') {
+                    if (stop === null) { stop = c.finish_reason; if (largeInput && c.native_finish_reason != null) nativeStop = c.native_finish_reason; }
+                    else if (stop !== c.finish_reason) fail('sequence');
+                    if (c.finish_reason === 'error') streamProblems.add('provider');
+                  }
                 }
                 if (largeInput && Object.hasOwn(d, 'openrouter_metadata')) {
                   const metadata = d.openrouter_metadata;
                   if (sawMetadata || stop !== 'stop' || metadata === null || typeof metadata !== 'object' || Array.isArray(metadata) ||
                       metadata.requested !== E.REVIEW_MODEL ||
-                      (metadata.pipeline !== undefined && (!Array.isArray(metadata.pipeline) || metadata.pipeline.length !== 0))) failed = true;
+                      (metadata.pipeline !== undefined && (!Array.isArray(metadata.pipeline) || metadata.pipeline.length !== 0))) fail('metadata');
                   sawMetadata = true;
                 }
               }
@@ -521,6 +586,7 @@ jobs:
             if (r.status === 200 && r.big) die('model output is too large to file; nothing filed');
             if (r.status === 200 && !r.broken) { res = r; break; }
             if (r.status === 429 || r.status >= 500) { if (i < 2) { out(`model attempt ${i}: HTTP ${r.status}`); await sleep(20000); continue; } }
+            if (r.status === 200 && r.broken) out(`stream validation: ${[...streamProblems].sort().join(',') || 'incomplete'}`);
             die(r.broken ? 'the model stream failed; nothing filed' : `model request failed: HTTP ${r.status}; nothing filed`);
           }
           if (Buffer.byteLength(res.text) > 60000) die('model output is too large to file; nothing filed');

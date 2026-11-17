@@ -151,6 +151,10 @@ The gate counts verdicts by attested principal and refuses the author's
 principal. A review workflow's result counts when its principal is listed in the
 repository's `docs/roles/review-workflow-principals.toml`, read at the anchor.
 
+Large-review stream failures log fixed diagnostic categories, not provider or
+review content. A failed or incomplete stream files no verdict; inspect the
+workflow result and the exact-head verdict separately.
+
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner>/<repo> \
   --issue <issue-id> --pr <number> --head <full-sha> \
