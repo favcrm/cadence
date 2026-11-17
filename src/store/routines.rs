@@ -597,6 +597,72 @@ fn parse_cron_checked(expr: &str) -> Result<(ParsedCron, i64)> {
     ))
 }
 
+const DAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// CAD-2402: a plain summary of a routine's trigger for an app. A schedule
+/// is written in the zone it runs in, which is the company zone unless the
+/// routine names another (then that zone is named, never silently shifted).
+/// Examples: "Weekdays at 09:00 (Asia/Hong_Kong)", "Every 15 min",
+/// "When <event>".
+pub fn schedule_text(routine: &Routine, company: Tz) -> String {
+    let text = if routine.trigger_kind == "event" {
+        match routine.event_source.as_deref().filter(|s| !s.is_empty()) {
+            Some(event) => format!("When {event}"),
+            None => "When an event arrives".to_string(),
+        }
+    } else if let Some(mins) = routine.interval_mins {
+        if mins >= 60 && mins % 60 == 0 {
+            format!("Every {} h", mins / 60)
+        } else {
+            format!("Every {mins} min")
+        }
+    } else if let Some(expr) = routine.cron.as_deref() {
+        let zone = routine
+            .timezone
+            .as_deref()
+            .and_then(|name| name.trim().parse::<Tz>().ok())
+            .unwrap_or(company);
+        format!("{} ({})", cron_text(expr), zone.name())
+    } else {
+        "No schedule".to_string()
+    };
+    text.chars().take(300).collect()
+}
+
+fn cron_text(expr: &str) -> String {
+    let Ok((cron, _)) = parse_cron_checked(expr) else {
+        return "On a schedule".to_string();
+    };
+    let days = match (&cron.dom, &cron.months, &cron.dow) {
+        (None, None, None) => "Daily".to_string(),
+        (None, None, Some(dow)) if dow.as_slice() == [1, 2, 3, 4, 5] => "Weekdays".to_string(),
+        (None, None, Some(dow)) => dow
+            .iter()
+            .filter_map(|d| DAY_NAMES.get(*d as usize).copied())
+            .collect::<Vec<_>>()
+            .join(", "),
+        (Some(dom), None, None) => format!(
+            "Monthly on day {}",
+            dom.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => return "On a custom schedule".to_string(),
+    };
+    let mut times = Vec::new();
+    for hour in &cron.hours {
+        for minute in &cron.minutes {
+            times.push(format!("{hour:02}:{minute:02}"));
+        }
+    }
+    if times.len() > 4 {
+        format!("{days}, several times a day")
+    } else {
+        format!("{days} at {}", times.join(", "))
+    }
+}
+
 pub fn parse_iana_timezone(tz: &str) -> Result<Tz> {
     let trimmed = tz.trim();
     if trimmed.is_empty() {

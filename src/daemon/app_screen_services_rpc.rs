@@ -401,6 +401,8 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
             super::app_calendar_query::parse_window(&args.from, &args.to)?;
             typed::<CalendarQueryArgs>(value)
         }
+        // CAD-2402: the call takes no arguments; any key is refused.
+        RoutinesList => typed::<Empty>(value),
         CampaignWorkSave => {
             let _: CampaignWorkSaveArgs = serde_json::from_value(value.clone()).map_err(|_| {
                 Error::rejected("screen service arguments exceed their closed shape")
@@ -603,6 +605,8 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         CampaignWorkSave => "crm_campaign_work_save",
         // CAD-2379: served by the host itself, never a daemon RPC method.
         CalendarQuery => "app_calendar_query",
+        // CAD-2402: served by the host itself, never a daemon RPC method.
+        RoutinesList => "app_routines_list",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -1028,6 +1032,24 @@ impl Shared {
                 || Ok(()),
             )?;
             return self.screen_calendar_query(proof, &params);
+        }
+        if proof.operation == RoutinesList {
+            // CAD-2402: routines are an operator read. A member session is
+            // already refused at the proof (members hold read-only mounts,
+            // which admit only the read allowlist); this is the second wall.
+            if proof.is_member() {
+                return Err(screen_access_denied(
+                    "screen service requires operator-role public session",
+                ));
+            }
+            self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || Ok(()),
+            )?;
+            return self.screen_routines_list();
         }
         if matches!(proof.operation, OriginShow | OriginManage) {
             params

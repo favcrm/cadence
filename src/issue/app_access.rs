@@ -171,6 +171,7 @@ pub fn access_rows(
     holds_records: bool,
     personal: bool,
     dated_reads: bool,
+    routines_list: bool,
 ) -> Value {
     let mut rows = Vec::new();
     for (slot, need) in &manifest.capabilities {
@@ -205,6 +206,17 @@ pub fn access_rows(
             None,
         ));
     }
+    // CAD-2402: the host's own sentence for an app that lists routines. It
+    // reads names, schedules and status only, so it carries no warn chip.
+    if routines_list {
+        rows.push(row(
+            "clock",
+            "Routines",
+            "Lists your routines: names, schedules and status only",
+            None,
+            None,
+        ));
+    }
     json!({
         "access": rows,
         "never": never_line(manifest, dated_reads),
@@ -226,7 +238,7 @@ mod tests {
     /// no never-line that contradicts it; any other app keeps both as before.
     #[test]
     fn a_dated_read_adds_its_row_and_drops_the_contradicting_never_line() {
-        let with = access_rows(&manifest(), None, false, false, true);
+        let with = access_rows(&manifest(), None, false, false, true, false);
         let rows = with["access"].as_array().unwrap();
         let row = rows
             .iter()
@@ -242,11 +254,32 @@ mod tests {
         assert!(!never.contains("other apps"), "{never}");
         assert!(never.contains("your logins stay with Cadence"), "{never}");
 
-        let without = access_rows(&manifest(), None, false, false, false);
+        let without = access_rows(&manifest(), None, false, false, false, false);
         assert!(!without["access"].to_string().contains("Dates across"));
         assert!(without["never"]
             .as_str()
             .unwrap()
             .contains("can't see other apps' data"));
+    }
+
+    /// CAD-2402: an app that declares `routines.list` shows the host's row,
+    /// worded exactly, with no warn chip; any other app shows none.
+    #[test]
+    fn a_routines_list_declaration_adds_its_row_with_no_chip() {
+        let with = access_rows(&manifest(), None, false, false, false, true);
+        let rows = with["access"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["title"] == "Routines")
+            .expect("the routines row");
+        assert_eq!(
+            row["sentence"],
+            "Lists your routines: names, schedules and status only"
+        );
+        assert!(row.get("chip").is_none_or(Value::is_null), "{row}");
+        let without = access_rows(&manifest(), None, false, false, false, false);
+        assert!(!without["access"]
+            .to_string()
+            .contains("Lists your routines"));
     }
 }
