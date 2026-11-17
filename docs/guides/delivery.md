@@ -92,10 +92,11 @@ lists, incomplete diff evidence, a sensitive path, or a delete, rename or mode
 change.
 
 The strict floor when the lists are unusable is two reviews and the owner's
-approval, and no Browser QA (the owner's approval is the human check there). When
-a hosted board has proven that a repository declares neither file, the default is
-one combined review and the owner's approval, with no path rules and no Browser
-QA.
+approval, and no Browser QA (the owner's approval is the human check there). A
+repository that declares neither file gets the same floor today. The evaluator
+also has a lighter default for a repository proven to declare none (one combined
+review and the owner's approval, no path rules, no Browser QA), but the hosted
+gate does not apply it yet.
 
 Ask the board what a PR needs for its exact head:
 
