@@ -759,6 +759,38 @@ pub fn connection_providers_answer(answer: &Value) -> bool {
     connection_rows(answer, "providers", connection_provider_row)
 }
 
+/// AOS-627: the strict `connected_effect` answer: `data` is exactly
+/// `{action_id, outcome, replayed, result?}`. It is the staged action's state,
+/// never a provider result.
+pub fn connected_effect_stage_answer(answer: &Value) -> bool {
+    let Some(data) = answer
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|_| answer.get("ok").and_then(Value::as_bool) == Some(true))
+    else {
+        return false;
+    };
+    data.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action_id" | "outcome" | "replayed" | "result"
+        )
+    }) && data
+        .get("action_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && matches!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("pending" | "applied" | "failed" | "denied")
+        )
+        && data.get("replayed").is_some_and(Value::is_boolean)
+        && data.get("result").is_none_or(Value::is_object)
+}
 pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
 }
@@ -6152,6 +6184,14 @@ fn call_verb_until_retry(
                 {
                     return Err(Error::unknown(format!(
                         "remote connected read returned no usable settled receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("connected_effect")
+                    if !body.as_ref().is_some_and(connected_effect_stage_answer) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected-effect stage returned no usable answer — {}",
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }

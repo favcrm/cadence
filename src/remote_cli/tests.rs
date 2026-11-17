@@ -9109,3 +9109,26 @@ mod agent_credential_refusals {
         assert!(r.notes().is_empty());
     }
 }
+
+// AOS-627: a staged connected effect is accepted only as the strict stage
+// answer, never as a provider result.
+#[test]
+fn hosted_connected_effect_answer_is_strict() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let ok = |data: Value| json!({"ok": true, "data": data});
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "pending", "replayed": false})
+    )));
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "applied", "replayed": true, "result": {}})
+    )));
+    for bad in [
+        json!({"action_id": id, "outcome": "pending"}),
+        json!({"action_id": "ABC", "outcome": "pending", "replayed": false}),
+        json!({"action_id": id, "outcome": "sent", "replayed": false}),
+        json!({"action_id": id, "outcome": "pending", "replayed": false, "price": {}}),
+    ] {
+        assert!(!connected_effect_stage_answer(&ok(bad)));
+    }
+    assert!(!connected_effect_stage_answer(&json!({"ok": false})));
+}
