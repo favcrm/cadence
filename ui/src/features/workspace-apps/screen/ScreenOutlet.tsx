@@ -525,7 +525,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;
   return <>
-    <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
+    <div data-installed-app-screen="" aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}

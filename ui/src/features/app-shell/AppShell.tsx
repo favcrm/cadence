@@ -1384,7 +1384,7 @@ export default function AppShell({
             ) : <>
               {linkNotice && (
                 <p className="self-start rounded border border-warn/40 px-3 py-1.5 text-label text-warn" role="alert" data-link-notice>
-                  {linkNotice}
+                  {t(linkNotice)}
                 </p>
               )}
               {previewKey !== null ? (
