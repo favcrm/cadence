@@ -201,6 +201,9 @@ async function boundaryChecks() {
     // metadata response as a local/anonymous admission.
     for (const downgraded of [
       { ...signedIn, signed_in: false, hosted: false, anonymous_reads: true, session: null },
+      { ...signedIn, signed_in: false, hosted: undefined, anonymous_reads: true, session: null },
+      { ...hostedSession, signed_in: false },
+      { ...hostedSession, signed_in: false, session: { origin: "public" } },
       { ...signedIn, hosted: false },
       { ...signedIn, hosted: true },
       { ...hostedSession, hosted: "invalid" },
@@ -308,6 +311,35 @@ async function boundaryChecks() {
     await focus();
     assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a session-required event preserves the confirmation requirement");
     await continueWithCurrent();
+
+    // localhost is classified as local before the first response. A remembered
+    // hosted identity must still survive a refusal on reload.
+    response = () => json({ error: { code: "board_session_required", message: "Session required" } }, 401);
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-auth-state='expired'] h1"), "a real refusal after reload ends the hosted session");
+    assert(sessionStorage.getItem("cadence.hostedIdentityConfirmationPending") === "1", "the remembered hosted identity requires confirmation even on a local-classified host");
+    response = () => json({ ...signedIn, hosted: false });
+    await focus();
+    assert(host.querySelector("[data-auth-state='unavailable'] h1") && !privateReadsAllowed(), "refusal after reload cannot downgrade hosted authority to local");
+    response = () => json(afterRequired);
+    await retry();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a sign-in after that refusal still needs confirmation");
+    await continueWithCurrent();
+
+    // A different public identity on the very first response after reload
+    // cannot be admitted just because the hostname hint is local.
+    const afterReloadSwitch = { ...afterRequired, session: { ...afterRequired.session, id: "seventh-hosted-session", user: { ...afterRequired.session.user, sub: "seventh-user", email: "seventh@example.test" } } };
+    response = () => json(afterReloadSwitch);
+    await React.act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    assert(host.querySelector("[data-auth-state='changed'] h1") && !privateReadsAllowed(), "a different hosted identity on reload requires confirmation");
+    await continueWithCurrent();
+    response = () => json({ ...afterReloadSwitch, signed_in: false, session: null, anonymous_reads: false });
+    await focus();
+    assert(host.querySelector("[data-auth-state='expired'] h1") && !privateReadsAllowed(), "a consistent hosted signed-out response still expires the session");
     // Start an independent fresh local-board scenario; a hosted tab cannot
     // silently change into this identity on the same origin.
     await React.act(async () => root.unmount());

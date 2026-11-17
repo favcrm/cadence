@@ -123,7 +123,7 @@ export default function AuthBoundary({ children }: {
   }, [setSession]);
 
   const requireHostedConfirmation = useCallback(() => {
-    if (!stateRef.current.hosted || identity.current === null) return;
+    if (identity.current === null || !(stateRef.current.hosted || hostedIdentity(identity.current))) return;
     pendingChange.current = true;
     proposedIdentity.current = null;
     approvedIdentity.current = null;
@@ -168,6 +168,8 @@ export default function AuthBoundary({ children }: {
       if ((meta.hosted !== undefined && typeof meta.hosted !== "boolean") ||
           (wasHosted && meta.hosted === false) ||
           (meta.hosted === false && session?.origin === "public") ||
+          (wasHosted && meta.anonymous_reads === true) ||
+          (hosted && meta.signed_in === false && session != null) ||
           (hosted && session != null && session.origin !== "public")) {
         unavailable("unavailable", hosted);
         return false;
@@ -196,7 +198,7 @@ export default function AuthBoundary({ children }: {
         const nextIdentity = meta.signed_in === true && session
           ? JSON.stringify([hosted, session.id, session.origin, session.created, session.origin === "public" ? null : session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
-        if (hosted && stateRef.current.hosted && identity.current !== null && identity.current !== nextIdentity) {
+        if (hosted && (stateRef.current.hosted || hostedIdentity(identity.current)) && identity.current !== null && identity.current !== nextIdentity) {
           requireHostedConfirmation();
           discard();
         }

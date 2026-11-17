@@ -99,6 +99,7 @@ async function main(): Promise<void> {
   }
   async function mount() {
     resetPrivateSession();
+    sessionStorage.removeItem("cadence.privateSessionIdentity");
     sessionStorage.removeItem("cadence.hostedIdentityConfirmationPending");
     actor = "first-member";
     unavailable = false;
