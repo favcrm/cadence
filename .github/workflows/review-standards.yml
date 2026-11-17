@@ -87,6 +87,9 @@ jobs:
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { execFileSync } from 'node:child_process';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
           if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
           // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
@@ -134,7 +137,10 @@ jobs:
             for (const line of lines) {
               if (o > 0 || n > 0) {
                 const c = line[0];
-                if (c === '\\') continue;
+                if (c === '\\') {
+                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
+                  continue;
+                }
                 if (c === '+') { cur?.add(nl); nl++; n--; continue; }
                 if (c === '-') { o--; continue; }
                 if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
@@ -152,10 +158,41 @@ jobs:
               if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
               if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
                 o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+                continue;
               }
+              if (line === '\\ No newline at end of file' ||
+                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
+              throw new Refusal('the diff has unexpected text');
             }
             if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
             return { files, sections };
+          }
+          // Apply the supplied patch to the pinned base and verify the head tree.
+          // Review only Git's own bounded diff of those trees, not unbound patch metadata.
+          function verifiedDiff(diff, base, head) {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cadence-review-')), repo = path.join(dir, 'repo.git');
+            const env = {
+              PATH: E.PATH, HOME: dir, LANG: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+              GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_INDEX_FILE: path.join(dir, 'index'),
+              GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+              GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${E.GH_TOKEN}`).toString('base64')}`,
+            };
+            const git = (args, input, maxBuffer = 1024 * 1024) => execFileSync('git', args, { env, input, timeout: 120000, maxBuffer, stdio: 'pipe' });
+            try {
+              git(['init', '--bare', '--quiet', '--template=', repo]);
+              git(['-C', repo, 'remote', 'add', 'origin', `https://github.com/${REPO}.git`]);
+              git(['-C', repo, 'config', 'remote.origin.promisor', 'true']);
+              git(['-C', repo, 'config', 'remote.origin.partialclonefilter', 'blob:none']);
+              git(['-C', repo, 'fetch', '--no-tags', '--depth=1', '--filter=blob:none', 'origin', base, head]);
+              git(['-C', repo, 'read-tree', base]);
+              git(['-C', repo, 'apply', '--cached', '--whitespace=nowarn', '-'], diff);
+              const actual = git(['-C', repo, 'write-tree', '--missing-ok']).toString('utf8').trim();
+              const expected = git(['-C', repo, 'rev-parse', `${head}^{tree}`]).toString('utf8').trim();
+              if (!/^[0-9a-f]{40}$/.test(actual) || actual !== expected) return null;
+              const bytes = git(['-C', repo, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--full-index', base, head, '--'], undefined, 2500001);
+              if (bytes.length > 2500000) return null;
+              return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            } catch { return null; } finally { fs.rmSync(dir, { recursive: true, force: true }); }
           }
           if (E.GITHUB_REF !== 'refs/heads/main') die('this workflow only runs from main: dispatch it with --ref main');
           const pub = publicKey(); // before any token is minted or context read
@@ -240,13 +277,19 @@ jobs:
           const d = await gh(`compare/${mainSha}...${HEAD}`, 'application/vnd.github.v3.diff');
           if (!d.ok) die(`cannot read the diff: HTTP ${d.status}`);
           const diff = await d.text();
-          if (Buffer.byteLength(diff) > 300000) die('diff is over 300 KB: too large to review, nothing filed');
+          if (Buffer.byteLength(diff) > 2500000) die('diff is over 2.5 MB: too large to review, nothing filed');
+          if (listed < 1) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
           let sections;
           try { sections = parseDiff(diff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the diff cannot be read'); }
           // Coverage is judged against the file list of this same comparison, never the PR's changed_files. The
           // list is complete (under the 300 cap), so a different section count means the diff was cut short by
           // GitHub or padded; that is the one case that refuses.
-          if (listed < 1 || sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
+          if (sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
+          const reviewedDiff = verifiedDiff(diff, mergeBase, HEAD);
+          if (reviewedDiff === null) die('the diff cannot be bound to the compared Git trees; nothing filed');
+          let reviewedSections;
+          try { reviewedSections = parseDiff(reviewedDiff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the verified diff cannot be read'); }
+          if (reviewedSections < 1 || reviewedSections >= 300) die('the verified diff changes too many files or has nothing to review; nothing filed');
           // The standard the reviewer applies is read at the pinned main (the rules in force when this merges),
           // never from the PR; the PR cannot change main.
           const doc = async (p) => {
@@ -262,10 +305,10 @@ jobs:
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(`${dir}/review-input.json`, JSON.stringify({
             repo: REPO, pr: Number(PR), head: HEAD, main: mainSha, merge_base: mergeBase, issue, pull: ctx.pull,
-            sealed_ticket, diff,
+            sealed_ticket, diff: reviewedDiff,
             agents_md: await doc('AGENTS.md'), risk_classes: await doc('docs/roles/risk-classes.md'),
           }));
-          fs.writeFileSync(`${dir}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, issue, diff }));
+          fs.writeFileSync(`${dir}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, issue, diff: reviewedDiff }));
           out(`prepared ${issue} PR ${PR} head ${HEAD.slice(0, 12)} main ${mainSha.slice(0, 12)}`);
           JS
       # A public repo's artifacts are downloadable by any signed-in GitHub user, so
@@ -387,9 +430,12 @@ jobs:
           // providers that accept every parameter sent (require_parameters, so json_schema is enforced or the call
           // is refused), that do not retain or train on prompts (data_collection deny, zdr); with no such
           // provider the call fails with a 404 and nothing is filed.
+          // Larger reviews require proof that the router did not transform the request or response.
+          const largeInput = Buffer.byteLength(input.diff) > 300000;
           const body = JSON.stringify({
             model: E.REVIEW_MODEL, max_tokens: 64000, stream: true, reasoning: { effort: 'high' },
             provider: { require_parameters: true, data_collection: 'deny', zdr: true },
+            ...(largeInput ? { plugins: [{ id: 'context-compression', enabled: false }] } : {}),
             response_format: { type: 'json_schema', json_schema: { name: 'review', strict: true, schema } },
             messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           });
@@ -400,30 +446,70 @@ jobs:
           async function ask() {
             const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
               method: 'POST', body, redirect: 'error', signal: AbortSignal.timeout(900000),
-              headers: { authorization: `Bearer ${E.OPENROUTER_API_KEY}`, 'content-type': 'application/json' },
+              headers: { authorization: `Bearer ${E.OPENROUTER_API_KEY}`, 'content-type': 'application/json', ...(largeInput ? { 'X-OpenRouter-Metadata': 'enabled' } : {}) },
             });
             if (!r.ok) return { status: r.status };
+            let sawModel = false;
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
+            let sawMetadata = false, sawDone = false;
             const dec = new TextDecoder();
             for await (const chunk of r.body) {
               buf += dec.decode(chunk, { stream: true });
               let i;
               while ((i = buf.indexOf('\n\n')) >= 0) {
                 const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-                const line = ev.split('\n').find((l) => l.startsWith('data: '));
-                if (!line) continue; // keep-alive comments (": OPENROUTER PROCESSING") carry no data
-                if (line === 'data: [DONE]') continue;
-                let d; try { d = JSON.parse(line.slice(6)); } catch { failed = true; continue; }
+                const lines = ev.split('\n');
+                const fields = lines.filter((l) => l === 'data' || l.startsWith('data:'));
+                if (largeInput && lines.some((l) => l && !l.startsWith(':') && l !== 'data' &&
+                    !['data:', 'event:', 'id:', 'retry:'].some((p) => l.startsWith(p)))) failed = true;
+                if (largeInput && lines.some((l) => l.startsWith('event:') && l.slice(6).trim() === 'error')) failed = true;
+                if (!fields.length) {
+                  if (largeInput && lines.some((l) => l && !l.startsWith(':'))) failed = true;
+                  continue; // comment-only keep-alives carry no data
+                }
+                const data = fields.map((l) => l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
+                if (data === '[DONE]') {
+                  if (largeInput && (!sawMetadata || sawDone || !sawModel)) failed = true;
+                  sawDone = true;
+                  continue;
+                }
+                if (largeInput && (sawMetadata || sawDone)) { failed = true; continue; }
+                let d; try { d = JSON.parse(data); } catch { failed = true; continue; }
                 // A provider error inside a 200 stream is a chunk with a top-level error.
-                if (d === null || typeof d !== 'object' || d.error !== undefined) { failed = true; continue; }
+                if (d === null || typeof d !== 'object' || Array.isArray(d) || d.error !== undefined ||
+                    (d.choices !== undefined && !Array.isArray(d.choices))) { failed = true; continue; }
+                if (largeInput && d.model !== undefined) {
+                  if (d.model !== E.REVIEW_MODEL) failed = true; else sawModel = true;
+                }
+                if (largeInput && Array.isArray(d.choices) && d.choices.length > 0 && d.model !== E.REVIEW_MODEL) failed = true;
                 for (const c of Array.isArray(d.choices) ? d.choices : []) {
+                  if (largeInput && stop !== null) { failed = true; continue; }
+                  if (largeInput && (!c || typeof c !== 'object' || Array.isArray(c) ||
+                      !c.delta || typeof c.delta !== 'object' || Array.isArray(c.delta))) { failed = true; continue; }
+                  if (largeInput && (
+                      Object.keys(c.delta).some((key) => !['role', 'content', 'refusal', 'reasoning', 'reasoning_details'].includes(key)) ||
+                      (c.delta.role != null && c.delta.role !== 'assistant') ||
+                      (c.delta.reasoning != null && typeof c.delta.reasoning !== 'string') ||
+                      (c.delta.reasoning_details != null && !Array.isArray(c.delta.reasoning_details)) ||
+                      !Object.hasOwn(c, 'finish_reason') || (c.finish_reason !== null && typeof c.finish_reason !== 'string')
+                    )) { failed = true; continue; }
                   if (c.index !== 0) { failed = true; continue; }
+                  if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { failed = true; continue; }
+                  if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { failed = true; continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
                   if (typeof c.finish_reason === 'string') { if (stop === null) stop = c.finish_reason; else if (stop !== c.finish_reason) failed = true; }
                 }
+                if (largeInput && Object.hasOwn(d, 'openrouter_metadata')) {
+                  const metadata = d.openrouter_metadata;
+                  if (sawMetadata || stop !== 'stop' || metadata === null || typeof metadata !== 'object' || Array.isArray(metadata) ||
+                      metadata.requested !== E.REVIEW_MODEL ||
+                      (metadata.pipeline !== undefined && (!Array.isArray(metadata.pipeline) || metadata.pipeline.length !== 0))) failed = true;
+                  sawMetadata = true;
+                }
               }
             }
+            if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;
             return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };
           }
           let res = null;
@@ -514,7 +600,10 @@ jobs:
             for (const line of lines) {
               if (o > 0 || n > 0) {
                 const c = line[0];
-                if (c === '\\') continue;
+                if (c === '\\') {
+                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
+                  continue;
+                }
                 if (c === '+') { cur?.add(nl); nl++; n--; continue; }
                 if (c === '-') { o--; continue; }
                 if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
@@ -532,7 +621,11 @@ jobs:
               if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
               if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
                 o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+                continue;
               }
+              if (line === '\\ No newline at end of file' ||
+                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
+              throw new Refusal('the diff has unexpected text');
             }
             if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
             return { files, sections };

@@ -235,6 +235,25 @@ export type ThreadProjection = (
   entries: readonly ThreadEntry[],
 ) => readonly ThreadEntry[];
 
+/**
+ * One skill a workspace owner approved (CAD-2395), as the host serves it.
+ *
+ * `name` follows the bundle tag grammar; `description` is one plain line of at
+ * most 240 characters; `body` is the SKILL.md instructions; `references` are
+ * `references/<leaf>` text files; `version` names the approved revision (for
+ * example its digest). Sizes follow the bundle grammar's skill caps. The
+ * runtime lists the skill as `ws-<name>` after its bundled skills, frames
+ * everything it returns as untrusted guidance, and drops an entry that breaks
+ * a rule rather than truncating it.
+ */
+export interface WorkspaceSkill {
+  readonly name: string;
+  readonly description: string;
+  readonly body: string;
+  readonly references: readonly { readonly path: string; readonly content: string }[];
+  readonly version: string;
+}
+
 export interface HostedSessionOptions {
   /**
    * Add host entries to what the board reads, on every thread path. It sees a
@@ -292,6 +311,13 @@ export interface HostedSessionOptions {
    */
   resumeModel?(url: string, signal?: AbortSignal): Promise<Response>;
   readonly tools: readonly RuntimeTools[];
+  /**
+   * The workspace's approved skills, read once when the conversation's harness
+   * opens (CAD-2395). Supply only approved revisions; a draft must never reach
+   * here. Absent, or a throw, leaves the bundled skills exactly as they are.
+   * A skill never grants, adds or selects a tool.
+   */
+  workspaceSkills?(): Promise<readonly WorkspaceSkill[]>;
   /**
    * Revalidate the live authority of this conversation before an execution.
    * Runs on every attempt, including a replay whose intent is already durable.
