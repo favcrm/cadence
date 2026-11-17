@@ -864,7 +864,11 @@ Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
 
-### PROJECT.md `delivery:` — the per-project delivery policy (CAD-826)
+### PROJECT.md `delivery:` — the per-project delivery policy
+
+The lifecycle, the trusted path lists, the evidence each review takes and the
+human approval are in [Delivery](guides/delivery.md). This section is the
+`delivery:` schema.
 
 A project may declare the delivery policy the loop will run under in
 `<pm>/<key>/PROJECT.md` frontmatter. Like the work gates it lives in
@@ -881,7 +885,7 @@ left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
 `integration_branch` optionally permits one additional PR target beside the
-repository default branch (CAD-1561). It must be a canonical branch name, not
+repository default branch. It must be a canonical branch name, not
 a `refs/` path or revision expression, and match the current, exactly approved
 policy. An unapproved, removed or malformed section cannot enable it through
 the last-approved fallback. Re-approve through the operator connection after
@@ -918,9 +922,8 @@ delivery:
   oversized: {lines_over: 3000, files_over: 40}   # optional
 ```
 
-`merge`, `max_revise`, `heavy` and `oversized` fall back to today's
-loop constants: `squash` through the merge queue, `max_revise`
-`MAX_REVISE`, `HEAVY_*`/`OVERSIZED_*` — and the default policy is one
+`merge`, `max_revise`, `heavy` and `oversized` fall back to built-in
+defaults (`squash` through the merge queue), and the default policy is one
 `review` agent review (`focus: general`) required unconditionally.
 Unknown keys are refused at every level. Validation: review names are
 tags; an `agent` needs a `focus` from the allowlist above and takes no
@@ -935,8 +938,8 @@ file-level glob grammar the `areas:` reader and an issue's `paths=`
 field use (`*` and `?` match inside one path segment, a `**` segment
 any number of segments, a trailing `/` everything under it — no
 leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
-control characters; validated by `areas::check_path` and, in slice 3,
-matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
+control characters; validated by the same path check and
+matched by the same matcher, so the two grammars can't diverge). `heavy` sits strictly
 under `oversized`. The policy schema requires at least one unconditional
 `agent` or `operator` review rule; a `check` cannot satisfy that schema
 floor. The shared requirements evaluator can nevertheless classify an
@@ -957,6 +960,11 @@ and `delivery_error: …` when it is malformed with none; `issue lint`
 warns the same. The shared requirements evaluator consumes the effective
 policy and trusted change evidence; the final enqueue gate can impose further
 requirements. Inspect the actual result for the target and exact head.
+
+The merge gate counts the `standards` and `spec-security` review axes itself.
+Counting reviews by a rule's `agent`, `check` or `operator` kind is not applied
+yet: the section is validated and approved, and the gate does not count against
+its `reviews` names. Read the gate with `delivery check`.
 
 ## Multi-host trackers — `issue sync`
 
