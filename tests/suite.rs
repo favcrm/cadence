@@ -12944,6 +12944,160 @@ if (mode === 'keys') {
         }
     }
 
+    #[test]
+    fn large_review_accepts_only_content_free_repeated_stop_usage() {
+        // Generate a valid full-index patch from real Git trees. The workflow
+        // harness still substitutes its fixed Git transport and dispatch IDs.
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| git_in(dir.path(), args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(
+            dir.path().join("big.txt"),
+            format!("{}\n", "x".repeat(80)).repeat(4000),
+        )
+        .unwrap();
+        git(&["add", "big.txt"]);
+        git(&["commit", "-q", "-m", "head"]);
+        let diff = git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--full-index",
+            "HEAD~1",
+            "HEAD",
+            "--",
+        ]);
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+        assert!(diff.contains("new file mode 100644\nindex "));
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            for (content, should_succeed) in [("", true), ("unexpected output", false)] {
+                let mut events = model_events("{}", Some("stop"));
+                // Replace the ordinary empty-choice usage fixture and DONE.
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage = or_chunk(
+                    json!({ "content": content, "role": "assistant" }),
+                    json!("stop"),
+                );
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(r.hits("openrouter").len(), 1, "{}: {}", wf.file, r.out);
+                assert!(r.hits("/verdict").is_empty(), "{}: {}", wf.file, r.out);
+                if should_succeed {
+                    assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+                    assert!(
+                        r.read("out/review-output.json").is_some(),
+                        "{}: {}",
+                        wf.file,
+                        r.out
+                    );
+                } else {
+                    assert!(r.failed(), "{}: post-stop content was accepted", wf.file);
+                    assert!(
+                        r.read("out/review-output.json").is_none(),
+                        "{}: {}",
+                        wf.file,
+                        r.out
+                    );
+                    assert!(r.files().is_empty(), "{}: {}", wf.file, r.out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_unproven_routing_after_accounting() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            let model = wf.env_str("REVIEW_MODEL");
+            let cases = [
+                ("missing metadata", None),
+                (
+                    "mismatched model",
+                    Some(json!({ "requested": "other/model", "pipeline": [] })),
+                ),
+                (
+                    "nonempty pipeline",
+                    Some(json!({
+                        "requested": model,
+                        "pipeline": [{ "type": "context_compression" }]
+                    })),
+                ),
+            ];
+            for (name, metadata) in cases {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage =
+                    or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                if let Some(metadata) = metadata {
+                    events.push(json!({
+                        "type": "metadata",
+                        "openrouter_metadata": metadata
+                    }));
+                }
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
+        }
+    }
+
     // ---- log hygiene: no attacker-controlled text on any path --------------
 
     #[test]
