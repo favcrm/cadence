@@ -43,6 +43,8 @@ A PR is auto-eligible under this allowlist only when every `scripts/**` path it 
 - **trigger6**: `src/rollout.rs`, `src/update.rs`, `src/upgrade.rs`, `src/cli/rollout.rs`, `src/cli/daemon.rs`, `src/cli/update.rs`, `src/cli/upgrade.rs`
 - **trigger7**: `docs/roles/**`, `docs/CHARTER.md`, `docs/AUDIT.md`, `docs/design/**`, `docs/cadence/**`, `docs/START-HERE.md`, `docs/ARCHITECTURE.md`, `docs/BOARD.md`, `docs/INSTALL-AGENT.md`, `docs/REMOTE-AUTH.md`, `AGENTS.md`, `cadence-review.toml`, `clippy.toml`, `src/review.rs`, `src/review/**`, `src/audit/**`, `src/delegation.rs`, `src/delegation/**`, `src/daemon/approvals_rpc.rs`, `src/store/events.rs`, `src/overview.rs`, `src/delivery.rs`, `src/delivery/**`, `src/issue/delivery_policy.rs`, `src/issue/delivery_requirements.rs`, `src/issue/model.rs`, `src/issue/board.rs`, `src/issue/parse.rs`, `src/cli/audit.rs`, `src/cli/mod.rs`, `scripts/**`, `tests/**`
 
+The shared requirements engine also reads three tables of `risk-paths.toml` that hold this repository's own rules as data (CAD-2386; the engine names no repository's paths): `operator` (further operator-class build, release, rule and gate files), `browser_qa` (paths whose change needs a Browser QA pass) and `routine` (ordinary documentation the routine class admits). Each is required; a missing or malformed one fails closed. Editing them is trigger 7 like the rest of `docs/roles/**`.
+
 ## Class `auto`
 Everything else.
 

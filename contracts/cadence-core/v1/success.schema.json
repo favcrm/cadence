@@ -214,7 +214,7 @@
           "const": "sensitive"
         },
         {
-          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are exactly the legacy ones.",
+          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are the legacy ones (see the module header).",
           "type": "string",
           "const": "strict"
         }
@@ -548,7 +548,7 @@
           "$ref": "#/$defs/Activation"
         },
         "browser_qa": {
-          "description": "A `ui/` change additionally needs a Browser QA pass.",
+          "description": "A change to a path in the repository's `browser_qa` table needs a\nBrowser QA pass (never when the lists are unreadable).",
           "type": "boolean"
         },
         "class": {

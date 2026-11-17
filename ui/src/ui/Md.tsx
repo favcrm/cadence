@@ -329,7 +329,7 @@ function IdCode({ className, children }: { className?: string; children?: ReactN
   );
 }
 
-function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false): Components {
+function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false, knownIssue?: (id: string) => boolean): Components {
   return {
     ...(ids
       ? {
@@ -381,7 +381,7 @@ function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids =
         <>{children}</>
       ) : issueId !== null ? (
         WHOLE_ISSUE_ID.test(issueId) ? (
-          onOpen ? (
+          onOpen && (!knownIssue || knownIssue(issueId)) ? (
             <button className="lnk num" onClick={() => onOpen(issueId)}>
               {nested}
             </button>
@@ -422,6 +422,18 @@ function componentsFor(onOpen?: (id: string) => void, wikiPage?: string, ids = f
   return built;
 }
 
+// CAD-2387: the known-id variant, cached per (predicate, opener) so a stable
+// pair keeps one component set across renders.
+const knownHandlerComponents = new WeakMap<object, WeakMap<object, [Components?, Components?]>>();
+function knownComponents(onOpen: (id: string) => void, known: (id: string) => boolean, ids: boolean): Components {
+  let byOpen = knownHandlerComponents.get(known);
+  if (!byOpen) knownHandlerComponents.set(known, (byOpen = new WeakMap()));
+  let pair = byOpen.get(onOpen);
+  if (!pair) byOpen.set(onOpen, (pair = []));
+  const slot = ids ? 1 : 0;
+  return (pair[slot] ??= buildComponents(onOpen, undefined, ids, known));
+}
+
 const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
 const ID_PLUGINS = [...PLUGINS, remarkIdTokens];
@@ -431,14 +443,21 @@ export default function Md({
   onOpen,
   wikiPage,
   idTokens = false,
+  knownIssue,
 }: {
   text: string;
   onOpen?: (id: string) => void;
+  /** CAD-2387: when set, only an id it accepts becomes a link; others stay plain. */
+  knownIssue?: (id: string) => boolean;
   /** CAD-1915: set only by the wiki page view — its links resolve against this path. */
   wikiPage?: string;
   /** CAD-2363: an assistant answer shows long hex identifiers as short copyable tokens. */
   idTokens?: boolean;
 }) {
+  const components =
+    knownIssue && onOpen && wikiPage === undefined
+      ? knownComponents(onOpen, knownIssue, idTokens)
+      : componentsFor(onOpen, wikiPage, idTokens && wikiPage === undefined);
   return (
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
@@ -447,7 +466,7 @@ export default function Md({
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={componentsFor(onOpen, wikiPage, idTokens && wikiPage === undefined)}
+      components={components}
     >
       {text}
     </Markdown>

@@ -262,6 +262,12 @@ pub struct DeliveryRequirementsInput {
     pub risk_paths: Option<String>,
     /// The trusted base's `docs/roles/one-review-paths.toml` text.
     pub one_review_paths: Option<String>,
+    /// CAD-2386: the caller proved both list files are absent at the anchor
+    /// (a definite "not found", never a failed read), so the product default
+    /// applies. Absent or `false` keeps today's reading: a missing text is
+    /// unreadable and fails closed. `true` with either text present refuses.
+    #[serde(default)]
+    pub lists_absent: bool,
 }
 
 /// The delivery half of a project work approval: the digest it recorded and
@@ -693,12 +699,21 @@ fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Valu
         policy: approval.policy.clone(),
     });
     let resolved = effective("project", file, approved.as_ref());
-    let lists = crate::delivery_requirements::TrustedLists {
-        risk_paths: input.risk_paths.as_deref(),
-        one_review: input.one_review_paths.as_deref(),
+    let requirements = if input.lists_absent {
+        if input.risk_paths.is_some() || input.one_review_paths.is_some() {
+            return Err(refuse(
+                Code::InvalidCommand,
+                "lists_absent contradicts a supplied list text".to_string(),
+            ));
+        }
+        crate::delivery_requirements::classify_without_lists(&resolved, &input.changes, input.lines)
+    } else {
+        let lists = crate::delivery_requirements::TrustedLists {
+            risk_paths: input.risk_paths.as_deref(),
+            one_review: input.one_review_paths.as_deref(),
+        };
+        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists)
     };
-    let requirements =
-        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists);
     serde_json::to_value(serde_json::json!({
         "policy": resolved.policy,
         "policy_source": resolved.source,

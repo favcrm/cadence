@@ -27,6 +27,8 @@ export function Turn({
   me,
   showName,
   markdown,
+  onOpenIssue,
+  knownIssue,
   state,
   children,
 }: {
@@ -35,6 +37,9 @@ export function Turn({
   me?: boolean;
   showName?: boolean;
   markdown?: boolean;
+  /** CAD-2387: opens a known issue id in a Markdown body; absent keeps ids plain. */
+  onOpenIssue?: (id: string) => void;
+  knownIssue?: (id: string) => boolean;
   state?: DeliveryState | string | null;
   children: ReactNode;
 }) {
@@ -54,7 +59,7 @@ export function Turn({
         ) : markdown && typeof children === "string" ? (
           <div className="answer">
             <div className="answer-body issue-reader">
-              <Md text={children} idTokens />
+              <Md text={children} idTokens onOpen={onOpenIssue} knownIssue={knownIssue} />
             </div>
           </div>
         ) : (

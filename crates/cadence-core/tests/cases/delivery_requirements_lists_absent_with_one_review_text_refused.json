@@ -1,0 +1,27 @@
+{
+  "input": {
+    "v": 1,
+    "op": "delivery.requirements.evaluate",
+    "input": {
+      "policy": null,
+      "approval": null,
+      "changes": [
+        {
+          "status": "M",
+          "old_mode": "100644",
+          "new_mode": "100644",
+          "path": "docs/a.md"
+        }
+      ],
+      "lines": 10,
+      "risk_paths": null,
+      "one_review_paths": "",
+      "lists_absent": true
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "lists_absent contradicts a supplied list text"
+  }
+}

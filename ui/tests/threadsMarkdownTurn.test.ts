@@ -1,6 +1,8 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type * as PartsModule from "../src/features/threads/ThreadChatParts";
+import type * as PageModule from "../src/features/threads/ThreadsPage";
+import type * as LinkModule from "../src/features/threads/IssueRefLink";
 import type * as BarModule from "../src/features/app-shell/chat/TurnBar";
 import { LocaleTextProvider } from "../src/lib/localeText";
 import { rendersMarkdown } from "../src/features/threads/threadsView";
@@ -16,6 +18,8 @@ loader.prototype.require = function (this: unknown, id: string) {
   return originalRequire.apply(this, arguments);
 };
 const { Turn } = require("../src/features/threads/ThreadChatParts") as typeof PartsModule;
+const { EntryRow, MessageRow } = require("../src/features/threads/ThreadsPage") as typeof PageModule;
+const { OpenWorkItem } = require("../src/features/threads/IssueRefLink") as typeof LinkModule;
 const { TurnBar } = require("../src/features/app-shell/chat/TurnBar") as typeof BarModule;
 loader.prototype.require = originalRequire;
 
@@ -58,7 +62,8 @@ check(billing.includes("計費") && !billing.includes("帳單"), "the billing se
 
 // Only agent prose and system notes are Markdown; tool rows stay plain.
 check(rendersMarkdown({ role: "agent", kind: "message" }) && rendersMarkdown({ role: "agent", kind: "assistant_text" }), "agent prose is Markdown");
-check(rendersMarkdown({ role: "system", kind: "message" }), "a system note is Markdown");
+check(rendersMarkdown({ role: "system", kind: "message" }), "a system message is Markdown");
+check(!rendersMarkdown({ role: "system", kind: "turn_result" }), "a system turn_result stays plain");
 for (const kind of ["tool_call", "tool_result", "turn_result"]) {
   check(!rendersMarkdown({ role: "agent", kind }), `an agent ${kind} stays plain`);
 }
@@ -66,3 +71,36 @@ check(!rendersMarkdown({ role: "operator", kind: "message" }), "an operator mess
 const shell = "# comment\nline two\nline three";
 const toolRow = renderToStaticMarkup(createElement(Turn, { who: "Agent", markdown: rendersMarkdown({ role: "agent", kind: "tool_result" }), children: shell }));
 check(!toolRow.includes("<h1") && toolRow.includes("# comment\nline two"), "a tool_result keeps its lines and its # line as text");
+
+// CAD-2387: the row wiring. EntryRow decides Markdown with rendersMarkdown, and
+// issue ids open through OpenWorkItem only when the board knows them.
+const projects = new Map([["CAD-2380", "cadence"]]);
+const entryHtml = (role: string, kind: string, text: string, open: ((id: string) => void) | null = () => undefined): string =>
+  renderToStaticMarkup(
+    createElement(OpenWorkItem.Provider, { value: open }, createElement(EntryRow, { entry: { seq: 1, role, kind, text }, issueProjects: projects })),
+  );
+const sysResult = entryHtml("system", "turn_result", "# heading\nCAD-2380 done");
+check(!sysResult.includes("<h1") && !sysResult.includes("answer-body") && sysResult.includes("# heading\nCAD-2380 done"), "EntryRow keeps a system turn_result plain");
+const agentTool = entryHtml("agent", "tool_result", "# heading\nCAD-2380 done");
+check(!agentTool.includes("<h1") && !agentTool.includes('class="lnk num"'), "EntryRow keeps an agent tool_result plain");
+const agentMsg = entryHtml("agent", "message", "see CAD-2380 and ZZZ-9");
+check(agentMsg.includes('<button class="lnk num">CAD-2380</button>'), "a known issue id in an agent message is a button");
+check(!agentMsg.includes("<button class=\"lnk num\">ZZZ-9") && agentMsg.includes('<span class="num">ZZZ-9</span>'), "an unknown id stays plain");
+const noOpener = entryHtml("agent", "message", "see CAD-2380", null);
+check(!noOpener.includes("<button"), "without an opener an id stays plain");
+const operatorMsg = entryHtml("operator", "message", "see CAD-2380");
+check(!operatorMsg.includes("answer-body") && !operatorMsg.includes("<button"), "an operator message is unchanged");
+const message = (kind: string, body: string) => ({
+  id: "m1", seq: 1, conversation: "c", sender: { uid: "u", alias: "bot", kind, removed: false }, origin: null, body,
+  state: "delivered", issue: null, task_id: null, created: 1, started: null, completed: null,
+});
+const rowHtml = (kind: string): string =>
+  renderToStaticMarkup(
+    createElement(OpenWorkItem.Provider, { value: () => undefined }, createElement(MessageRow, { message: message(kind, "see CAD-2380") as never, issueProjects: projects, writeBlock: null })),
+  );
+check(rowHtml("agent").includes('<button class="lnk num">CAD-2380</button>'), "MessageRow links a known id in an agent message");
+check(!rowHtml("operator").includes("<button"), "MessageRow leaves an operator message alone");
+const unknownRow = renderToStaticMarkup(
+  createElement(OpenWorkItem.Provider, { value: () => undefined }, createElement(MessageRow, { message: message("unknown", "**x** CAD-2380") as never, issueProjects: projects, writeBlock: null })),
+);
+check(!unknownRow.includes("<strong>") && !unknownRow.includes("<button"), "MessageRow keeps a non-agent sender's text plain");
