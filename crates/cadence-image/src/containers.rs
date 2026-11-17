@@ -482,6 +482,9 @@ pub(crate) fn webp(data: &[u8]) -> Result<Webp<'_>> {
     let mut exif = None;
     while at.checked_add(8).is_some_and(|n| n <= data.len()) {
         let kind = &data[at..at + 4];
+        if alpha && still.is_none() && kind != b"VP8 " {
+            return Err(ImageError::Invalid);
+        }
         let size = le32(data, at + 4)? as usize;
         let start = at + 8;
         let end = start.checked_add(size).ok_or(ImageError::Invalid)?;

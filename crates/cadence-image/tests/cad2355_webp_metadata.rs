@@ -116,3 +116,25 @@ fn conflicting_duplicate_webp_alpha_chunks_are_refused() {
         "conflicting duplicate ALPH chunks must be refused"
     );
 }
+
+#[test]
+fn webp_alpha_must_immediately_precede_vp8() {
+    let valid = include_bytes!("alpha-lossy.webp");
+    assert_eq!(&valid[30..34], b"ALPH");
+    assert_eq!(&valid[44..48], b"VP8 ");
+    assert!(
+        prepare(valid, Format::Webp).is_ok(),
+        "original image must be accepted"
+    );
+
+    let mut intervening = Vec::new();
+    chunk(&mut intervening, b"JUNK", b"harmless");
+    let mut ambiguous = valid.to_vec();
+    ambiguous.splice(44..44, intervening);
+    let riff_size = (ambiguous.len() - 8) as u32;
+    ambiguous[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    assert!(
+        prepare(&ambiguous, Format::Webp).is_err(),
+        "a chunk between ALPH and VP8 must be refused"
+    );
+}
