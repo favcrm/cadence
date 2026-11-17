@@ -163,6 +163,7 @@ pub(super) fn bearer(
     dir: &Path,
     deadline: Instant,
     note: &impl Fn(&str),
+    allow_login_fallback: bool,
 ) -> Result<Option<(Credential, Source)>> {
     if slot.declined() {
         return Ok(None);
@@ -178,7 +179,9 @@ pub(super) fn bearer(
             Ok(Some((*cred, Source::Minted)))
         }
         Minted::Keep(why) => {
-            slot.keep_login(note, why);
+            if allow_login_fallback {
+                slot.keep_login(note, why);
+            }
             Ok(None)
         }
     }

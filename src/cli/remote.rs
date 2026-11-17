@@ -3508,8 +3508,10 @@ where
                     if keyed_issue_create {
                         eprint_line(
                             "Issue creation was not confirmed. If the board supports retry IDs, \
-                             repeat the same command with the same --request-id and unchanged \
-                             arguments. Do not remove the ID after an unknown outcome.",
+                             repeat the same command with the same --request-id, unchanged \
+                             arguments, and the same user and acting agent or human identity. \
+                             If that identity is unavailable, inspect the board instead. \
+                             Do not remove the ID after an unknown outcome.",
                         );
                     } else {
                         eprint_line(

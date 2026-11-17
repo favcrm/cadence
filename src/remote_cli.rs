@@ -880,8 +880,21 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
         return false;
     }
     match verb {
-        // The server allocates the id, so a create is bound by the project and
-        // title. The tenant trims both; the native route preserves the title.
+        // A keyed tenant create is correlated by its immutable request receipt:
+        // the current issue's title and project may have changed since creation.
+        "issue_new" if arguments.contains_key("request_id") => {
+            object("card")
+                && card_id == issue_id
+                && arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .zip(reply.get("request_id").and_then(Value::as_str))
+                    .is_some_and(|(sent, got)| sent == got)
+        }
+        // Unkeyed creates have no receipt, so bind the allocated id to the
+        // project and title. The tenant trims both; the native route preserves
+        // the title.
         "issue_new" => {
             let project = arguments
                 .get("project")
@@ -6113,17 +6126,33 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let keyed_create = matches!(surface, Surface::Cli)
+        && verb == "issue_new"
+        && arguments.contains_key("request_id");
+    let identity_changed = || {
+        reject(
+            "retryable issue creation requires the same acting identity; this attempt was not \
+             run. If an earlier result is unknown, inspect the board before trying from a \
+             different agent or login",
+        )
+    };
+    if keyed_create && agent.is_some() && on_agent.is_none() {
+        return Err(identity_changed());
+    }
     let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
         let (agent_cred, from_cache) = match on_agent {
-            Some(slot) => match agent_credential::bearer(slot, target, dir, deadline, &note)? {
-                Some((credential, source)) => (
-                    Some(credential),
-                    matches!(source, agent_credential::Source::Cached),
-                ),
-                None => (None, false),
-            },
+            Some(slot) => {
+                match agent_credential::bearer(slot, target, dir, deadline, &note, !keyed_create)? {
+                    Some((credential, source)) => (
+                        Some(credential),
+                        matches!(source, agent_credential::Source::Cached),
+                    ),
+                    None if keyed_create => return Err(identity_changed()),
+                    None => (None, false),
+                }
+            }
             None => (None, false),
         };
         let using_agent = agent_cred.is_some();
@@ -6203,6 +6232,9 @@ fn call_verb_until_retry(
             _ => false,
         };
         if refused_agent {
+            if keyed_create {
+                return Err(identity_changed());
+            }
             if let Some(slot) = on_agent.take() {
                 slot.keep_login(&note, "this workspace has not been updated to accept it");
             }
