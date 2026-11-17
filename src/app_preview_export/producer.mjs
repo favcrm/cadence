@@ -243,6 +243,7 @@ var RECORD_CALL_VERBS = [
 	"works.trash",
 	"works.restore",
 	"works.request_review",
+	"calendar.query",
 	"catalog.call",
 	"catalog.status"
 ];

@@ -154,6 +154,33 @@ For a standalone source-backed draft, the receipt must still be attached to
 the context and the handle must remain a saved source. A run-backed draft
 instead proves the selected receipt and post against its own scoped run.
 
+### Dated items: `calendar.query`
+
+A `screen-records.v1` screen that declares `calendar.query` (with the
+`records.call` permission) can show the workspace's dated items without reading
+other apps' records. It is a read, so members and read-only mounts may call it.
+
+- Request `{from, to}`: `YYYY-MM-DD` days, half-open (`to` is not included),
+  `to` after `from`, at most 62 days. Anything else, and any other key, is
+  refused.
+- Reply exactly `{entries, zone, sources}`.
+  - `entry` is `{source, id, title, state, needs_you}` plus exactly one of
+    `starts_at` (an RFC 3339 UTC instant) or `date` (an all-day `YYYY-MM-DD`).
+    `source` is `post`, `crm`, `routine`, `task` or `holiday`.
+  - `sources` is `{source, ok}` for each source the host attempted. A source
+    that could not be read is `ok: false`; the others still return. A source
+    the host did not attempt is absent.
+  - `zone` is an IANA zone. The host returns UTC instants; the app places them
+    in `zone`. Until the workspace has a company zone, it is the first social
+    connection's zone, else `UTC`.
+- Sources today: `post` (scheduled social posts), `routine` (slots expanded
+  from the routine's schedule in its own zone, plus its runs), `task` (a
+  project milestone's `target_date` and a campaign work `due_at`, all-day on
+  that date only). `crm` and `holiday` are not served yet.
+- It carries titles, times and status only: never a customer list, message
+  text, caption or recipient. The consent page shows the host's own sentence
+  for an app that declares it; the bundle cannot reword it.
+
 ## 4. Local loop
 
 ```sh

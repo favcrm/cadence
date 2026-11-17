@@ -38,6 +38,7 @@ mod app_works_rpc;
 mod hosted_assignments;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
+mod app_calendar_query;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screen_services_rpc;
