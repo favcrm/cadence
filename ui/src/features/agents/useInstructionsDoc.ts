@@ -16,7 +16,7 @@ import {
   type DocOutcome,
 } from "./instructionsDoc";
 
-const liveDeps: DocDeps = {
+export const liveDeps: DocDeps = {
   readProfile: async (id) => (await api.agentProfile(id)).profile,
   writeProfile: async (id, body) => (await api.saveAgentProfile(id, body)).profile,
   readNative: async (alias) => (await api.agent(alias)).agent.instructions ?? null,
