@@ -7,7 +7,7 @@ import { setComposerDraft } from "../app-shell/chat/composerStore";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import type { ToastMsg } from "../../ui/Toast";
-import DrawerShell from "../app-shell/shared/DrawerShell";
+import DrawerShell, { type DrawerTab } from "../app-shell/shared/DrawerShell";
 import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile, WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
@@ -26,7 +26,27 @@ import {
 } from "./agentTabModel";
 import { agentLocation } from "./agentView";
 import RoutinesTab from "./RoutinesTab";
-import { assignedCount, isBuiltIn, libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames, usedByNote, type SkillDeps } from "./workspaceSkills";
+import Switch from "../../ui/Switch";
+import Toast from "../../ui/Toast";
+import { FilesPanel, InstructionsPanel, OverviewPanel, UsedByPanel } from "./SkillPanels";
+import { liveDeps as liveDocDeps } from "./useInstructionsDoc";
+import type { DocDeps } from "./instructionsDoc";
+import {
+  assignedCount,
+  isBuiltIn,
+  libraryAbsent,
+  liveSkillDeps,
+  otherRevision,
+  referenceFiles,
+  refusal,
+  setProfileSkill,
+  skillPills,
+  unapprovedNames,
+  usedByCounts,
+  usedByNote,
+  type ProfileSkillOutcome,
+  type SkillDeps,
+} from "./workspaceSkills";
 
 export interface TabContext {
   alias: string;
@@ -564,17 +584,25 @@ function Skills({ c }: { c: TabContext }) {
 
 type Library = { state: "reading" } | { state: "failed" } | { state: "absent" } | { state: "ready"; skills: WorkspaceSkillSummary[] };
 
-/** The status line of a library row, each part translated on its own. */
-function skillStatus(skill: WorkspaceSkillSummary, t: (english: string) => string): string {
-  return statusParts(skill)
-    .map((part) => t(part.text).replace("{n}", String(part.n)))
-    .join(" · ");
+/** A status pill, its English text translated and its revision filled in. */
+function SkillPills({ skill }: { skill: WorkspaceSkillSummary }) {
+  const t = useTranslate();
+  return (
+    <>
+      {skillPills(skill).map((pill) => (
+        <span key={pill.text} className={`chip ${pill.tone === "ok" ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>
+          {t(pill.text).replace("{n}", String(pill.n))}
+        </span>
+      ))}
+    </>
+  );
 }
 
 /**
  * CAD-2419: the workspace skill library on a hosted profile. Any member sees
  * it and which approved skills this profile lists; only the owner (`writable`)
  * assigns them and decides approvals. A board without the library hides it.
+ * CAD-2438: cards with a switch, and a tabbed panel per skill.
  */
 export function WorkspaceSkills({
   doc,
@@ -582,6 +610,7 @@ export function WorkspaceSkills({
   toast,
   absent = null,
   deps = liveSkillDeps,
+  profiles = liveDocDeps,
 }: {
   doc: InstructionsDoc;
   writable: boolean;
@@ -589,13 +618,18 @@ export function WorkspaceSkills({
   /** Shown instead when the board does not serve the library. */
   absent?: React.ReactNode;
   deps?: SkillDeps;
+  /** Reads and saves another agent's profile, for "Turn off for this agent". */
+  profiles?: Pick<DocDeps, "readProfile" | "writeProfile">;
 }) {
   const t = useTranslate();
   const [library, setLibrary] = useState<Library>({ state: "reading" });
   const [attempt, setAttempt] = useState(0);
+  // Bumped when who uses a skill changed, so an open panel reads it again.
+  const [tick, setTick] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [stale, setStale] = useState<"conflict" | "unconfirmed" | null>(null);
+  const [undo, setUndo] = useState<ToastMsg | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     let live = true;
@@ -608,6 +642,13 @@ export function WorkspaceSkills({
       live = false;
     };
   }, [deps, attempt]);
+  useEffect(() => {
+    if (undo === null) return;
+    const timer = window.setTimeout(() => setUndo(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [undo]);
+  // The Undo button runs a closure from the render that offered it: it reads the latest.
+  const latest = useRef<{ setFor: (skill: string, user: WorkspaceSkillUser, on: boolean) => Promise<ProfileSkillOutcome> } | null>(null);
   if (library.state === "absent") return <>{absent}</>;
   // A control that goes away when it is used hands focus to the section, not the page.
   const toHeading = () => setTimeout(() => heading.current?.focus(), 0);
@@ -619,6 +660,10 @@ export function WorkspaceSkills({
     setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.map((s) => (s.name === skill.name ? { ...skill, used_by: skill.used_by ?? s.used_by } : s)) } : now));
   const drop = (name: string) =>
     setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.filter((s) => s.name !== name) } : now));
+  const refresh = () => {
+    setAttempt((n) => n + 1);
+    setTick((n) => n + 1);
+  };
 
   const toggle = async (name: string, on: boolean) => {
     if (!assigned || saving !== null) return;
@@ -626,7 +671,8 @@ export function WorkspaceSkills({
     const out = await doc.saveSkills(on ? [...assigned, name] : assigned.filter((n) => n !== name));
     setSaving(null);
     if (out.kind === "saved") {
-      toast("ok", `${t(on ? "Assigned {name}." : "Unassigned {name}.").replace("{name}", () => name)} ${t("It applies when a session next loads this profile.")}`);
+      toast("ok", `${t(on ? "Turned on {name}." : "Turned off {name}.").replace("{name}", () => name)} ${t("It applies when a session next loads this profile.")}`);
+      refresh();
     } else if (out.kind === "conflict") {
       setStale("conflict");
       toast("warn", t("Someone else changed this agent, so nothing was saved. Reload to see the current skills."));
@@ -643,7 +689,50 @@ export function WorkspaceSkills({
     }
     setStale(null);
     doc.retry();
+    refresh();
     toHeading();
+  };
+
+  /** Turn `skill` off or on in one agent's profile: this page's own profile through
+   *  the page's revision, any other through a fresh read of it. Never overwrites. */
+  const setFor = async (skill: string, user: WorkspaceSkillUser, on: boolean): Promise<ProfileSkillOutcome> => {
+    if (user.profile_id !== doc.profile?.id) return setProfileSkill(profiles, user.profile_id, skill, on);
+    if (!assigned) return { kind: "refused", message: t("This agent’s assigned skills couldn’t be read.") };
+    if (assigned.includes(skill) === on) return { kind: "unchanged" };
+    const out = await doc.saveSkills(on ? [...assigned, skill] : assigned.filter((n) => n !== skill));
+    if (out.kind === "conflict") setStale("conflict");
+    else if (out.kind === "unconfirmed") setStale("unconfirmed");
+    if (out.kind === "busy") return { kind: "refused", message: t("Another save is still running. Try again in a moment.") };
+    return out.kind === "refused" ? out : { kind: out.kind as "saved" | "conflict" | "unconfirmed" };
+  };
+  latest.current = { setFor };
+  const turnOff = async (skill: string, user: WorkspaceSkillUser): Promise<ProfileSkillOutcome> => {
+    const out = await setFor(skill, user, false);
+    if (out.kind === "saved" || out.kind === "unchanged") {
+      refresh();
+      setUndo({
+        kind: out.kind === "saved" ? "ok" : "warn",
+        text: t(out.kind === "saved" ? "Turned off {skill} for {agent}." : "{agent} no longer lists {skill}.")
+          .replace("{skill}", () => skill)
+          .replace("{agent}", () => user.name),
+        action:
+          out.kind === "saved"
+            ? {
+                label: t("Undo"),
+                run: () => {
+                  setUndo(null);
+                  void latest.current?.setFor(skill, user, true).then((back) => {
+                    if (back.kind === "saved") {
+                      refresh();
+                      toast("ok", t("Turned {skill} back on for {agent}.").replace("{skill}", () => skill).replace("{agent}", () => user.name));
+                    } else toast("warn", t("Couldn’t undo. Open {agent}’s Skills tab to check.").replace("{agent}", () => user.name));
+                  });
+                },
+              }
+            : undefined,
+      });
+    }
+    return out;
   };
 
   const usedBy = (skill: WorkspaceSkillSummary) => {
@@ -660,7 +749,7 @@ export function WorkspaceSkills({
         </h3>
         {count && (
           <small className="num">
-            {t("{n} of {m} assigned").replace("{n}", String(count.assigned)).replace("{m}", String(count.approved))}
+            {t("{n} of {m} on").replace("{n}", String(count.assigned)).replace("{m}", String(count.approved))}
           </small>
         )}
       </div>
@@ -677,39 +766,50 @@ export function WorkspaceSkills({
       ) : skills.length === 0 ? (
         <Note>{t("No workspace skills yet. Agents draft them; an owner approves them.")}</Note>
       ) : (
-        <Rows>
+        <div className="sk-list">
           {skills.map((skill) => {
             const on = assigned?.includes(skill.name) ?? false;
+            const draft = !skill.approved;
             return (
-              <div key={skill.name} className="ap-skill">
-                <ManageRow
-                  id={`wskill-${skill.name}`}
-                  name={skill.name}
-                  line={[skill.description, skillStatus(skill, t), usedBy(skill)].filter(Boolean).join(" · ")}
-                  onOpen={() => setOpen(skill.name)}
-                />
-                {skill.approved && assigned !== null &&
-                  (canAssign ? (
-                    <label className="ap-skill-assign">
-                      <input
-                        type="checkbox"
-                        checked={on}
-                        // Not `disabled`: that would drop the focus while the save runs.
-                        aria-disabled={saving !== null}
-                        aria-label={`${t("Assigned")}: ${skill.name}`}
-                        onChange={(e) => void toggle(skill.name, e.target.checked)}
-                      />
-                      {t("Assigned")}
-                    </label>
-                  ) : (
-                    <small className="ap-skill-assign" data-assigned={on}>
-                      {t(on ? "Assigned" : "Not assigned")}
-                    </small>
-                  ))}
+              <div key={skill.name} className="sk-card">
+                <button type="button" className="sk-open" data-record-id={`wskill-${skill.name}`} onClick={() => setOpen(skill.name)}>
+                  <span className="sk-title">
+                    <b>{skill.name}</b>
+                    <SkillPills skill={skill} />
+                  </span>
+                  <span className="sk-desc">{skill.description}</span>
+                  {usedBy(skill) && <span className="sk-meta">{usedBy(skill)}</span>}
+                </button>
+                {assigned !== null && (
+                  <span className="sk-switch" data-state={on && !draft ? "on" : "off"}>
+                    {draft ? (
+                      writable ? (
+                        <>
+                          {t("Approve first")}
+                          <Switch checked={false} disabled label={`${t("On for this agent")}: ${skill.name}`} onToggle={() => {}} />
+                        </>
+                      ) : (
+                        t("Off")
+                      )
+                    ) : canAssign ? (
+                      <>
+                        {t(on ? "On" : "Off")}
+                        <Switch
+                          checked={on}
+                          pending={saving !== null}
+                          label={`${t("On for this agent")}: ${skill.name}`}
+                          onToggle={() => void toggle(skill.name, !on)}
+                        />
+                      </>
+                    ) : (
+                      t(on ? "On" : "Off")
+                    )}
+                  </span>
+                )}
               </div>
             );
           })}
-        </Rows>
+        </div>
       )}
       {stale && (
         <p className="rc-note" role="alert">
@@ -743,9 +843,14 @@ export function WorkspaceSkills({
           key={open}
           name={open}
           profileId={doc.profile?.id ?? null}
+          agentName={doc.profile?.name ?? t("this agent")}
           writable={writable}
           deps={deps}
           toast={toast}
+          tick={tick}
+          assign={{ on: assigned === null ? null : assigned.includes(open), canChange: canAssign, pending: saving !== null, toggle }}
+          turnOff={turnOff}
+          reloadFor={(user) => (user.profile_id === doc.profile?.id ? reload() : refresh())}
           onChanged={replace}
           onGone={(name) => {
             drop(name);
@@ -756,32 +861,25 @@ export function WorkspaceSkills({
           onClose={() => setOpen(null)}
         />
       )}
+      <Toast msg={undo} />
     </section>
   );
 }
 
-/** An agent's name in "Used by": a link to its Skills tab, unless it is this agent or archived. */
-function usedByAgent(user: WorkspaceSkillUser, profileId: string | null, t: (english: string) => string): React.ReactNode {
-  if (user.profile_id === profileId || user.status === "archived") return user.name;
-  return (
-    <Link className="lnk" href={`/agents/${encodeURIComponent(user.name)}?tab=skills`} aria-label={`${t("Skills")}: ${user.name}`}>
-      {user.name}
-    </Link>
-  );
-}
+type Confirming = "delete" | "revoke" | { turnOff: WorkspaceSkillUser } | null;
 
-function usedByMark(user: WorkspaceSkillUser, profileId: string | null, t: (english: string) => string): string | undefined {
-  const marks = [user.profile_id === profileId && t("this agent"), user.status === "archived" && t("archived")].filter(Boolean);
-  return marks.length ? marks.join(" · ") : undefined;
-}
-
-/** One library skill: what an agent would read, and the owner's decisions on it. */
+/** One library skill: what an agent would read, who uses it, and the owner's decisions on it. */
 function SkillDrawer({
   name,
   profileId,
+  agentName,
   writable,
   deps,
   toast,
+  tick,
+  assign,
+  turnOff,
+  reloadFor,
   onChanged,
   onGone,
   onClose,
@@ -789,9 +887,15 @@ function SkillDrawer({
   name: string;
   /** The profile whose Skills tab this is, so its own entry reads "this agent". */
   profileId: string | null;
+  agentName: string;
   writable: boolean;
   deps: SkillDeps;
   toast: TabContext["toast"];
+  /** Changes when who uses a skill did: read it again. */
+  tick: number;
+  assign: { on: boolean | null; canChange: boolean; pending: boolean; toggle: (name: string, on: boolean) => Promise<void> };
+  turnOff: (skill: string, user: WorkspaceSkillUser) => Promise<ProfileSkillOutcome>;
+  reloadFor: (user: WorkspaceSkillUser) => void;
   onChanged: (skill: WorkspaceSkillSummary) => void;
   onGone: (name: string) => void;
   onClose: () => void;
@@ -801,11 +905,13 @@ function SkillDrawer({
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<WorkspaceSkillRead | null | "failed">(null);
   const [busy, setBusy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [confirming, setConfirming] = useState<Confirming>(null);
+  const [tab, setTab] = useState("overview");
+  const [notice, setNotice] = useState<{ text: string; user: WorkspaceSkillUser } | null>(null);
   // Where focus goes once the next read lands: a decision swaps its button
   // (Approve for Revoke), and Retry or a revision switch replaces its own.
   const focusNext = useRef<"approve" | "revoke" | "top" | null>(null);
-  const top = useRef<HTMLDivElement>(null);
+  const focusTop = () => document.querySelector<HTMLElement>('[data-drawer="skill"] .crm-drawer-title')?.focus();
   useEffect(() => {
     let live = true;
     // The last answer stays on screen until the next one lands, so the
@@ -828,12 +934,13 @@ function SkillDrawer({
       live = false;
     };
     // Only what is asked starts a read; the callbacks are fresh each render.
-  }, [deps, name, shown, attempt]);
+  }, [deps, name, shown, attempt, tick]);
   useEffect(() => {
     const want = focusNext.current;
     if (want === null || read === null || read === "failed") return;
     focusNext.current = null;
-    (want === "top" ? top.current : (document.getElementById(`wskill-${want}`) ?? top.current))?.focus();
+    if (want === "top") focusTop();
+    else (document.getElementById(`wskill-${want}`) ?? document.querySelector<HTMLElement>('[data-drawer="skill"] .crm-drawer-title'))?.focus();
   }, [read]);
 
   const decide = async (
@@ -846,7 +953,7 @@ function SkillDrawer({
     setBusy(true);
     try {
       const skill = await job();
-      setConfirming(false);
+      setConfirming(null);
       toast("ok", t(done).replace("{name}", () => name).replace("{n}", String(n)));
       if (skill) {
         onChanged(skill);
@@ -855,7 +962,7 @@ function SkillDrawer({
       } else onGone(name);
     } catch (error) {
       const why = refusal(error);
-      setConfirming(false);
+      setConfirming(null);
       toast(why.unconfirmed ? "warn" : "err", t(why.text));
       if (why.code === "not_found") onGone(name);
       // The skill moved, or the answer was lost: show what the board holds now.
@@ -869,131 +976,164 @@ function SkillDrawer({
     }
   };
 
-  const body = () => {
-    if (read === null) return <Note>{t("Loading…")}</Note>;
-    if (read === "failed") {
-      return (
-        <Failed
-          text="This skill couldn’t be read."
-          onRetry={() => {
-            focusNext.current = "top";
-            setAttempt((n) => n + 1);
-          }}
-        />
-      );
-    }
-    const { skill, revision } = read;
-    const approved = skill.approved;
-    return (
-      <>
-        <p className="ap-drawer-lead">{revision.description}</p>
-        <Facts
-          items={[
-            ["Status", skillStatus(skill, t)],
-            ["Shown", `${t("Revision {n}").replace("{n}", String(revision.revision))}${read.approved ? ` · ${t("approved")}` : ""}`],
-            ["Latest revision", String(skill.latest_revision)],
-            ["Approved revision", approved ? `${approved.revision} · ${approved.digest.slice(0, 12)}` : t("None")],
-            ["Author", revision.author ?? t("Not recorded")],
-            ["Saved by", revision.created_by],
-          ]}
-        />
-        {(approved && approved.revision !== revision.revision) || revision.revision !== skill.latest_revision ? (
-          <div className="flex flex-wrap gap-2">
-            {approved && approved.revision !== revision.revision && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  focusNext.current = "top";
-                  setShown(approved.revision);
-                }}
-              >
-                {t("Show the approved revision")}
-              </Button>
-            )}
-            {revision.revision !== skill.latest_revision && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  focusNext.current = "top";
-                  setShown(undefined);
-                }}
-              >
-                {t("Show the latest revision")}
-              </Button>
-            )}
-          </div>
-        ) : null}
-        {/* No `disabled` while a decision runs: it would drop the focus. `decide` ignores a second click. */}
-        {writable && (
-          <div className="flex flex-wrap gap-2" aria-busy={busy}>
-            {!read.approved && (
-              <Button
-                size="sm"
-                variant="primary"
-                id="wskill-approve"
-                onClick={() =>
-                  void decide(() => deps.approve(name, revision.revision, revision.digest), "Approved revision {n} of {name}.", revision.revision, {
-                    done: "revoke",
-                    failed: "approve",
-                  })
-                }
-              >
-                {t("Approve revision {n}").replace("{n}", String(revision.revision))}
-              </Button>
-            )}
-            {approved && (
-              <Button
-                size="sm"
-                id="wskill-revoke"
-                onClick={() => void decide(() => deps.revoke(name, approved.digest), "Revoked {name}.", 0, { done: "approve", failed: "revoke" })}
-              >
-                {t("Revoke")}
-              </Button>
-            )}
-            {!approved && (
-              <Button size="sm" variant="danger" onClick={() => !busy && setConfirming(true)}>
-                {t("Delete")}
-              </Button>
-            )}
-          </div>
-        )}
-        {skill.used_by !== undefined && (
-          <div className="grid gap-1" data-work-panel="used-by">
-            <h4 className="slabel">{`${t("Used by")} · ${skill.used_by.length}`}</h4>
-            {skill.used_by.length === 0 ? (
-              <Note>{t("No agent lists this skill yet.")}</Note>
-            ) : (
-              <Rows>
-                {skill.used_by.map((user) => (
-                  <Row key={user.profile_id} left={usedByAgent(user, profileId, t)} right={usedByMark(user, profileId, t)} />
-                ))}
-              </Rows>
-            )}
-          </div>
-        )}
-        <h4 className="slabel">{t("Workspace guidance, shown as plain text")}</h4>
-        <Note>{t("An agent reads this as guidance from the workspace. Only an approved revision reaches an agent.")}</Note>
-        {skillFiles(revision.files).map(([path, text]) => (
-          <div key={path} className="grid gap-1">
-            <h4 className="slabel">{path === "SKILL.md" ? `${t("Instructions")} · ${path}` : path}</h4>
-            <pre className="ap-code">{text}</pre>
-          </div>
-        ))}
-      </>
-    );
+  const runTurnOff = async (user: WorkspaceSkillUser) => {
+    if (busy) return;
+    setBusy(true);
+    const out = await turnOff(name, user);
+    setBusy(false);
+    setConfirming(null);
+    if (out.kind === "saved" || out.kind === "unchanged") {
+      setNotice(null);
+      // The row that opened the menu is gone: focus lands on the tab, not the page.
+      setTimeout(() => document.getElementById("crm-tab-skill-used-by")?.focus(), 0);
+    } else if (out.kind === "conflict") {
+      setNotice({ text: t("Someone else changed {agent}’s profile, so nothing was saved.").replace("{agent}", () => user.name), user });
+    } else if (out.kind === "unconfirmed") {
+      setNotice({ text: t("Not confirmed: the connection dropped. Reload to see what the board holds."), user });
+    } else if (out.kind === "refused") toast("err", t(out.message));
   };
-  const latest = read !== null && read !== "failed" ? read.skill.latest_revision : null;
+
+  const ready = read !== null && read !== "failed" ? read : null;
+  const skill = ready?.skill;
+  const approved = skill?.approved ?? null;
+  const activeUsers = skill?.used_by ? usedByCounts(skill.used_by).active : null;
+  const other = ready && skill ? otherRevision(skill, ready.revision.revision) : null;
+
+  const tabs: DrawerTab[] = ready && skill
+    ? [
+        {
+          id: "overview",
+          label: t("Overview"),
+          panel: (
+            <OverviewPanel
+              read={ready}
+              profileId={profileId}
+              onSeeAll={() => {
+                setTab("used-by");
+                setTimeout(() => document.getElementById("crm-tab-skill-used-by")?.focus(), 0);
+              }}
+              assign={{
+                agentName,
+                draft: !approved,
+                on: assign.on,
+                canChange: assign.canChange && approved !== null,
+                pending: assign.pending,
+                onToggle: () => void assign.toggle(name, !(assign.on ?? false)),
+              }}
+            />
+          ),
+        },
+        { id: "instructions", label: t("Instructions"), panel: <InstructionsPanel read={ready} /> },
+        ...(skill.used_by !== undefined
+          ? [
+              {
+                id: "used-by",
+                label: `${t("Used by")} (${activeUsers})`,
+                panel: (
+                  <UsedByPanel
+                    users={skill.used_by}
+                    profileId={profileId}
+                    writable={writable}
+                    notice={notice ? { text: notice.text, reload: () => { const user = notice.user; setNotice(null); reloadFor(user); } } : null}
+                    onTurnOff={(user) => !busy && setConfirming({ turnOff: user })}
+                  />
+                ),
+              },
+            ]
+          : []),
+        { id: "files", label: `${t("Files")} (${referenceFiles(ready.revision.files).length})`, panel: <FilesPanel files={ready.revision.files} /> },
+      ]
+    : [];
+
+  const footer = ready && skill ? (
+    writable
+      ? {
+          secondary: (
+            <>
+              {!approved && (
+                <Button size="sm" variant="danger" onClick={() => !busy && setConfirming("delete")}>
+                  {t("Delete")}
+                </Button>
+              )}
+              {approved && (
+                <Button size="sm" id="wskill-revoke" onClick={() => !busy && setConfirming("revoke")}>
+                  {t("Revoke")}
+                </Button>
+              )}
+            </>
+          ),
+          primary: !ready.approved ? (
+            <Button
+              size="sm"
+              variant="primary"
+              id="wskill-approve"
+              onClick={() =>
+                void decide(() => deps.approve(name, ready.revision.revision, ready.revision.digest), "Approved revision {n} of {name}.", ready.revision.revision, {
+                  done: "revoke",
+                  failed: "approve",
+                })
+              }
+            >
+              {t("Approve revision {n}").replace("{n}", String(ready.revision.revision))}
+            </Button>
+          ) : undefined,
+          note: approved
+            ? t("Approved revision {n} is what agents read.").replace("{n}", String(approved.revision))
+            : t("Revision {n} isn’t approved yet.").replace("{n}", String(ready.revision.revision)),
+        }
+      : { note: t("Only the workspace owner can approve, revoke or delete skills.") }
+    ) : {};
+
   return (
     <>
-      <ItemDrawer title={name} onClose={onClose}>
-        <div ref={top} tabIndex={-1} className="ap-body focus:outline-none">
-          {body()}
-        </div>
-      </ItemDrawer>
+      <DrawerShell
+        kind="skill"
+        label={name}
+        title={name}
+        subtitle={ready?.revision.description}
+        pills={
+          skill ? (
+            <>
+              <SkillPills skill={skill} />
+              {other && (
+                <span className="sk-rev">
+                  {t(other.kind === "draft" ? "Showing approved revision" : "Showing draft revision")} ·{" "}
+                  <button
+                    type="button"
+                    className="lnk"
+                    onClick={() => {
+                      focusNext.current = "top";
+                      setShown(other.revision);
+                    }}
+                  >
+                    {t(other.kind === "draft" ? "see draft" : "see approved")}
+                  </button>
+                </span>
+              )}
+            </>
+          ) : undefined
+        }
+        tabs={tabs}
+        tab={tab}
+        onTab={setTab}
+        state={
+          read === null ? (
+            <Note>{t("Loading…")}</Note>
+          ) : read === "failed" ? (
+            <Failed
+              text="This skill couldn’t be read."
+              onRetry={() => {
+                focusNext.current = "top";
+                setAttempt((n) => n + 1);
+              }}
+            />
+          ) : undefined
+        }
+        {...footer}
+        onClose={onClose}
+      />
       {/* Outside the drawer: its transform would pin a fixed dialog inside it. */}
-      {confirming && latest !== null && (
+      {confirming === "delete" && ready && (
         <ConfirmDialog
           title={t("Delete {name}?").replace("{name}", () => name)}
           body={t("This removes the skill and every revision of it. It is not approved, so no agent reads it.")}
@@ -1002,11 +1142,42 @@ function SkillDrawer({
           error={null}
           onConfirm={() =>
             void decide(async () => {
-              await deps.remove(name, latest);
+              await deps.remove(name, ready.skill.latest_revision);
               return null;
             }, "Deleted {name}.", 0, { done: null, failed: null })
           }
-          onCancel={() => setConfirming(false)}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
+      {confirming === "revoke" && approved && (
+        <ConfirmDialog
+          title={t("Revoke {name}?").replace("{name}", () => name)}
+          body={
+            activeUsers === null
+              ? t("The approved revision is withdrawn. Every agent that lists this skill loses it at its next read. The skill and its revisions stay, so you can approve it again.")
+              : t(activeUsers === 1 ? "The approved revision is withdrawn. {n} active agent loses this skill at its next read. The skill and its revisions stay, so you can approve it again." : "The approved revision is withdrawn. {n} active agents lose this skill at their next read. The skill and its revisions stay, so you can approve it again.").replace("{n}", String(activeUsers))
+          }
+          confirmLabel={t("Revoke")}
+          pending={busy}
+          error={null}
+          onConfirm={() => void decide(() => deps.revoke(name, approved.digest), "Revoked {name}.", 0, { done: "approve", failed: "revoke" })}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
+      {typeof confirming === "object" && confirming !== null && (
+        <ConfirmDialog
+          title={t("Turn off {skill} for {agent}?").replace("{skill}", () => name).replace("{agent}", () => confirming.turnOff.name)}
+          body={
+            <>
+              <p>{t("{agent} stops seeing this skill in new work and can no longer read it. Other agents keep it.").replace("{agent}", () => confirming.turnOff.name)}</p>
+              <p>{t("This changes the agent’s profile, not the skill. You can turn it back on from the agent’s Skills tab.")}</p>
+            </>
+          }
+          confirmLabel={t("Turn off")}
+          pending={busy}
+          error={null}
+          onConfirm={() => void runTurnOff(confirming.turnOff)}
+          onCancel={() => setConfirming(null)}
         />
       )}
     </>

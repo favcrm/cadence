@@ -41,6 +41,61 @@
           "profile_id": "ap_qa_archivist",
           "name": "qa-archivist",
           "status": "archived"
+        },
+        {
+          "profile_id": "ap_qa_planner",
+          "name": "qa-planner",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_scout",
+          "name": "qa-scout",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_triage",
+          "name": "qa-triage",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_billing",
+          "name": "qa-billing",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_support",
+          "name": "qa-support",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_intake",
+          "name": "qa-intake",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_review",
+          "name": "qa-review",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_ops",
+          "name": "qa-ops",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_ledger",
+          "name": "qa-ledger",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_digest",
+          "name": "qa-digest",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_retired",
+          "name": "qa-retired",
+          "status": "archived"
         }
       ]
     },

@@ -1,6 +1,8 @@
 export interface ToastMsg {
   kind: "ok" | "warn" | "err";
   text: string;
+  /** A follow-up the message offers, such as Undo. */
+  action?: { label: string; run: () => void };
 }
 
 const KIND: Record<ToastMsg["kind"], string> = {
@@ -19,6 +21,11 @@ export default function Toast({ msg }: { msg: ToastMsg | null }) {
       className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-40 card px-4 py-2.5 num text-label shadow-2xl shadow-black/60 max-w-[80vw] ${KIND[msg.kind]}`}
     >
       {msg.text}
+      {msg.action && (
+        <button type="button" className="lnk ml-3" onClick={msg.action.run}>
+          {msg.action.label}
+        </button>
+      )}
     </div>
   );
 }

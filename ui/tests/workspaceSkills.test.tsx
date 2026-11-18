@@ -59,14 +59,37 @@ async function main() {
     revision: 4, created_at: 1, updated_at: 2, created_by: "owner", catalogue: null, model: "inherit",
   };
   const profileWrites: Record<string, unknown>[] = [];
+  // CAD-2438: another agent's profile, for "Turn off for this agent".
+  let copy: StoredAgentProfile = { ...stored, id: "ap_2", name: "copy-agent", skills: ["weekly-report", "tone-guide"], revision: 7 };
+  let theirWriteFails: (() => Error) | null = null;
+  let theirReadHook: (() => void) | null = null;
+  const keepUsedBy = (saved: StoredAgentProfile) => {
+    library = library.map((s) =>
+      s.used_by === undefined ? s : { ...s, used_by: [...s.used_by.filter((u) => u.profile_id !== saved.id), ...(saved.skills.includes(s.name) ? [{ profile_id: saved.id, name: saved.name, status: saved.status }] : [])] },
+    );
+  };
   const docDeps: DocDeps = {
-    readProfile: async () => stored,
-    writeProfile: async (_id, body) => {
-      profileWrites.push(body as Record<string, unknown>);
+    readProfile: async (id) => {
+      if (id === "ap_2") {
+        theirReadHook?.();
+        return copy;
+      }
+      return stored;
+    },
+    writeProfile: async (id, body) => {
+      profileWrites.push({ ...(body as Record<string, unknown>), id });
       if (holdWrite) await holdWrite;
       const b = body as { expectedRevision: number; skills: string[] };
+      if (id === "ap_2") {
+        if (theirWriteFails) throw theirWriteFails();
+        if (b.expectedRevision !== copy.revision) throw new ApiError("Reload the agent profile.", 409, { code: "revision_conflict" });
+        copy = { ...copy, skills: b.skills, revision: copy.revision + 1 };
+        keepUsedBy(copy);
+        return copy;
+      }
       if (b.expectedRevision !== stored.revision) throw new ApiError("Reload the agent profile.", 409, { code: "revision_conflict" });
       stored = { ...stored, skills: b.skills, revision: stored.revision + 1 };
+      keepUsedBy(stored);
       return stored;
     },
     readNative: async () => null,
@@ -85,7 +108,11 @@ async function main() {
       { profile_id: "ap_1", name: "ads-agent", status: "active" },
       { profile_id: "ap_2", name: "copy-agent", status: "active" },
       { profile_id: "ap_3", name: "old-agent", status: "archived" },
+      ...["f", "e", "d", "c", "b", "a"].map((x) => ({ profile_id: `ap_x${x}`, name: `agent-${x}`, status: "active" as const })),
     ];
+    copy = { ...copy, skills: ["weekly-report", "tone-guide"], revision: 7 };
+    theirWriteFails = null;
+    theirReadHook = null;
     library[1]!.used_by = [{ profile_id: "ap_2", name: "copy-agent", status: "active" }];
   };
   reset();
@@ -143,7 +170,7 @@ async function main() {
       NavigationProvider,
       {
         adapter: { navigate: () => {}, href: (h: string) => h, modifiedClicks: "browser" },
-        children: React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps }),
+        children: React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps, profiles: docDeps }),
       },
     );
   }
@@ -162,18 +189,30 @@ async function main() {
   const button = (label: string) => [...document.body.querySelectorAll("button")].find((b) => b.textContent === label) as HTMLButtonElement | undefined;
   const click = async (el: Element | undefined | null, why: string) => {
     assert(el, why);
+    // A real click focuses what it presses; a dialog's opener is whatever has focus.
+    (el as HTMLElement).focus();
     await React.act(async () => { (el as HTMLElement).click(); });
     await flush();
   };
   const focusedId = (): string => document.activeElement?.id ?? "";
   const row = (name: string) => host.querySelector(`[data-record-id="wskill-${name}"]`);
-  const toggle = (name: string) => host.querySelector<HTMLInputElement>(`input[aria-label="Assigned: ${name}"]`);
+  const toggle = (name: string) => host.querySelector<HTMLButtonElement>(`button[role=switch][aria-label="On for this agent: ${name}"]`);
+  const switches = () => host.querySelectorAll("button[role=switch]");
+  const drawer = () => document.body.querySelector("[data-drawer=skill]");
+  const tabButton = (label: RegExp) => [...document.body.querySelectorAll<HTMLButtonElement>("[role=tab]")].find((b) => label.test(b.textContent ?? ""));
   const closeDrawer = async () => {
     await React.act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
     // The drawer finishes closing on its transition, or 320 ms without one.
     await React.act(async () => { await new Promise((r) => setTimeout(r, 360)); });
-    assert(!document.body.querySelector(".ap-body pre"), "the drawer closed");
+    assert(!drawer(), "the drawer closed");
   };
+  const key = async (el: Element | null | undefined, k: string) => {
+    assert(el, `an element to press ${k} on`);
+    await React.act(async () => { el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true })); });
+    await flush();
+  };
+  const dialog = () => document.body.querySelector<HTMLElement>(".s-confirm[role=dialog]");
+  const dialogButton = (label: string) => [...(dialog()?.querySelectorAll("button") ?? [])].find((b) => b.textContent === label) as HTMLButtonElement | undefined;
 
   // A board that predates the library: the section is not shown at all.
   for (const status of [404, 501]) {
@@ -238,28 +277,100 @@ async function main() {
   const counted = W.assignedCount(["weekly-report", "copywriting", "pricing-check"], library);
   assert(counted.assigned === 1 && counted.approved === 2, "N counts approved assigned skills, M approved ones in the workspace");
 
+  // ---- CAD-2438: pure helpers ----
+  const pills = (x: WorkspaceSkillSummary) => W.skillPills(x).map((p) => `${p.text.replace("{n}", String(p.n))}/${p.tone}`);
+  assert(JSON.stringify(pills(summary("x", 3, 3))) === JSON.stringify(["Approved · rev 3/ok"]), "an approved skill has one pill");
+  assert(JSON.stringify(pills(summary("x", 4, 3))) === JSON.stringify(["Approved · rev 3/ok", "Draft rev 4 waiting/warn"]), "an approved skill with a newer draft has two");
+  assert(JSON.stringify(pills(summary("x", 2, null))) === JSON.stringify(["Draft · rev 2/warn"]), "a draft-only skill has one");
+  assert(W.otherRevision(summary("x", 3, 3), 3) === null && W.otherRevision(summary("x", 2, null), 2) === null, "no other revision when approved is latest or nothing is approved");
+  assert(W.otherRevision(summary("x", 4, 3), 4)?.kind === "approved" && W.otherRevision(summary("x", 4, 3), 4)?.revision === 3, "showing the draft points to the approved revision");
+  assert(W.otherRevision(summary("x", 4, 3), 3)?.kind === "draft" && W.otherRevision(summary("x", 4, 3), 3)?.revision === 4, "showing the approved points to the draft");
+  const crowd = [
+    { profile_id: "p9", name: "zed", status: "active" }, { profile_id: "p1", name: "Bob", status: "active" }, { profile_id: "p2", name: "amy", status: "active" },
+    { profile_id: "p3", name: "old", status: "archived" }, { profile_id: "me", name: "mmm", status: "active" }, { profile_id: "p4", name: "cat", status: "active" },
+    { profile_id: "p5", name: "dog", status: "active" }, { profile_id: "p6", name: "eel", status: "active" },
+  ] as const;
+  const crowdUsers = crowd.map((u) => ({ ...u })) as Parameters<typeof W.filterUsedBy>[0];
+  const names = (users: { name: string }[]) => users.map((u) => u.name).join(",");
+  assert(JSON.stringify(W.usedByCounts(crowdUsers)) === JSON.stringify({ active: 7, archived: 1, total: 8 }), "counts split active and archived");
+  assert(names(W.filterUsedBy(crowdUsers, { query: "", filter: "active", profileId: "me" })) === "mmm,amy,Bob,cat,dog,eel,zed", "active: this agent first, the rest by name");
+  assert(names(W.filterUsedBy(crowdUsers, { query: "", filter: "archived", profileId: "me" })) === "old", "archived shows only archived");
+  assert(W.filterUsedBy(crowdUsers, { query: "", filter: "all", profileId: "me" }).length === 8, "all shows everyone");
+  assert(names(W.filterUsedBy(crowdUsers, { query: " B", filter: "all", profileId: null })) === "Bob", "search ignores case and surrounding space");
+  assert(W.filterUsedBy(crowdUsers, { query: "nobody", filter: "all", profileId: null }).length === 0, "no match is empty");
+  const summ = W.usedBySummary(crowdUsers, "me");
+  assert(summ.shown.length === 5 && summ.shown[0]!.name === "mmm" && summ.more === 2, "the summary shows five active agents, this one first, and how many more");
+  assert(W.usedBySummary([], null).more === 0, "no users, nothing more");
+  assert(W.stripFrontmatter("---\nname: x\n---\n\n# Title\n") === "# Title\n", "frontmatter and its blank line are dropped");
+  assert(W.stripFrontmatter("---\r\nname: x\r\n---\r\nBody") === "Body", "CRLF frontmatter is dropped");
+  assert(W.stripFrontmatter("---\n---\nBody") === "Body", "empty frontmatter is dropped");
+  assert(W.stripFrontmatter("# No front\n---\nrule") === "# No front\n---\nrule" && W.stripFrontmatter("---\nunclosed\n# x") === "---\nunclosed\n# x", "text without a closed opening block is kept");
+  assert(JSON.stringify(W.referenceFiles({ "z.md": "", "SKILL.md": "", "a.md": "" }).map(([p]) => p)) === JSON.stringify(["a.md", "z.md"]), "reference files leave SKILL.md out");
+  const fakeProfile = (skills: string[], revision = 2) => ({ ...stored, id: "ap_9", skills, revision });
+  let wrote: { skills: string[]; expectedRevision: number } | null = null;
+  const offOk = await W.setProfileSkill({ readProfile: async () => fakeProfile(["a", "b"]), writeProfile: async (_i, b) => { wrote = b as never; return fakeProfile([]); } }, "ap_9", "a", false);
+  assert(offOk.kind === "saved" && JSON.stringify(wrote) === JSON.stringify({ name: stored.name, role: stored.role, responsibilities: stored.responsibilities, skills: ["b"], status: "active", expectedRevision: 2 }), "turn off saves the other skills at the revision read");
+  wrote = null;
+  const same = await W.setProfileSkill({ readProfile: async () => fakeProfile(["b"]), writeProfile: async () => { throw new Error("must not write"); } }, "ap_9", "a", false);
+  assert(same.kind === "unchanged", "a profile that no longer lists the skill is left alone");
+  const stale = await W.setProfileSkill({ readProfile: async () => fakeProfile(["a"]), writeProfile: async () => { throw new ApiError("Reload.", 409, { code: "revision_conflict" }); } }, "ap_9", "a", false);
+  assert(stale.kind === "conflict", "a stale revision is a conflict, not retried");
+  let writes = 0;
+  const lost = await W.setProfileSkill({ readProfile: async () => fakeProfile(["a"], 5), writeProfile: async () => { writes += 1; throw new ApiError("down", 503); } }, "ap_9", "a", false);
+  assert(lost.kind === "unconfirmed" && writes === 1, "a dropped answer is unconfirmed");
+  let reads = 0;
+  const landed = await W.setProfileSkill({ readProfile: async () => (reads++ === 0 ? fakeProfile(["a"], 5) : fakeProfile([], 6)), writeProfile: async () => { throw new ApiError("down", 503); } }, "ap_9", "a", false);
+  assert(landed.kind === "saved", "a re-read showing exactly this change confirms a dropped answer");
+  const refused = await W.setProfileSkill({ readProfile: async () => fakeProfile(["a"]), writeProfile: async () => { throw new ApiError("Owners only.", 403); } }, "ap_9", "a", false);
+  assert(refused.kind === "refused" && refused.message === "Owners only.", "a refusal carries the board's words");
+
   // ---- member: everything visible, nothing changeable ----
   await mount(false);
-  assert(/1 of 2 assigned/.test(host.querySelector("h3")?.parentElement?.textContent ?? ""), "the header counts assigned of approved");
-  assert(/Used by 3 agents/.test(row("weekly-report")?.textContent ?? "") && /Used by 1 agent(?!s)/.test(row("tone-guide")?.textContent ?? ""), "rows say how many agents use them");
+  assert(/1 of 2 on/.test(host.querySelector("h3")?.parentElement?.textContent ?? ""), "the header counts skills that are on, of approved");
+  assert(/Used by 9 agents/.test(row("weekly-report")?.textContent ?? "") && /Used by 1 agent(?!s)/.test(row("tone-guide")?.textContent ?? ""), "rows say how many agents use them");
   assert(!/Used by/.test(row("pricing-check")?.textContent ?? ""), "a skill without used_by has no note");
   await click(row("weekly-report"), "the weekly-report row");
+  assert(drawer()?.getAttribute("aria-label") === "weekly-report" && /Approved · rev 1/.test(drawer()?.querySelector(".crm-drawer-pills")?.textContent ?? ""), "the panel's header names the skill and its status");
+  assert(["Overview", "Instructions", "Used by (8)", "Files (2)"].every((label, i) => document.body.querySelectorAll("[role=tab]")[i]?.textContent === label), "the panel has four tabs with counts");
+  const summaryBox = document.body.querySelector("[data-work-panel=used-by-summary]");
+  assert(/Used by · 8 active/.test(summaryBox?.textContent ?? "") && /and 3 more/.test(summaryBox?.textContent ?? "") && /See all 9/.test(summaryBox?.textContent ?? ""), "the Overview shows five names, how many more and See all");
+  assert(!document.body.querySelector("[role=switch]") && /Details/.test(all()) && /Approved revision1 · weekly-repor/.test(all()) && /Approved byusr_owner/.test(all()), "a member has On/Off text and sees the details");
+  assert(/Only the workspace owner can approve, revoke or delete skills\./.test(drawer()?.querySelector("footer")?.textContent ?? "") && !drawer()?.querySelector("footer button"), "a member's footer says who can act and has no buttons");
+  await click(button("See all 9"), "See all");
+  assert(tabButton(/Used by/)?.getAttribute("aria-selected") === "true", "See all opens the Used by tab");
   const usedBy = document.body.querySelector("[data-work-panel=used-by]");
-  assert(/Used by · 3/.test(usedBy?.textContent ?? ""), "the drawer counts who uses the skill");
+  assert(/8 active, 1 archived/.test(usedBy?.textContent ?? ""), "the tab counts active and archived");
+  assert([...usedBy!.querySelectorAll(".sk-user-name")].map((n) => n.textContent).join(",") === "ads-agent,agent-a,agent-b,agent-c,agent-d,agent-e,agent-f,copy-agent", "this agent is pinned first, the rest by name, archived hidden");
   assert(/ads-agentthis agent/.test(usedBy?.textContent ?? "") && !usedBy?.querySelector("a[href*=ads-agent]"), "this agent is marked, not linked");
   assert(usedBy?.querySelector("a[href='/agents/copy-agent?tab=skills']"), "another agent links to its Skills tab");
-  assert(/old-agentarchived/.test(usedBy?.textContent ?? "") && !usedBy?.querySelector("a[href*=old-agent]"), "an archived agent is noted, not linked");
-  assert(!button("Approve revision 1") && !button("Revoke") && !button("Delete"), "a member sees used_by with no owner action");
-  assert(usedBy!.compareDocumentPosition(document.body.querySelector("pre.ap-code")!) & 4, "Used by comes before the file contents");
+  assert(!usedBy?.querySelector("[aria-haspopup=menu]"), "a member has no row menus");
+  const search = usedBy!.querySelector<HTMLInputElement>("input[type=search]")!;
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(search, "AGENT-C");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert([...document.body.querySelectorAll(".sk-user-name")].map((n) => n.textContent).join(",") === "agent-c", "search narrows the list");
+  await click(button("Archived"), "the Archived filter");
+  assert(/No agent matches\./.test(document.body.textContent ?? ""), "search plus filter can match nothing");
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(search, "");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert(/old-agentarchived/.test(document.body.querySelector("[data-work-panel=used-by]")?.textContent ?? "") && !document.body.querySelector("[data-work-panel=used-by] a[href*=old-agent]"), "an archived agent is noted, not linked");
+  await click(button("All"), "the All filter");
+  assert(document.body.querySelectorAll(".sk-user").length === 9, "All lists archived agents too");
+  // The panel's tabs move with the arrow keys.
+  await key(tabButton(/Used by/), "ArrowRight");
+  assert(tabButton(/Files/)?.getAttribute("aria-selected") === "true" && document.activeElement === tabButton(/Files/), "ArrowRight moves to the next tab and focuses it");
   await closeDrawer();
   await click(row("pricing-check"), "the pricing-check row, no used_by");
-  assert(!document.body.querySelector("[data-work-panel=used-by]"), "the section is hidden when the board omits used_by");
+  assert(!document.body.querySelector("[data-work-panel=used-by]") && !tabButton(/Used by/) && !document.body.querySelector("[data-work-panel=used-by-summary]"), "Used by is hidden everywhere when the board omits used_by");
   await closeDrawer();
   // An empty list is said, not hidden.
   library = library.map((s) => (s.name === "tone-guide" ? { ...s, used_by: [] } : s));
   await mount(false);
   await click(row("tone-guide"), "the tone-guide row, empty used_by");
-  assert(/Used by · 0/.test(document.body.textContent ?? "") && /No agent lists this skill yet/.test(document.body.textContent ?? ""), "an empty used_by says so");
+  assert(/Used by · 0 active/.test(document.body.textContent ?? "") && /No agent lists this skill yet/.test(document.body.textContent ?? ""), "an empty used_by says so");
   await closeDrawer();
   reset();
   // A bundled name on the profile reads Built-in; an unknown one keeps its words.
@@ -267,29 +378,44 @@ async function main() {
   stored = { ...stored, skills: [...stored.skills, "cadence"] };
   await mount(false);
   assert(/cadence\s*Built-in/.test(all()) && /copywriting\s*Not approved in this workspace/.test(all()), "a bundled name is Built-in, an unknown one is not approved");
-  assert(/1 of 2 assigned/.test(all()), "a built-in name does not count as an assigned workspace skill");
+  assert(/1 of 2 on/.test(all()), "a built-in name does not count as an assigned workspace skill");
   stored = keep;
   await mount(false);
-  assert(/Approved rev 1/.test(row("weekly-report")?.textContent ?? ""), "an approved skill says so");
-  assert(/Approved rev 1 · Draft rev 2 awaiting approval/.test(row("tone-guide")?.textContent ?? ""), "a newer draft of an approved skill says both");
-  assert(/Draft rev 1 awaiting approval/.test(row("pricing-check")?.textContent ?? ""), "a draft says it awaits approval");
-  assert(host.querySelectorAll("input[type=checkbox]").length === 0, "a member gets no toggles");
-  assert(/Assigned/.test(host.querySelector(".ap-skill-assign")?.textContent ?? ""), "a member sees the assignment read-only");
+  assert(/Approved · rev 1/.test(row("weekly-report")?.textContent ?? ""), "an approved skill says so");
+  assert(/Approved · rev 1Draft rev 2 waiting/.test(row("tone-guide")?.textContent ?? ""), "a newer draft of an approved skill says both");
+  assert(/Draft · rev 1/.test(row("pricing-check")?.textContent ?? ""), "a draft says so");
+  assert(row("weekly-report")?.textContent?.includes("Synthetic weekly-report guidance."), "a card carries the description");
+  assert(switches().length === 0, "a member gets no switches");
+  const states = [...host.querySelectorAll(".sk-switch")].map((n) => n.textContent);
+  assert(JSON.stringify(states) === JSON.stringify(["On", "Off", "Off"]), `a member sees On and Off as text: ${states}`);
   assert(/copywriting\s*Not approved in this workspace/.test(all()), "a listed name with no approved skill is named as such");
   await click(row("pricing-check"), "the pricing-check row");
   assert(!button("Approve revision 1") && !button("Delete") && !button("Revoke"), "a member's drawer has no owner actions");
-  assert(/Workspace guidance, shown as plain text/.test(all()), "the files are framed as workspace guidance");
-  const pre = [...document.body.querySelectorAll("pre.ap-code")];
-  assert(pre.length === 3 && /SKILL\.md/.test(pre[0]!.previousElementSibling?.textContent ?? ""), "SKILL.md comes first, then the other files");
-  assert(pre[0]!.textContent!.includes(HOSTILE) && !document.body.querySelector(".ap-body img") && !document.body.querySelector(".ap-body strong"), "skill text renders as plain text, never HTML or Markdown");
-  assert(/Authoragent:ads-agent/.test(all()) && /Saved byusr_member/.test(all()), "the drawer names the author and who saved it");
+  assert(/Authoragent:ads-agent/.test(all()), "the Overview names the author");
+  await click(tabButton(/Instructions/), "the Instructions tab");
+  assert(/Workspace guidance/.test(all()) && /SKILL\.md/.test(all()), "the file is framed as workspace guidance");
+  const preview = document.body.querySelector("[data-view=preview]");
+  assert(preview && !document.body.querySelector("[data-view=source]"), "Preview shows alone");
+  assert(!/description: x/.test(preview!.textContent ?? "") && !(preview!.textContent ?? "").startsWith("---"), "the frontmatter is not in Preview");
+  assert(!document.body.querySelector(".crm-drawer-body img") && !document.body.querySelector(".crm-drawer-body [onerror]") && preview!.querySelector("strong")?.textContent === "not bold", "Preview renders Markdown, never HTML");
+  await click(button("Source"), "Source");
+  assert(!document.body.querySelector("[data-view=preview]") && document.body.querySelector("[data-view=source]")?.textContent === `---\ndescription: x\n---\n${HOSTILE}`, "Source replaces Preview and is the exact text");
+  assert(button("Source")?.getAttribute("aria-pressed") === "true" && button("Preview")?.getAttribute("aria-pressed") === "false", "the segment says which is shown");
+  await click(button("Preview"), "Preview");
+  assert(document.body.querySelector("[data-view=preview]") && !document.body.querySelector("[data-view=source]"), "Preview replaces Source");
+  await click(tabButton(/Files/), "the Files tab");
+  const cards = [...document.body.querySelectorAll("details.sk-file-card")];
+  assert(cards.length === 2 && /references\/b\.md/.test(cards[0]!.textContent ?? "") && /skill\.json/.test(cards[1]!.textContent ?? ""), "Files lists each reference, then skill.json");
+  assert(/Reference text/.test(cards[0]!.textContent ?? "") && cards[1]!.querySelector("pre") && /generated/.test(cards[1]!.textContent ?? ""), "a reference is rendered, skill.json is plain");
   await closeDrawer();
 
   // ---- owner: the toggle saves the profile's skills at its revision ----
   await mount(true);
   const before = stored.revision;
-  assert(toggle("weekly-report")?.checked === true && toggle("tone-guide")?.checked === false, "the toggles show the profile's assignments");
-  assert(!toggle("pricing-check"), "a draft has no toggle");
+  const checked = (name: string) => toggle(name)?.getAttribute("aria-checked");
+  assert(checked("weekly-report") === "true" && checked("tone-guide") === "false", "the switches show the profile's assignments");
+  assert(toggle("pricing-check")?.disabled === true && /Approve first/.test(row("pricing-check")?.parentElement?.textContent ?? ""), "a draft has a disabled switch and says why");
+  assert(/On/.test(row("weekly-report")?.parentElement?.querySelector(".sk-switch")?.textContent ?? ""), "a row says On beside its switch");
   let release = () => {};
   holdWrite = new Promise<void>((resolve) => { release = resolve; });
   const box = toggle("tone-guide")!;
@@ -303,7 +429,7 @@ async function main() {
   const assign = profileWrites[profileWrites.length - 1] as { skills: string[]; expectedRevision: number; responsibilities: string };
   assert(JSON.stringify(assign.skills) === JSON.stringify(["weekly-report", "copywriting", "tone-guide"]), "assigning appends the skill");
   assert(assign.expectedRevision === before && assign.responsibilities === "# Ads", "it saves at the page's revision, keeping the stored text");
-  assert(toggle("tone-guide")?.checked === true && /Assigned tone-guide\./.test(lastToast()), "the toggle shows the saved state");
+  assert(checked("tone-guide") === "true" && /Turned on tone-guide\./.test(lastToast()), "the switch shows the saved state");
   await click(toggle("weekly-report"), "the weekly-report toggle");
   const unassign = profileWrites[profileWrites.length - 1] as { skills: string[]; expectedRevision: number };
   assert(unassign.expectedRevision === before + 1 && !unassign.skills.includes("weekly-report"), "the next save uses the advanced revision");
@@ -314,10 +440,10 @@ async function main() {
   await click(toggle("tone-guide"), "the tone-guide toggle again");
   assert(profileWrites.length === writesBefore + 1, "a stale revision is written once and not retried");
   assert(/Someone else changed this agent’s profile\./.test(all()) && button("Reload"), "a stale revision asks for a reload");
-  assert(host.querySelectorAll("input[type=checkbox]").length === 0, "toggles wait for the reload");
+  assert([...switches()].every((b) => (b as HTMLButtonElement).disabled), "switches wait for the reload");
   await click(button("Reload"), "the Reload button");
   assert(document.activeElement?.textContent === "Workspace skills", "Reload hands focus to the section");
-  assert(toggle("tone-guide")?.checked === false && toggle("weekly-report")?.checked === false, "the reload shows the board's assignments");
+  assert(checked("tone-guide") === "false" && checked("weekly-report") === "false", "the reload shows the board's assignments");
 
   // ---- owner decisions ----
   await click(row("pricing-check"), "the pricing-check row");
@@ -326,12 +452,19 @@ async function main() {
   assert(/Approved revision 1 of pricing-check\./.test(lastToast()) && !button("Delete") && button("Revoke"), "an approved skill offers Revoke, not Delete");
   assert(focusedId() === "wskill-revoke", "focus moves from Approve to the Revoke that replaced it");
   await click(button("Revoke"), "Revoke on pricing-check");
+  assert(dialog() && /Revoke pricing-check\?/.test(dialog()!.textContent ?? "") && /Every agent that lists this skill loses it/.test(dialog()!.textContent ?? ""), "Revoke asks first, and without a used_by says every agent");
+  assert(calls[calls.length - 1]![0] !== "revoke", "nothing is revoked before the confirm");
+  await click(dialogButton("Revoke"), "the confirm Revoke button");
+  assert(calls[calls.length - 1]![0] === "revoke" && !dialog(), "the confirm revokes and closes");
   assert(focusedId() === "wskill-approve", "focus moves from Revoke to the Approve that replaced it");
   await closeDrawer();
 
   // A draft newer than the approval: Approve names and sends that revision.
   await click(row("tone-guide"), "the tone-guide row");
-  assert(button("Show the approved revision") && button("Revoke") && !button("Delete"), "an approved skill cannot be deleted from the drawer");
+  assert(/Showing draft revision/.test(drawer()?.querySelector(".crm-drawer-pills")?.textContent ?? "") && button("see approved") && button("Revoke") && !button("Delete"), "a newer draft is flagged in the header and an approved skill cannot be deleted from the drawer");
+  await click(button("see approved"), "see approved");
+  assert(/Showing approved revision/.test(drawer()?.querySelector(".crm-drawer-pills")?.textContent ?? "") && button("see draft") && !button("Approve revision 1"), "the approved revision shows with a way back to the draft");
+  await click(button("see draft"), "see draft");
   decisionFails = () => new ApiError("Reload the skill and review it again.", 409, { code: "digest_mismatch" });
   await click(button("Approve revision 2"), "Approve on the newer draft");
   assert(JSON.stringify(calls[calls.length - 1]) === JSON.stringify(["approve", "tone-guide", 2, "tone-guide-d2"]), "the newer revision's digest is sent");
@@ -341,7 +474,8 @@ async function main() {
   assert(/as many approved skills as it can hold\. Revoke one first\./.test(lastToast()), "approved_limit reads plainly");
   decisionFails = () => new ApiError("Only owners decide workspace skills.", 403, { code: "owner_required" });
   await click(button("Revoke"), "Revoke");
-  assert(/Only a workspace owner can decide workspace skills\./.test(lastToast()), "owner_required reads plainly");
+  await click(dialogButton("Revoke"), "the confirm Revoke button");
+  assert(/Only a workspace owner can decide workspace skills\./.test(lastToast()) && !dialog(), "owner_required reads plainly");
   decisionFails = null;
   await closeDrawer();
 
@@ -350,7 +484,7 @@ async function main() {
   await mount(true);
   await click(row("draft-only"), "the draft-only row");
   await click(button("Delete"), "Delete on a draft");
-  assert(document.body.querySelector(".s-confirm[role=dialog]") && calls[calls.length - 1]![0] !== "delete", "Delete asks before anything is sent");
+  assert(dialog() && calls[calls.length - 1]![0] !== "delete", "Delete asks before anything is sent");
   decisionFails = () => new ApiError("Revoke the skill before deleting it.", 409, { code: "approved_skill" });
   const confirm = [...document.body.querySelectorAll(".s-confirm button")].find((b) => b.textContent === "Delete");
   await click(confirm, "the confirm Delete button");
@@ -361,6 +495,102 @@ async function main() {
   await click([...document.body.querySelectorAll(".s-confirm button")].find((b) => b.textContent === "Delete"), "confirm again");
   assert(!row("draft-only") && /Deleted draft-only\./.test(lastToast()), "a deleted skill leaves the list");
   assert(document.activeElement?.textContent === "Workspace skills", "focus lands on the section, not the page");
+
+  // ---- CAD-2438: the panel's own switch, Revoke's count, and Turn off for one agent ----
+  reset();
+  stored = { ...stored, skills: ["weekly-report"], revision: 20 };
+  await mount(true);
+  await click(row("pricing-check"), "the pricing-check row");
+  assert(/Approve first/.test(drawer()?.textContent ?? "") && !drawer()?.querySelector("[role=switch]"), "a draft's panel says Approve first and has no switch");
+  await closeDrawer();
+  await click(row("weekly-report"), "the weekly-report row");
+  const panelSwitch = () => drawer()?.querySelector<HTMLButtonElement>("button[role=switch]");
+  assert(panelSwitch()?.getAttribute("aria-label") === "On for ads-agent" && panelSwitch()?.getAttribute("aria-checked") === "true", "the panel has an On for <agent> switch");
+  await click(panelSwitch(), "the panel switch");
+  assert((profileWrites[profileWrites.length - 1] as { skills: string[] }).skills.length === 0 && panelSwitch()?.getAttribute("aria-checked") === "false", "the panel's switch saves the profile");
+  await click(panelSwitch(), "the panel switch again");
+  assert(panelSwitch()?.getAttribute("aria-checked") === "true", "and turns it back on");
+  // Revoke says how many active agents lose the skill, and Escape cancels it.
+  const revokesBefore = calls.filter((c) => c[0] === "revoke").length;
+  await click(button("Revoke"), "Revoke on weekly-report");
+  assert(/8 active agents lose this skill/.test(dialog()?.textContent ?? ""), "the Revoke confirm shows the active count");
+  await key(dialog(), "Escape");
+  assert(!dialog() && drawer() && calls.filter((c) => c[0] === "revoke").length === revokesBefore, "Escape cancels the confirm and leaves the panel open");
+  assert(document.activeElement === button("Revoke"), "focus returns to the Revoke button");
+
+  // The row menu: arrows, Escape returns focus, and the drawer stays open.
+  await click(tabButton(/Used by/), "the Used by tab");
+  const menuTrigger = (agent: string) => document.body.querySelector<HTMLButtonElement>(`button[aria-label="Actions for ${agent}"]`);
+  const items = () => [...document.body.querySelectorAll<HTMLElement>("[role=menuitem]")];
+  assert(menuTrigger("agent-a")?.getAttribute("aria-expanded") === "false" && items().length === 0, "a row menu starts closed");
+  await click(menuTrigger("agent-a"), "the agent-a menu");
+  assert(menuTrigger("agent-a")?.getAttribute("aria-expanded") === "true" && items().map((i) => i.textContent).join("|").startsWith("Open agent") && /Turn off for this agent/.test(items()[1]?.textContent ?? ""), "the menu offers Open agent, then Turn off");
+  assert(document.activeElement === items()[0], "the menu opens on its first item");
+  await key(items()[0], "ArrowDown");
+  assert(document.activeElement === items()[1], "ArrowDown moves to Turn off");
+  await key(items()[1], "ArrowDown");
+  assert(document.activeElement === items()[0], "ArrowDown wraps");
+  await key(items()[0], "ArrowUp");
+  assert(document.activeElement === items()[1], "ArrowUp wraps back");
+  await key(items()[1], "Escape");
+  assert(items().length === 0 && document.activeElement === menuTrigger("agent-a") && drawer(), "Escape closes the menu, returns focus to its trigger and keeps the panel");
+  await click(menuTrigger("agent-a"), "the agent-a menu again");
+  await click(items()[1], "Turn off for this agent");
+  assert(dialog() && /Turn off weekly-report for agent-a\?/.test(dialog()!.textContent ?? "") && /profile, not the skill/.test(dialog()!.textContent ?? ""), "Turn off asks first and says what changes");
+  assert(document.activeElement === dialog(), "the dialog takes focus");
+  const lastBtn = dialogButton("Turn off")!;
+  lastBtn.focus();
+  await key(lastBtn, "Tab");
+  assert(document.activeElement === dialogButton("Cancel"), "Tab wraps inside the dialog");
+  await key(dialogButton("Cancel"), "Escape");
+  assert(!dialog() && drawer() && document.activeElement === menuTrigger("agent-a"), "Escape cancels the dialog and returns focus to the menu's trigger");
+  const writesBeforeOff = profileWrites.length;
+  assert(profileWrites.length === writesBeforeOff, "a cancelled dialog writes nothing");
+  // The owner's own row has no Open agent.
+  await click(menuTrigger("ads-agent"), "the ads-agent menu");
+  assert(items().length === 1 && /Turn off for this agent/.test(items()[0]!.textContent ?? ""), "this agent's menu only turns the skill off");
+  await key(items()[0], "Escape");
+
+  // Turn off for copy-agent: its profile is read, then saved at its revision.
+  await click(menuTrigger("copy-agent"), "the copy-agent menu");
+  await click(items()[1], "Turn off for this agent");
+  await click(dialogButton("Turn off"), "the confirm Turn off button");
+  const off = profileWrites[profileWrites.length - 1] as { id: string; skills: string[]; expectedRevision: number };
+  assert(off.id === "ap_2" && JSON.stringify(off.skills) === JSON.stringify(["tone-guide"]) && off.expectedRevision === 7, "it saves copy-agent's own skills without the name, at its own revision");
+  assert(!dialog() && /Turned off weekly-report for copy-agent\./.test(host.querySelector("[role=status].fixed")?.textContent ?? "") && button("Undo"), "a toast confirms it and offers Undo");
+  assert(![...document.body.querySelectorAll(".sk-user-name")].some((n) => n.textContent === "copy-agent"), "the agent leaves the Used by list");
+  assert(document.activeElement === tabButton(/Used by/), "focus lands on the tab the row left");
+  await click(button("Undo"), "Undo");
+  const back = profileWrites[profileWrites.length - 1] as { id: string; skills: string[]; expectedRevision: number };
+  assert(back.id === "ap_2" && back.skills.includes("weekly-report") && back.expectedRevision === 8, "Undo turns it back on at the revision now stored");
+  assert([...document.body.querySelectorAll(".sk-user-name")].some((n) => n.textContent === "copy-agent") && !host.querySelector("[role=status].fixed"), "the agent is listed again and the toast is gone");
+  // A stale revision is reported, never overwritten.
+  theirWriteFails = () => new ApiError("Reload the agent profile.", 409, { code: "revision_conflict" });
+  const writesBeforeStale = profileWrites.length;
+  await click(menuTrigger("copy-agent"), "the copy-agent menu");
+  await click(items()[1], "Turn off for this agent");
+  await click(dialogButton("Turn off"), "the confirm Turn off button");
+  assert(profileWrites.length === writesBeforeStale + 1, "a stale revision is written once, not retried");
+  assert(/Someone else changed copy-agent’s profile, so nothing was saved\./.test(drawer()?.textContent ?? "") && !dialog(), "the panel says someone else changed it");
+  assert([...document.body.querySelectorAll(".sk-user-name")].some((n) => n.textContent === "copy-agent"), "nothing changed in the list");
+  theirWriteFails = null;
+  await click([...(drawer()?.querySelectorAll("button") ?? [])].find((b) => b.textContent === "Reload"), "the panel's Reload");
+  assert(!/Someone else changed copy-agent/.test(drawer()?.textContent ?? ""), "Reload clears the notice");
+  theirWriteFails = () => new ApiError("Owners only.", 403);
+  await click(menuTrigger("copy-agent"), "the copy-agent menu");
+  await click(items()[1], "Turn off for this agent");
+  await click(dialogButton("Turn off"), "the confirm Turn off button");
+  assert(toasts[toasts.length - 1]![0] === "err" && /Owners only\./.test(lastToast()), "a refusal reads as the board's words");
+  theirWriteFails = null;
+  // This agent's own row saves through the page's profile.
+  await click(menuTrigger("ads-agent"), "the ads-agent menu");
+  await click(items()[0], "Turn off for this agent");
+  await click(dialogButton("Turn off"), "the confirm Turn off button");
+  const own = profileWrites[profileWrites.length - 1] as { id: string; skills: string[]; expectedRevision: number };
+  assert(own.id === "ap_1" && own.skills.length === 0 && own.expectedRevision === stored.revision - 1, "this agent's skills are saved at the page's revision");
+  await click(button("Undo"), "Undo on this agent");
+  assert((profileWrites[profileWrites.length - 1] as { skills: string[] }).skills.includes("weekly-report"), "Undo turns it back on for this agent");
+  await closeDrawer();
 
   await React.act(async () => { root.unmount(); });
   console.log("workspaceSkills checks passed");

@@ -29,7 +29,7 @@ import {
 } from "../../src/features/documents/documentsClient";
 import { memberHistory, memberThreadStore, sendToAssistant } from "../../src/features/home/memberThread";
 import { classifyFailure } from "../../src/features/agents/instructionsDoc";
-import { libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames } from "../../src/features/agents/workspaceSkills";
+import { libraryAbsent, liveSkillDeps, refusal, skillFiles, skillPills, unapprovedNames } from "../../src/features/agents/workspaceSkills";
 import { settingsRedirect } from "../../src/features/settings/settingsNav";
 import { parseMount } from "../../src/features/workspace-apps/screen/screenLifecycle";
 import { screenProjection, screenTag } from "../../src/features/workspace-apps/screen/screenProjection";
@@ -405,6 +405,23 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
   const library = fixture.skills;
   const seed = JSON.parse(JSON.stringify(fx["skills-profile"])) as { profile: StoredAgentProfile };
   let profile = seed.profile;
+  // CAD-2438: every other agent a skill lists has a profile of its own, so the owner can turn a
+  // skill off for it. A profile save keeps each skill's `used_by` in step, as the board does.
+  const others = new Map<string, StoredAgentProfile>();
+  for (const skill of library) {
+    for (const user of skill.used_by ?? []) {
+      if (user.profile_id === profile.id) continue;
+      const known = others.get(user.profile_id) ?? { ...profile, id: user.profile_id, name: user.name, role: "QA agent", responsibilities: `# ${user.name}\n\nA synthetic QA agent.`, skills: [], status: user.status, revision: 1 };
+      others.set(user.profile_id, { ...known, skills: [...known.skills, skill.name] });
+    }
+  }
+  const syncUsedBy = (saved: StoredAgentProfile) => {
+    for (const skill of library) {
+      if (skill.used_by === undefined) continue;
+      skill.used_by = skill.used_by.filter((user) => user.profile_id !== saved.id);
+      if (saved.skills.includes(skill.name)) skill.used_by.push({ profile_id: saved.id, name: saved.name, status: saved.status });
+    }
+  };
   let probe: SkillProbe = "available";
   const answer = (route: string, status: number, body: unknown): DocumentsAnswer => ({ route, status, body });
   const no = (route: string, status: number, code: string, message: string) => answer(route, status, { error: { code, message } });
@@ -437,24 +454,29 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
     const profileRoute = /^\/api\/agent-profiles\/([^/]+)$/.exec(pathname);
     if (profileRoute) {
       const route = `${method} /api/agent-profiles/:id`;
-      if (decodeURIComponent(profileRoute[1]!) !== profile.id) return no(route, 404, "not_found", "Unknown agent profile.");
-      if (method === "GET") return answer(route, 200, { profile });
+      const id = decodeURIComponent(profileRoute[1]!);
+      const current = id === profile.id ? profile : others.get(id);
+      if (!current) return no(route, 404, "not_found", "Unknown agent profile.");
+      if (method === "GET") return answer(route, 200, { profile: current });
       if (!owner) return no(route, 403, "owner_required", "Only owners edit agent profiles.");
       const fields = exact(body, ["name", "role", "responsibilities", "skills", "status", "expectedRevision"]);
       if (!fields || !Array.isArray(fields.skills) || fields.skills.some((name) => typeof name !== "string")) {
         return no(route, 400, "invalid_request", "Invalid agent profile.");
       }
-      if (fields.expectedRevision !== profile.revision) return no(route, 409, "revision_conflict", "Reload the agent profile.");
-      profile = {
-        ...profile,
+      if (fields.expectedRevision !== current.revision) return no(route, 409, "revision_conflict", "Reload the agent profile.");
+      const saved: StoredAgentProfile = {
+        ...current,
         name: String(fields.name),
         role: String(fields.role),
         responsibilities: String(fields.responsibilities).trim(),
         skills: [...new Set(fields.skills as string[])],
-        revision: profile.revision + 1,
+        revision: current.revision + 1,
         updated_at: Date.now(),
       };
-      return answer(route, 200, { profile });
+      if (id === profile.id) profile = saved;
+      else others.set(id, saved);
+      syncUsedBy(saved);
+      return answer(route, 200, { profile: saved });
     }
     if (probe === "not-served") return no(`${method} ${pathname}`, 404, "not_found", "Not found.");
     if (method === "GET" && pathname === "/api/workspace-skills") {
@@ -613,7 +635,7 @@ async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
       fail("workspace-skills", "the library needs an approved skill, a draft and an approved skill with a newer draft");
     }
     for (const skill of skills) {
-      if (statusParts(skill).length === 0) fail("workspace-skills", `${skill.name}: no status line`);
+      if (skillPills(skill).length === 0) fail("workspace-skills", `${skill.name}: no status line`);
       const read = await liveSkillDeps.read(skill.name);
       if (skillFiles(read.revision.files)[0]?.[0] !== "SKILL.md") fail("workspace-skills", `${skill.name}: no SKILL.md`);
       if (skill.approved) {
@@ -623,6 +645,10 @@ async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
     }
     if (skills.some((s) => s.used_by === undefined) || !skills.some((s) => s.used_by?.some((u) => u.status === "archived"))) {
       fail("workspace-skills", "every skill should carry used_by, with an archived agent on one");
+    }
+    // CAD-2438: one skill is used by many agents, some archived, so the Used by tab has something to search.
+    if (!skills.some((s) => (s.used_by?.filter((u) => u.status === "active").length ?? 0) >= 12 && (s.used_by?.filter((u) => u.status === "archived").length ?? 0) >= 2)) {
+      fail("workspace-skills", "one skill needs 12 or more active users and 2 archived");
     }
     const detail = await liveSkillDeps.read(skills[0]!.name);
     if (detail.skill.used_by === undefined) fail("workspace-skills", "the detail read dropped used_by");
@@ -636,6 +662,8 @@ async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
     if (unapprovedNames(profile.skills, skills).length === 0 || unapprovedNames(profile.skills, skills).length === profile.skills.length) {
       fail("skills-profile", "the profile should list one approved skill and one name with no approved skill");
     }
+    const other = skills.find((s) => s.used_by?.some((u) => u.profile_id !== row.id && u.status === "active"))?.used_by?.find((u) => u.profile_id !== row.id && u.status === "active");
+    if (!other || (await api.agentProfile(other.profile_id)).profile.name !== other.name) fail("skills-profile", "an agent that uses a skill has no readable profile");
     const draft = skills.find((s) => !s.approved)!;
     await liveSkillDeps.approve(draft.name, draft.latest_revision, draft.latest_digest).then(
       () => fail("workspace-skills", "a member's approve was accepted"),
@@ -666,6 +694,13 @@ async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
     );
     await liveSkillDeps.revoke(approved.name, approved.approved!.digest);
     await liveSkillDeps.remove(approved.name, approved.latest_revision);
+    if (other) {
+      const theirs = (await api.agentProfile(other.profile_id)).profile;
+      const off = theirs.skills.find((name) => skills.some((s) => s.name === name))!;
+      await api.saveAgentProfile(other.profile_id, { name: theirs.name, role: theirs.role, responsibilities: theirs.responsibilities, skills: theirs.skills.filter((n) => n !== off), status: theirs.status, expectedRevision: theirs.revision });
+      const after = (await liveSkillDeps.list()).find((s) => s.name === off);
+      if (after?.used_by?.some((u) => u.profile_id === other.profile_id)) fail("skills-profile", "turning a skill off for another agent left it in used_by");
+    }
     const saved = (await api.saveAgentProfile(row.id, { name: profile.name, role: profile.role, responsibilities: profile.responsibilities, skills: [], status: profile.status, expectedRevision: profile.revision })).profile;
     if (saved.revision !== profile.revision + 1 || saved.skills.length !== 0) fail("skills-profile", "a profile save did not advance the revision");
     await api.saveAgentProfile(row.id, { name: profile.name, role: profile.role, responsibilities: profile.responsibilities, skills: [], status: profile.status, expectedRevision: profile.revision }).then(
