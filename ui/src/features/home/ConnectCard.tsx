@@ -21,10 +21,10 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const model = parseConnectRef(entry);
-  if (!model) return <p className="text-micro text-ink-500 break-words">· {plainText(entry.text, 500)}</p>;
+  if (!model) return <p className="text-micro text-ink-500 break-words chatcard-line">· {plainText(entry.text, 500)}</p>;
   // Owner only: a member or an unconfirmed session reads the text line.
   if (writeBlock !== null || operatorBlock !== null) {
-    return <p className="text-micro text-ink-500 break-words" data-kind="connect_ref">· {plainText(entry.text, 500)}</p>;
+    return <p className="text-micro text-ink-500 break-words chatcard-line" data-kind="connect_ref">· {plainText(entry.text, 500)}</p>;
   }
   const label = t("Connect {label}").replace("{label}", () => model.label);
   const connect = () => {
