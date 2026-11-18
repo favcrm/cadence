@@ -322,9 +322,67 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
   }, signal);
 }
 
+export type AppAgentSelection = {
+  digest: string;
+  revision: number;
+  stale: boolean;
+  agent: { id: string; name: string } | null;
+};
+
+function appAgentSelection(value: unknown, installId: string, stale: boolean): AppAgentSelection {
+  const invalid = new ApiError("The server returned an invalid app agent selection", 502);
+  if (typeof value !== "object" || value === null || !("install_id" in value) || value.install_id !== installId ||
+    !("digest" in value) || typeof value.digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.digest) ||
+    !("revision" in value) || typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 0 ||
+    !("agent" in value)) throw invalid;
+  const { digest, revision, agent } = value;
+  if (agent === null) return { digest, revision, stale, agent };
+  if (stale || revision === 0 || typeof agent !== "object" || !("profile_id" in agent) ||
+    typeof agent.profile_id !== "string" || !agent.profile_id || !("profile_revision" in agent) ||
+    typeof agent.profile_revision !== "number" || !Number.isSafeInteger(agent.profile_revision) || agent.profile_revision < 1 ||
+    !("profile" in agent) || typeof agent.profile !== "object" || agent.profile === null ||
+    !("id" in agent.profile) || agent.profile.id !== agent.profile_id ||
+    !("name" in agent.profile) || typeof agent.profile.name !== "string" || !agent.profile.name.trim() ||
+    !("revision" in agent.profile) || agent.profile.revision !== agent.profile_revision ||
+    !("status" in agent.profile) || agent.profile.status !== "active") throw invalid;
+  return { digest, revision, stale, agent: { id: agent.profile_id, name: agent.profile.name } };
+}
+
 /** One of the company's connected Instagram accounts or Facebook Pages (CAD-1290, CAD-1939). */
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
+  appAgent: async (id: string, signal?: AbortSignal) => {
+    const value = await request<unknown>(`${installation(id)}/agent`, signal);
+    if (typeof value !== "object" || value === null || !("stale" in value) || typeof value.stale !== "boolean")
+      throw new ApiError("The server returned an invalid app agent selection", 502);
+    return appAgentSelection(value, id, value.stale);
+  },
+  setAppAgent: async (id: string, previous: AppAgentSelection, profileId: string | null, signal?: AbortSignal) => {
+    const selected = appAgentSelection(await request<unknown>(`${installation(id)}/agent`, signal, {
+      expected_digest: previous.digest, expected_revision: previous.revision, profile_id: profileId,
+    }), id, false);
+    if (selected.digest !== previous.digest || selected.revision !== previous.revision + 1 ||
+      (selected.agent?.id ?? null) !== profileId)
+      throw new ApiError("The app agent change could not be verified", 502);
+    return selected;
+  },
+  activeAgentProfiles: async (signal?: AbortSignal) => {
+    const value = await request<unknown>("/api/agent-profiles", signal);
+    const invalid = new ApiError("The server returned an invalid agent roster", 502);
+    if (typeof value !== "object" || value === null || !("profiles" in value) || !Array.isArray(value.profiles))
+      throw invalid;
+    const profiles = new Map<string, string>();
+    for (const profile of value.profiles as unknown[]) {
+      if (typeof profile !== "object" || profile === null || !("status" in profile) ||
+        (profile.status !== "active" && profile.status !== "archived") ||
+        !("id" in profile) || typeof profile.id !== "string" || !profile.id ||
+        !("name" in profile) || typeof profile.name !== "string" || !profile.name.trim()) throw invalid;
+      if (profile.status !== "active") continue;
+      if (profiles.has(profile.id)) throw invalid;
+      profiles.set(profile.id, profile.name);
+    }
+    return profiles;
+  },
   /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board.
    *  `inlineConsent` is forwarded only when the board's own consent read proves the central
    *  capability exists, so an older daemon never receives a field it does not accept. */

@@ -14,6 +14,7 @@ import {
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
+import { AppAgentSettings } from "../workspace-apps/AppAgentSettings";
 import { CatalogBindings } from "../workspace-apps/CatalogBindings";
 import { declaredSlots, isCatalogSlot } from "../workspace-apps/bindingChoices";
 import "../workspace-apps/workspace-apps.css";
@@ -37,10 +38,12 @@ export default function ManageApp({
   installId,
   viewer,
   automaticUpdatesEnabled = true,
+  appAgentSession,
 }: {
   installId: string;
   viewer: Viewer;
   automaticUpdatesEnabled?: boolean;
+  appAgentSession: string | null;
 }) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
@@ -427,6 +430,10 @@ export default function ManageApp({
       {privateOpen && <PrivateAppDialog installation={inst} onClose={() => setPrivateOpen(false)} onInstalled={() => setReread((n) => n + 1)} />}
 
       <div className="mgrid mt-5">
+        {appAgentSession && !removed && !off && inst.install_id === installId &&
+          (inst.state === undefined || inst.state === "active") &&
+          (inst.approved === true || inst.approval?.state === "approved") &&
+          <AppAgentSettings key={appAgentSession} installId={installId} installedDigest={inst.digest} busy={applying || removing || restoring} />}
         <div className="card mcard">
           <h3>{t("App package")}</h3>
           {inst.source_kind === "private" ? (

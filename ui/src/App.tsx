@@ -373,6 +373,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // also produces `Meta.wiki`); local boards use transfer jobs.
   const hosted = meta ? meta.hosted === true : undefined;
   const viewerSub = meta?.session?.user?.sub ?? null;
+  // Platform operator sessions do not own a private app-agent setting.
+  const appAgentSession = hosted && meta?.signed_in && meta.session?.id && viewerSub && !viewerSub.startsWith("operator-token:")
+    ? JSON.stringify([meta.session.id, viewerSub])
+    : null;
   // CAD-1423: change signal for the notification inbox. The verified identity is
   // still read from the daemon by the inbox itself; this only says when to re-check.
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
@@ -1597,7 +1601,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CatalogDetail id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} />
         )}
         {(route.screen === "workspaceApp" || route.screen === "workspaceAppKey") && (
           <WorkspaceAppEntry
