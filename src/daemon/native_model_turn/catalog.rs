@@ -4,12 +4,9 @@
 //! variable, an agent process or a request field can never redirect it. It
 //! pins:
 //!
-//! - the exact Node executable and the immutable private SDK module graph
-//!   (every file the child imports, by digest);
-//! - the pinned published Devin provider entry and the installed Pi 1.4
-//!   package root the child resolves against;
-//! - one reviewed route per provider: the authoritative server origin(s) and
-//!   the frozen catalog the native role/model/effort maps through;
+//! - the exact Node executable and immutable SDK graph for Devin, or the
+//!   literal loopback TLS origin and trust root for AgenticOS;
+//! - the frozen catalog the native role/model/effort maps through;
 //! - the finite owner-approved request/concurrency limits and the output cap.
 //!
 //! The catalog mapping is a faithful port of the published `pi-devin@0.2.1`
@@ -41,8 +38,25 @@ fn refused(message: &str) -> Error {
     Error::invalid("route_unavailable", message)
 }
 
-/// The installed SDK's exact provider id for this route.
-pub(crate) const PROVIDER: &str = "devin";
+pub(super) const DEVIN: &str = "devin";
+pub(super) const AGENTICOS: &str = "agenticos";
+
+#[derive(Clone, Debug)]
+pub(super) enum RouteBackend {
+    Devin(SdkPins),
+    AgenticOs(ureq::tls::TlsConfig),
+}
+
+impl RouteBackend {
+    fn origin(&self, value: &str) -> Result<String> {
+        match self {
+            Self::Devin(_) => canonical_origin(value),
+            Self::AgenticOs(_) => {
+                super::agenticos_gateway::canonical_origin(value).map(str::to_owned)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModulePin {
@@ -102,7 +116,7 @@ pub(crate) struct RouteFacts {
     pub families: Vec<FamilyFacts>,
     pub max_output_tokens: u32,
     pub limits: OwnerLimits,
-    pub sdk: SdkPins,
+    pub(super) backend: RouteBackend,
     /// The exact approved loaded tool declarations, provisioned by the
     /// operator from the immutable image material.
     pub approved_tools: Vec<super::dto::NativeToolV1>,
@@ -112,14 +126,10 @@ pub(crate) struct RouteFacts {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeModelProfile {
-    pub routes: Vec<RouteFacts>,
+    pub(super) route: RouteFacts,
 }
 
 impl NativeModelProfile {
-    pub(crate) fn route(&self, provider: &str) -> Option<&RouteFacts> {
-        self.routes.iter().find(|route| route.provider == provider)
-    }
-
     pub(crate) fn load_default() -> Result<Option<Self>> {
         Self::load_path(Path::new(PROFILE_PATH))
     }
@@ -175,21 +185,15 @@ impl NativeModelProfile {
                 "the native model profile must declare exactly one qualified route",
             ));
         }
-        let mut routes = Vec::with_capacity(routes_map.len());
-        for (provider, route) in routes_map {
-            if provider != PROVIDER {
-                return Err(refused(
-                    "the native model profile declares an unqualified provider",
-                ));
-            }
-            routes.push(RouteFacts::parse(provider.clone(), route)?);
-        }
-        Ok(Self { routes })
+        let (provider, route) = routes_map.iter().next().expect("one configured route");
+        Ok(Self {
+            route: RouteFacts::parse(provider, route)?,
+        })
     }
 }
 
 impl RouteFacts {
-    fn parse(provider: String, value: &Value) -> Result<Self> {
+    fn parse(provider: &str, value: &Value) -> Result<Self> {
         let m = strict::object_with(
             value,
             &[
@@ -199,12 +203,22 @@ impl RouteFacts {
                 "catalog",
                 "max_output_tokens",
                 "limits",
-                "sdk",
                 "approved_tools_path",
                 "approved_tools_digest",
             ],
-            &[],
+            &["sdk", "tls_root_pem"],
         )?;
+        let backend = match (provider, m.get("sdk"), m.get("tls_root_pem")) {
+            (DEVIN, Some(sdk), None) => RouteBackend::Devin(SdkPins::parse(sdk)?),
+            (AGENTICOS, None, Some(Value::String(pem))) => {
+                RouteBackend::AgenticOs(super::agenticos_gateway::pinned_tls(pem)?)
+            }
+            _ => {
+                return Err(refused(
+                    "the native model profile has unsupported provider settings",
+                ))
+            }
+        };
         let origins_value = m.get("origins").ok_or_else(|| refused("no origin"))?;
         let origins_items = origins_value
             .as_array()
@@ -217,9 +231,9 @@ impl RouteFacts {
             let text = item
                 .as_str()
                 .ok_or_else(|| refused("the native model origin is malformed"))?;
-            origins.push(canonical_origin(text)?);
+            origins.push(backend.origin(text)?);
         }
-        let default_origin = canonical_origin(
+        let default_origin = backend.origin(
             m.get("default_origin")
                 .and_then(Value::as_str)
                 .ok_or_else(|| refused("the native model default origin is missing"))?,
@@ -232,9 +246,11 @@ impl RouteFacts {
             return Err(refused("the native model output cap is out of bounds"));
         }
         let catalog_revision = decimal_u64(m, "catalog_revision")?;
-        let families = parse_catalog(m.get("catalog").ok_or_else(|| refused("no catalog"))?)?;
+        let families = parse_catalog(
+            provider,
+            m.get("catalog").ok_or_else(|| refused("no catalog"))?,
+        )?;
         let limits = parse_limits(m.get("limits").ok_or_else(|| refused("no limits"))?)?;
-        let sdk = SdkPins::parse(m.get("sdk").ok_or_else(|| refused("no sdk pins"))?)?;
         let tools_path = absolute(
             strict::string(m, "approved_tools_path")?,
             "approved_tools_path",
@@ -244,14 +260,14 @@ impl RouteFacts {
         let (approved_tools, approved_tools_digest) =
             Self::load_approved_tools(&tools_path, &tools_digest)?;
         Ok(Self {
-            provider,
+            provider: provider.to_string(),
             origins,
             default_origin,
             catalog_revision,
             families,
             max_output_tokens: max_output_tokens as u32,
             limits,
-            sdk,
+            backend,
             approved_tools,
             approved_tools_digest,
         })
@@ -327,7 +343,7 @@ impl RouteFacts {
 
     /// Validate that `origin` is exactly one of the pinned route origins.
     pub(crate) fn require_origin(&self, origin: &str) -> Result<String> {
-        let origin = canonical_origin(origin)?;
+        let origin = self.backend.origin(origin)?;
         if !self.origins.iter().any(|allowed| allowed == &origin) {
             return Err(refused("the model origin is not approved"));
         }
@@ -343,6 +359,11 @@ impl RouteFacts {
         source_origin: Option<&str>,
     ) -> Result<ResolvedRoute> {
         let (provider, model_id) = split_model(model);
+        if self.provider == AGENTICOS && provider != AGENTICOS {
+            return Err(refused(
+                "the gateway model must name the agenticos provider",
+            ));
+        }
         if !provider.is_empty() && provider != self.provider {
             return Err(refused(
                 "the configured model belongs to a different provider",
@@ -515,7 +536,7 @@ fn parse_scope_limit(value: &Value) -> Result<ScopeLimit> {
     })
 }
 
-fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
+fn parse_catalog(provider: &str, value: &Value) -> Result<Vec<FamilyFacts>> {
     let m = strict::object_with(value, &["v", "families"], &[])?;
     if strict::safe_u64(m, "v")? != 1 {
         return Err(refused("the native model catalog version is unsupported"));
@@ -573,7 +594,17 @@ fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
                 max_output_tokens: optional_positive(m, "max_output_tokens")?,
             });
         }
-        let (model_id, thinking_level_map, reasoning) = family_models(&family_uid, &variants);
+        let (model_id, thinking_level_map, reasoning) = if provider == AGENTICOS {
+            let id = &variants[0].model_uid;
+            if variants.len() != 1 || !canonical_gateway_model(id) {
+                return Err(refused(
+                    "gateway catalog entries require one explicit author/model id",
+                ));
+            }
+            (id.clone(), Vec::new(), false)
+        } else {
+            family_models(&family_uid, &variants)
+        };
         parsed.push(FamilyFacts {
             family_uid,
             family_label,
@@ -584,6 +615,23 @@ fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
         });
     }
     Ok(parsed)
+}
+
+fn canonical_gateway_model(value: &str) -> bool {
+    fn part(value: &str) -> bool {
+        value.len() <= 100
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    }
+    value.len() <= 200
+        && value
+            .split_once('/')
+            .is_some_and(|(author, model)| part(author) && part(model))
 }
 
 fn optional_positive(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>> {

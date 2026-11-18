@@ -46,7 +46,7 @@ const SESSION_CONFIG = '/opt/cadence/material/guest/session.json';
 const WORKSPACE = '/workspace';
 const AGENT_DIR = '/home/agent/pi';
 const PI_VERSION = '1.4.0';
-const PROVIDER = 'devin';
+const PROVIDERS = new Set(['devin', 'agenticos']);
 const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -72,7 +72,7 @@ const readConfig = () => {
   for (const key of Object.keys(value)) {
     if (!keys.includes(key)) throw new Error('config extra field');
   }
-  if (value.provider !== PROVIDER) throw new Error('provider');
+  if (!PROVIDERS.has(value.provider)) throw new Error('provider');
   if (typeof value.model_uid !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(value.model_uid)) {
     throw new Error('model uid');
   }
@@ -85,6 +85,7 @@ const readConfig = () => {
   if (value.effort !== null && (typeof value.effort !== 'string' || !THINKING_LEVELS.has(value.effort))) {
     throw new Error('effort');
   }
+  if (value.provider === 'agenticos' && value.effort !== 'off') throw new Error('effort');
   if (!Array.isArray(value.tools) || value.tools.length === 0 || value.tools.length > 16) {
     throw new Error('tools');
   }
@@ -166,8 +167,8 @@ const reviewSettings = (manager) => {
 const buildModel = (config) => ({
   id: config.model_uid,
   name: config.model_uid,
-  api: 'pi-messages',
-  provider: PROVIDER,
+  api: config.provider === 'devin' ? 'pi-messages' : config.provider,
+  provider: config.provider,
   baseUrl: 'https://protected.invalid',
   input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -199,7 +200,7 @@ async function main() {
     modelRuntime.registerNativeProvider(
       createNativeModelProvider({
         socketPath: OPS_SOCKET,
-        provider: PROVIDER,
+        provider: config.provider,
         model,
         effort: config.effort,
         piAi,

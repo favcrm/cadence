@@ -667,6 +667,32 @@ repeating it. Preview starts no process and proves neither authentication nor
 future launch success. Launch saved profiles through the existing
 `cadence join ... --profile review` path.
 
+### Dedicated AgenticOS model gateway
+
+The protected native master can use an AgenticOS gateway on the same Linux
+host. Configure the protected runtime and its encrypted custody first. The
+ordinary same-UID sandbox is not eligible.
+
+- In the root-owned `native-model.json` profile, select `routes.agenticos`
+  instead of `routes.devin`. Use a literal `https://127.0.0.1:<port>` origin
+  and `tls_root_pem` containing the private gateway CA certificate. The gateway
+  certificate must be valid for `127.0.0.1`. Plain HTTP and redirects refuse.
+- Omit the Devin `sdk` section. The frozen catalog has one explicit
+  `author/model` variant per family. Configure the protected guest for
+  `agenticos`, that model and `off` effort. In Settings > Agents, grant that
+  model to the master only. The protected workspace id must match the
+  workspace that issued the device credential.
+- In AgenticOS, approve a device credential for `model.infer` only. In the
+  local Cadence operator session, run
+  `cadence connection enroll agenticos --shape native-model-api-key --no-open`.
+  Open its trusted credential-entry link and enter the scoped device bearer.
+  Do not pass it on the command line or put it in Pi configuration.
+
+Cadence sends one bounded gateway request for the admitted model turn. It
+uses the broker's durable request id for idempotency. The protected guest
+receives the terminal model receipt, not upstream connection headers or a
+live token stream. The gateway owns provider and billing authorization.
+
 ### Managing-agent authorization
 
 An unapproved agent can petition and list its own requests, not read or edit
