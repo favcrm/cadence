@@ -28,7 +28,8 @@ import type {
   ThreadContext,
   ThreadEntry,
 } from "./contract.ts";
-import { COMPACTION_FAILURE_TEXT } from "./contract.ts";
+import { compactionFailureText } from "./contract.ts";
+import type { CompactionFailureReason } from "./identity.ts";
 import { assistantIdentityText } from "./assistant-identity.ts";
 import { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
@@ -120,6 +121,11 @@ function engineViewChanges(ops: readonly Op[]): {
   return { master, entries };
 }
 
+
+/** CAD-2430: the board's sentence for a failed blocking compaction, or none. */
+function failureSentence(reason: CompactionFailureReason | null): string | null {
+  return reason === null ? null : compactionFailureText(reason);
+}
 
 /**
  * One agent conversation, one Durable Object.
@@ -965,12 +971,12 @@ export class HostedSession<
     return {
       ...operationStatus(pending),
       model,
-      compactionFailure: readCompactionFailure(
-        this.ctx.storage.sql as unknown as TaskSql,
-        Number(this.harness.session().id),
-      )
-        ? COMPACTION_FAILURE_TEXT
-        : null,
+      compactionFailure: failureSentence(
+        readCompactionFailure(
+          this.ctx.storage.sql as unknown as TaskSql,
+          Number(this.harness.session().id),
+        ),
+      ),
     };
   }
 

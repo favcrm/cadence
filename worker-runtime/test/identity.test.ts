@@ -149,27 +149,27 @@ describe("failed compaction adapter", () => {
     task(id, conversationId, outcome);
 
   it("reports a blocking failure once its owning generation settled", () => {
-    expect(readCompactionFailure(tasks([failed(30, 1)]), 1)).toBe(true);
-    expect(readCompactionFailure(tasks([failed(30, 1)], "running"), 1)).toBe(false);
-    expect(readCompactionFailure(tasks([failed(30, 1, { status: "faulted" })]), 1)).toBe(true);
-    expect(readCompactionFailure(tasks([failed(30, 1, { status: "orphaned" })]), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1)]), 1)).toBe("unknown");
+    expect(readCompactionFailure(tasks([failed(30, 1)], "running"), 1)).toBeNull();
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "faulted" })]), 1)).toBe("unknown");
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "orphaned" })]), 1)).toBe("unknown");
   });
 
   it("stops reporting once a later record owns the transcript", () => {
-    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 30), 1)).toBe(false);
-    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 12), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 30), 1)).toBeNull();
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 12), 1)).toBe("unknown");
   });
 
   it("ignores a conversation-owned background failure", () => {
     expect(readCompactionFailure(tasks([task(30, 1, { status: "failed" }, null)]), 1))
-      .toBe(false);
+      .toBeNull();
   });
 
   it("fails closed on a succeeded, malformed or unreadable task", () => {
     expect(readCompactionFailure(tasks([failed(30, 1, { status: "completed" })]), 1))
-      .toBe(false);
-    expect(readCompactionFailure(tasks([{ id: 30, record: "{" }]), 1)).toBe(false);
-    expect(readCompactionFailure(tasks([]), 1)).toBe(false);
+      .toBeNull();
+    expect(readCompactionFailure(tasks([{ id: 30, record: "{" }]), 1)).toBeNull();
+    expect(readCompactionFailure(tasks([]), 1)).toBeNull();
     expect(
       readCompactionFailure(
         {
@@ -179,7 +179,26 @@ describe("failed compaction adapter", () => {
         },
         1,
       ),
-    ).toBe(false);
+    ).toBeNull();
+  });
+
+  // CAD-2430: the category comes from the engine's own outcome, never its text.
+  it("names why the summary failed, by category only", () => {
+    const outcome = (message: string, reason: string) => ({
+      status: "failed",
+      error: { message, detail: { reason } },
+    });
+    const read = (value: unknown) => readCompactionFailure(tasks([failed(30, 1, value)]), 1);
+    expect(read(outcome("Summarization hit the token limit; the summary is incomplete", "model_error")))
+      .toBe("output_limit");
+    expect(read(outcome("Summarization failed: provider said something private", "model_error")))
+      .toBe("model_error");
+    expect(read(outcome("Summarization attempted to call a tool", "model_error"))).toBe("model_error");
+    expect(read(outcome("Compaction was interrupted 5 times in a row", "restart_limit")))
+      .toBe("interrupted");
+    expect(read(outcome("Model x/y is not available", "no_model"))).toBe("no_model");
+    expect(read(outcome("Something new", "a_reason_this_runtime_does_not_know"))).toBe("unknown");
+    expect(read({ status: "failed", error: "not an object" })).toBe("unknown");
   });
 });
 

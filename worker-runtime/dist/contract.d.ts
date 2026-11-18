@@ -372,6 +372,8 @@ export interface HostedState {
 }
 /** Shown when a blocking compaction failed and its run ended without an answer. */
 export declare const COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
+/** The board sentence for a failed blocking compaction, by reason category. */
+export declare function compactionFailureText(reason: string): string;
 /**
  * The entry kind this runtime stores an operator submission as, and the
  * metadata kind an application records a chat message under.

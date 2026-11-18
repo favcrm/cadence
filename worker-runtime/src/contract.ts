@@ -402,6 +402,28 @@ export const COMPACTION_FAILURE_TEXT =
   "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
 
 /**
+ * CAD-2430: the same sentence naming why, by the runtime's own category, so an
+ * operator can tell a summary that ran too long from an interrupted or
+ * unavailable model. Never provider text. The engine does not repeat a failed
+ * compaction for the next message, so sending again continues the conversation.
+ */
+const COMPACTION_FAILURE_BY_REASON: Readonly<Record<string, string>> = {
+  output_limit:
+    "The conversation could not be compacted: its summary ran past the length limit. Send your message again to continue, or start a fresh conversation.",
+  interrupted:
+    "The conversation could not be compacted: summarizing it was interrupted. Send your message again to continue, or start a fresh conversation.",
+  no_model:
+    "The conversation could not be compacted: no model is available to summarize it. Send your message again to continue, or start a fresh conversation.",
+  model_error:
+    "The conversation could not be compacted: the model could not write its summary. Send your message again to continue, or start a fresh conversation.",
+};
+
+/** The board sentence for a failed blocking compaction, by reason category. */
+export function compactionFailureText(reason: string): string {
+  return COMPACTION_FAILURE_BY_REASON[reason] ?? COMPACTION_FAILURE_TEXT;
+}
+
+/**
  * The entry kind this runtime stores an operator submission as, and the
  * metadata kind an application records a chat message under.
  */

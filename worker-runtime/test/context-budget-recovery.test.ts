@@ -4,8 +4,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
 import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { BOARD_MESSAGE_KIND, COMPACTION_FAILURE_TEXT, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
-import { CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel } from "../src/model.ts";
+import { BOARD_MESSAGE_KIND, compactionFailureText, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
+import { CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel, SUMMARY_MAX_OUTPUT_TOKENS } from "../src/model.ts";
 import type { ModelTaskContext } from "../src/model-task-context.ts";
 
 // The Workers module is absent in Bun; install its lifecycle stub before
@@ -68,6 +68,20 @@ function toolCall() {
     { headers: { "content-type": "text/event-stream" } },
   );
 }
+function cutOff(text: string) {
+  return new Response(
+    chunk({ role: "assistant", content: "" }) + chunk({ content: text }) +
+      chunk({}, "length") + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+/** The engine's summarization request opens with its own system prompt. */
+const isSummary = (input: Record<string, unknown>) => {
+  const first = (input.messages as Array<{ role?: string; content?: unknown }>)[0];
+  return first?.role === "system" && JSON.stringify(first.content).includes("context summarization assistant");
+};
+const outputBudget = (input: Record<string, unknown>) =>
+  input.max_completion_tokens ?? input.max_tokens;
 function refused() {
   return Response.json({ error: {
     type: "invalid_request_error", code: "context_budget_exceeded",
@@ -318,11 +332,56 @@ describe("gateway byte-budget recovery", () => {
     // The threshold compacts before the second generation, so the failed
     // summary is the last request and no answer follows it.
     expect(run.requests).toHaveLength(2);
-    expect((await run.hosted.state()).compactionFailure).toBe(COMPACTION_FAILURE_TEXT);
+    expect((await run.hosted.state()).compactionFailure).toBe(compactionFailureText("model_error"));
     // The transcript keeps only what the engine recorded: no invented row.
     const thread = await run.hosted.transcript(false);
     expect(failed(thread)).toHaveLength(0);
     expect(JSON.stringify(thread)).not.toContain("private summary failure");
+  });
+
+  // CAD-2430: demo-company's long Home conversation failed its first blocking
+  // compaction once CAD-2414 made compaction start earlier. A replay of that
+  // summary used 6,330 of the 8,192 output tokens, 3,629 of them reasoning.
+  it("gives the summary its own output budget and leaves a turn's budget alone", async () => {
+    const run = await session(
+      (requests) => (requests.length === 2 ? answer("Summary.") : answer("Answer.")),
+      { keepRecentTokens: 1, reserveTokens: 1_000_000 },
+    );
+    await (await run.submit("Earlier work.")).wait(BACKGROUND_CONTEXT);
+    await (await run.submit("Continue.")).wait(BACKGROUND_CONTEXT);
+    expect(run.requests.map((request) => isSummary(request.input))).toEqual([false, true, false]);
+    expect(outputBudget(run.requests[1]!.input)).toBe(SUMMARY_MAX_OUTPUT_TOKENS);
+    // A turn keeps whatever the engine sends for it; only the summary is raised.
+    expect(outputBudget(run.requests[0]!.input)).not.toBe(SUMMARY_MAX_OUTPUT_TOKENS);
+    expect(outputBudget(run.requests[2]!.input)).not.toBe(SUMMARY_MAX_OUTPUT_TOKENS);
+    expect((await run.hosted.state()).compactionFailure).toBeNull();
+  });
+
+  it("names a summary that ran past its budget, and the next message continues", async () => {
+    let summaries = 0;
+    const run = await session(
+      (requests) => {
+        const input = requests.at(-1)!.input;
+        if (!isSummary(input)) return answer("Answer.");
+        summaries++;
+        return cutOff("## Goal\nA summary that never ends");
+      },
+      { keepRecentTokens: 1, reserveTokens: 1_000_000 },
+    );
+    await (await run.submit("Earlier work.")).wait(BACKGROUND_CONTEXT);
+    await (await run.submit("Continue.")).wait(BACKGROUND_CONTEXT);
+    expect(summaries).toBe(1);
+    expect((await run.hosted.state()).compactionFailure)
+      .toBe(compactionFailureText("output_limit"));
+    // Sending again is answered: the engine does not repeat the failed
+    // compaction for it, and the failure no longer owns the thread.
+    await (await run.submit("Continue.")).wait(BACKGROUND_CONTEXT);
+    expect(summaries).toBe(1);
+    expect(isSummary(run.requests.at(-1)!.input)).toBe(false);
+    const thread = await run.hosted.transcript(false);
+    expect(thread.at(-1)?.kind).toBe("turn_result");
+    expect(thread.at(-1)?.text).toBe("Answer.");
+    expect((await run.hosted.state()).compactionFailure).toBeNull();
   });
 
   it("reports a failed summary without retrying the generation", async () => {

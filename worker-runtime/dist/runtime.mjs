@@ -54195,6 +54195,15 @@ function createAI(settings) {
 
 // src/contract.ts
 var COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
+var COMPACTION_FAILURE_BY_REASON = {
+  output_limit: "The conversation could not be compacted: its summary ran past the length limit. Send your message again to continue, or start a fresh conversation.",
+  interrupted: "The conversation could not be compacted: summarizing it was interrupted. Send your message again to continue, or start a fresh conversation.",
+  no_model: "The conversation could not be compacted: no model is available to summarize it. Send your message again to continue, or start a fresh conversation.",
+  model_error: "The conversation could not be compacted: the model could not write its summary. Send your message again to continue, or start a fresh conversation."
+};
+function compactionFailureText(reason) {
+  return COMPACTION_FAILURE_BY_REASON[reason] ?? COMPACTION_FAILURE_TEXT;
+}
 var BOARD_MESSAGE_KIND = "tenant.board.message";
 var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 
@@ -54774,40 +54783,58 @@ function entryText(model) {
     return null;
   return message.content;
 }
+function failureReason(outcome) {
+  if (outcome.status !== "failed")
+    return "unknown";
+  const error = outcome.error;
+  if (typeof error !== "object" || error === null || Array.isArray(error))
+    return "unknown";
+  const { message, detail } = error;
+  const reason = typeof detail === "object" && detail !== null && !Array.isArray(detail) ? detail.reason : undefined;
+  if (reason === "restart_limit")
+    return "interrupted";
+  if (reason === "no_model")
+    return "no_model";
+  if (reason !== "model_error")
+    return "unknown";
+  if (typeof message === "string" && message.startsWith("Summarization hit the token limit"))
+    return "output_limit";
+  return "model_error";
+}
 function readCompactionFailure(sql, conversationId) {
   if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
-    return false;
+    return null;
   try {
     const rows = sql.exec(`SELECT id, record FROM pi_tasks
           WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
           ORDER BY id DESC LIMIT 1`, conversationId).toArray();
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id))
-      return false;
+      return null;
     const id = Number(row.id);
     const latest = sql.exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId).toArray()[0]?.latest;
     if (typeof latest === "number" && id <= latest)
-      return false;
+      return null;
     const record = parseRecord(row.record);
     const owner = record?.owner;
     if (!Number.isSafeInteger(owner))
-      return false;
+      return null;
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state))
-      return false;
+      return null;
     const terminal = state;
     if (terminal.status !== "terminal")
-      return false;
+      return null;
     const outcome = terminal.outcome;
     if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
-      return false;
+      return null;
     const status = outcome.status;
     if (status !== "failed" && status !== "faulted" && status !== "orphaned")
-      return false;
+      return null;
     const parent = sql.exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner).toArray()[0];
-    return parent === undefined || parent.status === "terminal";
+    return parent === undefined || parent.status === "terminal" ? failureReason(outcome) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 function parseRecord(stored) {
@@ -54984,6 +55011,14 @@ var HOSTED_COMPACTION_POLICY = {
   backgroundTokens: 16384
 };
 var MODEL_MAX_OUTPUT_TOKENS = 8192;
+var SUMMARY_MAX_OUTPUT_TOKENS = 32768;
+function withSummaryBudget(input) {
+  const field = "max_completion_tokens" in input ? "max_completion_tokens" : "max_tokens";
+  const current = input[field];
+  if (typeof current === "number" && current >= SUMMARY_MAX_OUTPUT_TOKENS)
+    return input;
+  return { ...input, [field]: SUMMARY_MAX_OUTPUT_TOKENS };
+}
 var LEGACY_MODEL_IDS = ["@cf/zai-org/glm-5.3-flash", "z-ai/glm-5.3-flash"];
 function defaultModel(alias, acceptsImages = false) {
   return {
@@ -55287,7 +55322,7 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
         }, { status: 409 });
       }
       const compacting = isCompaction?.(options?.signal) === true;
-      const summary = compacting ? splitSummaryMessages(input) : input;
+      const summary = compacting ? withSummaryBudget(splitSummaryMessages(input)) : input;
       const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
       const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
@@ -56638,6 +56673,9 @@ function engineViewChanges(ops) {
   }
   return { master, entries };
 }
+function failureSentence(reason) {
+  return reason === null ? null : compactionFailureText(reason);
+}
 
 class HostedSession extends DurableObject {
   models = createModels();
@@ -57100,7 +57138,7 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
     return {
       ...operationStatus(pending),
       model,
-      compactionFailure: readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)) ? COMPACTION_FAILURE_TEXT : null
+      compactionFailure: failureSentence(readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)))
     };
   }
   async settledOperation(operationId) {

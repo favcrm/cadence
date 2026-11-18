@@ -44,7 +44,8 @@ export const MODEL_CONTEXT_WINDOW = 128_000;
  *   (8,000 × 10.5 ≈ 84 KB).
  * - Estimated Chinese tool results in one operation are kept in budget by
  *   `boundActiveToolResults`, not by these thresholds.
- * - The summary's output stays capped by the model's 8,192 output tokens.
+ * - The summary's output has its own budget, `SUMMARY_MAX_OUTPUT_TOKENS`;
+ *   a turn's answer keeps the model's 8,192 output tokens.
  */
 export const HOSTED_COMPACTION_POLICY = {
   reserveTokens: 80_000,
@@ -53,6 +54,27 @@ export const HOSTED_COMPACTION_POLICY = {
 } as const;
 
 const MODEL_MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * CAD-2430: the output budget of the engine's compaction summary, which the
+ * engine otherwise caps at the model's 8,192 tokens. A summary that stops at
+ * the cap is discarded and the blocking compaction fails ("The conversation
+ * could not be compacted"). A model may reason before it writes, and those
+ * tokens count against the same budget. Measured on 2026-11-18, replaying
+ * demo-company's failed summary (a 362-entry conversation, a 222 KB request)
+ * on `tencent/hy4-flash`: 6,330 output tokens, 3,629 of them reasoning, so
+ * the cap left about 1,900 tokens of room. 32,768 leaves room for a longer
+ * history and for reasoning, and applies only to the attested summary request.
+ */
+export const SUMMARY_MAX_OUTPUT_TOKENS = 32_768;
+
+/** Raise, never lower, the summary request's output budget. */
+function withSummaryBudget(input: Record<string, unknown>): Record<string, unknown> {
+  const field = "max_completion_tokens" in input ? "max_completion_tokens" : "max_tokens";
+  const current = input[field];
+  if (typeof current === "number" && current >= SUMMARY_MAX_OUTPUT_TOKENS) return input;
+  return { ...input, [field]: SUMMARY_MAX_OUTPUT_TOKENS };
+}
 
 /**
  * Models stored in sessions created before the alias landed. The engine
@@ -611,7 +633,7 @@ export function meteredBinding(
         );
       }
       const compacting = isCompaction?.(options?.signal) === true;
-      const summary = compacting ? splitSummaryMessages(input) : input;
+      const summary = compacting ? withSummaryBudget(splitSummaryMessages(input)) : input;
       const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
       const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
