@@ -289,7 +289,15 @@ impl Shared {
                  its permission prompts are not brokered"
             )));
         }
-        let kind = optional_str(params, "kind").unwrap_or("approval");
+        let kind = match params.get("kind") {
+            None | Some(Value::Null) => "approval",
+            Some(Value::String(s)) => s.trim(),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "request_open refused: kind must be a string",
+                ));
+            }
+        };
         proto::identifier(kind, "Request kind")?;
         if kind != "approval" {
             return Err(Error::rejected(format!(
