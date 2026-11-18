@@ -3,6 +3,7 @@ export const AGENT_TABS = [
   { id: "instructions", label: "Instructions" },
   { id: "routines", label: "Routines" },
   { id: "skills", label: "Skills" },
+  { id: "manage-skills", label: "Manage Skills" },
   { id: "tools", label: "Tools" },
   { id: "history", label: "History" },
 ] as const;

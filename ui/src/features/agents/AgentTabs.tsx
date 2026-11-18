@@ -540,6 +540,17 @@ function Instructions({ c }: { c: TabContext }) {
   );
 }
 
+function ManageSkillsTab({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  // CAD-2419: a hosted profile also has the workspace's own skill library.
+  const workspace = c.doc.kind === "hosted";
+  return (
+    <div className="ap-body">
+      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} />}
+    </div>
+  );
+}
+
 function Skills({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [open, setOpen] = useState<string | null>(null);
@@ -550,10 +561,8 @@ function Skills({ c }: { c: TabContext }) {
   const names = [...bundled, ...named.filter((name) => !bundled.includes(name))];
   const line = (name: string) =>
     BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
-  // CAD-2419: a hosted profile also has the workspace's own skill library.
-  const workspace = c.hired !== undefined && c.doc.kind === "hosted";
   const none = names.length === 0 && c.roleRead === "read" ? <Note>{t("No skills are recorded for this agent.")}</Note> : null;
-  if (none && !workspace) return none;
+  if (none) return none;
   return (
     <div className="ap-body">
       {names.length > 0 && (
@@ -564,7 +573,6 @@ function Skills({ c }: { c: TabContext }) {
         </Rows>
       )}
       <RoleRead c={c} />
-      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} absent={none} />}
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
@@ -1529,6 +1537,8 @@ export default function AgentTabBody({ tab, c }: { tab: AgentTab; c: TabContext 
       return <History c={c} />;
     case "skills":
       return <Skills c={c} />;
+    case "manage-skills":
+      return <ManageSkillsTab c={c} />;
     case "tools":
       return <Tools c={c} />;
     default:
