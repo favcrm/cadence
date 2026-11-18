@@ -1504,3 +1504,53 @@ button.sentchip:focus-visible {
   font-size: var(--text-label);
   padding: 0 0.5rem;
 }
+
+/* CAD-2436: a sent file is a tile, not a pill — a type badge coloured by
+   kind, the full name, and its size and type on a quiet second line, in the
+   chat font. The tile wraps inside the bubble like the pills did. */
+.sentchip {
+  display: inline-grid;
+  grid-template-columns: 1.875rem minmax(0, 1fr);
+  align-items: center;
+  column-gap: .5625rem;
+  height: auto;
+  min-width: min(11rem, 100%);
+  max-width: min(19rem, 100%);
+  padding: .375rem .625rem .375rem .375rem;
+  border-radius: .625rem;
+  border-color: color-mix(in srgb, var(--color-ink-100) 10%, transparent);
+  background: color-mix(in srgb, var(--color-ink-950) 20%, transparent);
+  font-family: var(--font-chat);
+  text-align: left;
+}
+.sentchip-ext {
+  display: grid;
+  place-items: center;
+  width: 1.875rem;
+  height: 2.125rem;
+  border-radius: .375rem;
+  background: #64748b;
+  color: #fff;
+  font: 600 .5625rem/1 var(--font-chat);
+  letter-spacing: .04em;
+}
+.sentchip[data-kind="pdf"] .sentchip-ext { background: #dc2626; }
+.sentchip[data-kind="image"] .sentchip-ext { background: #7c3aed; }
+.sentchip[data-kind="video"] .sentchip-ext { background: #db2777; }
+.sentchip[data-kind="text"] .sentchip-ext { background: #0891b2; }
+.sentchip-text {
+  display: grid;
+  min-width: 0;
+}
+.sentchip-name {
+  color: var(--color-ink-100);
+  font-size: .8125rem;
+  font-weight: 500;
+  line-height: 1.35;
+}
+.sentchip-meta {
+  color: var(--color-ink-400);
+  font-size: .6875rem;
+  line-height: 1.3;
+}
+

@@ -1686,9 +1686,11 @@ textarea.agentform-input { height: auto; width: 100%; }
   margin: 1.3em 0 .45em;
 }
 /* A paragraph that is only bold text is a section label, not a heading:
-   small, muted and without a rule (the mockup's `.answer .sect`). */
-.answer .issue-reader > p:has(> strong:only-child):not(:first-child),
-.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) {
+   small, muted and without a rule (the mockup's `.answer .sect`). CAD-2436:
+   the renderer marks it (`md-sect`); a bold lead-in followed by text is a
+   sentence and keeps body size. */
+.answer .issue-reader > p.md-sect:not(:first-child),
+.chat-bubble.issue-reader > p.md-sect:not(:first-child) {
   margin: 1.2em 0 .5em;
   color: var(--color-ink-500);
   font-size: .6875rem;
@@ -1696,15 +1698,15 @@ textarea.agentform-input { height: auto; width: 100%; }
   letter-spacing: .04em;
   line-height: 1.4;
 }
-.answer .issue-reader > p:has(> strong:only-child):not(:first-child) > strong,
-.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) > strong {
+.answer .issue-reader > p.md-sect:not(:first-child) > strong,
+.chat-bubble.issue-reader > p.md-sect:not(:first-child) > strong {
   color: inherit;
   font-weight: inherit;
 }
 .answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
-.answer .issue-reader > p:has(> strong:only-child):last-child,
+.answer .issue-reader > p.md-sect:last-child,
 .chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
-.chat-bubble.issue-reader > p:has(> strong:only-child):last-child {
+.chat-bubble.issue-reader > p.md-sect:last-child {
   margin-block-end: 0;
 }
 .answer .issue-reader > :first-child,
@@ -3096,4 +3098,95 @@ button.project-focus-preview:hover { color: var(--color-accent); }
     width: .875rem;
     height: .875rem;
   }
+}
+
+/* CAD-2436: rich content in chat, from the 2026-11-18 audit. Tokens only, so
+   every rule holds in dark and light. */
+
+/* Tables in an answer: a quiet header row on a subtle band, numeric columns
+   (marked `md-num` by the renderer) right-aligned in tabular figures, and a
+   lighter first column. The frame keeps its border; the cells carry the
+   padding so the header band reaches the edges. */
+.answer .issue-reader .md-table-wrap,
+.chat-bubble.issue-reader .md-table-wrap {
+  margin: 14px 0;
+  padding: 0;
+  overflow: hidden;
+  border-radius: .625rem;
+}
+.answer .issue-reader .md-table-wrap :is(th, td),
+.chat-bubble.issue-reader .md-table-wrap :is(th, td) {
+  padding: .45rem .75rem;
+}
+.answer .issue-reader .md-table-wrap thead th,
+.chat-bubble.issue-reader .md-table-wrap thead th {
+  background: var(--color-ink-875);
+  border-bottom: 1px solid var(--color-ink-800);
+  color: var(--color-ink-400);
+  font-size: .75rem;
+  font-weight: 500;
+  padding-block: .4rem;
+}
+.answer .issue-reader :is(th, td).md-num,
+.chat-bubble.issue-reader :is(th, td).md-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+.answer .issue-reader td:first-child strong,
+.chat-bubble.issue-reader td:first-child strong {
+  font-weight: 500;
+  color: var(--color-ink-200);
+}
+
+/* Code blocks and quotes keep their distance from the text around them. */
+.answer .issue-reader > :is(pre, blockquote, .codeblock),
+.chat-bubble.issue-reader > :is(pre, blockquote, .codeblock) {
+  margin-block: 14px;
+}
+
+/* Cards and forms under an answer: 14px from the answer, 10px apart, in a
+   row and when they wrap. */
+.turn-artifacts {
+  margin-top: 14px;
+  gap: 10px;
+}
+
+/* The chosen answer in a sent or open form reads at a glance in both themes. */
+.agentform .chip-btn:is([aria-checked="true"], [aria-pressed="true"]) {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-ink-100);
+  font-weight: 500;
+}
+
+/* A failed turn is an alert: the lead as a fail-coloured title, the reason in
+   readable ink (the light theme's red body text was 4.2:1). */
+.answer-fail {
+  display: block;
+  border: 1px solid color-mix(in srgb, var(--color-fail) 32%, transparent);
+  border-left: 3px solid var(--color-fail);
+  border-radius: .625rem;
+  background: color-mix(in srgb, var(--color-fail) 8%, var(--color-ink-900));
+}
+.answer-fail-title {
+  display: block;
+  color: var(--color-fail);
+  font-weight: 600;
+}
+.answer-fail-body {
+  color: var(--color-ink-100);
+}
+
+/* Step notes read as plain text; their inline Markdown is rendered. */
+.turntrace-text {
+  font-style: normal;
+}
+
+/* "Jump to latest" in the chat font, with even figures for its count. */
+.newpill {
+  font-family: var(--font-chat);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
 }
