@@ -8,7 +8,7 @@ import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import type { ToastMsg } from "../../ui/Toast";
 import DrawerShell from "../app-shell/shared/DrawerShell";
-import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile, WorkspaceSkillRead, WorkspaceSkillSummary } from "../../lib/types";
+import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile, WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
@@ -26,7 +26,7 @@ import {
 } from "./agentTabModel";
 import { agentLocation } from "./agentView";
 import RoutinesTab from "./RoutinesTab";
-import { libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames, type SkillDeps } from "./workspaceSkills";
+import { assignedCount, isBuiltIn, libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames, usedByNote, type SkillDeps } from "./workspaceSkills";
 
 export interface TabContext {
   alias: string;
@@ -616,7 +616,7 @@ export function WorkspaceSkills({
   const canAssign = writable && assigned !== null && stale === null;
   const skills = library.state === "ready" ? library.skills : [];
   const replace = (skill: WorkspaceSkillSummary) =>
-    setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.map((s) => (s.name === skill.name ? skill : s)) } : now));
+    setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.map((s) => (s.name === skill.name ? { ...skill, used_by: skill.used_by ?? s.used_by } : s)) } : now));
   const drop = (name: string) =>
     setLibrary((now) => (now.state === "ready" ? { state: "ready", skills: now.skills.filter((s) => s.name !== name) } : now));
 
@@ -646,13 +646,23 @@ export function WorkspaceSkills({
     toHeading();
   };
 
+  const usedBy = (skill: WorkspaceSkillSummary) => {
+    const note = usedByNote(skill);
+    return note ? t(note.text).replace("{n}", String(note.n)) : "";
+  };
   const unlisted = assigned && library.state === "ready" ? unapprovedNames(assigned, skills) : [];
+  const count = assigned && library.state === "ready" ? assignedCount(assigned, skills) : null;
   return (
     <section data-work-panel="workspace-skills">
       <div className="ap-panel-h">
         <h3 ref={heading} tabIndex={-1}>
           {t("Workspace skills")}
         </h3>
+        {count && (
+          <small className="num">
+            {t("{n} of {m} assigned").replace("{n}", String(count.assigned)).replace("{m}", String(count.approved))}
+          </small>
+        )}
       </div>
       {library.state === "reading" ? (
         <Note>{t("Loading…")}</Note>
@@ -675,7 +685,7 @@ export function WorkspaceSkills({
                 <ManageRow
                   id={`wskill-${skill.name}`}
                   name={skill.name}
-                  line={[skill.description, skillStatus(skill, t)].filter(Boolean).join(" · ")}
+                  line={[skill.description, skillStatus(skill, t), usedBy(skill)].filter(Boolean).join(" · ")}
                   onOpen={() => setOpen(skill.name)}
                 />
                 {skill.approved && assigned !== null &&
@@ -723,7 +733,7 @@ export function WorkspaceSkills({
           <h4 className="slabel mb-2">{t("Listed on this agent")}</h4>
           <Rows>
             {unlisted.map((name) => (
-              <Row key={name} left={name} right={t("Not approved in this workspace")} />
+              <Row key={name} left={name} right={t(isBuiltIn(name) ? "Built-in" : "Not approved in this workspace")} />
             ))}
           </Rows>
         </div>
@@ -732,6 +742,7 @@ export function WorkspaceSkills({
         <SkillDrawer
           key={open}
           name={open}
+          profileId={doc.profile?.id ?? null}
           writable={writable}
           deps={deps}
           toast={toast}
@@ -749,9 +760,25 @@ export function WorkspaceSkills({
   );
 }
 
+/** An agent's name in "Used by": a link to its Skills tab, unless it is this agent or archived. */
+function usedByAgent(user: WorkspaceSkillUser, profileId: string | null, t: (english: string) => string): React.ReactNode {
+  if (user.profile_id === profileId || user.status === "archived") return user.name;
+  return (
+    <Link className="lnk" href={`/agents/${encodeURIComponent(user.name)}?tab=skills`} aria-label={`${t("Skills")}: ${user.name}`}>
+      {user.name}
+    </Link>
+  );
+}
+
+function usedByMark(user: WorkspaceSkillUser, profileId: string | null, t: (english: string) => string): string | undefined {
+  const marks = [user.profile_id === profileId && t("this agent"), user.status === "archived" && t("archived")].filter(Boolean);
+  return marks.length ? marks.join(" · ") : undefined;
+}
+
 /** One library skill: what an agent would read, and the owner's decisions on it. */
 function SkillDrawer({
   name,
+  profileId,
   writable,
   deps,
   toast,
@@ -760,6 +787,8 @@ function SkillDrawer({
   onClose,
 }: {
   name: string;
+  /** The profile whose Skills tab this is, so its own entry reads "this agent". */
+  profileId: string | null;
   writable: boolean;
   deps: SkillDeps;
   toast: TabContext["toast"];
@@ -927,6 +956,20 @@ function SkillDrawer({
               <Button size="sm" variant="danger" onClick={() => !busy && setConfirming(true)}>
                 {t("Delete")}
               </Button>
+            )}
+          </div>
+        )}
+        {skill.used_by !== undefined && (
+          <div className="grid gap-1" data-work-panel="used-by">
+            <h4 className="slabel">{`${t("Used by")} · ${skill.used_by.length}`}</h4>
+            {skill.used_by.length === 0 ? (
+              <Note>{t("No agent lists this skill yet.")}</Note>
+            ) : (
+              <Rows>
+                {skill.used_by.map((user) => (
+                  <Row key={user.profile_id} left={usedByAgent(user, profileId, t)} right={usedByMark(user, profileId, t)} />
+                ))}
+              </Rows>
             )}
           </div>
         )}
