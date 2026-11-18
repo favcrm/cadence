@@ -61,6 +61,7 @@ pub(crate) struct AppToolRecord<'a> {
     pub input: &'a Value,
     pub result: &'a Value,
     pub asset: Option<(&'a str, &'a [u8])>,
+    pub actual_charge_micros: Option<u64>,
 }
 
 pub(crate) struct AppToolClaim<'a> {
@@ -220,6 +221,7 @@ impl Store {
             input,
             result,
             asset,
+            actual_charge_micros,
         } = record;
         let serialized = serde_json::to_vec(result)?;
         if serialized.len() > RESULT_BYTES {
@@ -305,12 +307,12 @@ impl Store {
                     now()
                 ],
             )?;
-            Self::event(
-                &tx,
-                Self::DAEMON_STREAM,
-                "app_tool_result_recorded",
-                json!({"install_id":install,"alias":alias,"receipt_id":id,"digest":digest}),
-            )?;
+            let mut event =
+                json!({"install_id":install,"alias":alias,"receipt_id":id,"digest":digest});
+            if let Some(micros) = actual_charge_micros {
+                event["actual_charge_micros"] = json!(micros);
+            }
+            Self::event(&tx, Self::DAEMON_STREAM, "app_tool_result_recorded", event)?;
             Self::app_tool_result_in(&tx, id)
         })
     }

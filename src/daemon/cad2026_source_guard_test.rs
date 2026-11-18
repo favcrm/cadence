@@ -115,6 +115,7 @@ fn retain_receipt(shared: &Arc<Shared>, receipt: &str, request: &str, owner: &st
             input: &input,
             result: &result,
             asset: None,
+            actual_charge_micros: None,
         })
         .unwrap();
 }

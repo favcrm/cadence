@@ -989,13 +989,28 @@ impl AgenticosExternalAdapter {
                 "AgenticOS text generation refused: {code}"
             )));
         }
-        // A 200 with a malformed result may already have been charged:
-        // a missing acknowledgment is uncertain, never free.
-        let result = validate_text_result(&envelope["data"]["result"])
-            .map_err(AppCapabilityError::Uncertain)?;
+        // A malformed charged response is uncertain, never a free refusal.
+        // The submitted quote is not used to validate the actual charge.
+        let data = &envelope["data"];
+        let price = &data["price"];
+        let actual_charge_micros = money_micros(price)
+            .filter(|_| {
+                data["slug"] == TEXT_TOOL
+                    && data["repeated"].is_boolean()
+                    && price.as_object().is_some_and(|fields| fields.len() == 3)
+                    && price["amount"]
+                        .as_str()
+                        .is_some_and(|amount| !amount.starts_with('0') || amount.starts_with("0."))
+            })
+            .ok_or_else(|| {
+                AppCapabilityError::Uncertain("AgenticOS text charge receipt is malformed".into())
+            })?;
+        let result =
+            validate_text_result(&data["result"]).map_err(AppCapabilityError::Uncertain)?;
         Ok(AppCapabilityOutput {
             result,
             asset: None,
+            actual_charge_micros: Some(actual_charge_micros),
         })
     }
 
@@ -1329,6 +1344,7 @@ impl AgenticosExternalAdapter {
                 media_type: media_type.into(),
                 bytes: asset_bytes,
             }),
+            actual_charge_micros: None,
         })
     }
 
@@ -2095,6 +2111,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             Some("social.read") => Ok(AppCapabilityOutput {
                 result: self.call_source(credential, authority, input, idempotency_key)?,
                 asset: None,
+                actual_charge_micros: None,
             }),
             Some("media.generate") => {
                 self.call_image(credential, authority, input, idempotency_key)
@@ -2335,7 +2352,7 @@ mod tests {
                     .unwrap();
             (adapter, seen, worker)
         };
-        let reply = json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":null}}});
+        let reply = json!({"ok":true,"data":{"slug":"generate_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.040000"},"result":{"text":"A grounded social caption.","finishReason":"stop","usage":null}}});
         // `writer` bound to text.generate reaches the text door.
         let (adapter, seen, worker) = door(reply.clone());
         let mut proof = text_authority("writer");
@@ -2343,7 +2360,11 @@ mod tests {
         let out = adapter
             .execute_app_capability_outcome(b"token", &proof, &input, "app-call-1302")
             .unwrap();
-        assert_eq!(out.result["text"], "A grounded social caption.");
+        assert_eq!(
+            out.result,
+            json!({"text":"A grounded social caption.","finishReason":"stop","usage":null})
+        );
+        assert_eq!(out.actual_charge_micros, Some(40_000));
         worker.join().unwrap();
         assert_eq!(seen.lock().unwrap()[0].url, CALL_PATH);
         // A slot NAMED `text` bound to another capability never reaches the
@@ -2918,10 +2939,23 @@ mod tests {
         // A 200 whose result fails validation may already be charged.
         let (outcome, entry) = run(
             200,
-            json!({"ok":true,"data":{"result":{"text":"","finishReason":"stop","usage":null}}}),
+            json!({"ok":true,"data":{"slug":"generate_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"text":"","finishReason":"stop","usage":null}}}),
         );
         assert!(matches!(outcome, Err(AppCapabilityError::Uncertain(_))));
         pending.push(entry);
+        // A successful result without verifiable settlement evidence may
+        // already have been charged and must never be treated as a refusal.
+        let result = json!({"text":"Synthetic caption","finishReason":"stop","usage":null});
+        for data in [
+            json!({"result":result}),
+            json!({"slug":"other","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":result}),
+            json!({"slug":"generate_text","repeated":"false","price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":result}),
+            json!({"slug":"generate_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.0315"},"result":result}),
+        ] {
+            let (outcome, entry) = run(200, json!({"ok":true,"data":data}));
+            assert!(matches!(outcome, Err(AppCapabilityError::Uncertain(_))));
+            pending.push(entry);
+        }
         // A confirmed refusal stays a refusal.
         let (outcome, entry) = run(403, json!({"ok":false,"error":{"code":"forbidden"}}));
         assert!(matches!(outcome, Err(AppCapabilityError::Refused(_))));
@@ -2952,9 +2986,10 @@ mod tests {
                 );
                 json_response(
                     200,
-                    json!({"ok":true,"data":{"result":{
-                        "text":"Synthetic caption","finishReason":"stop","usage":null
-                    }}}),
+                    json!({"ok":true,"data":{"slug":"generate_text","repeated":false,
+                        "price":{"currency":"USD","scale":6,"amount":"0.004200"},
+                        "result":{"text":"Synthetic caption","finishReason":"stop","usage":null}
+                    }}),
                 )
             }
             _ => panic!("unexpected text request {}", request.url),
@@ -2974,7 +3009,11 @@ mod tests {
             let output = adapter
                 .execute_app_capability_outcome(b"token", &current, &request, key)
                 .unwrap();
-            assert_eq!(output.result["text"], "Synthetic caption");
+            assert_eq!(
+                output.result,
+                json!({"text":"Synthetic caption","finishReason":"stop","usage":null})
+            );
+            assert_eq!(output.actual_charge_micros, Some(4200));
         }
         let different = json!({"model":"synthetic/selected","messages":[{"role":"user","content":"Draft a caption."}]});
         assert!(matches!(
@@ -3085,7 +3124,7 @@ mod tests {
         let (base, seen, worker) = media_door(|_| {
             json_response(
                 200,
-                json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
+                json!({"ok":true,"data":{"slug":"generate_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"text":"A grounded social caption.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
             )
         });
         let mut v4 = hosted_with_pin(TEXT_MANIFEST_PIN).unwrap();

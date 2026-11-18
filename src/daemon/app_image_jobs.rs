@@ -345,6 +345,7 @@ impl Shared {
             input_digest: text("input_digest"),
             input: &spec["input"],
             result: &output.result,
+            actual_charge_micros: output.actual_charge_micros,
             asset: output
                 .asset
                 .as_ref()

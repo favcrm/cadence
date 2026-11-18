@@ -207,6 +207,8 @@ mod app_capability_quote_tests {
 pub struct AppCapabilityOutput {
     pub result: Value,
     pub asset: Option<AppCapabilityAsset>,
+    /// Verified USD microcharge, separate from the app's result contract.
+    pub actual_charge_micros: Option<u64>,
 }
 
 pub struct AppCapabilityAsset {
