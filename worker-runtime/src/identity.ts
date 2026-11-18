@@ -679,8 +679,42 @@ function entryText(model: unknown): string | null {
  * The message is the caller's own sentence: a failed compaction's stored error
  * may carry provider prose, and this adapter never hands that out.
  */
-export function readCompactionFailure(sql: TaskSql, conversationId: number): boolean {
-  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return false;
+/**
+ * CAD-2430: why a blocking compaction failed, read from the engine's own
+ * terminal outcome. A category only: the outcome's message can carry provider
+ * text, so it is matched against the engine's fixed sentences and never
+ * passed on.
+ */
+export type CompactionFailureReason =
+  | "output_limit"
+  | "interrupted"
+  | "no_model"
+  | "model_error"
+  | "unknown";
+
+function failureReason(outcome: Record<string, unknown>): CompactionFailureReason {
+  if (outcome.status !== "failed") return "unknown";
+  const error = outcome.error;
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return "unknown";
+  const { message, detail } = error as Record<string, unknown>;
+  const reason =
+    typeof detail === "object" && detail !== null && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>).reason
+      : undefined;
+  if (reason === "restart_limit") return "interrupted";
+  if (reason === "no_model") return "no_model";
+  if (reason !== "model_error") return "unknown";
+  // The engine's own sentence for a summary that stopped at its output cap.
+  if (typeof message === "string" && message.startsWith("Summarization hit the token limit"))
+    return "output_limit";
+  return "model_error";
+}
+
+export function readCompactionFailure(
+  sql: TaskSql,
+  conversationId: number,
+): CompactionFailureReason | null {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return null;
   try {
     const rows = sql
       .exec(
@@ -691,7 +725,7 @@ export function readCompactionFailure(sql: TaskSql, conversationId: number): boo
       )
       .toArray();
     const row = rows[0];
-    if (row === undefined || !Number.isSafeInteger(row.id)) return false;
+    if (row === undefined || !Number.isSafeInteger(row.id)) return null;
     const id = Number(row.id);
     // A record written after the failure — a placed summary, an answer, or the
     // next input — means the failure belongs to history, not to the run on
@@ -699,24 +733,26 @@ export function readCompactionFailure(sql: TaskSql, conversationId: number): boo
     const latest = sql
       .exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId)
       .toArray()[0]?.latest;
-    if (typeof latest === "number" && id <= latest) return false;
+    if (typeof latest === "number" && id <= latest) return null;
     const record = parseRecord(row.record);
     const owner = record?.owner;
-    if (!Number.isSafeInteger(owner)) return false;
+    if (!Number.isSafeInteger(owner)) return null;
     const state = record?.state;
-    if (typeof state !== "object" || state === null || Array.isArray(state)) return false;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
     const terminal = state as Record<string, unknown>;
-    if (terminal.status !== "terminal") return false;
+    if (terminal.status !== "terminal") return null;
     const outcome = terminal.outcome;
-    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return false;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return null;
     const status = (outcome as Record<string, unknown>).status;
-    if (status !== "failed" && status !== "faulted" && status !== "orphaned") return false;
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned") return null;
     const parent = sql
       .exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner as number)
       .toArray()[0];
-    return parent === undefined || parent.status === "terminal";
+    return parent === undefined || parent.status === "terminal"
+      ? failureReason(outcome as Record<string, unknown>)
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
 

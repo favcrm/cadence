@@ -34,8 +34,9 @@ void (async () => {
   try {
     const fetchCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
     let quoteAttempt = 0;
-    let transcribeMode: "ok" | "fail_once" = "ok";
+    let transcribeMode: "ok" | "fail_once" | "rate_limit_tail" = "ok";
     let failOnceConsumed = false;
+    let releasedId: unknown;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = typeof input === "string" ? input : input.toString();
@@ -57,6 +58,15 @@ void (async () => {
       }
 
       if (url === "/api/app-screen-audio/transcribe") {
+        if (transcribeMode === "rate_limit_tail" && String(body.request_id).endsWith("_1")) {
+          if (releasedId === undefined) {
+            releasedId = body.request_id;
+            return Response.json({ code: "rate_limited" }, { status: 502 });
+          }
+          if (body.request_id === releasedId) {
+            return Response.json({ code: "generation_released" }, { status: 409 });
+          }
+        }
         if (transcribeMode === "fail_once" && !failOnceConsumed) {
           failOnceConsumed = true;
           return new Response(JSON.stringify({ code: "idempotency_in_progress" }), {
@@ -222,6 +232,50 @@ void (async () => {
     const uploadCallsAfterRetry = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/transcribe");
     check(uploadCallsAfterRetry.at(-1)?.body.request_id === uploadReqId, "retry reuses exact request_id");
 
+    // 4. A released live tail can be retried without resending successful audio.
+    transcribeMode = "rate_limit_tail";
+    const liveTailStart = fetchCalls.length;
+    const tailStarted = await session.dispatch(
+      { v: 2, op: "audio-session", id: "r1", action: "start", language: "zh" },
+      callAbort.signal,
+    );
+    check(tailStarted.ok, "live tail scenario starts recording");
+    const tailProcessor = processorFn as typeof invokeProcessor;
+    for (let second = 0; second < 12; second += 1) {
+      tailProcessor?.({ inputBuffer: { getChannelData: () => oneSecBlock } });
+    }
+    const tailStopped = await session.dispatch(
+      { v: 2, op: "audio-session", id: "r2", action: "stop" },
+      callAbort.signal,
+    );
+    check(tailStopped.ok, "stop returns the partial transcript");
+    const partial = tailStopped.data as ScreenAudioSessionSnapshot;
+    check(
+      partial.segments_done === 1 && partial.segments_failed === 1 && partial.error?.code === "rate_limited",
+      "short final segment hits the provider refusal",
+    );
+    const tailRecovered = await session.dispatch(
+      { v: 2, op: "audio-session", id: "r3", action: "retry" },
+      callAbort.signal,
+    );
+    check(tailRecovered.ok, "explicit retry returns a transcript");
+    const track = fetchCalls.slice(liveTailStart).filter((c) => c.url === "/api/app-screen-audio/transcribe");
+    check(track.length === 4, "only the failed tail is probed and redispatched once");
+    const [, tail, probe, fresh] = track.map((call) => call.body);
+    check(probe.request_id === tail.request_id, "retry proves release using the original request ID");
+    check(fresh.request_id !== tail.request_id, "terminal release permits a fresh request ID");
+    check(
+      fresh.audio_base64 === tail.audio_base64 && fresh.language === tail.language,
+      "the new request submits the same audio and language",
+    );
+    const recovered = tailRecovered.data as ScreenAudioSessionSnapshot;
+    check(
+      recovered.segments_failed === 0 &&
+        recovered.transcript === `${partial.transcript}\nTranscribed ${fresh.request_id}`,
+      "retry appends the recovered tail without altering the first segment",
+    );
+    transcribeMode = "ok";
+
     // 0. Refusal code normalization & UTF-8 transcript byte bound.
     check(normalizeRefusalCode("SPEECH-UNAVAILABLE") === "speech_unavailable", "hyphenated uppercase code normalizes");
     check(normalizeRefusalCode("", "unavailable") === "unavailable", "empty string code falls back");
@@ -232,18 +286,18 @@ void (async () => {
     const clampedCjk = clampTranscriptUtf8(cjkHeavy);
     check(new TextEncoder().encode(clampedCjk).length <= 240 * 1024, "clampTranscriptUtf8 enforces 240 KiB UTF-8 bound");
 
-    // 4. Mount abort during active live recording stops hardware mic track immediately.
+    // Mount abort during active live recording stops hardware mic track immediately.
     const live2 = await session.dispatch(
       { v: 2, op: "audio-session", id: "s6", action: "start" },
       callAbort.signal,
     );
     const stopsBeforeAbort: number = micTrackStops;
-    check(live2.ok && stopsBeforeAbort === 1, "second live session acquires mic");
+    check(live2.ok && stopsBeforeAbort === 2, "both earlier sessions released their mic");
     mountAbort.abort();
     await Promise.resolve();
     const stopsAfterAbort: number = micTrackStops;
     const closesAfterAbort: number = closedAudioContexts;
-    check(stopsAfterAbort === 2 && closesAfterAbort === 2, "mount abort disposes active microphone and AudioContext");
+    check(stopsAfterAbort === 3 && closesAfterAbort === 3, "mount abort disposes active microphone and AudioContext");
 
     // 5. Aborting an individual callSignal mid-transcribe resolves waitForDrain immediately without hanging.
     const mountAbort2 = new AbortController();

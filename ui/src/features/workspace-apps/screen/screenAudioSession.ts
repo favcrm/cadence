@@ -359,6 +359,7 @@ export function createScreenAudioSession({
     }
 
     pumping = true;
+    let canRedispatch = next.errorCode === "rate_limited";
     next.status = "transcribing";
     next.errorCode = null;
     emit();
@@ -367,39 +368,55 @@ export function createScreenAudioSession({
       let op: PrivateOperation | null = null;
       try {
         op = beginPrivateOperation(activeAbort.signal);
-        const res = await op.fetch("/api/app-screen-audio/transcribe", {
-          method: "POST",
-          credentials: "same-origin",
-          cache: "no-store",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Cadence-Board": "1",
-            ...sessionHeaders(),
-          },
-          body: JSON.stringify({
-            action_token: actionToken,
-            request_id: next.requestId,
-            audio_base64: next.chunk.base64,
-            ...(language ? { language } : {}),
-          }),
-        });
-        const body = (await res.json().catch(() => null)) as TranscribeReply | Record<string, unknown> | null;
-        if (disposed || activeAbort.signal.aborted || sessionId !== activeSessionId) return;
-        if (!res.ok || !body || typeof (body as TranscribeReply).text !== "string") {
-          const code = readErrorCode(body) ?? "failed";
-          next.status = "failed";
-          next.errorCode = code;
-          lastError = { code, text: transcribeFailureMessage(code, t) };
-        } else {
-          next.status = "done";
-          next.text = (body as TranscribeReply).text.trim();
-          next.errorCode = null;
-          next.chunk = { ...next.chunk, wavBytes: new Uint8Array(0), base64: "" };
-          if (!segments.some((s) => s.status === "failed")) {
-            lastError = null;
+        for (;;) {
+          const res = await op.fetch("/api/app-screen-audio/transcribe", {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Cadence-Board": "1",
+              ...sessionHeaders(),
+            },
+            body: JSON.stringify({
+              action_token: actionToken,
+              request_id: next.requestId,
+              audio_base64: next.chunk.base64,
+              ...(language ? { language } : {}),
+            }),
+          });
+          const body = (await res.json().catch(() => null)) as TranscribeReply | Record<string, unknown> | null;
+          if (disposed || activeAbort.signal.aborted || sessionId !== activeSessionId) return;
+          // A rate-limit error alone is not a release receipt. The same-key
+          // replay must confirm the old attempt closed before another paid call.
+          if (
+            canRedispatch &&
+            res.status === 409 &&
+            body &&
+            typeof body === "object" &&
+            "code" in body &&
+            body.code === "generation_released"
+          ) {
+            canRedispatch = false;
+            next.requestId = `aud_${randomAudioSessionId()}_${next.chunk.index}`;
+            continue;
           }
+          if (!res.ok || !body || typeof (body as TranscribeReply).text !== "string") {
+            const code = readErrorCode(body) ?? "failed";
+            next.status = "failed";
+            next.errorCode = code;
+            lastError = { code, text: transcribeFailureMessage(code, t) };
+          } else {
+            next.status = "done";
+            next.text = (body as TranscribeReply).text.trim();
+            next.chunk = { ...next.chunk, wavBytes: new Uint8Array(0), base64: "" };
+            if (!segments.some((s) => s.status === "failed")) {
+              lastError = null;
+            }
+          }
+          emit();
+          break;
         }
-        emit();
       } catch {
         if (!disposed && !activeAbort.signal.aborted && sessionId === activeSessionId) {
           next.status = "failed";
@@ -772,7 +789,6 @@ export function createScreenAudioSession({
     for (const item of segments) {
       if (item.status === "failed") {
         item.status = "queued";
-        item.errorCode = null;
       }
     }
     phase = "transcribing";
