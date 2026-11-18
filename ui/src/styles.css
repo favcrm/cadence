@@ -3236,7 +3236,9 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   border: 1px solid color-mix(in srgb, var(--tone) 20%, transparent);
   border-radius: .25rem;
   background: color-mix(in srgb, var(--tone) 15%, transparent);
-  color: var(--tone);
+  /* CAD-2441 QA: the bare tone was 3.8-4.2:1 on its tint in light theme;
+     toward ink it is at least 5.37:1 light and 6.70:1 dark for every tone. */
+  color: color-mix(in srgb, var(--tone) 75%, var(--color-ink-100));
   font: 500 .6875rem var(--font-chat);
 }
 .turncard-status[data-tone="ok"] { --tone: var(--color-ok); }
