@@ -62,7 +62,6 @@ async function main() {
   // CAD-2438: another agent's profile, for "Turn off for this agent".
   let copy: StoredAgentProfile = { ...stored, id: "ap_2", name: "copy-agent", skills: ["weekly-report", "tone-guide"], revision: 7 };
   let theirWriteFails: (() => Error) | null = null;
-  let theirReadHook: (() => void) | null = null;
   const keepUsedBy = (saved: StoredAgentProfile) => {
     library = library.map((s) =>
       s.used_by === undefined ? s : { ...s, used_by: [...s.used_by.filter((u) => u.profile_id !== saved.id), ...(saved.skills.includes(s.name) ? [{ profile_id: saved.id, name: saved.name, status: saved.status }] : [])] },
@@ -71,7 +70,6 @@ async function main() {
   const docDeps: DocDeps = {
     readProfile: async (id) => {
       if (id === "ap_2") {
-        theirReadHook?.();
         return copy;
       }
       return stored;
@@ -112,7 +110,6 @@ async function main() {
     ];
     copy = { ...copy, skills: ["weekly-report", "tone-guide"], revision: 7 };
     theirWriteFails = null;
-    theirReadHook = null;
     library[1]!.used_by = [{ profile_id: "ap_2", name: "copy-agent", status: "active" }];
   };
   reset();
@@ -538,6 +535,8 @@ async function main() {
   await key(items()[1], "Escape");
   assert(items().length === 0 && document.activeElement === menuTrigger("agent-a") && drawer(), "Escape closes the menu, returns focus to its trigger and keeps the panel");
   await click(menuTrigger("agent-a"), "the agent-a menu again");
+  // Counted before the dialog opens, so a write made by Escape or Cancel would show.
+  const writesBeforeOff = profileWrites.length;
   await click(items()[1], "Turn off for this agent");
   assert(dialog() && /Turn off weekly-report for agent-a\?/.test(dialog()!.textContent ?? "") && /profile, not the skill/.test(dialog()!.textContent ?? ""), "Turn off asks first and says what changes");
   assert(document.activeElement === dialog(), "the dialog takes focus");
@@ -547,7 +546,6 @@ async function main() {
   assert(document.activeElement === dialogButton("Cancel"), "Tab wraps inside the dialog");
   await key(dialogButton("Cancel"), "Escape");
   assert(!dialog() && drawer() && document.activeElement === menuTrigger("agent-a"), "Escape cancels the dialog and returns focus to the menu's trigger");
-  const writesBeforeOff = profileWrites.length;
   assert(profileWrites.length === writesBeforeOff, "a cancelled dialog writes nothing");
   // The owner's own row has no Open agent.
   await click(menuTrigger("ads-agent"), "the ads-agent menu");
