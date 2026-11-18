@@ -402,6 +402,66 @@ mod tests {
         crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
     }
 
+    #[test]
+    fn native_done_requires_a_real_referenced_artifact_and_no_declared_repo() {
+        use std::os::unix::fs::symlink;
+
+        for case in ["staged", "missing", "symlink", "repo"] {
+            let (tmp, pm) = tracker();
+            let ticket = pm.dir.join("cadence/CAD-1");
+            let source = tmp.path().join("brief.txt");
+            std::fs::write(&source, b"synthetic brief").unwrap();
+            if case == "symlink" {
+                std::fs::create_dir_all(ticket.join("artifacts")).unwrap();
+                symlink(&source, ticket.join("artifacts/brief.txt")).unwrap();
+            }
+            if case == "repo" {
+                let path = pm.dir.join("cadence/project.yaml");
+                let mut project = project::load(&path).unwrap();
+                project.repos.push(project::Repo {
+                    path: None,
+                    remote: Some("https://example.invalid/example/repo".into()),
+                    base: None,
+                });
+                std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+            }
+            let before = std::fs::read(ticket.join("issue.md")).unwrap();
+            let spec = crate::issue::edit::EditSpec {
+                set: vec!["status=done".into()],
+                refs: vec!["artifact:brief.txt".into()],
+                attach: if case == "staged" || case == "repo" {
+                    vec![source]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let result = crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None);
+            if case == "staged" {
+                result.unwrap();
+                assert_eq!(load_front(&ticket).unwrap().0.status, "done");
+                assert_eq!(
+                    std::fs::read(ticket.join("artifacts/brief.txt")).unwrap(),
+                    b"synthetic brief"
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("status=done needs evidence"),
+                    "{case}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read(ticket.join("issue.md")).unwrap(),
+                    before,
+                    "{case}"
+                );
+                if case == "repo" {
+                    assert!(!ticket.join("artifacts/brief.txt").exists());
+                }
+            }
+        }
+    }
+
     /// CAD-1522: `--unref` removes exactly the named ref, and an
     /// `--unref` whose target is not there refuses the whole edit — the
     /// caller asked for a correction that cannot be made, and the other

@@ -298,13 +298,6 @@ pub(super) fn kickoff_body(
     )
 }
 
-/// CAD-1373: one short discovery pointer shared by the full and compact
-/// job envelopes, so the compact form keeps it. It names the document's
-/// installed path and section — `cadence skill status` prints the path
-/// for the session's own `$HOME`, so the pointer needs no install.
-const KNOWLEDGE_POINTER: &str = " Company questions: read the \"Business knowledge\" section of \
-    $HOME/.agents/skills/cadence/SKILL.md.";
-
 /// The `job dispatch` kickoff for an assignee on `provider`/
 /// `endpoint_kind`. Public so `cadence dispatch --job` can build the
 /// same text before `issue start` and refuse a list that will not fit
@@ -417,7 +410,7 @@ pub fn job_kickoff(
     // in both envelopes, so the managed full form still ends on the
     // reminder, the managed compact form on the report contract, and
     // the explicit form on the correlation tail.
-    let discovery = KNOWLEDGE_POINTER;
+    let discovery = crate::briefing::TASK_GUIDANCE;
     let full = format!(
         "{head}{scope}{acceptance}{discovery}{issue}{report} Do not report a SHA you have not \
          committed.{correlation}"

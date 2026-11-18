@@ -9,6 +9,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Guidance route for a local task kickoff. A link is not a live load.
+pub(crate) const TASK_GUIDANCE: &str = " Read the Cadence protocol in \
+    $HOME/.agents/skills/cadence/SKILL.md (Business knowledge for company facts). \
+    If missing, use `cadence skill show cadence --file SKILL.md` where allowed. \
+    Report unreadable required SOPs before the affected step.";
+
 /// Run a git subcommand in `dir`, returning stdout.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))

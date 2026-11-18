@@ -373,6 +373,33 @@ assignment default in place.
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
 
+## Guidance diagnostics
+
+Plain local `cadence doctor` includes `checks.guidance`, comparing only the
+bundled `cadence` files with the copy in the caller's `$HOME/.agents/skills`.
+It reports `missing`, `stale`, `current`, or `unknown`; the storage check still
+determines its exit code. This does not establish provider discovery or what a
+running session read. `cadence skill sync` refreshes bundled guidance;
+`cadence skill install <name>` replaces the selected bundle after you review
+local changes.
+
+`cadence doctor --agent <alias> [--skill <bundled-name>]` checks the named
+native agent using the authorized agent read, defaulting to `cadence`. Managed
+Pi/omp disables automatic discovery; other runtimes report unknown rather than
+assuming the caller's home is their home. Explicitly supply guidance through an
+authorized task route where needed. It reads no target filesystem. A targeted
+report exits 1 when reachability is disabled or unknown.
+
+`cadence --org <org> doctor --agent <profile-id> [--skill <name>]` instead
+checks profile assignment and the workspace catalog's approved revision and
+digest, using the selected caller. It reports `not_assigned`, `missing`,
+`unapproved`, `available`, or `unknown`; `available` concerns the profile's
+board dispatch only, not an actual run or SOP compliance. Older boards,
+refusals and malformed metadata are unknown. Targeted hosted diagnostics
+require an explicit `--org`; `--offline` sends no requests and reports unknown.
+Targeted reports exit 0 only for available. These options do not change
+ordinary hosted connection checks or `doctor --host`.
+
 ## Cadence home, overrides and isolation (CAD-1922)
 
 One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor

@@ -79,6 +79,16 @@ answers `{"alias": "...", "endpoint_kind": "...", "queued": N,
 consumer drains.) Each running entry's `task` field names the job task
 the message carries — `null` for unattached deliveries.
 
+## Task guidance
+
+Read the assignment's outcome and identify the finish line: checked draft,
+approval decision, or confirmed effect. Follow the kickoff's read route for the
+required SOP. Where the CLI is available, `cadence skill show cadence --file
+SKILL.md` reads the bundled protocol regardless of automatic discovery. For a
+hosted dispatch with `workspace_skill`, request the approved workspace skill by
+name. If required guidance cannot be read, report what is missing and who can
+resolve it before the affected step; keep safe draft work within scope.
+
 ## Reporting on a task
 
 Every dispatched message expects a correlated report. When done, report
@@ -274,6 +284,10 @@ Choose the ticket handoff state deliberately:
 - **`status=done`:** use only when the work is complete within already-granted
   authority and requires no pending human sign-off, external release or merge
   gate.
+  On a repo-free native project, use `issue edit --attach <file> --ref
+  artifact:<basename> --set status=done --comment-file <verification>` for a
+  checked attachment. A run result, a draft, an approval and an external
+  receipt establish different outcomes. Report only the one you verified.
 
 ## Errors and exit codes
 

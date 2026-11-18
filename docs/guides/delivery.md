@@ -12,21 +12,32 @@ are in [Local and hosted](#local-and-hosted).
 
 ## The lifecycle
 
-Every issue follows one path:
+Use one issue from intake through the requested outcome:
 
 | Step | What happens | Status |
 | --- | --- | --- |
 | Draft | An issue is written with its outcome and acceptance. | `backlog`, then `ready` |
 | Start | An agent or person claims it and gets an isolated lane (a git worktree for code). | `doing` |
-| Review | The work is checked against the acceptance and the project's policy. A human approves. | `review` |
-| Delivery | The approved work lands (code) or is shared (a document). | `done` |
+| Review (when required) | The required reviewer or approver decides on the exact evidence. | `review` |
+| Finish | The agreed internal output is verified, or the requested release, share or other effect is confirmed. | `done` |
 
-Agents do the work and the checks. A human approves at review. Delivery follows
-the approval. An agent never records the human's approval.
+A run report says what the worker produced or what blocked it. It does not
+approve a version, deliver it externally or complete a task awaiting a decision.
+Use a human review when the task or project requires one; an agent never records
+the human's approval.
 
-For software, delivery is a pull request that the merge queue lands after the
-gate passes. For a document it is the owner sharing the approved version; see
-[Document review](#document-review-for-non-code-work).
+For code, the merge queue lands the pull request after the gate passes. For a
+hosted document that must go out, the owner shares the approved version; see
+[Document review](#document-review-for-non-code-work). For a native project
+with no Git repository, name the actual attachment for an internal deliverable:
+
+```sh
+cadence issue edit <ID> --attach campaign-brief.md --ref artifact:campaign-brief.md \
+  --set status=done --comment-file verification.md
+```
+
+Do this only when the task ends at the checked deliverable. An attachment does
+not waive an approval, merge, publish or send requirement.
 
 ## Policy: each project owns its rules
 
@@ -403,7 +414,7 @@ other than a plain add or modify. An unreadable file fails closed.
 
 ## Document review for non-code work
 
-The lifecycle is the same. A document replaces the pull request:
+Use this gate when the requested deliverable needs approval before sharing:
 
 1. The creator saves the file with `artifact put --label <type>` and submits it
    with `artifact submit <art-id>`.

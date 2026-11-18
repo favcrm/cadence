@@ -11,6 +11,7 @@
 //! Sandbox startup never writes to the shared home. File match and provider
 //! links are not evidence that a running agent session has reloaded them.
 
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -224,6 +225,56 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             SKILL_NAMES.join(", ")
         ))),
     }
+}
+/// Compare one bundled skill in this caller's home, without exposing its contents.
+pub fn guidance(home: Option<&Path>, name: &str) -> Result<Value> {
+    let bundle = selected(Some(name))?
+        .iter()
+        .find(|skill| skill.name == name)
+        .expect("selected skill includes its requested bundle");
+    let mut state = "current";
+    if let Some(home) = home {
+        let root = canonical_root(home).join(name);
+        for (relative, expected) in bundle.files {
+            let path = root.join(relative);
+            let actual = std::fs::metadata(&path).and_then(|metadata| {
+                if !metadata.is_file() {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                if metadata.len() != expected.len() as u64 {
+                    return Ok(false);
+                }
+                let mut file = std::fs::File::open(path)?;
+                let mut buffer = [0; 4096];
+                for bytes in expected.as_bytes().chunks(buffer.len()) {
+                    let chunk = &mut buffer[..bytes.len()];
+                    file.read_exact(chunk)?;
+                    if bytes != &*chunk {
+                        return Ok(false);
+                    }
+                }
+                Ok(file.read(&mut buffer[..1])? == 0)
+            });
+            match actual {
+                Ok(true) => {}
+                Ok(_) if state != "unknown" => state = "stale",
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && state != "unknown" => {
+                    state = "missing";
+                }
+                Err(_) => state = "unknown",
+                _ => {}
+            }
+        }
+    } else {
+        state = "unknown";
+    }
+    Ok(json!({
+        "skill": name,
+        "status": state,
+        "scope": "caller HOME",
+        "remedy": (state != "current").then(|| format!("cadence skill install {name} (review local changes first)")),
+        "live_session": "not checked"
+    }))
 }
 
 /// Refresh selected public guidance, including company-outputs' guidance
@@ -697,6 +748,31 @@ fn apply_staged_bundle(staged_home: &Path, home: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guidance_checks_only_the_requested_bundle_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        sync(home.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "missing"
+        );
+        sync(home.path(), false, Some("cadence")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "current"
+        );
+        std::fs::write(
+            canonical_root(home.path()).join("cadence/SKILL.md"),
+            b"different",
+        )
+        .unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "stale"
+        );
+        assert_eq!(guidance(None, "cadence").unwrap()["status"], "unknown");
+    }
 
     #[test]
     fn already_current_update_uses_this_process_and_rollback_uses_the_restored_sha() {

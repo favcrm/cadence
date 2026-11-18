@@ -177,6 +177,12 @@ pub(crate) enum Commands {
         /// local environment probe is already offline.
         #[arg(long, conflicts_with = "host")]
         offline: bool,
+        /// Inspect guidance reachability for a native agent alias or hosted profile ID.
+        #[arg(long, conflicts_with = "host")]
+        agent: Option<String>,
+        /// Scope the target diagnostic to one skill (default: cadence).
+        #[arg(long, requires = "agent", conflicts_with = "host")]
+        skill: Option<String>,
         /// With --host, list what could be freed — stale worktrees,
         /// per-lane target dirs, the shared cargo cache — with sizes
         /// and the command. Never deletes anything.

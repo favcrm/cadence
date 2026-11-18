@@ -212,10 +212,10 @@ pub(super) fn commit_staged_inner(
     }
 }
 
-/// CAD-756: `status=done` needs evidence — one of: a recorded `ref
-/// pr:`, a worktree ref `finish` already closed, or a review/verdict
-/// artifact in the issue folder. `force` substitutes a recorded
-/// reason (it lands in the commit summary — never silent). The
+/// `status=done` needs evidence. Software keeps its PR, commit, closed
+/// worktree or review/verdict evidence. A repo-free task can instead
+/// reference an actual attachment. `force` substitutes a recorded reason
+/// (it lands in the commit summary — never silent). The
 /// reconcile sweep and delivery merge path write through
 /// `mark_done_on_merge`, which IS the evidence — they never reach
 /// this gate. Only the close direction is gated: `done` → anything
@@ -223,6 +223,7 @@ pub(super) fn commit_staged_inner(
 /// `done` rewrite never asked a question it could fail.
 pub(super) fn check_done_evidence(
     pm: &Pm,
+    project: &project::Project,
     front: &Front,
     force: Option<&str>,
     staged_artifacts: &[String],
@@ -251,6 +252,33 @@ pub(super) fn check_done_evidence(
         return Ok(());
     }
     let (_project, dir) = issue_dir(pm, &front.id)?;
+    let artifacts = dir.join("artifacts");
+    if project.repos.is_empty()
+        && !front
+            .refs
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "branch" | "worktree"))
+    {
+        let real_dir = artifacts.symlink_metadata().is_ok_and(|m| m.is_dir());
+        let has_deliverable = front
+            .refs
+            .iter()
+            .filter(|r| r.kind == "artifact" && r.closed != Some(true))
+            .filter_map(|r| r.path.as_deref())
+            .any(|name| {
+                model::valid_artifact_name(name)
+                    && !model::reserved_artifact_name(name)
+                    && (staged_artifacts.iter().any(|n| n == name)
+                        || (real_dir
+                            && artifacts
+                                .join(name)
+                                .symlink_metadata()
+                                .is_ok_and(|m| m.is_file())))
+            });
+        if has_deliverable {
+            return Ok(());
+        }
+    }
     let is_verdictish = |name: &str| {
         let n = name.to_ascii_lowercase();
         n.starts_with("review") || n.contains("verdict")
@@ -258,7 +286,7 @@ pub(super) fn check_done_evidence(
     // CAD-908: an attachment staged in the same `issue edit` counts,
     // like a same-edit `--ref pr:` — it lands in the same commit.
     let verdictish = staged_artifacts.iter().any(|n| is_verdictish(n))
-        || std::fs::read_dir(dir.join("artifacts"))
+        || std::fs::read_dir(artifacts)
             .map(|rd| {
                 rd.flatten().any(|e| {
                     // CAD-971: only a real artifact counts — a valid
@@ -275,8 +303,9 @@ pub(super) fn check_done_evidence(
         return Ok(());
     }
     Err(Error::rejected(format!(
-        "{}: status=done needs evidence — a `ref pr:`, a closed worktree \
-         ref, or a review/verdict artifact in the issue folder. \
+        "{}: status=done needs evidence — a PR or commit ref, a closed worktree \
+         ref, or a review/verdict artifact. A repo-free task can name an attached \
+         file with `--ref artifact:<name>`. \
          `cadence issue reconcile --dry-run` shows the merge classification; \
          `--force \"<reason>\"` records an override in the commit",
         front.id

@@ -89,7 +89,7 @@ pub(crate) fn check_set_gates(
         // CAD-360: an unapproved plan's tickets stay in backlog.
         crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
         if front.status == "done" {
-            check_done_evidence(pm, front, force, staged_artifacts)?;
+            check_done_evidence(pm, project, front, force, staged_artifacts)?;
             forced = force.map(|r| r.trim().to_string());
         }
         // CAD-757: `ready` is the dispatch queue — a blocked ticket
