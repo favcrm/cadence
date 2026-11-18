@@ -62,7 +62,8 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
   const selectedAccount = selectedTool?.connectedAccounts?.find(account => account.id === accountId);
   return <section className="card mcard wa-stack" aria-label={`${slot.slot} ${t("platform tool")}`}>
     <h3>{t(effect === "read" ? "Read tool" : "Draft tool")} <span className="text-ink-400 text-label">· {slot.slot}</span></h3>
-    <p className="wa-muted">{t("The app can send inputs to this tool. Paid calls still ask for approval.")}</p>
+    <p className="wa-muted">{t("The app can send inputs to this tool. Charges use the workspace balance at the price when the tool runs.")}</p>
+    <p className="wa-muted">{t("Some app screens run tools as the owner without asking again.")}</p>
     {invalid ? <p className="wa-alert" role="alert">{t("The saved tool grant could not be verified.")}</p> : binding ? <>
       <p className="wa-kicker break-words">{t("Granted tool")}: {binding.config.tool_slug?.replace(/[_.-]+/g, " ").replace(/^./, (letter) => letter.toUpperCase())}</p>
       <details className="text-label">
@@ -81,6 +82,7 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
         <p role="status">{t("Loading platform tools…")}</p> : tools.length === 0 ?
           <p className="wa-muted">{t("No matching platform tools are available.")}</p> : <>
             <p className="wa-muted">{t("Choose what this app may use. Granting access does not run the tool.")}</p>
+            <p className="wa-muted">{t("Listed prices are estimates.")}</p>
             <Select value={selected} onChange={value => { setSelected(value); setAccountId(""); }} disabled={busy} full
               aria-label={t("Choose platform tool")}
               placeholder={t("Choose platform tool")}

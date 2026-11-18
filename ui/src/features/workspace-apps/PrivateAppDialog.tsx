@@ -143,9 +143,15 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                   </ul>
                 )}
                 {review.screens.map((screen) => (
-                  <p key={screen.tag} className="text-label">
-                    {t("Screen operations")}: {screen.operations?.length ?? t("Not declared")} · {t("Screen tools")}: {screen.tools?.length ?? t("Not declared")}
-                  </p>
+                  <div key={screen.tag} className="space-y-1 text-label">
+                    <p>{t("Screen operations")}: {screen.operations === null ? t("Not declared") : screen.operations.length === 0 ? t("None") : null}</p>
+                    {screen.operations && screen.operations.length > 0 && (
+                      <ul className="list-disc break-words pl-5">
+                        {screen.operations.map((operation) => <li key={operation}>{screenOperationLabel(operation, t)}</li>)}
+                      </ul>
+                    )}
+                    <p className="break-words">{t("Screen tools")}: {screen.tools === null ? t("Not declared") : screen.tools.join(", ") || t("None")}</p>
+                  </div>
                 ))}
                 {review.screens.some((screen) => screen.remote_image_origins.length > 0) && (
                   <p className="text-label break-all">{t("Loads images from")}: {review.screens.flatMap((screen) => screen.remote_image_origins).join(", ")}</p>
@@ -205,6 +211,16 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
 }
 
 type Capability = PrivateReview["declared"]["capabilities"][string];
+
+function screenOperationLabel(operation: string, t: (english: string) => string): string {
+  switch (operation) {
+    case "calendar.query": return t("Read workspace calendar items, including task and routine titles");
+    case "routines.list": return t("Read workspace routines");
+    case "catalog.call": return t("Run a granted platform tool with app data");
+    case "smtp.test-send": return t("Send a test email through the configured account");
+    default: return operation;
+  }
+}
 
 function describeCapability(value: Capability, t: (english: string) => string): string {
   if (value.capability === "file.upload") return t("Attach files to this app");
