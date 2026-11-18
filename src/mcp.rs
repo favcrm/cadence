@@ -160,20 +160,22 @@ fn decide(
     // a lost response re-opens the same handle — the daemon dedupes,
     // so a transport hiccup can never double-notify the PM.
     let handle = format!("perm-{}", uuid::Uuid::new_v4().simple());
+    let open_params = json!({"alias": alias, "kind": "approval", "tool": tool,
+        "request": handle,
+        "input_summary": summarize(input), "input": input});
     // `request_open` retries only on transport errors — a rejection
     // (unknown alias, not brokered) is final and denies immediately.
     let handle = loop {
         if Instant::now() >= deadline {
             return deny("timed out reaching the cadence daemon");
         }
-        match client::rpc(
-            dir,
-            "request_open",
-            json!({"alias": alias, "kind": "approval", "tool": tool,
-                   "request": handle,
-                   "input_summary": summarize(input), "input": input}),
-        ) {
-            Ok(v) => break v["request"].as_str().unwrap_or_default().to_string(),
+        match client::rpc(dir, "request_open", open_params.clone()) {
+            Ok(v) => {
+                if let Some(result) = immediate_verdict(&v, input) {
+                    return result;
+                }
+                break v["request"].as_str().unwrap_or_default().to_string();
+            }
             Err(Error::Rejected(m)) => return deny(&m),
             Err(_) => std::thread::sleep(RETRY),
         }
@@ -216,6 +218,11 @@ fn decide(
 
 /// The operator's answer → the provider's wire verdict: accept allows
 /// with the original input; decline denies carrying the reason.
+fn immediate_verdict(response: &Value, input: &Value) -> Option<Value> {
+    (response["state"].as_str() == Some("answered") && !response["answer"].is_null())
+        .then(|| verdict(&response["answer"], input))
+}
+
 fn verdict(answer: &Value, input: &Value) -> Value {
     if answer["decision"].as_str() == Some("accept") {
         json!({"behavior": "allow", "updatedInput": input})
@@ -261,5 +268,29 @@ mod tests {
         let long = "x".repeat(500);
         assert_eq!(summarize(&json!({"command": long})).len(), 240);
         assert!(summarize(&json!({"a": 1})).contains("\"a\":1"));
+    }
+
+    #[test]
+    fn immediate_verdict_returns_direct_allow_on_answered_response() {
+        let input = json!({"command": "git status"});
+        let allowed = immediate_verdict(
+            &json!({"request": "perm-1", "state": "answered", "answer": {"decision": "accept"}}),
+            &input,
+        )
+        .unwrap();
+        assert_eq!(allowed["behavior"], "allow");
+        assert_eq!(allowed["updatedInput"], input);
+
+        // Waiting or retry responses without an inline answer continue to request_wait.
+        assert!(immediate_verdict(
+            &json!({"request": "perm-1", "state": "waiting_input"}),
+            &input
+        )
+        .is_none());
+        assert!(immediate_verdict(
+            &json!({"request": "perm-1", "state": "answered", "existing": true}),
+            &input
+        )
+        .is_none());
     }
 }

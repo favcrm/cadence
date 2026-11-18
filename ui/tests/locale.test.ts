@@ -135,6 +135,23 @@ for (const [source, expected] of Object.entries(hostedMergeGateTranslations)) {
   }
 }
 
+const workerPermissionTranslations: Record<string, string> = {
+  "Agent": "代理程式",
+  "An agent wants to run a command": "代理程式想要執行指令",
+  "Tool request:": "工具請求：",
+  "All agents": "所有代理程式",
+  "The agent may need permission again.": "代理程式之後可能需要再次取得權限。",
+  "An agent wants to run a command that can change or delete things.": "代理程式想要執行可能會變更或刪除資料的指令。",
+  "Saved command rules for Master and managed agents. A deny takes precedence over an allow; every rule applies within its working folder.": "已儲存的主控與受管代理程式指令規則。拒絕優先於允許；每條規則僅套用在其工作資料夾內。",
+};
+
+for (const [source, expected] of Object.entries(workerPermissionTranslations)) {
+  const translated = translateUiText(source, "zh-TW");
+  if (translated !== expected) {
+    throw new Error(`Expected zh-TW worker permission string "${source}" to be "${expected}", got "${translated}"`);
+  }
+}
+
 const canvasBrowserTranslations: Record<string, string> = {
   "Open Browser": "開啟瀏覽器",
   "Canvas": "畫布",

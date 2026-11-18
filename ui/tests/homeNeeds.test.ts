@@ -271,4 +271,39 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   equal(bad[0].action.type, "command", "a non-issue subject keeps the command");
 }
 
+// CAD-616: worker master_permission item carries worker owner, requestedBy, and agent-neutral title.
+{
+  const workerNeeds = homeNeeds([
+    row({
+      kind: "master_permission",
+      audience: "operator",
+      title: "worker-1 wants to run: ls -la",
+      age: 5,
+      agent: "worker-1",
+      subject: { kind: "permission", id: "perm-w1" },
+      permission: {
+        id: "perm-w1",
+        command: "ls -la",
+        cwd: "/tmp/wt",
+        reason: "Inspect files",
+        risk: "low",
+        status: "pending",
+        requested_by: "worker-1",
+        prefix: null,
+      },
+    }),
+  ]);
+  equal(workerNeeds[0].owner, "worker-1", "worker master_permission preserves worker alias owner");
+  equal(
+    workerNeeds[0].action.type === "permission" ? workerNeeds[0].action.requestedBy : null,
+    "worker-1",
+    "worker permission action records requestedBy",
+  );
+  equal(
+    kindSpec(workerNeeds[0]).title(workerNeeds[0], { issueTitle: null }),
+    "An agent wants to run a command",
+    "worker master_permission uses agent title",
+  );
+}
+
 console.log("home needs checks passed");

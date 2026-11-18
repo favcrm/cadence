@@ -242,12 +242,16 @@ pub fn allowed(pm: &Pm, caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
 pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
-    // CAD-615: the operator's permission rules. Not a knowledge page,
-    // not a profile write, not something the master can put.
-    if matches!(op, Op::Write | Op::Remove) && segs == ["agents", "master", "permissions.yaml"] {
-        return no(
-            "agents/master/permissions.yaml is operator-owned — only a permission decision writes it",
-        );
+    // CAD-615 / CAD-616: the operator's permission rules. Not a knowledge
+    // page, not a profile write, not something any agent or the operator can
+    // put via wiki.
+    if matches!(op, Op::Write | Op::Remove)
+        && matches!(segs, ["agents", alias, "permissions.yaml"] if !alias.is_empty())
+    {
+        let alias = segs[1];
+        return no(&format!(
+            "agents/{alias}/permissions.yaml is operator-owned — only a permission decision writes it"
+        ));
     }
     let top = segs.first().copied().unwrap_or("");
     match top {
@@ -3059,6 +3063,10 @@ mod tests {
             ),
             (&op, Op::Write, "agents/master/permissions.yaml", false),
             (&agent(), Op::Write, "agents/master/permissions.yaml", false),
+            (&op, Op::Write, "agents/w1/permissions.yaml", false),
+            (&op, Op::Remove, "agents/w1/permissions.yaml", false),
+            (&agent(), Op::Write, "agents/w1/permissions.yaml", false),
+            (&agent(), Op::Remove, "agents/w1/permissions.yaml", false),
             // agents/<a>/memory/: read-only view for everyone.
             (&public, Op::Read, "agents/swe-1/memory/cadence/x.md", true),
             (&op, Op::Write, "agents/swe-1/memory/cadence/x.md", false),

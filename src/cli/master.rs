@@ -194,9 +194,16 @@ pub(crate) enum MasterAction {
     RevokePermission {
         /// The rule id.
         id: String,
+        /// Agent alias owning the rule (defaults to searching all agents).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Pending requests and saved rules (operator only).
-    Permissions,
+    Permissions {
+        /// Filter pending requests and saved rules by agent alias.
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
@@ -362,10 +369,20 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             "master_permission_reject",
             json!({"id": id, "dont_ask_again": dont_ask_again}),
         )?,
-        MasterAction::RevokePermission { id } => {
-            client::rpc(state_dir, "master_permission_revoke", json!({"id": id}))?
+        MasterAction::RevokePermission { id, agent } => {
+            let mut params = json!({"id": id});
+            if let Some(who) = agent {
+                params["agent"] = json!(who);
+            }
+            client::rpc(state_dir, "master_permission_revoke", params)?
         }
-        MasterAction::Permissions => client::rpc(state_dir, "master_permission_list", json!({}))?,
+        MasterAction::Permissions { agent } => {
+            let mut params = json!({});
+            if let Some(who) = agent {
+                params["agent"] = json!(who);
+            }
+            client::rpc(state_dir, "master_permission_list", params)?
+        }
         MasterAction::Confinement => {
             let env = cadence_agent::adapter::ProviderEnv::default();
             let (confine, policy) =

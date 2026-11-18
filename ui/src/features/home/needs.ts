@@ -55,6 +55,7 @@ export type NeedAction =
       cwd: string;
       reason: string;
       risk: string;
+      requestedBy?: string;
       /** A narrowed prefix the operator can always-allow, when one is safe. */
       prefix: string[] | null;
       status: string;
@@ -144,10 +145,12 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
       cwd?: unknown;
       reason?: unknown;
       risk?: unknown;
+      requested_by?: unknown;
       prefix?: unknown;
       status?: unknown;
       decision_label?: unknown;
     };
+    agent?: unknown;
     reason?: unknown;
   };
   const key = row.subject ? `${row.subject.kind}:${row.subject.id}` : `${row.kind}:${index}`;
@@ -205,9 +208,10 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     const p = extra.permission ?? {};
     const id = str(p.id);
     const prefix = Array.isArray(p.prefix) ? p.prefix.filter((x): x is string => !!str(x)) : [];
+    const requestedBy = str(p.requested_by) ?? str(extra.agent) ?? "master";
     return {
       ...base,
-      owner: "master",
+      owner: requestedBy,
       summary: str(p.reason) ?? str(extra.reason),
       action: id
         ? {
@@ -218,6 +222,7 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
             reason: str(p.reason) ?? str(extra.reason) ?? "",
             // Only what the server states: an unstated risk is not "some risk".
             risk: str(p.risk) ?? "",
+            requestedBy,
             prefix: prefix.length > 0 ? prefix : null,
             status: str(p.status) ?? "pending",
             decisionLabel: str(p.decision_label) ?? "",
@@ -368,7 +373,7 @@ export const KIND_TABLE: Readonly<Record<string, KindSpec>> = {
     type: "ok",
     place: "inline",
     control: "Allow",
-    title: fixed("Master wants to run a command"),
+    title: (item) => (item.owner && item.owner !== "master" ? "An agent wants to run a command" : "Master wants to run a command"),
   },
   // CAD-2186: opens the detail drawer; nothing expands in the rail.
   staged_write: { type: "ok", place: "drawer", control: "Review", title: fixed("A write is waiting for your OK") },

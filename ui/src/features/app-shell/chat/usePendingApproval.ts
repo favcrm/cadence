@@ -12,6 +12,7 @@ import type { ThreadEntry } from "../../home/thread";
 export function usePendingPermissionRequest(
   entries: ThreadEntry[],
   enabled = true,
+  includeWorkerRequests = false,
 ): MasterPermissionRequest | null {
   const ids: string[] = [];
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -20,14 +21,17 @@ export function usePendingPermissionRequest(
     const id = permissionIdFromText(e.text);
     if (id !== null && !ids.includes(id)) ids.push(id);
   }
-  const key = enabled ? ids.join(",") : "";
+  const active = enabled && (includeWorkerRequests || ids.length > 0);
+  const key = active ? `${includeWorkerRequests ? "1" : "0"}:${ids.join(",")}` : "";
   const [pending, setPending] = useState<MasterPermissionRequest | null>(null);
   useEffect(() => {
     if (key === "") {
       setPending(null);
       return;
     }
-    const orderedIds = key.split(",");
+    const withWorkers = key.startsWith("1:");
+    const rawIds = key.slice(2);
+    const orderedIds = rawIds ? rawIds.split(",") : [];
     let alive = true;
     let revision = 0;
     const read = () => {
@@ -43,6 +47,15 @@ export function usePendingPermissionRequest(
             if (req?.status === "pending") {
               match = req;
               break;
+            }
+          }
+          if (match === null && withWorkers) {
+            for (let i = out.requests.length - 1; i >= 0; i--) {
+              const req = out.requests[i];
+              if (req?.status === "pending" && (req.requested_by ?? "master") !== "master") {
+                match = req;
+                break;
+              }
             }
           }
           setPending(match);
@@ -70,6 +83,10 @@ export function usePendingPermissionRequest(
  * or decided request bumps the master stamp) and on a local decision; no
  * timer. Ids are read from the newest permission entries first.
  */
-export function usePendingPermission(entries: ThreadEntry[], enabled = true): boolean {
-  return usePendingPermissionRequest(entries, enabled) !== null;
+export function usePendingPermission(
+  entries: ThreadEntry[],
+  enabled = true,
+  includeWorkerRequests = false,
+): boolean {
+  return usePendingPermissionRequest(entries, enabled, includeWorkerRequests) !== null;
 }

@@ -764,6 +764,39 @@ struct AlwaysReq {
 struct RejectReq {
     #[serde(default)]
     dont_ask_again: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RevokeReq {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+pub(super) fn list_permissions(state_dir: &std::path::Path, raw_query: &str) -> HttpResp {
+    let mut agent: Option<String> = None;
+    for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(decoded) = super::pct_decode(value) else {
+            return err_response(400, "invalid query parameter");
+        };
+        match key {
+            "agent" | "alias" => agent = Some(decoded),
+            _ => return err_response(400, "unsupported query parameter"),
+        }
+    }
+    let mut params = json!({});
+    if let Some(who) = agent.filter(|s| !s.is_empty()) {
+        params["agent"] = json!(who);
+    }
+    match client::rpc(state_dir, "master_permission_list", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_permission_list"),
+    }
 }
 
 pub(super) fn decide_permission(
@@ -792,14 +825,27 @@ pub(super) fn decide_permission(
             Err(resp) => return resp,
         },
         "reject" => match parse_json::<RejectReq>(&bytes) {
-            Ok(req) => json!({"id": id, "dont_ask_again": req.dont_ask_again}),
+            Ok(req) => {
+                let mut out = json!({"id": id, "dont_ask_again": req.dont_ask_again});
+                if let Some(why) = req.reason.filter(|s| !s.is_empty()) {
+                    out["reason"] = json!(why);
+                }
+                out
+            }
             Err(resp) => return resp,
         },
         "revoke" => {
+            let mut out = json!({"id": id});
             if !bytes.is_empty() && bytes != b"{}" {
-                return err_response(400, "revoke takes an empty body");
+                let req = match parse_json::<RevokeReq>(&bytes) {
+                    Ok(req) => req,
+                    Err(resp) => return resp,
+                };
+                if let Some(who) = req.agent.or(req.alias).filter(|s| !s.is_empty()) {
+                    out["agent"] = json!(who);
+                }
             }
-            json!({"id": id})
+            out
         }
         _ => return err_response(404, "no such permission route"),
     };

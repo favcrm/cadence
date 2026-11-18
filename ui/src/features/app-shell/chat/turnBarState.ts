@@ -92,6 +92,8 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
 
   if (pendingMessages.length > 0) return { kind: "sending" };
 
+  if (awaitingApproval) return { kind: "approval" };
+
   // A finished turn shows only when its result arrived while this surface
   // was open: a reload does not replay the last historic outcome. A
   // successful finish carries no state of its own — the reply is the

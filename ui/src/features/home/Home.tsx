@@ -44,7 +44,7 @@ import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
-import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import { askDraft, homeNeeds, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
@@ -954,7 +954,14 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
-  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false);
+  const hasPendingPermissionNeed = useMemo(
+    () =>
+      homeNeeds(overview.data?.needs_me).some(
+        (n) => n.kind === "master_permission" && n.action.type === "permission" && n.action.status === "pending",
+      ),
+    [overview.data?.needs_me],
+  );
+  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false, hasPendingPermissionNeed);
   const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
@@ -1515,10 +1522,10 @@ function MasterHome({
   const focusApprovalBar = useCallback(() => focusApprovalBarIn(dockRef.current), []);
 
   const rejectAndReplyDraft = useCallback(
-    (command: string) => {
+    (command: string, requestedBy?: string) => {
       if (effectiveReadOnly) return;
       const existing = composerDraftState("home").text;
-      setComposerDraft("home", appendRejectReplyDraft(existing, command));
+      setComposerDraft("home", appendRejectReplyDraft(existing, command, requestedBy));
       focusHomeComposer();
     },
     [effectiveReadOnly, focusHomeComposer],
@@ -1731,7 +1738,13 @@ function MasterHome({
                   ? aheadHref === "/" ? jumpToLatest : () => window.location.assign(aheadHref)
                   : undefined,
                 onReview: () => {
-                  const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-status='pending']");
+                  if (railCollapsed) {
+                    writeRailCollapsed(false);
+                    setRailCollapsed(false);
+                  }
+                  const card =
+                    scrollRef.current?.querySelector<HTMLElement>("[data-permission-status='pending']") ??
+                    document.querySelector<HTMLElement>("[data-permission-status='pending']");
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
                 },
               }}
@@ -1740,7 +1753,7 @@ function MasterHome({
                   ? {
                       request: pendingPermission,
                       readOnly: effectiveReadOnly,
-                      onRejectAndReply: (req) => rejectAndReplyDraft(req.command),
+                      onRejectAndReply: (req) => rejectAndReplyDraft(req.command, req.requested_by),
                       onFocusComposer: focusHomeComposer,
                     }
                   : null

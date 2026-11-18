@@ -695,6 +695,9 @@ impl Shared {
             .ok_or_else(|| Error::internal("issue start returned no worktree"))?;
         let mut launch = serde_json::Map::new();
         launch.insert("upstream".to_string(), json!(group));
+        if provider == "claude" && kind == "managed" {
+            launch.insert("broker_approvals".to_string(), json!(true));
+        }
         if let Some(model) = model {
             launch.insert("model".to_string(), json!(model));
         }

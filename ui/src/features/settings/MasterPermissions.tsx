@@ -47,6 +47,8 @@ function ruleCountLine(visible: number, total: number, lastKnown: boolean, refre
   return line.replace("{visible}", String(visible)).replace("{total}", String(total));
 }
 
+const ruleKey = (rule: MasterPermissionRule) => `${rule.agent ?? "master"}:${rule.id}`;
+
 function RuleRow({
   rule,
   confirming,
@@ -97,6 +99,9 @@ function RuleRow({
           <span className="permission-effect" data-effect={rule.effect}>
             {rule.effect === "allow" ? t("Allow") : t("Deny")}
           </span>
+          <span className="permission-agent" data-agent={rule.agent || "master"}>
+            <bdi>{cleanPermissionInline(rule.agent || "master")}</bdi>
+          </span>
           <span>{t(scopeLabel(rule))}</span>
         </div>
         <code className="permission-command"><bdi>{formatRuleCommand(rule)}</bdi></code>
@@ -126,6 +131,12 @@ function RuleRow({
                 <dt>{t("Rule ID")}</dt>
                 <dd>
                   <code><bdi>{cleanPermissionInline(rule.id)}</bdi></code>
+                </dd>
+              </div>
+              <div>
+                <dt>{t("Agent")}</dt>
+                <dd>
+                  <code><bdi>{cleanPermissionInline(rule.agent || "master")}</bdi></code>
                 </dd>
               </div>
               <div>
@@ -163,7 +174,12 @@ function RuleRow({
             aria-describedby={`${id}-confirm`}
           >
             <p id={`${id}-confirm`}>
-              {t("Revoke this {effect} rule?").replace("{effect}", () => String(rule.effect ?? ""))} {rule.effect === "deny" ? t("This removes this restriction; an allow rule may then apply.") : t("The master may need permission again.")}{" "}
+              {t("Revoke this {effect} rule?").replace("{effect}", () => String(rule.effect ?? ""))}{" "}
+              {rule.effect === "deny"
+                ? t("This removes this restriction; an allow rule may then apply.")
+                : rule.agent && rule.agent !== "master"
+                  ? t("The agent may need permission again.")
+                  : t("The master may need permission again.")}{" "}
               {t("Takes effect on the next check.")}
             </p>
             <div>
@@ -209,6 +225,7 @@ function RuleWorkspace({
   const [fetching, setFetching] = useState(true);
   const [confirm, setConfirm] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [agentFilter, setAgentFilter] = useState("");
   const [effect, setEffect] = useState("");
   const [scope, setScope] = useState("");
   const alive = useRef(false);
@@ -261,7 +278,7 @@ function RuleWorkspace({
   }, [flight.busy, load]);
   useEffect(() => {
     setConfirm(null);
-  }, [readOnly, query, effect, scope]);
+  }, [readOnly, query, agentFilter, effect, scope]);
   useLayoutEffect(() => {
     if (flight.busy || !restoreAfterWrite.current || (!notice && !actionError))
       return;
@@ -273,7 +290,8 @@ function RuleWorkspace({
   const disabled =
     !!blocked || !!flight.busy || fetching || !!readError || rules === null;
   const revoke = async (rule: MasterPermissionRule) => {
-    if (disabled || confirm !== rule.id || !flight.begin(rule.id)) return;
+    const key = ruleKey(rule);
+    if (disabled || confirm !== key || !flight.begin(key)) return;
     restoreAfterWrite.current = true;
     ++request.current;
     setFetching(true);
@@ -281,10 +299,10 @@ function RuleWorkspace({
     setNotice(null);
     setActionError(null);
     try {
-      await api.permissionRevoke(rule.id);
+      await api.permissionRevoke(rule.id, rule.agent && rule.agent !== "master" ? rule.agent : undefined);
       if (!alive.current) return;
       setRules(
-        (previous) => previous?.filter((saved) => saved.id !== rule.id) ?? null,
+        (previous) => previous?.filter((saved) => ruleKey(saved) !== key) ?? null,
       );
       setNotice({ key: "revoked", id: rule.id });
     } catch (error) {
@@ -293,18 +311,27 @@ function RuleWorkspace({
       flight.finish();
     }
   };
-  const filtered = !!(query.trim() || effect || scope);
+  const agentOptions = [
+    { value: "", label: t("All agents") },
+    ...Array.from(new Set(["master", ...(rules ?? []).map((rule) => rule.agent || "master")])).map((agent) => ({
+      value: agent,
+      label: agent,
+    })),
+  ];
+  const filtered = !!(query.trim() || agentFilter || effect || scope);
   const visible = (rules ?? []).filter(
     (rule) =>
+      (!agentFilter || (rule.agent || "master") === agentFilter) &&
       (!effect || effect === rule.effect) &&
       (!scope || scope === rule.scope) &&
-      [rule.id, rule.by, rule.cwd, ...rule.argv, ...rule.tail]
+      [rule.id, rule.agent || "master", rule.by, rule.cwd, ...rule.argv, ...rule.tail]
         .join(" ")
         .toLowerCase()
         .includes(query.trim().toLowerCase()),
   );
   const clear = () => {
     setQuery("");
+    setAgentFilter("");
     setEffect("");
     setScope("");
   };
@@ -324,6 +351,16 @@ function RuleWorkspace({
               onChange={(event) => setQuery(event.target.value)}
             />
           </div>
+        </div>
+        <div className="permission-filter">
+          <label htmlFor={`${filterId}-agent`}>{t("Agent")}</label>
+          <Select
+            id={`${filterId}-agent`}
+            value={agentFilter}
+            onChange={setAgentFilter}
+            options={agentOptions}
+            full
+          />
         </div>
         <div className="permission-filter">
           <label htmlFor={`${filterId}-effect`}>{t("Effect")}</label>
@@ -413,23 +450,26 @@ function RuleWorkspace({
         </div>
       ) : (
         <ul className="permission-list" role="list" aria-busy={fetching}>
-          {visible.map((rule) => (
-            <RuleRow
-              key={rule.id}
-              rule={rule}
-              confirming={confirm === rule.id}
-              disabled={disabled}
-              busy={flight.busy === rule.id}
-              onRevoke={() => {
-                if (!disabled) {
-                  setConfirm(rule.id);
-                  setActionError(null);
-                }
-              }}
-              onCancel={() => setConfirm(null)}
-              onConfirm={() => void revoke(rule)}
-            />
-          ))}
+          {visible.map((rule) => {
+            const key = ruleKey(rule);
+            return (
+              <RuleRow
+                key={key}
+                rule={rule}
+                confirming={confirm === key}
+                disabled={disabled}
+                busy={flight.busy === key}
+                onRevoke={() => {
+                  if (!disabled) {
+                    setConfirm(key);
+                    setActionError(null);
+                  }
+                }}
+                onCancel={() => setConfirm(null)}
+                onConfirm={() => void revoke(rule)}
+              />
+            );
+          })}
         </ul>
       )}
     </>
@@ -455,7 +495,7 @@ export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
     <main className="permissions-workspace" data-settings="permissions">
       <header className="permissions-heading">
         <h1>{t("Master permissions")}</h1>
-        <p>{t("Saved command rules for the master. A deny takes precedence over an allow; every rule applies within its working folder.")}</p>
+        <p>{t("Saved command rules for Master and managed agents. A deny takes precedence over an allow; every rule applies within its working folder.")}</p>
       </header>
       {viewer.operator || (viewer.boardReadOnly && viewer.signedIn) ? (
         <RuleWorkspace

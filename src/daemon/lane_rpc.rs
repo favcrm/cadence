@@ -660,6 +660,9 @@ impl Shared {
         let spec = crate::adapter::registry::spec(provider, kind)?;
         let mut launch = Map::new();
         launch.insert("upstream".to_string(), json!(lane.group));
+        if provider == "claude" && kind == "managed" {
+            launch.insert("broker_approvals".to_string(), json!(true));
+        }
         if let Some(model) = model {
             if spec.launch_params.contains(&"model") {
                 launch.insert("model".to_string(), json!(model));
