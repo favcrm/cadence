@@ -118,25 +118,32 @@ function PdfPageDialog({ source, target, title, close }: {
     }
     const scope = new AbortController();
     mount.current = scope.signal;
+    let op: PrivateOperation | undefined;
+    const failLoad = () => {
+      op?.dispose();
+      if (!scope.signal.aborted) setError("This PDF couldn’t be opened. It may be unavailable, damaged, or password-protected.");
+    };
+    // A dynamic import cannot be aborted; show the refusal at the deadline
+    // even when the browser is still waiting for the renderer chunk.
+    const deadline = setTimeout(failLoad, STEP_TIMEOUT);
     async function load() {
-      let op: PrivateOperation | undefined;
-      const deadline = setTimeout(() => op?.dispose(), STEP_TIMEOUT);
       try {
         op = beginPrivateOperation(scope.signal);
         operation.current = op;
         const [{ loadPdfPages }, bytes] = await Promise.all([import("./pdfPageImages"), readPdf(original, op)]);
+        op.assertCurrent();
         const loaded = await loadPdfPages(bytes, op.signal);
         op.assertCurrent();
         setPdf(loaded);
       } catch {
-        op?.dispose();
-        if (!scope.signal.aborted) setError("This PDF couldn’t be opened. It may be unavailable, damaged, or password-protected.");
+        failLoad();
       } finally {
         clearTimeout(deadline);
       }
     }
     void load();
     return () => {
+      clearTimeout(deadline);
       scope.abort();
       operation.current?.dispose();
       operation.current = null;
