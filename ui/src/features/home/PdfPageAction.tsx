@@ -1,4 +1,4 @@
-import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
+import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
@@ -8,7 +8,7 @@ import { ATTACH_MAX_BYTES, ATTACH_MAX_FILES, type AttachDestination } from "../a
 import { activeComposerSlot, addFiles, attachItems, subscribeAttach } from "../app-shell/chat/composerStore";
 import { WorkspaceDialog } from "../workspace-apps/WorkspaceDialog";
 import "../workspace-apps/workspace-apps.css";
-import { attachmentHref, type AttachmentFile } from "./AttachmentMedia";
+import { attachmentHref, openAttachmentInTab, type AttachmentFile } from "./AttachmentMedia";
 import type { LoadedPdfPages } from "./pdfPageImages";
 
 interface PageTarget {
@@ -67,24 +67,27 @@ async function readPdf({ file, conversation }: PageSource, operation: PrivateOpe
   return bytes;
 }
 
-export default function PdfPageAction({ source, target }: { source: PageSource; target: PageTarget }) {
-  const t = useTranslate();
+export default function PdfPageAction({ source, target, tileTitle, children }: {
+  source: PageSource;
+  target: PageTarget;
+  tileTitle: string;
+  children: ReactNode;
+}) {
   const [open, setOpen] = useState(false);
-  const label = t("Attach pages as images");
   return (
     <>
-      <Button size="sm" variant="ghost" aria-label={`${label}: ${source.file.name}`} onClick={() => setOpen(true)}>
-        {label}
-      </Button>
-      {open && createPortal(<PdfPageDialog source={source} target={target} title={label} close={() => setOpen(false)} />, document.body)}
+      <button type="button" className="sentchip" data-kind="pdf" title={tileTitle}
+        aria-haspopup="dialog" onClick={() => setOpen(true)}>
+        {children}
+      </button>
+      {open && createPortal(<PdfPageDialog source={source} target={target} close={() => setOpen(false)} />, document.body)}
     </>
   );
 }
 
-function PdfPageDialog({ source, target, title, close }: {
+function PdfPageDialog({ source, target, close }: {
   source: PageSource;
   target: PageTarget;
-  title: string;
   close: () => void;
 }) {
   const t = useTranslate();
@@ -189,9 +192,14 @@ function PdfPageDialog({ source, target, title, close }: {
   }
 
   return (
-    <WorkspaceDialog title={title} onClose={close}>
+    <WorkspaceDialog title={t("Attach pages as images")} onClose={close}>
       <form className="grid gap-3" onSubmit={(event) => void submit(event)}>
-        <p className="m-0 min-w-0 truncate" title={original.file.name}>{original.file.name}</p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="m-0 min-w-0 truncate" title={original.file.name}>{original.file.name}</p>
+          <Button size="sm" onClick={() => openAttachmentInTab(original.file.id, original.conversation)}>
+            {t("Open original PDF")}
+          </Button>
+        </div>
         {!pdf && !error && <p className="m-0" role="status">{t("Opening PDF…")}</p>}
         {pdf && <>
           <label className="grid gap-1" htmlFor={id}>

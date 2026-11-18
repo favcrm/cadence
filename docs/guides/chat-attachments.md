@@ -377,11 +377,12 @@ keeps the metadata chips there without requesting attachment bytes.
 
 ### Give the assistant selected PDF pages as images
 
-On the hosted board, choose **Attach pages as images** on a PDF already in the
-conversation. Enter page numbers and ranges, for example `1, 3–5`. Duplicates
-are removed and the selected pages are attached as separate PNGs in document
-order. The batch must fit in the draft’s five attachment slots. The original PDF
-stays in the conversation; draft PDFs attach and send normally.
+On the hosted board, click the name of a PDF already in the conversation.
+In the dialog, enter page numbers and ranges, for example `1, 3–5`, and choose
+**Add to draft**. Duplicates are removed and the selected pages are attached
+as separate PNGs in document order. The batch must fit in the draft’s five
+attachment slots. **Open original PDF** opens the unchanged file. Draft PDFs
+attach and send normally.
 
 Your browser renders the pages locally, including scans, then uploads the PNGs
 through the normal private attachment queue. Converting never sends a message

@@ -719,23 +719,26 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
               </span>
             </>
           );
-          const canCapturePages = sent && pageTarget?.destination.conversation === conversation && pageTarget !== null;
-          return f.mime === "application/pdf" && conversation !== null && (hosted || canCapturePages) ? (
-            <span key={f.id} className="inline-flex min-w-0 flex-wrap items-center gap-1">
-              <button
-                type="button"
-                className="sentchip"
-                data-kind={fileKind(f.mime)}
-                title={`${title} — ${t("(opens in a new tab)")}`}
-                onClick={() => openAttachmentInTab(f.id, conversation)}
-              >
-                {body}
-              </button>
-              {canCapturePages && (
-                <PdfPageAction key={`${pageTarget.key}:${conversation}`} source={{ file: f, conversation }} target={pageTarget} />
-              )}
-            </span>
-          ) : (
+          if (f.mime === "application/pdf" && conversation !== null) {
+            if (sent && pageTarget?.destination.conversation === conversation) {
+              return (
+                <PdfPageAction key={`${f.id}:${pageTarget.key}:${conversation}`} source={{ file: f, conversation }}
+                  target={pageTarget} tileTitle={title}>
+                  {body}
+                </PdfPageAction>
+              );
+            }
+            if (hosted) {
+              return (
+                <button key={f.id} type="button" className="sentchip" data-kind="pdf"
+                  title={`${title} — ${t("(opens in a new tab)")}`}
+                  onClick={() => openAttachmentInTab(f.id, conversation)}>
+                  {body}
+                </button>
+              );
+            }
+          }
+          return (
             <span key={f.id} className="sentchip" data-kind={fileKind(f.mime)} title={title}>
               {body}
             </span>

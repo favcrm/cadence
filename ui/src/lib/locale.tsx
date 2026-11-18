@@ -2315,6 +2315,7 @@ Object.assign(zhTW, {
   "A preview is not available yet. Open in a new tab or use Download.": "目前尚未提供內嵌預覽，請在新分頁開啟或下載。",
   // CAD-2433: operator-side PDF page images.
   "Attach pages as images": "將頁面附加為圖片",
+  "Open original PDF": "開啟原始 PDF",
   "Pages": "頁碼",
   "Add to draft": "加入草稿",
   "Opening PDF…": "正在開啟 PDF…",
