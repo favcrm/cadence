@@ -28,7 +28,7 @@ export function RecordCard({ entry, density = "full" }: { entry: ThreadEntry; de
   const t = useTranslate();
   const model = parseRecordRef(entry);
   const layout = model ? recordLayout(model, { yes: t("Yes"), no: t("No") }) : null;
-  if (!model || !layout) return <p className="text-micro text-ink-500">· {plainText(entry.text, 500)}</p>;
+  if (!model || !layout) return <p className="text-micro text-ink-500 break-words">· {plainText(entry.text, 500)}</p>;
   return (
     <TurnCard
       kind="record"
