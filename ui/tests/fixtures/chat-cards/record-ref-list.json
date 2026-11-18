@@ -7,16 +7,51 @@
     "toolkit": "synthetic_crm",
     "tool": "synthetic_crm_list_contacts",
     "items": [
-      { "id": "c_1001", "name": "Alex Example", "visits": 4, "tags": ["vip"] },
-      { "id": "c_1002", "name": "Sam Sample", "visits": 1, "tags": [] }
+      {
+        "id": "c_1001",
+        "name": "Alex Example",
+        "visits": 4,
+        "tags": ["vip"]
+      },
+      {
+        "id": "c_1002",
+        "name": "Sam Sample",
+        "visits": 1,
+        "tags": []
+      }
     ],
     "fields": [
-      { "key": "id", "label": "ID", "type": "string", "untrusted": false },
-      { "key": "name", "label": "Name", "type": "string", "untrusted": true },
-      { "key": "visits", "label": "Visits", "type": "integer", "untrusted": false },
-      { "key": "tags", "label": "Tags", "type": "string_array", "untrusted": true }
+      {
+        "key": "id",
+        "label": "ID",
+        "type": "string",
+        "untrusted": false
+      },
+      {
+        "key": "name",
+        "label": "Name",
+        "type": "string",
+        "untrusted": true
+      },
+      {
+        "key": "visits",
+        "label": "Visits",
+        "type": "integer",
+        "untrusted": false
+      },
+      {
+        "key": "tags",
+        "label": "Tags",
+        "type": "string_array",
+        "untrusted": true
+      }
     ],
     "view": "list",
+    "roles": {
+      "title": "name",
+      "subtitle": "id",
+      "badge": "tags"
+    },
     "truncated": true
   }
 }

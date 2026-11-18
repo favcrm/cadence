@@ -3395,3 +3395,18 @@ button.turnsource:hover {
 .chatcard .turncard-head { margin-bottom: 0; }
 .chatcard .turncard-kind { flex: none; }
 .chatcard .btn { height: auto; min-height: 2rem; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+
+/* CAD-2452: record card roles layouts (list rows with chips, thread bubbles). */
+.recordcard-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .125rem .625rem; }
+.recordcard-row-main { display: grid; gap: .0625rem; min-width: 0; }
+.recordcard-title { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 600; overflow-wrap: anywhere; }
+.recordcard-subtitle { color: var(--color-ink-400); font-size: var(--text-micro); overflow-wrap: anywhere; }
+.recordcard-snippet { color: var(--color-ink-300); font-size: var(--text-label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recordcard-row-side { display: grid; justify-items: end; gap: .0625rem; max-width: 9rem; text-align: right; }
+.recordcard-time { color: var(--color-ink-500); font-size: var(--text-micro); overflow-wrap: anywhere; }
+.recordcard-amount { color: var(--color-ink-100); font-size: var(--text-label); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.recordcard-chips { display: flex; flex-wrap: wrap; grid-column: 1 / -1; gap: .25rem; }
+.recordcard-chip { max-width: 100%; padding: 0 .375rem; border: 1px solid var(--color-ink-700); border-radius: 999px; color: var(--color-ink-300); font-size: var(--text-micro); overflow-wrap: anywhere; }
+.recordcard-bubbles > li { justify-self: start; }
+.recordcard-bubbles > li[data-own] { justify-self: end; background: color-mix(in srgb, var(--color-accent) 16%, var(--color-ink-850)); }
+.recordcard-bubbles > li[data-own] .recordcard-meta { text-align: right; }

@@ -1,5 +1,5 @@
 /** CAD-2443: connect_ref / record_ref parsing and layout, against the shared agenticos-v2 fixtures. */
-import { CELL_MAX_CHARS, cellText, parseConnectRef, parseRecordRef, plainText, recordLayout } from "../src/features/home/chatCards";
+import { CELL_MAX_CHARS, cellText, parseConnectRef, parseInstant, parseRecordRef, plainText, recordLayout } from "../src/features/home/chatCards";
 import { asEntry, mergePage, threadItems, threadRuns } from "../src/features/home/thread";
 
 export {};
@@ -46,33 +46,81 @@ equal(parseRecordRef(entryOf(connect)), null, "a connect entry is not a record")
 const list = parseRecordRef(entryOf(fixture("record-ref-list")));
 assert(list, "list parses");
 equal([list.view, list.truncated, list.tool, list.items.length], ["list", true, "synthetic_crm_list_contacts", 2], "list model");
-const listLayout = recordLayout(list);
-equal(listLayout, {
+equal(recordLayout(list), {
+  view: "role-list",
+  rows: [
+    { title: "Alex Example", subtitle: "c_1001", snippet: "", time: null, chips: ["vip"], amount: "" },
+    { title: "Sam Sample", subtitle: "c_1002", snippet: "", time: null, chips: [], amount: "" },
+  ],
+}, "list layout from roles");
+const generic = { ...list, roles: null };
+equal(recordLayout(generic), {
   view: "list",
   rows: [
     [{ label: "ID", value: "c_1001" }, { label: "Name", value: "Alex Example" }, { label: "Visits", value: "4" }, { label: "Tags", value: "vip" }],
     [{ label: "ID", value: "c_1002" }, { label: "Name", value: "Sam Sample" }, { label: "Visits", value: "1" }],
   ],
-}, "list layout drops empty values");
+}, "list without roles is the generic typed rows");
 
 // record_ref thread
 const thread = parseRecordRef(entryOf(fixture("record-ref-thread")));
 assert(thread, "thread parses");
 equal(recordLayout(thread), {
+  view: "role-thread",
+  messages: [
+    { actor: "", time: { text: "2026-11-18T01:00:00Z", instant: Date.parse("2026-11-18T01:00:00Z") }, text: "Is my order ready?", own: false },
+    { actor: "", time: { text: "2026-11-18T01:02:00Z", instant: Date.parse("2026-11-18T01:02:00Z") }, text: "Yes, ready for pickup.", own: true },
+  ],
+}, "thread bubbles: side.self is the own side");
+equal(recordLayout({ ...thread, roles: null }), {
   view: "thread",
   messages: [
     { sender: "in", time: "2026-11-18T01:00:00Z", text: "Is my order ready?", outbound: false },
     { sender: "out", time: "2026-11-18T01:02:00Z", text: "Yes, ready for pickup.", outbound: true },
   ],
-}, "thread layout");
+}, "thread without roles keeps the heuristic layout");
 const noText = clone(thread);
 noText.fields = noText.fields.filter((f) => f.key !== "text");
+noText.roles = null;
 equal(recordLayout(noText), null, "a thread with no text field falls back");
 
 // table: key/value of the first item
-const table = { ...list, view: "table" as const };
+const tableFixture = parseRecordRef(entryOf(fixture("record-ref-table")));
+assert(tableFixture, "table fixture parses");
+equal(tableFixture.roles, null, "the table fixture has no roles");
+equal(recordLayout(tableFixture, { yes: "Yes", no: "No" }), { view: "table", pairs: [{ label: "Order", value: "o_501" }, { label: "Total", value: "42" }, { label: "Paid", value: "Yes" }] }, "table fixture layout");
+const table = { ...generic, view: "table" as const };
 equal(recordLayout(table), { view: "table", pairs: [{ label: "ID", value: "c_1001" }, { label: "Name", value: "Alex Example" }, { label: "Visits", value: "4" }, { label: "Tags", value: "vip" }] }, "table layout");
 equal(recordLayout({ ...table, items: [] }), null, "an empty table falls back");
+
+// roles: instants, chips, amount, own side, hostile text, strict parsing
+const NOW = Date.parse("2026-11-18T01:00:00Z");
+equal([parseInstant("2026-11-18T01:00:00Z"), parseInstant(1_790_000_000), parseInstant(1_790_000_000_000), parseInstant("1790000000"), parseInstant("yesterday"), parseInstant("12"), parseInstant(null)], [NOW, 1_790_000_000_000, 1_790_000_000_000, 1_790_000_000_000, null, null, null], "instants");
+const rich = clone(list) as any;
+rich.fields.push({ ...rich.fields[1], key: "state" }, { ...rich.fields[1], key: "due" }, { ...rich.fields[1], key: "price" });
+rich.items[0] = { ...rich.items[0], state: "open", due: "next week", price: "HK$12" };
+rich.roles = { title: "name", snippet: "tags", time: "due", status: "state", amount: "price" };
+const richLayout = recordLayout(rich);
+assert(richLayout && richLayout.view === "role-list", "rich list");
+equal(richLayout.rows[0], { title: "Alex Example", subtitle: "", snippet: "vip", time: { text: "next week", instant: null }, chips: ["open"], amount: "HK$12" }, "all list roles; time as given");
+const hostile = "[x](https://e.test) **b** " + "A".repeat(2000);
+const hostileModel = clone(list) as any;
+hostileModel.items[0].name = hostile;
+const hostileRows = recordLayout(hostileModel) as any;
+equal(hostileRows.rows[0].title.length, CELL_MAX_CHARS, "role-mapped untrusted text is capped");
+assert(hostileRows.rows[0].title.startsWith("[x](https://e.test) **b**"), "role-mapped text stays literal");
+const rolesOf = (roles: unknown) => { const e = clone(fixture("record-ref-list")) as any; e.payload.roles = roles; return parseRecordRef(entryOf(e)); };
+for (const [what, roles] of [
+  ["unknown role", { colour: "name" }],
+  ["a key that is not a field", { title: "nope" }],
+  ["side without self", { side: { key: "name", self: [] } }],
+  ["side naming no field", { side: { key: "zzz", self: ["a"] } }],
+  ["extra side key", { side: { key: "name", self: ["a"], more: 1 } }],
+  ["non-string role", { title: 3 }],
+  ["roles not an object", "name"],
+] as const) equal(rolesOf(roles), null, `record rejects roles: ${what}`);
+equal(rolesOf({})?.roles, {}, "empty roles parse");
+equal(recordLayout(rolesOf({ side: { key: "name", self: ["x"] } })!)?.view, "list", "roles with no layout role fall back to the generic rows");
 
 // strict narrowing: any malformed payload is null, never partial
 const listFixture = fixture("record-ref-list") as any;

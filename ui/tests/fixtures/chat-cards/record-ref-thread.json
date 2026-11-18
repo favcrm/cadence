@@ -7,15 +7,46 @@
     "toolkit": "synthetic_chat",
     "tool": "synthetic_chat_list_messages",
     "items": [
-      { "direction": "in", "text": "Is my order ready?", "sent_at": "2026-11-18T01:00:00Z" },
-      { "direction": "out", "text": "Yes, ready for pickup.", "sent_at": "2026-11-18T01:02:00Z" }
+      {
+        "direction": "in",
+        "text": "Is my order ready?",
+        "sent_at": "2026-11-18T01:00:00Z"
+      },
+      {
+        "direction": "out",
+        "text": "Yes, ready for pickup.",
+        "sent_at": "2026-11-18T01:02:00Z"
+      }
     ],
     "fields": [
-      { "key": "direction", "label": "Direction", "type": "string", "untrusted": false },
-      { "key": "text", "label": "Message", "type": "string", "untrusted": true },
-      { "key": "sent_at", "label": "Sent", "type": "string", "untrusted": false }
+      {
+        "key": "direction",
+        "label": "Direction",
+        "type": "string",
+        "untrusted": false
+      },
+      {
+        "key": "text",
+        "label": "Message",
+        "type": "string",
+        "untrusted": true
+      },
+      {
+        "key": "sent_at",
+        "label": "Sent",
+        "type": "string",
+        "untrusted": false
+      }
     ],
     "view": "thread",
+    "roles": {
+      "snippet": "text",
+      "time": "sent_at",
+      "side": {
+        "key": "direction",
+        "self": ["out"]
+      }
+    },
     "truncated": false
   }
 }
