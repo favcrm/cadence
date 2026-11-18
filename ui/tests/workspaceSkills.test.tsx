@@ -275,6 +275,7 @@ async function main() {
   assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [] })?.n === 0, "zero agents is still said");
   assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [user as never] })?.text === "Used by {n} agent", "one agent is singular");
   assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [user as never, user as never] })?.text === "Used by {n} agents", "two agents are plural");
+  assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [user as never, { ...user, profile_id: "p_old", status: "archived" } as never] })?.n === 1, "archived agents are not counted on the row");
   assert(W.isBuiltIn("cadence") && !W.isBuiltIn("weekly-report"), "a bundled skill is built in, a workspace one is not");
   const counted = W.assignedCount(["weekly-report", "copywriting", "pricing-check"], library);
   assert(counted.assigned === 1 && counted.approved === 2, "N counts approved assigned skills, M approved ones in the workspace");
@@ -329,7 +330,7 @@ async function main() {
   // ---- member: everything visible, nothing changeable ----
   await mount(false);
   assert(/1 of 2 on/.test(host.querySelector("h3")?.parentElement?.textContent ?? ""), "the header counts skills that are on, of approved");
-  assert(/Used by 9 agents/.test(row("weekly-report")?.textContent ?? "") && /Used by 1 agent(?!s)/.test(row("tone-guide")?.textContent ?? ""), "rows say how many agents use them");
+  assert(/Used by 8 agents/.test(row("weekly-report")?.textContent ?? "") && /Used by 1 agent(?!s)/.test(row("tone-guide")?.textContent ?? ""), "rows say how many agents use them");
   assert(!/Used by/.test(row("pricing-check")?.textContent ?? ""), "a skill without used_by has no note");
   await click(row("weekly-report"), "the weekly-report row");
   assert(drawer()?.getAttribute("aria-label") === "weekly-report" && /Approved · rev 1/.test(drawer()?.querySelector(".crm-drawer-pills")?.textContent ?? ""), "the panel's header names the skill and its status");

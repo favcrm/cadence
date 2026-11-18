@@ -169,7 +169,9 @@ export function assignedCount(profileSkills: string[], library: WorkspaceSkillSu
 /** "Used by N agents" for a row, in English for `t`; null when the board did not say. */
 export function usedByNote(skill: WorkspaceSkillSummary): { text: string; n: number } | null {
   if (skill.used_by === undefined) return null;
-  return { text: skill.used_by.length === 1 ? "Used by {n} agent" : "Used by {n} agents", n: skill.used_by.length };
+  // Active agents only, as the panel counts them; archived ones are in its Used by tab.
+  const n = skill.used_by.filter((user) => user.status !== "archived").length;
+  return { text: n === 1 ? "Used by {n} agent" : "Used by {n} agents", n };
 }
 
 /** Names the profile lists that no approved workspace skill answers. */
