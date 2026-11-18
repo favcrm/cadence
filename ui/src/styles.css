@@ -3172,7 +3172,9 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 }
 .answer-fail-title {
   display: block;
-  color: var(--color-fail);
+  /* Toward the text ink: darker red in light, lighter in dark, so the 14px
+     title also clears 4.5:1 on the tint (pure fail red was 4.27:1 in light). */
+  color: color-mix(in srgb, var(--color-fail) 75%, var(--color-ink-100));
   font-weight: 600;
 }
 .answer-fail-body {
