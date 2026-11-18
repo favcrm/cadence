@@ -21,8 +21,9 @@ export function itemCreated(item: ThreadItem): number | null {
   return null;
 }
 
-/** "Today", "Yesterday", or the local date with its weekday in the board's
- *  language (CAD-2363), with the year when it differs. */
+/** The local date with its weekday in the board's language (CAD-2363), with
+ *  the year when it differs. CAD-2425: "Today" and "Yesterday" lead it rather
+ *  than replace it, so a recent day still says which date it was. */
 export function dayText(ms: number, now: number, t: (key: string) => string, locale: string = "en"): string {
   const day = new Date(ms);
   const today = new Date(now);
@@ -31,14 +32,15 @@ export function dayText(ms: number, now: number, t: (key: string) => string, loc
       new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime()) /
       86_400_000,
   );
-  if (diff === 0) return t("Today");
-  if (diff === 1) return t("Yesterday");
-  return day.toLocaleDateString(locale, {
+  const date = day.toLocaleDateString(locale, {
     weekday: "short",
     month: "short",
     day: "numeric",
     ...(day.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }),
   });
+  if (diff === 0) return `${t("Today")} · ${date}`;
+  if (diff === 1) return `${t("Yesterday")} · ${date}`;
+  return date;
 }
 
 /** A quiet day rule between two days of a transcript (CAD-1886). */

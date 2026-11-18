@@ -1589,6 +1589,9 @@ export interface ConnectionProvider {
     projected: boolean;
   } | null;
   verification_support?: ConnectionVerificationSupport | null;
+  /** CAD-2428: hosted platform toolkit details. Untrusted wire value — read it only through
+   *  `hostedProvider` (connectionsView), which treats a malformed shape as absent. */
+  hosted?: unknown;
 }
 
 export interface ConnectionProvidersPayload {
@@ -1738,6 +1741,33 @@ export interface Connection {
   };
   /** CAD-2317: personal vs shared access & safety policy. */
   policy?: ConnectionPolicy | null;
+  /** CAD-2428: hosted platform account details. Untrusted wire value — read it only through
+   *  `hostedAccount` (connectionsView), which treats a malformed shape as absent. */
+  hosted?: unknown;
+}
+
+/** CAD-2428: one published tool an account can run. draft/send always wait for approval. */
+export interface HostedTool {
+  slug: string;
+  label: string;
+  effect: "read" | "draft" | "send";
+}
+
+/** CAD-2428: the narrowed `Connection.hosted`. */
+export interface HostedAccount {
+  label: string;
+  visibility: "personal" | "shared";
+  connectedByYou: boolean;
+  connectedAt: number | null;
+  lastUsedAt: number | null;
+  canChangeVisibility: boolean;
+  tools: HostedTool[];
+}
+
+/** CAD-2428: the narrowed `ConnectionProvider.hosted`. */
+export interface HostedProvider {
+  label: string;
+  tools: HostedTool[];
 }
 
 export interface ConnectionPolicy {

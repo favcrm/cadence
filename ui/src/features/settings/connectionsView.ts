@@ -1,4 +1,10 @@
-import type { Connection, ConnectionProvider } from "../../lib/types";
+import type {
+  Connection,
+  ConnectionProvider,
+  HostedAccount,
+  HostedProvider,
+  HostedTool,
+} from "../../lib/types";
 import { isLocalOutbox } from "../../lib/connections";
 import { fmtTime } from "../../lib/fmt";
 
@@ -191,6 +197,170 @@ export interface ServiceGroup {
   connections: Connection[];
 }
 
+// CAD-2428 — hosted platform accounts. `hosted` is an additive, untrusted wire
+// field: every reader below narrows it strictly and treats a malformed value as
+// absent, so an older platform (or a bad payload) renders exactly as before.
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function nonEmpty(v: unknown): v is string {
+  return typeof v === "string" && v.trim() !== "";
+}
+
+function timeOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Valid tools only: an entry with an unknown effect is dropped, never shown as safe. */
+function narrowTools(v: unknown): HostedTool[] | null {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) return null;
+  const out: HostedTool[] = [];
+  for (const item of v) {
+    if (!isRecord(item) || !nonEmpty(item.slug)) continue;
+    const effect = item.effect;
+    if (effect !== "read" && effect !== "draft" && effect !== "send") continue;
+    out.push({ slug: item.slug, label: nonEmpty(item.label) ? item.label : item.slug, effect });
+  }
+  return out;
+}
+
+/** The narrowed `hosted` of an enrolled connection row, or null (absent or malformed). */
+export function hostedAccount(row: Pick<Connection, "hosted">): HostedAccount | null {
+  const h = row.hosted;
+  if (!isRecord(h) || !nonEmpty(h.label)) return null;
+  if (h.visibility !== "personal" && h.visibility !== "shared") return null;
+  const tools = narrowTools(h.tools);
+  if (tools === null) return null;
+  return {
+    label: h.label,
+    visibility: h.visibility,
+    connectedByYou: h.connected_by_you === true,
+    connectedAt: timeOrNull(h.connected_at),
+    lastUsedAt: timeOrNull(h.last_used_at),
+    canChangeVisibility: h.can_change_visibility === true,
+    tools,
+  };
+}
+
+/** The narrowed `hosted` of a provider row, or null (absent or malformed). */
+export function hostedProvider(provider: Pick<ConnectionProvider, "hosted"> | null): HostedProvider | null {
+  const h = provider?.hosted;
+  if (!isRecord(h) || !nonEmpty(h.label)) return null;
+  const tools = narrowTools(h.tools);
+  return tools === null ? null : { label: h.label, tools };
+}
+
+/** The Personal / Shared badge text for a hosted account. */
+export function visibilityBadge(h: Pick<HostedAccount, "visibility">): string {
+  return h.visibility === "shared" ? "Shared" : "Personal";
+}
+
+/** The visibility that groups a row: the hosted account's, else the board policy's. */
+export function rowVisibility(row: Connection): "personal" | "shared" {
+  return hostedAccount(row)?.visibility ?? (row.policy?.visibility === "personal" ? "personal" : "shared");
+}
+
+/** A provider's service name: the hosted toolkit label, else the provider's. */
+export function providerServiceLabel(provider: ConnectionProvider): string {
+  return hostedProvider(provider)?.label ?? serviceLabel(provider.provider);
+}
+
+/** The account line for a hosted row: "Gmail · chris@example.com", or just the label
+ *  when the account identity is not known (the platform then sends the label). */
+export function hostedAccountLine(row: Connection, h: HostedAccount): string {
+  return row.account === h.label || row.account.trim() === "" ? h.label : `${h.label} · ${row.account}`;
+}
+
+/** Draft and send tools always wait for the owner's approval. */
+export function toolAsksFirst(tool: Pick<HostedTool, "effect">): boolean {
+  return tool.effect !== "read";
+}
+
+/** One line for the Add page: "3 tools: 2 read, 1 asks you first". `tr` translates the
+ *  English templates (identity by default). */
+export function toolsSummary(
+  tools: readonly HostedTool[],
+  tr: (text: string) => string = (text) => text,
+): string | null {
+  if (tools.length === 0) return null;
+  const ask = tools.filter(toolAsksFirst).length;
+  const read = tools.length - ask;
+  const parts: string[] = [];
+  if (read > 0) parts.push(tr("{n} read").replace("{n}", String(read)));
+  if (ask > 0) parts.push(tr("{n} ask you first").replace("{n}", String(ask)));
+  return parts.join(" · ");
+}
+
+/**
+ * Does the board-local "Who can use this account" panel apply? Its Personal switch
+ * revokes the shared credential first, which for a hosted platform account would
+ * disconnect it — so it is never offered for an account that carries `hosted`.
+ */
+export function showsPolicyPanel(
+  row: Connection,
+  hostedBoard: boolean,
+): boolean {
+  return canManage(row) && !hostedBoard && hostedAccount(row) === null;
+}
+
+/** Epoch milliseconds as the shared `17 Sep 18:27` text. */
+export function hostedTime(ms: number): string {
+  return fmtTime(new Date(ms).toISOString());
+}
+
+export type HostedReturn = { outcome: "connected" | "failed"; toolkit: string };
+
+/** The `?aos_connect=…&toolkit=…` a hosted connect returns with. Anything else is not ours. */
+export function hostedReturn(search: string): HostedReturn | null {
+  const query = new URLSearchParams(search);
+  const outcome = query.get("aos_connect");
+  const toolkit = query.get("toolkit");
+  if (outcome !== "connected" && outcome !== "failed") return null;
+  return toolkit !== null && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(toolkit) ? { outcome, toolkit } : null;
+}
+
+/** The row a connected return refers to: that toolkit's hosted account, newest first. */
+export function returnedRow(rows: readonly Connection[], toolkit: string): Connection | null {
+  let best: Connection | null = null;
+  let bestAt = -1;
+  for (const row of rows) {
+    const h = hostedAccount(row);
+    if (row.provider !== toolkit || h === null) continue;
+    const at = h.connectedAt ?? 0;
+    if (at > bestAt) {
+      best = row;
+      bestAt = at;
+    }
+  }
+  return best;
+}
+
+/** The banner line: "Gmail connected · chris@example.com · Personal to you". The return URL is a
+ *  report from another origin, not evidence, so "connected" is only said once the account list
+ *  shows the account; until then the line is neutral. */
+export function connectedBannerText(
+  label: string,
+  row: Connection | null,
+  tr: (text: string) => string = (text) => text,
+): string {
+  const h = row === null ? null : hostedAccount(row);
+  if (row === null || h === null) {
+    return tr("{label} sign-in finished — check your accounts below").replace("{label}", label);
+  }
+  const parts = [tr("{label} connected").replace("{label}", label)];
+  if (row.account !== h.label && row.account.trim() !== "") parts.push(row.account);
+  parts.push(tr(h.visibility === "shared" ? "Shared with company" : "Personal to you"));
+  return parts.join(" · ");
+}
+
+/** A visibility change is confirmed only by exactly `{ok:true, visibility:<asked>}`. */
+export function visibilityConfirmed(reply: unknown, asked: "personal" | "shared"): boolean {
+  return isRecord(reply) && reply.ok === true && reply.visibility === asked;
+}
+
 export function serviceLabel(providerName: string): string {
   if (providerName === "smtp") return "Email (SMTP)";
   if (providerName === "agenticos" || providerName === "agenticos_external")
@@ -214,7 +384,7 @@ export function serviceGroups(
     const info = registered.get(name) ?? null;
     const g: ServiceGroup = {
       provider: name,
-      label: serviceLabel(name),
+      label: hostedProvider(info)?.label ?? serviceLabel(name),
       info,
       builtin: false,
       connections: [],

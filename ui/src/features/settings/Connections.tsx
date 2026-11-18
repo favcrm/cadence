@@ -5,7 +5,7 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
-import type { Connection, ConnectionProvider, ConnectionSite } from "../../lib/types";
+import type { Connection, ConnectionProvider, ConnectionSite, HostedAccount } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
@@ -19,19 +19,33 @@ import {
   capabilityWords,
   connectionCapabilities,
   connectionNeedsAttention,
+  connectedBannerText,
   enrollmentSupport,
+  hostedAccount,
+  hostedAccountLine,
+  hostedProvider,
+  hostedReturn,
+  hostedTime,
   isAvailable,
   pinWord,
+  providerServiceLabel,
   readinessText,
+  returnedRow,
+  rowVisibility,
   scopeHint,
   serviceGroups,
   serviceLabel,
+  showsPolicyPanel,
   smtpPortTlsError,
   smtpSummary,
   isSmtpSender,
   smtpUnreadable,
   smtpErrorMessage,
+  toolAsksFirst,
+  toolsSummary,
   verificationSupport,
+  visibilityBadge,
+  visibilityConfirmed,
   type VerificationOutcome,
 } from "./connectionsView";
 import { connectErrorText, PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
@@ -40,6 +54,7 @@ import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
 import SettingsDrawer from "./SettingsDrawer";
+import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { useTranslate } from "../../lib/locale";
@@ -337,6 +352,20 @@ function ConnectionsIndex({
   const groups = serviceGroups(providers, rows);
   const [openId, setOpenId] = useState<string | null>(null);
   const open = rows.find((row) => row.id === openId) ?? null;
+  // CAD-2428: a hosted connect returns here with `?aos_connect=…&toolkit=…`. The URL is read once,
+  // then dropped so a reload does not repeat the banner; the account shown comes from the list.
+  const [returned, setReturned] = useState(() =>
+    typeof window === "undefined" ? null : hostedReturn(window.location.search),
+  );
+  useEffect(() => {
+    if (returned === null) return;
+    navigate(
+      window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash,
+      { replace: true },
+    );
+  }, [returned]);
+  const newRow =
+    returned?.outcome === "connected" && viewer.operator ? returnedRow(rows, returned.toolkit) : null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -373,6 +402,14 @@ function ConnectionsIndex({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
+          {returned !== null && (
+            <HostedReturnBanner
+              returned={returned}
+              row={newRow}
+              provider={providers.find((p) => p.provider === returned.toolkit) ?? null}
+              onDismiss={() => setReturned(null)}
+            />
+          )}
           {!hostedBoard && (
             <div className="mb-3">
               <RecentCredentialRequestList />
@@ -413,6 +450,7 @@ function ConnectionsIndex({
                 <ConnectionsGroupedList
                   rows={rows}
                   groups={groups}
+                  highlightId={newRow?.id ?? null}
                   onOpen={(id) => setOpenId(id)}
                 />
               )}
@@ -423,7 +461,11 @@ function ConnectionsIndex({
             // typed credential or armed Disconnect must never carry over to another account.
             <SettingsDrawer
               key={open.id}
-              title={isSmtpSender(open) && open.smtp?.sender ? open.smtp.sender : open.account}
+              title={
+                isSmtpSender(open) && open.smtp?.sender
+                  ? open.smtp.sender
+                  : (hostedAccount(open)?.label ?? open.account)
+              }
               onClose={() => setOpenId(null)}
             >
               <ConnectionDetail
@@ -451,6 +493,44 @@ function ConnectionsIndex({
         </>
       )}
     </section>
+  );
+}
+
+/** CAD-2428: the return from a hosted connect — what happened, in the owner's words. */
+function HostedReturnBanner({
+  returned,
+  row,
+  provider,
+  onDismiss,
+}: {
+  returned: { outcome: "connected" | "failed"; toolkit: string };
+  row: Connection | null;
+  provider: ConnectionProvider | null;
+  onDismiss: () => void;
+}) {
+  const t = useTranslate();
+  const label =
+    (row ? hostedAccount(row)?.label : null) ??
+    (provider ? providerServiceLabel(provider) : serviceLabel(returned.toolkit));
+  const ok = returned.outcome === "connected";
+  return (
+    <div
+      className="card px-3 py-2 mb-3 flex flex-wrap items-center gap-2 min-w-0"
+      role={ok ? "status" : "alert"}
+      data-state={ok ? "hosted-connected" : "hosted-failed"}
+    >
+      <span className={`text-label break-words min-w-0 flex-1 ${ok ? "text-ok" : "text-fail"}`}>
+        {ok
+          ? connectedBannerText(label, row, t)
+          : t("Couldn't connect {label}. Nothing was changed.").replace("{label}", () => label)}
+      </span>
+      {!ok && (
+        <Link href={connectionAddProviderHref(returned.toolkit)} className="settings-quiet">
+          {t("Retry")}
+        </Link>
+      )}
+      <Button size="sm" variant="ghost" onClick={onDismiss}>{t("Dismiss")}</Button>
+    </div>
   );
 }
 
@@ -634,11 +714,11 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
               <Link href={connectionAddProviderHref(p.provider)} className="conn-row">
                 <span className="conn-row-main">
                   <span className="text-label font-medium text-ink-100 break-words">
-                    {serviceLabel(p.provider)}
+                    {providerServiceLabel(p)}
                   </span>
-                  {capabilityWords(p) && (
+                  {(toolsSummary(hostedProvider(p)?.tools ?? [], t) ?? capabilityWords(p)) && (
                     <span className="text-micro text-ink-500 break-words">
-                      {capabilityWords(p)}
+                      {toolsSummary(hostedProvider(p)?.tools ?? [], t) ?? capabilityWords(p)}
                     </span>
                   )}
                 </span>
@@ -660,7 +740,7 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
           <ul className="space-y-1.5">
             {unsupported.map((p) => (
               <li key={p.provider} className="px-3 py-2 rounded border border-ink-700 bg-ink-850">
-                <span className="text-label text-ink-300 break-words">{serviceLabel(p.provider)}</span>
+                <span className="text-label text-ink-300 break-words">{providerServiceLabel(p)}</span>
                 <span className="block text-micro text-ink-500 mt-0.5 break-words">
                   {enrollmentSupport(p).reason}
                 </span>
@@ -1141,6 +1221,7 @@ export function ConnectionDetail({
   const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string; suffix?: string } | null>(null);
   const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
+  const hosted = hostedAccount(row);
   const shownCapabilities =
     capabilities ?? (row.read?.qualified === true ? row.read.slug : null);
   const verify = providerMetaPending
@@ -1335,9 +1416,34 @@ export function ConnectionDetail({
         <div className="flex flex-wrap gap-x-2">
           <dt className="text-ink-500">{t("Account")}</dt>
           <dd className="text-ink-200 break-words">
-            {row.provider} · {row.account}
+            {hosted ? hostedAccountLine(row, hosted) : `${row.provider} · ${row.account}`}
           </dd>
         </div>
+        {hosted && (
+          <>
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">{t("Access")}</dt>
+              <dd className="text-ink-200 break-words">
+                <span className="chip bg-ink-800 text-ink-300" data-hosted-visibility={hosted.visibility}>
+                  {t(visibilityBadge(hosted))}
+                </span>
+                {hosted.connectedByYou && <> {t("Connected by you")}</>}
+              </dd>
+            </div>
+            {hosted.connectedAt !== null && (
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Connected")}</dt>
+                <dd className="text-ink-200">{hostedTime(hosted.connectedAt)}</dd>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">{t("Last used")}</dt>
+              <dd className="text-ink-200">
+                {hosted.lastUsedAt !== null ? hostedTime(hosted.lastUsedAt) : t("not used yet")}
+              </dd>
+            </div>
+          </>
+        )}
         <div className="flex flex-wrap gap-x-2 min-w-0">
           <dt className="text-ink-500">{t("Readiness")}</dt>
           <dd className="text-ink-200 break-words">{readinessText(row)}</dd>
@@ -1389,31 +1495,37 @@ export function ConnectionDetail({
               <dd className="num text-ink-200 break-all">{row.registration_digest}</dd>
             </div>
           )}
-          {row.status.reviewed_pin && (
+          {!hosted && row.status.reviewed_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
               <dt className="text-ink-500">{t("Reviewed pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reviewed_pin}</dd>
             </div>
           )}
-          {row.status.reported_pin && (
+          {!hosted && row.status.reported_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
               <dt className="text-ink-500">{t("Reported pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reported_pin}</dd>
             </div>
           )}
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">{t("Deployment")}</dt>
-            <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">{t("Remote verification")}</dt>
-            <dd className="text-ink-200 break-words">
-              {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
-            </dd>
-          </div>
-          <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network. Verification, when offered, is a separate explicit human action on the trusted entry page with a one-use nonce; its result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
+          {!hosted && (
+            <>
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Deployment")}</dt>
+                <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
+              </div>
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Remote verification")}</dt>
+                <dd className="text-ink-200 break-words">
+                  {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
+                </dd>
+              </div>
+              <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network. Verification, when offered, is a separate explicit human action on the trusted entry page with a one-use nonce; its result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
+            </>
+          )}
         </dl>
       </details>
+
+      {hosted && <HostedAccountPanel row={row} hosted={hosted} canWrite={canWrite} onChanged={onChanged} />}
 
       {hostedBoard && row.provider === "google_search_console" && (
         <SearchConsoleProperty row={row} canWrite={canWrite} />
@@ -1536,7 +1648,7 @@ export function ConnectionDetail({
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in connections are always present — they carry no credential and cannot be edited or disconnected through credential management.")}</p>
       )}
-      {managed && !hostedBoard && (
+      {showsPolicyPanel(row, hostedBoard) && (
         <ConnectionPolicyPanel row={row} canWrite={canWrite} onChanged={onChanged} />
       )}
     </section>
@@ -1546,25 +1658,30 @@ export function ConnectionDetail({
 function ConnectionsGroupedList({
   rows,
   groups,
+  highlightId = null,
   onOpen,
 }: {
   rows: Connection[];
   groups: { provider: string; label: string }[];
+  /** The account a hosted connect just returned with. */
+  highlightId?: string | null;
   onOpen: (id: string) => void;
 }) {
   const t = useTranslate();
-  const personal = rows.filter((r) => r.policy?.visibility === "personal");
-  const shared = rows.filter((r) => r.policy?.visibility !== "personal");
+  const personal = rows.filter((r) => rowVisibility(r) === "personal");
+  const shared = rows.filter((r) => rowVisibility(r) !== "personal");
 
   const renderItem = (row: Connection) => {
     const flagged = connectionNeedsAttention(row);
-    const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
+    const hosted = hostedAccount(row);
+    const service = hosted?.label ?? groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
     return (
       <li key={row.id}>
         <button
           type="button"
           className="settings-row"
           data-record-id={row.id}
+          data-new={row.id === highlightId ? "true" : undefined}
           onClick={() => onOpen(row.id)}
         >
           <span className="settings-row-text">
@@ -1572,6 +1689,11 @@ function ConnectionsGroupedList({
             <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
           </span>
           <span className="conn-row-chips">
+            {hosted && (
+              <span className="chip bg-ink-800 text-ink-300" data-hosted-visibility={hosted.visibility}>
+                {t(visibilityBadge(hosted))}
+              </span>
+            )}
             {row.policy?.visibility === "personal" && row.policy?.is_default && (
               <span className="chip bg-ink-800 text-ink-300">{t("Default")}</span>
             )}
@@ -1601,6 +1723,107 @@ function ConnectionsGroupedList({
           <ul className="settings-rows" aria-label={t("connections")}>
             {shared.map(renderItem)}
           </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * CAD-2428: what a hosted platform account lets the assistant do, and who in the company
+ * can use it. The visibility switch only widens or narrows who may use the account — it
+ * never revokes or clears the credential, unlike the board-local Personal switch.
+ */
+function HostedAccountPanel({
+  row,
+  hosted,
+  canWrite,
+  onChanged,
+}: {
+  row: Connection;
+  hosted: HostedAccount;
+  canWrite: boolean;
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The list answer is the truth; this only bridges the moment between a saved change and it.
+  const [saved, setSaved] = useState<"personal" | "shared" | null>(null);
+  useEffect(() => {
+    setSaved(null);
+    setError(null);
+  }, [row.id, hosted.visibility]);
+  const shared = (saved ?? hosted.visibility) === "shared";
+  const toggle = () => {
+    if (saving) return;
+    const next = shared ? "personal" : "shared";
+    setSaving(true);
+    setError(null);
+    api
+      .connectionVisibility(row.id, { visibility: next })
+      .then((reply) => {
+        if (!visibilityConfirmed(reply, next)) {
+          setError("Could not confirm the change. Refresh to see who can use this account.");
+          return;
+        }
+        setSaved(next);
+        onChanged();
+      })
+      .catch((e: unknown) =>
+        setError(
+          e instanceof ApiError && e.status === 403
+            ? "Only the workspace owner can change who uses this account."
+            : e instanceof ApiError && e.status === 404
+              ? "This account was not found. Refresh and try again."
+              : "Could not change who can use this account. Nothing was changed.",
+        ),
+      )
+      .finally(() => setSaving(false));
+  };
+  return (
+    <div className="conn-policy" data-hosted-account>
+      <div className="conn-policy-group">
+        <span className="slabel">{t("What Nova can do")}</span>
+        {hosted.tools.length === 0 ? (
+          <p className="text-micro text-ink-500 break-words">{t("No tools are available for this account right now.")}</p>
+        ) : (
+          <ul className="space-y-1" aria-label={t("What Nova can do")}>
+            {hosted.tools.map((tool) => (
+              <li key={tool.slug} className="flex flex-wrap items-center gap-x-2 text-label text-ink-200 min-w-0" data-tool-effect={tool.effect}>
+                <span className="break-words min-w-0">{tool.label}</span>
+                {toolAsksFirst(tool) && (
+                  <span className="chip bg-warn/10 text-warn">{t("asks you first")}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      {hosted.canChangeVisibility && canWrite && (
+        <div className="conn-policy-group">
+          <span className="slabel">{t("Who can use this account")}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={shared}
+            disabled={saving}
+            className="conn-policy-toggle"
+            onClick={toggle}
+          >
+            <span className="conn-policy-box" aria-hidden>
+              {shared ? "✓" : ""}
+            </span>
+            <span className="min-w-0 break-words">
+              <b>{t("Shared with company")}</b>
+              <small className="block text-micro text-ink-400">
+                {t("Everyone in the company can use this account. Turning it off keeps the account connected, for you only.")}
+              </small>
+            </span>
+          </button>
+          {error && (
+            <p className="text-label text-fail break-words" role="alert">{t(error)}</p>
+          )}
         </div>
       )}
     </div>
@@ -2285,7 +2508,7 @@ function HostedConnect({
         <Button variant="primary" loading={busy} onClick={connect}>
           {busy
             ? t("Opening sign-in…")
-            : t("Connect {label}").replace("{label}", () => serviceLabel(provider.provider))}
+            : t("Connect {label}").replace("{label}", () => providerServiceLabel(provider))}
         </Button>
         <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>

@@ -82,7 +82,8 @@ check(splitIds("x-7d2e4c1a9b3f40e8a6c5d2b1f0e9a873y").every((p) => !p.id), "no t
   const zhTw = dayText(earlier, now, (k) => k, "zh-TW");
   check(/Sun/.test(en) && /Nov/.test(en), `English date with weekday: ${en}`);
   check(/11月8日/.test(zhTw) && /週日|星期日/.test(zhTw), `written Chinese date with weekday: ${zhTw}`);
-  check(dayText(now, now, (k) => k, "zh-TW") === "Today", "today stays the catalogue word");
+  const todayZh = dayText(now, now, (k) => k, "zh-TW");
+  check(todayZh.startsWith("Today · ") && /11月16日/.test(todayZh), `today leads with the catalogue word, then the date: ${todayZh}`);
 }
 
 // Rendered turns.

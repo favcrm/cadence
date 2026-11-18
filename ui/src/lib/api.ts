@@ -1404,6 +1404,16 @@ export const api = {
     accept_same_uid_risk?: boolean;
   }) => post<ConnectionPayload>("/api/connections", body),
   /**
+   * `POST /api/connections/<id>/visibility` (CAD-2428) — share a hosted
+   * platform account with the company or make it personal again. Owner
+   * only; never revokes or clears a credential.
+   */
+  connectionVisibility: (id: string, body: { visibility: "personal" | "shared" }) =>
+    post<{ ok: boolean; visibility: string }>(
+      `/api/connections/${encodeURIComponent(id)}/visibility`,
+      body,
+    ),
+  /**
    * `POST /api/connections/<id>/rotate` — replace the credential,
    * preserving the connection's identity (operator-only). Omitting
    * `scopes` keeps the current scopes.
