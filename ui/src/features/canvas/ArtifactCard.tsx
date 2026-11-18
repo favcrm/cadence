@@ -3,7 +3,7 @@ import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
 import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
 import type { ThreadEntry } from "../home/thread";
-import { TurnCardButton } from "../../ui/TurnCard";
+import { TurnCardButton, type CardDensity } from "../../ui/TurnCard";
 
 export const KIND_LABEL: Record<string, string> = { md: "MD", pdf: "PDF", html: "HTML", image: "IMG", csv: "CSV" };
 
@@ -16,7 +16,14 @@ export function sizeLabel(bytes: number): string {
 /** The thread's card for an artifact: kind tile, title, version and size. A
  *  click opens the drawer on that version; the card of the artifact on view
  *  reads "in canvas". The thread never holds the content. */
-export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
+export default function ArtifactCard({
+  entry,
+  density = "full",
+}: {
+  entry: ThreadEntry;
+  /** CAD-2440: the thread's density; the assistant panel is compact. */
+  density?: CardDensity;
+}) {
   const t = useTranslate();
   const canvas = useCanvas();
   const browser = useBrowserTab();
@@ -31,6 +38,7 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
     <TurnCardButton
       element="div"
       kind="artifact"
+      density={density}
       data-kind="artifact"
       data-artifact={ref.id}
       open={inCanvas}

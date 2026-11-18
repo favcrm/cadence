@@ -23,7 +23,7 @@ import {
   type Comp,
   type Data,
 } from "./formModel";
-import { TurnCard, type CardTone } from "../../ui/TurnCard";
+import { TurnCard, type CardDensity, type CardTone } from "../../ui/TurnCard";
 
 /**
  * CAD-2285: the master's A2UI form, drawn from the pilot catalog only.
@@ -58,7 +58,16 @@ function writeDraft(seq: number, data: Data | null): void {
   }
 }
 
-export default function AgentForm({ entry, status }: { entry: ThreadEntry; status: FormStatus }) {
+export default function AgentForm({
+  entry,
+  status,
+  density = "full",
+}: {
+  entry: ThreadEntry;
+  status: FormStatus;
+  /** CAD-2440: the thread's density; the assistant panel is compact. */
+  density?: CardDensity;
+}) {
   const t = useTranslate();
   const block = useWriteBlock(false);
   const surface = useMemo(() => parse(entry), [entry]);
@@ -307,6 +316,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     <TurnCard
       ref={root}
       kind="form"
+      density={density}
       className="card agentform"
       bodyClassName="agentform-body"
       data-kind="form"
