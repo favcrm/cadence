@@ -37,9 +37,9 @@ repository's paths and no team's rules.
   method, the review names, the risk rules and the size limits. The schema is in
   [BOARD.md](../BOARD.md#projectmd-delivery--the-per-project-delivery-policy). It
   takes effect once the owner approves it. Without a section the default policy
-  applies: one general agent review, squash merge through the queue. What the
-  hosted gate counts today is described under
-  [Trusted lists](#trusted-lists).
+  applies: one general agent review, squash merge through the queue. What an
+  approved section changes is described under
+  [An approved custom policy](#an-approved-custom-policy).
 - **The repository's trusted lists** say which paths need what. They live in the
   repository, in `docs/roles/risk-paths.toml`, `docs/roles/one-review-paths.toml`
   and, for review workflows, `docs/roles/workflow-auto-paths.toml` and
@@ -53,6 +53,11 @@ section with `issue project delivery` (needs a login made with
 cadence --org acme issue project delivery <project-key> \
   --repo <owner>/<repo> --delivery-file delivery.yaml
 ```
+
+The owner's save is the approval: the board accepts it only from the owner, so
+a hosted project's saved section is in force from the next gate read. On a
+native board the operator approves the section with
+`cadence issue project approve-work <project-key>`.
 
 The gate refuses a project with no recorded repository.
 
@@ -104,8 +109,12 @@ Cadence evaluates a PR into one of three classes:
 | `consequential` | One combined review (standards and spec/security together). | No | If a path matches `browser_qa`. |
 | `strict` | Two reviews (standards, spec/security), or one when every path is on the one-review list. | Yes, for `operator`, `schema`, `trigger4`, `trigger6` or `trigger7` paths, over 1500 changed lines, or when the lists are unusable. | If a path matches `browser_qa`. |
 
-Anything the evaluator cannot place safely lands on `strict`: a custom or
-unapproved `delivery:` section, a malformed section, unreadable or unusable
+This table is the default policy's answer. An approved custom policy decides the
+reviews itself, inside the same floor; see
+[An approved custom policy](#an-approved-custom-policy).
+
+Anything the evaluator cannot place safely lands on `strict`: an unapproved
+`delivery:` section, a malformed section, unreadable or unusable
 lists, incomplete diff evidence, a sensitive path, or a delete, rename or mode
 change.
 
@@ -133,6 +142,56 @@ itself, either as two review workflow results or as attested verdicts, and it
 adds the owner's approval when a verdict states a Risk other than `auto`. The
 requirements report is the policy's answer; always read the gate's own result
 with `delivery check`.
+
+### An approved custom policy
+
+Once the owner has approved a project's `delivery:` section, the evaluator runs
+its `risk` rules. A rule applies when it has no `when`, or when any of its
+conditions holds: a changed path matches `paths`, the change has more than
+`lines_over` lines, or more than `files_over` files. The change needs every
+review named by every rule that applies. The requirements answer lists them in
+`required_reviews` and the required checks in `required_checks`; both are absent
+under the default policy.
+
+What each required review asks of the hosted gate:
+
+| Review | What the gate needs |
+| --- | --- |
+| `agent`, `focus: standards` | A counted pass on the standards axis. |
+| `agent`, `focus: spec-security` | A counted pass on the spec/security axis. |
+| Both of the above | A pass on each axis, from two different reviewers. |
+| `agent`, `focus: general` | One combined review: a `combined` verdict, or a pass on both axes. |
+| `agent`, `focus: browser-qa` | A Browser QA pass (see [Browser QA](#browser-qa)). |
+| `operator` | The owner's approval. |
+| `check`, `mode: required` | The latest run of each check that App posted on the exact head concluded `success`. The hosted gate matches the App by its slug, so name it by slug, not by id. |
+| `check`, `mode: advisory` | Nothing; it never blocks. |
+
+A `revise` on an axis the policy does not require does not block. A change no
+rule asks a review of needs no code review, only its checks and evidence.
+
+The policy may ask for fewer reviews than the default classes, but only on
+ordinary paths. The trusted lists keep their floor, and the policy can add to it
+but never lower it. A change keeps at least the `strict` answer above when:
+
+- it touches an `operator`, `schema`, `trigger1`, `trigger3`, `trigger4`,
+  `trigger6` or `trigger7` path, or a path the one-review list excludes;
+- it is over 1500 changed lines;
+- it deletes, renames or changes the mode of a file, or its diff evidence is
+  incomplete;
+- the lists are unreadable or unusable.
+
+On such a change the policy's reviews are added to the strict ones, and the
+owner's approval and Browser QA are required if either side asks for them. The
+full required checks always apply under a custom policy. A `browser_qa` path
+still needs Browser QA under any policy. The
+`routine` shortcut does not apply: under a custom policy a documentation change
+needs the reviews its rules name.
+
+A change to the section takes effect only through the owner's approval: an
+agent's edit to `PROJECT.md` is not the approved policy. This section describes
+the hosted gate. The native merge queue does not apply an approved custom policy
+yet: it refuses a change whose requirements come from one, so keep a native
+project on the default policy until it does.
 
 ## Review evidence
 

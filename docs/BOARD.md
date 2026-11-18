@@ -876,7 +876,8 @@ PROJECT.md and not `project.yaml` (strict `deny_unknown_fields` — an
 older binary would refuse the whole file), and it takes effect only
 once the operator approves it: `cadence issue project approve-work
 <key>` records the resolved policy and its `sha256:` digest beside the
-stage-gate digest. A malformed `delivery:` refuses the whole approval;
+stage-gate digest. On a hosted org the owner's save with
+`issue project delivery` is the approval. A malformed `delivery:` refuses the whole approval;
 the daemon computes both fields from the file it read — a
 `delivery`/`delivery_digest` param is ignored. With no section the
 recorded policy is `null` and the digest is the default policy's. The
