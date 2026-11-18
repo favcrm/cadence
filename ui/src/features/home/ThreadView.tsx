@@ -17,6 +17,8 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import PdfPageAction, { PdfPageTarget } from "./PdfPageAction";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
+import { ConnectCard } from "./ConnectCard";
+import { RecordCard } from "./RecordCard";
 import { ACTION_MARK } from "./formModel";
 import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
 import { elapsedSecs, errorReason, formatElapsed, resultCount, toolKey, toolLabel, toolSubject } from "./turnText";
@@ -448,6 +450,10 @@ export function ThreadItemView({
       return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} readOnly={readOnly} />;
     case "form":
       return <AgentForm entry={item.entry} status={item.status} density={density} />;
+    case "connect":
+      return <ConnectCard entry={item.entry} density={density} />;
+    case "record":
+      return <RecordCard entry={item.entry} density={density} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -1298,6 +1304,10 @@ export function ThreadTurn({
               <div key={item.key} data-item-key={item.key}>
                 <AgentForm entry={item.entry} status={item.status} density={density} />
               </div>
+            ) : item.type === "connect" ? (
+              <div key={item.key} data-item-key={item.key}><ConnectCard entry={item.entry} density={density} /></div>
+            ) : item.type === "record" ? (
+              <div key={item.key} data-item-key={item.key}><RecordCard entry={item.entry} density={density} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
               <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
                 {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} density={density} />}

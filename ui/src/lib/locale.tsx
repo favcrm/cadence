@@ -2227,6 +2227,15 @@ Object.assign(zhTW, {
   "Stopping…": "停止中…",
   "Waiting for you": "等待您",
   "in canvas": "在畫布中",
+  // CAD-2443: host-written connect and record chat cards.
+  "Connect card": "連線卡片",
+  "Connection": "連線",
+  "Connect {label}": "連接 {label}",
+  "Opening sign-in…": "正在開啟登入…",
+  "Record card": "記錄卡片",
+  "Records": "記錄",
+  "More in {tool}": "更多內容在 {tool}",
+  "Received": "收到",
   "Hide Browser tab. The session keeps running.": "隱藏瀏覽器分頁。工作階段會繼續執行。",
   "Anything signed in to this session is lost.": "在此工作階段登入的內容將會失去。",
   // CAD-2186: owner decisions in the Home rail. Written Chinese, as a product reads it.
