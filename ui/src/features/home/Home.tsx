@@ -1686,7 +1686,7 @@ function MasterHome({
             {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
           </span>
           {showJumpPill(unseen, activity) && (
-            <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
+            <button type="button" className="newpill" onClick={jumpToLatest} data-jump-to-latest>
               <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
             </button>
           )}

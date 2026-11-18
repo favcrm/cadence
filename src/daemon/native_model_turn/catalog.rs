@@ -4,12 +4,9 @@
 //! variable, an agent process or a request field can never redirect it. It
 //! pins:
 //!
-//! - the exact Node executable and the immutable private SDK module graph
-//!   (every file the child imports, by digest);
-//! - the pinned published Devin provider entry and the installed Pi 1.4
-//!   package root the child resolves against;
-//! - one reviewed route per provider: the authoritative server origin(s) and
-//!   the frozen catalog the native role/model/effort maps through;
+//! - the exact Node executable and immutable SDK graph for Devin, or the
+//!   owner-selected loopback or production TLS origin for AgenticOS;
+//! - the frozen catalog the native role/model/effort maps through;
 //! - the finite owner-approved request/concurrency limits and the output cap.
 //!
 //! The catalog mapping is a faithful port of the published `pi-devin@0.2.1`
@@ -41,8 +38,69 @@ fn refused(message: &str) -> Error {
     Error::invalid("route_unavailable", message)
 }
 
-/// The installed SDK's exact provider id for this route.
-pub(crate) const PROVIDER: &str = "devin";
+pub(super) const DEVIN: &str = "devin";
+pub(super) const AGENTICOS: &str = "agenticos";
+
+#[derive(Clone, Debug)]
+pub(super) enum RouteBackend {
+    Devin(SdkPins),
+    AgenticOs {
+        tls: super::agenticos_gateway::GatewayTls,
+        workspace_id: String,
+    },
+}
+
+impl RouteBackend {
+    fn origin(&self, value: &str) -> Result<String> {
+        match self {
+            Self::Devin(_) => canonical_origin(value),
+            Self::AgenticOs { tls, .. } => tls.origin(value).map(str::to_owned),
+        }
+    }
+
+    pub(super) fn agenticos_workspace(&self) -> Option<&str> {
+        match self {
+            Self::AgenticOs { workspace_id, .. } => Some(workspace_id),
+            Self::Devin(_) => None,
+        }
+    }
+}
+
+fn parse_backend(provider: &str, m: &serde_json::Map<String, Value>) -> Result<RouteBackend> {
+    use super::agenticos_gateway::{pinned_tls, GatewayTls};
+    let settings = (
+        m.get("sdk"),
+        m.get("tls_root_pem"),
+        m.get("tls_mode"),
+        m.get("workspace_id"),
+    );
+    match (provider, settings) {
+        (DEVIN, (Some(sdk), None, None, None)) => Ok(RouteBackend::Devin(SdkPins::parse(sdk)?)),
+        (AGENTICOS, (None, root, mode, Some(Value::String(workspace_id))))
+            if (1..=128).contains(&workspace_id.len())
+                && workspace_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            let tls = match (root, mode) {
+                (Some(Value::String(pem)), None) => pinned_tls(pem)?,
+                (None, Some(Value::String(mode))) if mode == "webpki" => GatewayTls::Production,
+                _ => {
+                    return Err(refused(
+                        "the native model profile has unsupported provider settings",
+                    ))
+                }
+            };
+            Ok(RouteBackend::AgenticOs {
+                tls,
+                workspace_id: workspace_id.clone(),
+            })
+        }
+        _ => Err(refused(
+            "the native model profile has unsupported provider settings",
+        )),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModulePin {
@@ -102,7 +160,7 @@ pub(crate) struct RouteFacts {
     pub families: Vec<FamilyFacts>,
     pub max_output_tokens: u32,
     pub limits: OwnerLimits,
-    pub sdk: SdkPins,
+    pub(super) backend: RouteBackend,
     /// The exact approved loaded tool declarations, provisioned by the
     /// operator from the immutable image material.
     pub approved_tools: Vec<super::dto::NativeToolV1>,
@@ -112,14 +170,10 @@ pub(crate) struct RouteFacts {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeModelProfile {
-    pub routes: Vec<RouteFacts>,
+    pub(super) route: RouteFacts,
 }
 
 impl NativeModelProfile {
-    pub(crate) fn route(&self, provider: &str) -> Option<&RouteFacts> {
-        self.routes.iter().find(|route| route.provider == provider)
-    }
-
     pub(crate) fn load_default() -> Result<Option<Self>> {
         Self::load_path(Path::new(PROFILE_PATH))
     }
@@ -175,21 +229,15 @@ impl NativeModelProfile {
                 "the native model profile must declare exactly one qualified route",
             ));
         }
-        let mut routes = Vec::with_capacity(routes_map.len());
-        for (provider, route) in routes_map {
-            if provider != PROVIDER {
-                return Err(refused(
-                    "the native model profile declares an unqualified provider",
-                ));
-            }
-            routes.push(RouteFacts::parse(provider.clone(), route)?);
-        }
-        Ok(Self { routes })
+        let (provider, route) = routes_map.iter().next().expect("one configured route");
+        Ok(Self {
+            route: RouteFacts::parse(provider, route)?,
+        })
     }
 }
 
 impl RouteFacts {
-    fn parse(provider: String, value: &Value) -> Result<Self> {
+    fn parse(provider: &str, value: &Value) -> Result<Self> {
         let m = strict::object_with(
             value,
             &[
@@ -199,12 +247,12 @@ impl RouteFacts {
                 "catalog",
                 "max_output_tokens",
                 "limits",
-                "sdk",
                 "approved_tools_path",
                 "approved_tools_digest",
             ],
-            &[],
+            &["sdk", "tls_root_pem", "tls_mode", "workspace_id"],
         )?;
+        let backend = parse_backend(provider, m)?;
         let origins_value = m.get("origins").ok_or_else(|| refused("no origin"))?;
         let origins_items = origins_value
             .as_array()
@@ -217,9 +265,9 @@ impl RouteFacts {
             let text = item
                 .as_str()
                 .ok_or_else(|| refused("the native model origin is malformed"))?;
-            origins.push(canonical_origin(text)?);
+            origins.push(backend.origin(text)?);
         }
-        let default_origin = canonical_origin(
+        let default_origin = backend.origin(
             m.get("default_origin")
                 .and_then(Value::as_str)
                 .ok_or_else(|| refused("the native model default origin is missing"))?,
@@ -232,9 +280,11 @@ impl RouteFacts {
             return Err(refused("the native model output cap is out of bounds"));
         }
         let catalog_revision = decimal_u64(m, "catalog_revision")?;
-        let families = parse_catalog(m.get("catalog").ok_or_else(|| refused("no catalog"))?)?;
+        let families = parse_catalog(
+            provider,
+            m.get("catalog").ok_or_else(|| refused("no catalog"))?,
+        )?;
         let limits = parse_limits(m.get("limits").ok_or_else(|| refused("no limits"))?)?;
-        let sdk = SdkPins::parse(m.get("sdk").ok_or_else(|| refused("no sdk pins"))?)?;
         let tools_path = absolute(
             strict::string(m, "approved_tools_path")?,
             "approved_tools_path",
@@ -244,14 +294,14 @@ impl RouteFacts {
         let (approved_tools, approved_tools_digest) =
             Self::load_approved_tools(&tools_path, &tools_digest)?;
         Ok(Self {
-            provider,
+            provider: provider.to_string(),
             origins,
             default_origin,
             catalog_revision,
             families,
             max_output_tokens: max_output_tokens as u32,
             limits,
-            sdk,
+            backend,
             approved_tools,
             approved_tools_digest,
         })
@@ -327,7 +377,7 @@ impl RouteFacts {
 
     /// Validate that `origin` is exactly one of the pinned route origins.
     pub(crate) fn require_origin(&self, origin: &str) -> Result<String> {
-        let origin = canonical_origin(origin)?;
+        let origin = self.backend.origin(origin)?;
         if !self.origins.iter().any(|allowed| allowed == &origin) {
             return Err(refused("the model origin is not approved"));
         }
@@ -343,6 +393,11 @@ impl RouteFacts {
         source_origin: Option<&str>,
     ) -> Result<ResolvedRoute> {
         let (provider, model_id) = split_model(model);
+        if self.provider == AGENTICOS && provider != AGENTICOS {
+            return Err(refused(
+                "the gateway model must name the agenticos provider",
+            ));
+        }
         if !provider.is_empty() && provider != self.provider {
             return Err(refused(
                 "the configured model belongs to a different provider",
@@ -515,7 +570,7 @@ fn parse_scope_limit(value: &Value) -> Result<ScopeLimit> {
     })
 }
 
-fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
+fn parse_catalog(provider: &str, value: &Value) -> Result<Vec<FamilyFacts>> {
     let m = strict::object_with(value, &["v", "families"], &[])?;
     if strict::safe_u64(m, "v")? != 1 {
         return Err(refused("the native model catalog version is unsupported"));
@@ -573,7 +628,17 @@ fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
                 max_output_tokens: optional_positive(m, "max_output_tokens")?,
             });
         }
-        let (model_id, thinking_level_map, reasoning) = family_models(&family_uid, &variants);
+        let (model_id, thinking_level_map, reasoning) = if provider == AGENTICOS {
+            let id = &variants[0].model_uid;
+            if variants.len() != 1 || !canonical_gateway_model(id) {
+                return Err(refused(
+                    "gateway catalog entries require one explicit author/model id",
+                ));
+            }
+            (id.clone(), Vec::new(), false)
+        } else {
+            family_models(&family_uid, &variants)
+        };
         parsed.push(FamilyFacts {
             family_uid,
             family_label,
@@ -584,6 +649,23 @@ fn parse_catalog(value: &Value) -> Result<Vec<FamilyFacts>> {
         });
     }
     Ok(parsed)
+}
+
+fn canonical_gateway_model(value: &str) -> bool {
+    fn part(value: &str) -> bool {
+        value.len() <= 100
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    }
+    value.len() <= 200 - "agenticos/".len()
+        && value
+            .split_once('/')
+            .is_some_and(|(author, model)| part(author) && part(model))
 }
 
 fn optional_positive(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>> {
@@ -906,4 +988,56 @@ fn verify_root_owned_parents(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_profile_tests {
+    use super::*;
+
+    #[test]
+    fn owner_selects_one_gateway_origin_class_and_tls_mode() {
+        let production = json!({"tls_mode": "webpki", "workspace_id": "ws_example"});
+        let backend = parse_backend(AGENTICOS, production.as_object().unwrap()).unwrap();
+        assert!(backend.origin("https://api-v2.agenticos.hk").is_ok());
+        for origin in [
+            "https://api-v2.agenticos.hk/",
+            "https://api-v2.agenticos.hk:443",
+            "https://api-v2.agenticos.hk?x=1",
+            "https://api-v2.agenticos.hk/path",
+            "https://api-v2.agenticos.hk#fragment",
+            "https://api-v2.agenticos.hk.evil.test",
+            "https://api-v2.agenticos.hk@evil.test",
+            "https://API-v2.agenticos.hk",
+            "https://127.0.0.1:8443",
+        ] {
+            assert!(backend.origin(origin).is_err(), "{origin}");
+        }
+
+        // PEM parsing is enough at this seam; TLS validates certificate DER on use.
+        let loopback = json!({
+            "tls_root_pem": "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n",
+            "workspace_id": "ws_example"
+        });
+        let backend = parse_backend(AGENTICOS, loopback.as_object().unwrap()).unwrap();
+        assert!(backend.origin("https://127.0.0.1:8443").is_ok());
+        for origin in [
+            "https://api-v2.agenticos.hk",
+            "https://localhost:8443",
+            "https://127.0.0.1:08443",
+            "https://127.0.0.1:8443/",
+            "http://127.0.0.1:8443",
+        ] {
+            assert!(backend.origin(origin).is_err(), "{origin}");
+        }
+
+        for invalid in [
+            json!({"workspace_id": "ws_example"}),
+            json!({"workspace_id": "ws_example", "tls_mode": "webpki", "tls_root_pem": "root"}),
+            json!({"workspace_id": "ws_example", "tls_mode": "system"}),
+            json!({"workspace_id": "ws_example", "tls_mode": null}),
+            json!({"workspace_id": "ws_example", "tls_mode": "webpki", "sdk": {}}),
+        ] {
+            assert!(parse_backend(AGENTICOS, invalid.as_object().unwrap()).is_err());
+        }
+    }
 }

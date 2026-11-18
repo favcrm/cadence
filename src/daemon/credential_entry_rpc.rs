@@ -33,8 +33,8 @@
 use super::{optional_str, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::store::credential_requests::{
-    is_native_model_shape, AttemptOutcome, CredentialRequest, CredentialVerb, NewCredentialRequest,
-    MAX_SECRET_BYTES, NONCE_TTL_MS,
+    is_native_model_shape, provider_shape_allowed, AttemptOutcome, CredentialRequest,
+    CredentialVerb, NewCredentialRequest, MAX_SECRET_BYTES, NONCE_TTL_MS,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -608,16 +608,15 @@ fn request_from_params(shared: &Shared, params: &Value) -> Result<NewCredentialR
         participant_uid: None,
     };
     let (context, context_digest) = entry_context(shared, &target)?;
-    if is_native_model_shape(shape.as_deref()) {
-        // The native-model source is a broker-private encrypted source, not a
-        // business Connection. It has no account/transport/descriptor.
-        if provider != "devin" {
-            return Err(Error::invalid(
-                "invalid_request",
-                "this provider does not enroll that shape",
-            ));
-        }
-    } else {
+    if !provider_shape_allowed(&provider, shape.as_deref())
+        || (provider == "agenticos" && verb == CredentialVerb::Verify)
+    {
+        return Err(Error::invalid(
+            "invalid_request",
+            "this provider does not enroll that shape",
+        ));
+    }
+    if !is_native_model_shape(shape.as_deref()) {
         match verb {
             CredentialVerb::Enroll => {
                 let shape = shape.as_deref().ok_or_else(|| {

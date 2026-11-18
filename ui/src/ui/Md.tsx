@@ -19,7 +19,64 @@ interface MdNode {
   url?: string;
   children?: MdNode[];
   data?: { hProperties?: Record<string, unknown> };
+  /** GFM table column alignment. */
+  align?: (string | null)[];
 }
+
+function addClass(node: MdNode, name: string): void {
+  const props = node.data?.hProperties ?? {};
+  const current = props.className;
+  const list = Array.isArray(current) ? current.map(String) : typeof current === "string" ? current.split(" ") : [];
+  node.data = { ...node.data, hProperties: { ...props, className: [...list.filter(Boolean), name] } };
+}
+
+/** The plain text a node carries, for classifying it. */
+function nodeText(node: MdNode): string {
+  if (node.value !== undefined && (node.type === "text" || node.type === "inlineCode")) return node.value;
+  return (node.children ?? []).map(nodeText).join("");
+}
+
+// CAD-2436: a paragraph is a section label only when its whole text is one
+// bold run ("**Where things stand**"). "**Payment:** FPS / Bank Transfer" is
+// a sentence with a bold lead-in and keeps body size. CSS cannot tell the two
+// apart (`:only-child` ignores text), so the renderer marks the label.
+function markSectionLabels(tree: MdNode): void {
+  for (const node of tree.children ?? []) {
+    if (node.type !== "paragraph") continue;
+    const kids = (node.children ?? []).filter((kid) => !(kid.type === "text" && !(kid.value ?? "").trim()));
+    if (kids.length === 1 && kids[0]!.type === "strong" && nodeText(kids[0]!).trim() !== "") addClass(node, "md-sect");
+  }
+}
+const remarkSectionLabels = () => (tree: MdNode) => markSectionLabels(tree);
+
+// CAD-2436: a table column whose body cells are all numbers (amounts,
+// quantities, percentages, an optional currency code) is right-aligned and
+// marked for tabular figures. An empty cell does not count against it.
+const NUMERIC_CELL = /^[-+(]?(?:[A-Z]{3}\s)?[-+(]?[$€£¥]?\s?\d[\d,.\s]*%?\)?(?:\s[A-Z]{3})?$/;
+function markNumericColumns(node: MdNode): void {
+  if (node.type === "table") {
+    const rows = (node.children ?? []).filter((row) => row.type === "tableRow");
+    const body = rows.slice(1);
+    const columns = Math.max(0, ...rows.map((row) => row.children?.length ?? 0));
+    for (let column = 0; column < columns; column++) {
+      const values = body.map((row) => nodeText(row.children?.[column] ?? { type: "text", value: "" }).trim());
+      const filled = values.filter((value) => value !== "");
+      if (filled.length === 0 || !filled.every((value) => NUMERIC_CELL.test(value))) continue;
+      const align = node.align ?? [];
+      if (!align[column]) {
+        align[column] = "right";
+        node.align = align;
+      }
+      for (const row of rows) {
+        const cell = row.children?.[column];
+        if (cell) addClass(cell, "md-num");
+      }
+    }
+    return;
+  }
+  for (const kid of node.children ?? []) markNumericColumns(kid);
+}
+const remarkNumericColumns = () => (tree: MdNode) => markNumericColumns(tree);
 
 type CalloutKind = "note" | "tip" | "important" | "warning" | "caution";
 
@@ -434,7 +491,7 @@ function knownComponents(onOpen: (id: string) => void, known: (id: string) => bo
   return (pair[slot] ??= buildComponents(onOpen, undefined, ids, known));
 }
 
-const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
+const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks, remarkSectionLabels, remarkNumericColumns];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
 const ID_PLUGINS = [...PLUGINS, remarkIdTokens];
 

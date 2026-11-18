@@ -667,6 +667,39 @@ repeating it. Preview starts no process and proves neither authentication nor
 future launch success. Launch saved profiles through the existing
 `cadence join ... --profile review` path.
 
+### Dedicated AgenticOS model gateway
+
+The protected native master can use an owner-configured AgenticOS gateway.
+Configure the protected runtime and its encrypted custody first. The ordinary
+same-UID sandbox is not eligible.
+
+- In the root-owned `native-model.json` profile, select `routes.agenticos`
+  instead of `routes.devin` and choose exactly one origin class:
+  - Same host: use literal `https://127.0.0.1:<port>` origins and
+    `tls_root_pem` containing the private gateway CA certificate; omit
+    `tls_mode`. The certificate must have a `127.0.0.1` IP SAN.
+  - Production: set both `origins` and `default_origin` to the exact origin
+    `https://api-v2.agenticos.hk` (with `origins` as an array containing that
+    string), set `tls_mode` to `webpki`, and omit `tls_root_pem`. Rustls
+    verifies the public WebPKI chain and hostname.
+  Mixed modes, other hosts or aliases, explicit production ports, paths and
+  queries refuse. Plain HTTP, proxies and redirects are not used.
+- Omit the Devin `sdk` section. The frozen catalog has one explicit
+  `author/model` variant per family. Configure the protected guest for
+  `agenticos`, that model and `off` effort. In Settings > Agents, grant that
+  model to the master only. Set the route's `workspace_id` to the AgenticOS
+  workspace that issues the device credential; this is not the native board id.
+- In AgenticOS, approve a device credential for `model.infer` only. In the
+  local Cadence operator session, run
+  `cadence connection enroll agenticos --shape native-model-api-key --no-open`.
+  Open its trusted credential-entry link and enter the scoped device bearer.
+  Do not pass it on the command line or put it in Pi configuration.
+
+Cadence sends one bounded gateway request for the admitted model turn. It
+uses the broker's durable request id for idempotency. The protected guest
+receives the terminal model receipt, not upstream connection headers or a
+live token stream. The gateway owns provider and billing authorization.
+
 ### Managing-agent authorization
 
 An unapproved agent can petition and list its own requests, not read or edit

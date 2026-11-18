@@ -390,6 +390,11 @@ fn current_credential_revision(tx: &impl StoreConn, connection_id: &str) -> Resu
 /// sources and business Connections are distinct authorities; neither can
 /// substitute for the other's credential revision.
 fn current_revision_matches(request: &CredentialRequest, tx: &impl StoreConn) -> Result<bool> {
+    if !provider_shape_allowed(&request.provider, request.shape.as_deref())
+        || (request.provider == "agenticos" && request.verb == CredentialVerb::Verify.as_str())
+    {
+        return Ok(false);
+    }
     let Some(expected) = request.expected_credential_revision else {
         return Ok(!is_native_model_shape(request.shape.as_deref())
             || request.verb == CredentialVerb::Enroll.as_str());
@@ -418,6 +423,16 @@ pub(crate) fn is_native_model_shape(shape: Option<&str>) -> bool {
     shape.is_some_and(|shape| NATIVE_MODEL_SHAPES.contains(&shape))
 }
 
+pub(crate) fn provider_shape_allowed(provider: &str, shape: Option<&str>) -> bool {
+    match (provider, shape) {
+        ("agenticos", Some("native-model-api-key")) => true,
+        ("agenticos", _) => false,
+        ("devin", shape) if is_native_model_shape(shape) => true,
+        (_, shape) if is_native_model_shape(shape) => false,
+        _ => true,
+    }
+}
+
 fn validate_new(new: &NewCredentialRequest) -> Result<()> {
     if new.requester_kind != "operator_cli"
         && new.requester_kind != "operator_ui"
@@ -428,16 +443,17 @@ fn validate_new(new: &NewCredentialRequest) -> Result<()> {
             "unknown credential requester",
         ));
     }
+    if !provider_shape_allowed(&new.provider, new.shape.as_deref())
+        || (new.provider == "agenticos" && new.verb == CredentialVerb::Verify)
+    {
+        return Err(Error::invalid(
+            "invalid_request",
+            "this provider does not enroll that shape",
+        ));
+    }
     let native_shape = is_native_model_shape(new.shape.as_deref());
     if native_shape {
-        // Exactly the bounded native-model source pair. It is not a business
-        // Connection: no connection id, no scopes, provider exactly `devin`.
-        if new.provider != "devin" {
-            return Err(Error::invalid(
-                "invalid_request",
-                "this provider does not enroll that shape",
-            ));
-        }
+        // A native model source is not a business Connection.
         if new.connection_id.is_some() || !new.scopes.is_empty() {
             return Err(Error::invalid(
                 "invalid_request",
