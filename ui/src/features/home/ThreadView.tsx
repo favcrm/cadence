@@ -732,7 +732,7 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
                 {body}
               </button>
               {canCapturePages && (
-                <PdfPageAction key={`${pageTarget.key}:${conversation}`} source={{ kind: "retained", file: f, conversation }} target={pageTarget} />
+                <PdfPageAction key={`${pageTarget.key}:${conversation}`} source={{ file: f, conversation }} target={pageTarget} />
               )}
             </span>
           ) : (
