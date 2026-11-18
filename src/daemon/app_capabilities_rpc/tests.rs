@@ -37,15 +37,45 @@ fn approved_text_quote_cannot_silently_switch_defaults() {
         "quotes":{"writer":quote}
     }});
     assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_ok());
-    run["snapshot"]["quotes"]["writer"]["model"] = json!("synthetic/text-two");
-    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_err());
+    assert!(require_frozen_model_quote(
+        &run,
+        "writer",
+        &quote,
+        &json!({"model":"synthetic/text-one"})
+    )
+    .is_ok());
     assert!(require_frozen_model_quote(
         &run,
         "writer",
         &quote,
         &json!({"model":"synthetic/selected"})
     )
-    .is_ok());
+    .is_err());
+    let mut changed_quote = quote.clone();
+    changed_quote.model = Some("synthetic/text-two".into());
+    assert!(require_frozen_model_quote(
+        &run,
+        "writer",
+        &changed_quote,
+        &json!({"model":"synthetic/text-one"})
+    )
+    .is_err());
+    assert!(require_frozen_model_quote(
+        &run,
+        "writer",
+        &changed_quote,
+        &json!({"model":"synthetic/text-two"})
+    )
+    .is_err());
+    run["snapshot"]["quotes"]["writer"]["model"] = json!("synthetic/text-two");
+    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_err());
+    assert!(require_frozen_model_quote(
+        &run,
+        "writer",
+        &quote,
+        &json!({"model":"synthetic/text-two"})
+    )
+    .is_err());
 }
 
 fn fixture() -> (

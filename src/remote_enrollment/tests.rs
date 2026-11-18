@@ -574,6 +574,119 @@ fn public_request_access(
     (socket, serde_json::from_slice(&body).unwrap())
 }
 
+#[test]
+fn account_image_quote_receipt_guard_and_dynamic_model_transport() {
+    use crate::remote_cli::AccountImageOperation;
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("enroll");
+    let issuer = "https://issuer.example.test";
+    trust(&dir, issuer);
+    access_file(&dir, issuer);
+    let board = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    board.set_nonblocking(true).unwrap();
+    other.set_nonblocking(true).unwrap();
+    let audience = format!("http://{}", board.local_addr().unwrap());
+    let other_origin = format!("http://{}", other.local_addr().unwrap());
+    let input = json!({
+        "model": "provider/server-selected-image-v3",
+        "prompt": "A quiet harbour",
+        "aspectRatio": "1:1",
+        "max_charge_minor": 1_000_000_001_u64,
+        "charge_protocol": "quote@2",
+        "quote_revision": format!("sha256:{}", "a".repeat(64))
+    });
+    let mut malformed = input.clone();
+    malformed["quote_revision"] = json!(format!("sha256:{}G", "a".repeat(63)));
+    assert!(account_image_send(
+        &dir,
+        issuer,
+        &audience,
+        CHILD,
+        AccountImageOperation::Submit {
+            input: malformed,
+            idempotency_key: "receipt-test-1".into(),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .is_err());
+    assert_eq!(
+        board.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        other.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    board.set_nonblocking(false).unwrap();
+    let board_address = board.local_addr().unwrap();
+    let expected = input.clone();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = board.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "POST /__platform/media/image HTTP/1.1");
+        let mut authorization = None;
+        let mut idempotency = None;
+        let mut length = 0;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').unwrap();
+            assert!(!name.eq_ignore_ascii_case("cf-access-client-id"));
+            assert!(!name.eq_ignore_ascii_case("cf-access-client-secret"));
+            if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("idempotency-key") {
+                idempotency = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        assert_eq!(
+            authorization.as_deref(),
+            Some(format!("Bearer {CHILD}").as_str())
+        );
+        assert_eq!(idempotency.as_deref(), Some("receipt-test-1"));
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
+        write!(
+            socket,
+            "HTTP/1.1 302 Found\r\nLocation: {other_origin}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let result = account_image_send(
+        &dir,
+        issuer,
+        &audience,
+        CHILD,
+        AccountImageOperation::Submit {
+            input,
+            idempotency_key: "receipt-test-1".into(),
+        },
+        Instant::now() + Duration::from_secs(10),
+    );
+    // Unblock accept if the client rejected the valid request before connecting.
+    drop(std::net::TcpStream::connect(board_address));
+    server.join().unwrap();
+    assert!(result.is_err(), "cross-origin redirect must be refused");
+    assert_eq!(
+        other.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 fn continuity_request(listener: &TcpListener, path: &str) -> (std::net::TcpStream, Value) {
     let (socket, _) = listener.accept().unwrap();
     socket

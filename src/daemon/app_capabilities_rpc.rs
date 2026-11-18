@@ -89,7 +89,26 @@ fn require_frozen_model_quote(
         return Err(Error::rejected("the approved model quote is unavailable"));
     }
     if text {
-        if input.get("model").is_none() && saved["model"].as_str() != quote.model.as_deref() {
+        if saved["charge_protocol"] == "quote@2"
+            || quote.charge_protocol.as_deref() == Some("quote@2")
+        {
+            let approved = saved["model"]
+                .as_str()
+                .filter(|model| crate::platform::agenticos_external::valid_model_id(model))
+                .ok_or_else(|| Error::rejected("the approved text model is unavailable"))?;
+            if saved["charge_protocol"] != "quote@2"
+                || quote.charge_protocol.as_deref() != Some("quote@2")
+                || quote.model.as_deref() != Some(approved)
+                || input
+                    .get("model")
+                    .is_some_and(|model| model.as_str() != Some(approved))
+            {
+                return Err(Error::rejected(
+                    "the text model or protocol changed since approval; request a new quote",
+                ));
+            }
+        } else if input.get("model").is_none() && saved["model"].as_str() != quote.model.as_deref()
+        {
             return Err(Error::rejected(
                 "the text model changed since approval; request a new quote",
             ));
@@ -887,15 +906,11 @@ impl Shared {
                     // CAD-1374: the sealed approving human bound at approval
                     // time. Null for a legacy approval (no human recorded).
                     let sealed_human = run["approval"]["human"].clone();
-                    // CAD-1141: price drift is accepted. The fresh quote is
-                    // the call's `max_charge_minor` ceiling (authority below);
-                    // the frozen snapshot itself must still be unchanged.
                     if run["snapshot_digest"] != checked_run["snapshot_digest"] {
                         return Err(Error::rejected(
                             "run snapshot digest changed since run approval",
                         ));
                     }
-                    require_frozen_model_quote(&run, &slot, &quote, input)?;
                     self.recheck_app_capability_quote(&proof, &quote)?;
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
@@ -935,6 +950,9 @@ impl Shared {
                         }
                         return Ok(std::ops::ControlFlow::Break(existing));
                     }
+                    // Price checks for a new dispatch must not invalidate a
+                    // retained receipt under the same authorized identity.
+                    require_frozen_model_quote(&run, &slot, &quote, input)?;
                     let call_id = format!(
                         "app-call-{}",
                         uuid::Uuid::new_v5(
