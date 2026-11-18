@@ -1999,7 +1999,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
-    <PdfPageTarget.Provider value={canAttach && convId !== null && attachDestination
+    <PdfPageTarget.Provider value={hosted && canAttach && attachDestination
       ? { key: composerKey, destination: attachDestination, isCurrent: isCurrentUploadOrigin }
       : null}>
     <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>

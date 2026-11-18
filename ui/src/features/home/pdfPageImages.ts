@@ -2,7 +2,7 @@ import { getDocument, PDFWorker, type PDFDocumentProxy } from "pdfjs-dist/legacy
 import PdfWorkerScript from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?worker";
 import { ATTACH_MAX_BYTES } from "../app-shell/chat/attach";
 
-const PDF_ASSETS = `${import.meta.env.BASE_URL}assets/pdfjs/`;
+const PDF_ASSETS = "/assets/pdfjs/";
 const MAX_PAGE_SIDE = 2048;
 
 export type LoadedPdfPages = {

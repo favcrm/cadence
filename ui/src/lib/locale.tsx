@@ -2305,6 +2305,7 @@ Object.assign(zhTW, {
   "Replace PDF with page images": "以頁面圖片取代 PDF",
   "Replace in draft": "在草稿中取代",
   "Opening PDF…": "正在開啟 PDF…",
+  "Update your browser to attach PDF pages as images.": "請更新瀏覽器，才可將 PDF 頁面附加為圖片。",
   "This PDF couldn’t be opened. It may be unavailable, damaged, or password-protected.": "無法開啟此 PDF。檔案可能無法存取、已損毀，或受密碼保護。",
   "This draft has no free attachment slots. Remove an attachment first.": "此草稿的附件已達上限。請先移除一個附件。",
   "Choose up to {limit} of {count} pages, e.g. 1, 3–5. Images are added to the draft, not sent.": "文件共有 {count} 頁，最多可選 {limit} 頁，例如 1、3–5。圖片只會加入草稿，不會傳送。",

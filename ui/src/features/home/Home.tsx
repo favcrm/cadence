@@ -1529,6 +1529,9 @@ function MasterHome({
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    <PdfPageTarget.Provider value={hosted === true && canAttach && !effectiveReadOnly && homeConversation && attachDestination
+      ? { key: "home", destination: attachDestination }
+      : null}>
     {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main
@@ -1646,9 +1649,6 @@ function MasterHome({
 
             <CredentialRequestList conversationId={homeConversation} enabled={credentialRequestsEnabled} className="mx-1" />
             <ImageConversation.Provider value={homeConversation ?? null}>
-            <PdfPageTarget.Provider value={canAttach && !effectiveReadOnly && homeConversation && attachDestination
-              ? { key: "home", destination: attachDestination }
-              : null}>
             <ThreadList
               items={items}
               conversation={homeConversation ?? null}
@@ -1664,7 +1664,6 @@ function MasterHome({
               queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
-            </PdfPageTarget.Provider>
             </ImageConversation.Provider>
             {cmds.map((c) => (
               <CmdCard
@@ -1783,6 +1782,7 @@ function MasterHome({
       </section>
     </main>
     </StagedSourceContext.Provider>
+    </PdfPageTarget.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

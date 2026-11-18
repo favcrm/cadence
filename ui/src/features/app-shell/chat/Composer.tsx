@@ -1,6 +1,7 @@
 import { askBody, askLabel, citesArtifact } from "../../canvas/askRefs";
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -12,8 +13,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { hostedOrigin } from "../../auth/hosted";
-import PdfPageAction from "../../home/PdfPageAction";
+import PdfPageAction, { PdfPageTarget } from "../../home/PdfPageAction";
 import type { PendingAttachment } from "../../home/thread";
 import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
@@ -180,7 +180,6 @@ function AttachChips({
   t,
   onRetry,
   onRemove,
-  pdfDestination,
   storeKey,
 }: {
   items: AttachItem[];
@@ -189,9 +188,9 @@ function AttachChips({
   t: (english: string) => string;
   onRetry: (item: AttachItem) => void;
   onRemove: (item: AttachItem, focus: RemoveFocusTarget | null) => void;
-  pdfDestination?: AttachDestination;
   storeKey: string;
 }) {
+  const pageTarget = useContext(PdfPageTarget);
   const [expanded, setExpanded] = useState(false);
   // Failed first, then uploading, then ready: the rows behind +N more
   // are the ones that still need the operator.
@@ -265,8 +264,12 @@ function AttachChips({
                 {displayAttachError(a.error, t)}
               </small>
             )}
-            {pdfDestination && (a.file.type === "application/pdf" || /\.pdf$/i.test(a.file.name)) && (
-              <PdfPageAction source={{ kind: "draft", file: a.file, itemKey: a.key }} target={{ key: storeKey, destination: pdfDestination }} />
+            {pageTarget?.key === storeKey && (a.file.type === "application/pdf" || /\.pdf$/i.test(a.file.name)) && (
+              <PdfPageAction
+                key={pageTarget.destination.conversation ?? pageTarget.destination.subject}
+                source={{ kind: "draft", file: a.file, itemKey: a.key }}
+                target={pageTarget}
+              />
             )}
           </span>
           {a.status === "failed" && !a.permanent && (
@@ -744,7 +747,6 @@ export default function Composer({
         items={attachItems}
         t={translateAttachText}
         storeKey={key}
-        pdfDestination={attachEnabled && hostedOrigin(window.location.hostname) ? attachDestination : undefined}
         onRetry={(item) => retryAttach(key, item.key)}
         onRemove={(item, focus) => {
           pendingFocus.current = focus;

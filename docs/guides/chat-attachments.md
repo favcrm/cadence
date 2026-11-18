@@ -388,3 +388,5 @@ through the normal private attachment queue. Converting never sends a message
 or opens the assistant’s browser. A failed conversion changes nothing in the
 draft; if a PNG upload fails, use the attachment’s retry or remove action.
 Image attachments still require a model that accepts visual input.
+On browsers that cannot run the PDF renderer, opening the original still works;
+update your browser to use page capture.

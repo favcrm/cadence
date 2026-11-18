@@ -700,7 +700,8 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
               <span className="sentchip-meta num">{attachMeta(f.name, f.size, t)}</span>
             </>
           );
-          return f.mime === "application/pdf" && hosted && conversation !== null ? (
+          const canCapturePages = sent && pageTarget?.destination.conversation === conversation && pageTarget !== null;
+          return f.mime === "application/pdf" && conversation !== null && (hosted || canCapturePages) ? (
             <span key={f.id} className="inline-flex min-w-0 flex-wrap items-center gap-1">
               <button
                 type="button"
@@ -710,7 +711,7 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
               >
                 {body}
               </button>
-              {sent && pageTarget?.destination.conversation === conversation && (
+              {canCapturePages && (
                 <PdfPageAction key={`${pageTarget.key}:${conversation}`} source={{ kind: "retained", file: f, conversation }} target={pageTarget} />
               )}
             </span>

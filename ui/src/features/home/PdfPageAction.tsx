@@ -1,4 +1,4 @@
-import { createContext, useCallback, useEffect, useId, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
+import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
@@ -109,15 +109,20 @@ function PdfPageDialog({ source, target, title, close }: {
   const limit = pdf ? Math.min(pdf.count, slots) : slots;
   const full = slots === 0;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // The bundled PDF.js build still requires native Promise.withResolvers.
+    // Older browsers can use the rest of chat and open the original PDF.
+    if (typeof Promise.withResolvers !== "function" || typeof Worker === "undefined") {
+      setError("Update your browser to attach PDF pages as images.");
+      return;
+    }
     const scope = new AbortController();
     mount.current = scope.signal;
     async function load() {
       let op: PrivateOperation | undefined;
-      const step = new AbortController();
-      const deadline = setTimeout(() => step.abort(), STEP_TIMEOUT);
+      const deadline = setTimeout(() => op?.dispose(), STEP_TIMEOUT);
       try {
-        op = beginPrivateOperation(AbortSignal.any([scope.signal, step.signal]));
+        op = beginPrivateOperation(scope.signal);
         operation.current = op;
         const [{ loadPdfPages }, bytes] = await Promise.all([import("./pdfPageImages"), readPdf(original, op)]);
         const loaded = await loadPdfPages(bytes, op.signal);
