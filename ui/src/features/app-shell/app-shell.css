@@ -1523,30 +1523,36 @@ button.sentchip:focus-visible {
   font-family: var(--font-chat);
   text-align: left;
 }
+/* The badge colour comes from the board's status tokens, tinted like a
+   status pill, so it follows the theme: no palette of its own. */
 .sentchip-ext {
+  --kind: var(--color-ink-400);
   display: grid;
   place-items: center;
   width: 1.875rem;
   height: 2.125rem;
   border-radius: .375rem;
-  background: #64748b;
-  color: #fff;
+  background: color-mix(in srgb, var(--kind) 18%, transparent);
+  color: var(--kind);
   font: 600 .5625rem/1 var(--font-chat);
   letter-spacing: .04em;
 }
-.sentchip[data-kind="pdf"] .sentchip-ext { background: #dc2626; }
-.sentchip[data-kind="image"] .sentchip-ext { background: #7c3aed; }
-.sentchip[data-kind="video"] .sentchip-ext { background: #db2777; }
-.sentchip[data-kind="text"] .sentchip-ext { background: #0891b2; }
+.sentchip[data-kind="pdf"] .sentchip-ext { --kind: var(--color-fail); }
+.sentchip[data-kind="image"] .sentchip-ext { --kind: var(--color-info); }
+.sentchip[data-kind="video"] .sentchip-ext { --kind: var(--color-warn); }
+.sentchip[data-kind="text"] .sentchip-ext { --kind: var(--color-accent); }
 .sentchip-text {
   display: grid;
   min-width: 0;
 }
 .sentchip-name {
+  overflow: hidden;
   color: var(--color-ink-100);
   font-size: .8125rem;
   font-weight: 500;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sentchip-meta {
   color: var(--color-ink-400);
