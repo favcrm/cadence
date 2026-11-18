@@ -49,6 +49,7 @@ import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
+import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
 import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
@@ -1645,6 +1646,9 @@ function MasterHome({
 
             <CredentialRequestList conversationId={homeConversation} enabled={credentialRequestsEnabled} className="mx-1" />
             <ImageConversation.Provider value={homeConversation ?? null}>
+            <PdfPageTarget.Provider value={canAttach && !effectiveReadOnly && homeConversation && attachDestination
+              ? { key: "home", destination: attachDestination }
+              : null}>
             <ThreadList
               items={items}
               conversation={homeConversation ?? null}
@@ -1660,6 +1664,7 @@ function MasterHome({
               queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
+            </PdfPageTarget.Provider>
             </ImageConversation.Provider>
             {cmds.map((c) => (
               <CmdCard

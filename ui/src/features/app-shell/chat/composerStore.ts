@@ -275,6 +275,11 @@ export function composerDraftState(key: string): ComposerDraft {
   return family ? activeOf(family).snapshot : EMPTY_DRAFT;
 }
 
+/** Identity of the visible draft, for asynchronous actions that must not cross a slot change. */
+export function activeComposerSlot(key: string): number | undefined {
+  return families.get(key)?.activeId;
+}
+
 /** The slot a read addresses: the family's visible slot, or one parked
  *  bundle named by `savedIntentsFor(key)`'s `slot`. */
 function slotOf(key: string, slot?: number): DraftCell | undefined {

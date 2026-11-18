@@ -374,3 +374,17 @@ Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
 10 MiB). A video is stored and played, never decoded: the model still receives
 its name, size and type only. A local board has no such route, and the client
 keeps the metadata chips there without requesting attachment bytes.
+
+### Give the assistant selected PDF pages as images
+
+On the hosted board, choose **Replace PDF with page images** on a draft PDF
+or **Attach pages as images** on a PDF already in the conversation. Enter page
+numbers and ranges, for example `1, 3–5`. Duplicates are removed and the selected
+pages are attached as separate PNGs in document order. The batch must fit in the
+draft’s five attachment slots; replacing a draft PDF frees its slot.
+
+Your browser renders the pages locally, including scans, then uploads the PNGs
+through the normal private attachment queue. Converting never sends a message
+or opens the assistant’s browser. A failed conversion changes nothing in the
+draft; if a PNG upload fails, use the attachment’s retry or remove action.
+Image attachments still require a model that accepts visual input.
