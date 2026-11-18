@@ -51,6 +51,19 @@ const result = (text: string): ThreadEntry => ({ seq: ++seq, role: "agent", kind
   check(!oddHtml.includes("href="), "a record id the app screen would refuse is not a link");
 }
 
+// CAD-2450: an artifact chip is named by the artifact's title when the turn holds it.
+{
+  const id = "art-4cff6ebbaae44734856e9acb4549e320";
+  const sources = turnSources([call(`artifact_read {"id":"${id}"}`)]);
+  const held: ThreadEntry = { seq: ++seq, role: "agent", kind: "artifact", text: "", message: "m1", payload: { id, version: 1, kind: "md", title: "Quote draft", bytes: 10, digest: "d" } };
+  const titled = sourcesHtml({ sources, artifacts: [held] });
+  check(titled.includes("<bdi>Quote draft</bdi>") && titled.includes(`title="${id}"`), `a held artifact is named by its title: ${titled}`);
+  check(/<button[^>]*data-source-kind="artifact"/.test(titled), "a held artifact opens");
+  const bare = sourcesHtml({ sources, artifacts: [] });
+  check(bare.includes("<bdi>art-4cff6ebb…</bdi>") && bare.includes(`title="${id}"`), "an artifact from another turn is a short id with the full id in the tooltip");
+  check(!/<(a|button)[^>]*data-source-kind="artifact"/.test(bare), "with no opener it is plain text");
+}
+
 // Trust boundary: a web chip is an anchor only through SafeLink's policy.
 {
   const web = (url: string) => sourcesHtml({ sources: [{ kind: "web", key: `web:${url}`, label: "x", target: url }], artifacts: [] });

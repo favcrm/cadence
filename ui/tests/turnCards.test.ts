@@ -1,7 +1,7 @@
 import { parsePreview, parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
 import type { ThreadEntry } from "../src/features/home/thread";
 declare function require(name: string): any;
-import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, parseToolCall, stagedFields, stagedInTurn, turnSources } from "../src/features/home/turnCards";
+import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, parseToolCall, shortId, stagedFields, stagedInTurn, turnSources } from "../src/features/home/turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): a turn's sources and staged
@@ -52,6 +52,9 @@ check(parseToolCall('wiki_read {"path":') === null, "broken JSON is not a call")
   const app = sources.find((s) => s.kind === "app");
   check(app?.app === "crm" && app.target === "c1", "an app source is the record, by app and record id");
 }
+check(shortId("art-4cff6ebbaae44734856e9acb4549e320") === "art-4cff6ebb…", `a long artifact id is cut: ${shortId("art-4cff6ebbaae44734856e9acb4549e320")}`);
+check(shortId("art-1") === "art-1", "a short id stays whole");
+check(turnSources([call('artifact_read {"id":"art-4cff6ebbaae44734856e9acb4549e320"}')])[0]!.target === "art-4cff6ebbaae44734856e9acb4549e320", "the chip still targets the full id");
 check(turnSources([prose("No tools here.")]).length === 0, "a turn that read nothing has no sources");
 check(SOURCES_SHOWN === 8, "the row shows at most 8 chips");
 
@@ -77,7 +80,21 @@ const appRow = (id: string, status = "pending") =>
   check(stagedInTurn([result("nothing staged")], rows).length === 0, "no id in the results, no card");
   check(stagedInTurn([prose(`I staged ${ACTION}`)], rows).length === 0, "an id only in prose does not make a card");
   const dashed = `${ACTION.slice(0, 8)}-${ACTION.slice(8, 12)}-${ACTION.slice(12, 16)}-${ACTION.slice(16, 20)}-${ACTION.slice(20)}`;
-  check(stagedInTurn([result(`{"action_id":"${dashed}"}`)], rows).length === 1, "a dashed form of the id matches");
+  check(stagedInTurn([result(`{"staged":true,"action_id":"${dashed}"}`)], rows).length === 1, "a dashed form of the id matches");
+
+  // CAD-2450, shapes seen on Demo Company: the staging result is the only match.
+  const staging = result(`{"staged":true,"actionId":"${ACTION}","note":"Recorded as an action for an owner to decide."}`);
+  check(stagedInTurn([staging], rows).map((r) => r.id).join() === ACTION, "a camelCase actionId staging result matches");
+  const listing = result(`{"total":2,"actions":[{"id":"${ACTION}","tool":"app_call"},{"id":"${OTHER}","tool":"app_call"}]}`);
+  check(stagedInTurn([listing], rows).length === 0, "an actions list names ids but stages nothing");
+  check(stagedInTurn([result(`{"record":{"id":"${ACTION}"},"staged":false}`)], rows).length === 0, "a record read is not a staging result");
+  check(stagedInTurn([result(`{"actionId":"${ACTION}"}`)], rows).length === 0, "an id without staged:true is not a staging result");
+  check(stagedInTurn([result(`Staged ${ACTION}`)], rows).length === 0, "plain text naming the id is not a staging result");
+  const payloadResult: ThreadEntry = { seq: ++seq, role: "agent", kind: "tool_result", text: "ok", message: "m1", payload: { staged: true, actionId: OTHER } };
+  check(stagedInTurn([payloadResult], rows).map((r) => r.id).join() === OTHER, "a staging payload matches");
+  // Two turns: the staging turn shows the card, the later turn that lists it does not.
+  check(stagedInTurn([call('app_call {"app":"accounting","operation":"records.create"}'), staging], rows).length === 1, "turn 1 staged it");
+  check(stagedInTurn([call('app_call {"app":"accounting","operation":"records.list"}'), listing], rows).length === 0, "turn 2 only listed it");
 }
 
 // A connected effect: the AOS-647 contract fixture, copied from

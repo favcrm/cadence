@@ -41,6 +41,13 @@ export function parseToolCall(text: string): { name: string; args: Record<string
   }
 }
 
+/** A long opaque id cut for a chip: `art-4cff6ebb…`. */
+export function shortId(id: string): string {
+  const dash = id.indexOf("-");
+  const head = dash > 0 && dash <= 8 ? dash + 1 : 0;
+  return id.length > head + 10 ? `${id.slice(0, head + 8)}…` : id;
+}
+
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
 
 /** An app operation that reads one record by id. */
@@ -74,8 +81,10 @@ function sourceOf(name: string, args: Record<string, unknown>): TurnSource | nul
     }
     case "artifact_read":
     case "artifact_show": {
+      // The chip names the artifact by its title when the turn holds it
+      // (TurnRichCards); otherwise by this short id.
       const id = str(args.id) ?? str(args.artifact);
-      return id ? { kind: "artifact", key: `artifact:${id}`, label: id, target: id } : null;
+      return id ? { kind: "artifact", key: `artifact:${id}`, label: shortId(id), target: id } : null;
     }
     case "web_read": {
       const url = str(args.url);
@@ -128,17 +137,37 @@ export function turnSources(entries: readonly ThreadEntry[]): TurnSource[] {
 const norm = (s: string): string => s.toLowerCase().replace(/-/g, "");
 
 /**
- * The staged writes this turn made: a decision whose id appears in one of the
- * turn's recorded tool results. Only rows the surface already holds can
- * match, so a write the viewer cannot see never shows.
+ * The decision id a staging result names: `{"staged": true, "actionId": …}`
+ * (or `action_id`), from the result's JSON text or payload. A result that
+ * only lists, reads or mentions an id names none (CAD-2450).
+ */
+export function stagedActionId(entry: ThreadEntry): string | null {
+  const candidates: unknown[] = [entry.payload];
+  try {
+    candidates.push(JSON.parse((entry.text ?? "").trim()));
+  } catch {
+    // Not JSON: not a staging result.
+  }
+  for (const value of candidates) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const result = value as Record<string, unknown>;
+    if (result.staged !== true) continue;
+    const id = str(result.actionId) ?? str(result.action_id);
+    if (id) return norm(id);
+  }
+  return null;
+}
+
+/**
+ * The staged writes this turn made: a decision named by one of the turn's
+ * staging results. Only rows the surface already holds can match, so a write
+ * the viewer cannot see never shows, and a later turn that lists or reads the
+ * decision does not repeat its card.
  */
 export function stagedInTurn(entries: readonly ThreadEntry[], rows: readonly StagedWrite[]): StagedWrite[] {
-  const results = entries
-    .filter((entry) => entry.kind === "tool_result")
-    .map((entry) => norm(`${entry.text ?? ""} ${entry.payload ? JSON.stringify(entry.payload) : ""}`))
-    .join("\n");
-  if (results.trim() === "") return [];
-  return rows.filter((row) => row.id.length >= 8 && results.includes(norm(row.id)));
+  const ids = new Set(entries.filter((entry) => entry.kind === "tool_result").map(stagedActionId).filter((id): id is string => id !== null));
+  if (ids.size === 0) return [];
+  return rows.filter((row) => ids.has(norm(row.id)));
 }
 
 export interface StagedField {
