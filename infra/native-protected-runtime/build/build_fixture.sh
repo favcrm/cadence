@@ -153,7 +153,13 @@ fi
 [ -d "$PI_GRAPH" ] && [ ! -L "$PI_GRAPH" ] || die "Pi SDK graph must be a real node_modules directory"
 [ -d "$MODEL_SDK" ] && [ ! -L "$MODEL_SDK" ] || die "model SDK must be a real directory"
 [[ "$GUEST_PROVIDER" =~ ^[a-z][a-z0-9_-]{1,31}$ ]] || die "--guest-provider is malformed"
-[[ "$GUEST_MODEL" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "--guest-model is malformed"
+if [ "$GUEST_PROVIDER" = agenticos ]; then
+  [[ ${#GUEST_MODEL} -le 190 && "$GUEST_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]] \
+    || die "--guest-model must be an explicit AgenticOS author/model id"
+  [ "$GUEST_EFFORT" = off ] || die "AgenticOS requires --guest-effort off"
+else
+  [[ "$GUEST_MODEL" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "--guest-model is malformed"
+fi
 [[ "$GUEST_MAX_OUTPUT" =~ ^[1-9][0-9]*$ ]] || die "--guest-max-output is malformed"
 [[ "$GUEST_MAX_CONTEXT" =~ ^[1-9][0-9]*$ ]] || die "--guest-max-context is malformed"
 if [ -n "$GUEST_EFFORT" ]; then

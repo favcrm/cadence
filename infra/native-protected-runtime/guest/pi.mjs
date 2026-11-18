@@ -73,7 +73,11 @@ const readConfig = () => {
     if (!keys.includes(key)) throw new Error('config extra field');
   }
   if (!PROVIDERS.has(value.provider)) throw new Error('provider');
-  if (typeof value.model_uid !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(value.model_uid)) {
+  const modelId = value.provider === 'agenticos'
+    ? /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/
+    : /^[A-Za-z0-9._-]{1,128}$/;
+  if (typeof value.model_uid !== 'string' || !modelId.test(value.model_uid)
+      || (value.provider === 'agenticos' && value.model_uid.length > 190)) {
     throw new Error('model uid');
   }
   if (!Number.isSafeInteger(value.max_output_tokens) || value.max_output_tokens < 1 || value.max_output_tokens > 8192) {
@@ -172,7 +176,7 @@ const buildModel = (config) => ({
   baseUrl: 'https://protected.invalid',
   input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  reasoning: config.effort !== null,
+  reasoning: config.effort !== null && config.provider !== 'agenticos',
   contextWindow: config.max_context_tokens,
   maxTokens: config.max_output_tokens,
 });

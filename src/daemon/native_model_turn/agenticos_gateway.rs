@@ -337,19 +337,24 @@ mod tests {
     fn loopback_listener_cannot_receive_the_bearer_without_tls() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let origin = format!("https://{}", listener.local_addr().unwrap());
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
         let peer = std::thread::spawn(move || {
             let (mut connection, _) = listener.accept().unwrap();
             connection
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut handshake = [0; 4096];
-            let received = connection.read(&mut handshake).unwrap();
-            assert!(received >= 5);
-            assert_eq!(handshake[0], 22, "the first record must be a TLS handshake");
-            assert!(!handshake[..received]
+            let mut record_header = [0; 5];
+            connection.read_exact(&mut record_header).unwrap();
+            assert_eq!(record_header[0], 22, "the first record must be TLS");
+            let remaining = usize::from(u16::from_be_bytes([record_header[3], record_header[4]]));
+            assert!(remaining <= 16 * 1024);
+            let mut handshake = vec![0; remaining];
+            connection.read_exact(&mut handshake).unwrap();
+            assert!(!handshake
                 .windows(b"synthetic-bearer".len())
                 .any(|window| window == b"synthetic-bearer"));
             // Drop the socket instead of proving a certificate.
+            observed_tx.send(()).unwrap();
         });
         let result = invoke(GatewayTurn {
             origin: &origin,
@@ -373,6 +378,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(result, ChildOutcome::Unknown { .. }));
+        observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         peer.join().unwrap();
     }
 }

@@ -651,7 +651,7 @@ fn canonical_gateway_model(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     }
-    value.len() <= 200
+    value.len() <= 200 - "agenticos/".len()
         && value
             .split_once('/')
             .is_some_and(|(author, model)| part(author) && part(model))

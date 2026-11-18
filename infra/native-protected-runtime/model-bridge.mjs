@@ -391,7 +391,7 @@ const assistantMessage = (stream, configured, receipt) => {
     content: Array.isArray(message.content) ? message.content : [],
     api: message.api,
     provider: message.provider,
-    model: message.model ?? configured.model,
+    model: configured.provider === 'agenticos' ? configured.model : (message.model ?? configured.model),
     usage: message.usage ?? emptyUsage(),
     stopReason: message.stopReason,
     timestamp: safeInt(message.timestamp) ? message.timestamp : Date.now(),

@@ -656,7 +656,7 @@ impl NativeModelBroker {
         let evidence = self.measured(caller)?;
         let task = self.active_task(&evidence)?;
         let shared = self.shared()?;
-        let route = self.route()?.clone();
+        let route = self.route()?;
 
         let row = shared
             .store
@@ -773,7 +773,7 @@ impl NativeModelBroker {
             ));
         }
         require_source_account(route, &configuration.account)?;
-        if configuration.approved_tools_json != approved_tool_bindings(&route)? {
+        if configuration.approved_tools_json != approved_tool_bindings(route)? {
             return Err(refused(
                 "stale_configuration",
                 "the approved tool declarations changed",
@@ -798,7 +798,7 @@ impl NativeModelBroker {
             ));
         }
 
-        let active = authorize_tools(&parsed.messages, &evidence, &route)?;
+        let active = authorize_tools(&parsed.messages, &evidence, route)?;
         let binding = dto::operation_binding(&parsed, &active)?;
         let input_digest = operation_input_digest(
             &binding,
@@ -842,7 +842,7 @@ impl NativeModelBroker {
             &shared,
             &evidence,
             &task,
-            &route,
+            route,
             &source,
             &configuration,
             &parsed,
@@ -1178,25 +1178,23 @@ impl NativeModelBroker {
         };
         let child = match outcome {
             Ok(child) => child,
-            Err(error) if matches!(error.code(), Some("route_unavailable")) => {
-                return self
-                    .settle_refused(
-                        shared,
-                        &parsed.request_id,
-                        ClosedModelTurnErrorV1::route_unavailable(),
-                    )
-                    .and_then(|row| receipt(&row));
-            }
-            Err(error) if matches!(error.code(), Some("payload_too_large")) => {
-                return self
-                    .settle_refused(
-                        shared,
-                        &parsed.request_id,
-                        ClosedModelTurnErrorV1::payload_too_large(),
-                    )
-                    .and_then(|row| receipt(&row));
-            }
-            Err(_) => {
+            Err(error) => {
+                let refusal = match error.code() {
+                    Some("route_unavailable") => Some(ClosedModelTurnErrorV1::route_unavailable()),
+                    Some("payload_too_large") => Some(ClosedModelTurnErrorV1::payload_too_large()),
+                    Some("unsupported_content") if route.provider == AGENTICOS => {
+                        Some(ClosedModelTurnErrorV1::unsupported_content())
+                    }
+                    Some("auth_unavailable") if route.provider == AGENTICOS => {
+                        Some(ClosedModelTurnErrorV1::auth_unavailable())
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    return self
+                        .settle_refused(shared, &parsed.request_id, refusal)
+                        .and_then(|row| receipt(&row));
+                }
                 let current = self.mark_unknown(shared, &parsed.request_id, 0, 0, 0)?;
                 return receipt(&current);
             }
