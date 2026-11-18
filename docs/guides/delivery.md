@@ -160,14 +160,17 @@ What each required review asks of the hosted gate:
 | `agent`, `focus: standards` | A counted pass on the standards axis. |
 | `agent`, `focus: spec-security` | A counted pass on the spec/security axis. |
 | Both of the above | A pass on each axis, from two different reviewers. |
-| `agent`, `focus: general` | One combined review: a `combined` verdict, or a pass on both axes. |
+| `agent`, `focus: general` | One combined review: a `combined` verdict, or a pass on both axes. When another applying rule already needs a `standards` or `spec-security` review, that review covers it. |
 | `agent`, `focus: browser-qa` | A Browser QA pass (see [Browser QA](#browser-qa)). |
 | `operator` | The owner's approval. |
 | `check`, `mode: required` | The latest run of each check that App posted on the exact head concluded `success`. The hosted gate matches the App by its slug, so name it by slug, not by id. |
 | `check`, `mode: advisory` | Nothing; it never blocks. |
 
 A `revise` on an axis the policy does not require does not block. A change no
-rule asks a review of needs no code review, only its checks and evidence.
+rule asks a review of needs no code review, only its checks and evidence. A
+verdict that states a Risk other than `auto` still adds the owner's approval,
+as does a counted review workflow result on a path outside
+`workflow-auto-paths.toml`.
 
 The policy may ask for fewer reviews than the default classes, but only on
 ordinary paths. The trusted lists keep their floor, and the policy can add to it
@@ -190,8 +193,10 @@ needs the reviews its rules name.
 A change to the section takes effect only through the owner's approval: an
 agent's edit to `PROJECT.md` is not the approved policy. This section describes
 the hosted gate. The native merge queue does not apply an approved custom policy
-yet: it refuses a change whose requirements come from one, so keep a native
-project on the default policy until it does.
+yet. It refuses a change that the policy alone decides. It accepts a change at
+the strict floor, but enforces only the floor, the owner's approval and Browser
+QA, not the policy's own required checks or named reviews. Keep a native project
+on the default policy until it does.
 
 ## Review evidence
 
