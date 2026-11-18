@@ -3332,7 +3332,8 @@ button.turnsource:hover {
 /* The staged action card: kind and live status in the header, the write's
    title, its key fields (a missing value flagged), Review / Not now. */
 .turncard-staged {
-  max-width: min(100%, 32rem);
+  /* CAD-2450: one width for every staged card, not content-sized. */
+  width: min(100%, 32rem);
   overflow: hidden;
 }
 .turncard-staged .turncard-body {

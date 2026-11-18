@@ -44,14 +44,22 @@ function SourceChip({
 }) {
   const t = useTranslate();
   const conversation = useImageConversation();
+  // CAD-2450: an artifact the turn holds is named by its title, not its id.
+  const artifact =
+    source.kind === "artifact"
+      ? artifacts.map((a) => artifactRef(a.payload)).find((ref) => ref?.id === source.target) ?? null
+      : null;
+  const label = artifact && artifact.title !== "Untitled" ? artifact.title : source.label;
   const body: ReactNode = (
     <>
       <span className="turnsource-n num" aria-hidden>{n}</span>
       <span className="turnsource-kind">{t(KIND_LABEL[source.kind])}</span>
-      <span className="turnsource-label"><bdi>{source.label}</bdi></span>
+      <span className="turnsource-label"><bdi>{label}</bdi></span>
     </>
   );
-  const attrs = { className: "turnsource", "data-source-kind": source.kind, title: source.label };
+  // The tooltip carries the full identity a shortened label leaves out.
+  const tip = source.kind === "web" || source.kind === "artifact" ? source.target : label;
+  const attrs = { className: "turnsource", "data-source-kind": source.kind, title: tip };
   switch (source.kind) {
     case "wiki":
       return <Link {...attrs} href={`/wiki/${source.target.split("/").map(encodeURIComponent).join("/")}`}>{body}</Link>;
@@ -77,8 +85,7 @@ function SourceChip({
         <span {...attrs}>{body}</span>
       );
     case "artifact": {
-      const entry = artifacts.find((a) => artifactRef(a.payload)?.id === source.target);
-      const ref = entry ? artifactRef(entry.payload) : null;
+      const ref = artifact;
       return ref ? (
         <button type="button" {...attrs} onClick={() => openArtifact(ref)}>{body}</button>
       ) : (
