@@ -39,6 +39,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.candidate.outputs.source_sha }}
+      ci_run_id: ${{ steps.candidate.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.candidate.outputs.ci_run_attempt }}
+      has_runtime_owner: ${{ steps.facts.outputs.has_runtime_owner }}
     permissions:
       contents: read
       actions: read
@@ -149,6 +152,12 @@ jobs:
           # the main head actually observed for this publication.
           observed_main=$(git rev-parse origin/main)
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          # Historical candidates have no separately signed companion. Decide
+          # from the promoted source, never from whether a download succeeds.
+          owner_verifier=$(git ls-tree "$SOURCE_SHA" -- scripts/verify-runtime-owner.sh)
+          if [ -n "$owner_verifier" ]; then
+            echo "has_runtime_owner=true" >> "$GITHUB_OUTPUT"
+          fi
           # Limit output before writing; the extra entry detects
           # overflow, which refuses instead of accepting truncation.
           git rev-list --max-count=20001 --reverse "$SOURCE_SHA" > "$RUNNER_TEMP/ancestors.txt"
@@ -301,6 +310,32 @@ jobs:
           path: ${{ runner.temp }}/completion
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
+      - name: Download the companion from the approved CI run
+        if: needs.complete.outputs.has_runtime_owner == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cadence-runtime-owner-${{ needs.complete.outputs.source_sha }}-x86_64-linux
+          path: ${{ runner.temp }}/owner
+          run-id: ${{ needs.complete.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify and package the companion without executing it
+        if: needs.complete.outputs.has_runtime_owner == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
+          CI_RUN_ID: ${{ needs.complete.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.complete.outputs.ci_run_attempt }}
+        run: |
+          set -euo pipefail
+          owner="$RUNNER_TEMP/owner"
+          bash scripts/verify-runtime-owner.sh "$owner" "$SOURCE_SHA" "$CI_RUN_ID" "$CI_RUN_ATTEMPT"
+          # Recreate executable mode lost by the Actions ZIP. Fixed metadata
+          # and gzip headers make retries of the immutable upload byte-identical.
+          chmod 0755 "$owner/cadence-runtime-owner"
+          chmod 0644 "$owner/cadence-runtime-owner.sha256" "$owner/owner-attestation.jsonl"
+          tar --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - -C "$owner" \
+            cadence-runtime-owner cadence-runtime-owner.sha256 owner-attestation.jsonl \
+            | gzip -n > "$RUNNER_TEMP/cadence-runtime-owner.tar.gz"
       - name: Merge completion evidence into the package
         env:
           SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
@@ -320,6 +355,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
           UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+          HAS_RUNTIME_OWNER: ${{ needs.complete.outputs.has_runtime_owner }}
           # Operator-provisioned R2 access keys via repository secrets —
           # a hosted runner has no local AWS profile, so none is
           # created; credentials are never arguments or printed, and a
@@ -329,6 +365,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          companion=()
+          if [ "$HAS_RUNTIME_OWNER" = true ]; then
+            companion=(--artifact "cadence-runtime-owner.tar.gz=$RUNNER_TEMP/cadence-runtime-owner.tar.gz:x86_64-linux:application/octet-stream")
+          fi
           # No --published-at: a native promotion has no GitHub Release
           # publication instant to record, so publishedAt stays null —
           # the catalogue's recordedAt (truthful write time) is its
@@ -340,4 +380,5 @@ jobs:
             --version "$SOURCE_SHA" --source-sha "$SOURCE_SHA" \
             --visibility "${{ vars.RELEASES_R2_VISIBILITY || 'private' }}" \
             --production-candidate-id "$UPSTREAM_ID" \
-            --artifact "cadence-release.tar.gz=$RUNNER_TEMP/cadence-release-final.tar.gz:x86_64-linux:application/octet-stream"
+            --artifact "cadence-release.tar.gz=$RUNNER_TEMP/cadence-release-final.tar.gz:x86_64-linux:application/octet-stream" \
+            "${companion[@]}"
