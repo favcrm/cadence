@@ -47,22 +47,22 @@ export const TurnCard = forwardRef<HTMLElement, TurnCardProps>(function TurnCard
     <section
       ref={ref}
       {...rest}
-      className={["tcard", className].filter(Boolean).join(" ")}
+      className={["turncard", className].filter(Boolean).join(" ")}
       data-card-kind={kind}
       data-density={density}
       aria-label={label}
     >
-      <div className={["tcard-body", bodyClassName].filter(Boolean).join(" ")}>
+      <div className={["turncard-body", bodyClassName].filter(Boolean).join(" ")}>
         {(icon !== undefined || kindLabel !== undefined || status !== undefined) && (
-          <div className="tcard-head">
+          <div className="turncard-head">
             {(icon !== undefined || kindLabel !== undefined) && (
-              <span className="tcard-kind">
+              <span className="turncard-kind">
                 {icon}
                 {kindLabel}
               </span>
             )}
             {status && (
-              <span className="tcard-status" data-tone={status.tone} {...status.attrs}>
+              <span className="turncard-status" data-tone={status.tone} {...status.attrs}>
                 {status.text}
               </span>
             )}
@@ -70,7 +70,7 @@ export const TurnCard = forwardRef<HTMLElement, TurnCardProps>(function TurnCard
         )}
         {children}
       </div>
-      {footer !== undefined && footer !== null && footer !== false && <div className="tcard-foot">{footer}</div>}
+      {footer !== undefined && footer !== null && footer !== false && <div className="turncard-foot">{footer}</div>}
     </section>
   );
 });
@@ -102,8 +102,8 @@ export function TurnCardButton({
 }: TurnCardButtonProps) {
   const body = (
     <>
-      <span className="tcard-tile arttype">{tile}</span>
-      <span className="tcard-text arttext">
+      <span className="turncard-tile arttype">{tile}</span>
+      <span className="turncard-text arttext">
         <b>{title}</b>
         {meta}
       </span>
@@ -112,7 +112,7 @@ export function TurnCardButton({
   );
   const shared = {
     ...rest,
-    className: ["tcard-button artcard", className].filter(Boolean).join(" "),
+    className: ["turncard-button artcard", className].filter(Boolean).join(" "),
     "data-card-kind": kind,
     "data-density": density,
     "data-open": open || undefined,
