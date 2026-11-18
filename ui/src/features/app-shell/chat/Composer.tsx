@@ -791,8 +791,8 @@ export default function Composer({
       }}
     />
   ) : null;
-  // CAD-2425: the full composer names the control beside its icon (the
-  // approved chat-polish footer row); the compact pane keeps the icon only.
+  // CAD-2425: the control is named beside its icon (the approved
+  // chat-polish footer row); CSS shows the name from 640px.
   const attachControl = (labelled: boolean) => attach ? (
     <button
       type="button"
@@ -888,7 +888,7 @@ export default function Composer({
           {boxEl}
           <div className="app-chat-composer-tools">
             {attachInput}
-            {attachControl(false)}
+            {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>

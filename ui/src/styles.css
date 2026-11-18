@@ -3032,7 +3032,8 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   display: none;
 }
 @media (min-width: 640px) {
-  .composer-foot .app-chat-attach {
+  .composer-foot .app-chat-attach,
+  .app-chat-composer-tools .app-chat-attach {
     display: inline-flex;
     align-items: center;
     gap: .3rem;
@@ -3041,9 +3042,15 @@ button.project-focus-preview:hover { color: var(--color-accent); }
     border-radius: .375rem;
     font-size: var(--text-micro);
   }
-  .composer-foot .app-chat-attach-label {
+  .composer-foot .app-chat-attach-label,
+  .app-chat-composer-tools .app-chat-attach-label {
     display: inline;
   }
+}
+/* The assistant panel's compact composer follows the same card: 12px
+   corners (already), the same padding, and on desktop the message size. */
+.app-chat-composer[data-density] {
+  padding: .625rem .75rem .5rem;
 }
 
 /* Desktop reading size: 15px at 1.65 for answers and the operator's own
@@ -3066,19 +3073,25 @@ button.project-focus-preview:hover { color: var(--color-accent); }
     max-width: min(78%, 34rem);
     border-radius: .875rem;
   }
-  [data-composer]:has(> .composer-foot) > textarea {
+  [data-composer]:has(> .composer-foot) > textarea,
+  .app-chat-composer .app-chat-box {
     min-height: 2.5rem;
     font-size: .9375rem;
   }
   .composer-foot .app-chat-attach,
-  .composer-foot .app-chat-send {
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-attach,
+  .app-chat-composer-tools .app-chat-send {
     height: 1.625rem;
   }
-  .composer-foot .app-chat-send {
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-send {
     width: 1.625rem;
   }
   .composer-foot .app-chat-attach svg,
-  .composer-foot .app-chat-send svg {
+  .composer-foot .app-chat-send svg,
+  .app-chat-composer-tools .app-chat-attach svg,
+  .app-chat-composer-tools .app-chat-send svg {
     width: .875rem;
     height: .875rem;
   }
