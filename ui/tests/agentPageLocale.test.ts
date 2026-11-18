@@ -16,15 +16,63 @@ const FILES = [
   "src/features/agents/workspaceSkills.ts",
 ];
 
-/** `t("…")` literals, plus the `text:` strings helpers hand to `t()` later. */
-function englishLabels(source: string): string[] {
+const LITERAL = /"((?:[^"\\]|\\.)*)"/g;
+const unquote = (body: string): string => JSON.parse(`"${body}"`);
+
+/** Every string literal inside each `t(...)` call: ternaries and concatenations included. */
+function insideT(source: string): string[] {
   const labels: string[] = [];
-  const literal = '"((?:[^"\\\\]|\\\\.)*)"';
-  for (const match of source.matchAll(new RegExp(`\\bt\\(\\s*${literal}`, "g"))) labels.push(JSON.parse(`"${match[1]}"`));
-  for (const match of source.matchAll(new RegExp(`text:\\s*[^"\\n]*${literal}(?:\\s*:\\s*${literal})?`, "g"))) {
-    for (const group of [match[1], match[2]]) if (group !== undefined) labels.push(JSON.parse(`"${group}"`));
+  for (const start of source.matchAll(/\bt\(/g)) {
+    let depth = 1;
+    let index = (start.index ?? 0) + start[0].length;
+    const from = index;
+    let quote: string | null = null;
+    while (index < source.length && depth > 0) {
+      const char = source[index];
+      if (quote !== null) {
+        if (char === "\\") index += 1;
+        else if (char === quote) quote = null;
+      } else if (char === '"' || char === "'" || char === "`") quote = char;
+      else if (char === "(") depth += 1;
+      else if (char === ")") depth -= 1;
+      index += 1;
+    }
+    const args = source.slice(from, index - 1);
+    for (const match of args.matchAll(LITERAL)) {
+      // An id compared inside a ternary (`kind === "saved" ? … : …`) is not copy.
+      const before = args.slice(0, match.index ?? 0);
+      const after = args.slice((match.index ?? 0) + match[0].length);
+      if (/[!=]==\s*$/.test(before) || /^\s*[!=]==/.test(after)) continue;
+      labels.push(unquote(match[1]));
+    }
   }
   return labels;
+}
+
+/**
+ * Labels the agent page translates later, outside a literal `t()` call:
+ * `Detail label="…"`, RowMenu items (`label: "…"`), `Facts` keys
+ * (`["Source", …]`), and the `text:` strings helpers hand to `t()`.
+ */
+function laterLabels(source: string): string[] {
+  const labels: string[] = [];
+  const patterns = [
+    /\blabel="((?:[^"\\]|\\.)*)"/g,
+    /\blabel:\s*"((?:[^"\\]|\\.)*)"/g,
+    /\[\s*"([A-Z](?:[^"\\]|\\.)*)",\s*(?:t\(|[A-Za-z_][\w.]*|`|"|\()/g,
+  ];
+  for (const pattern of patterns) for (const match of source.matchAll(pattern)) labels.push(unquote(match[1]));
+  for (const match of source.matchAll(/text:\s*[^"\n]*"((?:[^"\\]|\\.)*)"(?:\s*:\s*"((?:[^"\\]|\\.)*)")?/g)) {
+    for (const group of [match[1], match[2]]) if (group !== undefined) labels.push(unquote(group));
+  }
+  return labels;
+}
+
+/** Literals that are not English copy: file names and bare placeholders. */
+const NOT_COPY = /^(?:.*\.(?:md|json|tsx?|js)|\{[a-z]+\})$/;
+
+function englishLabels(source: string): string[] {
+  return [...insideT(source), ...laterLabels(source)].filter((label) => /[A-Za-z]/.test(label) && !NOT_COPY.test(label.trim()));
 }
 
 function main() {
