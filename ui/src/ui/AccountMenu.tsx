@@ -81,7 +81,7 @@ export default function AccountMenu({
     if (signingOut.current) return;
     signingOut.current = true;
     setBusy(true);
-    closeSession()
+    closeSession(meta.hosted === true || meta.session?.origin === "public")
       .then(() => onChange())
       .catch(() => undefined)
       .finally(() => {

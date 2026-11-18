@@ -3374,3 +3374,24 @@ button.turnsource:hover {
 .turncard-staged[data-folded] .turncard-body {
   gap: .4rem;
 }
+
+/* CAD-2443: record card layouts (list rows, message thread, key/value). */
+.recordcard-list, .recordcard-thread { display: grid; gap: .375rem; margin: 0; padding: 0; list-style: none; }
+.recordcard-list > li { padding-top: .375rem; border-top: 1px solid var(--color-ink-700); }
+.recordcard-list > li:first-child { padding-top: 0; border-top: 0; }
+.recordcard-pairs { display: flex; flex-wrap: wrap; gap: .125rem .875rem; margin: 0; }
+.recordcard-pair { display: flex; min-width: 0; gap: .375rem; font-size: var(--text-label); }
+.recordcard-pair dt { color: var(--color-ink-500); }
+.recordcard-pair dd { min-width: 0; margin: 0; color: var(--color-ink-200); overflow-wrap: anywhere; }
+.recordcard-thread > li { display: grid; gap: .125rem; max-width: 85%; padding: .375rem .5rem; border-radius: .375rem; background: var(--color-ink-800); }
+.recordcard-thread > li[data-outbound] { justify-self: end; }
+.recordcard-meta { color: var(--color-ink-500); font-size: var(--text-micro); }
+.recordcard-text { color: var(--color-ink-200); font-size: var(--text-label); overflow-wrap: anywhere; white-space: pre-wrap; }
+.turncard[data-density="compact"] .recordcard-thread > li { max-width: 100%; }
+.chatcard { max-width: min(100%, 32rem); overflow: hidden; }
+.chatcard-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: .6rem; min-width: 0; padding: .75rem; }
+.turn-artifacts > div:has(> .chatcard, > .chatcard-line) { flex-basis: 100%; min-width: 0; }
+.chatcard-line { min-width: 0; overflow-wrap: anywhere; }
+.chatcard .turncard-head { margin-bottom: 0; }
+.chatcard .turncard-kind { flex: none; }
+.chatcard .btn { height: auto; min-height: 2rem; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }

@@ -1,0 +1,6 @@
+{
+  "role": "agent",
+  "kind": "connect_ref",
+  "text": "Connect Synthetic Mail to continue.",
+  "payload": { "v": 1, "toolkit": "synthetic_mail", "toolkit_label": "Synthetic Mail" }
+}
