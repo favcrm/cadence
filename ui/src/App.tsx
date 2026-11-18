@@ -9,7 +9,7 @@ import AppDetail from "./features/apps/AppDetail";
 import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
 import ManageApp from "./features/explorer/ManageApp";
-import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
+import AppShell, { type ActiveInstallation, type AppShellHeaderTargets } from "./features/app-shell/AppShell";
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
@@ -36,6 +36,10 @@ import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
 import Members from "./features/settings/Members";
+import DocumentTypes from "./features/settings/DocumentTypes";
+import { documentsNavHidden, documentsProbe } from "./features/documents/documentsProbe";
+import DocumentsScreen from "./features/documents/DocumentsScreen";
+import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
@@ -184,6 +188,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   threads: "threads",
   myWork: "my work",
   wiki: "wiki",
+  documents: "documents",
   outbox: "outbox",
   setup: "setup",
   settings: "settings",
@@ -310,9 +315,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const humanThreadsOn = boardSupports(meta, "human_threads");
   const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
+  // probed; the nav shows Documents once the probe answers `available`.
+  const documentsHosted = meta?.hosted === true;
+  const documentsProbeState = useMaybeResource(documentsHosted ? documentsProbe : null);
   const hiddenScreens: Screen[] = [
     ...(!myWorkOn ? ["myWork" as const] : []),
     ...(!workConversationsOn && !humanThreadsOn ? ["threads" as const] : []),
+    ...(documentsNavHidden(documentsHosted, documentsProbeState?.data) ? ["documents" as const] : []),
   ];
 
   const personalState = useMaybeResource(screen === "myWork" && myWorkOn ? resources.myWork : null);
@@ -368,6 +378,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
+  // The routine `refresh` below is the only probe: it runs on mount and on
+  // every recheck, so a mount probes once. A latched `unavailable` answer
+  // makes no request for the rest of the session.
 
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
@@ -541,9 +554,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.agents.refresh();
       if (overviewWantedRef.current) void resources.overview.refresh();
       if (personalWanted.current) void resources.myWork.refresh();
+      // CAD-2286: a probe that failed recovers on the routine recheck; a
+      // latched `unavailable` answers from the store without a request.
+      if (documentsHosted) void documentsProbe.revalidate();
       loadDetail();
     });
-  }, [loadDetail, recheck]);
+  }, [loadDetail, recheck, documentsHosted]);
   const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
@@ -822,6 +838,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, []);
   const openIssue = useCallback((id: string) => openWorkItem(id, "issue"), [openWorkItem]);
   const openHomeWork = useCallback((id: string) => openWorkItem(id, "home"), [openWorkItem]);
+  const openThreadsWork = useCallback((id: string) => openWorkItem(id, "threads"), [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
@@ -976,6 +993,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     (installId: string) => installationAppHref(installations.list, installId),
     [installations.list],
   );
+  const [appBreadcrumbTarget, setAppBreadcrumbTarget] = useState<HTMLSpanElement | null>(null);
+  const [appActionsTarget, setAppActionsTarget] = useState<HTMLDivElement | null>(null);
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps = receipt === null ? installed
     : installed.some((a) => a.installId === receipt.installId)
@@ -1166,7 +1185,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
           Other screens retain the natural document flow. */}
       <div data-canvas-main className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
-        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:pr-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+        <header data-installed-app={onAppScreen || undefined} className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:pr-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
@@ -1182,6 +1201,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             </button>
           </div>
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
+            {onAppScreen ? (
+              <>
+                <Link href={hrefFor({ screen: "apps", project: null, name: null })}>{t("Apps")}</Link>
+                <span ref={setAppBreadcrumbTarget} className="app-header-location-target" />
+              </>
+            ) : (
+              <>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
             <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
@@ -1199,12 +1225,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <span className="truncate text-ink-100">{t(settingsLabel(route.section) ?? "")}</span>
               </>
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
+              </>
+            )}
           </nav>
 
           <HeaderSearch noWiki={!wikiAvailable(meta)} issues={issuesState} route={route} navHref={hrefFor} />
 
-          <div className="ml-auto flex items-center gap-1 shrink-0">
-            {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
+          {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
+          <div className="app-header-utilities ml-auto flex items-center gap-1 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -1227,6 +1255,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               footer={versionLine}
             /></div> : <><LocalLanguage /><ThemeToggle /></>}
           </div>
+          {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
         <AssistantUnreadProbes apps={installed} />
@@ -1273,6 +1302,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 onRefresh={refresh}
               >
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
+                {staleBuild !== null && staleBuild !== dismissedBuild && (
+                  <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
+                )}
               </StatusChips>
             </div>
             {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2" onClick={(event) => { if ((event.target as Element).closest("a")) closeMenu(); }}><AccountMenu
@@ -1283,6 +1315,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
               footer={versionLine}
             /></div>}
+            {meta?.signed_in !== true && <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-ink-700 pt-2">
+              <LocalLanguage />
+              <ThemeToggle />
+            </div>}
           </MobileNavigation>
         )}
 
@@ -1575,6 +1611,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             recheckFinished={recheckFinished}
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
+            header={{ breadcrumbs: appBreadcrumbTarget, actions: appActionsTarget }}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
             automaticUpdatesEnabled={automaticUpdatesOn}
           />
@@ -1645,7 +1682,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <ThreadsPage
               key={meta.session?.id ?? ""}
               operator={meta.operator === true}
-              onOpenWorkItem={(id) => openWorkItem(id, "threads")}
+              onOpenWorkItem={openThreadsWork}
               workConversationsEnabled={workConversationsOn}
               humanThreadsEnabled={humanThreadsOn}
             />
@@ -1662,6 +1699,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CredentialAuthorize key={route.requestId} requestId={route.requestId} />
         )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
+        {/* CAD-2286: hosted only. A native board, or a hosted one whose probe is
+            not available, gets the screen's unavailable state, never a blank body. */}
+        {route.screen === "documents" && (
+          <DocumentsScreen
+            hosted={documentsHosted}
+            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
+            archived={route.archived}
+            stage={route.stage}
+            hrefFor={hrefFor}
+          />
+        )}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
@@ -1689,6 +1737,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 `settingsRedirect` has already moved the URL off. */}
             {route.section === "members" && meta?.settings_sections?.includes("members") && (
               <Members viewer={viewer} />
+            )}
+            {/* CAD-2286: hosted only, offered while the board names `documents`
+                in `settings_sections`. The page reads the shared probe and
+                says when the lifecycle is unavailable or unsupported. */}
+            {route.section === "documents" && meta?.settings_sections?.includes("documents") && (
+              <DocumentTypes hosted={documentsHosted} viewer={viewer} viewerSub={viewerSub} />
             )}
             {route.section === "connections" && (
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
@@ -1795,6 +1849,7 @@ function WorkspaceAppEntry({
   recheckFinished,
   onRetryWorkspace,
   onInstallation,
+  header,
   onBack,
   automaticUpdatesEnabled,
 }: {
@@ -1809,6 +1864,7 @@ function WorkspaceAppEntry({
   recheckFinished: boolean;
   onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
+  header: AppShellHeaderTargets;
   onBack: () => void;
   automaticUpdatesEnabled: boolean;
 }) {
@@ -1934,6 +1990,7 @@ function WorkspaceAppEntry({
       installId={installation.install_id}
       viewer={viewer}
       onInstallation={onInstallation}
+      header={header}
     >
       {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} restoreDrawer={screen.restoreDrawer} onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed} automaticUpdatesEnabled={automaticUpdatesEnabled} />}
     </AppShell>

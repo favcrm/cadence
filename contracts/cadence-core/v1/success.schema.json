@@ -141,6 +141,22 @@
         "op",
         "value"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "agent.form.compile"
+        },
+        "value": {
+          "$ref": "#/$defs/FormCompileValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
     }
   ],
   "required": [
@@ -198,7 +214,7 @@
           "const": "sensitive"
         },
         {
-          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are exactly the legacy ones.",
+          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are the legacy ones (see the module header).",
           "type": "string",
           "const": "strict"
         }
@@ -349,6 +365,39 @@
         "valid"
       ]
     },
+    "FormCompileValue": {
+      "description": "Success value of `agent.form.compile`. When `valid`, `form`, `fallback`\nand `digest` are set; otherwise `message` names the refused spec or form\npath and rule.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "form": {
+          "description": "The compiled `{\"version\":\"1.0\",\"createSurface\":{...}}` envelope."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid"
+      ]
+    },
     "ManifestPreflightValue": {
       "description": "Success value of `app.manifest.preflight`.",
       "type": "object"
@@ -398,6 +447,61 @@
       "required": [
         "ready",
         "blocked"
+      ]
+    },
+    "RequiredCheck": {
+      "description": "CAD-2413: a GitHub App check an approved policy requires on the head.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "app"
+      ]
+    },
+    "RequiredReview": {
+      "description": "CAD-2413: one review an approved policy's applying rules require, so a\ngate can count it by kind.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "A `check` review's GitHub App.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focus": {
+          "description": "An `agent` review's focus.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`agent`, `check` or `operator`.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "A `check` review's mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The review's name in the policy's `reviews` map.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
       ]
     },
     "RequirementCheck": {
@@ -499,7 +603,7 @@
           "$ref": "#/$defs/Activation"
         },
         "browser_qa": {
-          "description": "A `ui/` change additionally needs a Browser QA pass.",
+          "description": "A change to a path in the repository's `browser_qa` table needs a\nBrowser QA pass (never when the lists are unreadable).",
           "type": "boolean"
         },
         "class": {
@@ -524,11 +628,31 @@
             "type": "string"
           }
         },
+        "required_checks": {
+          "description": "CAD-2413: the GitHub App checks those rules require; absent likewise.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredCheck"
+          }
+        },
+        "required_reviews": {
+          "description": "CAD-2413: the reviews an approved custom policy's applying rules\nrequire, in rule order. Absent when no approved policy was evaluated,\nso a gate can tell \"the policy requires none\" from \"no policy\".",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredReview"
+          }
+        },
         "review_kind": {
           "$ref": "#/$defs/ReviewKind"
         },
         "reviews": {
-          "description": "Independent verdict count on the exact head: `0` only for\nroutine under a valid default-equivalent policy.",
+          "description": "Independent verdict count on the exact head: `0` for routine under a\nvalid default-equivalent policy, or when an approved policy's applying\nrules name no code review (CAD-2413).",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -723,6 +847,16 @@
           "description": "Two verdicts — Standards and Spec/security — by distinct\nreviewers.",
           "type": "string",
           "const": "standards_and_spec"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Standards review.",
+          "type": "string",
+          "const": "standards"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Spec/security review.",
+          "type": "string",
+          "const": "spec_security"
         }
       ]
     },
@@ -775,7 +909,7 @@
           "minimum": 0
         },
         "paths": {
-          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it. Slice 3 matches them with\n`areas::matches`, so the two grammars must agree.",
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it, and a glob without wildcards\nis a file or a directory covering everything under it. Matched with\n[`crate::delivery_rules::area_match`], the same function as `areas:`.",
           "type": "array",
           "default": [],
           "items": {

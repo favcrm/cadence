@@ -128,6 +128,18 @@ let nextSlotId = 0;
 const controllers = new Map<string, AbortController>();
 const appliedSeeds = new Map<string, object>();
 const savedListeners = new Set<() => void>();
+const focusListeners = new Set<(key: string) => void>();
+
+/** Focus is an explicit UI intent, never a draft edit or a send. */
+export function requestComposerFocus(key: string): void {
+  for (const listener of focusListeners) listener(key);
+}
+
+/** Mounted composers reveal their owner before focusing their own input. */
+export function onComposerFocusRequest(listener: (key: string) => void): () => void {
+  focusListeners.add(listener);
+  return () => { focusListeners.delete(listener); };
+}
 
 /** A parent-held seed object is a one-shot intent, not a reset on every
  *  remount. A new explicit seed object can still replace this draft. */

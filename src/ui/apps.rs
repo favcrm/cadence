@@ -828,6 +828,16 @@ pub(super) enum ReadRoute<'a> {
     Outputs(&'a str, &'a str),
 }
 
+impl ReadRoute<'_> {
+    /// The project the route names; `None` for the all-projects list.
+    pub(super) fn project(&self) -> Option<&str> {
+        match self {
+            ReadRoute::List => None,
+            ReadRoute::Detail(p, _) | ReadRoute::Runs(p, _) | ReadRoute::Outputs(p, _) => Some(p),
+        }
+    }
+}
+
 /// The read route for a path under `/api/apps` — exactly `/api/apps`
 /// (or `/api/apps/`), `/api/apps/<project>/<name>` (app names are
 /// tag-shaped — a single segment), or one app's `/runs` or `/outputs`.
@@ -921,9 +931,10 @@ pub(super) fn read(
     opts: &ServeOpts,
     query: &dyn Fn(&str) -> Option<String>,
     route: ReadRoute<'_>,
+    readable: Option<&std::collections::BTreeSet<String>>,
 ) -> HttpResp {
     match route {
-        ReadRoute::List => list(pm, state_dir, query),
+        ReadRoute::List => list(pm, state_dir, query, readable),
         ReadRoute::Detail(project, name) => detail(pm, state_dir, project, name),
         ReadRoute::Runs(project, name) => runs(pm, state_dir, project, name),
         ReadRoute::Outputs(project, name) => outputs(request, pm, state_dir, opts, project, name),
@@ -931,7 +942,17 @@ pub(super) fn read(
 }
 
 /// `GET /api/apps[?project=<key>]` — the `app ls` payload.
-fn list(pm: &Pm, state_dir: &std::path::Path, query: &dyn Fn(&str) -> Option<String>) -> HttpResp {
+///
+/// `readable` is the caller's project set when the caller is not the
+/// operator (CAD-2212): rows of any other project are dropped and `count`
+/// counts only what is served. A named project outside the set never
+/// reaches here — the route answers it as unknown first.
+fn list(
+    pm: &Pm,
+    state_dir: &std::path::Path,
+    query: &dyn Fn(&str) -> Option<String>,
+    readable: Option<&std::collections::BTreeSet<String>>,
+) -> HttpResp {
     let project = query("project");
     if let Some(p) = &project {
         if !model::valid_key(p) {
@@ -939,7 +960,19 @@ fn list(pm: &Pm, state_dir: &std::path::Path, query: &dyn Fn(&str) -> Option<Str
         }
     }
     match app::ls(pm, project.as_deref(), state_dir) {
-        Ok(listed) => json_response(listed),
+        Ok(mut listed) => {
+            if let Some(readable) = readable {
+                if let Some(rows) = listed["apps"].as_array_mut() {
+                    rows.retain(|row| {
+                        row["project"]
+                            .as_str()
+                            .is_some_and(|key| readable.contains(key))
+                    });
+                    listed["count"] = json!(rows.len());
+                }
+            }
+            json_response(listed)
+        }
         Err(e) if e.to_string().starts_with("No project") => err_response(404, &e.to_string()),
         Err(e) => err_response(503, &e.to_string()),
     }

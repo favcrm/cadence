@@ -27,16 +27,17 @@
     "verify": "bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.4.0",
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-durable": "1.4.0",
-    "agents": "0.30.0"
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
+    "@earendil-works/pi-schema": "1.5.2",
+    "agents": "0.33.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260930.2",
     "typescript": "7.0.2"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.19.0"
   }
 }

@@ -38,7 +38,9 @@ mod app_works_rpc;
 mod hosted_assignments;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
+mod app_calendar_query;
 mod app_records_rpc;
+mod app_routines_list;
 mod app_runs_rpc;
 mod app_screen_services_rpc;
 #[cfg(feature = "test-seam")]
@@ -53,6 +55,7 @@ mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad811_installed_crm_qa_fixture;
+mod company_zone_rpc;
 mod routines_rpc;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
@@ -3497,6 +3500,14 @@ impl Shared {
                     )));
                 }
                 let board = params.get("board").and_then(Value::as_bool) == Some(true);
+                // CAD-2323: the briefing roster (`briefing::roster_read`)
+                // asks for each group row's `params`, whose upstream names
+                // the group.
+                let include_group = match params.get("include_group") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(include)) => *include,
+                    Some(_) => return Err(Error::rejected("include_group must be a boolean")),
+                };
                 let member_access = match public_principal.as_ref() {
                     Some(principal) if board && scope.is_some() && !principal.operator => {
                         self.member_app_access(principal)?
@@ -3649,6 +3660,12 @@ impl Shared {
                     }
                     if scope.is_some() {
                         identity::retain_scoped_agent_fields(&mut j, visible_running);
+                        // CAD-2323: per row, only for the agent itself or its
+                        // group root on its own connection (as `agent show`).
+                        if include_group && self.owner_read(params, peer_pid, "agent list", &agent)
+                        {
+                            j["params"] = json!(agent.params);
+                        }
                     }
                     if board {
                         if let Some(running) = &scoped_running {
@@ -4010,30 +4027,25 @@ impl Shared {
                         crate::peer::AgentMutation::SelfService,
                     )?;
                 }
+                // CAD-2323: the launch/join poll (`briefing::launch_poll_read`)
+                // asks for the stored `state` and `endpoint` it waits on.
+                let include_launch_state = match params.get("include_launch_state") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(include)) => *include,
+                    Some(_) => {
+                        return Err(Error::rejected("include_launch_state must be a boolean"))
+                    }
+                };
+                let briefing_fields =
+                    include_profile_instructions || include_catalogue_instructions;
                 // CAD-2310: the briefing read (`briefing::briefing_read`) by
                 // the agent itself or its group root keeps what the briefing
-                // is built from past the scoped filter below. Allowed only
-                // when the caller rule admits an AGENT connection: every
-                // relayed read rides an operator-proven connection, so its
-                // reader is never the caller the rule judged.
+                // is built from past the scoped filter below; CAD-2323: the
+                // launch poll keeps its state and endpoint. Each flag keeps
+                // only its own fields.
                 let owner_read = scope.is_some()
-                    && (include_profile_instructions || include_catalogue_instructions)
-                    && match self.authorize_agent_mutation(
-                        params,
-                        peer_pid,
-                        "agent show",
-                        &agent,
-                        crate::peer::AgentMutation::SelfService,
-                    ) {
-                        Ok(crate::peer::AgentCaller::Agent(_)) => true,
-                        Ok(crate::peer::AgentCaller::Operator) | Err(Error::Rejected(_)) => false,
-                        Err(error) => {
-                            eprintln!(
-                                "agent show: briefing fields withheld for '{alias}': {error}"
-                            );
-                            false
-                        }
-                    };
+                    && (briefing_fields || include_launch_state)
+                    && self.owner_read(params, peer_pid, "agent show", &agent);
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.
@@ -4251,10 +4263,18 @@ impl Shared {
                     }
                 }
                 if scope.is_some() {
+                    // The row's own values, so a cloud agent's null endpoint
+                    // stays null.
+                    let launch_state = (owner_read && include_launch_state)
+                        .then(|| (agent_json["state"].clone(), agent_json["endpoint"].clone()));
                     identity::retain_scoped_agent_fields(&mut agent_json, Some(&visible_running));
-                    if owner_read {
+                    if owner_read && briefing_fields {
                         agent_json["params"] = json!(agent.params);
                         agent_json["cwd"] = json!(agent.cwd);
+                    }
+                    if let Some((state, endpoint)) = launch_state {
+                        agent_json["state"] = state;
+                        agent_json["endpoint"] = endpoint;
                     }
                 }
                 // After the scoped filter, so a job the caller rule admitted
@@ -4719,6 +4739,8 @@ impl Shared {
             "endpoint_enable" => self.rpc_endpoint_set_enabled(params, true, peer_pid),
             "endpoint_disable" => self.rpc_endpoint_set_enabled(params, false, peer_pid),
             "endpoint_remove" => self.rpc_endpoint_remove(params, peer_pid),
+            "company_zone_get" => self.rpc_company_zone_get(),
+            "company_zone_set" => self.rpc_company_zone_set(params, peer_pid),
             "routine_list" => self.rpc_routine_list(params, peer_pid),
             "routine_show" => self.rpc_routine_show(params, peer_pid),
             "routine_create" => self.rpc_routine_create(params, peer_pid),

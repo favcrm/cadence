@@ -12,6 +12,7 @@ import {
 } from "../explorer/memberAccess";
 import type { AppDisplayI18n, ListingDisplayLocale } from "./appLocale";
 import type { ScreenNavigation } from "./screen/screenProtocol";
+import { parseCatalogGrant, parseCatalogTools, type CatalogEffect } from "./platformCatalog";
 
 export type { Agent };
 
@@ -33,6 +34,8 @@ export interface Installation {
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
   /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
   catalogue?: CatalogueLocator | null;
+  /** Explicit private-upload provenance; absent or null means unknown. */
+  source_kind?: "private" | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
   /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
   removed?: number | null; restore_after?: number | null;
@@ -98,7 +101,8 @@ export interface BindingDrift {
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
-  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping;
+  config: { bundle_digest: string; connection_id?: string; provider: string; account?: string; mapping?: ActionMapping;
+    connection_kind?: string; tool_slug?: string; declaration?: SlotDeclaration;
     publish?: { destination_id: string; destination_label: string; toolkit: string } };
   drift?: BindingDrift;
 }
@@ -341,6 +345,21 @@ export const workspaceApps = {
   /** CAD-1939: retire one binding (one destination) at the revision the caller read. */
   revokeBinding: (id: string, bindingId: string, expectedRevision: number) =>
     request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/revoke`, undefined, { expected_revision: expectedRevision }),
+  platformTools: async (id: string, slot: string, effect: CatalogEffect, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ slot });
+    return parseCatalogTools(await request<unknown>(`${installation(id)}/platform-tools?${query}`, signal), effect);
+  },
+  bindPlatformTool: async (id: string, body: { slot: string; tool_slug: string; expected_digest: string; request_id: string; connection_id?: string }, effect: CatalogEffect) =>
+    parseCatalogGrant(await request<unknown>(`${installation(id)}/platform-tools/bind`, undefined, body), {
+      installId: id, digest: body.expected_digest, slot: body.slot, slug: body.tool_slug, effect,
+      ...(body.connection_id === undefined ? {} : { connectionId: body.connection_id }),
+    }),
+  revokePlatformTool: async (id: string, bindingId: string, revision: number, expected: { digest: string; slot: string; slug: string; effect: CatalogEffect; connectionId?: string }) => {
+    const receipt = parseCatalogGrant(await request<unknown>(`${installation(id)}/bindings/${part(bindingId)}/revoke`, undefined, { expected_revision: revision }), { installId: id, ...expected });
+    if (receipt.id !== bindingId || receipt.state !== "revoked" || receipt.revision !== revision + 1)
+      throw new ApiError("The tool revocation could not be verified.", 502);
+    return receipt;
+  },
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
   upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>

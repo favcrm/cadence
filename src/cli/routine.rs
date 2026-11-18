@@ -20,7 +20,7 @@ pub(crate) enum RoutineAction {
         /// Fixed interval in minutes (>= 15).
         #[arg(long)]
         interval_mins: Option<i64>,
-        /// Explicit IANA timezone (e.g. `Asia/Hong_Kong`, `UTC`).
+        /// IANA timezone (e.g. `Asia/Hong_Kong`, `UTC`). Defaults to the company time zone.
         #[arg(long = "tz", visible_alias = "timezone")]
         tz: Option<String>,
         /// Verified app event source (e.g. `gmail:inbox`), instead of a schedule.

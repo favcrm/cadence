@@ -192,6 +192,26 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         max_charge: Option<u64>,
     },
+    /// Hosted orgs only: stage a draft/send connected tool for its owner's
+    /// approval. Nothing runs: the board holds the exact call until an owner
+    /// approves it there.
+    Stage {
+        /// The draft/send tool name (a connected tool, not a read).
+        tool: String,
+        /// The tool's input as one JSON object: inline, `@file`, a file path,
+        /// or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// The provider connection the staged call would act through.
+        #[arg(long)]
+        connection: String,
+        /// Stable handle for the staged action. The same handle with the same
+        /// call replays the same action; the same handle with a different
+        /// call is refused. Omitted: derived from the tool, input and
+        /// connection.
+        #[arg(long)]
+        request: Option<String>,
+    },
     /// Read-only lookup of a hosted platform call or media job by request handle
     /// or job id. Never dispatches, reserves, settles or polls a provider.
     Status {
@@ -513,6 +533,11 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
                 print_json(&rpc("platform_call", params)?);
             }
         }
+        PlatformAction::Stage { .. } => {
+            return Err(Error::rejected(
+                "`platform stage` stages a connected tool for a hosted workspace owner's approval — pass `--org <workspace>`. Nothing was sent",
+            ));
+        }
         PlatformAction::Status { .. } => {
             return Err(Error::rejected(
                 "`platform status` reconciles a hosted workspace call — pass `--org <workspace>`, \
@@ -748,6 +773,28 @@ pub(super) fn platform_human_summary(body: &Value) -> Vec<String> {
         }
     }
     let data = body.get("data").unwrap_or(body);
+    // AOS-627: a staged connected effect names the board's action, never a
+    // provider result. Say what its state means before anything else.
+    if let Some(action) = data.get("action_id").and_then(Value::as_str) {
+        let outcome = data.get("outcome").and_then(Value::as_str).unwrap_or("-");
+        let meaning = match outcome {
+            "pending" => {
+                "PENDING OWNER APPROVAL: the call did NOT run; nothing runs until an owner \
+                 approves this action on the board"
+            }
+            "applied" => "the owner already approved this action and it ran",
+            "failed" => "the owner approved this action but it failed",
+            "denied" => "the owner denied this action; it did not run",
+            _ => "unrecognised state; treat the call as not run",
+        };
+        lines.push(format!(
+            "cadence platform stage action={action} outcome={outcome}: {meaning}"
+        ));
+        if data.get("replayed").and_then(Value::as_bool) == Some(true) {
+            lines.push("cadence platform stage: replay of an action already staged under this request; nothing new was staged".into());
+        }
+        return lines;
+    }
     if let Some(outcome) = data.get("outcome").and_then(Value::as_str) {
         let key = data.get("key").and_then(Value::as_str).unwrap_or("-");
         let job_status = data

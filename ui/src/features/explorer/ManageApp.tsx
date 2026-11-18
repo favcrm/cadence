@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import {
   appExplorer,
   workspaceApps,
+  type AppBinding,
   type HomeInstallation,
   type Installation,
   type RemovePreview,
@@ -12,6 +13,10 @@ import {
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
+import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
+import { CatalogBindings } from "../workspace-apps/CatalogBindings";
+import { declaredSlots, isCatalogSlot } from "../workspace-apps/bindingChoices";
+import "../workspace-apps/workspace-apps.css";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import MemberAccessPanel from "./MemberAccessPanel";
@@ -44,6 +49,7 @@ export default function ManageApp({
   const [preview, setPreview] = useState<RemovePreview | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [privateOpen, setPrivateOpen] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -69,8 +75,13 @@ export default function ManageApp({
   const applyRequest = useRef(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [catalogBindings, setCatalogBindings] = useState<AppBinding[] | null>(null);
+  const [catalogError, setCatalogError] = useState(false);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const catalogLock = useRef(false);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  const hasCatalogSlots = inst?.source_kind === "private" && declaredSlots(inst).some(isCatalogSlot);
   const [reread, setReread] = useState(0);
   // CAD-1438: "Open its page" spells the canonical `/apps/<key>` route,
   // resolved against the verified install list; ambiguous or unsafe
@@ -100,6 +111,31 @@ export default function ManageApp({
       .catch(() => { if (!controller.signal.aborted) setHomeUnavailable(true); });
     return () => controller.abort();
   }, [installId, reread, isOp]);
+
+  useEffect(() => {
+    if (!isOp || !inst || inst.install_id !== installId || !hasCatalogSlots || inst.removed != null) return;
+    const slots = new Set(declaredSlots(inst).filter(isCatalogSlot).map((slot) => slot.slot));
+    const controller = new AbortController();
+    setCatalogBindings(null);
+    setCatalogError(false);
+    void workspaceApps.bindings(installId, undefined, controller.signal)
+      .then((bindings) => {
+        if (!Array.isArray(bindings) || bindings.some((binding) =>
+          !binding || typeof binding !== "object" || Array.isArray(binding) ||
+          binding.install_id !== installId || typeof binding.id !== "string" ||
+          typeof binding.slot !== "string" ||
+          (binding.context_id !== null && typeof binding.context_id !== "string") ||
+          typeof binding.state !== "string" || !Number.isSafeInteger(binding.revision) ||
+          typeof binding.digest !== "string" || !binding.config ||
+          typeof binding.config !== "object" || Array.isArray(binding.config) ||
+          (binding.context_id === null && slots.has(binding.slot) &&
+            binding.state !== "configured" && binding.state !== "revoked")
+        )) throw new Error("Invalid app bindings");
+        if (!controller.signal.aborted) setCatalogBindings(bindings);
+      })
+      .catch(() => { if (!controller.signal.aborted) setCatalogError(true); });
+    return () => controller.abort();
+  }, [installId, inst?.digest, inst?.removed, hasCatalogSlots, isOp, reread]);
 
   useEffect(() => {
     if (!automaticUpdatesEnabled || !isOp) return;
@@ -195,6 +231,25 @@ export default function ManageApp({
   const catalogueHref = catalogueId === null
     ? "/apps/explore"
     : `/apps/catalog/${encodeURIComponent(catalogueId)}?${new URLSearchParams({ installation: inst.install_id })}`;
+
+  const mutateCatalog = async (work: () => Promise<void>) => {
+    if (!isOp || catalogLock.current) return;
+    catalogLock.current = true;
+    setCatalogBusy(true);
+    setNotice(null);
+    try {
+      await work();
+    } catch (e: unknown) {
+      if (currentInstallId.current === installId)
+        setNotice(appErrorCopy(e, "The saved tool grant could not be verified."));
+    } finally {
+      catalogLock.current = false;
+      if (currentInstallId.current === installId) {
+        setCatalogBusy(false);
+        setReread((n) => n + 1);
+      }
+    }
+  };
 
   const openRemove = () => {
     void appExplorer.removePreview(installId)
@@ -369,10 +424,18 @@ export default function ManageApp({
           Manage. It re-reads the daemon's list itself and refuses every
           write it cannot prove from that answer. */}
       <MemberAccessPanel installId={installId} operator={isOp} />
+      {privateOpen && <PrivateAppDialog installation={inst} onClose={() => setPrivateOpen(false)} onInstalled={() => setReread((n) => n + 1)} />}
 
       <div className="mgrid mt-5">
         <div className="card mcard">
           <h3>{t("App package")}</h3>
+          {inst.source_kind === "private" ? (
+            <>
+              <p className="mt-2">{t("This private app is installed only in this workspace.")}</p>
+              <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+              <Button className="btn-sm mt-3" disabled={removed || inst.state === "removed"} onClick={() => setPrivateOpen(true)}>{t("Update private app")}</Button>
+            </>
+          ) : <>
           <div className="swrow">
             <div>
               <p>{t("Automatic updates")}</p>
@@ -423,13 +486,14 @@ export default function ManageApp({
             {automatic && releaseChangesReach(upgradeProposal.receipt.access_diff) && <p className="hint mt-2">{t("This release changes what {title} can reach.").replace("{title}", () => inst.title)}</p>}
             <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={() => applyKnown(upgradeProposal, "manual")}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
           </div>}
+          </>}
         </div>
 
         <div className="card mcard">
           <h3>{t("Connections and setup")}</h3>
           <p>{t("The accounts and helpers {title} uses.").replace("{title}", () => inst.title)}</p>
           {(inst.connection_slots ?? []).length === 0 ? (
-            <p className="hint mt-2">{t("No outside accounts.")}</p>
+            !hasCatalogSlots && <p className="hint mt-2">{t("No outside accounts.")}</p>
           ) : (
             <ul className="mt-2">
               {inst.connection_slots.map((s) => (
@@ -448,6 +512,19 @@ export default function ManageApp({
             })()}
           </div>
         </div>
+
+        {hasCatalogSlots && !removed && (
+          catalogBindings ? (
+            <CatalogBindings installation={inst} bindings={catalogBindings} canWrite={isOp}
+              busy={catalogBusy || checking || applying || restoring || removing} mutate={mutateCatalog} />
+          ) : (
+            <div className="card mcard">
+              {catalogError ? <p role="alert">{t("The saved tool grant could not be verified.")}</p>
+                : <p role="status">{t("Loading platform tools…")}</p>}
+              {catalogError && <Button onClick={() => setReread((n) => n + 1)}>{t("Retry")}</Button>}
+            </div>
+          )
+        )}
 
         <div className="card mcard">
           <h3>{t("Access")}</h3>

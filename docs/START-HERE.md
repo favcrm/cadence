@@ -1,13 +1,16 @@
 # Start here: Cadence project context
 
-Navigation updated 2026-09-26. This is a navigation guide, not a live
-status feed. Check the current source revision and running build before acting.
-A merged feature is not necessarily installed, enabled or proven unattended.
+This is a navigation guide, not a live status feed. Check the current source
+revision and running build before acting. A merged feature is not necessarily
+installed, enabled or proven unattended.
 
-Cadence is a local Rust controller for a development team: it coordinates
-provider agents, durable messages, tasks, project issues, fresh-session review and
-operational evidence. The intended outcome is a human goal carried through
-verified delivery with routine coordination handled by the system.
+Cadence coordinates agents and people on one board for any team. An issue moves
+through one lifecycle, draft, start, review and delivery: agents do the work and
+the checks, a human approves, and delivery follows. It runs as a hosted workspace
+or as a native install on your own machine. Start with the
+[hosted workspace guide](guides/hosted-workspace.md) to join or connect, and
+[Delivery](guides/delivery.md) for how work is reviewed and approved. The rest of
+this page maps the contracts and the source.
 
 ## Read in this order
 
@@ -16,7 +19,9 @@ verified delivery with routine coordination handled by the system.
 | What are we building, and what is outside scope? | [Charter](CHARTER.md) — goal, principles, non-goals and roadmap. Its autonomy labels are planning context; verify current capability evidence below. |
 | How is it built? | [Architecture and code map](ARCHITECTURE.md) — boundaries, durable stores, adapters and file ownership. |
 | What experience are we aiming for? | [Development-team design proposal](design/DEVELOPMENT-TEAM.md) — feedback, memory, project context and staged acceptance. Proposed behavior is labelled. |
-| How do contributors deliver and validate work? | [Contribution guide](../CONTRIBUTING.md), [repository instructions](../AGENTS.md) and the [agent protocol](../skills/cadence/SKILL.md). Native agents read their generated briefing; external agents must not claim a native identity. |
+| How does work get reviewed, approved and delivered? | [Delivery](guides/delivery.md) — lifecycle, per-project policy, review evidence, the human approval and refusals. |
+| How does an agent work an issue? | The [agent protocol](../skills/cadence/SKILL.md). Native agents read their generated briefing; external agents must not claim a native identity. |
+| How do contributors build Cadence itself? | [Contribution guide](../CONTRIBUTING.md) and [repository instructions](../AGENTS.md). |
 | What are the task/message contracts? | [RPC vocabulary](../src/proto.rs), [job handlers](../src/daemon/jobs_rpc.rs), [message handlers](../src/daemon/messages_rpc.rs), [native exact-turn steering](NATIVE_MESSAGING.md) and [durable storage](../src/store/mod.rs). Use `cadence job --help` and `cadence message --help` for the installed CLI. |
 | Where are projects, issues and memories? | [Board and tracker](BOARD.md), [issue commands](../src/issue/mod.rs), [worktree operations](../src/worktree.rs) and [memory implementation](../src/memory/mod.rs). |
 | How is company and project knowledge uploaded and retrieved? | [Wiki knowledge guide](guides/wiki-knowledge.md) — source pages, PDF extraction, search, scoped fetches and curated pages. Members may create, edit, move and delete shared pages under `global/` and `projects/<key>/`, and manage their own `users/<handle>/`. Other private and agent-owned areas stay protected. |
@@ -54,16 +59,10 @@ versions, not only the short injected summary.
 
 Durable message/job storage, issue/worktree tools, scoped memory, report intake,
 relay foundations, revisioned task-context delivery for managed issue dispatch
-(`src/context_pack.rs`, pinned at dispatch, opted in per project with
-`agent_delivery: true`), monitor observations, UI alerts,
+(pinned at dispatch, opted in per project with `agent_delivery: true`), monitor observations, UI alerts,
 provider profile display, build/test slots and structured review evidence exist
 in source. This list does not certify every adapter, configuration or
 deployment.
-
-The bounded acceptance harness was removed in the CAD-1073 clean-slate
-retirement. Its former labels and ticket evidence are preserved in git history;
-do not infer full autonomy from a green subset or change labels to claim
-completion.
 
 Live assignments, queue ages and quota belong in runtime state. Plans,
 acceptance, reviews and release evidence belong in the tracker/artifacts.

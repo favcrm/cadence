@@ -98,12 +98,12 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// `routine_runs`, `connection_policies`, `staged_routine_proposals`, and
 /// `credential_request_resolutions` (and their indexes). None changes a latch
 /// or witness table or adds a trigger, so the bound extends to 68 (CAD-2310,
-/// CAD-2317).
+/// CAD-2317). v69 (CAD-2378) adds only `workspace_settings`, likewise.
 ///
 /// It stays a reviewed literal rather than `rollout::SCHEMA_VERSION`, so a
 /// migration that does touch a latch or witness table is never accepted
 /// unread; the assertion below fails the build when the two part.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 68;
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 69;
 const _: () = assert!(
     PROTECTED_SCHEMA_MAX == crate::rollout::SCHEMA_VERSION,
     "review the new migrations for latch/witness tables, then raise PROTECTED_SCHEMA_MAX"

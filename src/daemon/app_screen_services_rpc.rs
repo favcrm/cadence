@@ -44,6 +44,11 @@ pub(super) struct ScreenServiceProof {
     confirmed: Option<(Value, Value)>,
     csv_confirmation: Option<(String, String)>,
     command_args: Option<Value>,
+    /// CAD-2379: the project-policy spelling of the live session's person
+    /// (`operator` for an operator), and whether that is a member. Derived
+    /// from the live session, never from a frame field.
+    policy_actor: String,
+    member: bool,
 }
 
 impl ScreenServiceProof {
@@ -55,6 +60,12 @@ impl ScreenServiceProof {
             .context_id
             .as_deref()
             .ok_or_else(|| screen_access_denied("missing screen context"))
+    }
+    pub(super) fn policy_actor(&self) -> &str {
+        &self.policy_actor
+    }
+    pub(super) fn is_member(&self) -> bool {
+        self.member
     }
     pub(super) fn csv_confirmation(&self) -> Option<(&str, &str)> {
         self.csv_confirmation
@@ -335,6 +346,12 @@ args!(WorksRequestReviewArgs {
 });
 args!(WorksReviewArgs { id: String, revision: i64, decision: Option<String>, note: Option<String> });
 args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
+// CAD-2379: the dated read's window. The shape is closed here; the day
+// grammar and the span bound are enforced by `app_calendar_query::parse_window`.
+args!(CalendarQueryArgs {
+    from: String,
+    to: String
+});
 // CAD-1827: campaign work. Scope and the writing actor are host-derived;
 // the body carries only the campaign, the CAS token and the values. Nulls
 // are kept (a typed round-trip would drop an explicit clear), so `save`
@@ -377,6 +394,15 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         // CAD-1827: a campaign work read is the campaign alone; a save keeps
         // its explicit nulls so `null` clears instead of disappearing.
         CampaignWorkShow => typed::<CampaignId>(value),
+        CalendarQuery => {
+            let args: CalendarQueryArgs = serde_json::from_value(value.clone()).map_err(|_| {
+                Error::rejected("screen service arguments exceed their closed shape")
+            })?;
+            super::app_calendar_query::parse_window(&args.from, &args.to)?;
+            typed::<CalendarQueryArgs>(value)
+        }
+        // CAD-2402: the call takes no arguments; any key is refused.
+        RoutinesList => typed::<Empty>(value),
         CampaignWorkSave => {
             let _: CampaignWorkSaveArgs = serde_json::from_value(value.clone()).map_err(|_| {
                 Error::rejected("screen service arguments exceed their closed shape")
@@ -577,6 +603,10 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         // CAD-1827: the paired campaign-work contract's two operations.
         CampaignWorkShow => "crm_campaign_work_show",
         CampaignWorkSave => "crm_campaign_work_save",
+        // CAD-2379: served by the host itself, never a daemon RPC method.
+        CalendarQuery => "app_calendar_query",
+        // CAD-2402: served by the host itself, never a daemon RPC method.
+        RoutinesList => "app_routines_list",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -699,6 +729,15 @@ impl Shared {
             confirmed: None,
             csv_confirmation: None,
             command_args: None,
+            policy_actor: if member {
+                view.user
+                    .as_ref()
+                    .map(|user| crate::project_policy::policy_user_actor(&user.sub))
+                    .unwrap_or_else(|| "service/unresolved-member".to_string())
+            } else {
+                "operator".to_string()
+            },
+            member,
         })
     }
 
@@ -980,6 +1019,38 @@ impl Shared {
                 },
             );
         }
+        if proof.operation == CalendarQuery {
+            // The scope proof re-checks the live mount, the approved bundle
+            // and that this package declares the operation. The sources are
+            // gathered after it: each opens its own stores and the catalog,
+            // which must not nest inside the runtime snapshot it holds.
+            self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || Ok(()),
+            )?;
+            return self.screen_calendar_query(proof, &params);
+        }
+        if proof.operation == RoutinesList {
+            // CAD-2402: routines are an operator read. A member session is
+            // already refused at the proof (members hold read-only mounts,
+            // which admit only the read allowlist); this is the second wall.
+            if proof.is_member() {
+                return Err(screen_access_denied(
+                    "screen service requires operator-role public session",
+                ));
+            }
+            self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || Ok(()),
+            )?;
+            return self.screen_routines_list();
+        }
         if matches!(proof.operation, OriginShow | OriginManage) {
             params
                 .as_object_mut()
@@ -1131,7 +1202,6 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        use crate::issue::app_campaign_work as work;
         self.operator_connection("campaign work sources", params, peer_pid)?;
         if params.as_object().is_none_or(|fields| !fields.is_empty()) {
             return Err(Error::invalid(
@@ -1139,6 +1209,13 @@ impl Shared {
                 "campaign work sources takes no fields",
             ));
         }
+        self.campaign_work_inventory()
+    }
+
+    /// The discovery itself, after the caller's admission. CAD-2379: the
+    /// calendar read shares it, so both name the same live sources.
+    pub(super) fn campaign_work_inventory(&self) -> Result<Value> {
+        use crate::issue::app_campaign_work as work;
         let pm = self.pm_at(&self.pm_dir()?)?;
         let listed = workspace::list(&pm)?;
         let rows = match listed {

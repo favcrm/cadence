@@ -14,6 +14,11 @@ export const REFUSAL_STATUS = Object.freeze({
   missing: 404,
   stale_revision: 409,
   conflict: 409,
+  confirmation_required: 409,
+  confirmation_invalid: 409,
+  quote_changed: 409,
+  grant_changed: 409,
+  uncertain: 409,
   unavailable: 503,
   timeout: 504,
 });

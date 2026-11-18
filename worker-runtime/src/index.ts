@@ -13,6 +13,7 @@ export type {
   HostedSessionOptions,
   HostedState,
   MasterStatus,
+  OperationSettlement,
   PendingOperation,
   RuntimeTool,
   RuntimeTools,
@@ -23,6 +24,7 @@ export type {
   ToolContext,
   ToolInvocation,
   ToolResult,
+  WorkspaceSkill,
 } from "./contract.ts";
 export { BOARD_MESSAGE_KIND, OPERATIONAL_SKILL_VERSION } from "./contract.ts";
 export { masterState, type MasterMetadata } from "./master.ts";

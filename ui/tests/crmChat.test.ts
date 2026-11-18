@@ -1,5 +1,5 @@
 import { streamFixture } from "./streamFixture";
-/** CAD-1051 / CAD-1046: the shell chat — rail, markdown, folded steps,
+/** CAD-1051 / CAD-1046: the shell chat — visibility, markdown, folded steps,
  *  directive cards and the one shared compact composer. */
 declare function require(name: string): any;
 declare const process: { cwd(): string };
@@ -31,7 +31,15 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellComponent = require("../src/features/app-shell/AppShell").default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(React.Fragment, null,
+      React.createElement("nav", { ref: setBreadcrumbs }),
+      React.createElement("div", { ref: setActions }),
+      React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } })));
+};
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { matchDirective, hideIds } = require("../src/features/app-shell/chat/directive") as typeof import("../src/features/app-shell/chat/directive");
 const { parseAppChat } = require("../src/features/app-shell/chat/contract") as typeof import("../src/features/app-shell/chat/contract");
@@ -180,27 +188,26 @@ await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a
 await flush();
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to a record");
 
-// Collapse to a rail; draft and pane survive; waiting dot on new reply.
+// Closing preserves the draft and moves the waiting indicator into the header.
 // An app page may open collapsed (CAD-1810); this check starts from the pane.
 if (grid().hasAttribute("data-chat-collapsed")) {
-  await click(host.querySelector(".app-chat-rail"));
+  await click(host.querySelector(".app-header-assistant"));
   await flush();
 }
 const before = box.value;
-await click(host.querySelector(".app-chat-collapse"));
+await click(host.querySelector(".app-chat-close"));
 assert(grid().hasAttribute("data-chat-collapsed"), "grid collapses");
 equal(pane().getAttribute("data-collapsed"), "true", "pane marks collapsed");
 equal(host.querySelectorAll("[data-chat-pane]").length, 1, "still one pane");
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, before, "draft survives collapse");
-assert(!host.querySelector(".app-chat-dot"), "no dot without news");
+assert(!host.querySelector(".app-header-assistant-unread"), "no waiting indicator without news");
 thread = { ...thread, entries: [...thread.entries, ent(8, "agent", "turn_result", "Another reply", { source: "master" })] };
 await React.act(async () => { await (require("../src/lib/resources") as any).resources.masterThread.refresh(); });
 await flush();
-assert(host.querySelector(".app-chat-dot"), "waiting dot appears for a reply while collapsed");
-await click(host.querySelector(".app-chat-rail"));
-assert(!grid().hasAttribute("data-chat-collapsed"), "rail expands the chat");
-assert(!host.querySelector(".app-chat-dot"), "dot clears once seen");
-assert(host.querySelector("aside, [data-chat-pane]")!.compareDocumentPosition(host.querySelector(".app-shell-outlet")!) & 4, "chat stays before (left of) the workspace");
+assert(host.querySelector(".app-header-assistant-unread"), "the header marks a reply received while collapsed");
+await click(host.querySelector(".app-header-assistant"));
+assert(!grid().hasAttribute("data-chat-collapsed"), "the header expands the chat");
+assert(!host.querySelector(".app-header-assistant-unread"), "the waiting indicator clears once seen");
 await React.act(async () => { root.unmount(); });
 console.log("crm chat checks passed");
 }

@@ -366,6 +366,29 @@ fn visible_threads_fp(
     Some(value_fp(&json!(pages)))
 }
 
+/// The member's agent scope, asked at most twice. The daemon refuses an
+/// `agent_list` whose running set moved while it was being selected ("running
+/// work changed"); a live board makes that routine, and the answer to the
+/// very next ask is settled. Two refusals in a row still fail, so the stream
+/// closes exactly as before and never keeps flowing on an unproven scope.
+fn member_scope(
+    state_dir: &Path,
+    proof: &super::operator::ReadRelayProof,
+) -> crate::error::Result<super::serve::MemberAgentScope> {
+    retry_once(|| super::serve::member_agent_scope(state_dir, proof))
+}
+
+/// Ask again only after a refusal. A transport or internal error (an
+/// unreachable daemon, a reply past the RPC deadline) closes at once: asking
+/// a hung daemon a second time would hold the stream thread for another full
+/// RPC timeout.
+fn retry_once<T>(mut ask: impl FnMut() -> crate::error::Result<T>) -> crate::error::Result<T> {
+    match ask() {
+        Err(crate::error::Error::Rejected(_)) => ask(),
+        first => first,
+    }
+}
+
 /// One signed member's projection of the shared watcher.
 ///
 /// Every frame is decided by comparing the reader's own representation with
@@ -416,7 +439,7 @@ impl MemberReader {
         let pm = Pm::at(pm_dir).ok()?;
         let model = read_model::get(state_dir, pm_dir);
         let jobs = super::serve::readable_job_state(state_dir, &pm, actor, proof).ok()?;
-        let scope = super::serve::member_agent_scope(state_dir, proof).ok()?;
+        let scope = member_scope(state_dir, proof).ok()?;
         let read =
             super::serve::member_board_over(state_dir, &pm, actor, proof, None, &jobs, &scope)
                 .ok()?;
@@ -573,7 +596,7 @@ impl MemberReader {
             None
         };
         let scope = if want_scope || want_board {
-            Some(super::serve::member_agent_scope(state_dir, proof).ok()?)
+            Some(member_scope(state_dir, proof).ok()?)
         } else {
             None
         };
@@ -963,5 +986,66 @@ pub(super) fn stream_events(
             }
             ping_at = Instant::now() + Duration::from_secs(15);
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_once;
+    use crate::error::{Error, Result};
+
+    /// Feed `retry_once` these answers in order; return its result and how
+    /// many answers it asked for.
+    fn asked(answers: Vec<Result<u8>>) -> (Result<u8>, usize) {
+        let mut answers = answers.into_iter();
+        let mut calls = 0;
+        let out = retry_once(|| {
+            calls += 1;
+            answers.next().expect("asked more often than answered")
+        });
+        (out, calls)
+    }
+
+    #[test]
+    fn one_refusal_is_retried_once() {
+        let (out, calls) = asked(vec![Err(Error::rejected("moved")), Ok(7)]);
+        assert!(matches!(out, Ok(7)), "{out:?}");
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn two_refusals_still_fail_after_exactly_one_retry() {
+        let (out, calls) = asked(vec![
+            Err(Error::rejected("moved")),
+            Err(Error::rejected("revoked")),
+            Ok(7),
+        ]);
+        assert!(
+            matches!(&out, Err(Error::Rejected(m)) if m == "revoked"),
+            "{out:?}"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_transport_error_is_not_retried() {
+        // What `client::rpc` returns for a daemon past its deadline and for
+        // one it cannot reach.
+        for error in [
+            Error::busy("daemon original header deadline reached"),
+            Error::internal("Daemon is not reachable"),
+        ] {
+            let kind = error.kind();
+            let (out, calls) = asked(vec![Err(error), Ok(7)]);
+            assert_eq!(out.err().map(|e| e.kind()), Some(kind));
+            assert_eq!(calls, 1, "{kind} was asked again");
+        }
+    }
+
+    #[test]
+    fn a_first_answer_is_not_asked_again() {
+        let (out, calls) = asked(vec![Ok(1), Err(Error::rejected("late"))]);
+        assert!(matches!(out, Ok(1)), "{out:?}");
+        assert_eq!(calls, 1);
     }
 }

@@ -6,7 +6,7 @@ import type {
   SqliteExecutor,
   SqliteValue,
 } from "@earendil-works/chord/sqlite";
-import { Harness, watchEvents } from "@earendil-works/pi-durable";
+import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
 import { defaultModel } from "../src/model.ts";
@@ -44,7 +44,6 @@ const PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 const UNVALIDATED = "UNVALIDATED";
 const ANSWER = "answered in text";
-const RUN_END = '"type":"run_end"';
 
 const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
   `data: ${JSON.stringify({
@@ -111,6 +110,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
     async run(sql: string, ...params: SqliteValue[]) {
       database.prepare(sql).run(...(params as never[]));
     },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       const row = database.prepare(sql).get(...(params as never[])) as
         | T
@@ -162,6 +164,40 @@ function drain(response: Response) {
       while (text.split(marker).length - 1 < times) {
         const left = deadline - Date.now();
         if (left <= 0) throw new Error(`/events never sent ${marker}`);
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, left);
+          waiters.push(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    },
+    async untilIdleView(lastEntryId: unknown) {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        for (const frame of text.split("\n\n")) {
+          if (!frame.startsWith("data: ")) continue;
+          let event: {
+            type?: string;
+            view?: {
+              entries?: Array<{ id: unknown }>;
+              docs?: Record<string, { run?: unknown }>;
+            };
+          };
+          try {
+            event = JSON.parse(frame.slice(6));
+          } catch {
+            continue;
+          }
+          if (
+            event.type === "view" &&
+            event.view?.entries?.at(-1)?.id === lastEntryId &&
+            event.view.docs?.["pi.live"]?.run == null
+          ) return;
+        }
+        const left = deadline - Date.now();
+        if (left <= 0) throw new Error("/events never sent the completed view");
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, left);
           waiters.push(() => {
@@ -261,7 +297,7 @@ async function openSession(
   wired.harness = {
     session: () => ({
       id: conversation.id,
-      events: () => watchEvents(harness, conversation.id, BACKGROUND_CONTEXT),
+      watch: () => conversation.watch(BACKGROUND_CONTEXT),
     }),
     conversation: async () => conversation,
   };
@@ -270,7 +306,13 @@ async function openSession(
       new Request("https://session.internal/events"),
     );
     expect(response.status).toBe(200);
-    return drain(response);
+    const stream = drain(response);
+    await stream.until('"type":"snapshot"');
+    const initial = JSON.parse(stream.text().split("\n\n")[0]!.slice(6));
+    expect(initial.type).toBe("snapshot");
+    expect(initial.view).toBeDefined();
+    expect(initial.snapshot).toBeUndefined();
+    return stream;
   };
   const live = await openEvents();
   cleanups.push(() => live.stop());
@@ -281,10 +323,9 @@ async function openSession(
     live,
     openEvents,
     session,
-    /** One board turn, returned once `/events` has sent its end. */
+    /** One board turn, returned once /events has sent its completed view. */
     async turn(content: string) {
       const operationId = `op-${(operations += 1)}`;
-      const ended = live.text().split(RUN_END).length - 1;
       const operation = await conversation.submit(
         {
           type: "input",
@@ -295,7 +336,12 @@ async function openSession(
         BACKGROUND_CONTEXT,
       );
       await operation.wait(BACKGROUND_CONTEXT);
-      await live.until(RUN_END, ended + 1);
+      await conversation.waitForIdle(BACKGROUND_CONTEXT);
+      const watch = await conversation.watch(BACKGROUND_CONTEXT);
+      const lastEntry = watch.value.entries.at(-1);
+      await watch.stop();
+      if (lastEntry === undefined) throw new Error("completed turn has no entry");
+      await live.untilIdleView(lastEntry.id);
     },
     async stored() {
       const items = (
@@ -465,16 +511,15 @@ async function watchEventsOf(run: {
     run.session as {
       harness: {
         session(): {
-          events(): Promise<{
-            snapshot: unknown;
-            stop(): Promise<unknown>;
-          }>;
+          watch(): Promise<{ value: unknown; stop(): Promise<unknown> }>;
         };
       };
     }
   ).harness;
-  const watch = await harness.session().events();
-  const text = JSON.stringify(watch.snapshot);
-  await watch.stop();
-  return text;
+  const watch = await harness.session().watch();
+  try {
+    return JSON.stringify(watch.value);
+  } finally {
+    await watch.stop();
+  }
 }

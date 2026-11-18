@@ -1,0 +1,360 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "title": "Order intake",
+        "intro": "Tell us about the order.\nAll answers stay private.",
+        "fields": [
+          {
+            "id": "name",
+            "label": "Full name",
+            "type": "text",
+            "placeholder": "Jane Doe",
+            "default": "Sam"
+          },
+          {
+            "id": "bio",
+            "label": "Bio",
+            "type": "longtext"
+          },
+          {
+            "id": "age",
+            "label": "Age",
+            "type": "number",
+            "default": 42,
+            "placeholder": "years"
+          },
+          {
+            "id": "email",
+            "label": "Email",
+            "type": "email",
+            "required": true
+          },
+          {
+            "id": "start",
+            "label": "Start date",
+            "type": "date",
+            "default": "2026-03-15"
+          },
+          {
+            "id": "remind",
+            "label": "Reminder time",
+            "type": "time"
+          },
+          {
+            "id": "meeting",
+            "label": "Meeting",
+            "type": "datetime",
+            "default": "2026-03-15T09:30"
+          },
+          {
+            "id": "size",
+            "label": "Size",
+            "type": "choice",
+            "default": "l",
+            "options": [
+              {
+                "value": "s",
+                "label": "Small"
+              },
+              {
+                "value": "l",
+                "label": "Large"
+              }
+            ]
+          },
+          {
+            "id": "extras",
+            "label": "Extras",
+            "type": "multichoice",
+            "default": [
+              "gift"
+            ],
+            "options": [
+              {
+                "value": "gift",
+                "label": "Gift wrap"
+              },
+              {
+                "value": "card",
+                "label": "Card"
+              },
+              {
+                "value": "rush",
+                "label": "Rush"
+              }
+            ]
+          },
+          {
+            "id": "agree",
+            "label": "I agree",
+            "type": "checkbox",
+            "default": true
+          }
+        ],
+        "submit": "Place order"
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": true,
+      "form": {
+        "version": "1.0",
+        "createSurface": {
+          "surfaceId": "form",
+          "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+          "dataModel": {
+            "name": "Sam",
+            "bio": "",
+            "age": "42",
+            "email": "",
+            "start": "2026-03-15",
+            "remind": "",
+            "meeting": "2026-03-15T09:30",
+            "size": [
+              "l"
+            ],
+            "extras": [
+              "gift"
+            ],
+            "agree": true
+          },
+          "components": [
+            {
+              "id": "root",
+              "component": "Card",
+              "child": "body"
+            },
+            {
+              "id": "body",
+              "component": "Column",
+              "children": [
+                "title",
+                "intro",
+                "field_name",
+                "field_bio",
+                "field_age",
+                "field_email",
+                "field_start",
+                "field_remind",
+                "field_meeting",
+                "field_size",
+                "field_extras",
+                "field_agree",
+                "submit"
+              ]
+            },
+            {
+              "id": "title",
+              "component": "Text",
+              "text": "Order intake"
+            },
+            {
+              "id": "intro",
+              "component": "Text",
+              "variant": "body",
+              "text": "Tell us about the order.\nAll answers stay private."
+            },
+            {
+              "id": "field_name",
+              "label": "Full name",
+              "value": {
+                "@path": "/name"
+              },
+              "component": "TextField",
+              "variant": "shortText",
+              "placeholder": "Jane Doe"
+            },
+            {
+              "id": "field_bio",
+              "label": "Bio",
+              "value": {
+                "@path": "/bio"
+              },
+              "component": "TextField",
+              "variant": "longText"
+            },
+            {
+              "id": "field_age",
+              "label": "Age",
+              "value": {
+                "@path": "/age"
+              },
+              "component": "TextField",
+              "variant": "number",
+              "placeholder": "years"
+            },
+            {
+              "id": "field_email",
+              "label": "Email",
+              "value": {
+                "@path": "/email"
+              },
+              "component": "TextField",
+              "variant": "shortText",
+              "@checks": [
+                {
+                  "condition": {
+                    "@call": "required",
+                    "args": {
+                      "value": {
+                        "@path": "/email"
+                      }
+                    }
+                  },
+                  "message": "Email is required"
+                },
+                {
+                  "condition": {
+                    "@call": "email",
+                    "args": {
+                      "value": {
+                        "@path": "/email"
+                      }
+                    }
+                  },
+                  "message": "Email must be an email address"
+                }
+              ]
+            },
+            {
+              "id": "field_start",
+              "label": "Start date",
+              "value": {
+                "@path": "/start"
+              },
+              "component": "DateTimeInput",
+              "enableDate": true,
+              "enableTime": false
+            },
+            {
+              "id": "field_remind",
+              "label": "Reminder time",
+              "value": {
+                "@path": "/remind"
+              },
+              "component": "DateTimeInput",
+              "enableDate": false,
+              "enableTime": true
+            },
+            {
+              "id": "field_meeting",
+              "label": "Meeting",
+              "value": {
+                "@path": "/meeting"
+              },
+              "component": "DateTimeInput",
+              "enableDate": true,
+              "enableTime": true
+            },
+            {
+              "id": "field_size",
+              "label": "Size",
+              "value": {
+                "@path": "/size"
+              },
+              "component": "ChoicePicker",
+              "variant": "mutuallyExclusive",
+              "options": [
+                {
+                  "label": "Small",
+                  "value": "s"
+                },
+                {
+                  "label": "Large",
+                  "value": "l"
+                }
+              ]
+            },
+            {
+              "id": "field_extras",
+              "label": "Extras",
+              "value": {
+                "@path": "/extras"
+              },
+              "component": "ChoicePicker",
+              "variant": "multipleSelection",
+              "options": [
+                {
+                  "label": "Gift wrap",
+                  "value": "gift"
+                },
+                {
+                  "label": "Card",
+                  "value": "card"
+                },
+                {
+                  "label": "Rush",
+                  "value": "rush"
+                }
+              ]
+            },
+            {
+              "id": "field_agree",
+              "label": "I agree",
+              "value": {
+                "@path": "/agree"
+              },
+              "component": "CheckBox"
+            },
+            {
+              "id": "submit",
+              "component": "Button",
+              "variant": "primary",
+              "child": "submit_label",
+              "action": {
+                "event": {
+                  "name": "answer",
+                  "context": {
+                    "name": {
+                      "@path": "/name"
+                    },
+                    "bio": {
+                      "@path": "/bio"
+                    },
+                    "age": {
+                      "@path": "/age"
+                    },
+                    "email": {
+                      "@path": "/email"
+                    },
+                    "start": {
+                      "@path": "/start"
+                    },
+                    "remind": {
+                      "@path": "/remind"
+                    },
+                    "meeting": {
+                      "@path": "/meeting"
+                    },
+                    "size": {
+                      "@path": "/size"
+                    },
+                    "extras": {
+                      "@path": "/extras"
+                    },
+                    "agree": {
+                      "@path": "/agree"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "submit_label",
+              "component": "Text",
+              "text": "Place order"
+            }
+          ]
+        }
+      },
+      "fallback": "Order intake\n- Full name\n- Bio\n- Age\n- Email\n- Start date\n- Reminder time\n- Meeting\n- Size: Small, Large (choose one)\n- Extras: Gift wrap, Card, Rush (choose any)\n- I agree (yes or no)\nAnswer the form in the board, or reply here.",
+      "digest": "de28b026b0cf905888190a3d90fb17efe96dde6d825ab27695ba6ed08aa9fe26"
+    }
+  }
+}

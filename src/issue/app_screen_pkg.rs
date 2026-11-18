@@ -230,6 +230,21 @@ pub fn campaign_work_source(files: &BTreeMap<String, String>) -> CampaignWorkSou
     CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
 }
 
+/// CAD-2379: does any screen package in this bundle declare `operation`?
+/// The consent page asks it of the bundle itself, because the host (not the
+/// bundle) decides what the declaration means to the person installing. A
+/// package that fails integrity declares nothing here: install refuses it.
+pub fn bundle_declares(
+    files: &BTreeMap<String, String>,
+    operation: app_screen_decl::ScreenOperation,
+) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter()
+            .filter_map(|tag| extract(files, tag).ok())
+            .any(|pkg| pkg.operations.contains(&operation))
+    })
+}
+
 /// Re-prove one screen package against the live bundle snapshot./// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the
@@ -587,6 +602,37 @@ mod tests {
         );
         // An unknown operation still refuses at parse time.
         assert!(extract(&with(&paired, &["campaign-work.send"], None), "a").is_err());
+    }
+
+    /// CAD-2379: a package that declares `calendar.query` parses and the
+    /// bundle says it declares it; a package that does not still refuses the
+    /// operation (the services guard requires it in `pkg.operations`).
+    #[test]
+    fn cad2379_calendar_query_parses_and_an_undeclared_bundle_does_not_declare_it() {
+        let js = "x";
+        let op = app_screen_decl::ScreenOperation::CalendarQuery;
+        let declared = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["calendar.query"]),
+            &[("client.js", js)],
+        );
+        let pkg = extract(&declared, "a").unwrap();
+        assert_eq!(pkg.operations, vec![op]);
+        assert!(bundle_declares(&declared, op));
+        let undeclared = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["records.list"]),
+            &[("client.js", js)],
+        );
+        assert!(!extract(&undeclared, "a").unwrap().operations.contains(&op));
+        assert!(!bundle_declares(&undeclared, op));
+        // The closed vocabulary still refuses a neighbour at parse time.
+        let unknown = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["calendar.update"]),
+            &[("client.js", js)],
+        );
+        assert!(extract(&unknown, "a").is_err());
     }
 
     #[test]

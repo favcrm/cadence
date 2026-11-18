@@ -539,7 +539,8 @@ pre {
    pulse dot + Working + elapsed, accent, mono — beside the row's own
    name and timestamp, which the bubble keeps rendering. */
 .chat-live {
-  margin-left: auto;
+  /* CAD-2363: beside the name, not across the row. */
+  margin-left: .375rem;
   display: inline-flex;
   align-items: center;
   color: var(--color-accent);
@@ -820,7 +821,7 @@ pre {
 .turn-name {
   color: var(--color-ink-200);
   font-size: var(--text-label);
-  font-weight: 500;
+  font-weight: 600;
 }
 .turn-time {
   font-family: "IBM Plex Mono", monospace;
@@ -840,7 +841,7 @@ pre {
   padding: .15rem .5rem .15rem .3rem;
   border-radius: .375rem;
   background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
 }
 .turntrace-head:hover,
 .turntrace[data-open] .turntrace-head {
@@ -855,7 +856,7 @@ pre {
 .turntrace-summary {
   min-width: 0;
   overflow: hidden;
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -917,12 +918,11 @@ pre {
   display: flex;
   align-items: center;
   gap: .625rem;
-  margin: .25rem 0;
+  /* CAD-2425: air above the day it opens, the mockup's 20px / 14px. */
+  margin: 1.25rem 0 .875rem;
   color: var(--color-ink-500);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: .65625rem;
-  letter-spacing: .06em;
-  text-transform: uppercase;
+  /* CAD-2363: a date in the board's language, set as text, not a mono label. */
+  font-size: .6875rem;
 }
 .day-sep::before,
 .day-sep::after {
@@ -932,7 +932,8 @@ pre {
   background: var(--color-ink-800);
 }
 
-/* CAD-1886: the keyboard affordance under a full-density composer. */
+/* CAD-1886: the keyboard affordance of a full-density composer (CAD-2425:
+   now in its footer row, beside send). */
 .composer-hint {
   margin: .375rem .125rem 0;
   color: var(--color-ink-500);
@@ -1157,6 +1158,28 @@ textarea.agentform-input { height: auto; width: 100%; }
 .agentform-foot .btn { max-width: none; }
 .agentform[data-form-state="sent"] .agentform-body, .agentform[data-form-state="closed"] .agentform-body { background: color-mix(in srgb, var(--color-ink-900) 45%, transparent); }
 .agentform-fallback { max-width: min(100%, 40rem); }
+/* CAD-2411: a running turn's latest committed note, held between steps.
+   Quiet and short; the trace keeps the whole note. */
+.answer.turn-interim .answer-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  color: var(--color-ink-400);
+}
+/* One paragraph (see `interimLine`). Beat the answer's section-label and
+   heading rules, which would otherwise restyle it. */
+.answer.turn-interim .answer-body.issue-reader > * {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: normal;
+}
+.answer.turn-interim .answer-body.issue-reader strong {
+  color: inherit;
+}
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
    made-up answer body. */
 .typing {
@@ -1455,11 +1478,11 @@ textarea.agentform-input { height: auto; width: 100%; }
 [data-chat-message="user"] .chat-bubble,
 [data-chat-message="user"] .chat-bubble.text-body {
   max-width: min(100%, 34rem);
-  padding: 0.7rem 1rem;
+  padding: .5625rem .875rem;
   border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
   background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-850));
   color: var(--color-ink-100);
-  line-height: 1.55;
+  line-height: 1.6;
 }
 [data-chat-message] .refsrow {
   margin-top: 0.5rem;
@@ -1473,6 +1496,96 @@ textarea.agentform-input { height: auto; width: 100%; }
 }
 .chat-bubble[data-pending="sending"] {
   opacity: 0.85;
+}
+/* CAD-2362: the operator's own message. No "You" row: the time sits under
+   the bubble, shown on hover or focus and always on touch; a delivery state
+   (`data-always`) never hides. */
+.chat-me-at {
+  margin-top: .25rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  opacity: 0;
+  transition: opacity .14s ease;
+}
+.chat-me:hover .chat-me-at,
+.chat-me:focus-within .chat-me-at,
+.chat-me-at[data-always] {
+  opacity: 1;
+}
+@media (hover: none) {
+  .chat-me-at { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-me-at { transition: none; }
+}
+/* The board loads upright faces only and turns synthesis off (base.css),
+   so <em> rendered upright and an operator's *emphasis* vanished. Chat
+   emphasis asks the browser for a slanted style. */
+[data-chat-message] em,
+.answer em {
+  font-synthesis-style: auto;
+}
+[data-chat-message="user"] .op-code {
+  padding: .05rem .3rem;
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-100) 9%, transparent);
+  font: .9em "IBM Plex Mono", monospace;
+}
+[data-chat-message="user"] .op-pre {
+  margin: .5rem -.25rem 0;
+  padding: .55rem .7rem;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-950) 28%, transparent);
+  color: var(--color-ink-200);
+  font-size: .78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+[data-chat-message="user"] .op-pre:first-child {
+  margin-top: 0;
+}
+/* A long message folds to six lines with a fade; the foot carries its line
+   count, Show all and Copy. */
+.op-fold-body {
+  max-height: 9.3em;
+  max-height: 6lh;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 60%, transparent);
+  mask-image: linear-gradient(#000 60%, transparent);
+}
+.op-fold[data-open] .op-fold-body {
+  max-height: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.op-fold-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .25rem 1rem;
+  margin-top: .4rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.op-fold-actions {
+  display: inline-flex;
+  gap: .75rem;
+}
+/* A form answer the card already shows: one quiet receipt line. */
+.form-receipt {
+  display: inline-block;
+  max-width: min(100%, 34rem);
+  padding: .2rem .7rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .75rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.form-receipt-line {
+  color: var(--color-ink-200);
 }
 /* Markdown drops its trailing margin inside the padded surface, so the
    last line and the bubble edge stay even. */
@@ -1543,39 +1656,50 @@ textarea.agentform-input { height: auto; width: 100%; }
 .issue-reader table {
   margin-block: .6rem;
 }
+/* CAD-2408: chat answers follow the approved chat-polish mockup's rhythm
+   (2026-11-16): 1.6 lines, .85em between paragraphs, .2em between list
+   items. Wiki, issue and document readers keep the base reader rules. */
 .answer .issue-reader,
 .chat-bubble.issue-reader {
-  line-height: 1.7;
+  line-height: 1.6;
 }
 .answer .issue-reader p,
 .chat-bubble.issue-reader p {
-  margin-block: .9rem;
+  margin-block: .85em;
   text-wrap: pretty;
 }
 .answer .issue-reader ul,
 .answer .issue-reader ol,
 .chat-bubble.issue-reader ul,
 .chat-bubble.issue-reader ol {
-  margin-block: .6rem 1rem;
+  margin-block: .85em;
   padding-inline-start: 1.25rem;
 }
-.answer .issue-reader ul + p,
-.answer .issue-reader ol + p,
-.chat-bubble.issue-reader ul + p,
-.chat-bubble.issue-reader ol + p {
-  margin-top: 1.25rem;
+.answer .issue-reader li + li,
+.chat-bubble.issue-reader li + li {
+  margin-top: .2em;
 }
+/* A real Markdown heading keeps its reader size and weight; only the
+   spacing is the mockup's. */
 .answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child) {
+  margin: 1.3em 0 .45em;
+}
+/* A paragraph that is only bold text is a section label, not a heading:
+   small, muted and without a rule (the mockup's `.answer .sect`). */
 .answer .issue-reader > p:has(> strong:only-child):not(:first-child),
-.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
 .chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) {
-  margin: 1.75rem 0 .75rem;
-  padding-top: 1.35rem;
-  border-top: 1px solid color-mix(in srgb, var(--color-ink-700) 60%, transparent);
-  color: var(--color-ink-100);
-  font-size: .9375rem;
-  font-weight: 600;
+  margin: 1.2em 0 .5em;
+  color: var(--color-ink-500);
+  font-size: .6875rem;
+  font-weight: 500;
+  letter-spacing: .04em;
   line-height: 1.4;
+}
+.answer .issue-reader > p:has(> strong:only-child):not(:first-child) > strong,
+.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) > strong {
+  color: inherit;
+  font-weight: inherit;
 }
 .answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
 .answer .issue-reader > p:has(> strong:only-child):last-child,
@@ -2251,6 +2375,23 @@ button.refchip:hover {
   );
 }
 
+/* CAD-2363: while the jump-to-latest pill floats over the thread (scrolled
+   up), the fade rises to end just under the pill, so it never sits on
+   opaque text. The pill is up to 2.75rem tall (touch), .6–.75rem above the dock, and
+   below the rail breakpoint also above the Needs-you band (--need-clear). */
+.chat-scroll[data-jump-pill] {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 5.1rem),
+    transparent calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 3.6rem)
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 5.1rem),
+    transparent calc(100% - var(--dock-h, 7rem) - var(--need-clear, 0px) - 3.6rem)
+  );
+}
+
 /* Below the rail breakpoint the Needs-you button is fixed in the band
    above the dock, on the right. The thread's padding clears that button
    as well as the dock, so the last message's box stays above it.
@@ -2331,7 +2472,7 @@ button.refchip:hover {
 }
 .home-workspace .chatdock { left: 0; right: 0; }
 .home-workspace .chat-scroll { scrollbar-gutter: stable; }
-.home-workspace .issue-reader { line-height: 1.7; }
+.home-workspace .issue-reader:not(.answer-body, .chat-bubble) { line-height: 1.7; }
 .home-workspace .issue-reader p { text-wrap: pretty; }
 .home-workspace .master-heading { padding-block: .25rem .75rem; }
 .home-workspace [data-composer][data-blocked] { background: var(--color-ink-875); border-style: solid; }
@@ -2371,9 +2512,44 @@ button.refchip:hover {
 .desktop-collapse-control { display: none; }
 @media (width >= 1024px) { .desktop-collapse-control { display: inline-flex; flex: none; } }
 .header-breadcrumb { display: flex; align-items: center; gap: .5rem; font-size: var(--text-micro); }
+.app-header-location-target, .app-header-location { display: flex; align-items: center; gap: .5rem; min-width: 0; }
+.app-header-location { font-size: var(--text-label); }
+.header-breadcrumb .app-header-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-100); font-weight: 500; }
+.app-header-version { flex: none; white-space: nowrap; font-family: var(--font-mono); }
+.app-header-section { min-width: 0; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-200); }
+.app-header-actions-target { display: contents; }
+.app-header-app-actions { display: flex; flex: none; align-items: center; gap: .5rem; }
+.app-header-more { width: 1.75rem; height: 1.75rem; }
+.app-header-action-menu { position: fixed; inset: 2.5rem 1rem auto auto; margin: 0; min-width: 12rem; max-width: calc(100vw - 2rem); padding: .5rem; border: 1px solid var(--color-ink-700); border-radius: .375rem; background: var(--color-ink-850); color: var(--color-ink-100); }
+.app-header-action-menu:popover-open { display: flex; flex-direction: column; align-items: stretch; gap: .5rem; }
+.app-header-action-menu a { padding: .375rem .5rem; }
+.app-header-assistant { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: .375rem; height: 1.75rem; padding: 0 .5625rem; border: 1px solid var(--color-ink-700); border-radius: .25rem; background: transparent; color: var(--color-ink-400); font-size: var(--text-label); line-height: 1; font-weight: 500; white-space: nowrap; }
+.app-header-assistant:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.app-header-assistant[aria-expanded="true"] { border-color: color-mix(in srgb, var(--color-accent) 35%, var(--color-ink-700)); background: color-mix(in srgb, var(--color-accent) 8%, var(--color-ink-900)); color: var(--color-accent); }
+.app-header-assistant:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.app-header-assistant-unread { width: .4rem; height: .4rem; flex: none; border-radius: 50%; background: var(--color-warn); }
+.app-header[data-installed-app] .header-breadcrumb > a { flex: none; }
+.app-header[data-installed-app] .header-breadcrumb { font-size: var(--text-label); }
+@media (width < 1024px) {
+  .app-header[data-installed-app] { min-height: 2.75rem; }
+  .app-header-assistant, .app-header-more { height: 2.25rem; }
+  .app-header-more { width: 2.25rem; }
+  .app-header-action-menu { top: 3rem; }
+}
+@media (width < 640px) {
+  .app-header[data-installed-app] { flex-wrap: nowrap; }
+  .app-header[data-installed-app] .header-breadcrumb { order: 0; flex: 1 1 0%; gap: .375rem; }
+  .app-header[data-installed-app] .app-header-utilities { display: none; }
+  .app-header-location-target, .app-header-location { gap: .375rem; }
+}
 @media (width < 640px) {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
   .header-breadcrumb { order: 1; flex: 0 0 100%; }
+}
+@media (width < 420px) {
+  .app-header[data-installed-app] { flex-wrap: wrap; row-gap: .125rem; }
+  .app-header[data-installed-app] .header-breadcrumb { order: 1; flex: 0 0 100%; padding-bottom: .25rem; }
+  .app-header[data-installed-app] .app-header-app-actions { margin-left: auto; }
 }
 /* CAD-1312: the configured organisation name truncates inside a bounded
    span so a long configured name never pushes the status controls out. */
@@ -2677,5 +2853,247 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   }
   .ps-grant-add > .btn {
     width: 100%;
+  }
+}
+
+/* CAD-2363: assistant turns. The running turn's one clock sits beside the
+   name in tabular figures; a known tool reads as what it did, its subject
+   quieter; long identifiers are short copyable tokens; answer emphasis is
+   600, tables are framed, and a rule
+   never doubles a section heading's own line. Styles only: the Markdown
+   renderer is not forked. */
+.turn-clock {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  color: var(--color-accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.turn-clock .workdot {
+  width: .4rem;
+  height: .4rem;
+}
+.chat-live,
+.chat-live .text-ink-500 {
+  font-variant-numeric: tabular-nums;
+}
+.step-what {
+  color: var(--color-ink-300);
+}
+.step-subject {
+  color: var(--color-ink-500);
+}
+.turntrace-raw {
+  display: inline-block;
+  margin-top: .375rem;
+  font-size: var(--text-micro);
+}
+.idtok {
+  display: inline;
+  padding: .05rem .35rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-700) 35%, transparent);
+  color: var(--color-ink-300);
+  font: .85em "IBM Plex Mono", monospace;
+  cursor: copy;
+  vertical-align: baseline;
+}
+.idtok:hover {
+  border-color: var(--color-ink-600);
+  color: var(--color-ink-100);
+}
+.idtok:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+/* CAD-2364: a staged write named in an answer. It opens the review card;
+   it never decides. One line: at narrow widths the meta, then the title truncate;
+   the status always shows. */
+.stagedchip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .375rem;
+  max-width: 100%;
+  min-width: 0;
+  padding: .05rem .5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .375rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+  font-size: .9em;
+  line-height: 1.5;
+  text-align: left;
+  vertical-align: baseline;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.stagedchip:hover {
+  border-color: var(--color-ink-600);
+  background: var(--color-ink-800);
+}
+.stagedchip:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.stagedchip[aria-disabled="true"] {
+  cursor: default;
+}
+.stagedchip-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+.stagedchip-meta {
+  flex-shrink: 4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+.stagedchip-status {
+  flex-shrink: 0;
+  color: var(--color-accent);
+  font-size: var(--text-micro);
+  font-weight: 500;
+}
+.stagedchip[data-outcome="applied"] .stagedchip-status {
+  color: var(--color-ok);
+}
+.stagedchip[data-outcome="failed"] .stagedchip-status {
+  color: var(--color-fail);
+}
+.stagedchip[data-outcome="unconfirmed"] .stagedchip-status {
+  color: var(--color-warn);
+}
+.stagedchip[data-outcome="denied"] .stagedchip-status {
+  color: var(--color-ink-400);
+}
+.stagedchip[data-outcome="denied"] .stagedchip-title {
+  text-decoration: line-through;
+  text-decoration-color: var(--color-ink-500);
+}
+.answer .issue-reader strong {
+  font-weight: 600;
+  color: var(--color-ink-100);
+}
+.answer .issue-reader .md-table-wrap {
+  margin: .25rem 0 .85rem;
+  padding: .15rem .75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+}
+.answer .issue-reader .md-table-wrap table {
+  margin: 0;
+}
+
+/* CAD-2425: chat reads in the device's own interface font (SF Pro and
+   PingFang on Apple, Segoe UI and Microsoft JhengHei on Windows, Roboto and
+   Noto on Android), so Latin and Chinese match and nothing is downloaded.
+   The page's `lang` (set from the board locale) picks traditional glyphs.
+   Code, times and counts keep their own IBM Plex Mono rules. Screens other
+   than chat keep IBM Plex Sans. */
+:root {
+  --font-chat: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+}
+.chat-scroll,
+.app-chat-list,
+[data-composer],
+.app-chat-composer {
+  font-family: var(--font-chat);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* The full composer (Home, member and agent chat): one 12px card, the box,
+   then one footer row — attach, the keyboard hint, send. */
+[data-composer]:has(> .composer-foot) {
+  border-radius: .75rem;
+  padding: .625rem .75rem .5rem;
+}
+[data-composer]:has(> .composer-foot) > textarea {
+  display: block; /* no inline baseline gap under the box */
+  line-height: 1.5;
+}
+.composer-foot {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-top: .25rem;
+}
+.composer-foot .composer-hint {
+  margin: 0;
+}
+.app-chat-attach-label {
+  display: none;
+}
+@media (min-width: 640px) {
+  .composer-foot .app-chat-attach,
+  .app-chat-composer-tools .app-chat-attach {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    width: auto;
+    padding: 0 .4rem;
+    border-radius: .375rem;
+    font-size: var(--text-micro);
+  }
+  .composer-foot .app-chat-attach-label,
+  .app-chat-composer-tools .app-chat-attach-label {
+    display: inline;
+  }
+}
+/* The assistant panel's compact composer follows the same card: 12px
+   corners (already), the same padding, and on desktop the message size. */
+.app-chat-composer[data-density] {
+  padding: .625rem .75rem .5rem;
+}
+
+/* Desktop reading size: 15px at 1.65 for answers and the operator's own
+   bubble, a 680px measure, the compact composer and an evenly rounded
+   bubble. Below 1024px CAD-1881's 16px phone reading stays as it is. */
+@media (min-width: 1024px) {
+  .answer .answer-body.issue-reader,
+  .chat-bubble.issue-reader,
+  [data-chat-message="user"] .chat-bubble,
+  [data-chat-message="user"] .chat-bubble.text-body {
+    font-size: .9375rem;
+    line-height: 1.65;
+    text-wrap: pretty;
+  }
+  .answer,
+  .turn-head {
+    max-width: min(100%, 42.5rem);
+  }
+  [data-chat-message="user"] .chat-bubble,
+  [data-chat-message="user"] .chat-bubble.text-body {
+    max-width: min(78%, 34rem);
+    border-radius: .875rem;
+  }
+  [data-composer]:has(> .composer-foot) > textarea,
+  .app-chat-composer .app-chat-box {
+    min-height: 2.5rem;
+    font-size: .9375rem;
+  }
+  .composer-foot .app-chat-attach,
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-attach,
+  .app-chat-composer-tools .app-chat-send {
+    height: 1.625rem;
+  }
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-send {
+    width: 1.625rem;
+  }
+  .composer-foot .app-chat-attach svg,
+  .composer-foot .app-chat-send svg,
+  .app-chat-composer-tools .app-chat-attach svg,
+  .app-chat-composer-tools .app-chat-send svg {
+    width: .875rem;
+    height: .875rem;
   }
 }

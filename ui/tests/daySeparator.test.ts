@@ -16,9 +16,13 @@ const translate = (key: string) => key;
 const today = dayText(now, now, translate);
 const yesterday = dayText(now - DAY, now, translate);
 const older = dayText(now - 5 * DAY, now, translate);
-ok(today === "Today", `today reads Today (got ${today})`);
-ok(yesterday === "Yesterday", `yesterday reads Yesterday (got ${yesterday})`);
-ok(older !== "Today" && older !== "Yesterday" && older.length > 0, `older reads a date (got ${older})`);
+const olderDate = dayText(now - 5 * DAY, now, translate);
+const todayDate = new Date(now).toLocaleDateString("en", { weekday: "short", month: "short", day: "numeric" });
+const yesterdayDate = new Date(now - DAY).toLocaleDateString("en", { weekday: "short", month: "short", day: "numeric" });
+// CAD-2425: a recent day leads with its word and still names its date.
+ok(today === `Today · ${todayDate}`, `today reads Today and its date (got ${today})`);
+ok(yesterday === `Yesterday · ${yesterdayDate}`, `yesterday reads Yesterday and its date (got ${yesterday})`);
+ok(!older.includes("Today") && !older.includes("Yesterday") && older === olderDate && older.length > 0, `older reads a date only (got ${older})`);
 
 // Same local day at a different hour is one key; the next day is another.
 ok(dayKey(now) === dayKey(new Date(2026, 9, 27, 23, 59).getTime()), "same local day keeps one key");
@@ -38,6 +42,6 @@ const html = renderToStaticMarkup(
   createElement(LocaleProvider, null, createElement(DayDivider, { ms: now, now })),
 );
 ok(html.includes('data-day-sep'), "the divider carries its test hook");
-ok(html.includes("Today"), "the divider prints Today");
+ok(html.includes("Today · "), "the divider prints Today and the date");
 
 console.log("day separator checks passed");

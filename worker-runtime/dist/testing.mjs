@@ -60,43 +60,81 @@ function assistantRecord(id, content) {
     ]
   };
 }
-function liveBatch(entry) {
-  if (typeof entry !== "object" || entry === null || !("model" in entry)) {
-    throw new Error("liveBatch requires a record from assistantRecord");
-  }
-  const model = entry.model;
-  if (!Array.isArray(model) || model.length === 0) {
-    throw new Error("liveBatch requires a record with one stored message");
-  }
-  const message = model[0];
-  if (typeof message !== "object" || message === null || !("content" in message) || !Array.isArray(message.content)) {
-    throw new Error("liveBatch requires an assistant message with content");
-  }
-  const changes = [];
-  message.content.forEach((block, contentIndex) => {
-    if (typeof block === "object" && block !== null && "type" in block && block.type === "thinking" && "thinking" in block && typeof block.thinking === "string") {
-      changes.push({
-        type: "thinking_delta",
-        contentIndex,
-        delta: block.thinking
-      });
-    }
-    changes.push({ type: "block", contentIndex, block });
+function conversationFixture(stored, live) {
+  let committed = false;
+  const observers = new Set;
+  const messages = async () => {
+    const entry = committed ? live() : undefined;
+    return entry === undefined ? stored() : [...stored(), entry];
+  };
+  const view = async () => ({
+    entries: await messages(),
+    docs: { "pi.live": {} }
   });
-  changes.push({ type: "message", message });
-  return [
-    {
-      type: "message_update",
-      usage: "usage" in message ? message.usage : undefined,
-      changes
-    },
-    { type: "message_end", entry }
-  ];
+  const session = {
+    id: "1",
+    messages,
+    busy: async () => false,
+    watch: async () => {
+      let value = await view();
+      const closed = Promise.withResolvers();
+      let ended = false;
+      const finish = (end) => {
+        if (!ended) {
+          ended = true;
+          closed.resolve(end);
+        }
+      };
+      return {
+        get value() {
+          return value;
+        },
+        closed: closed.promise,
+        start(listener) {
+          const entry = live();
+          if (entry === undefined) {
+            finish({ kind: "ended" });
+            return;
+          }
+          committed = true;
+          value = { entries: [...stored(), entry], docs: { "pi.live": {} } };
+          const change = {
+            kind: "value",
+            value,
+            ops: [["r", value]],
+            retired: false
+          };
+          for (const observer of observers)
+            observer.advance(change);
+          listener(change).then(() => finish({ kind: "ended" }), (error) => finish({ kind: "listener_error", error }));
+        },
+        async stop() {
+          const end = { kind: "ended" };
+          finish(end);
+          return end;
+        }
+      };
+    }
+  };
+  return {
+    session: () => session,
+    conversation: async () => ({ entries: async () => ({ items: await messages() }) }),
+    pending: async () => [],
+    pi: async () => ({
+      observeConversation: async (_id, observer) => {
+        const value = await view();
+        observers.add(observer);
+        return { value, detach: () => {
+          observers.delete(observer);
+        } };
+      }
+    })
+  };
 }
 export {
   assistantRecord,
   authorizeTool,
   authorizeTools,
-  liveBatch,
+  conversationFixture,
   userRecord
 };

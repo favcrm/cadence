@@ -272,8 +272,16 @@ export default function Members({ viewer }: { viewer: Viewer }) {
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState("");
-  const [open, setOpen] = useState<OpenDrawer | null>(null);
+  const [open, setOpenState] = useState<OpenDrawer | null>(null);
   const openSeq = useRef(0);
+  // The opening that is live now, readable from a write that started earlier.
+  // It is set with the state, never after the commit, so a write answering in
+  // between still sees the opening that replaced its own.
+  const openRef = useRef<OpenDrawer | null>(null);
+  const setOpen = useCallback((next: OpenDrawer | null) => {
+    openRef.current = next;
+    setOpenState(next);
+  }, []);
   const showDrawer = useCallback((drawer: Drawer) => {
     setOpen({ drawer, token: ++openSeq.current });
   }, []);
@@ -332,12 +340,6 @@ export default function Members({ viewer }: { viewer: Viewer }) {
     return () => controller.abort();
   }, [viewer.operator, refresh, attempt]);
 
-  // The opening that is live now, readable from a write that started earlier.
-  const openRef = useRef<OpenDrawer | null>(null);
-  useEffect(() => {
-    openRef.current = open;
-  }, [open]);
-
   /**
    * Close the drawer only if it is still the opening that asked. A write can
    * resolve after its drawer was closed or reopened; it must not dismiss the
@@ -351,7 +353,6 @@ export default function Members({ viewer }: { viewer: Viewer }) {
     const record = focusRecord.current ?? (owner?.kind === "member" ? owner.id : null);
     focusInvite.current = false;
     focusRecord.current = null;
-    openRef.current = null;
     setOpen(null);
     window.setTimeout(() => {
       if (record !== null) {

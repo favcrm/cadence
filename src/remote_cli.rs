@@ -131,6 +131,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "agent_profile_context",
     // CAD-2101: one stored profile with its revision.
     "agent_profile_show",
+    // CAD-2396: a hosted workspace's own skills. `check` validates and saves
+    // nothing.
+    "workspace_skill_list",
+    "workspace_skill_show",
+    "workspace_skill_check",
     "issue_ls",
     "issue_show",
     "issue_history",
@@ -141,6 +146,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "artifact_find",
     "artifact_show",
     "artifact_read",
+    // CAD-2286: the workspace's document types and baseline. It is also the
+    // one probe that decides whether the document lifecycle is available
+    // ([`document_lifecycle_unavailable`]).
+    "document_types",
     "message_read",
     "message_inbox",
     "team_list",
@@ -160,6 +169,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_message_send",
     "issue_messages_read",
     "issue_set",
+    // CAD-2286: submit a file the caller saved into the document lifecycle.
+    // It rides a managed session's agent credential like any other verb: that
+    // credential carries the member's subject, which the creator check reads,
+    // and the board's read-only guard refuses a reader or reviewer session.
+    "document_submit",
     // AOS-528: one link added or removed. The board applies the delta to the
     // card it holds, so the client sends ids and a kind, never a whole card.
     "issue_link",
@@ -178,6 +192,13 @@ pub const REMOTE_VERBS: &[&str] = &[
     // human owner and owns the field limits and the revision fence.
     "agent_profile_create",
     "agent_profile_update",
+    // CAD-2396: any cli.write caller saves a draft; approving one revision by
+    // digest, and revoking it, need a live human owner on the board.
+    "workspace_skill_draft",
+    "workspace_skill_approve",
+    "workspace_skill_revoke",
+    // agenticos-v2 #2147: owner-only, removes an unapproved skill.
+    "workspace_skill_delete",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
@@ -262,9 +283,15 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
         | "agent_roles"
         | "project_ls"
-        | "project_timeline" => &["cli.read"],
+        | "project_timeline"
+        | "document_types" => &["cli.read"],
+        // CAD-2286: the tenant admits `document_submit` with cli.write alone.
+        "document_submit" => &["cli.write"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         // A delegated approval is the designated agent's own act (`cli.write`),
@@ -276,6 +303,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
         "project_new" | "agent_profile_create" | "agent_profile_update" => &["cli.write"],
+        "workspace_skill_draft"
+        | "workspace_skill_approve"
+        | "workspace_skill_revoke"
+        | "workspace_skill_delete" => &["cli.write"],
         // CAD-2001: attesting project eligibility or a principal's GitHub
         // identity decides whose verdicts count, so both writes need the same
         // `audit.approve` login as the merge approval — and the tenant admits
@@ -357,9 +388,12 @@ const RECONCILE_ISSUE_MESSAGES_READ: &str =
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
+const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved — read `workspace-skill show <name>` with the same explicit --org before repeating it; its latest revision says whether the draft landed";
+const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
 const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
+const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
@@ -380,6 +414,7 @@ const RECONCILE_AUDIT_SCOPE_PROJECT: &str = "the scope pre-approval may or may n
 const RECONCILE_AUDIT_DESIGNATE_PROJECT: &str = "the designation may or may not have been updated — read `audit designations` for the same project before repeating it";
 const RECONCILE_AUDIT_APPROVE_DELEGATED: &str = "the delegated approval may or may not have been recorded — read `audit approval` for the same project, issue, repo and head before repeating it";
 const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
+const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — repeat `artifact submit <id>`, which answers the document's current stage and does not submit it twice";
 const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
@@ -406,6 +441,9 @@ fn cli_effect(verb: &str) -> Effect {
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
         | "issue_ls"
         | "issue_show"
         | "issue_history"
@@ -414,6 +452,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "artifact_find"
         | "artifact_show"
         | "artifact_read"
+        | "document_types"
         | "message_read"
         | "message_inbox"
         | "team_list"
@@ -442,10 +481,15 @@ fn cli_effect(verb: &str) -> Effect {
         "issue_review" => mutation(RECONCILE_ISSUE_REVIEW),
         "issue_message_send" => mutation(RECONCILE_ISSUE_MESSAGE_SEND),
         "issue_messages_read" => mutation(RECONCILE_ISSUE_MESSAGES_READ),
+        "document_submit" => mutation(RECONCILE_DOCUMENT_SUBMIT),
         "project_policy" => mutation(RECONCILE_PROJECT_POLICY),
         "project_new" => mutation(RECONCILE_PROJECT_NEW),
         "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
         "agent_profile_update" => mutation(RECONCILE_PROFILE_UPDATE),
+        "workspace_skill_draft" => mutation(RECONCILE_SKILL_DRAFT),
+        "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete" => {
+            mutation(RECONCILE_SKILL_DECISION)
+        }
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
         // `settings_agents` is refined per operation by [`call_effect`]; without
@@ -508,6 +552,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 // link, so its lost or unusable answer is a possible mutation; the
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 Some("call") => match arguments.get("tool").and_then(Value::as_str) {
                     Some("app_describe") => Effect::Read,
                     Some("app_call") => mutation(RECONCILE_APP_ACTION),
@@ -750,6 +795,38 @@ pub fn connection_providers_answer(answer: &Value) -> bool {
     connection_rows(answer, "providers", connection_provider_row)
 }
 
+/// AOS-627: the strict `connected_effect` answer: `data` is exactly
+/// `{action_id, outcome, replayed, result?}`. It is the staged action's state,
+/// never a provider result.
+pub fn connected_effect_stage_answer(answer: &Value) -> bool {
+    let Some(data) = answer
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|_| answer.get("ok").and_then(Value::as_bool) == Some(true))
+    else {
+        return false;
+    };
+    data.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action_id" | "outcome" | "replayed" | "result"
+        )
+    }) && data
+        .get("action_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && matches!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("pending" | "applied" | "failed" | "denied")
+        )
+        && data.get("replayed").is_some_and(Value::is_boolean)
+        && data.get("result").is_none_or(Value::is_object)
+}
 pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
 }
@@ -848,8 +925,21 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
         return false;
     }
     match verb {
-        // The server allocates the id, so a create is bound by the project and
-        // title. The tenant trims both; the native route preserves the title.
+        // A keyed tenant create is correlated by its immutable request receipt:
+        // the current issue's title and project may have changed since creation.
+        "issue_new" if arguments.contains_key("request_id") => {
+            object("card")
+                && card_id == issue_id
+                && arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .zip(reply.get("request_id").and_then(Value::as_str))
+                    .is_some_and(|(sent, got)| sent == got)
+        }
+        // Unkeyed creates have no receipt, so bind the allocated id to the
+        // project and title. The tenant trims both; the native route preserves
+        // the title.
         "issue_new" => {
             let project = arguments
                 .get("project")
@@ -2117,6 +2207,104 @@ pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
 
 /// Stable code for a board that predates `limit` on `issue_ls`.
 pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
+
+/// CAD-2286: stable code for a workspace whose document lifecycle cannot be
+/// used — the tenant predates it, the flag is off, or an older relay refuses
+/// the verb. Only `document_types` decides it ([`document_lifecycle_unavailable`]).
+pub const DOCUMENT_LIFECYCLE_UNAVAILABLE: &str = "document_lifecycle_unavailable";
+
+/// CAD-2286: the `document_types` answers that mean "this workspace has no
+/// document lifecycle", never "remote unavailable, retry later":
+///
+/// - `501` — a tenant without the verb (`not_implemented`);
+/// - `404 not_found` — the tenant's flag is off; it answers that before it
+///   reads any argument;
+/// - `400 invalid_request`/`unknown_verb` — a relay older than the verb.
+///   `document_types` takes no arguments, so the refusal can only be the
+///   name, as [`tenant_cannot_serve`] reasons.
+///
+/// Every other verb, `document_submit` included, keeps its own answer: a 404
+/// on submit is a missing file, not a missing lifecycle.
+fn document_lifecycle_unavailable(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_types" {
+        return None;
+    }
+    let state = body.and_then(|b| b["state"].as_str()).unwrap_or_default();
+    if matches!(state, "waking" | "wake_failed") {
+        return None;
+    }
+    let code = refusal_fields(body).0;
+    let cause = match (status, code) {
+        (501, _) | (400, Some("invalid_request" | "unknown_verb")) => {
+            "the workspace's server is older than this command"
+        }
+        (404, Some("not_found")) => "document review is turned off on this workspace",
+        _ => return None,
+    };
+    Some(Error::invalid(
+        DOCUMENT_LIFECYCLE_UNAVAILABLE,
+        format!(
+            "document lifecycle is not available on this workspace (HTTP {status}{}): \
+             {cause}. Nothing was read",
+            code.map_or(String::new(), |c| format!(", {c}"))
+        ),
+    ))
+}
+
+/// CAD-2286: a `document_submit` 2xx is a receipt only in the shape of the
+/// tenant's `documentSubmitView` (`apps/api/src/tenant-board/document-store.ts`):
+/// a lifecycle stage (`DOCUMENT_STAGES` in `document-lifecycle.ts`), the type,
+/// whether that type is confirmed, and the baseline object for an unconfirmed
+/// one. The answer carries no id to correlate, so the shape is the proof; any
+/// other body may follow a recorded submit and is an unknown outcome.
+fn document_submit_receipt(reply: &Value) -> bool {
+    matches!(
+        reply.get("stage").and_then(Value::as_str),
+        Some("draft" | "in_review" | "approved" | "delivered" | "archived")
+    ) && reply.get("type").is_some_and(Value::is_string)
+        && reply.get("typeConfirmed").is_some_and(Value::is_boolean)
+        && reply.get("baseline").is_none_or(Value::is_object)
+}
+
+/// CAD-2286: the tenant's `document_submit` refusals
+/// (`DOCUMENT_SUBMIT_STATUS` in `apps/api/src/tenant-board/cli.ts`), each a
+/// typed error carrying its code. Without this, the generic decoder drops a
+/// 403 code as an access denial. A 501 is a server that predates the submit
+/// (the release order is named, as for the ticket-message verbs); no other
+/// 5xx is mapped: an unmapped store code answers 500 `internal`, after a
+/// possible write, so it stays unknown.
+fn document_submit_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_submit" {
+        return None;
+    }
+    if status == 501 {
+        return Some(Error::invalid(
+            "not_implemented",
+            artifact_tenant_too_old("artifact submit", status, "submitted"),
+        ));
+    }
+    let (code, why): (&'static str, &str) = match (status, refusal_fields(body).0?) {
+        (404, "not_found") => (
+            "not_found",
+            "no such file that you can see on this workspace",
+        ),
+        (403, "not_creator") => ("not_creator", "only the file's creator can submit it"),
+        (400, "unlabelled") => (
+            "unlabelled",
+            "give the file a document type label before submitting it",
+        ),
+        (409, "already_shared") => (
+            "already_shared",
+            "this version is already shared; save a new version to submit it for review",
+        ),
+        (409, "document_archived") => ("document_archived", "this document is archived"),
+        _ => return None,
+    };
+    Some(Error::invalid(
+        code,
+        format!("{why} ({code}, HTTP {status}). Nothing was submitted"),
+    ))
+}
 
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
 /// explicit `project` — plus `issue` for the two approvals — so the answer is
@@ -4579,6 +4767,62 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "capability_unavailable",
             "the board could not reach its profile store; nothing was read. Try again later",
         )),
+        // CAD-2396: workspace skills. A package refusal (`skill_refused`) is
+        // answered with its reason by `skill_refusal`, before this table.
+        (
+            "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete",
+            Some("not_permitted" | "unauthorized" | "owner_required"),
+        ) => Some((
+            "not_permitted",
+            "approving, revoking or deleting a workspace skill is a live human workspace \
+             owner's decision; this login is not one. Nothing was changed",
+        )),
+        (
+            "workspace_skill_show"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("not_found"),
+        ) => Some((
+            "not_found",
+            "this workspace has no such skill, or no such revision of it; nothing was read or \
+             changed",
+        )),
+        ("workspace_skill_approve" | "workspace_skill_revoke", Some("digest_mismatch")) => Some((
+            "digest_mismatch",
+            "the digest is not the one this decision needs — read `workspace-skill show` again \
+             and pass the digest it prints. Nothing was changed",
+        )),
+        ("workspace_skill_delete", Some("approved_skill")) => Some((
+            "approved_skill",
+            "that skill is approved, so agents may be reading it — revoke it first, then \
+             delete. Nothing was changed",
+        )),
+        ("workspace_skill_draft", Some("skill_limit")) => Some((
+            "skill_limit",
+            "this workspace holds the most skills it can; the owner deletes an unused one to \
+             make room, or draft a new revision of an existing skill. Nothing was written",
+        )),
+        ("workspace_skill_approve", Some("approved_limit")) => Some((
+            "approved_limit",
+            "this workspace already has the most approved skills an agent can list; revoke one \
+             first. Nothing was changed",
+        )),
+        (
+            "workspace_skill_list"
+            | "workspace_skill_show"
+            | "workspace_skill_check"
+            | "workspace_skill_draft"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value was not accepted, or this workspace's \
+             board predates workspace skills — if the values are right, update the board \
+             first. Nothing was written",
+        )),
         // CAD-1999: the hosted project registry's own typed refusals. A key
         // that already exists as a ticket-only project conflicts exactly like
         // a registered one; only the identical key+name+prefix is a reuse.
@@ -5271,6 +5515,83 @@ pub fn cli_material_until(
     })
 }
 
+/// CAD-2286: `artifact submit <id>` on a hosted org. It asks `document_types`
+/// first, so an unavailable lifecycle is named as such
+/// ([`document_lifecycle_unavailable`]) and a 404 from the submit itself can
+/// only mean the file. Both calls ride a managed session's agent credential.
+///
+/// The probe and the submit are two calls, so the lifecycle can be turned off
+/// between them. The submit then answers 404 `not_found` and is reported as no
+/// such file; nothing was submitted, and running the command again names the
+/// unavailable lifecycle. The window is one round trip, so it is accepted
+/// rather than closed.
+pub fn submit_document(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let session = agent_credential::bound_session();
+    submit_document_in(
+        target,
+        id,
+        deadline,
+        wake_timeout,
+        &dir,
+        session.as_deref(),
+        note,
+        std::thread::sleep,
+    )
+}
+
+/// [`submit_document`] with the credential dir, the managed session and the
+/// sleep injectable, so a test drives the real order.
+#[allow(clippy::too_many_arguments)]
+fn submit_document_in(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    dir: &Path,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+    sleep: impl Fn(Duration),
+) -> Result<Value> {
+    let call = |verb: &str, arguments: Map<String, Value>| {
+        call_verb_until_retry(
+            target,
+            verb,
+            arguments,
+            deadline,
+            wake_timeout,
+            dir,
+            true,
+            agent,
+            &note,
+            &sleep,
+        )
+    };
+    // The probe decides availability only; its body is not read. What proves
+    // the submit is the submit's own receipt (`document_submit_receipt`).
+    if let RemoteAnswer::Conflict(_) = call("document_types", Map::new())? {
+        return Err(reject(
+            "remote read answered a conflict; nothing was submitted",
+        ));
+    }
+    let mut arguments = Map::new();
+    arguments.insert("id".into(), json!(id));
+    match call("document_submit", arguments)? {
+        RemoteAnswer::Ok(body) => Ok(body),
+        RemoteAnswer::Conflict(_) => Err(reject(
+            "remote submit answered a conflict; nothing was submitted",
+        )),
+    }
+}
+
 /// Execute within the command-owned deadline. Continuations reuse it rather
 /// than starting a fresh wake budget for each range.
 pub fn call_verb(
@@ -5400,13 +5721,69 @@ fn profile_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<Strin
     named && profile.get("revision").is_some_and(Value::is_u64)
 }
 
+/// CAD-2396: the board names why it refused a package, and the reason is the
+/// fix, so it is shown. `refusal_fields` keeps only a safe lowercase code; no
+/// package text is ever echoed.
+fn skill_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    reason: Option<&str>,
+) -> Option<Error> {
+    if !matches!(verb, "workspace_skill_check" | "workspace_skill_draft")
+        || code != Some("skill_refused")
+    {
+        return None;
+    }
+    let reason = reason.unwrap_or("unnamed");
+    Some(Error::invalid(
+        "skill_refused",
+        format!(
+            "the board refused the package: {reason} (skill_refused, HTTP {status}). Fix the \
+             package and run `workspace-skill check` again. Nothing was written"
+        ),
+    ))
+}
+
+/// CAD-2396: a workspace-skill write's 2xx names the skill it wrote. A draft
+/// carries the revision it saved; an approve carries exactly the approved
+/// revision and digest that were asked for; a revoke carries no approval.
+fn skill_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    // A delete answers `{name, deleted: true}` for exactly the skill it removed.
+    if verb == "workspace_skill_delete" {
+        return arguments.get("name").and_then(Value::as_str).is_some()
+            && reply.get("name") == arguments.get("name")
+            && reply.get("deleted") == Some(&Value::Bool(true));
+    }
+    let Some(skill) = reply.get("skill") else {
+        return false;
+    };
+    let name = arguments.get("name").and_then(Value::as_str);
+    if name.is_none() || skill.get("name").and_then(Value::as_str) != name {
+        return false;
+    }
+    match verb {
+        "workspace_skill_draft" => reply.get("revision").is_some_and(Value::is_u64),
+        "workspace_skill_approve" => {
+            let approved = skill.get("approved");
+            approved.and_then(|a| a.get("revision")) == arguments.get("revision")
+                && approved.and_then(|a| a.get("digest")) == arguments.get("digest")
+                && arguments.contains_key("revision")
+        }
+        "workspace_skill_revoke" => skill.get("approved").is_some_and(Value::is_null),
+        _ => false,
+    }
+}
+
 /// CAD-2101: a tenant board that predates the profile verbs answers
 /// `501 not_implemented` before it reads anything. Say to update the board,
 /// never that coordination is unavailable. A newer tenant behind an older
 /// control answers a bare `400 invalid_request`, which a bad value gets too,
 /// so that case is left to the verb's own refusal text.
 fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
-    if !verb.starts_with("agent_profile_") || status != 501 {
+    if !(verb.starts_with("agent_profile_") || verb.starts_with("workspace_skill_"))
+        || status != 501
+    {
         return None;
     }
     let nothing = if mutating_cli_verb(verb) {
@@ -5854,6 +6231,19 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let keyed_create = matches!(surface, Surface::Cli)
+        && verb == "issue_new"
+        && arguments.contains_key("request_id");
+    let identity_changed = || {
+        reject(
+            "retryable issue creation requires the same acting identity; this attempt was not \
+             run. If an earlier result is unknown, inspect the board before trying from a \
+             different agent or login",
+        )
+    };
+    if keyed_create && agent.is_some() && on_agent.is_none() {
+        return Err(identity_changed());
+    }
     let require_agent = verb == "platform_call" && agent.is_some();
     if require_agent && on_agent.is_none() {
         return Err(agent_credential::platform_agent_required());
@@ -5863,12 +6253,22 @@ fn call_verb_until_retry(
         request_timeout(deadline, AUTH_TIMEOUT)?;
         let (agent_cred, from_cache) = match on_agent {
             Some(slot) => {
-                match agent_credential::bearer(slot, target, dir, deadline, !require_agent, &note)?
-                {
+                match agent_credential::bearer(
+                    slot,
+                    target,
+                    dir,
+                    deadline,
+                    &note,
+                    !(keyed_create || require_agent),
+                )? {
                     Some((credential, source)) => (
                         Some(credential),
                         matches!(source, agent_credential::Source::Cached),
                     ),
+                    None if keyed_create => return Err(identity_changed()),
+                    None if require_agent => {
+                        return Err(agent_credential::platform_agent_required())
+                    }
                     None => (None, false),
                 }
             }
@@ -5951,6 +6351,9 @@ fn call_verb_until_retry(
             _ => false,
         };
         if refused_agent {
+            if keyed_create {
+                return Err(identity_changed());
+            }
             if require_agent {
                 return Err(Error::invalid(
                     agent_credential::HUMAN_SESSION_REQUIRED,
@@ -6023,6 +6426,14 @@ fn call_verb_until_retry(
                 {
                     return Err(Error::unknown(format!(
                         "remote connected read returned no usable settled receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("connected_effect")
+                    if !body.as_ref().is_some_and(connected_effect_stage_answer) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected-effect stage returned no usable answer — {}",
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
@@ -6203,6 +6614,11 @@ fn call_verb_until_retry(
                 "agent_profile_create" | "agent_profile_update" => {
                     !profile_receipt_correlates(verb, reply, &arguments)
                 }
+                "workspace_skill_draft"
+                | "workspace_skill_approve"
+                | "workspace_skill_revoke"
+                | "workspace_skill_delete" => !skill_receipt_correlates(verb, reply, &arguments),
+                "document_submit" => !document_submit_receipt(reply),
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)
                 }
@@ -6226,6 +6642,7 @@ fn call_verb_until_retry(
             )));
         }
         let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
+        let refusal_reason = refusal_fields(body.as_ref()).1.map(str::to_owned);
         // A 5xx with no pre-forward proof may come from the platform *after*
         // the mutation was attempted: the write may have landed behind an
         // unanswerable reply, so it is an unknown outcome, never availability
@@ -6310,6 +6727,13 @@ fn call_verb_until_retry(
             let verb = verb.replacen('_', " ", 1);
             return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
         }
+        // CAD-2286: availability is decided by the type list alone, and a
+        // submit refusal keeps the store's code.
+        if let Some(error) = document_lifecycle_unavailable(verb, status, body.as_ref())
+            .or_else(|| document_submit_refusal(verb, status, body.as_ref()))
+        {
+            return Err(error);
+        }
         // CAD-2150: a board that predates `include_body` refuses the field as an
         // invalid request. That is not "the tenant cannot serve the verb": the
         // plain read still works, so the caller gets a typed code and re-reads
@@ -6357,6 +6781,39 @@ fn call_verb_until_retry(
                 "the connected read was refused: check the input and connection, or update \
                  the hosted tenant server if it predates connected-read support",
             ));
+        }
+        // AOS-627: the stage's refusals are named by the board (`not_allowlisted`,
+        // `connection_access_denied`, `capability_unavailable`, ...). The generic
+        // classification drops the code of a 403, 404 or 503, so print it here.
+        // A board that predates the operation refuses it as `invalid_request`.
+        // Only the stage's own pre-effect refusals are definite: 400/403/404/409,
+        // and the two 503 codes the board returns before staging. A 401 keeps its
+        // login remedy, a waking answer keeps its wake path, and any other 5xx
+        // stays an unknown outcome (the row may exist), reconciled by replaying
+        // the same stage.
+        if platform_operation == Some("connected_effect")
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+        {
+            let definite = match (status, refusal_code.as_deref()) {
+                (400 | 403 | 404 | 409, Some(code)) => Some(code),
+                (503, Some(code @ ("capability_unavailable" | "authority_unavailable"))) => {
+                    Some(code)
+                }
+                _ => None,
+            };
+            if let Some(code) = definite {
+                let hint = if code == "invalid_request" {
+                    " — check the input and connection, or update the hosted tenant server if \
+                     it predates connected-effect support"
+                } else {
+                    ""
+                };
+                return Err(reject(format!(
+                    "the stage was refused (HTTP {status}, {code}){hint}; nothing was staged \
+                     and nothing ran"
+                )));
+            }
         }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
@@ -6433,6 +6890,14 @@ fn call_verb_until_retry(
                 ));
             }
             Verdict::Done(Err(e)) => {
+                if let Some(error) = skill_refusal(
+                    verb,
+                    status,
+                    refusal_code.as_deref(),
+                    refusal_reason.as_deref(),
+                ) {
+                    return Err(error);
+                }
                 return Err(message_family_refusal(
                     verb,
                     status,

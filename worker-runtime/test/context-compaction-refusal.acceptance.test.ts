@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
-import { CompactionTask, Harness, hook, watchEvents } from "@earendil-works/pi-durable";
+import { CompactionTask, Harness, hook, type LiveState } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { GenerationIdentity } from "../src/contract.ts";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
@@ -60,6 +60,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
   const executor: SqliteExecutor = {
     async exec(sql) { database.exec(sql); },
     async run(sql, ...params) { database.prepare(sql).run(...(params as never[])); },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       return (database.prepare(sql).get(...(params as never[])) as T | null | undefined) ?? undefined;
     },
@@ -147,9 +150,11 @@ async function exercise(failCompactionRead: boolean) {
     name: "acceptance-compaction-gate",
     hooks: [hook(CompactionTask, {
       async beforeCompact() {
-        // Automatic compaction and the request are created in the same engine
-        // commit; do not depend on which task the scheduler runs first.
+        // Keep the background task live until the view watch observes its
+        // status: watch deliveries may fold intermediate revisions. Cleanup
+        // can release this gate even if the observation never arrives.
         await generationEntered.promise;
+        await Promise.race([started.promise, releaseGeneration.promise]);
         return undefined;
       },
     })],
@@ -183,21 +188,39 @@ async function exercise(failCompactionRead: boolean) {
     agent: { model: { provider: defaultModel("default").provider, modelId: "default" } },
   });
   wired.harness = {
+    pi: async () => harness,
     session: () => ({
       id: conversation.id,
-      events: () => watchEvents(harness, conversation.id, BACKGROUND_CONTEXT),
+      watch: () => conversation.watch(BACKGROUND_CONTEXT),
     }),
     conversation: async () => conversation,
   };
 
-  const stream = await watchEvents(harness, conversation.id, BACKGROUND_CONTEXT);
-  stream.start(async (events) => {
-    for (const event of events) {
-      if (event.type === "compaction_start") {
-        started.resolve({ taskId: Number(event.taskId), reason: event.reason, blocking: event.blocking });
-      } else if (event.type === "compaction_end") {
-        ended.resolve({ taskId: Number(event.taskId), error: event.error });
+  const stream = await conversation.watch(BACKGROUND_CONTEXT);
+  let observedCompaction: number | undefined;
+  stream.start(async (call) => {
+    if (call.kind === "failed") throw call.error;
+    const live = call.value.docs["pi.live"] as LiveState | undefined;
+    if (observedCompaction === undefined) {
+      const status = live?.compactions?.[0];
+      if (status !== undefined) {
+        observedCompaction = Number(status.taskId);
+        started.resolve({
+          taskId: observedCompaction,
+          reason: status.trigger,
+          blocking: status.blocking,
+        });
       }
+    }
+    if (
+      observedCompaction !== undefined &&
+      !live?.compactions?.some((status) => Number(status.taskId) === observedCompaction)
+    ) {
+      const failure = live?.compactionFailure;
+      ended.resolve({
+        taskId: observedCompaction,
+        error: Number(failure?.taskId) === observedCompaction ? failure?.error : undefined,
+      });
     }
   });
   cleanups.push(async () => { await stream.stop(); });

@@ -74,6 +74,58 @@ pub(crate) fn briefing_read(alias: &str) -> Value {
     })
 }
 
+/// The `agent_show` request a launch or `join` polls the new agent with
+/// until its endpoint opens (CAD-2323).
+pub fn launch_poll_read(alias: &str) -> Value {
+    json!({"alias": alias, "include_launch_state": true})
+}
+
+/// Whether a launched agent's endpoint reports open, which gates its
+/// briefing: an attachable kind once it has an endpoint, any other kind
+/// once its actor is back.
+pub fn endpoint_opened(agent: &Value, attachable: bool) -> bool {
+    agent["endpoint"].is_string()
+        || (!attachable
+            && matches!(
+                agent["state"].as_str().unwrap_or_default(),
+                "idle" | "running" | "waiting_input"
+            ))
+}
+
+/// The `agent_list` request the briefing's group roster is read with
+/// (CAD-2323).
+pub(crate) fn roster_read() -> Value {
+    json!({"include_group": true})
+}
+
+/// The briefing's "Group at write time" lines: the root and every agent
+/// whose upstream is the root, from an `agent_list` answer.
+pub(crate) fn group_roster(list: &Value, root: &str) -> String {
+    list["agents"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| {
+            a["alias"].as_str() == Some(root) || a["params"]["upstream"].as_str() == Some(root)
+        })
+        .map(|a| {
+            format!(
+                "- `{}` — {} ({}, {})",
+                a["alias"].as_str().unwrap_or_default(),
+                if a["alias"].as_str() == Some(root) {
+                    "group root"
+                } else {
+                    "worker"
+                },
+                a["provider"].as_str().unwrap_or_default(),
+                a["state"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
 /// state dir — `<state>/briefings/<root>/`, where `<root>` is the
 /// upstream PM's alias when wired, else the agent's own. Split-mode
@@ -431,29 +483,9 @@ pub fn briefing_body(
         .as_str()
         .map(|m| format!(" Permission mode: `{m}` (replayed on every launch)."))
         .unwrap_or_default();
-    let roster = client::rpc(state_dir, "agent_list", json!({}))
-        .ok()
-        .and_then(|l| l["agents"].as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter(|a| {
-            a["alias"].as_str() == Some(root) || a["params"]["upstream"].as_str() == Some(root)
-        })
-        .map(|a| {
-            format!(
-                "- `{}` — {} ({}, {})",
-                a["alias"].as_str().unwrap_or_default(),
-                if a["alias"].as_str() == Some(root) {
-                    "group root"
-                } else {
-                    "worker"
-                },
-                a["provider"].as_str().unwrap_or_default(),
-                a["state"].as_str().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let roster = client::rpc(state_dir, "agent_list", roster_read())
+        .map(|list| group_roster(&list, root))
+        .unwrap_or_default();
     // Turn-result reporters auto-complete the message — the token flow
     // is for peers on explicitly-reported endpoints.
     let reporting = if registry::report_hint(

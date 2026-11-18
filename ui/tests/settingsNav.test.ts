@@ -25,8 +25,8 @@ for (const absent of ["Agents", "Memory", "Master permissions", "Advanced custod
   if (flat(OWNER).includes(absent)) throw new Error(`${absent} must be hidden on a hosted board`);
 equal(
   flat(null),
-  ["Preferences", "Agents", "Connections", "Email sending", "Memory", "Status", "Master permissions", "Advanced custody"],
-  "no list keeps every section a native board has",
+  ["Preferences", "Agents", "Connections", "Email sending", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
+  "no list keeps every section a native board has, General (company time zone) included",
 );
 equal(
   flat({ ...OWNER, platform_account_configured: true }).includes("Account"),
@@ -42,3 +42,18 @@ equal(settingsRedirect("permissions", {}), null, "a board that states nothing ke
 equal(settingsRedirect("members", {}), "models", "a native board does not expose hosted members");
 equal(settingsRedirect("members", { settings_sections: ["preferences"] }), "preferences", "a board without the capability refuses the direct link");
 equal(settingsLabel("update"), "Status", "the crumb names the section");
+
+// CAD-2286: Settings → Documents is hosted only, offered when the board names it.
+const DOCUMENTS = { settings_sections: ["preferences", "general", "members", "documents", "connections", "email", "status"] };
+equal(
+  flat(DOCUMENTS),
+  ["Preferences", "Members", "Documents", "Connections", "Email sending", "General", "Status"],
+  "a board that serves the lifecycle offers Documents after Members",
+);
+equal(flat(OWNER).includes("Documents"), false, "a board that does not name documents hides it");
+equal(flat(null).includes("Documents"), false, "a native board has no Documents section");
+equal(settingsRedirect("documents", DOCUMENTS), null, "a listed documents section stays");
+equal(settingsRedirect("documents", OWNER), "members", "an unlisted documents section moves away");
+equal(settingsRedirect("documents", {}), "models", "a native board does not expose hosted documents");
+equal(settingsRedirect("documents", { settings_sections: ["preferences"] }), "preferences", "a board without the capability refuses the direct link");
+equal(settingsLabel("documents"), "Documents", "the crumb names the section");

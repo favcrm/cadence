@@ -2,7 +2,7 @@ import type { SettingsSection } from "../../lib/router";
 
 export type SettingsIcon =
   | "preferences" | "connections" | "email" | "general"
-  | "status" | "agents" | "memory" | "permissions" | "custody" | "account" | "members";
+  | "status" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
 export type SettingsNavGroupSpec = { label: string; items: SettingsNavEntry[] };
@@ -21,6 +21,9 @@ const ENTRIES = {
   /** CAD-2115: hosted only — a native board has no tenant member list, so this
    *  entry is offered only by a board that names `members` in its sections. */
   members: { section: "members", label: "Members", icon: "members" },
+  /** CAD-2286: hosted only — offered by a board that names `documents`, which
+   *  the hosted board does while the document lifecycle is on. */
+  documents: { section: "documents", label: "Documents", icon: "documents" },
 } satisfies Record<string, SettingsNavEntry>;
 
 /** The fields of `/api/meta` that decide what Settings offers. */
@@ -33,7 +36,8 @@ export type SettingsMeta = {
  * Which sections to offer. A board that sends `settings_sections` has said what
  * it serves, so only those appear. One that doesn't (a native board, or a hosted
  * board that predates the field) keeps the full list — which has no `members`:
- * a native board has no tenant member list to show.
+ * a native board has no tenant member list to show. CAD-2397: it does have
+ * General, which holds the company time zone.
  */
 export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   const account = meta?.platform_account_configured ? [ENTRIES.account] : [];
@@ -41,7 +45,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   if (!listed) {
     return [
       { label: "You", items: [ENTRIES.preferences] },
-      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ENTRIES.memory] },
+      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ENTRIES.general, ENTRIES.memory] },
       { label: "System", items: [ENTRIES.status, ...account, ENTRIES.permissions, ENTRIES.custody] },
     ];
   }
@@ -50,16 +54,18 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   return [
     { label: "You", items: pick("preferences") },
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
-    { label: "Workspace", items: pick("members", "connections", "email", "general") },
+    // CAD-2286: Documents follows Members; Members stays first, where
+    // `settingsRedirect` lands a request for a page this board does not serve.
+    { label: "Workspace", items: pick("members", "documents", "connections", "email", "general") },
     { label: "System", items: [...pick("status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }
 
 /**
  * Sections only a hosted board can serve. A native board has no tenant member
- * list, so it neither offers nor mounts one.
+ * list and no document lifecycle, so it neither offers nor mounts either.
  */
-const HOSTED_ONLY: readonly SettingsSection[] = ["members"];
+const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents"];
 
 /**
  * Where a request for `section` should land instead, or null when it is fine.

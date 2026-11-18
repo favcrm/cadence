@@ -42,6 +42,8 @@ import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
+import { homeDecisions } from "../decisions/useDecisions";
+import { StagedSourceContext } from "../../ui/StagedChip";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
@@ -60,6 +62,7 @@ import MemberChat from "./MemberChat";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
+import { formatElapsed } from "./turnText";
 import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
@@ -100,13 +103,6 @@ const EXAMPLES = [
   "Summarise what changed on the tracker since yesterday.",
 ];
 
-/** `42s` → `2m 5s` → `1h 3m` — the working row's elapsed read-out. */
-function fmtElapsed(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  const m = Math.floor(secs / 60);
-  if (m < 60) return `${m}m ${secs % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
-}
 
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
@@ -150,7 +146,7 @@ function AssistantActivity({ since }: { since: number | null }) {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-  const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
+  const elapsed = since !== null && Number.isFinite(since) ? formatElapsed(Math.max(0, Math.floor(now / 1000 - since)), t) : null;
   return (
     <span className="flex gap-1.5 items-center" data-assistant-activity>
       <span className="workdot live" aria-hidden />
@@ -1532,6 +1528,8 @@ function MasterHome({
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
+    <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1624,6 +1622,7 @@ function MasterHome({
             ref={scrollRef}
             onScroll={onPanelScroll}
             data-chat-scroll
+            data-jump-pill={showJumpPill(unseen, activity) ? "" : undefined}
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
             {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
@@ -1778,6 +1777,7 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </StagedSourceContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

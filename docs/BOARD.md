@@ -864,7 +864,11 @@ Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
 
-### PROJECT.md `delivery:` — the per-project delivery policy (CAD-826)
+### PROJECT.md `delivery:` — the per-project delivery policy
+
+The lifecycle, the trusted path lists, the evidence each review takes and the
+human approval are in [Delivery](guides/delivery.md). This section is the
+`delivery:` schema.
 
 A project may declare the delivery policy the loop will run under in
 `<pm>/<key>/PROJECT.md` frontmatter. Like the work gates it lives in
@@ -872,7 +876,8 @@ PROJECT.md and not `project.yaml` (strict `deny_unknown_fields` — an
 older binary would refuse the whole file), and it takes effect only
 once the operator approves it: `cadence issue project approve-work
 <key>` records the resolved policy and its `sha256:` digest beside the
-stage-gate digest. A malformed `delivery:` refuses the whole approval;
+stage-gate digest. On a hosted org the owner's save with
+`issue project delivery` is the approval. A malformed `delivery:` refuses the whole approval;
 the daemon computes both fields from the file it read — a
 `delivery`/`delivery_digest` param is ignored. With no section the
 recorded policy is `null` and the digest is the default policy's. The
@@ -881,7 +886,7 @@ left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
 `integration_branch` optionally permits one additional PR target beside the
-repository default branch (CAD-1561). It must be a canonical branch name, not
+repository default branch. It must be a canonical branch name, not
 a `refs/` path or revision expression, and match the current, exactly approved
 policy. An unapproved, removed or malformed section cannot enable it through
 the last-approved fallback. Re-approve through the operator connection after
@@ -918,9 +923,8 @@ delivery:
   oversized: {lines_over: 3000, files_over: 40}   # optional
 ```
 
-`merge`, `max_revise`, `heavy` and `oversized` fall back to today's
-loop constants: `squash` through the merge queue, `max_revise`
-`MAX_REVISE`, `HEAVY_*`/`OVERSIZED_*` — and the default policy is one
+`merge`, `max_revise`, `heavy` and `oversized` fall back to built-in
+defaults (`squash` through the merge queue), and the default policy is one
 `review` agent review (`focus: general`) required unconditionally.
 Unknown keys are refused at every level. Validation: review names are
 tags; an `agent` needs a `focus` from the allowlist above and takes no
@@ -935,8 +939,8 @@ file-level glob grammar the `areas:` reader and an issue's `paths=`
 field use (`*` and `?` match inside one path segment, a `**` segment
 any number of segments, a trailing `/` everything under it — no
 leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
-control characters; validated by `areas::check_path` and, in slice 3,
-matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
+control characters; validated by the same path check and
+matched by the same matcher, so the two grammars can't diverge). `heavy` sits strictly
 under `oversized`. The policy schema requires at least one unconditional
 `agent` or `operator` review rule; a `check` cannot satisfy that schema
 floor. The shared requirements evaluator can nevertheless classify an
@@ -957,6 +961,11 @@ and `delivery_error: …` when it is malformed with none; `issue lint`
 warns the same. The shared requirements evaluator consumes the effective
 policy and trusted change evidence; the final enqueue gate can impose further
 requirements. Inspect the actual result for the target and exact head.
+
+The merge gate counts the `standards` and `spec-security` review axes itself.
+Counting reviews by a rule's `agent`, `check` or `operator` kind is not applied
+yet: the section is validated and approved, and the gate does not count against
+its `reviews` names. Read the gate with `delivery check`.
 
 ## Multi-host trackers — `issue sync`
 
@@ -2621,6 +2630,50 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
+Documents (`/documents`, CAD-2286) is hosted only: the review side of the
+document lifecycle that `artifact submit` starts
+(`docs/guides/hosted-workspace.md`). One shared probe,
+`GET /api/document-types`, decides whether it exists. The nav item shows on a hosted
+board only once the probe answers the `cad2286.document-lifecycle.v1`
+capability. A `404`, a `501 not_implemented` or another capability hides it,
+and that answer holds until the private session changes. A failed probe is an
+error with Retry, and a failed re-read keeps the last good answer. The screen
+has Active and Archived tabs (`?archived=1`); Active has stage chips (All, In
+review, Approved, Delivered, Draft; `?stage=`) that filter the server's list in
+the browser. The server lists recent files only, so an empty Active tab says
+older documents may not appear. A title opens the file in the canvas: its
+approver gets the version under review, everyone else the newest version they
+can see. Every control only hides, and the hosted workspace decides each
+action. Approve shows on an in-review row to the approver in force: a confirmed
+type's named member, otherwise the workspace owner. It sends the version it
+showed, so an approval never covers a version the approver did not open. A
+member approving their own version is refused by the server (`self_approval`),
+because the wire carries no author. An owner who is the approver may approve
+their own, and this session's row then says "Approved by you (self)". Archive
+and Restore are the owner's; Restore returns the stage the document had before
+it was archived. A platform operator session changes nothing. Each write asks
+for confirmation and reports a refusal in that code's own words. A list that
+answers `404` after the probe said available means review was turned off: the
+screen says so and asks the probe again once.
+
+Settings → Documents (`/settings/documents`) is mounted when the hosted board
+names `documents` in `settings_sections`, which it does while the lifecycle is
+on. It lists each type's approval rule, approver, archive delay and recipient
+note, and the baseline that a type follows until it is confirmed. The rows are
+the probe's answer, not a second read. Approver names come from
+`/api/team/members`; an unreadable roster shows ids and never says an approver
+has left. Only the workspace owner (operator proof, not read-only, not a
+platform operator session) adds, edits and confirms a type. Everyone else sees
+the page without controls. A member's answer for a type, for example through
+the assistant, is pending: the owner sees "Needs your confirmation" and
+Confirm, which sends the row's `rev`. The owner's own save is confirmed at
+once. The form checks what the server checks: a name of 1–40 characters, a
+note of at most 200, no control characters and 1–3650 days. It also refuses a
+name of "." or "..", and a new name that an existing type already has in any
+case, so adding never replaces a type. A confirmed approver who is no longer a
+member is flagged to the owner, because nobody can approve that type until it
+is edited.
+
 `ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests. Design tokens
 per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
 Sans/Mono, teal `#2dd4bf` on interactive elements only.
@@ -2740,6 +2793,30 @@ same app key. An existing conflicting pin refuses before redirect or app
 mount; it is never overwritten. The redirect replaces history and preserves
 the original query and fragment, adding only a missing installation pin.
 
+Installed apps use the board header for `Apps / App name / Section`; the
+version is secondary metadata, and a default section adds no duplicate leaf.
+Sections come only from the active app's declared `section_query`, using the
+verified installation declaration before screen readiness and in native outlets.
+Section labels use the same app-provided locale resolver as sidebar navigation.
+Parent navigation retains installation/context pins and unrelated query
+parameters while clearing record and segment selection. The aligned
+**Assistant** button controls the right-hand chat pane without remounting the
+conversation or app frame. A collapsed chat leaves no rail; on narrow screens
+the workspace and assistant share one pane. App-content navigation temporarily
+selects the narrow workspace; a conversation link reveals the assistant. Neither
+changes the saved Assistant preference. Context-only URL writes do not select a pane.
+Workflow launchers and developer
+tools live in the header's **More actions** menu. Narrow layouts keep account,
+board status, update, language and theme controls in the existing mobile navigation.
+App actions remain unavailable until the current installation receipt is verified.
+Pending approvals stay installation-scoped across cached app switches and
+override the untouched collapsed default; an explicit choice
+still wins. Canvas edit requests reveal the current composer; editable inputs
+receive focus without sending or replacing the draft.
+App-to-chat requests also clear a temporary narrow workspace selection.
+Non-modal app canvases start below the board header and end before the assistant.
+Expansion is disabled when it cannot add width.
+
 Every setup or Browser QA handover states these separately:
 
 - The actually served backend build and board address, with the existing
@@ -2760,10 +2837,11 @@ This procedure grants no permission to refresh staging or production.
 
 ### QA board for hosted surfaces (CAD-2291)
 
-Member chat, the Browser panel and member app screens exist only on a hosted
-board, and an agent session cannot sign in to one. The QA board serves a
-checkout's UI with those routes answered from fixtures as a synthetic hosted
-member, so a Browser QA run needs no hand-written stub:
+Member chat, the Browser panel, member app screens, Documents and Settings →
+Documents exist only on a hosted board, and an agent session cannot sign in to
+one. The QA board serves a checkout's UI with those routes answered from
+fixtures as a synthetic hosted member (or owner), so a Browser QA run needs no
+hand-written stub:
 
 ```bash
 node ui/scripts/qa-board.mjs up --checkout <path> [--name <n>] [--cadence <bin>]
@@ -2783,9 +2861,13 @@ on free ports in 3110-3199:
   `/api/browser` with `/view` and `/stop`, and one member app screen: the
   repo's starter app (`app-toolchain/template/app`) through the binary's own
   frame (`cadence app frame-kit`), with an installation, context and run shaped
-  like `ui/scripts/app-fixtures/producer.ts`. Every other route goes to the
-  sandbox; a sandbox 401 is answered as a 404, so it cannot sign the member
-  out, and is counted;
+  like `ui/scripts/app-fixtures/producer.ts`. It also answers the document
+  routes (`/api/document-types[/<label>[/confirm]]`, `/api/documents` and
+  `/api/documents/<id>/approve|archive|restore`) as the hosted board answers
+  the preset viewer, with writes kept in its own copy of the rows, and
+  `/api/team/members` under the `hosted` settings or the `owner` viewer.
+  Every other route goes to the sandbox; a sandbox 401 is answered as a 404, so
+  it cannot sign the member out, and is counted;
 - a stand-in HTTPS live view with a self-signed certificate made at start
   (browse with `--ignore-https-errors`). Its Done button ends a takeover.
 
@@ -2794,8 +2876,10 @@ compiles `ui/scripts/qa-board/validate.ts` against the checkout's `ui/src`
 with the ui tests' compiler options and runs every payload through the UI's
 own client code (`parseBrowserRead`, `readBrowser`, `viewBrowser`,
 `stopBrowser`, `readPersonalIdentity`, `mutatePersonalProfile`, the member
-thread store, `sendToAssistant`, `screenTag`, `screenProjection`, `shapeFor`
-and `parseMount`). A refused payload is named and `up` stops: the board is
+thread store, `sendToAssistant`, `screenTag`, `screenProjection`, `shapeFor`,
+`parseMount`, `readTeamMembers`, `settingsRedirect`, `sessionAdmissible`, and
+the documents client and access rules, which it drives through every write for
+each viewer preset). A refused payload is named and `up` stops: the board is
 proved by running it, so there is no separate unit test. `/api/meta` and
 `/api/locale` have no exported parser: meta is checked by `writeBlock` and
 `kickoffBlock`, and both by the live render.
@@ -2816,9 +2900,55 @@ The control endpoint is on the fixture proxy's port:
   "en" | "zh-TW" | null}`, every field optional: a preset, then overrides. A
   browser state `parseBrowserRead` refuses is answered 400. The UI polls the
   session while it is live; a locale change shows after a reload.
-- `GET /__qa/state` returns the current state. `GET /__qa/counts` returns the
-  requests per fixture route, the live-view requests and the sandbox routes
-  whose 401 was masked.
+- The same body takes the document presets, also optional:
+  - `documents`: `available` (the default) or `not-served`, where every
+    document route answers `404 not_found`. The fixture meta is hosted, so the
+    Documents nav shows from the start. Any `documents` value rebuilds the rows
+    and types from the fixtures and clears `document_refusals`.
+  - `document_refusals`: a list of `approve`, `archive`, `restore`, `set-type`
+    and `confirm-type`; each listed route answers its refusal from
+    `fixtures/document-refusals.json` ahead of its normal answer.
+  - `settings`: `native` (the default) sends no `settings_sections`, so every
+    native Settings page stays. `hosted` sends the list the hosted board sends
+    the viewer (`HOSTED_SECTIONS` in `validate.ts`), with `documents` while the
+    documents preset is `available`.
+  - `viewer`: `member` (the default) or `owner`. `owner` serves meta as the
+    hosted board serves the roster's owner (`operator: true`, session role
+    `operator`), so Archive and Restore show, and with `settings: hosted` the
+    type form too. The member view answers the owner's writes with
+    `403 owner_only`, and its `set-type` on a new or pending type answers
+    pending; a confirmed type is `owner_only`. The member sees every fixture
+    row, where a real member sees only what `artifact find` would show them
+    plus what they review.
+  - Changing `viewer` resets no rows. Start clean as the member with
+    `{"documents":"available","document_refusals":[],"settings":"native","viewer":"member"}`,
+    or as the owner with
+    `{"viewer":"owner","settings":"hosted","documents":"available"}`.
+- CAD-2419, the workspace skill library on the Skills tab of the hosted
+  profile `qa-writer` (`/agents/qa-writer?tab=skills`). The proxy adds that
+  profile to the sandbox's `GET /api/agents` roster. It answers
+  `/api/agent-profiles/ap_qa_writer` (GET, and POST at the stored revision)
+  and `/api/workspace-skills[/<name>[/approve|revoke|delete]]` from
+  `fixtures/workspace-skills.json` and `fixtures/skills-profile.json`.
+  Writes go to its own copy. The member is answered `403 owner_required`.
+  The QA board refuses an approval past `approved_max` (3) with
+  `approved_limit`. The same body takes:
+  - `skills`: `available` (the default), `not-served` (every library route
+    answers 404, so the section is hidden) or `failing` (the list answers
+    503). Any `skills` value restores the library and the profile from the
+    fixtures.
+  - `profile_changed: true`: another writer saved the profile. Its revision
+    moves on, so the page's next Assigned toggle is stale.
+- `GET /__qa/state` returns the current state, including `viewer`, `settings`,
+  `documents` (`probe`, `refusals`, and in `changed` the documents
+  approved, archived or restored and the types written since the last
+  `documents` preset) and `skills` (`probe`, and the profile's `revision` and
+  `skills`). `GET /__qa/counts` returns the requests per fixture
+  route, the live-view requests and the sandbox routes whose 401 was masked.
+  Document writes count under templated keys
+  (`POST /api/documents/:id/approve`, likewise `archive` and `restore`;
+  `POST /api/document-types/:label` and `POST /api/document-types/:label/confirm`),
+  and the Archived tab's list counts apart as `GET /api/documents?archived=1`.
 
 Every result from the QA board is **fixture evidence**, not a real hosted
 board run, and the report says so. A check on a real hosted board stays an

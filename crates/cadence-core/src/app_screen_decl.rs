@@ -200,6 +200,13 @@ pub enum ScreenOperation {
     RecordsBatch,
     #[serde(rename = "records.aggregate")]
     RecordsAggregate,
+    // Hosted platform catalogue access; native execution remains unavailable.
+    #[serde(rename = "catalog.call")]
+    CatalogCall,
+    #[serde(rename = "catalog.status")]
+    CatalogStatus,
+    #[serde(rename = "catalog.confirm")]
+    CatalogConfirm,
     #[serde(rename = "records.csv.import")]
     RecordsCsvImport,
     #[serde(rename = "records.csv.confirm")]
@@ -386,6 +393,15 @@ pub enum ScreenOperation {
     CampaignWorkShow,
     #[serde(rename = "campaign-work.save")]
     CampaignWorkSave,
+    // CAD-2379: one read over the workspace's dated items (posts, routine
+    // slots, due dates). A CALL, never a SLOT; the host builds the reply
+    // and it carries titles, instants and states only.
+    #[serde(rename = "calendar.query")]
+    CalendarQuery,
+    // CAD-2402: the workspace's routines as names, schedules and status. An
+    // operator-session CALL; deliberately not a read-only-mount operation.
+    #[serde(rename = "routines.list")]
+    RoutinesList,
 }
 
 impl ScreenOperation {
@@ -401,6 +417,7 @@ impl ScreenOperation {
             self,
             Self::RecordsCsvImport
                 | Self::RecordsCsvConfirm
+                | Self::CatalogConfirm
                 | Self::ContentApprove
                 | Self::SendsApprove
                 | Self::SendsResolve
@@ -461,6 +478,7 @@ impl ScreenOperation {
         matches!(
             self,
             Self::RecordsList
+                | Self::CatalogStatus
                 | Self::RecordsShow
                 | Self::SegmentsList
                 | Self::SegmentsShow
@@ -504,6 +522,8 @@ impl ScreenOperation {
                 // CAD-1827: recorded campaign work facts are a read; the
                 // work write stays operator-only.
                 | Self::CampaignWorkShow
+                // CAD-2379: dated summary read; titles, times and states.
+                | Self::CalendarQuery
         )
     }
     pub fn args_limit(self) -> usize {
@@ -1940,6 +1960,41 @@ mod tests {
         let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["records.truncate"]);
         assert!(validate_map(&unknown, &bodies).is_err());
         assert!(validate_facts(&unknown, &facts(BODY)).is_err());
+    }
+
+    /// CAD-2379: `calendar.query` is a read CALL. A declaration listing it
+    /// passes with `records.call` alone, a read-only screen may call it, and
+    /// it is not a SLOT; an unknown neighbour still refuses.
+    #[test]
+    fn calendar_query_is_a_read_call_and_an_unknown_verb_still_refuses() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &["calendar.query"]);
+        let checked = validate_map(&call, &bodies).expect("calendar.query validates");
+        assert_eq!(checked.operations(), &[ScreenOperation::CalendarQuery]);
+        assert!(ScreenOperation::CalendarQuery.is_screen_read());
+        assert!(!ScreenOperation::CalendarQuery.is_slot());
+        assert_eq!(ScreenOperation::CalendarQuery.args_limit(), 16_384);
+
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["calendar.query"]);
+        assert!(validate_map(&slot_only, &bodies).is_err());
+
+        let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["calendar.update"]);
+        assert!(validate_map(&unknown, &bodies).is_err());
+    }
+
+    /// CAD-2402: `routines.list` is a CALL that parses with `records.call`
+    /// alone. It is not a SLOT and not a read-only-mount operation, so only an
+    /// operator session can call it.
+    #[test]
+    fn routines_list_is_an_operator_call_that_parses() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &["routines.list"]);
+        let checked = validate_map(&call, &bodies).expect("routines.list validates");
+        assert_eq!(checked.operations(), &[ScreenOperation::RoutinesList]);
+        assert!(!ScreenOperation::RoutinesList.is_slot());
+        assert!(!ScreenOperation::RoutinesList.is_screen_read());
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["routines.list"]);
+        assert!(validate_map(&slot_only, &bodies).is_err());
     }
 
     /// The seam this operation exists for: a host-only operation passes the

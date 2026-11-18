@@ -2407,6 +2407,25 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     assert!(!text.contains("retry later"), "{text}");
 }
 
+#[test]
+fn issue_new_keyed_receipt_correlates_after_the_issue_is_edited() {
+    let args = json!({"project": "original", "title": "Original", "request_id": "retry-1"});
+    let args = args.as_object().unwrap();
+    let current = json!({
+        "request_id": "retry-1",
+        "issue": {"id": "SYN-1"},
+        "card": {"id": "SYN-1", "project": "new-project", "title": "Edited"}
+    });
+    assert!(issue_receipt_correlates("issue_new", &current, args));
+    for receipt in [
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}}),
+        json!({"request_id": "other", "issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}}),
+        json!({"request_id": "retry-1", "issue": {"id": "SYN-1"}, "card": {"id": "SYN-2"}}),
+    ] {
+        assert!(!issue_receipt_correlates("issue_new", &receipt, args));
+    }
+}
+
 /// AOS-528: a link write answers the card it changed. A 200 naming another
 /// ticket, or naming none, cannot prove this link landed, so it is an unknown
 /// outcome rather than a success the caller would trust.
@@ -3638,6 +3657,36 @@ fn cad2277_board_without_issue_ls_limit_gets_typed_refusal_only_when_limit_sent(
     let plain_err = plain_result.unwrap_err();
     assert_eq!(plain_err.code(), None);
     assert_eq!(plain_err.kind(), "rejected");
+}
+
+#[test]
+fn issue_new_retry_id_is_not_downgraded_on_old_or_uncertain_board() {
+    let args = json!({
+        "project": "demo",
+        "title": "Synthetic issue",
+        "request_id": " stable-create-id "
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    for (status, code, kind) in [
+        (400, "invalid_request", "rejected"),
+        (503, "capability_unavailable", "unknown"),
+    ] {
+        let (out, requests) = run(
+            vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+            "issue_new",
+            args.clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), kind);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        let call = requests
+            .iter()
+            .find(|request| request["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!(args));
+    }
 }
 
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
@@ -5834,6 +5883,278 @@ fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
     let old = artifact_tenant_too_old("artifact_find", 501, "read");
     assert!(old.contains("update the tenant server first"));
     assert!(!old.contains("unavailable"));
+}
+
+// CAD-2286: `artifact types` and `artifact submit`. The statuses and codes are
+// the tenant's (`apps/api/src/tenant-board/cli.ts`, `readDocumentTypes`,
+// `writeDocumentSubmit`, `DOCUMENT_SUBMIT_STATUS`).
+mod cad2286_document {
+    use super::*;
+
+    fn refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn submit_args() -> Map<String, Value> {
+        json!({"id": "art-x"}).as_object().unwrap().clone()
+    }
+
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`, through
+    /// `documentBaselineView`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentSubmitView`: an unconfirmed type carries the baseline.
+    fn submit_receipt() -> Value {
+        json!({"stage": "in_review", "type": "quotation", "typeConfirmed": false,
+            "baseline": baseline()})
+    }
+
+    #[test]
+    fn document_verbs_are_registered_with_one_scope_each() {
+        use super::super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb};
+        assert!(REMOTE_VERBS.contains(&"document_types"));
+        assert!(REMOTE_VERBS.contains(&"document_submit"));
+        assert_eq!(cli_requested_scopes("document_types"), &["cli.read"]);
+        assert_eq!(cli_requested_scopes("document_submit"), &["cli.write"]);
+        assert!(!mutating_cli_verb("document_types"));
+        assert!(mutating_cli_verb("document_submit"));
+        // No correlated receipt: a repeated submit answers the current stage,
+        // so a lost answer sends the caller back to the same command.
+        let note = lost_mutation_note("document_submit");
+        assert!(note.contains("repeat `artifact submit <id>`"), "{note}");
+        assert!(note.contains("current stage"), "{note}");
+        assert!(note.contains("does not submit it twice"), "{note}");
+    }
+
+    #[test]
+    fn document_verbs_ride_the_agent_credential() {
+        // Operator decision 2026-11-15: the credential carries the member's
+        // subject, so neither verb is an exception to the default.
+        use super::super::agent_credential::stays_on_login;
+        assert!(!stays_on_login(Surface::Cli, "document_submit"));
+        assert!(!stays_on_login(Surface::Cli, "document_types"));
+    }
+
+    #[test]
+    fn document_types_answers_the_body_and_sends_no_arguments() {
+        // `documentTypesView`, with `DOCUMENT_CAPABILITY`.
+        let types = json!({
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
+            "types": [],
+        });
+        let (out, requests) = run(
+            vec![(200, "", types.clone())],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_eq!(out.unwrap(), types);
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["body"]["verb"], json!("document_types"));
+        assert!(calls[0]["body"].get("arguments").is_none());
+    }
+
+    #[test]
+    fn document_types_unavailable_answers_are_typed_and_never_an_outage() {
+        const OLDER: &str = "the workspace's server is older than this command";
+        const OFF: &str = "document review is turned off on this workspace";
+        for (status, code, cause) in [
+            // A tenant without the verb.
+            (501u16, "not_implemented", OLDER),
+            // The lifecycle flag is off.
+            (404, "not_found", OFF),
+            // A relay older than the verb: `document_types` takes no
+            // arguments, so the refusal can only be the name.
+            (400, "invalid_request", OLDER),
+            (400, "unknown_verb", OLDER),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_types",
+                Map::new(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(
+                err.code(),
+                Some("document_lifecycle_unavailable"),
+                "{status} {code}: {err}"
+            );
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            let shown = err.to_string();
+            assert!(
+                shown.contains("document lifecycle is not available on this workspace"),
+                "{shown}"
+            );
+            assert!(shown.contains(cause), "{status} {code}: {shown}");
+            assert!(!shown.contains("retry"), "{status} {code}: {shown}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+        // An access refusal is not an unavailable lifecycle.
+        let (out, _) = run(
+            vec![(403, "", refusal("forbidden"))],
+            "document_types",
+            Map::new(),
+            10,
+        );
+        assert_ne!(
+            out.unwrap_err().code(),
+            Some("document_lifecycle_unavailable")
+        );
+    }
+
+    #[test]
+    fn document_submit_refusals_carry_the_store_code() {
+        for (status, code) in [
+            (403u16, "not_creator"),
+            (400, "unlabelled"),
+            (409, "already_shared"),
+            (409, "document_archived"),
+            // After a successful probe, a 404 is the file, not the lifecycle.
+            (404, "not_found"),
+        ] {
+            let (out, requests) = run(
+                vec![(status, "", refusal(code))],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some(code), "{status} {code}: {err}");
+            assert_eq!(err.kind(), "rejected", "{status} {code}: {err}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
+    fn a_tenant_without_document_submit_is_named_and_is_not_an_outage() {
+        // After a successful probe a 501 can only be a server that serves the
+        // type list but not the submit: name the release order, as the
+        // ticket-message verbs do.
+        let (out, requests) = run(
+            vec![(501, "", refusal("not_implemented"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some("not_implemented"), "{err}");
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("`artifact submit`"), "{shown}");
+        assert!(shown.contains("update the tenant server first"), "{shown}");
+        assert!(shown.contains("Nothing was submitted"), "{shown}");
+        for outage in ["unavailable", "retry"] {
+            assert!(!shown.contains(outage), "reads as an outage: {shown}");
+        }
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+    }
+
+    #[test]
+    fn a_document_submit_success_without_a_submit_receipt_is_unknown() {
+        // A 2xx proves the submit only as `documentSubmitView`: a known stage, a
+        // type string, a boolean `typeConfirmed` and an object baseline if
+        // any. Anything else may follow a recorded submit, so it is unknown and
+        // sends the caller back to the repeat, never a success.
+        let mut bad_baseline = submit_receipt();
+        bad_baseline["baseline"] = json!("baseline");
+        let mut unknown_stage = submit_receipt();
+        unknown_stage["stage"] = json!("submitted");
+        let mut no_type = submit_receipt();
+        no_type.as_object_mut().unwrap().remove("type");
+        let mut string_confirmed = submit_receipt();
+        string_confirmed["typeConfirmed"] = json!("false");
+        for reply in [
+            json!({}),
+            json!({"ok": false}),
+            json!({"stage": 7}),
+            unknown_stage,
+            no_type,
+            string_confirmed,
+            bad_baseline,
+        ] {
+            let (out, requests) = run(
+                vec![(200, "", reply.clone())],
+                "document_submit",
+                submit_args(),
+                10,
+            );
+            let err = out.expect_err(&format!("{reply} is not a submit receipt"));
+            assert_eq!(err.kind(), "unknown", "{reply}: {err}");
+            assert!(
+                err.to_string().contains("repeat `artifact submit <id>`"),
+                "{reply}: {err}"
+            );
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "never retried");
+        }
+    }
+
+    #[test]
+    fn document_submit_answers_the_stage_and_a_lost_answer_is_unknown() {
+        let stage = submit_receipt();
+        let (out, requests) = run(
+            vec![(200, "", stage.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), stage);
+        // A confirmed type answers without the baseline.
+        let confirmed = json!({"stage": "approved", "type": "quotation", "typeConfirmed": true});
+        let (out, _) = run(
+            vec![(200, "", confirmed.clone())],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        assert_eq!(out.unwrap(), confirmed);
+        let call = requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/call"))
+            .unwrap();
+        assert_eq!(call["body"]["arguments"], json!({"id": "art-x"}));
+        assert_eq!(
+            minted_scopes(&requests),
+            ["cli.write"],
+            "submit asks for cli.write only"
+        );
+        // An unmapped store code answers 500 `internal`: the write may have
+        // landed, so it is unknown and names the read, never a refusal.
+        let (out, _) = run(
+            vec![(500, "", refusal("internal"))],
+            "document_submit",
+            submit_args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(
+            err.to_string().contains("repeat `artifact submit <id>`"),
+            "{err}"
+        );
+    }
+
+    fn minted_scopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/authorize"))
+            .unwrap()["body"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
 }
 
 // CAD-2083 acceptance, written from the ticket by the reviewer rather than the
@@ -8241,6 +8562,75 @@ mod agent_credential_acceptance {
         assert!(s.lines().is_empty());
     }
 
+    impl Session {
+        /// The real `artifact submit` order: the type-list probe, then the submit.
+        fn submit_document(&self) -> Result<Value> {
+            super::super::submit_document_in(
+                &self.target,
+                "art-x",
+                Instant::now() + Duration::from_secs(10),
+                10,
+                &self.dir,
+                Some(&self.slot),
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+        }
+
+        fn verbs(&self) -> Vec<Value> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|req| req.path.ends_with("/cli/call"))
+                .map(|req| req.body["verb"].clone())
+                .collect()
+        }
+    }
+
+    // CAD-2286, operator decision 2026-11-15: the credential carries the
+    // member's subject, so the creator check admits the member's files on it,
+    // and a reader or reviewer session's submit meets the board's read-only
+    // guard. Both the probe and the submit ride the agent credential.
+    #[test]
+    fn a_managed_artifact_submit_probes_and_submits_on_the_agent_credential() {
+        // The probe's body is not read; the submit's answer must be a receipt.
+        let mut b = board();
+        b.agent_call = (
+            200,
+            json!({"stage": "in_review", "type": "quotation", "typeConfirmed": true}),
+        );
+        let s = session(b, 5);
+        s.submit_document().unwrap();
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        assert_eq!(
+            s.verbs(),
+            vec![json!("document_types"), json!("document_submit")]
+        );
+        assert!(s.lines().is_empty(), "{:?}", s.lines());
+    }
+
+    // A failed mint never falls back to the member's wider login: the probe is
+    // refused, so no submit is ever sent.
+    #[test]
+    fn a_failed_mint_refuses_artifact_submit_before_anything_is_submitted() {
+        let mut b = board();
+        b.mint = (403, json!({"ok": false, "code": "forbidden"}));
+        let s = session(b, 1);
+        s.submit_document().unwrap_err();
+        assert_eq!(s.trail(), vec![step("agent-credential", "login")]);
+        assert!(s.verbs().is_empty());
+    }
+
     // The board's own `issued_at` bounds the lifetime; a slow mint (the client
     // reads the clock after the answer) is not aged out of it.
     #[test]
@@ -8604,6 +8994,39 @@ mod agent_credential_refusals {
             vec![MINT, "authorize:A", "call:A", "authorize:A"],
             "a policy 401 was re-minted"
         );
+    }
+
+    #[test]
+    fn keyed_create_never_falls_back_to_the_member_identity() {
+        for stage in ["agent-credential", "authorize", "call"] {
+            let r = rig(8, move |route, req| {
+                if route == "agent-credential" && stage == route {
+                    return Some(Reply::Json(404, refused("not_found")));
+                }
+                (agent(req) && route == stage)
+                    .then(|| Reply::Json(403, refused("human_session_required")))
+            });
+            let slot = r.slot(CLAIM, 1);
+            let error = r
+                .send(
+                    Some(&slot),
+                    "issue_new",
+                    json!({"project": "demo", "title": "Synthetic", "request_id": "retry-1"}),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("same acting identity"),
+                "{error}"
+            );
+            let mut expected = vec![MINT];
+            if stage != "agent-credential" {
+                expected.push("authorize:A");
+            }
+            if stage == "call" {
+                expected.push("call:A");
+            }
+            assert_eq!(r.trail(), expected, "fallback at {stage}");
+        }
     }
 
     // 2. Exactly `human_session_required` falls back, once; nothing else does.
@@ -9062,4 +9485,416 @@ mod agent_credential_refusals {
             );
         }
     }
+}
+
+const SKILL_VERBS: [&str; 7] = [
+    "workspace_skill_list",
+    "workspace_skill_show",
+    "workspace_skill_check",
+    "workspace_skill_draft",
+    "workspace_skill_approve",
+    "workspace_skill_revoke",
+    "workspace_skill_delete",
+];
+
+fn skill_args(value: Value) -> Map<String, Value> {
+    value.as_object().unwrap().clone()
+}
+
+#[test]
+fn cad2396_skill_verbs_are_registered_with_their_scopes() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+    for verb in SKILL_VERBS {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+    }
+    for verb in [
+        "workspace_skill_list",
+        "workspace_skill_show",
+        "workspace_skill_check",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.read"], "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+        assert!(super::mutation_reconcile(verb).is_none(), "{verb}");
+    }
+    for verb in [
+        "workspace_skill_draft",
+        "workspace_skill_approve",
+        "workspace_skill_revoke",
+        "workspace_skill_delete",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.write"], "{verb}");
+        assert!(mutating_cli_verb(verb), "{verb}");
+        assert!(
+            lost_mutation_note(verb).contains("workspace-skill show"),
+            "{verb}"
+        );
+    }
+}
+
+#[test]
+fn cad2396_a_refused_package_shows_its_reason_and_never_its_text() {
+    for verb in ["workspace_skill_check", "workspace_skill_draft"] {
+        let (out, requests) = run(
+            vec![(
+                400,
+                "",
+                json!({"ok": false, "error": {"code": "skill_refused", "reason": "package_too_large",
+                    "message": "server-text /private"}}),
+            )],
+            verb,
+            skill_args(
+                json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 0}),
+            ),
+            10,
+        );
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some("skill_refused"), "{verb}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb}: {shown}");
+        assert!(shown.contains("package_too_large"), "{verb}: {shown}");
+        assert!(
+            !shown.contains("server-text") && !shown.contains("/private"),
+            "{shown}"
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+    }
+}
+
+#[test]
+fn cad2396_skill_refusals_keep_their_code_and_are_never_retried() {
+    let refusal = |code: &str| json!({"error": {"code": code, "message": "server-text /private"}});
+    for (verb, status, code, shown_code) in [
+        (
+            "workspace_skill_approve",
+            403u16,
+            "not_permitted",
+            "not_permitted",
+        ),
+        (
+            "workspace_skill_delete",
+            403,
+            "not_permitted",
+            "not_permitted",
+        ),
+        ("workspace_skill_delete", 404, "not_found", "not_found"),
+        (
+            "workspace_skill_delete",
+            409,
+            "approved_skill",
+            "approved_skill",
+        ),
+        ("workspace_skill_draft", 409, "skill_limit", "skill_limit"),
+        (
+            "workspace_skill_approve",
+            403,
+            "owner_required",
+            "not_permitted",
+        ),
+        (
+            "workspace_skill_revoke",
+            401,
+            "unauthorized",
+            "not_permitted",
+        ),
+        ("workspace_skill_show", 404, "not_found", "not_found"),
+        ("workspace_skill_approve", 404, "not_found", "not_found"),
+        (
+            "workspace_skill_approve",
+            409,
+            "digest_mismatch",
+            "digest_mismatch",
+        ),
+        (
+            "workspace_skill_revoke",
+            409,
+            "digest_mismatch",
+            "digest_mismatch",
+        ),
+        (
+            "workspace_skill_approve",
+            409,
+            "approved_limit",
+            "approved_limit",
+        ),
+        (
+            "workspace_skill_draft",
+            400,
+            "invalid_request",
+            "invalid_request",
+        ),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some(shown_code), "{verb} {code}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb} {code}: {shown}");
+        assert!(!shown.contains("server-text"), "{shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} {code}");
+    }
+}
+
+#[test]
+fn cad2396_stale_draft_revision_is_a_conflict_answer() {
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "workspace_skill_draft",
+        skill_args(json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 1})),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2396_a_board_without_skill_verbs_says_to_update_it() {
+    for verb in SKILL_VERBS {
+        let (out, requests) = run(
+            vec![(501, "", json!({"error": {"code": "not_implemented"}}))],
+            verb,
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("update the board first"), "{verb}: {shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn cad2396_skill_write_without_a_matching_receipt_is_unknown() {
+    let draft =
+        || skill_args(json!({"name": "weekly", "files": {"SKILL.md": "x"}, "expectedRevision": 0}));
+    let approve = || skill_args(json!({"name": "weekly", "revision": 2, "digest": "sha256:aa"}));
+    let revoke = || skill_args(json!({"name": "weekly", "digest": "sha256:aa"}));
+    for (verb, args, receipt) in [
+        ("workspace_skill_draft", draft(), json!({"ok": true})),
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "other"}, "revision": 1}),
+        ),
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "weekly"}}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 1, "digest": "sha256:aa"}}}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": null}}),
+        ),
+        (
+            "workspace_skill_revoke",
+            revoke(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 2, "digest": "sha256:aa"}}}),
+        ),
+    ] {
+        let (out, requests) = run(vec![(200, "", receipt.clone())], verb, args, 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{verb} {receipt}: {err}");
+        assert!(err.to_string().contains("workspace-skill show"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    for (verb, args, receipt) in [
+        (
+            "workspace_skill_draft",
+            draft(),
+            json!({"skill": {"name": "weekly"}, "revision": 1, "created": true}),
+        ),
+        (
+            "workspace_skill_approve",
+            approve(),
+            json!({"skill": {"name": "weekly", "approved": {"revision": 2, "digest": "sha256:aa", "by": "u", "at": 1}}}),
+        ),
+        (
+            "workspace_skill_revoke",
+            revoke(),
+            json!({"skill": {"name": "weekly", "approved": null}}),
+        ),
+    ] {
+        let (out, _) = run(vec![(200, "", receipt)], verb, args, 10);
+        assert!(out.is_ok(), "{verb}: {out:?}");
+    }
+}
+
+// AOS-627: a staged connected effect is accepted only as the strict stage
+// answer, never as a provider result.
+#[test]
+fn hosted_connected_effect_answer_is_strict() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let ok = |data: Value| json!({"ok": true, "data": data});
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "pending", "replayed": false})
+    )));
+    assert!(connected_effect_stage_answer(&ok(
+        json!({"action_id": id, "outcome": "applied", "replayed": true, "result": {}})
+    )));
+    for bad in [
+        json!({"action_id": id, "outcome": "pending"}),
+        json!({"action_id": "ABC", "outcome": "pending", "replayed": false}),
+        json!({"action_id": id, "outcome": "sent", "replayed": false}),
+        json!({"action_id": id, "outcome": "pending", "replayed": false, "price": {}}),
+    ] {
+        assert!(!connected_effect_stage_answer(&ok(bad)));
+    }
+    assert!(!connected_effect_stage_answer(&json!({"ok": false})));
+}
+
+// AOS-627: an uncertain stage never points at `platform status`, which cannot
+// see staged actions; repeating the same stage with the same key is the safe
+// retry.
+#[test]
+fn hosted_connected_effect_reconciles_by_replaying_the_same_stage() {
+    let arguments = json!({"operation": "connected_effect"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+    assert!(effect.is_mutation());
+    let note = effect.reconciliation().unwrap();
+    assert!(note.contains("same `--request`"), "{note}");
+    assert!(!note.contains("replaying `platform call`"), "{note}");
+}
+
+// AOS-627: a refused stage prints the board's code, including the 403/404/503
+// ones the generic classification drops.
+#[test]
+fn hosted_connected_effect_refusal_prints_its_code() {
+    let args = json!({
+        "operation": "connected_effect",
+        "tool": "gmail_send",
+        "connectionId": "con_synthetic",
+        "body": {},
+        "key": "synthetic-stage-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for (status, code) in [
+        (404, "not_allowlisted"),
+        (403, "connection_access_denied"),
+        (503, "capability_unavailable"),
+    ] {
+        let (listener, _requests, _server) = fake_worker(vec![(
+            status,
+            "",
+            json!({"ok": false, "error": {"code": code}}),
+        )]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a refused stage is not retried"),
+        )
+        .expect_err("a refused stage is an error");
+        assert!(err.to_string().contains(code), "{err}");
+        assert!(err.to_string().contains("nothing ran"), "{err}");
+    }
+}
+
+// AOS-627: a coded 5xx other than the two pre-staging 503s may follow a
+// committed stage, so it is an unknown outcome, never "nothing was staged".
+#[test]
+fn hosted_connected_effect_5xx_is_unknown_not_a_refusal() {
+    let args = json!({
+        "operation": "connected_effect",
+        "tool": "gmail_send",
+        "connectionId": "con_synthetic",
+        "body": {},
+        "key": "synthetic-stage-2"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let (listener, _requests, _server) = fake_worker(vec![(
+        500,
+        "",
+        json!({"ok": false, "error": {"code": "internal_error"}}),
+    )]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let err = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an uncertain stage is not retried"),
+    )
+    .expect_err("a 500 is not a success");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(!err.to_string().contains("nothing was staged"), "{err}");
+}
+
+#[test]
+fn cad2415_skill_delete_needs_its_own_receipt() {
+    let args = || skill_args(json!({"name": "weekly", "expectedRevision": 2}));
+    for receipt in [
+        json!({"ok": true}),
+        json!({"name": "other", "deleted": true}),
+        json!({"name": "weekly", "deleted": false}),
+        json!({"skill": {"name": "weekly"}}),
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "workspace_skill_delete",
+            args(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{receipt}: {err}");
+        assert!(err.to_string().contains("workspace-skill show"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    let (out, _) = run(
+        vec![(200, "", json!({"name": "weekly", "deleted": true}))],
+        "workspace_skill_delete",
+        args(),
+        10,
+    );
+    assert!(out.is_ok(), "{out:?}");
+}
+
+#[test]
+fn cad2415_stale_delete_revision_is_a_conflict_answer() {
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "workspace_skill_delete",
+        skill_args(json!({"name": "weekly", "expectedRevision": 1})),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
 }

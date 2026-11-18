@@ -54,6 +54,10 @@ mod cad2018_wiki_http_acceptance;
 mod cad2317_routine_connection_guard_acceptance;
 #[cfg(test)]
 mod cad2321_actor_kind_http_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2378_time_zone_guard_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2402_routines_list_guard_acceptance;
 mod cli_route;
 mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
@@ -90,6 +94,7 @@ mod tailscale_serve;
 #[cfg(all(test, feature = "test-seam"))]
 mod team_assistants_http_refusal;
 mod threads;
+mod time_zone;
 mod topics;
 mod updates;
 mod whatsapp;
@@ -1304,6 +1309,31 @@ fn qr_term(text: &str) -> Option<String> {
         y += 2;
     }
     Some(out)
+}
+
+/// Keep SIGCHLD from waking the client's socket reads in the real HTTP board
+/// rigs (`cad2018_wiki_http_acceptance`, `cad2317_routine_connection_guard_acceptance`,
+/// `team_assistants_http_refusal` and its children). The daemon and board
+/// threads a rig starts spawn `git`. A child that exits while its parent
+/// thread has signals blocked (as `Command::spawn` does across the fork) has
+/// the SIGCHLD queued on the process instead of dropped as ignored, and the
+/// kernel then wakes any thread that does not block it. When that is the thread
+/// in a timed `recv`, the call fails with EINTR: a socket with a receive
+/// timeout is never restarted, whatever the signal's disposition, and ureq 3.4.2
+/// does not retry it. Blocking it on the test thread is inherited by every
+/// thread the rig spawns; `wait`/`waitpid` do not need it delivered.
+#[cfg(all(test, feature = "test-seam"))]
+fn block_sigchld() {
+    // SAFETY: a local signal set and a mask change on the calling thread.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+            0
+        );
+    }
 }
 
 #[cfg(test)]

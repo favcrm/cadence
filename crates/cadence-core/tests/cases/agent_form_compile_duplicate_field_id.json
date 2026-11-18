@@ -1,0 +1,30 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "fields": [
+          {
+            "id": "name",
+            "label": "Name",
+            "type": "text"
+          },
+          {
+            "id": "name",
+            "label": "Again",
+            "type": "text"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": false,
+      "message": "spec /fields/1/id: 'name' is used twice"
+    }
+  }
+}

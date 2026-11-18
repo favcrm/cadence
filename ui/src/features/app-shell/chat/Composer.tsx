@@ -2,6 +2,7 @@ import { askBody, askLabel, citesArtifact } from "../../canvas/askRefs";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -21,6 +22,7 @@ import {
   captureReady,
   composerDraftState,
   consumeSeed,
+  onComposerFocusRequest,
   removeAttach,
   reserveDraft,
   retryAttach,
@@ -101,6 +103,8 @@ export interface ComposerProps {
   onSubmitted?: () => void;
   /** Focus the box after a send (the Home dock does). */
   refocusAfterSend?: boolean;
+  /** Reveal an owning pane before an external request focuses this composer. */
+  onReveal?: () => void;
   textareaId?: string;
   ariaLabel?: string;
   placeholder?: string;
@@ -146,6 +150,14 @@ export interface ComposerAction {
   label: string;
   onSelect: () => void;
 }
+
+/** CAD-2422: a message longer than this (UTF-8) is sent as a text attachment.
+ *  Large enough for any ordinary message; small next to the 256 KiB model request. */
+const LONG_TEXT_BYTES = 32 * 1024;
+/** CAD-2422: per composer key, the long text already copied into an
+ *  attachment row and that row, so the next send carries the row in its
+ *  place while the text itself never leaves the box until it is sent. */
+const pastedText = new Map<string, { text: string; itemKey: string }>();
 
 /** Draft attachment chips (CAD-1419): one icon slot per chip that
  *  becomes Remove on hover/focus and stays visible on touch. Up to three
@@ -390,6 +402,7 @@ export default function Composer({
   onSend,
   onSubmitted,
   refocusAfterSend,
+  onReveal,
   textareaId,
   ariaLabel,
   placeholder,
@@ -416,6 +429,7 @@ export default function Composer({
   const cell = useSyncExternalStore(subscribeDraftCell, readDraftCell);
   const draft = cell.text;
   const refs = cell.refs;
+  const hasArtifactRef = citesArtifact(refs);
   const libraryImage = cell.libraryImage;
   const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
   const setDraft = (next: string) => setComposerDraft(key, next);
@@ -450,21 +464,54 @@ export default function Composer({
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const revealRef = useRef(onReveal);
+  revealRef.current = onReveal;
+  useLayoutEffect(() => {
+    let frame: number | null = null;
+    const off = onComposerFocusRequest((requestedKey) => {
+      if (requestedKey !== key) return;
+      revealRef.current?.();
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        box.current?.focus();
+      });
+    });
+    return () => {
+      off();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [key]);
   useEffect(() => {
     if (seed && seed.n > 0 && consumeSeed(key, seed)) {
       setComposerContent(key, seed.text, seed.refs ?? []);
       if (!block) box.current?.focus();
     }
   }, [seed]);
-  // The textarea grows with its content (auto-height), capped by the
-  // CSS max-height — past it the box scrolls. `resize:none` is the
-  // mock's rule: no bottom-right grip in either density.
-  useEffect(() => {
+  // The box can mount while its pane is hidden. Size it once visible and
+  // whenever its available width changes, as well as when its text changes.
+  const resizeBox = useCallback(() => {
     const el = box.current;
-    if (!el) return;
+    if (!el || el.clientWidth === 0) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
+  }, []);
+  useEffect(() => {
+    resizeBox();
+  }, [draft, block, blockedPlaceholder, placeholder, compact, t, hasArtifactRef, resizeBox]);
+  useEffect(() => {
+    const el = box.current;
+    // No observer where the API is missing; the initial measure above stays.
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      resizeBox();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [compact, resizeBox]);
 
   // Slash completion is a full-density extra (Home's commands); compact
   // mode routes slash verbs through onCommand without sending them
@@ -521,6 +568,37 @@ export default function Composer({
       onNotice?.(hold);
       return;
     }
+    // CAD-2422: a message is never compacted or shortened on its way to the
+    // model, so a very long one goes as a text file the assistant pages
+    // through instead (`chat_attachment_read`). The first send copies the
+    // text into an attachment row and stops; the text stays in the box, so a
+    // failed or removed upload never loses it. Once that row is ready, the
+    // next send carries the row with a short line instead of the text.
+    let outgoing = body;
+    const bodyBytes = new TextEncoder().encode(body).length;
+    if (bodyBytes > LONG_TEXT_BYTES && !parseSlash(body)) {
+      const kb = String(Math.ceil(bodyBytes / 1024));
+      if (!attachEnabled) {
+        onNotice?.({ key: "This message is too long to send ({kb} KB, the limit is 32 KB). Attach it as a text file instead.", slots: { kb } });
+        return;
+      }
+      const pasted = pastedText.get(key);
+      const row = pasted && storedAttachItems(key).some((item) => item.key === pasted.itemKey);
+      if (pasted && row && pasted.text === body) {
+        // The hold above already stopped a send while the row uploads or
+        // failed, so the row is ready here.
+        outgoing = t("Please read the attached text.");
+      } else {
+        // An edited text replaces its earlier copy rather than adding one.
+        if (pasted && row) removeAttach(key, pasted.itemKey);
+        const name = `pasted-text-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+        addFiles(key, [new File([body], name, { type: "text/plain" })], attachDestination);
+        const added = storedAttachItems(key).at(-1);
+        if (added) pastedText.set(key, { text: body, itemKey: added.key });
+        onNotice?.({ key: "The long text ({kb} KB) will be sent as {name}. Press Send again once it has uploaded; the text stays here until then.", slots: { kb, name } });
+        return;
+      }
+    }
     // Pin before a pending row or command card paints, so a follow
     // effect scrolls the working indicator into view.
     onSubmitted?.();
@@ -569,7 +647,7 @@ export default function Composer({
         handoff = onSend({
           // A cited artifact is expanded into the body: refs are stored for the
           // board, only the body reaches the agent.
-          body: askBody(body, refs),
+          body: askBody(outgoing, refs),
           refs,
           // Only ready rows ride a send — gating above already withheld
           // it while anything unresolved remained.
@@ -585,6 +663,7 @@ export default function Composer({
         return;
       }
       const settle = (accepted: boolean) => {
+        if (accepted && outgoing !== body) pastedText.delete(key);
         if (accepted) {
           // Remove exactly the rows this send carried; a failed row, a
           // file queued after the send's resolution, or a later distinct
@@ -684,9 +763,9 @@ export default function Composer({
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onKeyDown={onKey}
-      rows={compact ? 1 : 2}
+      rows={1}
       disabled={!!block}
-      placeholder={t(block ? blockedPlaceholder : citesArtifact(refs) ? "Say what to change…" : (placeholder ?? ""))}
+      placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
       aria-expanded={matches.length > 0 || undefined}
       className={
@@ -712,7 +791,9 @@ export default function Composer({
       }}
     />
   ) : null;
-  const attachButton = attach ? (
+  // CAD-2425: the control is named beside its icon (the approved
+  // chat-polish footer row); CSS shows the name from 640px.
+  const attachControl = (labelled: boolean) => attach ? (
     <button
       type="button"
       className="app-chat-attach"
@@ -726,6 +807,7 @@ export default function Composer({
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M21 12.5l-8.5 8.5a5.5 5.5 0 01-7.8-7.8l9-9a3.67 3.67 0 015.2 5.2l-8.5 8.5a1.83 1.83 0 01-2.6-2.6l7.8-7.8" />
       </svg>
+      {labelled && <span className="app-chat-attach-label" aria-hidden="true">{t("Attach file")}</span>}
     </button>
   ) : null;
   const sendHeld = unresolvedHint(attachHold(key), translateAttachText);
@@ -806,7 +888,7 @@ export default function Composer({
           {boxEl}
           <div className="app-chat-composer-tools">
             {attachInput}
-            {attachButton}
+            {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
@@ -860,9 +942,10 @@ export default function Composer({
       {refsRow}
       {attachChips}
       {boxEl}
-      <div className="flex items-center gap-2 mt-1.5">
+      {/* CAD-2425: one footer row — attach, the keyboard hint, then send. */}
+      <div className="composer-foot" data-composer-foot="">
         {attachInput}
-        {attachButton}
+        {attachControl(true)}
         {/* A held send's reason is on the failed file's own row; this
             line is only for a blocked (read-only) composer. */}
         {block ? (
@@ -870,15 +953,15 @@ export default function Composer({
             {t(block)}
           </p>
         ) : (
-          <span className="flex-1" />
+          <>
+            <span className="flex-1" />
+            <p className="composer-hint" data-composer-hint>
+              {t("Enter to send · Shift+Enter for a new line")}
+            </p>
+          </>
         )}
         {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
-      {!block && (
-        <p className="composer-hint" data-composer-hint>
-          {t("Enter to send · Shift+Enter for a new line")}
-        </p>
-      )}
     </form>
   );
 }

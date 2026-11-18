@@ -77,7 +77,7 @@ pub enum MilestoneStatus {
 }
 
 impl MilestoneStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Planned => "planned",
             Self::Active => "active",

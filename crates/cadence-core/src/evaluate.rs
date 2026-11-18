@@ -42,6 +42,10 @@
 //! a non-native host refuses exactly what the daemon refuses and builds the
 //! same fallback text and digest. It is a shape check only: who may ask,
 //! in which conversation and on which turn stays the host's own decision.
+//!
+//! `agent.form.compile` takes the agent's flat field list instead of an
+//! envelope, builds the envelope ([`crate::agent_form::compile`]) and runs
+//! the same check, so its value is the check's plus the `form`.
 
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
 use crate::app_screen_decl::{
@@ -144,6 +148,55 @@ pub enum Operation {
     /// refuses is a `valid: false` value, not an envelope refusal.
     #[serde(rename = "agent.form.check")]
     AgentFormCheck(FormCheckInput),
+    /// Compile an agent's flat field list into the A2UI envelope and check it
+    /// (CAD-2345). The same answer shape as `agent.form.check`, plus `form`.
+    #[serde(rename = "agent.form.compile")]
+    AgentFormCompile(FormCompileInput),
+}
+
+/// Input of `agent.form.compile`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FormCompileInput {
+    /// The agent's `FormSpec`: optional `id`, `title`, `intro` and `submit`,
+    /// and 1-12 `fields`. Unknown keys are refused.
+    pub spec: Value,
+}
+
+/// Success value of `agent.form.compile`. When `valid`, `form`, `fallback`
+/// and `digest` are set; otherwise `message` names the refused spec or form
+/// path and rule.
+#[derive(Serialize, JsonSchema)]
+pub struct FormCompileValue {
+    pub valid: bool,
+    /// The compiled `{"version":"1.0","createSurface":{...}}` envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn form_compile(input: &FormCompileInput) -> FormCompileValue {
+    match crate::agent_form::compile(&input.spec) {
+        Ok(form) => FormCompileValue {
+            valid: true,
+            form: Some(form.envelope),
+            fallback: Some(form.fallback),
+            digest: Some(form.digest),
+            message: None,
+        },
+        Err(error) => FormCompileValue {
+            valid: false,
+            form: None,
+            fallback: None,
+            digest: None,
+            message: Some(error.to_string()),
+        },
+    }
 }
 
 /// Input of `agent.form.check`.
@@ -209,6 +262,21 @@ pub struct DeliveryRequirementsInput {
     pub risk_paths: Option<String>,
     /// The trusted base's `docs/roles/one-review-paths.toml` text.
     pub one_review_paths: Option<String>,
+    /// CAD-2386: the caller proved both list files are absent at the anchor
+    /// (a definite "not found", never a failed read), so the product default
+    /// applies. Absent or `false` keeps today's reading: a missing text is
+    /// unreadable and fails closed. `true` with either text present refuses.
+    #[serde(default)]
+    pub lists_absent: bool,
+    /// CAD-2417: the host vouches that `policy` is owner-approved as sent (on
+    /// hosted Cadence only a live owner can save a project's delivery policy).
+    /// A policy that parses is then resolved as approved at its own digest,
+    /// exactly as an `approval` of it would be; an absent or malformed text
+    /// changes nothing. Absent or `false` keeps today's answers; `true` with an
+    /// `approval` refuses as contradictory. Set it only for an owner-written
+    /// host record, never for text read from a repository or a PR head.
+    #[serde(default)]
+    pub policy_owner_approved: bool,
 }
 
 /// The delivery half of a project work approval: the digest it recorded and
@@ -477,6 +545,8 @@ pub enum OpValue {
     DeliveryRequirements(Value),
     #[serde(rename = "agent.form.check")]
     FormCheck(FormCheckValue),
+    #[serde(rename = "agent.form.compile")]
+    FormCompile(FormCompileValue),
 }
 
 /// Success response.
@@ -633,17 +703,43 @@ fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Valu
         None => Ok(None),
         Some(text) => parse(text).map_err(|error| error.to_string()),
     };
-    let approved = input.approval.as_ref().map(|approval| Approved {
-        digest: approval.digest.clone(),
-        policy: approval.policy.clone(),
-    });
-    let resolved = effective("project", file, approved.as_ref());
-    let lists = crate::delivery_requirements::TrustedLists {
-        risk_paths: input.risk_paths.as_deref(),
-        one_review: input.one_review_paths.as_deref(),
+    if input.policy_owner_approved && input.approval.is_some() {
+        return Err(refuse(
+            Code::InvalidCommand,
+            "policy_owner_approved contradicts a supplied approval".to_string(),
+        ));
+    }
+    let approved = if input.policy_owner_approved {
+        // CAD-2417: the policy text itself is the owner's approval.
+        match &file {
+            Ok(Some(policy)) => Some(Approved {
+                digest: crate::delivery::digest(policy),
+                policy: Some(policy.clone()),
+            }),
+            _ => None,
+        }
+    } else {
+        input.approval.as_ref().map(|approval| Approved {
+            digest: approval.digest.clone(),
+            policy: approval.policy.clone(),
+        })
     };
-    let requirements =
-        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists);
+    let resolved = effective("project", file, approved.as_ref());
+    let requirements = if input.lists_absent {
+        if input.risk_paths.is_some() || input.one_review_paths.is_some() {
+            return Err(refuse(
+                Code::InvalidCommand,
+                "lists_absent contradicts a supplied list text".to_string(),
+            ));
+        }
+        crate::delivery_requirements::classify_without_lists(&resolved, &input.changes, input.lines)
+    } else {
+        let lists = crate::delivery_requirements::TrustedLists {
+            risk_paths: input.risk_paths.as_deref(),
+            one_review: input.one_review_paths.as_deref(),
+        };
+        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists)
+    };
     serde_json::to_value(serde_json::json!({
         "policy": resolved.policy,
         "policy_source": resolved.source,
@@ -755,6 +851,7 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
         Operation::AgentFormCheck(input) => Ok(OpValue::FormCheck(form_check(&input))),
+        Operation::AgentFormCompile(input) => Ok(OpValue::FormCompile(form_compile(&input))),
     }
 }
 

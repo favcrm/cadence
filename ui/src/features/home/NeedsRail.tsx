@@ -4,7 +4,7 @@ import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
@@ -205,16 +205,28 @@ export default function NeedsRail({
     },
     ask: (lead) => ask(need, lead),
   });
+  const reviewStaged = (queue: string[], at: number, opener: Element | null = document.activeElement) => {
+    stagedOpener.current = opener;
+    homeDecisions.clearNotice();
+    reviewOpening.current = true;
+    setDrawer(false);
+    setReview({ queue, at });
+  };
+  // CAD-2364: a chip in the thread opens the same review card, over what is waiting now.
+  // The chip is the opener: a click does not focus a button in every browser.
+  const openStaged = useRef<(id: string, opener: HTMLElement) => void>(() => {});
+  openStaged.current = (id: string, opener: HTMLElement) => {
+    const queue = staged.pending.map((w) => w.id);
+    const at = queue.indexOf(id);
+    if (at >= 0) reviewStaged(queue, at, opener);
+  };
+  useEffect(() => homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener)), []);
   const openDecision = (key: string) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
     if (stagedCard) {
       // Not an issue-backed item: the staged detail is the rail's own, on the same shell.
       const queue = cards.flatMap((n) => (n.action.type === "staged" ? [n.action.id] : []));
-      stagedOpener.current = document.activeElement;
-      homeDecisions.clearNotice();
-      reviewOpening.current = true;
-      setDrawer(false);
-      setReview({ queue, at: Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0) });
+      reviewStaged(queue, Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0));
       return;
     }
     const need = readers.find((n) => n.key === key);
@@ -592,12 +604,12 @@ function DecidedLine({ write }: { write: StagedWrite }) {
   if (outcome === "failed") {
     return (
       <li data-fail>
-        <span><bdi>{isolate(write.title)}</bdi></span>
+        <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
         <span className="text-ink-500">
           <span className="dx-bad">{t("Did not apply")}</span> · {when}
         </span>
         <span className="dx-why">
-          {t(failureReason(write))}
+          {reasonText(failureReason(write), t)}
           <button type="button" className="lnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
             {raw ? t("Hide raw") : t("Show raw")}
           </button>
@@ -618,13 +630,18 @@ function DecidedLine({ write }: { write: StagedWrite }) {
       ? t("Denied")
       : write.kind === "create_issue" && write.result?.ticket
         ? `${t("Created")} ${write.result.ticket}`
-        : t("Applied");
+        : write.connected !== null
+          ? t(write.connected.effect === "send" ? "Sent" : "Drafted")
+          : t("Applied");
   return (
     <li>
-      <span><bdi>{isolate(write.title)}</bdi></span>
+      <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
       <span className="text-ink-500">
         {label} · {when}
       </span>
+      {outcome === "unconfirmed" && write.connected !== null && isUncertain(write) && (
+        <span className="dx-why">{reasonText(failureReason(write), t)}</span>
+      )}
     </li>
   );
 }

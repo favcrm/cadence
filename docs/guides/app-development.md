@@ -154,6 +154,63 @@ For a standalone source-backed draft, the receipt must still be attached to
 the context and the handle must remain a saved source. A run-backed draft
 instead proves the selected receipt and post against its own scoped run.
 
+### Dated items: `calendar.query`
+
+A `screen-records.v1` screen that declares `calendar.query` (with the
+`records.call` permission) can show the workspace's dated items without reading
+other apps' records. It is a read, so members and read-only mounts may call it.
+
+- Request `{from, to}`: `YYYY-MM-DD` days, half-open (`to` is not included),
+  `to` after `from`, at most 62 days. Anything else, and any other key, is
+  refused.
+- Reply exactly `{entries, zone, sources}`.
+  - `entry` is `{source, id, title, state, needs_you}` plus exactly one of
+    `starts_at` (an RFC 3339 UTC instant) or `date` (an all-day `YYYY-MM-DD`).
+    `source` is `post`, `crm`, `routine`, `task` or `holiday`.
+  - `sources` is `{source, ok}` for each source the host attempted. A source
+    that could not be read is `ok: false`; the others still return. A source
+    the host did not attempt is absent.
+  - `zone` is an IANA zone. The host returns UTC instants; the app places them
+    in `zone`. Until the workspace has a company zone, it is the first social
+    connection's zone, else `UTC`.
+- Sources today: `post` (scheduled social posts), `routine` (slots expanded
+  from the routine's schedule in its own zone, plus its runs), `task` (a
+  project milestone's `target_date` and a campaign work `due_at`, all-day on
+  that date only). `crm` and `holiday` are not served yet.
+- It carries titles, times and status only: never a customer list, message
+  text, caption or recipient. The consent page shows the host's own sentence
+  for an app that declares it; the bundle cannot reword it.
+
+### Routines: `routines.list`
+
+A `screen-records.v1` screen that declares `routines.list` (with the
+`records.call` permission) can list the workspace's routines without reading
+their content. Routines are an operator read today, so only an operator session
+may call it; a member or a read-only mount is refused with the same forbidden
+refusal as any other operator-only call, and no row is returned.
+
+- Request `{}`: no arguments. Any key is refused.
+- Reply exactly `{routines: [row]}`, at most 500 rows, ordered by agent then
+  name. A row has exactly these keys:
+  - `id`: the routine id.
+  - `name`: at most 200 characters.
+  - `agent`: the owning agent alias, at most 120 characters.
+  - `schedule_text`: a plain summary of the trigger, at most 300 characters,
+    such as "Weekdays at 09:00 (Asia/Hong_Kong)", "Every 15 min" or
+    "When <event>". A schedule is written in the company time zone; a routine
+    that names a different zone is written in its own zone, named in the text.
+  - `next_run_at`: optional, an RFC 3339 UTC instant of the next due time.
+    Omitted when there is none.
+  - `status`: `on`, `paused`, `waiting` or `repoint`. `waiting` is a routine
+    waiting for the owner's approval; any other status the host does not
+    recognise reads as `paused`. An app on an older parser sees `waiting` as an
+    unrecognised status, so ship the app after or with the host.
+  - `asks_first`: true when any checklist step requires approval.
+- It never carries routine markdown or script content, paths, digests, inputs,
+  the destination thread, the connection account or run output. The consent
+  page shows the host's own row, "Lists your routines: names, schedules and
+  status only", for an app that declares it.
+
 ## 4. Local loop
 
 ```sh
@@ -238,6 +295,12 @@ id; see the
 Hosted boards read catalogue metadata from `api.internal`; the release document
 is proxied through the closed `catalogue-packages.internal` broker. Every
 install/update is operator-only.
+
+Where private uploads are available, an owner can select **Add private app**
+in Apps, check the ZIP, review its declared access and explicitly install it.
+If the install or update result is unconfirmed, it may already have committed.
+Refresh Apps and inspect the installed version before checking the ZIP again;
+do not blindly resubmit it.
 
 ## 7. Existing apps
 

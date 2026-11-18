@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
-import { setComposerRefs } from "../app-shell/chat/composerStore";
+import { requestComposerFocus, setComposerRefs } from "../app-shell/chat/composerStore";
 import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
@@ -51,10 +51,11 @@ function useViewport(): number {
   return w;
 }
 
-/** The chat pane's right edge with no drawer padding applied (app shell). */
-function chatRightEdge(pushed: number): number | null {
-  const pane = document.querySelector<HTMLElement>("[data-chat-pane]");
-  return pane ? pane.getBoundingClientRect().right + pushed : null;
+/** The stable app workspace box; the assistant lives beyond its right edge. */
+function appWorkspaceBounds(): { left: number; right: number; top: number } | null {
+  const pane = document.querySelector<HTMLElement>("#app-shell-workspace");
+  const bounds = pane?.getBoundingClientRect();
+  return bounds && bounds.width > 0 ? { left: bounds.left, right: bounds.right, top: bounds.top } : null;
 }
 
 /** The passage the operator selected inside the document, or "". */
@@ -64,18 +65,14 @@ function selectedPassage(root: HTMLElement | null): string {
   return sel.toString().trim().slice(0, 1200);
 }
 
-function focusComposer(): void {
-  const box = document.querySelector<HTMLElement>("#app-shell-chat-box, [data-composer] textarea");
-  box?.focus();
-}
-
-function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, onClose, htmlView, onHtmlView }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
   working: Working | null;
   sheet: boolean;
   expanded: boolean;
+  canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
   htmlView: HtmlView;
@@ -85,6 +82,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
+  // A version whose size is unknown shows none, never another version's.
+  const size = info?.bytes;
   // "updating v1 → v2" only while this turn has asked to add a version to
   // this artifact and it has not landed; once it has, "updated to v2".
   // A put still waiting for its result wins, so a second put of the same
@@ -112,8 +111,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
     if (!composerKey) return;
     const passage = selectedPassage(contentRef.current);
     setComposerRefs(composerKey, [makeAskRef({ artifact: tab.id, version: tab.selected, title: tab.title, passage })]);
+    requestComposerFocus(composerKey);
     if (sheet) onClose();
-    requestAnimationFrame(focusComposer);
   };
 
   const first = Math.max(1, tab.latest - KEPT_VERSIONS + 1);
@@ -149,6 +148,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
               type="button"
               className="cv-iconbtn"
               onClick={onExpand}
+              disabled={!canExpand}
               aria-pressed={expanded}
               aria-label={t("Expand canvas")}
               title={t("Expand canvas")}
@@ -226,7 +226,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
       {image ? null : (
       <footer className="cv-foot">
         <span>
-          v{tab.selected} · {sizeLabel(info?.bytes ?? tab.bytes)}
+          v{tab.selected}{size === undefined ? "" : ` · ${sizeLabel(size)}`}
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
         {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
@@ -252,6 +252,7 @@ export default function CanvasDrawer() {
   // The width the operator dragged to wins; until then each kind has its own.
   const [dragged, setDragged] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
   // Per artifact, held here because Body remounts when the version changes.
   const [htmlViews, setHtmlViews] = useState<Record<string, HtmlView>>({});
   // The session tab (browserStore.ts) is not an artifact: it can open the drawer
@@ -271,11 +272,16 @@ export default function CanvasDrawer() {
     const mine = at === document.body || !!rootRef.current?.contains(at);
     requestAnimationFrame(() => {
       if (!mine) return;
+      const current = document.activeElement;
+      if (current !== at && current !== document.body && !rootRef.current?.contains(current)) return;
       const root = rootRef.current;
-      if (!root) return focusComposer();
+      if (!root) {
+        if (canvas.composerKey !== null) requestComposerFocus(canvas.composerKey);
+        return;
+      }
       (root.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? root).focus();
     });
-  }, []);
+  }, [canvas.composerKey]);
   const closeAll = useCallback(() => {
     handFocusOn();
     closeDrawer();
@@ -283,16 +289,28 @@ export default function CanvasDrawer() {
   }, [handFocusOn]);
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
-  const pushed = useRef(0);
+  const [canvasTop, setCanvasTop] = useState(0);
+  const [, measureWorkspace] = useState(0);
 
-  // The layout is measured from the page (the chat pane's edge), so it is
-  // recomputed after every render that could move it.
+  // A chat toggle changes the available workspace without remounting it.
+  useLayoutEffect(() => {
+    if (!open || canvas.surface !== "app") return;
+    const workspace = document.querySelector("#app-shell-workspace");
+    if (!workspace) return;
+    const observer = new ResizeObserver(() => measureWorkspace((value) => value + 1));
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  }, [open, canvas.surface]);
+
+  // Measure after layout; cover mode leaves both underlying panes unchanged.
   useLayoutEffect(() => {
     if (!open) return;
     const surface: Surface = canvas.surface;
-    const next = drawerLayout(viewport, want, surface, surface === "app" ? chatRightEdge(pushed.current) : null, expanded);
-    pushed.current = next.mode === "push" ? next.width : 0;
-    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width ? cur : next));
+    const workspace = surface === "app" ? appWorkspaceBounds() : null;
+    const next = drawerLayout(viewport, want, surface, workspace, expanded);
+    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right ? cur : next));
+    setCanvasTop(surface === "app" && next.mode === "cover" && workspace !== null ? Math.max(0, workspace.top) : 0);
+    setCanExpand(expanded || drawerLayout(viewport, want, surface, workspace, true).width > next.width);
   });
 
   // The page makes room (push) or steps aside through these two attributes.
@@ -387,9 +405,10 @@ export default function CanvasDrawer() {
       className="canvas-drawer"
       data-canvas-drawer
       data-mode={layout.mode}
+      data-surface={canvas.surface}
       aria-label={t("Canvas")}
       tabIndex={-1}
-      style={sheet ? undefined : { width: layout.width }}
+      style={sheet ? undefined : { width: layout.width, right: layout.right ?? 0, top: canvasTop }}
     >
       {!sheet && !expanded ? (
         <div
@@ -459,6 +478,7 @@ export default function CanvasDrawer() {
             working={working}
             sheet={sheet}
             expanded={expanded}
+            canExpand={canExpand}
             onExpand={() => setExpanded((x) => !x)}
             onClose={closeAll}
             htmlView={htmlViews[tab.id] ?? "rendered"}
@@ -473,6 +493,7 @@ export default function CanvasDrawer() {
           active={showBrowser}
           sheet={sheet}
           expanded={expanded}
+          canExpand={canExpand}
           onExpand={() => setExpanded((x) => !x)}
           onClose={closeAll}
         />

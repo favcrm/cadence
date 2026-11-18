@@ -7,6 +7,7 @@ import {
   bindingForSlot,
   bindingHealth,
   candidatesFor,
+  isCatalogSlot,
   plainRequirement,
   type DeclaredSlot,
 } from "./bindingChoices";
@@ -31,6 +32,7 @@ export function SlotBindings({
   digest,
   contextId,
   contextLabel,
+  privateApp,
   slots,
   bindings,
   connections,
@@ -42,6 +44,7 @@ export function SlotBindings({
   digest: string;
   contextId: string | null;
   contextLabel: string | null;
+  privateApp: boolean;
   slots: DeclaredSlot[];
   bindings: AppBinding[];
   connections: Connection[];
@@ -51,7 +54,7 @@ export function SlotBindings({
 }) {
   const t = useTranslate();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const typed = slots.filter((slot) => slot.declaration !== null);
+  const typed = slots.filter((slot) => slot.declaration !== null && !(privateApp && isCatalogSlot(slot)));
   const untyped = slots.filter((slot) => slot.declaration === null);
   if (slots.length === 0) {
     return (
@@ -60,6 +63,7 @@ export function SlotBindings({
       </p>
     );
   }
+  if (typed.length === 0 && untyped.length === 0) return null;
   // Drafts are keyed by context and slot: an unsaved choice in one
   // brand never carries into another context's save.
   const draftKey = (slot: string) => `${contextId ?? ""}::${slot}`;
@@ -103,7 +107,7 @@ export function SlotBindings({
             )}
             {binding && health === "missing-connection" && (
               <p className="wa-alert">
-                {t("Its connection ({id}) is gone — revoked or re-enrolled elsewhere. Choose another below.").replace("{id}", () => shortId(binding.config.connection_id))}
+                {t("Its connection ({id}) is gone — revoked or re-enrolled elsewhere. Choose another below.").replace("{id}", () => shortId(binding.config.connection_id ?? t("unavailable")))}
               </p>
             )}
             {binding && health === "not-configured" && (

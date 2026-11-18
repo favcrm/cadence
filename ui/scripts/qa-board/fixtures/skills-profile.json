@@ -1,0 +1,31 @@
+{
+  "row": {
+    "id": "ap_qa_writer",
+    "alias": "qa-writer",
+    "role": "Writer",
+    "team_role": "worker",
+    "catalogue": null,
+    "look": null,
+    "job": null,
+    "model": "inherit",
+    "runtimes": [],
+    "wiki_root": "agents/ap_qa_writer"
+  },
+  "profile": {
+    "id": "ap_qa_writer",
+    "name": "qa-writer",
+    "role": "Writer",
+    "responsibilities": "# Writer\n\nDraft synthetic weekly reports for the QA workspace.",
+    "skills": [
+      "weekly-report",
+      "research"
+    ],
+    "status": "active",
+    "revision": 3,
+    "created_at": 1794600000000,
+    "updated_at": 1794600000000,
+    "created_by": "usr_qa_owner",
+    "catalogue": null,
+    "model": "inherit"
+  }
+}

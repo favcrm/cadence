@@ -166,15 +166,11 @@ pub(super) fn bearer(
     target: &RemoteTarget,
     dir: &Path,
     deadline: Instant,
-    allow_login_fallback: bool,
     note: &impl Fn(&str),
+    allow_login_fallback: bool,
 ) -> Result<Option<(Credential, Source)>> {
     if slot.declined() {
-        return if allow_login_fallback {
-            Ok(None)
-        } else {
-            Err(platform_agent_required())
-        };
+        return Ok(None);
     }
     let at = now()?;
     if let Some(cached) = read_cached(slot, target, at) {
@@ -186,9 +182,10 @@ pub(super) fn bearer(
             let _ = write_cache(slot, &cred);
             Ok(Some((*cred, Source::Minted)))
         }
-        Minted::Keep(_) if !allow_login_fallback => Err(platform_agent_required()),
         Minted::Keep(why) => {
-            slot.keep_login(note, why);
+            if allow_login_fallback {
+                slot.keep_login(note, why);
+            }
             Ok(None)
         }
     }

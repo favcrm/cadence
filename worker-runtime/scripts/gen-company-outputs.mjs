@@ -7,7 +7,6 @@
  * lookup because hosted cannot act on them. `bun run build` regenerates this file, so CI's
  * clean-dist check fails a skill edit that did not rebuild the runtime.
  */
-import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,15 +48,9 @@ function renderCompanyOutputs() {
       path: `references/${file}`,
       content: hostedText(file, readFileSync(join(source, "references", file), "utf8")),
     }));
-  const digest = createHash("sha256")
-    .update(JSON.stringify({ description, body, resources }))
-    .digest("hex")
-    .slice(0, 16);
-  const skill = { name, version: digest, description, body, resources };
+  const skill = { name, description, body, resources };
   return `// Generated from skills/company-outputs by scripts/gen-company-outputs.mjs. Do not edit.
 import type { SkillManifest } from "agents/skills";
-
-export const COMPANY_OUTPUTS_FINGERPRINT = ${JSON.stringify(`tenant-company-outputs-${digest}`)};
 
 export const COMPANY_OUTPUTS_SKILL = ${JSON.stringify(skill, null, 2)} as unknown as SkillManifest["skills"][number];
 `;

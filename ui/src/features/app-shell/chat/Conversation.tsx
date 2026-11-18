@@ -19,6 +19,7 @@ import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, 
 import { resources, threadReader } from "../../../lib/resources";
 import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
+import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
@@ -52,8 +53,10 @@ import {
   rowPaintKey,
   settlePending,
   stepSummary,
+  clockRuns,
   threadItems,
   threadRuns,
+  turnStartMs,
   visibleWindow,
   type PendingAttachment,
   type ThreadItem,
@@ -104,6 +107,8 @@ import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
 import ConversationDecisions from "./ConversationDecisions";
+import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
+import { StagedSourceContext } from "../../../ui/StagedChip";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -229,8 +234,9 @@ export interface AppPaneProps {
   /** Refresh the live projection after the native endpoint refuses upload. */
   onFileUploadUnavailable: () => void;
   collapsed: boolean;
-  /** A decision is waiting for this person; the shell keeps the rail visible. */
+  /** A decision is waiting for this person; the shell can reveal the assistant. */
   onPendingDecision?: (pending: boolean) => void;
+  onWaitingChange?: (waiting: boolean) => void;
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
@@ -265,6 +271,7 @@ function HomeList({
 }: HomeListProps) {
   const { t } = useLocale();
   const runs = useMemo(() => threadRuns(items), [items]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
   // Only a transcript with no answer kind anywhere predates the mapper. A
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
@@ -445,6 +452,8 @@ function HomeList({
           <li className={`min-w-0 space-y-4${live && !turnKey.has(run.key) ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
+              startedAt={turnStartMs(items, run.items)}
+              clock={clocks.has(run.key)}
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
@@ -667,7 +676,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
   const { locale, t, formatNumber } = useLocale();
   const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
@@ -680,6 +689,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const thread = useResource(store);
   const homeMasterState = useQuery(resources.masterState);
   const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  const entries = thread.data?.entries ?? [];
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
+  const onPendingDecision = useCallback(
+    (pending: boolean) => reportPendingDecision?.(pending || permissionPending),
+    [reportPendingDecision, permissionPending],
+  );
   // Hosted turn state belongs to the selected session, just like identity.
   // Native retains the install-wide coordinator queue.
   const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
@@ -709,8 +725,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   }, []);
   const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
   const operationPending = operationState?.scope === operationScope && operationState.pending;
-  const stagedPending = hosted && viewer.operator === true && !viewer.readOnly && convId !== null &&
-    stagedState?.conversation === convId && stagedState.pending;
+  const decisionsOn = hosted && viewer.operator === true && !viewer.readOnly && convId !== null;
+  // CAD-2364: one store for this conversation's decisions and its answers' chips.
+  // Held in state, not a memo React may drop: a new conversation gets a new store, a re-render never does.
+  const [decisionHold, setDecisionHold] = useState<{ conversation: string; store: DecisionsStore } | null>(null);
+  const decisionStore = !decisionsOn || convId === null
+    ? null
+    : decisionHold?.conversation === convId
+      ? decisionHold.store
+      : null;
+  useEffect(() => {
+    if (decisionsOn && convId !== null && decisionHold?.conversation !== convId)
+      setDecisionHold({ conversation: convId, store: conversationDecisions(convId) });
+  }, [decisionsOn, convId, decisionHold]);
+  const stagedPending = decisionsOn && stagedState?.conversation === convId && stagedState.pending;
   useEffect(() => {
     onPendingDecision?.(operationPending || stagedPending);
   }, [onPendingDecision, operationPending, stagedPending]);
@@ -1232,16 +1260,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ? t("The conversations could not be read — retry above")
           : t("No conversation yet — start one with + New");
   const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
-  // Waiting dot: the selected conversation grew while the rail was collapsed.
+  // Waiting dot: the selected conversation grew while chat was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
   const waiting = collapsed && items.length > seen.current;
+  useEffect(() => { onWaitingChange?.(waiting); }, [onWaitingChange, waiting]);
   // The turn bar (turnBar.ts, shared with Home): Stop carries this
   // conversation's own running message; Cancel its own queued message.
-  const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
-  const permissionPending = pendingPermission !== null;
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -1758,6 +1784,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // last owns the typing dots, and only the segment carrying the answer says
   // anything about completion.
   const runs = useMemo(() => threadRuns(shown), [shown]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
   // A transcript with no answer kind anywhere predates the mapper: its last
   // worker note is what the operator read as the reply (same rule as Home).
   const legacyTranscript = useMemo(() => items.every((item) => item.type !== "answer"), [items]);
@@ -1954,6 +1981,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const canReplyDraft = canSend && binding.error === null;
   const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const revealComposer = useCallback(() => onCollapsed(false), [onCollapsed]);
   const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
   const rejectAndReplyDraft = useCallback(
     (command: string) => {
@@ -1971,17 +1999,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
     <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
-      <button
-        type="button"
-        className="btn btn-ghost btn-sm app-chat-rail"
-        aria-label={t("Expand assistant chat")}
-        aria-expanded={!collapsed}
-        onClick={() => onCollapsed(false)}
-        data-waiting={waiting || undefined}
-      >
-        {waiting && <span className="app-chat-dot" role="status" aria-label={t("New reply waiting")} />}
-        <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
-      </button>
       <div className="app-chat-head">
         <div
           className="app-chat-title min-w-0"
@@ -2052,17 +2069,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
-            className="app-chat-iconbtn app-chat-collapse"
+            className="app-chat-iconbtn app-chat-close"
             aria-label={t("Collapse assistant chat")}
             title={t("Collapse assistant chat")}
-            aria-expanded={!collapsed}
             onClick={() => onCollapsed(true)}
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="3.5" y="4" width="17" height="16" rx="2.5" />
-              <path d="M9.5 4v16" />
-              <path d="m16 15-3-3 3-3" />
-            </svg>
+            <IconClose size={14} />
           </button>
         </div>
         {historyOpen && active.state === "ready" && (
@@ -2182,6 +2194,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
+      <StagedSourceContext.Provider value={decisionStore}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2242,6 +2255,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                           >
               <ThreadTurn
                 items={safe}
+                startedAt={turnStartMs(shown, view.run.items)}
+                clock={clocks.has(view.run.key)}
                 density={density}
                 head={view.head}
                 continued={view.continued}
@@ -2327,9 +2342,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </StagedSourceContext.Provider>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
-      {hosted && convId !== null && viewer.operator === true && !viewer.readOnly && (
-        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
+      {decisionsOn && convId !== null && decisionStore !== null && (
+        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
@@ -2484,6 +2500,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         stop={canStop ? { onStop: () => { if (runningMessage) turnCommand("stop", runningMessage); } } : null}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
+        onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
         onCommand={(name, arg) => {

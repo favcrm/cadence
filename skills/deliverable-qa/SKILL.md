@@ -129,19 +129,21 @@ screenshots of what you judged, named `NN-<what>-<width>.png`.
 ## Filing the result
 
 **A software PR (`ui/**` and other UI changes)**
-1. Post the full report as one PR comment, first line
+1. Give the full report to the dispatcher if your review role is read-only;
+   otherwise post it as one PR comment, first line
    `Browser QA of PR <n> at <full sha>: PASS` (or `: FAIL`).
-2. Only on a pass, post a second, separate comment whose whole body is exactly
-   these two lines and nothing else, and never edit it afterwards:
+2. Only on a pass, the authorized filer posts a second, separate comment
+   whose whole body is exactly these two lines and never edits it. A read-only
+   reviewer sends the result to the dispatcher to post:
 
    ```
    Browser QA: pass
    Head: <full 40-hex sha>
    ```
 
-   The merge gate (`scripts/enqueue-reviewed`, `--browser-qa <url>`) counts only
-   an unedited comment by a repository member that is exactly those two lines
-   for the exact head it merges. A new commit needs a new QA run.
+   Follow the repository's gate for who may count that comment. On a hosted
+   Cadence PR, the author's pass needs the operator's exact-head approval;
+   see `docs/guides/hosted-workspace.md`. A new commit needs new QA evidence.
 3. A fail is the report only, with steps to reproduce each failure.
 
 **Any other deliverable**

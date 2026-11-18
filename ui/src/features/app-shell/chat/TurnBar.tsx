@@ -244,7 +244,7 @@ export function TurnBar({
     }
     case "failed":
       title = t("Failed");
-      detail = state.reason;
+      detail = t(state.reason);
       controls = actions.onRetry ? button("Retry", actions.onRetry) : null;
       break;
     case "stopped":

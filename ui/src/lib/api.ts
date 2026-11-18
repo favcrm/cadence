@@ -19,6 +19,8 @@ import type {
   AgentProfileBody,
   HiredProfile,
   StoredAgentProfile,
+  WorkspaceSkillRead,
+  WorkspaceSkillSummary,
   AgentRolesPayload,
   InstructionsResult,
   AgentsPayload,
@@ -1175,6 +1177,23 @@ export const api = {
    *  was read at. Owner only; a stale revision answers 409. */
   saveAgentProfile: (id: string, body: object) =>
     post<{ profile: StoredAgentProfile }>(`/api/agent-profiles/${encodeURIComponent(id)}`, body),
+  /** `GET /api/workspace-skills` (CAD-2419) - the hosted workspace skill
+   *  library. Any member; a board without it answers 404 or 501. */
+  workspaceSkills: () => get<{ skills: WorkspaceSkillSummary[] }>("/api/workspace-skills"),
+  /** `GET /api/workspace-skills/<name>[?revision=N]` - one revision, the latest by default. */
+  workspaceSkill: (name: string, revision?: number) =>
+    get<WorkspaceSkillRead>(
+      `/api/workspace-skills/${encodeURIComponent(name)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  /** `POST /api/workspace-skills/<name>/approve` - owner only: exactly the revision read, by its digest. */
+  approveWorkspaceSkill: (name: string, revision: number, digest: string) =>
+    post<{ skill: WorkspaceSkillSummary }>(`/api/workspace-skills/${encodeURIComponent(name)}/approve`, { revision, digest }),
+  /** `POST /api/workspace-skills/<name>/revoke` - owner only: the approval read, by its digest. */
+  revokeWorkspaceSkill: (name: string, digest: string) =>
+    post<{ skill: WorkspaceSkillSummary }>(`/api/workspace-skills/${encodeURIComponent(name)}/revoke`, { digest }),
+  /** `POST /api/workspace-skills/<name>/delete` - owner only: an unapproved skill, at its latest revision. */
+  deleteWorkspaceSkill: (name: string, expectedRevision: number) =>
+    post<{ name: string; deleted: true }>(`/api/workspace-skills/${encodeURIComponent(name)}/delete`, { expectedRevision }),
   /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the

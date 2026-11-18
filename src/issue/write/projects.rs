@@ -301,18 +301,16 @@ pub fn project_add(
 /// The one refusal sentence for private, shared by every writer so the CLI,
 /// the daemon and the board cannot describe the gate differently.
 pub const PRIVATE_UNAVAILABLE: &str =
-    "private projects are not available yet — the isolation gate \
-     has not passed; only workspace-visible can be recorded";
+    "private projects are not available on this install: local agents can \
+     read every project's files on disk, so only workspace-visible can be recorded";
 
-/// May this build record `private` (CAD-1950, AOS-274 / SEC-006)?
+/// May this build record `private` (AOS-274 / SEC-006)?
 ///
-/// The isolation gate stays closed until CAD-1950 records, per enforcement
-/// path, a test proving a non-granted caller is served nothing:
-/// `project_policy::readable` and `refused` for listings and single rows,
-/// `retain_overview` for the overview payload, and `reads_every_project`
-/// for the shared live stream (which is one un-filterable model, so a
-/// caller who cannot read every project is refused live updates rather
-/// than served filtered frames).
+/// Stays `false` until (a) every board, daemon and hosted-CLI read path has a
+/// test proving a non-granted caller is served nothing (CAD-2187), and (b)
+/// local agents cannot read the tracker except through policy-gated daemon
+/// reads (CAD-2216, the open design decision). The board's live stream
+/// already filters by `project_policy::readable` (CAD-2215).
 ///
 /// It is one function on purpose: `set_project_policy`, `project new` and
 /// the board's Settings page read the same answer, so flipping it is one
@@ -338,7 +336,7 @@ pub fn set_project_policy(
     // slash must never become a path outside the tracker.
     let key = crate::issue::model::check_key(key)?;
     if visibility == project::Visibility::Private && !private_available() {
-        return Err(Error::rejected(PRIVATE_UNAVAILABLE));
+        return Err(Error::invalid("private_unavailable", PRIVATE_UNAVAILABLE));
     }
     let dir = project_dir(pm, &key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;

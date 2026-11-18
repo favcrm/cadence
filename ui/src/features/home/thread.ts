@@ -1,4 +1,5 @@
 import type { SseEvent } from "../../lib/sse";
+import { answeredData, parse, walk } from "./formModel";
 
 /**
  * The master's thread as the Home screen holds it (CAD-328): the stored
@@ -334,9 +335,26 @@ export function discardPending(state: ThreadState | null, message: string): Thre
   return { ...base, pending: base.pending.filter((p) => p.message !== message) };
 }
 
+/** CAD-2362: whether an operator message answers a form whose card reads
+ *  the answer (`answeredData(...).known`) — the one condition under which
+ *  the card shows the values the message would otherwise repeat. */
+function formAnswerShown(entry: ThreadEntry, surfaces: Map<string, ThreadEntry>): boolean {
+  const refs = entry.payload?.refs;
+  if (!Array.isArray(refs)) return false;
+  for (const ref of refs) {
+    if (!ref || typeof ref !== "object" || (ref as { kind?: unknown }).kind !== "surface") continue;
+    const form = surfaces.get(String((ref as { id?: unknown }).id));
+    const surface = form ? parse(form) : null;
+    if (surface && answeredData(walk(surface.comps), surface.data, entry.text).known) return true;
+  }
+  return false;
+}
+
 /** What the thread view renders, in order. */
 export type ThreadItem =
-  | { type: "operator"; key: string; entry: ThreadEntry }
+  /** `formShown` (CAD-2362): this message answers a form whose card can show
+   *  the answered values, so the message reads as a one-line receipt. */
+  | { type: "operator"; key: string; entry: ThreadEntry; formShown?: boolean }
   | { type: "system"; key: string; entry: ThreadEntry }
   | { type: "thinking"; key: string; entry: ThreadEntry }
   | { type: "commentary"; key: string; entry: ThreadEntry }
@@ -358,7 +376,8 @@ export type FormStatus =
   | { state: "open" }
   | { state: "sending" }
   | { state: "failed"; pending: PendingMessage }
-  | { state: "sent"; at: string | null }
+  /** `answer` is the citing message's text, which carries the A2UI action. */
+  | { state: "sent"; at: string | null; answer: string }
   | { state: "closed" };
 
 const answers = (refs: unknown, seq: number): boolean =>
@@ -369,7 +388,7 @@ export function formStatus(seq: number, entries: ThreadEntry[], pending: Pending
   let closed = false;
   for (const e of entries) {
     if (e.seq <= seq || e.role !== "operator") continue;
-    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null };
+    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null, answer: e.text };
     closed = true;
   }
   const own = pending.find((p) => answers(p.refs, seq));
@@ -400,9 +419,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     items.push(...held);
     held = [];
   };
+  const surfaces = new Map<string, ThreadEntry>();
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
     const card = cardType(entry.kind);
+    if (entry.kind === "surface") surfaces.set(String(entry.seq), entry);
     // CAD-2285: the form is written inside its `ask-form` tool call, so it
     // waits for the run to end like any other card.
     const form: ThreadItem | null =
@@ -449,7 +470,7 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       // A generated video's block: a job id and a shape, never the video.
       items.push({ type: "video", key, entry });
     } else if (entry.role === "operator") {
-      items.push({ type: "operator", key, entry });
+      items.push(formAnswerShown(entry, surfaces) ? { type: "operator", key, entry, formShown: true } : { type: "operator", key, entry });
     } else {
       items.push({ type: "system", key, entry });
     }
@@ -523,6 +544,45 @@ export function itemMessage(item: ThreadItem): string | null {
   if (item.type === "pending") return item.pending.message;
   if (item.type === "tools") return item.entries.find((e) => e.message)?.message ?? null;
   return item.entry.message ?? null;
+}
+
+/**
+ * CAD-2363: when a turn started (epoch ms) — the time of its own send, the
+ * operator or pending row whose message id the turn's rows carry. A queued
+ * row between the send and the turn, or inside it, is never the start, and a
+ * turn whose rows carry no message id (or whose send is out of the window)
+ * has none: its head then counts from its own first entry.
+ */
+export function turnStartMs(items: ThreadItem[], runItems: ThreadItem[]): number | null {
+  const message = runItems.map(itemMessage).find((m) => m !== null) ?? null;
+  if (message === null) return null;
+  for (let i = items.indexOf(runItems[0]) - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type !== "operator" && item.type !== "pending") || itemMessage(item) !== message) continue;
+    if (item.type === "pending") return Number.isFinite(item.pending.at) ? item.pending.at : null;
+    const ms = item.entry.created ? Date.parse(item.entry.created) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/**
+ * CAD-2363: the turn runs that carry a send's clock — the first run of each
+ * message. A queued row can split one turn into segments; only its first
+ * shows the live clock, so a turn never shows two. A run with no message id
+ * is its own first.
+ */
+export function clockRuns(runs: ThreadRun[]): Set<string> {
+  const seen = new Set<string>();
+  const out = new Set<string>();
+  for (const run of runs) {
+    if (!run.turn) continue;
+    const message = run.items.map(itemMessage).find((m) => m !== null) ?? null;
+    if (message !== null && seen.has(message)) continue;
+    if (message !== null) seen.add(message);
+    out.add(run.key);
+  }
+  return out;
 }
 
 /** React key for a user row. The optimistic pending row and the stored

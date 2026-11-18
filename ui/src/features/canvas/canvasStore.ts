@@ -27,7 +27,9 @@ export interface ArtifactRef {
   version: number;
   kind: ArtifactKind;
   title: string;
-  bytes: number;
+  /** Absent when the opener does not know this version's size (CAD-2286: a
+   *  document opened at an older version than the one its list row names). */
+  bytes?: number;
   digest?: string;
   /** A generated image's shape (`16:9`), shown on its overlay; absent otherwise. */
   aspect?: string;
@@ -35,7 +37,7 @@ export interface ArtifactRef {
 
 /** What the board knows of one stored version (from its thread card). */
 export interface VersionInfo {
-  bytes: number;
+  bytes?: number;
   digest?: string;
 }
 
@@ -43,7 +45,8 @@ export interface CanvasTab {
   id: string;
   kind: ArtifactKind;
   title: string;
-  bytes: number;
+  /** Absent when the version that opened the tab had no known size. */
+  bytes?: number;
   aspect?: string;
   /** The newest version the thread has announced. */
   latest: number;
@@ -364,56 +367,46 @@ export function writeWidth(px: number): void {
 export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
 export const CHAT_MIN = 320;
-/** The least an expand must add to be worth it (else it covers the chat). */
-const EXPAND_GAIN = 96;
 /** What the chat keeps when the canvas is expanded: a narrow strip. The chat
  *  panel is inset 32px, so 96px leaves about 64px of it showing. */
 export const CHAT_STRIP = 96;
 const SIDEBAR = 208;
-/** The app chat pane's right edge on a tablet with the canvas open: 1rem page
- *  padding + the 22rem column `app-shell.css` gives it. */
-export const APP_TABLET_CHAT_RIGHT = 16 + 352;
 
 export interface DrawerLayout {
   mode: CanvasMode;
   width: number;
+  /** App canvases end before the right-docked assistant. Home stays flush right. */
+  right?: number;
 }
 
 /**
- * The mockup's per-surface rule: push while the chat keeps its room (Home:
- * the chat's 320px; the app shell: the chat plus 20rem of app area). When it
- * does not fit, cover stops short of the chat — on Home it keeps the chat's
- * first 320px, in the app shell it ends at the chat pane's right edge
- * (`chatRight`, the pane's right edge with no drawer padding). If that leaves
- * less than the minimum width, the drawer is a full-screen sheet instead.
+ * App canvases cover the workspace without resizing its frame or the right
+ * assistant. Narrow app views use a sheet. Home retains its push/cover rule.
  */
 export function drawerLayout(
   viewport: number,
   want: number,
   surface: Surface,
-  chatRight: number | null,
+  workspace: { left: number; right: number } | null,
   expanded = false,
 ): DrawerLayout {
-  if (viewport < SHEET_BELOW) return { mode: "sheet", width: viewport };
+  if (viewport < SHEET_BELOW || (surface === "app" && viewport < 1024)) {
+    return { mode: "sheet", width: viewport };
+  }
+  if (surface === "app" && workspace !== null) {
+    const room = workspace.right - workspace.left;
+    if (room < MIN_WIDTH) return { mode: "sheet", width: viewport };
+    return { mode: "cover", width: expanded ? room : Math.min(want, room), right: Math.max(0, viewport - workspace.right) };
+  }
   const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
   if (expanded) {
-    // Expand: cover, taking most of the page, leaving a narrow strip of chat.
-    // The app shell stops at the chat pane's right edge while that is wider
-    // than the drawer already is; when it is not, expand would do nothing,
-    // so it covers the chat down to the strip as Home does.
-    const edge = surface === "app" && viewport < 1024 ? APP_TABLET_CHAT_RIGHT : chatRight;
-    const edgeRoom = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_STRIP;
-    const room = edgeRoom >= drawerLayout(viewport, want, surface, chatRight).width + EXPAND_GAIN ? edgeRoom : main - CHAT_STRIP;
+    const room = main - CHAT_STRIP;
     return room < MIN_WIDTH ? { mode: "sheet", width: viewport } : { mode: "cover", width: room };
   }
   const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;
   if (main - want >= need) return { mode: "push", width: want };
-  // Without a chat pane in the page (the operator navigated away from an app
-  // conversation) there is no edge to stop at: use the page-based cap.
-  // Tablet app shell: the board narrows the chat pane while the canvas is open
-  // (app-shell.css, `[data-canvas]`), so its edge is known without measuring.
-  const edge = surface === "app" && viewport < 1024 ? APP_TABLET_CHAT_RIGHT : chatRight;
-  const cap = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_MIN - 28;
+  // Without an app workspace, retain the page-based cap.
+  const cap = main - CHAT_MIN - 28;
   if (cap < MIN_WIDTH) return { mode: "sheet", width: viewport };
   return { mode: "cover", width: Math.min(want, cap) };
 }

@@ -495,6 +495,7 @@ fn start_with_history_fault(
     enroll: bool,
     member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
 ) -> Rig {
+    block_sigchld();
     let dir = tempfile::Builder::new()
         .prefix("c1380-http")
         .tempdir()

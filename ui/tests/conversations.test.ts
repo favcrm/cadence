@@ -1,9 +1,12 @@
+/// <reference lib="es2024.promise" />
 import "fake-indexeddb/auto";
 import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
 import type * as ConversationModule from "../src/features/app-shell/chat/Conversation";
 import type { MasterState } from "../src/lib/types";
+import type * as CanvasStoreModule from "../src/features/canvas/canvasStore";
+import type * as ComposerStoreModule from "../src/features/app-shell/chat/composerStore";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -37,11 +40,23 @@ const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof 
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellComponent = require("../src/features/app-shell/AppShell").default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null,
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
+const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
+const { canvasSnapshot, openArtifact, closeTab } = require("../src/features/canvas/canvasStore") as typeof CanvasStoreModule;
+const { composerDraftState, setComposerContent } = require("../src/features/app-shell/chat/composerStore") as typeof ComposerStoreModule;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(React.Fragment, null,
+        React.createElement("nav", { ref: setBreadcrumbs }),
+        React.createElement("div", { ref: setActions }),
+        React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } }),
+        React.createElement(CanvasDrawer)) }));
+};
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList, readChatCollapsedChoice } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
@@ -55,6 +70,8 @@ const convs: Record<string, any[]> = {
   "install-crm": [conv("c-gen", { is_general: true }), conv("c-camp", { subject: "campaign:cmp-1", title: "Spring launch" })],
   "install-other": [conv("o-gen", { is_general: true })],
   "install-social": [conv("s-gen", { is_general: true }), conv("s-full", { title: "Has messages" })],
+  "install-native-approval": [conv("native-gen", { is_general: true })],
+  "install-native-approval-other": [conv("native-other-gen", { is_general: true })],
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
@@ -65,11 +82,14 @@ const threads: Record<string, any[]> = {
   "o-gen": [],
   "s-gen": [],
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
+  "native-gen": [],
+  "native-other-gen": [],
 };
 let turn: any = null;
 // CAD-1700: the master queue in delivery order, and the board commands posted.
 let queue: { message: string; conversation: string | null }[] = [];
 let operations: unknown[] = [];
+let nativePermissionPending = false;
 let controlledTranscript = false;
 let holdReconnect = false;
 let disconnectTranscript: (() => void) | null = null;
@@ -155,7 +175,15 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
-  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [{ id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] }] });
+  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [
+    { id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] },
+    ...(nativePermissionPending ? [
+      { id: "permission-native", status: "pending", command: "echo preview", cwd: null, reason: "Review this command", risk: "low", prefix: [] },
+      { id: "permission-native-other", status: "pending", command: "echo other", cwd: null, reason: "Review the other command", risk: "low", prefix: [] },
+    ] : []),
+  ] });
+  if (url.pathname === "/api/artifacts/focus-doc/1")
+    return new Response("A synthetic canvas document.", { headers: { "Content-Type": "text/markdown" } });
   if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
   if (url.pathname.endsWith("/assistant/operations"))
     return heldOperations === null ? json({ operations }) : new Promise<Response>((resolve) => heldOperations!.push(resolve));
@@ -271,6 +299,118 @@ const barButton = (label: string) =>
 const stopButton = () => host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]');
 const typingBubble = () => host.querySelector('[data-kind="typing"]');
 await pick("Spring launch");
+
+// A native request opens an untouched default; explicit choices remain authoritative.
+{
+  const previousViewport = win.innerWidth;
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await mount("install-native-approval");
+  await React.act(async () => { await resources.masterState.refresh(); });
+  const disclosure = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
+  equal(disclosure.getAttribute("aria-expanded"), "false", "a fresh app starts with the default collapsed choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&appview=new"); });
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation leaves the default collapse choice untouched");
+  await React.act(async () => {
+    nativePermissionPending = true;
+    threads["native-gen"].push({
+      ...ent(1, "system", "message", "Permission requested (permission-native, risk low): echo preview", null),
+      payload: { source: "permission" },
+    });
+    await conversationThread("native-gen").refresh();
+  });
+  equal(disclosure.getAttribute("aria-expanded"), "true", "a native permission request reveals its approval controls");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a"); });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "content navigation reveals the narrow workspace even with a pending decision");
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation does not persist a collapse over the pending decision");
+  threads["native-other-gen"].push({
+    ...ent(1, "system", "message", "Permission requested (permission-native-other, risk low): echo other", null),
+    payload: { source: "permission" },
+  });
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "the other app reveals its own pending permission");
+  await mount("install-native-approval");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "returning to a cached pending app reveals its approval");
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "switching between two cached pending apps reveals the current approval");
+  await mount("install-native-approval");
+  await React.act(async () => { disclosure.click(); });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "an explicit collapse still wins over a pending request");
+  await React.act(async () => {
+    nativePermissionPending = false;
+    const { noteMasterChanged } = require("../src/lib/masterChanged");
+    noteMasterChanged();
+    await resources.masterState.refresh();
+  });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "resolving the request preserves the explicit choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen"); });
+  equal(disclosure.getAttribute("aria-expanded"), "true", "a conversation link reveals the assistant despite a saved collapse");
+  equal(readChatCollapsedChoice("install-native-approval"), true, "opening a conversation link does not overwrite the saved preference");
+  for (const width of [390, 1440]) {
+    await React.act(async () => { root.render(null); });
+    history.pushState(null, "", "/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: width, configurable: true, writable: true });
+      win.dispatchEvent(new win.PopStateEvent("popstate"));
+      root.render(React.createElement(AppShell, { installId: "install-native-approval", viewer: { operator: true, readOnly: false } }));
+    });
+    await settle();
+    equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "true", `a direct conversation link opens the assistant at ${width}px`);
+    equal(readChatCollapsedChoice("install-native-approval"), true, "a direct conversation link preserves the saved collapse");
+  }
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await mount("install-crm");
+  await pick("Spring launch");
+}
+
+// Canvas Ask to change opens the owning app composer before focusing it,
+// keeping the draft and reference without sending a message.
+{
+  const beforeCanvas = canvasSnapshot();
+  const key = beforeCanvas.composerKey;
+  assert(key && beforeCanvas.conversation === "c-camp", "the active pane publishes its own composer binding");
+  const before = composerDraftState(key);
+  const previousWidth = win.innerWidth;
+  const sendsBefore = messagePosts.length;
+  const originalBox = box();
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "Keep this canvas draft");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+    (host.querySelector(".app-header-assistant") as HTMLButtonElement).click();
+    Object.defineProperty(win, "innerWidth", { value: 375, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+    openArtifact({ id: "focus-doc", version: 1, kind: "md", title: "Focus document", bytes: 28 });
+  });
+  const drawer = host.querySelector('.canvas-drawer[data-mode="sheet"]');
+  assert(drawer, "a narrow app canvas is a sheet");
+  equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "false", "the canvas began over collapsed chat");
+  const ask = Array.from(drawer.querySelectorAll<HTMLButtonElement>("button")).find((b) => b.textContent === "Ask to change");
+  assert(ask && !ask.disabled, "the document offers Ask to change");
+  await React.act(async () => { ask.click(); });
+  await React.act(async () => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    requestAnimationFrame(() => resolve());
+    await promise;
+  });
+  assert(!host.querySelector(".canvas-drawer"), "the sheet closes for the edit request");
+  equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "true", "Ask to change reveals the assistant");
+  assert(box() === originalBox && document.activeElement === originalBox, "the existing composer receives focus");
+  equal(box().value, "Keep this canvas draft", "the edit request preserves the typed draft");
+  assert(composerDraftState(key).refs.some((ref) => ref.kind === "artifact"), "the composer retains the document reference");
+  equal(messagePosts.length, sendsBefore, "Ask to change never sends");
+  await React.act(async () => {
+    closeTab("focus-doc");
+    setComposerContent(key, before.text, before.refs);
+    Object.defineProperty(win, "innerWidth", { value: previousWidth, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+}
+
 turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
@@ -478,7 +618,7 @@ await pick("Spring launch");
 // CAD-1810: an app page may open with the assistant collapsed (unless a
 // decision is waiting); this test needs the pane visible.
 if (host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed")) {
-  await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
 }
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the assistant is visible for this check");
@@ -501,11 +641,11 @@ await settle();
 equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
-await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "CRM chat collapses");
 await mount("install-other");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app opens with its own assistant collapsed");
-await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat expands independently");
 equal(await optionLabels(), ["General"], "another app lists only its own conversations");
@@ -532,7 +672,7 @@ assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed
     return fixtureFetch(input as RequestInfo | URL, init);
   }) as typeof fetch;
   try {
-    await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await settle();
     await React.act(async () => { await conversationList("install-crm").refresh(); });
     await settle();

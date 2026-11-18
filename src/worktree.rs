@@ -263,8 +263,11 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
 /// Git runs pre-push hooks with GIT_DIR already pointed at the
 /// worktree's git dir and cwd at the worktree root, so the receipt and
-/// `scripts/boat-build` both resolve per-lane. The check plan runs in
-/// this worktree's Boat sandbox so the shared host does not compile; the receipt
+/// `scripts/boat-build` both resolve per-lane. With `scripts/boat-build` the
+/// check plan runs in this worktree's Boat sandbox so the shared host does not
+/// compile; a repository without it runs its own `scripts/pre-push` on the
+/// host like a git hook — git's arguments, the ref lines on stdin and
+/// `CADENCE_PRE_PUSH_MODE=repo` (CAD-2403). The receipt
 /// records the checked head, base, sandbox and result under this
 /// worktree's git dir. Required CI, review and approval remain
 /// authoritative. A `--no-verify` push leaves no receipt, which is the
@@ -272,10 +275,12 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// pushed HEAD on a clean tree when the last receipt says rc=0 and
 /// `tree=clean` for it (CAD-2341); any other receipt runs the plan.
 const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
-# CAD-1909: run scripts/pre-push in a Boat sandbox; the shared host does not
-# compile. A missing Boat CLI or helper refuses the push rather than falling
-# back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit emergency
-# path and runs the same plan on this host.
+# CAD-1909: run scripts/pre-push in a Boat sandbox through scripts/boat-build;
+# the shared host does not compile. A missing Boat CLI refuses the push rather
+# than falling back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit
+# emergency path and runs the same plan on this host. CAD-2403: a repository
+# without scripts/boat-build runs its own scripts/pre-push here instead, as a
+# git hook would (CADENCE_PRE_PUSH_MODE=repo).
 top=$(git rev-parse --show-toplevel) || exit 1
 gd=$(git rev-parse --absolute-git-dir) || exit 1
 cd "$top" || exit 1
@@ -293,8 +298,11 @@ lane=${CADENCE_ALIAS:-$USER}
 # refuse a multi-head push rather than checking only one of them.
 pushed=
 saw_ref=
+refs=
 while read -r local_ref local_sha remote_ref remote_sha; do
     saw_ref=1
+    refs="$refs$local_ref $local_sha $remote_ref $remote_sha
+"
     case "$local_sha" in
         *[!0]*) ;;
         *) continue ;;
@@ -308,6 +316,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     esac
 done
 if [ "$pushed" = multiple ]; then
+    echo "pre-push: refusing a push of several heads at once; push one branch at a time" >&2
     printf 'head=%s lane=%s mode=boat steps=refused:multiple-heads rc=1 at=%s\n' \
         "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 1
@@ -347,13 +356,30 @@ if [ -z "${PRE_PUSH_TESTS:-}" ] && [ "$pushed" = "$head" ] && [ -n "$tree_clean"
     prev=$(tail -n 1 "$out" 2>/dev/null)
     case "$prev" in
         *steps=skipped*|*steps=refused*) ;;
-        "head=$head "*" patch=$EMPTY_PATCH "*" rc=0 "*" tree=clean" | "head=$head lane="*" kind="*" rc=0 "*" tree=clean")
+        "head=$head "*" patch=$EMPTY_PATCH "*" rc=0 "*" tree=clean" | "head=$head lane="*" kind="*" rc=0 "*" tree=clean" | "head=$head lane="*" mode=repo rc=0 "*" tree=clean")
             echo "pre-push: recorded clean pass for $head; not re-running the plan"
             exit 0 ;;
     esac
 fi
-if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
+if [ ! -x scripts/boat-build ]; then
+    # CAD-2403: a repository without a sandbox helper runs its own
+    # scripts/pre-push here, like a git hook: git's remote name and URL as
+    # arguments and the ref lines on stdin, plus CADENCE_PRE_PUSH_MODE=repo.
+    # It checks the working tree, so the pushed commit must be HEAD. The hook
+    # writes the receipt itself.
+    commit=$(git rev-parse --verify -q "$pushed^{commit}" 2>/dev/null) || commit=$pushed
+    if [ "$commit" != "$head" ]; then
+        echo "pre-push: the pushed commit is not HEAD; check out the commit you push and push again" >&2
+        printf 'head=%s lane=%s mode=repo steps=refused:head-mismatch rc=1 at=%s\n' \
+            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+        exit 1
+    fi
+    printf '%s' "$refs" | CADENCE_PRE_PUSH_MODE=repo scripts/pre-push "$@"
+    rc=$?
+    line="head=$head lane=$lane mode=repo rc=$rc at=$(date +%s)"
+elif [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     if [ "$pushed" != "$head" ]; then
+        echo "pre-push: the pushed commit is not HEAD; check out the commit you push and push again" >&2
         printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
             "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
         exit 1
@@ -365,11 +391,6 @@ if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
     printf '%s\n' "$output" >&2
     line=$(printf '%s\n' "$output" | tail -n 1)
 else
-    if [ ! -x scripts/boat-build ]; then
-        printf 'head=%s lane=%s mode=boat steps=refused:no-boat-build rc=1 at=%s\n' \
-            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
-        exit 1
-    fi
     output=$(scripts/boat-build --receipt --head "$pushed" ${PRE_PUSH_TESTS:+--tests})
     rc=$?
     line=$(printf '%s\n' "$output" | tail -n 1)
@@ -1451,5 +1472,241 @@ mod tests {
         )
         .unwrap();
         assert_eq!(effective_target_dir(&repo), PathBuf::from("/mine"));
+    }
+
+    // ---- CAD-2403: the installed lane pre-push hook, run as a script ----
+
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+    const EMPTY_PATCH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Commit an executable script at `scripts/<name>` in the repo.
+    fn commit_script(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join("scripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", &format!("add {name}")]);
+    }
+
+    /// A fake `scripts/pre-push` recording argv (one arg per line, plus a
+    /// marker line per run) under `rec` (outside the repo, so the tree
+    /// stays clean) and exiting `rc`.
+    fn recording_pre_push(rec: &Path, rc: i32) -> String {
+        format!(
+            "#!/bin/sh\necho run >> '{r}/runs'\nfor a in \"$@\"; do echo \"$a\" >> '{r}/argv'; done\n: >> '{r}/argv'\necho some plan output\nexit {rc}\n",
+            r = rec.display()
+        )
+    }
+
+    /// Install the hook and run it directly with one pre-push stdin line.
+    /// Returns (exit code, last line of the receipt).
+    fn run_hook(repo: &Path, pushed: &str) -> (i32, String) {
+        use std::io::Write;
+        let hook = install_pre_push_hook(repo).unwrap();
+        let home = TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .current_dir(repo)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("USER", "tester")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let line = format!("refs/heads/x {pushed} refs/heads/x {ZERO_SHA}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let gd = git(repo, &["rev-parse", "--absolute-git-dir"]);
+        let receipt = std::fs::read_to_string(Path::new(&gd).join("cadence-pre-push-receipt"))
+            .unwrap_or_default();
+        let last = receipt.lines().last().unwrap_or("").to_string();
+        let rc = out.status.code().unwrap_or(-1);
+        eprintln!(
+            "hook rc={rc} receipt={last:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (rc, last)
+    }
+
+    #[test]
+    fn pre_push_hook_no_pre_push_script_skips() {
+        let repo = git_repo();
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0);
+        assert!(
+            receipt.contains("steps=skipped:no-pre-push rc=0"),
+            "{receipt}"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_runs_repo_script_without_args() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert!(receipt.starts_with(&format!("head={head} ")), "{receipt}");
+        assert!(receipt.contains("mode=repo"), "{receipt}");
+        assert!(receipt.contains("rc=0"), "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // A customer script gets no Cadence flags (no --receipt, no --tests).
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("argv"))
+                .unwrap()
+                .trim(),
+            "",
+            "repo-mode pre-push must receive no arguments"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_failing_script_blocks_push() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 1));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_ne!(rc, 0, "{receipt}");
+        assert!(receipt.contains("mode=repo"), "{receipt}");
+        assert!(receipt.contains("rc=1"), "{receipt}");
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_refuses_pushed_sha_not_head() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let first = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("g"), "y").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-qm", "second"]);
+        assert_ne!(first, git(repo.path(), &["rev-parse", "HEAD"]));
+        let (rc, receipt) = run_hook(repo.path(), &first);
+        assert_ne!(rc, 0, "{receipt}");
+        assert!(receipt.contains("steps=refused:head-mismatch"), "{receipt}");
+        assert!(
+            !rec.path().join("runs").exists(),
+            "the plan must not run against a different working tree"
+        );
+    }
+
+    // CAD-2403 review: a repository's own script runs like a git hook — git's
+    // remote and URL as arguments, the ref lines on stdin and
+    // CADENCE_PRE_PUSH_MODE=repo — and never receives this repository's
+    // `--receipt`, even with CADENCE_PRE_PUSH_LOCAL=1.
+    #[test]
+    fn pre_push_hook_repo_mode_passes_git_args_refs_and_mode() {
+        use std::io::Write;
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        let d = rec.path().display();
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {d}/argv\ncat > {d}/stdin\nprintf '%s' \"$CADENCE_PRE_PUSH_MODE\" > {d}/mode\nexit 0\n"
+        );
+        commit_script(repo.path(), "pre-push", &body);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let hook = install_pre_push_hook(repo.path()).unwrap();
+        let home = TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .arg("origin")
+            .arg("git@example.com:o/r.git")
+            .current_dir(repo.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("USER", "tester")
+            .env("CADENCE_PRE_PUSH_LOCAL", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let line = format!("refs/heads/x {head} refs/heads/x {ZERO_SHA}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{:?}", out);
+        let read = |n: &str| std::fs::read_to_string(rec.path().join(n)).unwrap();
+        assert_eq!(read("argv"), "origin\ngit@example.com:o/r.git\n");
+        assert_eq!(read("stdin"), line);
+        assert_eq!(read("mode"), "repo");
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_clean_pass_is_not_rerun() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        // Installing the hook writes the lane's `.env` (the cargo shim's PATH);
+        // a repository that ignores it keeps a clean tree, which the skip needs.
+        // Without the ignore the tree is dirty and the plan simply runs again.
+        std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert!(receipt.ends_with("tree=clean"), "{receipt}");
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "second push of the same clean HEAD must not re-run the script"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_boat_build_present_uses_boat_route() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        // The fake Boat helper echoes the head it was asked to check ($3 of
+        // `--receipt --head <sha>`) in a receipt line.
+        let boat = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\" >> '{r}/boat-argv'; done\necho \"head=$3 lane=x mode=boat patch={EMPTY_PATCH} rc=0 at=1\"\n",
+            r = rec.path().display()
+        );
+        commit_script(repo.path(), "boat-build", &boat);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("boat-argv")).unwrap(),
+            format!("--receipt\n--head\n{head}\n")
+        );
+        assert!(
+            !rec.path().join("runs").exists(),
+            "the repo's own pre-push must not be called directly on the Boat route"
+        );
+        assert!(
+            receipt.starts_with(&format!("head={head} lane=x mode=boat")),
+            "{receipt}"
+        );
     }
 }

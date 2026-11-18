@@ -11088,6 +11088,56 @@ mod cad2088_review_workflows {
 import fs from 'node:fs';
 const sc = JSON.parse(fs.readFileSync(process.env.STUB_SCENARIO, 'utf8'));
 const logf = process.env.STUB_LOG;
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+// Synthetic process boundary; the separate real-Git acceptance checks object binding.
+const gitLog = process.env.STUB_GIT_LOG;
+let gitStep = 0, gitRepo = null;
+const treeA = '1'.repeat(40), treeB = '2'.repeat(40);
+const failGit = () => { throw new Error('synthetic git failure'); };
+childProcess.execFileSync = (program, args, options = {}) => {
+  fs.appendFileSync(gitLog, JSON.stringify({program, args, input_matches: options.input === sc.git_diff}) + '\n');
+  if (program !== 'git' || !Array.isArray(args) || !sc.git_base || !sc.git_head) return failGit();
+  const env = options.env || {};
+  const keys = ['PATH','HOME','LANG','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_GLOBAL','GIT_ATTR_NOSYSTEM',
+    'GIT_TERMINAL_PROMPT','GIT_INDEX_FILE','GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'].sort();
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!eq(Object.keys(env).sort(), keys) || !env.PATH || !env.HOME || env.LANG !== 'C' ||
+      env.GIT_CONFIG_NOSYSTEM !== '1' || env.GIT_CONFIG_GLOBAL !== '/dev/null' ||
+      env.GIT_ATTR_NOSYSTEM !== '1' || env.GIT_TERMINAL_PROMPT !== '0' ||
+      env.GIT_INDEX_FILE !== env.HOME + '/index' || env.GIT_CONFIG_COUNT !== '1' ||
+      env.GIT_CONFIG_KEY_0 !== 'http.https://github.com/.extraheader' ||
+      env.GIT_CONFIG_VALUE_0 !== 'AUTHORIZATION: basic ' + Buffer.from('x-access-token:gh-test-token').toString('base64') ||
+      options.stdio !== 'pipe') return failGit();
+  const current = gitStep++;
+  if (sc.git_failure === current) return failGit();
+  if (current === 0) {
+    if (args.length !== 5 || !eq(args.slice(0,4), ['init','--bare','--quiet','--template='])) return failGit();
+    gitRepo = args[4];
+    if (gitRepo !== env.HOME + '/repo.git') return failGit();
+    return Buffer.alloc(0);
+  }
+  const p = ['-C', gitRepo];
+  let expected;
+  switch (current) {
+    case 1: expected = [...p,'remote','add','origin','https://github.com/favcrm/cadence.git']; break;
+    case 2: expected = [...p,'config','remote.origin.promisor','true']; break;
+    case 3: expected = [...p,'config','remote.origin.partialclonefilter','blob:none']; break;
+    case 4: expected = [...p,'fetch','--no-tags','--depth=1','--filter=blob:none','origin',sc.git_base,sc.git_head]; break;
+    case 5: expected = [...p,'read-tree',sc.git_base]; break;
+    case 6: expected = [...p,'apply','--cached','--whitespace=nowarn','-']; break;
+    case 7: expected = [...p,'write-tree','--missing-ok']; break;
+    case 8: expected = [...p,'rev-parse',sc.git_head+'^{tree}']; break;
+    case 9: expected = [...p,'diff','--no-ext-diff','--no-textconv','--no-color','--no-renames','--full-index',sc.git_base,sc.git_head,'--']; break;
+    default: return failGit();
+  }
+  if (!eq(args, expected) || (current === 6 && options.input !== sc.git_diff)) return failGit();
+  if (current === 7) return Buffer.from(treeA+'\n');
+  if (current === 8) return Buffer.from((sc.git_mismatch ? treeB : treeA)+'\n');
+  if (current === 9) return Buffer.from(sc.git_canonical_diff, 'utf8');
+  return Buffer.alloc(0);
+};
+syncBuiltinESMExports();
 const hits = new Map();
 let minted = 0;
 const realSet = globalThis.setTimeout;
@@ -11323,6 +11373,7 @@ if (mode === 'keys') {
         code: Option<i32>,
         out: String,
         reqs: Vec<Value>,
+        git_calls: Vec<Value>,
         runner: std::path::PathBuf,
         _dir: tempfile::TempDir,
     }
@@ -11413,9 +11464,11 @@ if (mode === 'keys') {
         setup(&runner);
         let sc = dir.path().join("sc.json");
         let log = dir.path().join("log.jsonl");
+        let git_log = dir.path().join("git.jsonl");
         let stub = dir.path().join("stub.mjs");
         std::fs::write(&sc, scenario.to_string()).unwrap();
         std::fs::write(&log, "").unwrap();
+        std::fs::write(&git_log, "").unwrap();
         std::fs::write(&stub, STUB).unwrap();
         let mut ctx = std::collections::HashMap::new();
         for (a, b) in [
@@ -11463,6 +11516,7 @@ if (mode === 'keys') {
             .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
             .env("STUB_SCENARIO", &sc)
             .env("STUB_LOG", &log)
+            .env("STUB_GIT_LOG", &git_log)
             .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -11481,6 +11535,12 @@ if (mode === 'keys') {
             .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
             .collect();
+        let git_calls = std::fs::read_to_string(&git_log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+
         let out = format!(
             "{}{}",
             String::from_utf8_lossy(&o.stdout),
@@ -11490,6 +11550,7 @@ if (mode === 'keys') {
             code: o.status.code(),
             out,
             reqs,
+            git_calls,
             runner,
             _dir: dir,
         }
@@ -11587,7 +11648,15 @@ if (mode === 'keys') {
             "contents/docs/roles/risk-classes.md",
             json!([{ "text": "risk classes text" }]),
         ));
-        json!({ "routes": routes })
+        json!({
+            "routes": routes,
+            "git_base": cmp["merge_base"],
+            "git_head": HEAD,
+            "git_diff": w["diff"],
+            "git_canonical_diff": w.get("canonical_diff").unwrap_or(&w["diff"]),
+            "git_failure": w.get("git_failure").cloned().unwrap_or(Value::Null),
+            "git_mismatch": w.get("git_mismatch").cloned().unwrap_or(json!(false)),
+        })
     }
 
     // Replace the answers of the route with this URL part (and Accept header).
@@ -11940,8 +12009,8 @@ if (mode === 'keys') {
             "const AXIS",
             "//",
         ];
-        let strip = |w: &Wf| -> Vec<String> {
-            let lines: Vec<&str> = w.raw.lines().collect();
+        let strip = |w: &Wf, raw: &str| -> Vec<String> {
+            let lines: Vec<&str> = raw.lines().collect();
             let on = lines
                 .iter()
                 .position(|l| *l == "on:")
@@ -11969,7 +12038,62 @@ if (mode === 'keys') {
             }
             out
         };
-        let (sa, sb) = (strip(&a), strip(&b));
+        // Bind each CAD-2359 fragment to its original shared-code neighbors.
+        assert!(b.raw.contains(concat!(
+            "            let text = '', stop = null, buf = '', failed = false, big = false, refused = false;\n",
+            "            let nonStringContent = false;\n",
+            "            let sawMetadata = false, sawDone = false;\n",
+            "            const dec = new TextDecoder();\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "                  if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }\n",
+            "                  else if (c.delta?.content != null) nonStringContent = true;\n",
+            "                  if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "            }\n",
+            "            if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;\n",
+            "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+            "          }\n",
+            "          let res = null;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "          let parsed;\n",
+            "          try { parsed = JSON.parse(res.text); } catch {\n",
+            "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+            "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+            "            die('model output is not JSON; nothing filed');\n",
+            "          }\n",
+            "          fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });\n",
+        )));
+        let mut spec = b.raw.clone();
+        for (from, to) in [
+            ("            let nonStringContent = false;\n", ""),
+            ("                  else if (c.delta?.content != null) nonStringContent = true;\n", ""),
+            (
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };\n",
+            ),
+            (
+                concat!(
+                    "          try { parsed = JSON.parse(res.text); } catch {\n",
+                    "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+                    "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+                    "            die('model output is not JSON; nothing filed');\n",
+                    "          }\n",
+                ),
+                "          try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }\n",
+            ),
+        ] {
+            assert_eq!(
+                spec.matches(from).count(),
+                1,
+                "{}: expected exactly one occurrence of the CAD-2359 diagnostic fragment",
+                b.file
+            );
+            spec = spec.replacen(from, to, 1);
+        }
+        let (sa, sb) = (strip(&a, &a.raw), strip(&b, &spec));
         assert_eq!(
             sa.len(),
             sb.len(),
@@ -12158,10 +12282,10 @@ if (mode === 'keys') {
             ),
             ("missing final newline", json!(no_newline), 1, "incomplete"),
             (
-                "over 300 KB",
-                json!(format!("{one}+{}\n", "x".repeat(300_000))),
+                "over 2.5 MB",
+                json!(format!("{one}+{}\n", "x".repeat(2_500_000))),
                 1,
-                "300 KB",
+                "2.5 MB",
             ),
         ];
         for wf in all() {
@@ -12182,7 +12306,7 @@ if (mode === 'keys') {
                     wf.file
                 );
                 // The file job applies the same walk to the diff it was handed.
-                if *name != "over 300 KB" {
+                if *name != "over 2.5 MB" {
                     let mut input = file_input(&world(&wf));
                     input["diff"] = diff.clone();
                     let f = run_file(
@@ -12253,6 +12377,94 @@ if (mode === 'keys') {
                     wf.file
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prepare_binds_small_and_large_diffs_to_the_pinned_trees() {
+        let large = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(large.len() > 300_000 && large.len() < 2_500_000);
+        for wf in all() {
+            for (name, diff, count) in [("small", DIFF.to_string(), 2), ("large", large.clone(), 1)]
+            {
+                let mut w = world(&wf);
+                w["diff"] = json!(diff);
+                w["cmp"]["files_n"] = json!(count);
+                let r = prepare(&wf, &w, &[]);
+                assert_eq!(r.code, Some(0), "{} {name}: {}", wf.file, r.out);
+                assert_eq!(
+                    r.git_calls.len(),
+                    10,
+                    "{} {name}: {:?}",
+                    wf.file,
+                    r.git_calls
+                );
+                assert_eq!(r.git_calls[6]["input_matches"], json!(true));
+                assert_eq!(r.read("out/review-input.json").unwrap()["diff"], w["diff"]);
+                assert_eq!(r.read("out/file-input.json").unwrap()["diff"], w["diff"]);
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_uses_the_git_generated_diff_in_both_artifacts() {
+        for wf in all() {
+            let mut w = world(&wf);
+            let canonical = DIFF.replace("+hello\n", "+canonical hello\n");
+            assert_ne!(canonical, DIFF);
+            w["canonical_diff"] = json!(canonical);
+            let r = prepare(&wf, &w, &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert_eq!(r.git_calls.len(), 10, "{}: {:?}", wf.file, r.git_calls);
+            assert_eq!(r.git_calls[6]["input_matches"], json!(true));
+            assert_eq!(
+                r.read("out/review-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+            assert_eq!(
+                r.read("out/file-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_each_git_failure_and_a_tree_mismatch() {
+        for wf in all() {
+            for step in 0..10 {
+                let mut w = world(&wf);
+                w["git_failure"] = json!(step);
+                let r = prepare(&wf, &w, &[]);
+                assert!(r.failed(), "{} git step {step}: {}", wf.file, r.out);
+                assert!(
+                    r.out.contains("cannot be bound to the compared Git trees"),
+                    "{}",
+                    r.out
+                );
+                assert_eq!(r.git_calls.len(), step as usize + 1);
+                assert!(
+                    r.files().is_empty()
+                        && r.hits("openrouter").is_empty()
+                        && r.hits("/verdict").is_empty()
+                );
+            }
+            let mut w = world(&wf);
+            w["git_mismatch"] = json!(true);
+            let r = prepare(&wf, &w, &[]);
+            assert!(
+                r.failed() && r.out.contains("cannot be bound to the compared Git trees"),
+                "{}",
+                r.out
+            );
+            assert_eq!(r.git_calls.len(), 9);
+            assert!(
+                r.files().is_empty()
+                    && r.hits("openrouter").is_empty()
+                    && r.hits("/verdict").is_empty()
+            );
         }
     }
 
@@ -12729,6 +12941,259 @@ if (mode === 'keys') {
                 "{}: provider controls",
                 wf.file
             );
+        }
+    }
+
+    #[test]
+    fn large_review_accepts_only_content_free_repeated_stop_usage() {
+        // Generate a valid full-index patch from real Git trees. The workflow
+        // harness still substitutes its fixed Git transport and dispatch IDs.
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| git_in(dir.path(), args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(
+            dir.path().join("big.txt"),
+            format!("{}\n", "x".repeat(80)).repeat(4000),
+        )
+        .unwrap();
+        git(&["add", "big.txt"]);
+        git(&["commit", "-q", "-m", "head"]);
+        let diff = git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--full-index",
+            "HEAD~1",
+            "HEAD",
+            "--",
+        ]);
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+        assert!(diff.contains("new file mode 100644\nindex "));
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+            let mut output = good_output(&wf);
+            for check in output["checks"].as_array_mut().unwrap() {
+                check["citations"] = json!([{ "file": "big.txt", "line": 1 }]);
+            }
+            let output_text = output.to_string();
+
+            for (content, should_succeed) in [("", true), ("unexpected output", false)] {
+                let mut events = model_events(&output_text, Some("stop"));
+                // Replace the ordinary empty-choice usage fixture and DONE.
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage = or_chunk(
+                    json!({ "content": content, "role": "assistant" }),
+                    json!("stop"),
+                );
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(r.hits("openrouter").len(), 1, "{}: {}", wf.file, r.out);
+                assert!(r.hits("/verdict").is_empty(), "{}: {}", wf.file, r.out);
+                if should_succeed {
+                    assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+                    let sealed = r
+                        .read("out/review-output.json")
+                        .expect("successful review must seal its output");
+                    let filed = run_file(
+                        &wf,
+                        &file_input(&w),
+                        Some(&sealed),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    );
+                    assert_eq!(filed.code, Some(0), "{}: {}", wf.file, filed.out);
+                    assert_eq!(
+                        filed.hits("/__platform/review-jobs/verdict").len(),
+                        1,
+                        "{}: {}",
+                        wf.file,
+                        filed.out
+                    );
+                } else {
+                    assert!(r.failed(), "{}: post-stop content was accepted", wf.file);
+                    assert!(
+                        r.read("out/review-output.json").is_none(),
+                        "{}: {}",
+                        wf.file,
+                        r.out
+                    );
+                    assert!(r.files().is_empty(), "{}: {}", wf.file, r.out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_unproven_routing_after_accounting() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            let model = wf.env_str("REVIEW_MODEL");
+            let cases = [
+                ("missing metadata", None),
+                (
+                    "mismatched model",
+                    Some(json!({ "requested": "other/model", "pipeline": [] })),
+                ),
+                (
+                    "nonempty pipeline",
+                    Some(json!({
+                        "requested": model,
+                        "pipeline": [{ "type": "context_compression" }]
+                    })),
+                ),
+            ];
+            for (name, metadata) in cases {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage =
+                    or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                if let Some(metadata) = metadata {
+                    events.push(json!({
+                        "type": "metadata",
+                        "openrouter_metadata": metadata
+                    }));
+                }
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_hidden_choice_message_and_null_usage() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            for name in [
+                "message on first stop",
+                "null post-stop usage",
+                "missing usage",
+                "inconsistent token counts",
+            ] {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                if name == "message on first stop" {
+                    let stop = events.last_mut().unwrap();
+                    stop["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    });
+                    stop["choices"][0]["message"] = json!({
+                        "role": "assistant",
+                        "content": "hidden output"
+                    });
+                } else if name == "null post-stop usage" {
+                    events.push(json!({ "type": "usage", "choices": [], "usage": null }));
+                } else if name == "inconsistent token counts" {
+                    let mut usage =
+                        or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                    usage["choices"][0]["native_finish_reason"] = json!("stop");
+                    usage["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 999
+                    });
+                    events.push(usage);
+                }
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
         }
     }
 
@@ -17339,5 +17804,521 @@ mod cad2064_artifact_acceptance {
         assert_eq!(receipt["file"]["id"], REQUESTED_ID);
         assert_eq!(receipt["file"]["version"], VERSION);
         assert_eq!(receipt["written"], destination.to_str().unwrap());
+    }
+}
+
+// CAD-2286 acceptance: `artifact types` and `artifact submit` through the
+// packaged CLI against a TLS fake that answers the tenant's statuses and codes
+// (`apps/api/src/tenant-board/cli.ts`: `readDocumentTypes`,
+// `writeDocumentSubmit`, `DOCUMENT_SUBMIT_STATUS`, `documentVerbOff`).
+#[cfg(all(unix, feature = "test-seam"))]
+mod cad2286_document_acceptance {
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ORG: &str = "document-acceptance";
+    const ORG_ID: &str = "ws_document_acceptance";
+    const ENDPOINT: &str = "https://lc.cadencecloud.app";
+    const RELAY_VERSION: &str = "hosted-cadence-cli.v1";
+    const FILE_ID: &str = "art-x";
+
+    /// The server's baseline (`DOCUMENT_BASELINE` in
+    /// `apps/api/src/tenant-board/document-lifecycle.ts`).
+    fn baseline() -> Value {
+        json!({"stages": ["draft", "in_review", "approved", "delivered", "archived"],
+            "requireApproval": true, "approver": null, "archiveAfterDays": 30,
+            "recipientNote": ""})
+    }
+
+    /// `documentTypesView` with `DOCUMENT_CAPABILITY`.
+    fn types() -> Value {
+        json!({
+            "capability": "cad2286.document-lifecycle.v1",
+            "baseline": baseline(),
+            "types": []
+        })
+    }
+
+    /// `documentSubmitView` for a first submission of an unconfirmed type.
+    fn submitted() -> Value {
+        json!({
+            "stage": "in_review", "type": "invoice", "typeConfirmed": false,
+            "baseline": baseline()
+        })
+    }
+
+    fn refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn openssl(dir: &Path, args: &[&str]) {
+        let mut command = Command::new("openssl");
+        command
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = cadence_agent::reaper::status(&mut command)
+            .expect("openssl is required for CAD-2286's disposable TLS fixture");
+        assert!(status.success(), "openssl fixture step failed: {args:?}");
+    }
+
+    fn status_line(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            400 => "400 Bad Request",
+            403 => "403 Forbidden",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            501 => "501 Not Implemented",
+            _ => "500 Internal Server Error",
+        }
+    }
+
+    struct Board {
+        home: tempfile::TempDir,
+        address: SocketAddr,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Board {
+        /// `answers` are the `/__platform/cli/call` answers, in order. Every
+        /// authorize mints an envelope; a call past the script answers 500.
+        fn new(answers: Vec<(u16, Value)>) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path();
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "ca.key",
+                    "-out",
+                    "ca.pem",
+                    "-days",
+                    "2",
+                    "-subj",
+                    "/CN=CAD-2286-CA",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
+                ],
+            );
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-new",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "leaf.key",
+                    "-out",
+                    "leaf.csr",
+                    "-subj",
+                    "/CN=lc.cadencecloud.app",
+                ],
+            );
+            fs::write(
+                root.join("leaf.ext"),
+                concat!(
+                    "subjectAltName=DNS:lc.cadencecloud.app\n",
+                    "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n",
+                    "extendedKeyUsage=serverAuth\n"
+                ),
+            )
+            .unwrap();
+            openssl(
+                root,
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "leaf.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "2",
+                    "-extfile",
+                    "leaf.ext",
+                    "-out",
+                    "leaf.pem",
+                ],
+            );
+            fs::set_permissions(root.join("ca.pem"), fs::Permissions::from_mode(0o600)).unwrap();
+            let chain = rustls_pemfile::certs(&mut BufReader::new(
+                fs::File::open(root.join("leaf.pem")).unwrap(),
+            ))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(&mut BufReader::new(
+                fs::File::open(root.join("leaf.key")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+            );
+
+            let config = root.join("config/cadence");
+            let auth = config.join("remote-auth");
+            fs::create_dir_all(&auth).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                config.join("orgs.json"),
+                serde_json::to_vec(&json!({
+                    "selected": {"org": ORG},
+                    "connections": [{
+                        "selection": {"org": ORG},
+                        "destination": {
+                            "mode": "remote", "endpoint": ENDPOINT, "org_id": ORG_ID
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let credential = auth.join(format!("cli-{ORG}.json"));
+            fs::write(
+                &credential,
+                serde_json::to_vec(&json!({
+                    "version": "hosted-cadence-auth.v1",
+                    "organization_id": ORG_ID, "audience": ENDPOINT,
+                    "access_token": format!("hct_{}", "B".repeat(43)),
+                    "expires_at": expires
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(credential, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server_calls = Arc::clone(&calls);
+            let mut script: VecDeque<(u16, Value)> = answers.into();
+            let worker = thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    let socket = incoming.unwrap();
+                    if server_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let stream = rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(Arc::clone(&tls)).unwrap(),
+                        socket,
+                    );
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut length = None;
+                    loop {
+                        line.clear();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (key, value) = line.split_once(':').unwrap();
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let mut raw = vec![0; length.expect("JSON request must have content-length")];
+                    reader.read_exact(&mut raw).unwrap();
+                    let request: Value = serde_json::from_slice(&raw).unwrap();
+                    let (status, response) = match path.as_str() {
+                        "/__platform/cli/authorize" => (
+                            200,
+                            json!({
+                                "version": RELAY_VERSION, "envelope": "synthetic.fixture.envelope"
+                            }),
+                        ),
+                        "/__platform/cli/call" => {
+                            server_calls.lock().unwrap().push(request);
+                            script
+                                .pop_front()
+                                .unwrap_or_else(|| (500, refusal("unexpected_call")))
+                        }
+                        other => panic!("unexpected fixture request: {other}"),
+                    };
+                    let encoded = serde_json::to_vec(&response).unwrap();
+                    let wire = reader.get_mut();
+                    write!(
+                        wire,
+                        concat!(
+                            "HTTP/1.1 {}\r\ncontent-type: application/json\r\n",
+                            "content-length: {}\r\nconnection: close\r\n\r\n"
+                        ),
+                        status_line(status),
+                        encoded.len()
+                    )
+                    .unwrap();
+                    wire.write_all(&encoded).unwrap();
+                    wire.flush().unwrap();
+                }
+            });
+            Self {
+                home,
+                address,
+                stop,
+                worker: Some(worker),
+                calls,
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            let root = self.home.path();
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "20s"])
+                .arg(env!("CARGO_BIN_EXE_cadence"))
+                .env_clear()
+                .current_dir(root)
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                )
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("CADENCE_TEST_TLS_CA", root.join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", self.address.to_string())
+                .args(["--org", ORG, "artifact"])
+                .args(args);
+            bounded(&mut command)
+        }
+
+        /// The verb and arguments of every call the board served.
+        fn verbs(&self) -> Vec<(Value, Option<Value>)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| (call["verb"].clone(), call.get("arguments").cloned()))
+                .collect()
+        }
+    }
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake accept; no timing-based polling and no background fixture left alive.
+            let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(2));
+            let result = self.worker.take().unwrap().join();
+            if !thread::panicking() {
+                result.expect("CAD-2286 TLS fixture panicked");
+            }
+        }
+    }
+
+    fn bounded(command: &mut Command) -> Output {
+        let output = cadence_agent::reaper::output(command)
+            .expect("CAD-2286 acceptance requires GNU timeout on PATH; no unbounded fallback");
+        assert!(
+            output
+                .status
+                .code()
+                .is_some_and(|code| code != 124 && code != 137),
+            "packaged CLI exceeded its 20-second fixture deadline or was signalled: \
+             status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn probe() -> (Value, Option<Value>) {
+        // `document_types` takes no arguments, so the call carries none.
+        (json!("document_types"), None)
+    }
+
+    fn submit() -> (Value, Option<Value>) {
+        (json!("document_submit"), Some(json!({"id": FILE_ID})))
+    }
+
+    /// A refusal exits with the rejected code (3), prints no receipt, and names
+    /// the stable code on stderr.
+    fn assert_refused(output: &Output, code: &str) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stdout.is_empty(), "a refusal printed a receipt");
+        assert!(
+            stderr.contains(&format!("\"code\": \"{code}\"")),
+            "expected {code}: {stderr}"
+        );
+    }
+
+    #[test]
+    fn artifact_types_prints_the_server_document() {
+        let board = Board::new(vec![(200, types())]);
+        let output = board.run(&["types"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(printed, types());
+        assert_eq!(board.verbs(), vec![probe()]);
+    }
+
+    #[test]
+    fn artifact_submit_probes_then_prints_the_stage() {
+        let board = Board::new(vec![(200, types()), (200, submitted())]);
+        let output = board.run(&["submit", FILE_ID]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(printed, submitted());
+        assert_eq!(board.verbs(), vec![probe(), submit()]);
+    }
+
+    #[test]
+    fn artifact_submit_refusals_exit_with_the_stable_code() {
+        for (status, code) in [
+            (403, "not_creator"),
+            (409, "already_shared"),
+            (400, "unlabelled"),
+            (409, "document_archived"),
+            // A 404 after a successful probe is the file, never the lifecycle.
+            (404, "not_found"),
+            // A server that answers the probe but predates the submit.
+            (501, "not_implemented"),
+        ] {
+            let board = Board::new(vec![(200, types()), (status, refusal(code))]);
+            let output = board.run(&["submit", FILE_ID]);
+            assert_refused(&output, code);
+            assert_eq!(board.verbs(), vec![probe(), submit()], "{code}");
+        }
+    }
+
+    #[test]
+    fn a_submit_success_without_a_receipt_is_unknown_and_prints_nothing() {
+        let board = Board::new(vec![(200, types()), (200, json!({"ok": false}))]);
+        let output = board.run(&["submit", FILE_ID]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "an unproved submit printed a receipt"
+        );
+        assert!(stderr.contains("\"kind\": \"unknown\""), "{stderr}");
+        assert!(stderr.contains("repeat `artifact submit <id>`"), "{stderr}");
+        assert_eq!(board.verbs(), vec![probe(), submit()]);
+    }
+
+    #[test]
+    fn document_lifecycle_unavailable_is_decided_by_the_type_list() {
+        for (status, code) in [
+            (501, "not_implemented"),
+            (404, "not_found"),
+            // A relay older than the verb.
+            (400, "invalid_request"),
+            (400, "unknown_verb"),
+        ] {
+            let board = Board::new(vec![(status, refusal(code))]);
+            let output = board.run(&["types"]);
+            assert_refused(&output, "document_lifecycle_unavailable");
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("retry"),
+                "an unavailable lifecycle is not an outage"
+            );
+            assert_eq!(board.verbs(), vec![probe()], "{status} {code}");
+
+            // Submit asks the same question first and sends nothing else.
+            let board = Board::new(vec![(status, refusal(code))]);
+            let output = board.run(&["submit", FILE_ID]);
+            assert_refused(&output, "document_lifecycle_unavailable");
+            assert_eq!(board.verbs(), vec![probe()], "submit {status} {code}");
+        }
+    }
+
+    #[test]
+    fn artifact_types_and_submit_are_refused_on_a_native_org() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        for args in [&["types"][..], &["submit", FILE_ID][..]] {
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "20s"])
+                .arg(env!("CARGO_BIN_EXE_cadence"))
+                .env_clear()
+                .current_dir(root)
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                )
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .arg("artifact")
+                .args(args);
+            let output = bounded(&mut command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(stderr.contains("\"code\": \"usage\""), "{args:?}: {stderr}");
+            assert!(stderr.contains("hosted-only"), "{args:?}: {stderr}");
+        }
     }
 }
