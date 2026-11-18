@@ -355,6 +355,11 @@ export interface AskResult {
   readonly operationId: string | undefined;
 }
 
+/** A read-only reply from an exact input. Unconfirmed is never proof it did not run. */
+export type OperationReply =
+  | { readonly state: "answered"; readonly operationId: string; readonly text: string }
+  | { readonly state: "unanswered" | "unconfirmed"; readonly operationId: string };
+
 /** One submission the runtime has not settled yet. */
 export interface PendingOperation {
   /** The id the input was submitted under: the board's message id for a send. */

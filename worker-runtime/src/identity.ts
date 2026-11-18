@@ -1,4 +1,4 @@
-import type { GenerationIdentity } from "./contract.ts";
+import type { GenerationIdentity, OperationReply } from "./contract.ts";
 
 /**
  * The one place that knows the engine's durable SQLite layout.
@@ -510,6 +510,60 @@ export function readSubmissionSettlement(
   if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
     return { state: "unknown" };
   return settled;
+}
+
+/** Return positive evidence for one exact input, without needing other work to settle. */
+export function readOperationReply(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): OperationReply {
+  const unconfirmed = { state: "unconfirmed", operationId } as const;
+  try {
+    const rows = sql.exec(
+      `SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    ).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
+    const submission = parseRecord(row.record);
+    if (submission === null || submission.id !== row.id || submission.conversationId !== conversationId ||
+        submission.requestId !== operationId || submission.type !== "input" || submission.status !== row.status)
+      return unconfirmed;
+    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
+      return { state: "unanswered", operationId };
+    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(submission.answer) ||
+        submission.reason !== undefined || submission.detail !== undefined)
+      return unconfirmed;
+
+    // The engine commits the answer pointer in the submission. Do not read the
+    // conversation tail: it can already contain another operation's reply.
+    const answer = sql.exec(
+      "SELECT conversation_id, record FROM pi_entries WHERE id=?",
+      submission.answer,
+    ).toArray()[0];
+    if (answer?.conversation_id !== conversationId) return unconfirmed;
+    const entry = parseRecord(answer.record);
+    if (entry === null || entry.id !== submission.answer || entry.conversationId !== conversationId ||
+        !Array.isArray(entry.model)) return unconfirmed;
+    const message: unknown = entry.model[0];
+    if (typeof message !== "object" || message === null || !("role" in message) ||
+        message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
+      return unconfirmed;
+    let text = "";
+    for (const part of message.content as unknown[]) {
+      if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
+      if (part.type === "text") {
+        if (!("text" in part) || typeof part.text !== "string") return unconfirmed;
+        text += part.text;
+      } else if (part.type !== "thinking" && part.type !== "toolCall") return unconfirmed;
+    }
+    return text === "" ? unconfirmed : { state: "answered", operationId, text };
+  } catch {
+    return unconfirmed;
+  }
 }
 
 /** Whether the engine's submissions table exists; without it, none is held. */

@@ -23,6 +23,7 @@ import type {
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
+  OperationReply,
   OperationSettlement,
   PendingOperation,
   ThreadContext,
@@ -42,6 +43,7 @@ import {
   readCompactionIdentity,
   readGenerationIdentity,
   readHeldSubmission,
+  readOperationReply,
   readSubmissionEntry,
   readSubmissionRequestId,
   readSubmissionSettlement,
@@ -995,6 +997,15 @@ export class HostedSession<
         status: settlement.status,
       };
     return { state: settlement.state, operationId: id, conversation };
+  }
+
+  /** Inspect one reply without resending, waking the engine, or reading a transcript. */
+  async operationReply(operationId: string): Promise<OperationReply> {
+    return readOperationReply(
+      this.ctx.storage.sql as unknown as TaskSql,
+      ROOT_CONVERSATION_ID,
+      requireOperationId(operationId),
+    );
   }
 
   /**
