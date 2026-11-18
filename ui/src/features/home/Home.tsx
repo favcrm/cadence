@@ -46,7 +46,7 @@ import MasterChips from "./MasterChips";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
-import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import { askDraft, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
@@ -229,6 +229,7 @@ function HeaderMenu({
   readOnly,
   canPickModel,
   scope,
+  profileHref,
 }: {
   master: MasterState | null | undefined;
   row: Agent | undefined;
@@ -236,6 +237,7 @@ function HeaderMenu({
   canPickModel: boolean;
   /** The header's scope line, moved here on a narrow screen. */
   scope: string;
+  profileHref?: string;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -310,7 +312,7 @@ function HeaderMenu({
             </div>
             <p className="assistant-scope" data-menu-scope>{scope}</p>
             <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={canPickModel} />
-            <AssistantAboutButton className="assistant-menu-about" />
+            <AssistantAboutButton className="assistant-menu-about" profileHref={profileHref} />
           </div>
         </>
       )}
@@ -767,7 +769,6 @@ export default function Home({
   onOpenIssue,
   onOpenDecision,
   decisions = false,
-  overviewHref,
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
@@ -806,7 +807,6 @@ export default function Home({
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
   decisions?: boolean;
-  overviewHref: string;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
   /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
@@ -872,7 +872,6 @@ export default function Home({
         onOpenIssue={onOpenIssue}
         onOpenDecision={onOpenDecision}
         decisions={decisions}
-        overviewHref={overviewHref}
         permissionsHref={permissionsHref}
         resolveAppPath={resolveAppPath}
         setupNotice={setupNotice}
@@ -896,7 +895,6 @@ function MasterHome({
   onOpenIssue,
   onOpenDecision,
   decisions = false,
-  overviewHref,
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
@@ -917,7 +915,6 @@ function MasterHome({
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
   decisions?: boolean;
-  overviewHref: string;
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
   setupNotice?: ReactNode;
@@ -930,9 +927,6 @@ function MasterHome({
     text: "",
     n: 0,
   });
-  // CAD-574: the rail's collapse is a layout concern — the grid column
-  // narrows with it, so the state lives here and the rail renders it.
-  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
   const [link, setLink] = useState<StreamLink>("connecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -1263,6 +1257,11 @@ function MasterHome({
     !readOnly,
     personalBootstrap.identity,
   );
+  // Hosted Home can carry a personal actor over the Master transport.
+  const profileHref =
+    actor.scope === "workspace" && actor.read.state === "ready" && masterRow && (hosted === false || operator === true)
+      ? `/agents/${MASTER}?tab=instructions`
+      : undefined;
   const onRetrySend = useCallback(
     (
       message: string,
@@ -1576,12 +1575,6 @@ function MasterHome({
     const draft = askDraft(need, lead, hosted === false ? undefined : t("what should we do?"));
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
-  const toggleRail = () => {
-    setRailCollapsed((c) => {
-      writeRailCollapsed(!c);
-      return !c;
-    });
-  };
 
   const focusHomeComposer = useCallback(() => focusComposerById(dockRef.current, HOME_COMPOSER_ID), []);
 
@@ -1620,11 +1613,7 @@ function MasterHome({
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <AttachmentNamesContext.Provider value={homeAttachmentNames}>
     <main
-      className={`home-workspace home-master px-4 lg:px-8 sm:pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
-        railCollapsed
-          ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
-          : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
-      }`}
+      className="home-workspace home-master px-4 lg:px-8 sm:pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)] flex-1 min-h-0"
     >
       {/* The rail is its own column (CAD-574), bounded by the panel's
           height (CAD-600): its `rail-scroll` scrolls independently of
@@ -1639,7 +1628,6 @@ function MasterHome({
           scopedHost={hosted !== false}
           hostedRoster={hosted === false ? undefined : agents.data ?? null}
           onOpenIssue={onOpenIssue}
-          overviewHref={overviewHref}
           permissionsHref={permissionsHref}
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
@@ -1648,8 +1636,6 @@ function MasterHome({
             text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
           }))}
-          collapsed={railCollapsed}
-          onToggleCollapse={toggleRail}
           onSent={engage}
         />
       </aside>
@@ -1678,7 +1664,14 @@ function MasterHome({
                   <span className="text-micro text-ink-500">{t("first-time setup")}</span>
                 )}
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
-                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} scope={scopeDescriptor(actor.scope, t)} />
+                <HeaderMenu
+                  master={master.data}
+                  row={masterRow}
+                  readOnly={readOnly}
+                  canPickModel={canPickModel}
+                  scope={scopeDescriptor(actor.scope, t)}
+                  profileHref={profileHref}
+                />
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
@@ -1710,7 +1703,7 @@ function MasterHome({
                   {t("Finish setup")}
                 </button>
               )}
-              <AssistantAboutButton />
+              <AssistantAboutButton profileHref={profileHref} />
             </div>
           </div>
 

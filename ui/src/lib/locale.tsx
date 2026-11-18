@@ -484,8 +484,8 @@ Object.assign(zhTW, {
 
 Object.assign(zhTW, {
   "Setup isn't finished": "設定尚未完成", "still to do:": "仍待處理：", "Open setup →": "開啟設定 →", "dismiss the setup reminder": "關閉設定提醒", "dismiss": "關閉",
-  "Home rail": "首頁側欄", "The list couldn't be loaded. It will try again.": "無法載入清單，將會重試。", "Reading what needs you…": "正在讀取需要你處理的項目…", "Nothing needs you. The team is working.": "目前沒有需要你處理的項目。團隊正在工作。", "Tap a card to see more. “Fix it” hands the problem to Master.": "點選卡片可查看更多。「修正」會將問題交給主助理。", "Recently decided": "最近已決定", "Standing rules are in Settings": "常設規則位於設定中", "Updates": "更新", "Team overview": "團隊總覽", "close the rail": "關閉側欄", "to do — {count} waiting; expand the rail": "待辦 — {count} 項等待中；展開側欄", "to do — {count} waiting; open the list": "待辦 — {count} 項等待中；開啟清單", "to do": "待辦",
-  "Recent work across all projects. Ask the Assistant to check in or explain an update.": "所有專案的近期工作。請詢問助理以確認進度或說明更新內容。", "Agent updates unavailable": "無法取得代理程式更新", "Reading agent activity…": "正在讀取代理程式活動…", "Daemon unreachable. Showing the last available activity.": "無法連線至 Daemon。顯示最近可用的活動。", "No agent activity yet. Ask the Assistant to plan the next job.": "目前尚無代理程式活動。請詢問助理規劃下一項工作。", "Showing the 12 most recently active agents. See Team overview for everyone.": "顯示最近活動的 12 個代理程式。完整名單請見團隊總覽。", "Ask the Assistant about this": "詢問助理此事", "Recent updates could not be loaded.": "無法載入近期更新。", "Some recent updates could not be loaded.": "部分近期更新無法載入。", "Refresh failed; showing earlier updates.": "重新整理失敗；顯示較早的更新。", "Refresh failed.": "重新整理失敗。", "Showing earlier updates while refreshing…": "重新整理期間顯示較早的更新…", "Refreshing recent updates…": "正在重新整理近期更新…", "No recent progress notes.": "沒有近期進度記錄。", "Reading recent updates…": "正在讀取近期更新…", "Reading more updates…": "正在讀取更多更新…",
+  "Home rail": "首頁側欄", "The list couldn't be loaded. It will try again.": "無法載入清單，將會重試。", "Reading what needs you…": "正在讀取需要你處理的項目…", "Nothing needs you. The team is working.": "目前沒有需要你處理的項目。團隊正在工作。", "Tap a card to see more. “Fix it” hands the problem to Master.": "點選卡片可查看更多。「修正」會將問題交給主助理。", "Recently decided": "最近已決定", "Standing rules are in Settings": "常設規則位於設定中", "Updates": "更新", "close the rail": "關閉側欄", "to do — {count} waiting; open the list": "待辦 — {count} 項等待中；開啟清單", "to do": "待辦",
+  "Recent work across all projects. Ask the Assistant to check in or explain an update.": "所有專案的近期工作。請詢問助理以確認進度或說明更新內容。", "Agent updates unavailable": "無法取得代理程式更新", "Reading agent activity…": "正在讀取代理程式活動…", "Daemon unreachable. Showing the last available activity.": "無法連線至 Daemon。顯示最近可用的活動。", "No agent activity yet. Ask the Assistant to plan the next job.": "目前尚無代理程式活動。請詢問助理規劃下一項工作。", "Showing the 12 most recently active agents.": "顯示最近活動的 12 個代理程式。", "See all agents": "查看所有代理程式", "Ask the Assistant about this": "詢問助理此事", "Recent updates could not be loaded.": "無法載入近期更新。", "Some recent updates could not be loaded.": "部分近期更新無法載入。", "Refresh failed; showing earlier updates.": "重新整理失敗；顯示較早的更新。", "Refresh failed.": "重新整理失敗。", "Showing earlier updates while refreshing…": "重新整理期間顯示較早的更新…", "Refreshing recent updates…": "正在重新整理近期更新…", "No recent progress notes.": "沒有近期進度記錄。", "Reading recent updates…": "正在讀取近期更新…", "Reading more updates…": "正在讀取更多更新…",
   "Interrupt the running turn (same as /stop)": "中斷執行中的回合（與 /stop 相同）", "running…": "執行中…", "Open its conversation": "開啟其對話", "it can": "可以", "read the tracker, reports and what agents are doing": "讀取追蹤器、報告與代理程式的工作狀況", "propose a plan — tickets with size and acceptance": "提出計畫 — 含大小與驗收條件的工作單", "dispatch tickets of a plan you approved": "派送你核准計畫中的工作單", "answer workers' questions, and bring you the ones it can't": "回答工作者的問題，並將它無法處理的問題轉給你", "it can't": "不可以", "approve its own plans — only you do, here or with `cadence plan approve`": "核准它自己的計畫 — 只能由你在此或使用 `cadence plan approve` 核准", "start work outside an approved plan": "在未核准的計畫外開始工作", "merge, push or reach your git credentials": "合併、推送或存取你的 git 憑證", "change settings or other agents": "變更設定或其他代理程式",
   "Checking assistant availability…": "正在檢查助理是否可用…", "Your assistant is unavailable": "你的助理目前無法使用", "The master is stopped": "主助理已停止", "Start the master to chat": "啟動主助理以開始對話", "Checking this board’s session and assistant state.": "正在檢查此看板的工作階段與助理狀態。", "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available.": "你的工作區管理員可以檢查並還原助理設定。助理可用後，你即可傳送訊息。", "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:": "主助理是你在此對話的代理程式。它會與你一起規劃工作，並將已核准的工作單交給你的代理程式。請在此機器的終端機中啟動或恢復它：", "Ask the master for work": "向主助理請求工作", "No conversation yet. Try one of these:": "尚無對話。可以試試以下範例：", "The thread could not be read —": "無法讀取對話串 —", "not started": "未啟動", "stream stopped": "串流已停止", "reconnecting…": "重新連線中…",
 });
@@ -2211,6 +2211,7 @@ Object.assign(zhTW, {
   "About your assistant": "關於你的助理",
   "About the workspace assistant": "關於工作區助理",
   "About the assistant": "關於助理",
+  "View assistant profile": "查看助理資料",
   "Ask": "詢問",
   "Recruit": "招募",
   "Close assistant details": "關閉助理資料",
@@ -3127,8 +3128,6 @@ Object.assign(zhTW, {
 // (Show, All, Group, and Open are defined earlier in zhTW.)
 Object.assign(zhTW, {
   "Notifications": "通知",
-  "Your conversations": "你的對話",
-  "{count} unread messages": "{count} 則未讀訊息",
   "Open notifications": "開啟通知",
   "Open notifications, {count} unread": "開啟通知，{count} 則未讀",
   "Close notifications": "關閉通知",
@@ -3146,7 +3145,7 @@ Object.assign(zhTW, {
   "Mute": "靜音",
   "Unmute": "取消靜音",
   "Open {title}, {count} unread": "開啟 {title}，{count} 則未讀",
-  "Notification links never grant access.": "通知連結不會授予存取權限。",
+  "Browser alerts": "瀏覽器提示",
   "Turn off browser alerts": "關閉瀏覽器提示",
   "Enable browser alerts": "啟用瀏覽器提示",
   "Browser alerts unavailable": "無法使用瀏覽器提示",

@@ -10,7 +10,6 @@ import type { DocumentStage } from "../features/documents/documentsClient";
  * a link that survives a refresh or a paste:
  *
  *   /                          Home — the master's thread (CAD-328)
- *   /overview                  the team overview (needs, drift, monitors)
  *   /projects[/:slug]          a project's issues (board or list)
  *   /projects/:slug/epics      its epics: stage, progress, health (CAD-432)
  *   /projects/:slug/milestones its milestones: progress, worst health
@@ -37,7 +36,7 @@ import type { DocumentStage } from "../features/documents/documentsClient";
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the in-page filter on
- * screens that have one — Agents, Team overview and Settings → Memory),
+ * screens that have one — Settings → Memory),
  * `issue` (the open issue drawer, on any screen), `view` and the filter
  * keys (Projects only). Home, Wiki, Outbox, the Apps home and the rest
  * of Settings carry no project scope. Parameters the app does not own
@@ -76,7 +75,6 @@ export type ConnectionPage =
 
 export type Route =
   | { screen: "home"; privateChat?: true }
-  | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
@@ -140,20 +138,16 @@ export function navItems(noWiki: boolean, hiddenScreens?: readonly Screen[]): ty
  * is `route.screen === "projects"` (`navProject` in App.tsx).
  *
  * - `slug` — the project page (`/projects/:slug`). A sidebar project opens it.
- * - `chips` — an in-page chip row, stored as `?project=` (Team overview).
- *   Agents belong to the team, not a project (CAD-1752), so `/agents` has none.
  * - `picker` — an in-page project picker, stored as `?project=`
  *   (Settings → Memory).
  * - `none` — no project scope in the URL or in state.
  */
-export type ProjectScope = "slug" | "chips" | "picker" | "none";
+export type ProjectScope = "slug" | "picker" | "none";
 
 export function projectScope(route: Route): ProjectScope {
   switch (route.screen) {
     case "projects":
       return "slug";
-    case "overview":
-      return "chips";
     case "settings":
       return route.section === "memory" ? "picker" : "none";
     default:
@@ -166,7 +160,7 @@ export function projectScope(route: Route): ProjectScope {
 /** Screens that keep `?project=` as a visible in-page filter. */
 export function projectFilter(route: Route): boolean {
   const scope = projectScope(route);
-  return scope === "chips" || scope === "picker";
+  return scope === "picker";
 }
 
 /**
@@ -308,7 +302,6 @@ export function matchRoute(pathname: string): Route {
     if (head === "threads" && !a) return { screen: "threads" };
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
-    if (head === "overview" && !a) return { screen: "overview" };
     // `?item=<effect_id>` deep-links one published item (CAD-546).
     if (head === "outbox" && !a) return { screen: "outbox" };
     if (head === "my-work" && !a) return { screen: "myWork" };
@@ -414,8 +407,6 @@ export function routePath(route: Route): string {
       return `/connections/authorize/${encodeURIComponent(route.requestId)}`;
     case "login":
       return "/login";
-    case "overview":
-      return "/overview";
     case "outbox":
       return "/outbox";
     case "myWork":

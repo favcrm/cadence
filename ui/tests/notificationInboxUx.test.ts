@@ -152,7 +152,7 @@ async function main(): Promise<void> {
     });
     await settle(() => (host.textContent?.includes("全部標示為已讀") ?? false), "zh-TW localized inbox renders");
     const zhText = host.textContent ?? "";
-    assert(zhText.includes("通知") && zhText.includes("你的對話"), "zh-TW heading localized");
+    assert(popover().querySelector("h2")?.textContent === "通知", "zh-TW heading localized");
     assert(zhText.includes("全部標示為已讀") && zhText.includes("已讀完所有訊息。"), "zh-TW tools and empty state localized");
     const zhAllTab = Array.from(popover().querySelectorAll("button")).find((b) => b.textContent === "全部") as HTMLButtonElement;
     await React.act(async () => { zhAllTab.click(); });

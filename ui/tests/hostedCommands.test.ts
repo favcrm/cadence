@@ -72,7 +72,7 @@ async function main() {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
         readOnly: false, hosted, overview: resources.overview.get(),
         onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-        overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+        permissionsHref: "/permissions", resolveAppPath: () => null,
       })));
     });
     await settle();
@@ -310,7 +310,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: null, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -321,7 +321,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: true, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -331,7 +331,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: false, operator: false, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -342,7 +342,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: false, operator: true, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();

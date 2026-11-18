@@ -65,8 +65,7 @@ function DocumentFollowUpRows({
 /**
  * The Home rail shows actions for the viewer in "To do" and informational
  * rows and recent work in "Updates". Private Home supplies only documents;
- * it does not mount Master activity. Desktop can collapse the rail to
- * its count; under ~1100px it is a
+ * it does not mount Master activity. Under ~1100px it is a
  * slide-over opened from the floating button. Reading items (plans,
  * ideas, merge decisions) open inside the one shared work-item detail,
  * mounted by App (CAD-1811); the rail hands it the reading queue as it
@@ -80,12 +79,9 @@ export default function NeedsRail({
   scopedHost = false,
   hostedRoster,
   onOpenIssue,
-  overviewHref,
   permissionsHref,
   onAsk,
   onOpenDecision,
-  collapsed,
-  onToggleCollapse,
   onAskAgent,
   onSent,
   decisions: decisionsOn = false,
@@ -99,14 +95,11 @@ export default function NeedsRail({
   scopedHost?: boolean;
   hostedRoster?: AgentsPayload | null;
   onOpenIssue?: (id: string) => void;
-  overviewHref?: string;
   /** Settings → Master permissions, where the standing "Always" rules live. */
   permissionsHref?: string;
   onAsk?: (need: HomeNeed, lead?: string) => void;
   /** Open a reading item in the shared detail (App owns the one mount). */
   onOpenDecision?: (open: HomeDecisionOpen) => void;
-  collapsed: boolean;
-  onToggleCollapse: () => void;
   onAskAgent?: (agent: Agent, update?: AgentUpdate) => void;
   /** A "Fix it" reached Master: Home pins the chat to the sent message. */
   onSent?: () => void;
@@ -214,8 +207,14 @@ export default function NeedsRail({
   };
   // Updates on screen is Updates viewed: a failed write stops asking for attention.
   useEffect(() => {
-    if (decisionsOn && tab === "updates" && !collapsed) homeDecisions.markFailedSeen();
-  }, [decisionsOn, tab, collapsed, staged.decided]);
+    if (!decisionsOn || tab !== "updates") return;
+    const markVisible = () => {
+      if (drawer || window.innerWidth >= 1100) homeDecisions.markFailedSeen();
+    };
+    markVisible();
+    window.addEventListener("resize", markVisible);
+    return () => window.removeEventListener("resize", markVisible);
+  }, [decisionsOn, tab, drawer, staged.decided]);
   const stagedOpener = useRef<Element | null>(null);
   /** The detail closed: the opener if it is still there, else the rail. */
   const closeStaged = () => {
@@ -578,25 +577,11 @@ export default function NeedsRail({
           <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
         )}
       </button>
-      <span className="todo-tools">
-        {overviewHref && <Link href={overviewHref} className="lnk text-label" onClick={() => setDrawer(false)}>
-          {t("Team overview")}
-        </Link>}
-        {drawerMode ? (
-          <button type="button" className="lnk text-label" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
-            ✕
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="lnk text-label"
-            aria-label={collapsed ? "expand the rail" : "collapse the rail"}
-            onClick={onToggleCollapse}
-          >
-            {collapsed ? "»" : "«"}
-          </button>
-        )}
-      </span>
+      {drawerMode && (
+        <button type="button" className="lnk text-label todo-close" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
+          ✕
+        </button>
+      )}
     </div>
   );
 
@@ -604,30 +589,12 @@ export default function NeedsRail({
 
   return (
     <>
-      {/* ≥1100px: the detached column — sticky in the grid, scrolling on
-          its own; collapsed it is the slim rail with the count. */}
+      {/* The desktop column scrolls independently of the conversation. */}
       <div className="hidden rail:block h-full min-h-0">
-        {collapsed ? (
-          <button
-            type="button"
-            className="slimrail card"
-            aria-label={t("to do — {count} waiting; expand the rail").replace("{count}", String(count))}
-            onClick={onToggleCollapse}
-          >
-            <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
-              {countKnown ? count : "…"}
-            </span>
-            <span className="vert text-label text-ink-400">{t("To do")}</span>
-            <span className="text-ink-500" aria-hidden>
-              «
-            </span>
-          </button>
-        ) : (
-          <section className="card needsrail overflow-hidden" aria-label={t("to do")} data-collapsed="false">
-            {tabs(false)}
-            <div className="rail-scroll min-h-0">{panelBody}</div>
-          </section>
-        )}
+        <section className="card needsrail overflow-hidden" aria-label={t("to do")}>
+          {tabs(false)}
+          <div className="rail-scroll min-h-0">{panelBody}</div>
+        </section>
       </div>
 
       {/* <1100px: a floating button opens the slide-over drawer. */}

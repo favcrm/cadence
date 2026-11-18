@@ -135,7 +135,7 @@ async function main() {
   await React.act(async () => { root.render(null); navigate("/"); resources.masterThread.reset(); });
   await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
     readOnly: false, hosted: false, overview: resources.overview.get(), onOpenIssue: () => undefined,
-    onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    onOpenDecision: () => undefined, permissionsHref: "/permissions", resolveAppPath: () => null,
   }))); });
   await settle();
   assert(streams.length === 1 && host.textContent?.includes(cloud.text), "actual Home loads cached cloud history and opens its real stream consumer");

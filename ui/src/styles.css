@@ -2062,25 +2062,6 @@ textarea.agentform-input { height: auto; width: 100%; }
   scrollbar-gutter: stable;
 }
 
-/* The collapsed strip: count badge, then the title written vertically. */
-.slimrail {
-  width: 3rem;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: .625rem;
-  padding: .625rem 0;
-  cursor: pointer;
-}
-.slimrail:hover {
-  border-color: var(--color-ink-600);
-}
-.slimrail .vert {
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  letter-spacing: .02em;
-}
 
 /* The floating drawer button (<1100px) — above the chat's dock
    (CAD-600), whose measured height `--dock-h` carries. */
@@ -2225,11 +2206,8 @@ textarea.agentform-input { height: auto; width: 100%; }
   border-color: var(--color-accent);
   font-weight: 500;
 }
-.todo-tools {
+.todo-tabs > .todo-close {
   margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: .5rem;
 }
 .todo-count {
   min-width: 1rem;

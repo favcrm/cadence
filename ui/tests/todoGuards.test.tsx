@@ -187,8 +187,8 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
           // Without the badge nothing reconciles: the marks alone must not hide a changed need.
           opts.noBadge ? null : React.createElement(Badge, { needs: rows }),
           React.createElement(RailWithDetail, {
-            overview, readOnly: ro, hosted: opts.hosted, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
-            onAsk: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
+            overview, readOnly: ro, hosted: opts.hosted, onOpenIssue: () => {}, permissionsHref: "/settings/permissions",
+            onAsk: () => {}, onAskAgent: () => {},
           }),
         ),
       );

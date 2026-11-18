@@ -13,7 +13,6 @@ const { createElement: h } = require("react");
 const { renderToStaticMarkup } = require("react-dom/server");
 const { default: SafeLink } = require("../src/ui/SafeLink");
 const { NeedMenu } = require("../src/features/home/NeedsRail");
-const { NeedRows } = require("../src/features/home/Overview");
 const { Links } = require("../src/features/issues/Links");
 const { PrPanel } = require("../src/features/issues/PrPanel");
 const { MilestoneCheckpoint } = require("../src/features/projects/Milestones");
@@ -63,10 +62,6 @@ const menu = (link: string | null) =>
   renderToStaticMarkup(
     h(NeedMenu, { need: need(link), block: null, busy: false, onOpenIssue: () => {}, onDecide: () => {}, onCopied: () => {}, onClose: () => {} }),
   );
-const ovRows = (link: string | null) =>
-  renderToStaticMarkup(
-    h(NeedRows, { decision: false, rows: [{ kind: "approval", title: "ovt", age: 1, project: "demo", command: "c", link, audience: "operator" }] as never }),
-  );
 const detail = (url: string) =>
   ({ id: "CAD-1", rev: 1, refs: [{ kind: "pr", url, label: "PR #1" }, { kind: "url", url, label: "ref" }], links: { parent: null, children: [], blocked_by: [], blocks: [], relates: [], duplicate_of: null, duplicates: [] }, reports: [] }) as never;
 const links = (url: string) =>
@@ -81,7 +76,6 @@ const ms = (entry: string) =>
 
 const surfaces: Record<string, (href: string) => string> = {
   "needs menu": (u) => menu(u),
-  overview: ovRows,
   "issue links": links,
   "pr panel": prPanel,
   milestone: ms,

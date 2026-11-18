@@ -151,11 +151,8 @@ await React.act(async () => {
       overview,
       readOnly: false,
       onOpenIssue: () => {},
-      overviewHref: "/overview",
       permissionsHref: "/settings/permissions",
       onAsk: () => {},
-      collapsed: false,
-      onToggleCollapse: () => {},
       onAskAgent: () => {},
     }),
   );

@@ -63,6 +63,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const [inbox, setInbox] = useState<Inbox | null>(null);
   const [filter, setFilter] = useState<"unread" | "all">("unread");
   const [notice, setNotice] = useState<string | null>(null);
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
@@ -110,6 +111,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     toast.clear();
     setInbox(null);
     setNotice(null);
+    setSettingsNotice(null);
     setSettingsOpen(false);
     setPopoverOpen(false);
     popover.current?.close();
@@ -139,7 +141,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
               throw e;
             }
             if (active && generation.current === epoch) {
-              setNotice("Could not sync browser alerts. Your threads still load.");
+              setSettingsNotice("Could not sync browser alerts. Your threads still load.");
             }
           })
           .finally(() => {
@@ -315,7 +317,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     const mine = generation.current;
     setInbox((cur) => (cur ? { ...cur, preferences: next } : cur));
     void setNotificationPreferences(next).catch(() => {
-      if (generation.current === mine) setNotice("Could not save notification settings.");
+      if (generation.current === mine) setSettingsNotice("Could not save notification settings.");
     });
   };
 
@@ -334,7 +336,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
   const enable = () => {
     if (inbox.push.public_key === null) {
-      setNotice("Browser alerts are not available on this board.");
+      setSettingsNotice("Browser alerts are not available on this board.");
       return;
     }
     const mine = generation.current;
@@ -346,12 +348,12 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       .then(() => enableBrowserAlerts(publicKey, isCurrent))
       .then((msg) => {
         if (!isCurrent()) return;
-        setNotice(msg);
+        setSettingsNotice(msg);
         setDeviceId(localStorage.getItem(DEVICE_KEY));
       })
       .catch((e: unknown) => {
         if (e instanceof StaleEnableError) return;
-        if (isCurrent()) setNotice("Could not turn on browser alerts.");
+        if (isCurrent()) setSettingsNotice("Could not turn on browser alerts.");
       });
   };
 
@@ -360,16 +362,16 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     void disableBrowserAlerts(id)
       .then((msg) => {
         if (generation.current !== mine) return;
-        setNotice(msg);
+        setSettingsNotice(msg);
         setDeviceId(null);
       })
       .catch(() => {
-        if (generation.current === mine) setNotice("Could not turn off browser alerts.");
+        if (generation.current === mine) setSettingsNotice("Could not turn off browser alerts.");
       });
   };
 
   return (
-    <div className="relative">
+    <div className="notification-anchor">
       <button
         ref={bell}
         type="button"
@@ -396,11 +398,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         onClose={() => setPopoverOpen(false)}
       >
         <div className="notification-heading">
-          <div>
-            <span className="kicker">{t("Notifications")}</span>
-            <h2 id="notification-popover-title">{t("Your conversations")}</h2>
-            <p className="muted">{t("{count} unread messages").replace("{count}", String(total))}</p>
-          </div>
+          <h2 id="notification-popover-title">{t("Notifications")}</h2>
           <div className="flex gap-1">
             <Button variant="ghost" size="sm" aria-label={t("Notification settings")} icon={<IconSettings />} onClick={() => { setSettingsOpen(true); settings.current?.showModal(); }} />
             <Button variant="ghost" size="sm" aria-label={t("Close notifications")} icon={<IconClose />} onClick={() => close()} />
@@ -408,7 +406,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         </div>
         <div className="notification-tools">
           <div className="filter-row" role="group" aria-label={t("Show")}>
-            <button type="button" className={`filter ${filter === "unread" ? "selected" : ""}`} aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>{t("Unread")}</button>
+            <button type="button" className={`filter ${filter === "unread" ? "selected" : ""}`} aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>{t("Unread")} <span className="notification-unread-count">{total}</span></button>
             <button type="button" className={`filter ${filter === "all" ? "selected" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>{t("All")}</button>
           </div>
           <button type="button" className="lnk" disabled={total === 0} onClick={markAll}>{t("Mark all read")}</button>
@@ -417,9 +415,11 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         <div className="notification-list">
           {groups.length === 0 && (
             <div className="notification-empty">
-              <IconCheck size={18} />
-              <strong>{filter === "unread" ? t("You're all caught up.") : t("No conversations yet.")}</strong>
-              <p>{filter === "unread" ? t("No unread messages. Your history is under All.") : t("Direct messages and mentions will appear here.")}</p>
+              <span className="notification-empty-icon"><IconCheck size={18} /></span>
+              <div>
+                <strong>{filter === "unread" ? t("You're all caught up.") : t("No conversations yet.")}</strong>
+                <p>{filter === "unread" ? t("No unread messages. Your history is under All.") : t("Direct messages and mentions will appear here.")}</p>
+              </div>
             </div>
           )}
           {groups.map((g) => (
@@ -438,17 +438,6 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             </div>
           ))}
         </div>
-        <div className="notification-footer">
-          <span>{t("Notification links never grant access.")}</span>
-          {deviceId !== null && (
-            <button type="button" className="lnk" onClick={() => disable(deviceId)}>{t("Turn off browser alerts")}</button>
-          )}
-          {inbox.push.available && pushSupported() ? (
-            <button type="button" className="lnk" onClick={enable}>{t("Enable browser alerts")}</button>
-          ) : (
-            <span>{t("Browser alerts unavailable")}</span>
-          )}
-        </div>
       </dialog>
 
       <dialog
@@ -462,6 +451,18 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
           <h2 id="notification-settings-title">{t("Notification settings")}</h2>
           <Button variant="ghost" size="sm" aria-label={t("Close notification settings")} icon={<IconClose />} onClick={closeSettings} />
         </div>
+        <div className="notification-setting notification-browser-alerts">
+          <span>
+            <strong>{t("Browser alerts")}</strong>
+            {deviceId === null && !(inbox.push.available && pushSupported()) && <small>{t("Browser alerts unavailable")}</small>}
+          </span>
+          {deviceId !== null ? (
+            <button type="button" className="lnk" onClick={() => disable(deviceId)}>{t("Turn off browser alerts")}</button>
+          ) : inbox.push.available && pushSupported() ? (
+            <button type="button" className="lnk" onClick={enable}>{t("Enable browser alerts")}</button>
+          ) : null}
+        </div>
+        {settingsNotice !== null && <p className="settings-note" role="status">{t(settingsNotice)}</p>}
         {settingsOpen && <PreferenceList prefs={inbox.preferences} onChange={savePrefs} />}
       </dialog>
 

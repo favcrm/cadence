@@ -820,8 +820,6 @@ export const api = {
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
-  monitorAck: (monitor: string, alert: number) =>
-    post<{ ok: boolean; alert: unknown }>(`/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`, {}),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);

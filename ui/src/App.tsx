@@ -57,7 +57,6 @@ import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
-import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import type { DocumentFollowUpState } from "./features/home/NeedsRail";
 import { ownerDecisionsOn, useDecisions } from "./features/decisions/useDecisions";
@@ -72,7 +71,6 @@ import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import Button from "./ui/Button";
-import ProjectFilter from "./ui/ProjectFilter";
 import PageState from "./ui/PageState";
 import { wikiAvailable } from "./lib/wikiAvailable";
 import { boardSupports } from "./lib/capabilities";
@@ -124,9 +122,7 @@ import {
   locationHref,
   matchRoute,
   openProject,
-  projectScope,
   readLocation,
-  showProjectChoices,
   stripAppRouteParams,
   withProject,
   type AppLocation,
@@ -138,13 +134,12 @@ import { humanThreadsAvailable } from "./lib/humanThreads";
 import { navigate, useHref } from "./lib/useLocation";
 import { NavigationProvider } from "../screen-ui/src/navigation";
 import { hostNavigation } from "./ui/hostNavigation";
-import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./features/projects/projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
   type ProjectView,
 } from "./lib/urlState";
-import type { Health, IssueCard, Meta, ProjectContext } from "./lib/types";
+import type { Health, IssueCard, Meta } from "./lib/types";
 
 /** The location as the app reads it — the URL is the only copy. */
 function currentLocation(): AppLocation {
@@ -179,7 +174,6 @@ const settingsHomeRoute: Route = { screen: "settings", section: "models" };
 
 const SCREEN_LABEL: Record<Screen, string> = {
   home: "home",
-  overview: "overview",
   projects: "projects",
   apps: "apps",
   appsExplore: "explore",
@@ -202,8 +196,6 @@ const SCREEN_LABEL: Record<Screen, string> = {
   notFound: "not found",
 };
 
-/** Screens that read the overview: Home's Needs-you rail and the full overview. */
-const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 /** Patch a loaded queue row in place; an issue that left the caller drops out. */
 function mergePersonalCard(previous: MyWorkList, card: IssueCard): MyWorkList {
@@ -274,10 +266,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [],
   );
   const goRoute = useCallback((r: Route) => update((c) => goTo(c, r)), []);
-  const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
-  const [projectContextLoading, setProjectContextLoading] = useState(false);
-  const projectContextRequest = useRef(0);
-  const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
   // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
@@ -447,45 +435,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     persistBrowserProjectView(view);
   }, [view]);
 
-  // The overview payload costs a daemon probe + gh cache read, so it
-  // only fetches while a screen that reads it is on screen: Home, the
-  // overview, or an Apps screen (the cards' live lines and the app
-  // page's Needs-you strip mark runs against it). The refs keep
-  // `refresh` and the stream handler stable.
-  const overviewWanted = overviewOn(screen) || screen === "apps";
+  // Home and Apps consume the overview payload.
+  const overviewWanted = screen === "home" || screen === "apps";
   const overviewWantedRef = useRef(overviewWanted);
   overviewWantedRef.current = overviewWanted;
-  // Repository guidance is only used by the compact overview.
-  const contextOn = screen === "overview";
 
-  useEffect(() => {
-    const request = ++projectContextRequest.current;
-    setProjectContext(null);
-    if (!contextOn || project === "all") {
-      setProjectContextLoading(false);
-      return;
-    }
-    setProjectContextLoading(true);
-    const expectedRevision = observedContextRevisions.current[project];
-    api
-      .projectContext(project, "pm", expectedRevision)
-      .then((next) => {
-        if (!responseBelongsToRequest(request, projectContextRequest.current, project, next.project)) return;
-        setProjectContext(next);
-        if (next.snapshot.head_revision) {
-          observedContextRevisions.current[project] = next.snapshot.head_revision;
-        }
-      })
-      .catch(() => {
-        if (!requestIsCurrent(request, projectContextRequest.current, project, project)) return;
-        setProjectContext(null);
-      })
-      .finally(() => {
-        if (requestIsCurrent(request, projectContextRequest.current, project, project)) {
-          setProjectContextLoading(false);
-        }
-      });
-  }, [project, contextOn]);
 
   // The peek's id and the issue page's id, read through refs so the
   // stream and poll handlers stay stable. The page clears `openId`, so
@@ -752,27 +706,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-2103: the Browser tab's failures reach the person here.
   useEffect(() => onBrowserAlert((text) => say("err", t(text))), [say, t]);
 
-  const ackMonitor = useCallback(
-    (monitor: string, seq: number) => {
-      if (block) {
-        say("err", `monitor acknowledgements are disabled — ${block}`);
-        return;
-      }
-      api
-        .monitorAck(monitor, seq)
-        .then(() => {
-          say("ok", `${monitor} alert ${seq} acknowledged`);
-          return resources.overview.invalidate();
-        })
-        .catch((e) =>
-          say(
-            "err",
-            `monitor alert acknowledgement failed: ${String(e.message ?? e)}`,
-          ),
-        );
-    },
-    [block, say],
-  );
 
   /// A write response is authoritative: merge the fresh card into the
   /// board and the fresh detail into the drawer — no second fetch.
@@ -949,7 +882,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, []);
 
   const navProject = route.screen === "projects" ? project : null;
-  const projectSlug = project === "all" ? null : project;
   // Board-level Apps menu (CAD-784, CAD-1116): the installed apps come
   // from the verified installation list (or the shell's receipt for the
   // open one), never from the bare route, so a forged installId in the
@@ -1352,11 +1284,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           </MobileNavigation>
         )}
 
-        {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (
-          <div className="px-4 lg:px-8 pt-4">
-            <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
-          </div>
-        )}
         {route.screen === "myWork" && (
           myWorkOn ? (
             <MyWork
@@ -1389,7 +1316,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onOpenIssue={openHomeWork}
             onOpenDecision={openDecision}
             decisions={decisionsOn}
-            overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
             setupNotice={
@@ -1398,21 +1324,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
               />
             }
-          />
-        )}
-        {screen === "overview" && (
-          <OverviewView
-            state={overviewState}
-            issues={issuesState}
-            onRetry={() => void resources.overview.refresh()}
-            project={project}
-            projects={projects}
-            context={visibleContext(project, projectContext)}
-            contextLoading={projectContextLoading}
-            readOnly={readOnly}
-            onAck={ackMonitor}
-            onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
-            noWiki={!wikiAvailable(meta)}
           />
         )}
         {(route.screen === "issue" || (route.screen === "projects" && route.slug)) && (
