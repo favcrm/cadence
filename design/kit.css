@@ -215,12 +215,13 @@ a.lnk:hover, button.lnk:hover {
 }
 .btn-acc, .btn-primary {
   border-color: transparent;
-  background: var(--color-accent); color: var(--color-on-accent);
+  background: var(--color-ink-200); color: var(--color-ink-950);
   font-weight: 500;
+  transition: border-color .15s ease;
 }
 .btn-acc:hover:not(:disabled):not([aria-disabled="true"]),
 .btn-primary:hover:not(:disabled):not([aria-disabled="true"]) {
-  border-color: transparent; background: var(--color-accent); filter: brightness(1.1);
+  background: var(--color-ink-100);
 }
 .btn-ghost {
   background: transparent; border-color: transparent; color: var(--color-ink-300);

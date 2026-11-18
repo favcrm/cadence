@@ -261,6 +261,17 @@
   max-width: 100%;
 }
 
+.assistant-name-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.625rem;
+}
+.assistant-name-row > .btn {
+  height: 2.25rem;
+  font-size: var(--text-secondary);
+}
+
 /* CAD-2269: minimal first-entry personal assistant card (Avatar + Name + Skip). */
 .assistant-bootstrap {
   display: grid;
