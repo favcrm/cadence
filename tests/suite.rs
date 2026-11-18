@@ -8,6 +8,116 @@ fn an_identifier_is_validated_before_anything_uses_it() {
     assert!(cadence_agent::proto::identifier("not a valid id", "issue id").is_err());
 }
 
+#[test]
+fn native_done_requires_named_real_evidence_on_a_repo_free_task() {
+    use cadence_agent::issue::edit::{edit, EditSpec};
+    use cadence_agent::issue::write::{new_issue, project_add};
+    use cadence_agent::issue::{parse, project, Pm};
+    use std::os::unix::fs::symlink;
+
+    for scenario in ["missing", "symlink", "unreferenced", "repo", "attached"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        new_issue(
+            &pm,
+            tmp.path(),
+            Some("cadence"),
+            "ticket",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        let issue = pm.dir.join("cadence/CAD-1");
+        let attachment = issue.join("artifacts/brief.txt");
+        let source = tmp.path().join("brief.txt");
+        std::fs::write(&source, b"the actual deliverable").unwrap();
+
+        if scenario == "symlink" {
+            std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+            symlink(&source, &attachment).unwrap();
+        }
+        if scenario == "repo" {
+            let path = pm.dir.join("cadence/project.yaml");
+            let mut project = project::load(&path).unwrap();
+            project.repos.push(project::Repo {
+                path: None,
+                remote: Some("https://example.invalid/example/repo".into()),
+                base: None,
+            });
+            std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+        }
+
+        let before = std::fs::read(issue.join("issue.md")).unwrap();
+        let spec = EditSpec {
+            set: vec!["status=done".into()],
+            refs: if scenario == "unreferenced" {
+                vec![]
+            } else {
+                vec!["artifact:brief.txt".into()]
+            },
+            attach: if matches!(scenario, "attached" | "unreferenced" | "repo") {
+                vec![source]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        let result = edit(&pm, "CAD-1", &spec, "t", None);
+        if scenario == "attached" {
+            result.unwrap();
+            let text = std::fs::read_to_string(issue.join("issue.md")).unwrap();
+            let (front, _) = parse::parse_issue(&text).unwrap();
+            assert_eq!(front.status, "done");
+            assert!(front
+                .refs
+                .iter()
+                .any(|r| { r.kind == "artifact" && r.path.as_deref() == Some("brief.txt") }));
+            assert_eq!(
+                std::fs::read(&attachment).unwrap(),
+                b"the actual deliverable"
+            );
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("status=done needs evidence"),
+                "{scenario}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(issue.join("issue.md")).unwrap(),
+                before,
+                "{scenario}"
+            );
+            if scenario == "symlink" {
+                assert!(attachment
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            } else {
+                assert!(
+                    !attachment.exists(),
+                    "{scenario}: attachment survived refusal"
+                );
+            }
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&pm.dir)
+                .args(["diff", "--cached", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{scenario}: refusal left staged changes");
+        }
+    }
+}
+
 // CAD-2162 security acceptance, authored independently of the implementation.
 #[test]
 fn svg_attachment_refuses_active_external_references() {
