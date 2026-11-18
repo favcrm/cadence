@@ -918,7 +918,8 @@ pre {
   display: flex;
   align-items: center;
   gap: .625rem;
-  margin: .25rem 0;
+  /* CAD-2425: air above the day it opens, the mockup's 20px / 14px. */
+  margin: 1.25rem 0 .875rem;
   color: var(--color-ink-500);
   /* CAD-2363: a date in the board's language, set as text, not a mono label. */
   font-size: .6875rem;
@@ -931,7 +932,8 @@ pre {
   background: var(--color-ink-800);
 }
 
-/* CAD-1886: the keyboard affordance under a full-density composer. */
+/* CAD-1886: the keyboard affordance of a full-density composer (CAD-2425:
+   now in its footer row, beside send). */
 .composer-hint {
   margin: .375rem .125rem 0;
   color: var(--color-ink-500);
@@ -2986,4 +2988,112 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 }
 .answer .issue-reader .md-table-wrap table {
   margin: 0;
+}
+
+/* CAD-2425: chat reads in the device's own interface font (SF Pro and
+   PingFang on Apple, Segoe UI and Microsoft JhengHei on Windows, Roboto and
+   Noto on Android), so Latin and Chinese match and nothing is downloaded.
+   The page's `lang` (set from the board locale) picks traditional glyphs.
+   Code, times and counts keep their own IBM Plex Mono rules. Screens other
+   than chat keep IBM Plex Sans. */
+:root {
+  --font-chat: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+}
+.chat-scroll,
+.app-chat-list,
+[data-composer],
+.app-chat-composer {
+  font-family: var(--font-chat);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* The full composer (Home, member and agent chat): one 12px card, the box,
+   then one footer row — attach, the keyboard hint, send. */
+[data-composer]:has(> .composer-foot) {
+  border-radius: .75rem;
+  padding: .625rem .75rem .5rem;
+}
+[data-composer]:has(> .composer-foot) > textarea {
+  display: block; /* no inline baseline gap under the box */
+  line-height: 1.5;
+}
+.composer-foot {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-top: .25rem;
+}
+.composer-foot .composer-hint {
+  margin: 0;
+}
+.app-chat-attach-label {
+  display: none;
+}
+@media (min-width: 640px) {
+  .composer-foot .app-chat-attach,
+  .app-chat-composer-tools .app-chat-attach {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    width: auto;
+    padding: 0 .4rem;
+    border-radius: .375rem;
+    font-size: var(--text-micro);
+  }
+  .composer-foot .app-chat-attach-label,
+  .app-chat-composer-tools .app-chat-attach-label {
+    display: inline;
+  }
+}
+/* The assistant panel's compact composer follows the same card: 12px
+   corners (already), the same padding, and on desktop the message size. */
+.app-chat-composer[data-density] {
+  padding: .625rem .75rem .5rem;
+}
+
+/* Desktop reading size: 15px at 1.65 for answers and the operator's own
+   bubble, a 680px measure, the compact composer and an evenly rounded
+   bubble. Below 1024px CAD-1881's 16px phone reading stays as it is. */
+@media (min-width: 1024px) {
+  .answer .answer-body.issue-reader,
+  .chat-bubble.issue-reader,
+  [data-chat-message="user"] .chat-bubble,
+  [data-chat-message="user"] .chat-bubble.text-body {
+    font-size: .9375rem;
+    line-height: 1.65;
+    text-wrap: pretty;
+  }
+  .answer,
+  .turn-head {
+    max-width: min(100%, 42.5rem);
+  }
+  [data-chat-message="user"] .chat-bubble,
+  [data-chat-message="user"] .chat-bubble.text-body {
+    max-width: min(78%, 34rem);
+    border-radius: .875rem;
+  }
+  [data-composer]:has(> .composer-foot) > textarea,
+  .app-chat-composer .app-chat-box {
+    min-height: 2.5rem;
+    font-size: .9375rem;
+  }
+  .composer-foot .app-chat-attach,
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-attach,
+  .app-chat-composer-tools .app-chat-send {
+    height: 1.625rem;
+  }
+  .composer-foot .app-chat-send,
+  .app-chat-composer-tools .app-chat-send {
+    width: 1.625rem;
+  }
+  .composer-foot .app-chat-attach svg,
+  .composer-foot .app-chat-send svg,
+  .app-chat-composer-tools .app-chat-attach svg,
+  .app-chat-composer-tools .app-chat-send svg {
+    width: .875rem;
+    height: .875rem;
+  }
 }

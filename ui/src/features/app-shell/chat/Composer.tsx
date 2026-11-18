@@ -763,7 +763,7 @@ export default function Composer({
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onKeyDown={onKey}
-      rows={compact ? 1 : 2}
+      rows={1}
       disabled={!!block}
       placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
@@ -791,7 +791,9 @@ export default function Composer({
       }}
     />
   ) : null;
-  const attachButton = attach ? (
+  // CAD-2425: the control is named beside its icon (the approved
+  // chat-polish footer row); CSS shows the name from 640px.
+  const attachControl = (labelled: boolean) => attach ? (
     <button
       type="button"
       className="app-chat-attach"
@@ -805,6 +807,7 @@ export default function Composer({
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M21 12.5l-8.5 8.5a5.5 5.5 0 01-7.8-7.8l9-9a3.67 3.67 0 015.2 5.2l-8.5 8.5a1.83 1.83 0 01-2.6-2.6l7.8-7.8" />
       </svg>
+      {labelled && <span className="app-chat-attach-label" aria-hidden="true">{t("Attach file")}</span>}
     </button>
   ) : null;
   const sendHeld = unresolvedHint(attachHold(key), translateAttachText);
@@ -885,7 +888,7 @@ export default function Composer({
           {boxEl}
           <div className="app-chat-composer-tools">
             {attachInput}
-            {attachButton}
+            {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
@@ -939,9 +942,10 @@ export default function Composer({
       {refsRow}
       {attachChips}
       {boxEl}
-      <div className="flex items-center gap-2 mt-1.5">
+      {/* CAD-2425: one footer row — attach, the keyboard hint, then send. */}
+      <div className="composer-foot" data-composer-foot="">
         {attachInput}
-        {attachButton}
+        {attachControl(true)}
         {/* A held send's reason is on the failed file's own row; this
             line is only for a blocked (read-only) composer. */}
         {block ? (
@@ -949,15 +953,15 @@ export default function Composer({
             {t(block)}
           </p>
         ) : (
-          <span className="flex-1" />
+          <>
+            <span className="flex-1" />
+            <p className="composer-hint" data-composer-hint>
+              {t("Enter to send · Shift+Enter for a new line")}
+            </p>
+          </>
         )}
         {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
-      {!block && (
-        <p className="composer-hint" data-composer-hint>
-          {t("Enter to send · Shift+Enter for a new line")}
-        </p>
-      )}
     </form>
   );
 }
