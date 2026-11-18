@@ -1524,7 +1524,9 @@ button.sentchip:focus-visible {
   text-align: left;
 }
 /* The badge colour comes from the board's status tokens, tinted like a
-   status pill, so it follows the theme: no palette of its own. */
+   status pill, so it follows the theme: no palette of its own. The text
+   leans toward the ink so every kind clears 4.5:1 on its tint in both
+   themes (the raw light tokens were 3.2-4.4:1). */
 .sentchip-ext {
   --kind: var(--color-ink-400);
   display: grid;
@@ -1532,8 +1534,8 @@ button.sentchip:focus-visible {
   width: 1.875rem;
   height: 2.125rem;
   border-radius: .375rem;
-  background: color-mix(in srgb, var(--kind) 18%, transparent);
-  color: var(--kind);
+  background: color-mix(in srgb, var(--kind) 14%, transparent);
+  color: color-mix(in srgb, var(--kind) 60%, var(--color-ink-100));
   font: 600 .5625rem/1 var(--font-chat);
   letter-spacing: .04em;
 }
