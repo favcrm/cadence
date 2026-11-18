@@ -1,4 +1,6 @@
+// @ts-ignore
 import { describe, it } from 'node:test';
+// @ts-ignore
 import assert from 'node:assert';
 import { usedByCounts } from '../src/features/agents/workspaceSkills';
 import type { WorkspaceSkillUser } from '../src/lib/types';
