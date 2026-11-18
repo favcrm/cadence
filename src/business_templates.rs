@@ -17,6 +17,47 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
+#[path = "business_templates_html.rs"]
+pub mod html;
+
+pub use html::{
+    build_suggested_html_from_intake, extract_html_placeholders, render_html_template,
+    validate_and_sanitize_html_template, HTML_MAX_BYTES,
+};
+
+/// Sentinel string emitted for unpriced lines/totals under `allow_partial`.
+pub const UNRESOLVED_PRICE: &str = "UNRESOLVED";
+
+/// Retained source representation of a template version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceFormat {
+    Docx,
+    Html,
+    Authoring,
+}
+
+impl SourceFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docx => "docx",
+            Self::Html => "html",
+            Self::Authoring => "authoring",
+        }
+    }
+}
+
+pub fn parse_source_format(s: &str) -> Result<SourceFormat> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "docx" => Ok(SourceFormat::Docx),
+        "html" => Ok(SourceFormat::Html),
+        "authoring" => Ok(SourceFormat::Authoring),
+        other => refuse(format!(
+            "unsupported template source_format '{other}'; expected docx, html, or authoring"
+        )),
+    }
+}
+
 /// Largest accepted money amount in minor units (10^13 cents).
 const MAX_MINOR: i128 = 10_000_000_000_000;
 /// Largest accepted quantity in thousandths (10^12 milli-units).
@@ -37,6 +78,7 @@ const RESERVED: &[&str] = &[
     "tax_rate",
     "discount_rate",
     "kind",
+    "has_unresolved_pricing",
 ];
 
 /// The document kind a template produces. Drafts only: no kind issues,
@@ -124,7 +166,7 @@ pub struct ItemOut {
 }
 
 /// A validated, calculated draft. `context()` is the complete placeholder
-/// map a later DOCX render reads.
+/// map a later DOCX or HTML render reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub kind: DocumentKind,
@@ -138,6 +180,7 @@ pub struct Draft {
     pub discount: String,
     pub tax: String,
     pub total: String,
+    pub has_unresolved_pricing: bool,
 }
 
 impl Draft {
@@ -156,6 +199,10 @@ impl Draft {
         ctx.insert("tax".into(), json!(self.tax));
         ctx.insert("total".into(), json!(self.total));
         ctx.insert("items".into(), json!(self.items));
+        ctx.insert(
+            "has_unresolved_pricing".into(),
+            json!(self.has_unresolved_pricing),
+        );
         Value::Object(ctx)
     }
 }
@@ -491,6 +538,36 @@ pub fn retained_source<'a>(definition: &TemplateDefinition, source: &'a [u8]) ->
     }
 }
 
+/// Format-aware source validation and canonicalization for stored template versions.
+pub fn retained_source_with_format(
+    definition: &TemplateDefinition,
+    format: SourceFormat,
+    source: &[u8],
+) -> Result<Vec<u8>> {
+    match (definition, format) {
+        (TemplateDefinition::Financial(_), SourceFormat::Docx) => {
+            check_docx_package(source)?;
+            Ok(source.to_vec())
+        }
+        (TemplateDefinition::Financial(spec), SourceFormat::Html) => {
+            let clean = validate_and_sanitize_html_template(source, spec)?;
+            Ok(clean.into_bytes())
+        }
+        (TemplateDefinition::Financial(_), SourceFormat::Authoring) => {
+            refuse("financial templates require docx or html source format")
+        }
+        (TemplateDefinition::Authoring(_), SourceFormat::Authoring) => {
+            if !source.is_empty() {
+                return refuse("authoring reference packs do not accept a source payload");
+            }
+            Ok(Vec::new())
+        }
+        (TemplateDefinition::Authoring(_), _) => {
+            refuse("authoring reference packs only accept authoring source format")
+        }
+    }
+}
+
 fn bound_authoring_wire(value: &Value) -> Result<()> {
     if value.get("kind").and_then(Value::as_str) != Some("authoring") {
         return Ok(());
@@ -640,9 +717,10 @@ fn reference_extension_matches(name: &str, media_type: &str) -> Result<bool> {
         "application/pdf" => &["pdf"],
         "text/plain" => &["txt"],
         "text/markdown" => &["md"],
+        "text/html" => &["html", "htm"],
         other => {
             return refuse(format!(
-                "reference '{name}' media_type '{other}' is not png, jpeg, pdf, plain text, or markdown"
+                "reference '{name}' media_type '{other}' is not png, jpeg, pdf, plain text, markdown, or html"
             ))
         }
     };
@@ -659,13 +737,16 @@ fn check_reference_bytes(name: &str, media_type: &str, bytes: &[u8]) -> Result<(
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
         "application/pdf" => bytes.starts_with(b"%PDF-"),
-        "text/plain" | "text/markdown" => text_bytes(bytes),
+        "text/plain" | "text/markdown" | "text/html" => text_bytes(bytes),
         _ => false,
     };
     if !ok {
         return refuse(format!(
             "reference '{name}' does not match media_type '{media_type}'"
         ));
+    }
+    if media_type == "text/html" {
+        html::validate_html_reference(bytes)?;
     }
     Ok(())
 }
@@ -709,6 +790,18 @@ pub fn sample_data(spec: &TemplateSpec) -> DocumentData {
 
 /// Validate `data` against `spec` and compute every total in code.
 pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
+    build_draft_with_options(spec, data, false)
+}
+
+/// Validate `data` against `spec` and compute every priced line in code.
+/// When `allow_partial` is true, line items whose `unit_price` is empty or
+/// `"UNRESOLVED"` emit `"UNRESOLVED"` line totals and document totals while
+/// flagging `has_unresolved_pricing = true`.
+pub fn build_draft_with_options(
+    spec: &TemplateSpec,
+    data: &DocumentData,
+    allow_partial: bool,
+) -> Result<Draft> {
     validate_spec(spec)?;
     check_approvable(spec)?;
     for key in data.fields.keys() {
@@ -751,6 +844,7 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
     let rules = &spec.calculation;
     let mut items = Vec::with_capacity(data.items.len());
     let mut subtotal: i128 = 0;
+    let mut has_unresolved_pricing = false;
     for (index, row) in data.items.iter().enumerate() {
         let n = index + 1;
         let description = row.description.trim();
@@ -761,6 +855,17 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
         }
         let qty = parse_quantity(&row.quantity)
             .map_err(|e| Error::rejected(format!("line item {n}: {e}")))?;
+        let trimmed_price = row.unit_price.trim();
+        if allow_partial && (trimmed_price.is_empty() || trimmed_price == UNRESOLVED_PRICE) {
+            has_unresolved_pricing = true;
+            items.push(ItemOut {
+                description: description.to_string(),
+                quantity: format_milli(qty),
+                unit_price: UNRESOLVED_PRICE.to_string(),
+                line_total: UNRESOLVED_PRICE.to_string(),
+            });
+            continue;
+        }
         let price = parse_money(&row.unit_price)
             .map_err(|e| Error::rejected(format!("line item {n}: {e}")))?;
         let line = round_div(qty * price, 1000);
@@ -772,10 +877,20 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
             line_total: format_minor(line),
         });
     }
-    let discount = round_div(subtotal * rules.discount_bps as i128, 10_000);
-    let taxable = subtotal - discount;
-    let tax = round_div(taxable * rules.tax_rate_bps as i128, 10_000);
-    let total = taxable + tax;
+    let (subtotal_s, discount_s, tax_s, total_s) = if has_unresolved_pricing {
+        let u = || UNRESOLVED_PRICE.to_string();
+        (u(), u(), u(), u())
+    } else {
+        let discount = round_div(subtotal * rules.discount_bps as i128, 10_000);
+        let taxable = subtotal - discount;
+        let tax = round_div(taxable * rules.tax_rate_bps as i128, 10_000);
+        (
+            format_minor(subtotal),
+            format_minor(discount),
+            format_minor(tax),
+            format_minor(taxable + tax),
+        )
+    };
     Ok(Draft {
         kind: spec.kind,
         fields,
@@ -784,10 +899,11 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
         currency: rules.currency.clone(),
         tax_rate_bps: rules.tax_rate_bps,
         discount_bps: rules.discount_bps,
-        subtotal: format_minor(subtotal),
-        discount: format_minor(discount),
-        tax: format_minor(tax),
-        total: format_minor(total),
+        subtotal: subtotal_s,
+        discount: discount_s,
+        tax: tax_s,
+        total: total_s,
+        has_unresolved_pricing,
     })
 }
 
@@ -1110,5 +1226,68 @@ mod tests {
     fn base64_std(bytes: &[u8]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn html_template_sanitizes_renders_and_preserves_table_loops() {
+        let s = spec();
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let raw = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><style>@page {{ size: A4; }} .num {{ text-align: right; }}</style></head><body><h1>{{{{ customer }}}}</h1><img src=\"data:image/png;base64,{png}\" alt=\"Logo\"><table><tbody>{{% for item in items %}}<tr><td>{{{{ item.description }}}}</td><td class=\"num\">{{{{ item.line_total }}}}</td></tr>{{% endfor %}}</tbody></table><p>{{{{ total }}}} {{{{ currency }}}}</p></body></html>"
+        );
+        let clean = validate_and_sanitize_html_template(raw.as_bytes(), &s).unwrap();
+        assert!(
+            clean.contains("@page { size: A4; }")
+                && clean.contains("<tbody>{% for item in items %}")
+        );
+        let d = build_draft(
+            &s,
+            &data(
+                json!([{"description": "<Acme & Sons>", "quantity": "2", "unit_price": "10.00"}]),
+            ),
+        )
+        .unwrap();
+        let rendered = render_html_template(&clean, &d.context(), true).unwrap();
+        assert!(
+            rendered.contains("data-sample-banner=\"true\"")
+                && rendered.contains("&lt;Acme &amp; Sons&gt;")
+                && !rendered.contains("{{")
+        );
+    }
+
+    #[test]
+    fn html_template_rejects_active_external_or_undeclared_content() {
+        let s = spec();
+        for bad in [
+            "<script>alert(1)</script><p>{{ customer }}</p>",
+            "<p onclick=\"alert(1)\">{{ customer }}</p>",
+            "<style>@import url(https://evil.invalid/x.css);</style><p>{{ customer }}</p>",
+            "<img src=\"https://evil.invalid/pixel.png\"><p>{{ customer }}</p>",
+            "<img src=\"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=\"><p>{{ customer }}</p>",
+            "<p>{{ undeclared_field }}</p>",
+        ] {
+            assert!(
+                validate_and_sanitize_html_template(bad.as_bytes(), &s).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_draft_and_authoring_html_ref() {
+        let s = spec();
+        let d = data(
+            json!([{"description": "Fixed", "quantity": "1", "unit_price": "50.00"}, {"description": "Custom", "quantity": "2", "unit_price": "UNRESOLVED"}]),
+        );
+        assert!(build_draft(&s, &d).is_err());
+        let p = build_draft_with_options(&s, &d, true).unwrap();
+        assert!(
+            p.has_unresolved_pricing
+                && p.items[0].line_total == "50.00"
+                && p.items[1].line_total == "UNRESOLVED"
+                && p.subtotal == "UNRESOLVED"
+                && p.total == "UNRESOLVED"
+        );
+        assert!(parse_definition(pack(json!([{"name": "starter.html", "media_type": "text/html", "description": "HTML snippet", "content_base64": base64_std(b"<!doctype html><html><body>Hi</body></html>\n")}]))).is_ok());
     }
 }

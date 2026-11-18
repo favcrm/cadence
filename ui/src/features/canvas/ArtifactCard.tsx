@@ -1,4 +1,7 @@
+import { useContext } from "react";
 import { useTranslate } from "../../lib/locale";
+import { WriteGate } from "../auth/WriteGate";
+import { requestSaveAsTemplateForArtifact } from "../templates/canvasTemplateDraft";
 import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
 import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
@@ -19,12 +22,13 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
   const t = useTranslate();
   const canvas = useCanvas();
   const browser = useBrowserTab();
+  const writeGate = useContext(WriteGate);
   const ref: ArtifactRef | null = artifactRef(entry.payload);
   if (!ref) return <p className="text-micro text-ink-500">· {t("Artifact unavailable")}</p>;
   const tab = canvas.open ? canvas.tabs.find((x) => x.id === canvas.active) : undefined;
   // The Browser tab, when in front, is what the canvas shows.
   const inCanvas = !isBrowserPanelShown(canvas, browser) && tab?.id === ref.id && tab.selected === ref.version;
-  return (
+  const card = (
     <div
       className="artcard"
       data-kind="artifact"
@@ -53,6 +57,26 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
       ) : (
         <span className="artopen">{t("Open")}</span>
       )}
+    </div>
+  );
+  if (ref.kind !== "html") return card;
+  return (
+    <div className="grid gap-1" data-artifact-card-wrap={ref.id}>
+      {card}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          className="btn btn-ghost text-micro"
+          data-artifact-save-template={ref.id}
+          disabled={writeGate !== null}
+          onClick={() => {
+            requestSaveAsTemplateForArtifact(ref.id);
+            openArtifact(ref);
+          }}
+        >
+          {t("Save as Template")}
+        </button>
+      </div>
     </div>
   );
 }

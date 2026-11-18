@@ -113,6 +113,7 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/templates/revise", RouteClass::OperatorOnly),
     route("POST", "/api/templates/approve", RouteClass::OperatorOnly),
     route("POST", "/api/documents/create", RouteClass::OperatorOnly),
+    route("POST", "/api/documents/export", RouteClass::OperatorOnly),
     route("POST", "/api/templates/intake", RouteClass::OperatorOnly),
     route("POST", "/api/routines", RouteClass::OperatorOnly),
     route("POST", "/api/routines/*/update", RouteClass::OperatorOnly),
