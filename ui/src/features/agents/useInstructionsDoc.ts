@@ -6,6 +6,8 @@ import type { ToastMsg } from "../../ui/Toast";
 import {
   checkHosted,
   checkNative,
+  classifyFailure,
+  profileBody,
   saveHosted,
   saveNative,
   savedText,
@@ -22,6 +24,11 @@ const liveDeps: DocDeps = {
 };
 
 export type DocPhase = "idle" | "saving" | "conflict" | "unconfirmed";
+
+/** What saving the profile's `skills` came to. Only "saved" changed the page. */
+export type SkillsOutcome =
+  | { kind: "saved" | "conflict" | "unconfirmed" | "busy" }
+  | { kind: "refused"; message: string };
 
 /** Where the caret was when the textarea last lost it, so Preview and a tab
  *  trip give it back. */
@@ -55,6 +62,9 @@ export interface InstructionsDoc {
   useTheirs: () => void;
   check: () => void;
   discard: () => void;
+  /** Hosted: save the profile's `skills` at the revision this page holds,
+   *  keeping its stored text. A stale revision is never retried. */
+  saveSkills: (skills: string[]) => Promise<SkillsOutcome>;
 }
 
 export function useInstructionsDoc(opts: {
@@ -252,6 +262,35 @@ export function useInstructionsDoc(opts: {
     check: () => {
       const job = ready ? checkJob() : null;
       if (job && sent.current) void run(job, sent.current.text, sent.current.base, true);
+    },
+    saveSkills: async (skills) => {
+      if (!ready || kind !== "hosted" || !profile || busy.current) return { kind: "busy" };
+      busy.current = true;
+      const base = profile;
+      try {
+        setProfile(await deps.writeProfile(base.id, profileBody(base, base.responsibilities, base.revision, skills)));
+        return { kind: "saved" };
+      } catch (error) {
+        const out = classifyFailure(error, "hosted");
+        if (out === "refused") return { kind: out, message: error instanceof Error ? error.message : String(error) };
+        if (out === "unconfirmed") {
+          // The write may have landed: only a read that shows exactly this
+          // change on top of the page's revision is taken as ours.
+          const latest = await deps.readProfile(base.id).catch(() => null);
+          if (
+            latest &&
+            latest.revision === base.revision + 1 &&
+            latest.responsibilities === base.responsibilities &&
+            latest.skills.join("\n") === skills.join("\n")
+          ) {
+            setProfile(latest);
+            return { kind: "saved" };
+          }
+        }
+        return { kind: out };
+      } finally {
+        busy.current = false;
+      }
     },
     discard: () => {
       if (phase !== "unconfirmed") {

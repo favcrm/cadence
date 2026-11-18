@@ -694,6 +694,38 @@ export interface StoredAgentProfile {
   model: string;
 }
 
+/** `GET /api/workspace-skills` on a hosted board (agenticos-v2 AOS-626): one
+ *  skill of the workspace library. `latest_revision` may be a draft. */
+export interface WorkspaceSkillSummary {
+  name: string;
+  latest_revision: number;
+  latest_digest: string;
+  description: string;
+  /** Null until an owner approves a revision, and again after a revoke. */
+  approved: { revision: number; digest: string; by: string; at: number } | null;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** `GET /api/workspace-skills/<name>[?revision=N]`: one revision, its files as text. */
+export interface WorkspaceSkillRead {
+  notice: string;
+  skill: WorkspaceSkillSummary;
+  revision: {
+    name: string;
+    revision: number;
+    digest: string;
+    description: string;
+    files: Record<string, string>;
+    created_by: string;
+    author: string | null;
+    created_at: number;
+  };
+  /** Whether the revision shown is the approved one. */
+  approved: boolean;
+}
+
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
  *  fields re-declared here: a registered agent always reports `provider` and
  *  `endpoint_kind`, the board reads the allowance record as the wider
