@@ -19,28 +19,76 @@ pub(super) fn run(
     if let Some(alias) = agent {
         let name = skill.as_deref().unwrap_or("cadence");
         // Validate the bundle name without inspecting this caller's home as the target.
-        cadence_agent::skill::guidance(None, name)?;
+        cadence_agent::skill::guidance_copy(None, name)?;
         let shown = client::rpc(
             &state_dir,
             "agent_show",
             json!({"alias": alias, "limit": 0}),
         )?;
+        let agent = &shown["agent"];
+        let caller = client::rpc(&state_dir, "agent_identity", json!({})).ok();
+        // The daemon identifies the calling process, not its CADENCE_ALIAS.
+        // An off-runner invocation must not use its own files for this target.
+        let own_runner = caller
+            .as_ref()
+            .and_then(|identity| identity["alias"].as_str())
+            .zip(agent["alias"].as_str())
+            .is_some_and(|(caller, target)| caller == target);
+        let copies = if own_runner {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            let cwd = std::env::current_dir().ok();
+            let home_state = cadence_agent::skill::guidance_copy(home.as_deref(), name)?;
+            let working_state = if cwd == home {
+                home_state
+            } else {
+                cadence_agent::skill::guidance_copy(cwd.as_deref(), name)?
+            };
+            Some((home_state, working_state))
+        } else {
+            None
+        };
         let disabled = native_discovery_disabled(&shown);
+        let installed =
+            copies.is_some_and(|(home, working)| home == "current" || working == "current");
+        let (status, remedy) = if disabled {
+            (
+                "disabled",
+                "Managed Pi/omp disables automatic skill discovery; explicitly provide the guidance through an authorized task route.",
+            )
+        } else if installed {
+            (
+                "installed",
+                "The bundled copy matches this CLI; verify the provider's load route or supply the guidance explicitly.",
+            )
+        } else if own_runner {
+            (
+                "unknown",
+                "No current bundled copy was verified; explicitly provide the guidance through an authorized task route.",
+            )
+        } else {
+            (
+                "unknown",
+                "Run the diagnostic inside the named runner if it can use the CLI; otherwise explicitly provide the guidance.",
+            )
+        };
         print_json(&json!({
             "target": alias,
             "skill": name,
             "scope": "native agent",
-            "provider": shown["agent"]["provider"],
-            "endpoint_kind": shown["agent"]["endpoint_kind"],
-            "status": if disabled { "disabled" } else { "unknown" },
-            "remedy": if disabled {
-                "Managed Pi/omp disables automatic skill discovery; explicitly provide the guidance through an authorized task route."
-            } else {
-                "Runtime guidance reachability is not established; inspect its supported configuration and provide guidance explicitly."
-            },
+            "provider": agent["provider"],
+            "endpoint_kind": agent["endpoint_kind"],
+            "status": status,
+            "copies": copies.map(|(home, working_directory)| json!({
+                "home": home,
+                "working_directory": working_directory
+            })),
+            "discovery": if disabled { "disabled" } else { "unknown" },
+            "remedy": remedy,
             "live_session": "not checked"
         }));
-        return Ok(1);
+        return Ok(i32::from(status != "installed"));
     }
     let report = cadence_agent::doctor::run(&state_dir)?;
     print_json(&report);

@@ -18772,3 +18772,124 @@ mod cad2019_html_templates_acceptance {
         );
     }
 }
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn named_native_doctor_checks_copies_only_in_the_verified_runner() {
+    use cadence_agent::store::{NewAgent, Store};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::process::{Child, Command, Stdio};
+
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let pm = root.path().join("pm");
+    let workspace = root.path().join("work");
+    let home = root.path().join("runner-home");
+    let daemon_home = root.path().join("daemon-home");
+    let copy = workspace.join(".agents/skills/cadence/SKILL.md");
+    for path in [
+        state.as_path(),
+        home.as_path(),
+        daemon_home.as_path(),
+        copy.parent().unwrap(),
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    cadence_agent::issue::Pm::init(&pm).unwrap();
+    fs::write(copy, cadence_agent::skill::SKILL_MD).unwrap();
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    for provider in ["codex", "pi"] {
+        store
+            .register_agent(&NewAgent {
+                alias: provider,
+                provider,
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: workspace.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
+    drop(store);
+
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", root.path().parent().unwrap())
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &pm)
+            .current_dir(&workspace);
+        command
+    };
+    let log = fs::File::create(root.path().join("daemon.log")).unwrap();
+    let daemon = Daemon(
+        cadence_agent::reaper::spawn(
+            cli()
+                .env("HOME", &daemon_home)
+                .env("CADENCE_TEST_SEAM", "1")
+                .args(["daemon", "run"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log)),
+        )
+        .unwrap(),
+    );
+    let health =
+        cadence_agent::client::rpc_relay(&state, "health", json!({})).unwrap_or_else(|error| {
+            panic!(
+                "{error}: {}",
+                fs::read_to_string(root.path().join("daemon.log")).unwrap()
+            )
+        });
+    assert_eq!(health["pid"], daemon.0.id());
+
+    let report = |target, actor, code| -> Value {
+        let out = cadence_agent::reaper::output(
+            cli()
+                .env("HOME", &home)
+                .env("CADENCE_TEST_AS", actor)
+                .env("CADENCE_ALIAS", target)
+                .args(["doctor", "--agent", target]),
+        )
+        .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let own = report("codex", "agent:codex", 0);
+    assert_eq!(own["status"], "installed");
+    assert_eq!(
+        own["copies"],
+        json!({"home": "missing", "working_directory": "current"})
+    );
+    assert_eq!(own["discovery"], "unknown");
+
+    let outside = report("codex", "operator", 1);
+    assert_eq!(outside["status"], "unknown");
+    assert!(outside["copies"].is_null());
+
+    let disabled = report("pi", "agent:pi", 1);
+    assert_eq!(disabled["status"], "disabled");
+    assert_eq!(disabled["copies"]["working_directory"], "current");
+    assert_eq!(disabled["discovery"], "disabled");
+}

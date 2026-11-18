@@ -12,7 +12,7 @@
 //! links are not evidence that a running agent session has reloaded them.
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -226,48 +226,53 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
         ))),
     }
 }
-/// Compare one bundled skill in this caller's home, without exposing its contents.
-pub fn guidance(home: Option<&Path>, name: &str) -> Result<Value> {
+/// Compare the fixed bundle under `root/.agents/skills`, without returning files.
+pub fn guidance_copy(root: Option<&Path>, name: &str) -> Result<&'static str> {
     let bundle = selected(Some(name))?
         .iter()
         .find(|skill| skill.name == name)
         .expect("selected skill includes its requested bundle");
+    let Some(root) = root else {
+        return Ok("unknown");
+    };
+    let root = canonical_root(root).join(name);
     let mut state = "current";
-    if let Some(home) = home {
-        let root = canonical_root(home).join(name);
-        for (relative, expected) in bundle.files {
-            let path = root.join(relative);
-            let actual = std::fs::metadata(&path).and_then(|metadata| {
-                if !metadata.is_file() {
-                    return Err(std::io::ErrorKind::InvalidData.into());
-                }
-                if metadata.len() != expected.len() as u64 {
+    for (relative, expected) in bundle.files {
+        let actual = (|| -> std::io::Result<bool> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(root.join(relative))?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            if metadata.len() != expected.len() as u64 {
+                return Ok(false);
+            }
+            let mut buffer = [0; 4096];
+            for bytes in expected.as_bytes().chunks(buffer.len()) {
+                let chunk = &mut buffer[..bytes.len()];
+                file.read_exact(chunk)?;
+                if bytes != &*chunk {
                     return Ok(false);
                 }
-                let mut file = std::fs::File::open(path)?;
-                let mut buffer = [0; 4096];
-                for bytes in expected.as_bytes().chunks(buffer.len()) {
-                    let chunk = &mut buffer[..bytes.len()];
-                    file.read_exact(chunk)?;
-                    if bytes != &*chunk {
-                        return Ok(false);
-                    }
-                }
-                Ok(file.read(&mut buffer[..1])? == 0)
-            });
-            match actual {
-                Ok(true) => {}
-                Ok(_) if state != "unknown" => state = "stale",
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && state != "unknown" => {
-                    state = "missing";
-                }
-                Err(_) => state = "unknown",
-                _ => {}
             }
+            Ok(file.read(&mut buffer[..1])? == 0)
+        })();
+        match actual {
+            Ok(false) if state == "current" => state = "stale",
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state = "missing",
+            Err(_) => return Ok("unknown"),
+            _ => {}
         }
-    } else {
-        state = "unknown";
     }
+    Ok(state)
+}
+
+/// Compare one bundled skill in this caller's home, without exposing its contents.
+pub fn guidance(home: Option<&Path>, name: &str) -> Result<Value> {
+    let state = guidance_copy(home, name)?;
     Ok(json!({
         "skill": name,
         "status": state,

@@ -384,11 +384,17 @@ running session read. `cadence skill sync` refreshes bundled guidance;
 local changes.
 
 `cadence doctor --agent <alias> [--skill <bundled-name>]` checks the named
-native agent using the authorized agent read, defaulting to `cadence`. Managed
-Pi/omp disables automatic discovery; other runtimes report unknown rather than
-assuming the caller's home is their home. Explicitly supply guidance through an
-authorized task route where needed. It reads no target filesystem. A targeted
-report exits 1 when reachability is disabled or unknown.
+native agent, defaulting to `cadence`. Run it **inside that runner** to check
+the bundled copies in `$HOME/.agents/skills` and `./.agents/skills` for the
+invocation. The daemon verifies that the caller is the named runner before
+the CLI checks either directory. An outside invocation reads no target files
+and leaves `copies` null; run inside the runner or supply the guidance
+through an authorized task route.
+
+`installed` (exit 0) means a copy matches this CLI's bundle, not that the
+provider discovers or has read it. Managed Pi/omp reports `disabled` (exit 1)
+even with a matching copy. If neither can be established, the report is
+`unknown` (exit 1). The `copies` and `discovery` fields keep these facts separate.
 
 `cadence --org <org> doctor --agent <profile-id> [--skill <name>]` instead
 checks profile assignment and the workspace catalog's approved revision and
