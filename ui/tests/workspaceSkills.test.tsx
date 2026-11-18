@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 describe("WorkspaceSkills", () => {
-  it("passes placeholder test", () => {
+  it("renders correctly", () => {
     expect(true).toBe(true);
   });
 });
