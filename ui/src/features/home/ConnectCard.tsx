@@ -47,6 +47,8 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   return (
     <TurnCard
       kind="connect"
+      className="card chatcard"
+      bodyClassName="chatcard-body"
       density={density}
       data-kind="connect_ref"
       label={t("Connect card")}

@@ -32,6 +32,8 @@ export function RecordCard({ entry, density = "full" }: { entry: ThreadEntry; de
   return (
     <TurnCard
       kind="record"
+      className="card chatcard"
+      bodyClassName="chatcard-body"
       density={density}
       data-kind="record_ref"
       data-record-view={layout.view}

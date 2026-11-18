@@ -3275,3 +3275,8 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .recordcard-meta { color: var(--color-ink-500); font-size: var(--text-micro); }
 .recordcard-text { color: var(--color-ink-200); font-size: var(--text-label); overflow-wrap: anywhere; white-space: pre-wrap; }
 .turncard[data-density="compact"] .recordcard-thread > li { max-width: 100%; }
+.chatcard { max-width: min(100%, 32rem); overflow: hidden; }
+.chatcard-body { display: grid; gap: .6rem; min-width: 0; padding: .75rem; }
+.chatcard .turncard-head { margin-bottom: 0; }
+.chatcard .turncard-kind { flex: none; }
+.chatcard .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
