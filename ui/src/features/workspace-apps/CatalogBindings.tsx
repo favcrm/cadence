@@ -83,7 +83,8 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
               aria-label={t("Choose platform tool")}
               placeholder={t("Choose platform tool")}
               options={tools.map(tool => ({ value: tool.slug, label: tool.displayName,
-                hint: `${tool.price.currency} ${tool.price.amount} ${t("per call")}${tool.unitPrice ? ` · ${tool.unitPrice.currency} ${tool.unitPrice.amount} ${t("per unit")}` : ""}` }))} />
+                hint: tool.pricing === "request_quote" ? t("Price reviewed per request") :
+                  `${tool.price.currency} ${tool.price.amount} ${t("per call")}${tool.unitPrice ? ` · ${tool.unitPrice.currency} ${tool.unitPrice.amount} ${t("per unit")}` : ""}` }))} />
             {needsAccount && (selectedTool?.connectedAccounts?.length
               ? <Select value={accountId} onChange={setAccountId} disabled={busy} full
                   aria-label={t("Choose connected account")} placeholder={t("Choose connected account")}

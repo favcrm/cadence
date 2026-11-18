@@ -347,7 +347,17 @@ export const workspaceApps = {
     request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/revoke`, undefined, { expected_revision: expectedRevision }),
   platformTools: async (id: string, slot: string, effect: CatalogEffect, signal?: AbortSignal) => {
     const query = new URLSearchParams({ slot });
-    return parseCatalogTools(await request<unknown>(`${installation(id)}/platform-tools?${query}`, signal), effect);
+    if (effect !== "draft") return parseCatalogTools(await request<unknown>(`${installation(id)}/platform-tools?${query}`, signal), effect);
+    const quoteQuery = new URLSearchParams({ slot, pricing: "request_quote@1" });
+    let value: unknown;
+    try {
+      value = await request<unknown>(`${installation(id)}/platform-tools?${quoteQuery}`, signal);
+    } catch (error) {
+      if (signal?.aborted || !(error instanceof ApiError) || error.status !== 400 ||
+          error.code !== "validation_failed" || error.message !== "Choose one app slot and search query.") throw error;
+      value = await request<unknown>(`${installation(id)}/platform-tools?${query}`, signal);
+    }
+    return parseCatalogTools(value, effect);
   },
   bindPlatformTool: async (id: string, body: { slot: string; tool_slug: string; expected_digest: string; request_id: string; connection_id?: string }, effect: CatalogEffect) =>
     parseCatalogGrant(await request<unknown>(`${installation(id)}/platform-tools/bind`, undefined, body), {
