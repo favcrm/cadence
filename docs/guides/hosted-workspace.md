@@ -520,9 +520,9 @@ than as an empty list. Hosted calls refuse `--platform`, `--account` and
 
 The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query`,
 `--input` and, for a connected read, `--connection`, or accepts an explicit
-`--request <handle>`. If a call fails with a
-timeout, 5xx or uncertain outcome, inspect its recorded state read-only before
-retrying:
+`--request <handle>`. For a provider, connected-read or media call that fails
+with a timeout, 5xx or uncertain outcome, inspect its recorded state read-only
+before retrying:
 
 ```sh
 cadence --org acme platform status --request <handle>
@@ -690,6 +690,42 @@ account, revokes its connection grants and drops the selected property:
 ```sh
 cadence --org acme connection revoke <connection-id>
 ```
+
+## Installed app actions
+
+Discover and call the actions a hosted app exposes without nesting JSON strings:
+
+```sh
+cadence --org acme app describe
+cadence --org acme app describe social-content
+cadence --org acme app call social-content social.sources.show
+cadence --org acme app call social-content social.drafts.show \
+  --args '{"draft_id":"draft_from_list"}'
+```
+
+Both commands use the existing hosted app tools and require `cli.write`. The
+host checks the installed app, action, current member and role; a refused
+effect is not approved or performed by this command. `--args` accepts a JSON
+object inline, from `@file`, a path or `-` for stdin. Draft writes may name a
+stable `--request`; keep that handle and the same input if the result is
+uncertain. `--reason` accompanies a write held for an owner's decision.
+Without `--request`, identical actions and arguments use the same derived
+handle and replay. For a deliberate second identical draft, supply a different
+explicit handle; do not change it merely because an outcome is uncertain.
+
+For a staged write, the receipt's status is the outcome: `pending` awaits an
+owner, `applied` was written, and `denied` or `failed` exits nonzero while
+keeping the receipt on stdout.
+
+Managed agents use their own credential for platform and app operations. If
+that credential is unavailable or refused, the CLI does not retry the action
+as the member; a separate human session may use its own authorized access.
+
+`platform status` tracks provider and media calls, not app-specific writes: an
+`unrecorded` answer does **not** mean an app draft was not saved. Inspect the
+app's records before retrying; do not blindly repeat an uncertain write. For
+Social Content draft create/update, the same request and material replay the
+first answer, while changed material is refused.
 
 ## A teammate's own-agent collaboration flow
 

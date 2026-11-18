@@ -19,16 +19,13 @@
 //!   has no refresh token: renewal is a fresh mint.
 //!
 //! When it is not used, and what that costs:
-//! - The board has no mint route (404) or the member's login has no renewable
-//!   session (409 `renewable_login_required`): keep the login, one stderr line.
-//! - The board accepts the mint but the TENANT predates the agent identity:
-//!   the first authorize (or call) answers 403 `human_session_required`.
-//!   Keep the login for the rest of the invocation, one stderr line. That is
-//!   the only answer that falls back. A 401, a 403 `forbidden` and everything
-//!   else is the agent's own refusal and is never retried on the login, or the
-//!   refusal would be undone.
-//! - Any other mint failure refuses the verb. It never silently takes the
-//!   member's wider authority, because the failure could be an outage.
+//! - For `platform_call`, an unavailable or refused agent credential stops the
+//!   action. Retrying as the member could give the call a person's authority.
+//! - Other verbs keep the login when the board has no mint route (404), the
+//!   login has no renewable session (409 `renewable_login_required`), or the
+//!   tenant answers `human_session_required`. One stderr line names this.
+//! - A 401, a 403 `forbidden` and every other refusal is never retried on the
+//!   login, or the refusal would be undone.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,6 +142,13 @@ pub(super) fn applies<'a>(
     verb: &str,
 ) -> Option<&'a AgentSlot> {
     slot.filter(|slot| slot.serves(target) && !stays_on_login(surface, verb) && !slot.declined())
+}
+
+pub(super) fn platform_agent_required() -> Error {
+    Error::invalid(
+        "agent_credential_required",
+        "A managed platform action needs an agent credential; the member login was not used for the action.",
+    )
 }
 
 /// Where the bearer came from. A 401 to a fresh mint is the agent's own

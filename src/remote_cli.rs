@@ -392,6 +392,7 @@ const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved �
 const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
 const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
@@ -552,6 +553,11 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
                 Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
+                Some("call") => match arguments.get("tool").and_then(Value::as_str) {
+                    Some("app_describe") => Effect::Read,
+                    Some("app_call") => mutation(RECONCILE_APP_ACTION),
+                    _ => cli_effect(verb),
+                },
                 _ => cli_effect(verb),
             }
         }
@@ -4384,6 +4390,46 @@ fn platform_error_details(body: Option<&Value>) -> String {
     out
 }
 
+/// Only fixed app refusal codes cross this boundary; provider text stays private.
+fn app_action_refusal(status: u16, code: Option<&str>) -> Option<Error> {
+    let (code, message) = match (status, code) {
+        (400, Some("validation_failed")) => (
+            "validation_failed",
+            "The app action arguments were refused. Use `cadence --org <workspace> app describe <app>` to check the action's required fields.",
+        ),
+        (403, Some("owner_required")) => (
+            "owner_required",
+            "This app action requires the workspace owner. Ask the owner to perform it.",
+        ),
+        (403, Some("approval_required")) => (
+            "approval_required",
+            "This action is not available through app call. Use the app's own controls or ask the workspace owner.",
+        ),
+        (403, Some("conversation_required")) => (
+            "conversation_required",
+            "This action needs a board conversation. Open the app in the board.",
+        ),
+        (404, Some("app_unavailable")) => (
+            "app_unavailable",
+            "The app is unavailable in this workspace. Use `cadence --org <workspace> app describe` to list available apps.",
+        ),
+        (409, Some("stale_revision")) => (
+            "stale_revision",
+            "The record changed. Read it again and use its current revision for a new request.",
+        ),
+        (400, Some("request_id_reused")) => (
+            "request_id_reused",
+            "This request belongs to different action input. Use a new request only for a deliberate new action.",
+        ),
+        (409, Some("unsupported_verb")) => (
+            "unsupported_verb",
+            "This app does not offer that action. Use `cadence --org <workspace> app describe` to list its actions.",
+        ),
+        _ => return None,
+    };
+    Some(Error::invalid(code, message))
+}
+
 /// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
 /// safe to show. `hop` is an allowlisted name (today only the board names a
 /// hop) and `request_id` must be a bounded UUID. Anything else is dropped, so
@@ -6198,17 +6244,31 @@ fn call_verb_until_retry(
     if keyed_create && agent.is_some() && on_agent.is_none() {
         return Err(identity_changed());
     }
+    let require_agent = verb == "platform_call" && agent.is_some();
+    if require_agent && on_agent.is_none() {
+        return Err(agent_credential::platform_agent_required());
+    }
     let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
         let (agent_cred, from_cache) = match on_agent {
             Some(slot) => {
-                match agent_credential::bearer(slot, target, dir, deadline, &note, !keyed_create)? {
+                match agent_credential::bearer(
+                    slot,
+                    target,
+                    dir,
+                    deadline,
+                    &note,
+                    !(keyed_create || require_agent),
+                )? {
                     Some((credential, source)) => (
                         Some(credential),
                         matches!(source, agent_credential::Source::Cached),
                     ),
                     None if keyed_create => return Err(identity_changed()),
+                    None if require_agent => {
+                        return Err(agent_credential::platform_agent_required())
+                    }
                     None => (None, false),
                 }
             }
@@ -6294,6 +6354,12 @@ fn call_verb_until_retry(
             if keyed_create {
                 return Err(identity_changed());
             }
+            if require_agent {
+                return Err(Error::invalid(
+                    agent_credential::HUMAN_SESSION_REQUIRED,
+                    "This platform action requires a person. The member login was not used for the action.",
+                ));
+            }
             if let Some(slot) = on_agent.take() {
                 slot.keep_login(&note, "this workspace has not been updated to accept it");
             }
@@ -6340,10 +6406,12 @@ fn call_verb_until_retry(
                             && answer.get("data").is_some_and(Value::is_object)
                     }) =>
                 {
-                    return Err(Error::unknown(format!(
-                        "remote tool returned no usable receipt — {}",
-                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
-                    )));
+                    if let Some(reconcile) = effect.reconciliation() {
+                        return Err(Error::unknown(format!(
+                            "remote tool returned no usable receipt — {reconcile}"
+                        )));
+                    }
+                    return Err(reject("remote tool returned no usable response"));
                 }
                 Some("connected_read")
                     if !body.as_ref().is_some_and(|answer| {
@@ -6587,10 +6655,12 @@ fn call_verb_until_retry(
         // a same-key replay; preserve its dedicated reconciliation guidance.
         // CAD-2226: an uncertain `connection_start` is the same unresolved
         // outcome — the one-time link may exist but cannot be read back.
-        let platform_outcome_unknown = matches!(
-            platform_operation,
-            Some("call" | "connected_read" | "connection_start")
-        ) && !board_gate_refused(body.as_ref())
+        let platform_outcome_unknown = effect.is_mutation()
+            && matches!(
+                platform_operation,
+                Some("call" | "connected_read" | "connection_start")
+            )
+            && !board_gate_refused(body.as_ref())
             && !tracker_unavailable_before_verb(status, body.as_ref())
             && ((status == 409
                 && matches!(
@@ -6794,6 +6864,16 @@ fn call_verb_until_retry(
                     .as_deref()
                     .map_or(String::new(), |c| format!(", {c}"))
             )));
+        }
+        if platform_operation == Some("call")
+            && matches!(
+                arguments.get("tool").and_then(Value::as_str),
+                Some("app_call" | "app_describe")
+            )
+        {
+            if let Some(error) = app_action_refusal(status, refusal_code.as_deref()) {
+                return Err(error);
+            }
         }
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if platform_outcome_unknown => {
