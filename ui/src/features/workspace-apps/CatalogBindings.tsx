@@ -61,13 +61,15 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
   const needsAccount = selectedTool?.connectedAccounts !== undefined;
   const selectedAccount = selectedTool?.connectedAccounts?.find(account => account.id === accountId);
   return <section className="card mcard wa-stack" aria-label={`${slot.slot} ${t("platform tool")}`}>
-    <h3>{t("Platform tool")}: {slot.slot}</h3>
-    <p className="wa-kicker">{effect === "read" ? t("This slot requests a read tool.") : t("This slot requests a draft tool.")}</p>
-    <p className="wa-muted">{t("This app can provide data to the selected tool. Charges use the workspace balance; paid calls require confirmation.")}</p>
+    <h3>{t(effect === "read" ? "Read tool" : "Draft tool")} <span className="text-ink-400 text-label">· {slot.slot}</span></h3>
+    <p className="wa-muted">{t("The app can send inputs to this tool. Paid calls still ask for approval.")}</p>
     {invalid ? <p className="wa-alert" role="alert">{t("The saved tool grant could not be verified.")}</p> : binding ? <>
-      <p className="wa-kicker">{t("Granted tool")}: <code>{binding.config.tool_slug}</code></p>
-      {binding.config.connection_id && <p className="wa-muted">{t("Connected account")}: <code>{binding.config.connection_id}</code></p>}
-      <p className="wa-muted">{t("Tool availability and price are checked when used.")}</p>
+      <p className="wa-kicker break-words">{t("Granted tool")}: {binding.config.tool_slug?.replace(/[_.-]+/g, " ").replace(/^./, (letter) => letter.toUpperCase())}</p>
+      <details className="text-label">
+        <summary className="cursor-pointer">{t("Technical details")}</summary>
+        <p className="break-all">{t("Tool")}: <code>{binding.config.tool_slug}</code></p>
+        {binding.config.connection_id && <p className="break-all">{t("Connected account")}: <code>{binding.config.connection_id}</code></p>}
+      </details>
       <Button disabled={!canWrite || busy} loading={busy} onClick={() => void mutate(async () => {
         const slug = binding.config.tool_slug;
         if (!slug) throw new Error(t("The tool grant is unavailable."));
@@ -78,7 +80,7 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
       <p className="wa-alert" role="alert">{t("The platform tool catalogue is unavailable.")}</p> : tools === null ?
         <p role="status">{t("Loading platform tools…")}</p> : tools.length === 0 ?
           <p className="wa-muted">{t("No matching platform tools are available.")}</p> : <>
-            <p className="wa-muted">{t("Listed prices are indicative; check the price before confirming a call.")}</p>
+            <p className="wa-muted">{t("Choose what this app may use. Granting access does not run the tool.")}</p>
             <Select value={selected} onChange={value => { setSelected(value); setAccountId(""); }} disabled={busy} full
               aria-label={t("Choose platform tool")}
               placeholder={t("Choose platform tool")}
