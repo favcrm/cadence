@@ -3,7 +3,7 @@ import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
 import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
 import type { ThreadEntry } from "../home/thread";
-import { TurnCardButton, type CardDensity } from "../../ui/TurnCard";
+import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 
 export const KIND_LABEL: Record<string, string> = { md: "MD", pdf: "PDF", html: "HTML", image: "IMG", csv: "CSV" };
 
@@ -35,7 +35,8 @@ export default function ArtifactCard({
   // CAD-2440: the card system's summary shape; the markup, roles, labels
   // and hooks are the ones this card always had.
   return (
-    <TurnCardButton
+    <TurnCard
+      shape="button"
       element="div"
       kind="artifact"
       density={density}
@@ -52,8 +53,8 @@ export default function ArtifactCard({
           openArtifact(ref);
         }
       }}
-      tile={KIND_LABEL[ref.kind] ?? "FILE"}
-      title={ref.title}
+      icon={KIND_LABEL[ref.kind] ?? "FILE"}
+      subject={ref.title}
       meta={
         <span className="artmeta">
           v{ref.version}{ref.bytes === undefined ? "" : ` · ${sizeLabel(ref.bytes)}`}

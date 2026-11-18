@@ -3217,6 +3217,15 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   height: 12px;
   flex: none;
 }
+.turncard-subject {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .turncard-status {
   --tone: var(--color-ink-400);
   display: inline-flex;
