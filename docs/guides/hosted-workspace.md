@@ -197,6 +197,16 @@ The marker survives a restart and is invalidated before a repeated generation
 request; unrelated HTTP or streamed error text cannot claim this reason. Raw
 gateway text stays private and the gateway's limits are unchanged.
 
+The summary request has its own output budget, 32,768 tokens
+(`SUMMARY_MAX_OUTPUT_TOKENS`). A turn keeps the model's own output limit.
+Without that budget, a summary that stops at the model's 8,192-token cap is
+discarded and the blocking compaction fails (CAD-2430). Reasoning tokens count
+against the same budget. When a blocking compaction does fail, the board's
+sentence names the category: the summary ran past its limit, it was
+interrupted, no model was available, or the model could not write it. It never
+carries provider text. Sending the next message continues the conversation:
+the engine does not repeat the failed compaction for it.
+
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns personal, workspace, company-agent or agent-profile context, and
