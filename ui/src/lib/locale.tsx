@@ -1778,6 +1778,13 @@ Object.assign(zhTW, {
   "This issue is no longer available to you — private details and any draft were cleared.": "你已無法存取此議題 — 私人詳細資料與草稿已清除。",
 });
 
+Object.assign(zhTW, {
+  "The linked context is not active in this installation — the selection was cleared.": "連結的情境已不在此安裝中啟用，已清除所選項目。",
+  "The record link names no context — the selection was cleared.": "紀錄連結沒有指定情境，已清除所選項目。",
+  "The linked context is not this workspace's active scope — the workspace context was used.": "連結的情境不是此工作區的有效範圍，已使用工作區情境。",
+  "This app's screen is unavailable.": "此應用程式的畫面目前無法使用。",
+});
+
 /** CAD-2363: the active locale where a provider may be absent (a test or an
  *  isolated render): English then. Date formatting in a transcript uses it. */
 export function useLocaleTag(): Locale {

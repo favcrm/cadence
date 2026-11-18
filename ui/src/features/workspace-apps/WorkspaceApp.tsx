@@ -144,7 +144,7 @@ function ScreenFailurePane({ failure, onRetry, onReinstall, busy }: {
     ? t(pane.title).replace("{required}", () => failure.required).replace("{current}", () => failure.current)
     : t(pane.title);
   return (
-    <section className="card px-4 py-5" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
+    <section className="card px-4 py-5" data-installed-app-screen="" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
       <p className="wa-muted">{title}</p>
       <div className="wa-row">
         {pane.actions.includes("sign_in") && <Button href="/login">{t("Sign in")}</Button>}
