@@ -17,6 +17,7 @@ import {
   useBrowserTab,
   type BrowserTabState,
 } from "./browserStore";
+import { TurnCardButton } from "../../ui/TurnCard";
 
 /** How long a live view may take to load before it is given up on. */
 const FRAME_WAIT_MS = 20000;
@@ -641,21 +642,23 @@ export function BrowserCard() {
   const host = (phase === "active" || phase === "handoff") && b.session?.url ? (addressParts(b.session.url)?.host ?? "") : "";
   return (
     <div className="bz-card-wrap">
-      <button
-        type="button"
-        className="artcard bz-card"
+      {/* CAD-2440: the card system's summary shape, same markup and hooks. */}
+      <TurnCardButton
+        kind="browser"
+        className="bz-card"
         data-kind="session"
-        data-open={shown || undefined}
+        open={shown}
         aria-label={[t("Open Browser"), statusText, host].filter(Boolean).join(" · ")}
         onClick={openBrowser}
-      >
-        <span className="arttype"><GlobeIcon size={16} /></span>
-        <span className="arttext">
-          <b>{t("Browser")}</b>
-          <span className="artmeta">{statusText}</span>
-          {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
-        </span>
-      </button>
+        tile={<GlobeIcon size={16} />}
+        title={t("Browser")}
+        meta={
+          <>
+            <span className="artmeta">{statusText}</span>
+            {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
+          </>
+        }
+      />
     </div>
   );
 }

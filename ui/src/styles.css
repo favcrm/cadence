@@ -3192,3 +3192,63 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
+
+/* CAD-2440 (card system phase 0, CAD-2437): the shared frame for rich
+   content under an answer. The region shape's head reproduces the form's
+   (kind on the left, status pill on the right); the status pill is the
+   board's chip in words, its tone from a status token so it follows the
+   theme. Callers keep their own frame classes (`.card`, `.artcard`). */
+.tcard-head {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-height: 1.25rem;
+  margin-bottom: -.4rem;
+}
+.tcard-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+}
+.tcard-kind svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+.tcard-status {
+  --tone: var(--color-ink-400);
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  margin-left: auto;
+  padding: .05rem .4rem;
+  border: 1px solid color-mix(in srgb, var(--tone) 20%, transparent);
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--tone) 15%, transparent);
+  color: var(--tone);
+  font: 500 .6875rem var(--font-chat);
+}
+.tcard-status[data-tone="ok"] { --tone: var(--color-ok); }
+.tcard-status[data-tone="warn"] { --tone: var(--color-warn); }
+.tcard-status[data-tone="fail"] { --tone: var(--color-fail); }
+.tcard-status[data-tone="info"] { --tone: var(--color-info); }
+.tcard-status[data-tone="accent"] { --tone: var(--color-accent); }
+.tcard-status[data-tone="muted"] {
+  --tone: var(--color-ink-400);
+  background: var(--color-ink-800);
+}
+.tcard-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: .5rem;
+  padding: .5rem .75rem;
+  border-top: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+}
+.tcard[data-density="compact"] .tcard-foot {
+  padding: .375rem .625rem;
+}
