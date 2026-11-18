@@ -335,10 +335,10 @@ async function main() {
   assert(drawer()?.getAttribute("aria-label") === "weekly-report" && /Approved · rev 1/.test(drawer()?.querySelector(".crm-drawer-pills")?.textContent ?? ""), "the panel's header names the skill and its status");
   assert(["Overview", "Instructions", "Used by (8)", "Files (2)"].every((label, i) => document.body.querySelectorAll("[role=tab]")[i]?.textContent === label), "the panel has four tabs with counts");
   const summaryBox = document.body.querySelector("[data-work-panel=used-by-summary]");
-  assert(/Used by · 8 active/.test(summaryBox?.textContent ?? "") && /and 3 more/.test(summaryBox?.textContent ?? "") && /See all 9/.test(summaryBox?.textContent ?? ""), "the Overview shows five names, how many more and See all");
+  assert(/Used by · 8 active/.test(summaryBox?.textContent ?? "") && /and 3 more/.test(summaryBox?.textContent ?? "") && /See all 8/.test(summaryBox?.textContent ?? ""), "the Overview shows five names, how many more and See all");
   assert(!document.body.querySelector("[role=switch]") && /Details/.test(all()) && /Approved revision1 · weekly-repor/.test(all()) && !/usr_owner/.test(all()) && /Approved\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}/.test(all()), "a member has On/Off text and sees the details");
   assert(/Only the workspace owner can approve, revoke or delete skills\./.test(drawer()?.querySelector("footer")?.textContent ?? "") && !drawer()?.querySelector("footer button"), "a member's footer says who can act and has no buttons");
-  await click(button("See all 9"), "See all");
+  await click(button("See all 8"), "See all");
   assert(tabButton(/Used by/)?.getAttribute("aria-selected") === "true", "See all opens the Used by tab");
   const usedBy = document.body.querySelector("[data-work-panel=used-by]");
   assert(/8 active, 1 archived/.test(usedBy?.textContent ?? ""), "the tab counts active and archived");

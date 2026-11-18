@@ -116,7 +116,8 @@ export function OverviewPanel({
               ))}
               {summary.more > 0 && <span className="sk-more">{t("and {n} more").replace("{n}", String(summary.more))}</span>}
               <button type="button" className="lnk" onClick={onSeeAll}>
-                {t("See all {n}").replace("{n}", String(counts.total))}
+                {/* Counts what the Used by tab shows first (its Active filter), so the number matches. */}
+                {t("See all {n}").replace("{n}", String(counts.active))}
               </button>
             </p>
           )}
