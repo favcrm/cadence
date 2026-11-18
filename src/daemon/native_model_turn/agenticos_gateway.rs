@@ -1,5 +1,6 @@
-//! One bounded, private call to the on-box AgenticOS inference gateway.
+//! One bounded, private call to an owner-selected AgenticOS inference gateway.
 use std::io::Read;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -13,7 +14,7 @@ use super::dto::{
 use super::sdk::{ChildOutcome, MAX_CHILD_REPLY};
 use crate::error::Error;
 use crate::protected_runtime::strict;
-use ureq::tls::{Certificate, RootCerts, TlsConfig};
+use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 
 pub(super) const CHAT_PATH: &str = "/v1/runtime/inference/chat/completions";
 const MAX_GATEWAY_REQUEST: usize = 512 * 1024;
@@ -22,7 +23,39 @@ fn unsupported() -> Error {
     Error::invalid("unsupported_content", "the model content is not supported")
 }
 
-pub(super) fn canonical_origin(value: &str) -> crate::Result<&str> {
+const PRODUCTION_ORIGIN: &str = "https://api-v2.agenticos.hk";
+static PRODUCTION_TLS: LazyLock<TlsConfig> = LazyLock::new(|| {
+    TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .root_certs(RootCerts::WebPki)
+        .build()
+});
+
+#[derive(Clone, Debug)]
+pub(super) enum GatewayTls {
+    Loopback(TlsConfig),
+    Production,
+}
+
+impl GatewayTls {
+    pub(super) fn origin<'a>(&self, value: &'a str) -> crate::Result<&'a str> {
+        let invalid = || Error::invalid("route_unavailable", "the gateway origin is invalid");
+        match self {
+            Self::Production if value == PRODUCTION_ORIGIN => Ok(value),
+            Self::Loopback(_) => loopback_origin(value),
+            _ => Err(invalid()),
+        }
+    }
+
+    fn config(&self) -> TlsConfig {
+        match self {
+            Self::Loopback(tls) => tls.clone(),
+            Self::Production => PRODUCTION_TLS.clone(),
+        }
+    }
+}
+
+fn loopback_origin(value: &str) -> crate::Result<&str> {
     let invalid = || Error::invalid("route_unavailable", "the gateway origin is invalid");
     let port = value
         .strip_prefix("https://127.0.0.1:")
@@ -36,19 +69,21 @@ pub(super) fn canonical_origin(value: &str) -> crate::Result<&str> {
     Ok(value)
 }
 
-pub(super) fn pinned_tls(pem: &str) -> crate::Result<TlsConfig> {
+pub(super) fn pinned_tls(pem: &str) -> crate::Result<GatewayTls> {
     // Loopback alone proves neither listener ownership nor server identity.
     // Trust only this operator-provisioned root and require the IP SAN.
     let cert = Certificate::from_pem(pem.as_bytes())
         .map_err(|_| Error::invalid("route_unavailable", "the gateway TLS root is invalid"))?;
-    Ok(TlsConfig::builder()
-        .root_certs(RootCerts::new_with_certs(&[cert]))
-        .build())
+    Ok(GatewayTls::Loopback(
+        TlsConfig::builder()
+            .root_certs(RootCerts::new_with_certs(&[cert]))
+            .build(),
+    ))
 }
 
 pub(super) struct GatewayTurn<'a> {
     pub origin: &'a str,
-    pub tls: &'a TlsConfig,
+    pub tls: &'a GatewayTls,
     pub configured_model: &'a str,
     pub model_id: &'a str,
     pub request_id: &'a str,
@@ -273,7 +308,7 @@ fn response(value: &Value, turn: &GatewayTurn<'_>) -> Option<ChildOutcome> {
 }
 
 pub(super) fn invoke(turn: GatewayTurn<'_>) -> crate::Result<ChildOutcome> {
-    let origin = canonical_origin(turn.origin)?;
+    let origin = turn.tls.origin(turn.origin)?;
     let token = std::str::from_utf8(turn.bearer)
         .map_err(|_| Error::invalid("auth_unavailable", "the gateway credential is unusable"))?;
     if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
@@ -295,7 +330,7 @@ pub(super) fn invoke(turn: GatewayTurn<'_>) -> crate::Result<ChildOutcome> {
             .http_status_as_error(false)
             .max_redirects(0)
             .proxy(None)
-            .tls_config(turn.tls.clone())
+            .tls_config(turn.tls.config())
             .build(),
     );
     let result = agent
@@ -334,6 +369,46 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn transport_binds_origin_to_owner_tls_mode_before_sending_credentials() {
+        let production = GatewayTls::Production;
+        let public_tls = production.config();
+        assert!(matches!(public_tls.provider(), TlsProvider::Rustls));
+        assert!(matches!(public_tls.root_certs(), RootCerts::WebPki));
+        assert!(!public_tls.disable_verification());
+        assert!(public_tls.use_sni());
+        let loopback = GatewayTls::Loopback(
+            TlsConfig::builder()
+                .root_certs(RootCerts::new_with_certs(&[]))
+                .build(),
+        );
+        for (tls, origin) in [
+            (&production, "https://127.0.0.1:8443"),
+            (&loopback, "https://api-v2.agenticos.hk"),
+            (&production, "https://api-v2.agenticos.hk:443"),
+            (&production, "https://api-v2.agenticos.hk@evil.test"),
+        ] {
+            let result = invoke(GatewayTurn {
+                origin,
+                tls,
+                configured_model: "agenticos/example/model",
+                model_id: "example/model",
+                request_id: "synthetic-request",
+                workspace_id: "ws_synthetic",
+                max_output_tokens: 64,
+                tool_choice: "none",
+                messages: &[],
+                tools: &[],
+                bearer: b"synthetic-bearer",
+                deadline: Duration::from_secs(1),
+            });
+            let Err(error) = result else {
+                panic!("unexpectedly accepted {origin}");
+            };
+            assert_eq!(error.code(), Some("route_unavailable"), "{origin}");
+        }
+    }
+
+    #[test]
     fn loopback_listener_cannot_receive_the_bearer_without_tls() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let origin = format!("https://{}", listener.local_addr().unwrap());
@@ -358,7 +433,11 @@ mod tests {
         });
         let result = invoke(GatewayTurn {
             origin: &origin,
-            tls: &TlsConfig::default(),
+            tls: &GatewayTls::Loopback(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::new_with_certs(&[]))
+                    .build(),
+            ),
             configured_model: "agenticos/example/model",
             model_id: "example/model",
             request_id: "synthetic-request",

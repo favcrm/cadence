@@ -5,7 +5,7 @@
 //! pins:
 //!
 //! - the exact Node executable and immutable SDK graph for Devin, or the
-//!   literal loopback TLS origin and trust root for AgenticOS;
+//!   owner-selected loopback or production TLS origin for AgenticOS;
 //! - the frozen catalog the native role/model/effort maps through;
 //! - the finite owner-approved request/concurrency limits and the output cap.
 //!
@@ -45,7 +45,7 @@ pub(super) const AGENTICOS: &str = "agenticos";
 pub(super) enum RouteBackend {
     Devin(SdkPins),
     AgenticOs {
-        tls: ureq::tls::TlsConfig,
+        tls: super::agenticos_gateway::GatewayTls,
         workspace_id: String,
     },
 }
@@ -54,9 +54,7 @@ impl RouteBackend {
     fn origin(&self, value: &str) -> Result<String> {
         match self {
             Self::Devin(_) => canonical_origin(value),
-            Self::AgenticOs { .. } => {
-                super::agenticos_gateway::canonical_origin(value).map(str::to_owned)
-            }
+            Self::AgenticOs { tls, .. } => tls.origin(value).map(str::to_owned),
         }
     }
 
@@ -65,6 +63,42 @@ impl RouteBackend {
             Self::AgenticOs { workspace_id, .. } => Some(workspace_id),
             Self::Devin(_) => None,
         }
+    }
+}
+
+fn parse_backend(provider: &str, m: &serde_json::Map<String, Value>) -> Result<RouteBackend> {
+    use super::agenticos_gateway::{pinned_tls, GatewayTls};
+    let settings = (
+        m.get("sdk"),
+        m.get("tls_root_pem"),
+        m.get("tls_mode"),
+        m.get("workspace_id"),
+    );
+    match (provider, settings) {
+        (DEVIN, (Some(sdk), None, None, None)) => Ok(RouteBackend::Devin(SdkPins::parse(sdk)?)),
+        (AGENTICOS, (None, root, mode, Some(Value::String(workspace_id))))
+            if (1..=128).contains(&workspace_id.len())
+                && workspace_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            let tls = match (root, mode) {
+                (Some(Value::String(pem)), None) => pinned_tls(pem)?,
+                (None, Some(Value::String(mode))) if mode == "webpki" => GatewayTls::Production,
+                _ => {
+                    return Err(refused(
+                        "the native model profile has unsupported provider settings",
+                    ))
+                }
+            };
+            Ok(RouteBackend::AgenticOs {
+                tls,
+                workspace_id: workspace_id.clone(),
+            })
+        }
+        _ => Err(refused(
+            "the native model profile has unsupported provider settings",
+        )),
     }
 }
 
@@ -216,32 +250,9 @@ impl RouteFacts {
                 "approved_tools_path",
                 "approved_tools_digest",
             ],
-            &["sdk", "tls_root_pem", "workspace_id"],
+            &["sdk", "tls_root_pem", "tls_mode", "workspace_id"],
         )?;
-        let backend = match (
-            provider,
-            m.get("sdk"),
-            m.get("tls_root_pem"),
-            m.get("workspace_id"),
-        ) {
-            (DEVIN, Some(sdk), None, None) => RouteBackend::Devin(SdkPins::parse(sdk)?),
-            (AGENTICOS, None, Some(Value::String(pem)), Some(Value::String(workspace_id)))
-                if (1..=128).contains(&workspace_id.len())
-                    && workspace_id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-                    }) =>
-            {
-                RouteBackend::AgenticOs {
-                    tls: super::agenticos_gateway::pinned_tls(pem)?,
-                    workspace_id: workspace_id.clone(),
-                }
-            }
-            _ => {
-                return Err(refused(
-                    "the native model profile has unsupported provider settings",
-                ))
-            }
-        };
+        let backend = parse_backend(provider, m)?;
         let origins_value = m.get("origins").ok_or_else(|| refused("no origin"))?;
         let origins_items = origins_value
             .as_array()
@@ -977,4 +988,56 @@ fn verify_root_owned_parents(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_profile_tests {
+    use super::*;
+
+    #[test]
+    fn owner_selects_one_gateway_origin_class_and_tls_mode() {
+        let production = json!({"tls_mode": "webpki", "workspace_id": "ws_example"});
+        let backend = parse_backend(AGENTICOS, production.as_object().unwrap()).unwrap();
+        assert!(backend.origin("https://api-v2.agenticos.hk").is_ok());
+        for origin in [
+            "https://api-v2.agenticos.hk/",
+            "https://api-v2.agenticos.hk:443",
+            "https://api-v2.agenticos.hk?x=1",
+            "https://api-v2.agenticos.hk/path",
+            "https://api-v2.agenticos.hk#fragment",
+            "https://api-v2.agenticos.hk.evil.test",
+            "https://api-v2.agenticos.hk@evil.test",
+            "https://API-v2.agenticos.hk",
+            "https://127.0.0.1:8443",
+        ] {
+            assert!(backend.origin(origin).is_err(), "{origin}");
+        }
+
+        // PEM parsing is enough at this seam; TLS validates certificate DER on use.
+        let loopback = json!({
+            "tls_root_pem": "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n",
+            "workspace_id": "ws_example"
+        });
+        let backend = parse_backend(AGENTICOS, loopback.as_object().unwrap()).unwrap();
+        assert!(backend.origin("https://127.0.0.1:8443").is_ok());
+        for origin in [
+            "https://api-v2.agenticos.hk",
+            "https://localhost:8443",
+            "https://127.0.0.1:08443",
+            "https://127.0.0.1:8443/",
+            "http://127.0.0.1:8443",
+        ] {
+            assert!(backend.origin(origin).is_err(), "{origin}");
+        }
+
+        for invalid in [
+            json!({"workspace_id": "ws_example"}),
+            json!({"workspace_id": "ws_example", "tls_mode": "webpki", "tls_root_pem": "root"}),
+            json!({"workspace_id": "ws_example", "tls_mode": "system"}),
+            json!({"workspace_id": "ws_example", "tls_mode": null}),
+            json!({"workspace_id": "ws_example", "tls_mode": "webpki", "sdk": {}}),
+        ] {
+            assert!(parse_backend(AGENTICOS, invalid.as_object().unwrap()).is_err());
+        }
+    }
 }

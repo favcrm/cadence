@@ -669,14 +669,21 @@ future launch success. Launch saved profiles through the existing
 
 ### Dedicated AgenticOS model gateway
 
-The protected native master can use an AgenticOS gateway on the same Linux
-host. Configure the protected runtime and its encrypted custody first. The
-ordinary same-UID sandbox is not eligible.
+The protected native master can use an owner-configured AgenticOS gateway.
+Configure the protected runtime and its encrypted custody first. The ordinary
+same-UID sandbox is not eligible.
 
 - In the root-owned `native-model.json` profile, select `routes.agenticos`
-  instead of `routes.devin`. Use a literal `https://127.0.0.1:<port>` origin
-  and `tls_root_pem` containing the private gateway CA certificate. The gateway
-  certificate must be valid for `127.0.0.1`. Plain HTTP and redirects refuse.
+  instead of `routes.devin` and choose exactly one origin class:
+  - Same host: use literal `https://127.0.0.1:<port>` origins and
+    `tls_root_pem` containing the private gateway CA certificate; omit
+    `tls_mode`. The certificate must have a `127.0.0.1` IP SAN.
+  - Production: set both `origins` and `default_origin` to the exact origin
+    `https://api-v2.agenticos.hk` (with `origins` as an array containing that
+    string), set `tls_mode` to `webpki`, and omit `tls_root_pem`. Rustls
+    verifies the public WebPKI chain and hostname.
+  Mixed modes, other hosts or aliases, explicit production ports, paths and
+  queries refuse. Plain HTTP, proxies and redirects are not used.
 - Omit the Devin `sdk` section. The frozen catalog has one explicit
   `author/model` variant per family. Configure the protected guest for
   `agenticos`, that model and `off` effort. In Settings > Agents, grant that
