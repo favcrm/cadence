@@ -15,6 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 #[derive(Subcommand)]
 pub(crate) enum TemplateAction {
     /// List all templates with their latest and latest-approved versions.
+    #[command(visible_alias = "ls")]
     List,
     /// Create version 1 from a spec JSON file. A quotation or invoice also
     /// needs `--html` or `--docx`. An authoring pack must omit both. The daemon

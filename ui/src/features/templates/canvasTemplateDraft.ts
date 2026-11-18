@@ -4,7 +4,7 @@ export interface ExtractedPlaceholders { scalars: string[]; itemFields: string[]
 export interface CanvasTemplatePrefill { name: string; html: string; specJson: string }
 export interface ParameterizedTemplateHtml { html: string; scalars: string[]; itemFields: string[]; autoParameterized: boolean }
 
-const RESERVED = new Set("items subtotal discount tax total currency has_unresolved_pricing kind".split(" "));
+const RESERVED = new Set("items subtotal discount tax total currency tax_rate discount_rate has_unresolved_pricing kind".split(" "));
 
 export function extractHtmlPlaceholders(html: string): ExtractedPlaceholders {
   const scalars: string[] = [], seenS = new Set<string>(), itemFields: string[] = [], seenI = new Set<string>();

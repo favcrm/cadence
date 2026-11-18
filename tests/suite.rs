@@ -18348,10 +18348,27 @@ mod cad2019_html_templates_acceptance {
             ("<style>p{background:url(https://x.test/b)}</style>", ""),
             ("", r#"<a href="https://x.test/{{ customer }}">x</a>"#),
             ("", r#"<p style="color:{{ customer }}">x</p>"#),
+            ("", r#"<p onclick="alert(1)">{{ customer }}</p>"#),
+            ("", "<p>{{ undeclared_var }}</p>"),
             ("", "<!-- c -->"),
         ] {
             let d = format!("{hd}{h}</head><body>{b}<p>{{{{ customer }}}}</p></body></html>");
-            assert!(bt::validate_and_sanitize_html_template(d.as_bytes(), &s).is_err());
+            assert!(bt::html::validate_and_sanitize_html_template(d.as_bytes(), &s).is_err());
+        }
+        for frag in [
+            r#"<svg viewBox="0 0 10 10"><rect x="0" y="0" width="5" height="5" clip-path="\000075rl(https://x.test/a)" fill="\75 rl(https://x.test/b)"/></svg>"#,
+            r#"<svg viewBox="0 0 10 10"><rect x="0" y="0" width="5" height="5" fill="url/**/(https://x.test/c)"/></svg>"#,
+            "<!-- comment --><p>{{ customer }}</p>",
+            "<!-- {% if customer %} --><p>{{ customer }}</p><!-- {% endif %} -->",
+        ] {
+            assert!(
+                bt::html::validate_and_sanitize_html_template(frag.as_bytes(), &s).is_err(),
+                "{frag}"
+            );
+            assert!(
+                bt::html::validate_html_reference(frag.as_bytes()).is_err(),
+                "{frag}"
+            );
         }
         let cl = bt::validate_and_sanitize_html_template(HTML.as_bytes(), &s).unwrap();
         assert!(

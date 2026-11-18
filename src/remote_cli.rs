@@ -4302,7 +4302,7 @@ fn is_template_or_document_verb(verb: &str) -> bool {
 }
 
 fn template_store_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
-    const CODES: &str = "invalid_request not_found conflict docx_executable_unsupported owner_required template_not_approved export_required payload_too_large pdf_too_large pdf_renderer_unavailable pdf_render_failed";
+    const CODES: &str = "invalid_request not_found conflict docx_executable_unsupported owner_required template_not_approved already_approved digest_mismatch export_required payload_too_large pdf_too_large pdf_renderer_unavailable pdf_render_failed";
     if !is_template_or_document_verb(verb) {
         return None;
     }

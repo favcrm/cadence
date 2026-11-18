@@ -478,15 +478,24 @@ fn validate_tag_attrs(
                 check_data_image(dec.trim(), img_b)?;
             } else if attr == "style" {
                 validate_css(&dec, "inline style", img_b)?;
-            } else if dec.to_ascii_lowercase().contains("url") {
-                let u = dec
-                    .trim()
-                    .strip_prefix("url(")
-                    .and_then(|s| s.strip_suffix(')'));
+            } else {
                 chk!(
-                    u.is_some_and(|id| is_frag(id.trim())),
-                    "SVG '{attr}' url(...) must reference #id"
+                    !dec.contains('\\')
+                        && !dec.contains("/*")
+                        && !dec.contains("*/")
+                        && !has_ctrl(&dec, false),
+                    "CSS escapes/comments/controls disallowed in SVG '{attr}'"
                 );
+                if dec.to_ascii_lowercase().contains("url") {
+                    let u = dec
+                        .trim()
+                        .strip_prefix("url(")
+                        .and_then(|s| s.strip_suffix(')'));
+                    chk!(
+                        u.is_some_and(|id| is_frag(id.trim())),
+                        "SVG '{attr}' url(...) must reference #id"
+                    );
+                }
             }
         }
         if attr == "rel" && tag == "a" {
@@ -521,7 +530,7 @@ fn check_comment_end(after: &str, in_body: bool) -> Result<usize> {
 fn check_structure_and_extract(html: &str, img_b: &mut usize) -> Result<StructuralCheck> {
     let mut stack: Vec<(String, bool)> = Vec::new();
     let (mut svg_d, mut styles, mut spans) = (0usize, Vec::new(), Vec::new());
-    let (mut nc, mut saw_body) = (String::with_capacity(html.len()), false);
+    let (mut nc, mut saw_body, mut saw_comment) = (String::with_capacity(html.len()), false, false);
     let (mut b0, mut b1, mut lang, mut i, b) = (None, None, "en".to_string(), 0, html.as_bytes());
     let no_cend = |t: &str| {
         ensure(
@@ -542,6 +551,7 @@ fn check_structure_and_extract(html: &str, img_b: &mut usize) -> Result<Structur
         let tail = &html[lt..];
 
         if let Some(after) = tail.strip_prefix("<!--") {
+            saw_comment = true;
             i = lt + check_comment_end(after, saw_body && b1.is_none())?;
             continue;
         }
@@ -627,6 +637,7 @@ fn check_structure_and_extract(html: &str, img_b: &mut usize) -> Result<Structur
     if let Some((u, _)) = stack.last() {
         return rej(format!("unclosed <{u}>"));
     }
+    chk!(saw_body || !saw_comment, "comments disallowed in body");
     let body_frag = if saw_body {
         b0.zip(b1)
             .map(|(s, e)| html[s..e].trim().to_string())
