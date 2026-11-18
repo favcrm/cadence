@@ -124,6 +124,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                 <AppGlyph name={review.title} size="sm" />
                 <div className="min-w-0">
                   <p className="text-cardtitle font-semibold text-ink-100 break-words">{review.title}</p>
+                  {review.summary && <p className="text-label wrap-anywhere">{review.summary}</p>}
                   <p className="text-label text-ink-400 break-words">
                     {installation ? `${installation.version} → ${review.version}` : `${t("Version")} ${review.version}`} · {t("This workspace only")}
                   </p>

@@ -297,8 +297,9 @@ is proxied through the closed `catalogue-packages.internal` broker. Every
 install/update is operator-only.
 
 Where private uploads are available, an owner can select **Add private app**
-in Apps, check the ZIP, review the exact version and requested access, then
-explicitly install it. Expand **Technical details** to inspect the package
+in Apps, check the ZIP, review the app's description (when the checked package
+provides one), exact version and requested access, then explicitly install it.
+Expand **Technical details** to inspect the package
 digest, file list and precise screen operations. A check does not grant
 access or review the app's behavior.
 If the install or update result is unconfirmed, it may already have committed.
