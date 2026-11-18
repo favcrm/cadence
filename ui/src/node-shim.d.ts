@@ -12,6 +12,7 @@ declare module "node:child_process" {
 }
 
 declare module "node:fs" {
+  export function createReadStream(path: string): { pipe(destination: object): void };
   export function readFileSync(path: unknown, encoding: string): string;
   export function readFileSync(path: unknown): Uint8Array;
   export function readdirSync(path: string): string[];
@@ -20,8 +21,13 @@ declare module "node:fs" {
 }
 
 declare module "node:path" {
+  export function dirname(path: string): string;
   export function join(...paths: string[]): string;
   export function resolve(...paths: string[]): string;
+}
+
+declare module "node:module" {
+  export function createRequire(url: string): { resolve(specifier: string): string };
 }
 
 declare module "node:zlib" {
