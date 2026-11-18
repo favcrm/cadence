@@ -318,8 +318,12 @@ install, start, promote or publish anything.
 
 Use the verified pair to replay installation and qualify the full launch on a
 network-isolated VPS: the real installer and observer must bring the pinned
-guest to `ready`, using fresh state and no production credentials. Record the
-signed source, run, attempt and guest result before requesting promotion.
+guest to `ready`, using fresh state and no production credentials. For
+the first Tencent rollout, record the clean install and guest result for
+the exact signed source, CI run and attempt in
+[CAD-2454](https://fav-limited.cadencecloud.app/projects/cadence/issues/CAD-2454).
+Do not dispatch production promotion while either pre-promotion check is open;
+the release-store may publish immediately after an approved promotion.
 
 **After promotion:** Replay the download from the release catalogue to check
 the bytes actually served to operators.
@@ -339,8 +343,9 @@ ordinary release's production-candidate receipt, not from the owner download.
 The verifier needs `gh`, `jq` and GNU coreutils, not Cargo. It refuses absent
 members, modified bytes and provenance from a different build or attempt.
 Verification does not install the file or authorize a restart. Pin the
-verified owner digest in the live root-owned profile only after the isolated
-qualification and published-download checks pass.
+verified owner digest in the live root-owned profile only after CAD-2454's
+isolated qualification and public-download checks pass. Obtain separate
+operator authorization for the live rollout.
 
 **Scheduled and `workflow_run` staging cannot promote.** Their successful
 runs may have `promote: skipped`; that means staged, not production-approved.
