@@ -3063,6 +3063,7 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   [data-chat-message="user"] .chat-bubble.text-body {
     font-size: .9375rem;
     line-height: 1.65;
+    text-wrap: pretty;
   }
   .answer,
   .turn-head {
