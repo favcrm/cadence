@@ -3410,3 +3410,5 @@ button.turnsource:hover {
 .recordcard-bubbles > li { justify-self: start; }
 .recordcard-bubbles > li[data-own] { justify-self: end; background: color-mix(in srgb, var(--color-accent) 16%, var(--color-ink-850)); }
 .recordcard-bubbles > li[data-own] .recordcard-meta { text-align: right; }
+.recordcard-bubbles { grid-template-columns: minmax(0, 1fr); }
+.recordcard-meta, .recordcard-time { min-width: 0; overflow-wrap: anywhere; }
