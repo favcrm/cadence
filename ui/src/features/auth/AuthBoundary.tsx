@@ -14,7 +14,7 @@ import Login from "./Login";
 import { SIGN_IN_COMMAND, sessionAdmissible } from "./gate";
 import { hostedOrigin } from "./hosted";
 import "./auth.css";
-import { captureLoginNonce, closeSession } from "./session";
+import { captureLoginNonce, closeSession, hostedSessionNotice, HOSTED_SESSION_NOTICE, settleHostedLogout } from "./session";
 
 type Status = "checking" | "signedout" | "signedoutexplicit" | "signingout" | "logoutunknown" | "unavailable" | "expired" | "refused" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
@@ -84,8 +84,22 @@ export default function AuthBoundary({ children }: {
     setSession(null);
   }, [setSession]);
 
-  const recheck = useCallback((): Promise<boolean> => {
-    if (logoutPending.current || logoutUncertain.current) return Promise.resolve(false);
+  const invalidate = useCallback((status: Status, hosted = stateRef.current.hosted) => {
+    sequence.current += 1;
+    inFlight.current?.controller.abort();
+    inFlight.current = null;
+    discard();
+    publish({ ...stateRef.current, status, hosted, accepted: null, generation: privateSessionGeneration() });
+  }, [discard, publish]);
+
+  const recheck = useCallback((recoverLogout = false): Promise<boolean> => {
+    if (logoutPending.current) return Promise.resolve(false);
+    const notice = hostedSessionNotice();
+    const unresolved = notice?.startsWith("logout:") === true;
+    if (!recoverLogout && (logoutUncertain.current || (unresolved && stateRef.current.hosted))) {
+      if (stateRef.current.status !== "logoutunknown") invalidate("logoutunknown");
+      return Promise.resolve(false);
+    }
     const key = sessionKey();
     if (key !== credential.current) {
       credential.current = key;
@@ -102,8 +116,17 @@ export default function AuthBoundary({ children }: {
     const previous = stateRef.current;
     // Routine successful revalidation never hides/remounts the workspace.
     if (previous.status !== "ready") publish({ ...previous, status: "checking" });
-    const current = () => request === sequence.current && key === sessionKey();
+    const current = () => request === sequence.current && key === sessionKey() && notice === hostedSessionNotice();
+    const settleRecovery = () => {
+      if (!recoverLogout) return;
+      settleHostedLogout(notice);
+      logoutUncertain.current = false;
+    };
     const unavailable = () => {
+      if (recoverLogout && (unresolved || logoutUncertain.current)) {
+        invalidate("logoutunknown");
+        return;
+      }
       const focused = document.activeElement;
       if (stateRef.current.status === "ready" && focused instanceof HTMLElement && focused.closest("[data-app-shell]")) privateFocus.current = focused;
       pausePrivateReads();
@@ -114,6 +137,10 @@ export default function AuthBoundary({ children }: {
       if (!current()) return false;
       const hosted = meta.hosted === true || meta.session?.origin === "public";
       const session = meta.session;
+      if (hosted && unresolved && !recoverLogout) {
+        invalidate("logoutunknown", hosted);
+        return false;
+      }
       const sessionValid = sessionAdmissible(session);
       // A claimed sign-in without its verified identity is unanswered, not
       // authority. Explicit anonymous policy cannot rescue malformed identity.
@@ -123,6 +150,7 @@ export default function AuthBoundary({ children }: {
       }
       const admitted = meta.signed_in === true || (!hosted && meta.anonymous_reads === true);
       if (admitted) {
+        settleRecovery();
         // SessionView.id is only a non-secret display prefix; stable creation
         // and expiry plus verified subject/role distinguish its observations.
         const nextIdentity = meta.signed_in === true && session
@@ -140,6 +168,7 @@ export default function AuthBoundary({ children }: {
         unavailable();
         return false;
       }
+      settleRecovery();
       const expired = stateRef.current.accepted !== null || identity.current !== null || key !== null || stateRef.current.status === "expired";
       discard();
       // Only a positive refusal of this exact tab credential removes it.
@@ -151,7 +180,12 @@ export default function AuthBoundary({ children }: {
       return false;
     }).catch((error: unknown) => {
       if (!current()) return false;
+      if (!recoverLogout && unresolved && error instanceof ApiError && error.status === 401 && error.code === "board_session_required") {
+        invalidate("logoutunknown", true);
+        return false;
+      }
       if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
+        settleRecovery();
         const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
         discard();
         publish({ ...stateRef.current, status: error.status === 403 ? "refused" : explicitlySignedOut() ? "signedoutexplicit" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
@@ -163,7 +197,7 @@ export default function AuthBoundary({ children }: {
     });
     inFlight.current = { key, controller, promise };
     return promise;
-  }, [discard, publish, setSession]);
+  }, [discard, invalidate, publish, setSession]);
 
   useEffect(() => {
     pausePrivateReads();
@@ -176,23 +210,21 @@ export default function AuthBoundary({ children }: {
         void recheck();
       }
     };
-    const ended = () => {
-      sequence.current += 1;
-      inFlight.current?.controller.abort();
-      inFlight.current = null;
-      discard();
-      publish({ ...stateRef.current, status: "signedout", accepted: null, generation: privateSessionGeneration() });
+    const hostedChanged = () => {
+      if (logoutPending.current) return;
+      logoutUncertain.current = false;
+      invalidate("checking");
+      void recheck();
     };
     const ending = () => {
       logoutPending.current = true;
       logoutUncertain.current = false;
-      ended();
-      if (stateRef.current.hosted) publish({ ...stateRef.current, status: "signingout" });
+      invalidate(stateRef.current.hosted ? "signingout" : "signedout");
     };
     const finished = () => {
       logoutPending.current = false;
-      ended();
-      if (stateRef.current.hosted) publish({ ...stateRef.current, status: "signedoutexplicit" });
+      invalidate(stateRef.current.hosted ? "signedoutexplicit" : "signedout");
+      if (stateRef.current.hosted && hostedSessionNotice()?.startsWith("logout:")) void recheck();
     };
     const logoutUnavailable = () => {
       logoutPending.current = false;
@@ -219,26 +251,19 @@ export default function AuthBoundary({ children }: {
     const focused = () => { if (!document.hidden) void recheck(); };
     const online = () => { void recheck(); };
     const shared = (event: StorageEvent) => {
+      if (event.key === HOSTED_SESSION_NOTICE) {
+        if (stateRef.current.hosted && event.newValue === hostedSessionNotice()) hostedChanged();
+        return;
+      }
       // Another tab replaced or removed the shared key. Drop this tab's
       // fallback copy and let `changed` re-verify (or sign out) before any
       // further private work.
       if (applySharedSessionChange(event)) changed();
     };
-    let channel: BroadcastChannel | null = null;
-    if (typeof window.BroadcastChannel === "function") {
-      try {
-        channel = new window.BroadcastChannel("cadence-workspace-session");
-        channel.onmessage = (event: MessageEvent) => {
-          if (!stateRef.current.hosted || event.data !== "signed-out" || logoutPending.current || logoutUncertain.current) return;
-          sequence.current += 1;
-          inFlight.current?.controller.abort();
-          inFlight.current = null;
-          discard();
-          publish({ ...stateRef.current, status: "checking", accepted: null, generation: privateSessionGeneration() });
-          void recheck();
-        };
-      } catch { /* Focus and periodic verification remain available. */ }
-    }
+    // Back/forward-cache restoration may have missed the storage event.
+    const restored = (event: PageTransitionEvent) => {
+      if (event.persisted && stateRef.current.hosted && !logoutUncertain.current) hostedChanged();
+    };
     window.addEventListener("online", online);
     window.addEventListener("storage", shared);
     window.addEventListener("cadence:session-changed", changed);
@@ -247,6 +272,7 @@ export default function AuthBoundary({ children }: {
     window.addEventListener("cadence:session-logout-unavailable", logoutUnavailable);
     window.addEventListener("cadence:session-required", required);
     window.addEventListener("focus", focused);
+    window.addEventListener("pageshow", restored);
     document.addEventListener("visibilitychange", focused);
     const timer = window.setInterval(focused, 30_000);
     return () => {
@@ -254,7 +280,6 @@ export default function AuthBoundary({ children }: {
       inFlight.current?.controller.abort();
       inFlight.current = null;
       pausePrivateReads();
-      channel?.close();
       window.clearInterval(timer);
       window.removeEventListener("cadence:session-changed", changed);
       window.removeEventListener("cadence:session-ending", ending);
@@ -262,11 +287,12 @@ export default function AuthBoundary({ children }: {
       window.removeEventListener("cadence:session-logout-unavailable", logoutUnavailable);
       window.removeEventListener("cadence:session-required", required);
       window.removeEventListener("focus", focused);
+      window.removeEventListener("pageshow", restored);
       window.removeEventListener("online", online);
       window.removeEventListener("storage", shared);
       document.removeEventListener("visibilitychange", focused);
     };
-  }, [discard, publish, recheck]);
+  }, [discard, invalidate, publish, recheck]);
 
   // A local daemon restart or a brief identity outage leaves the session
   // intact (`unavailable` is not a sign-out). Retry on a short cadence so
@@ -344,7 +370,7 @@ export default function AuthBoundary({ children }: {
             {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
               {state.status === "logoutunknown" ? <>
                 <Button variant="primary" full onClick={() => { void closeSession(true).catch(() => undefined); }}>{t("Retry sign-out")}</Button>
-                <button className="auth-back-link" onClick={() => { logoutUncertain.current = false; retryFocus.current = true; void recheck(); }}>{t("Verify session and return")}</button>
+                <button className="auth-back-link" onClick={() => { retryFocus.current = true; void recheck(true); }}>{t("Verify session and return")}</button>
               </> : state.status === "unavailable" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
                 {hosted ? <a className="auth-back-link" href={switchLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">

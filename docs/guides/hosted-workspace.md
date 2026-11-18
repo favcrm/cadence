@@ -22,9 +22,11 @@ The signed-out page remains after a reload or opening another tab. Continue
 with AgenticOS to sign in again; it may select the same account. Choose **Use
 another account** to switch accounts instead.
 
-If sign-out cannot be confirmed, workspace content stays hidden. Retry sign-out
-or explicitly verify your session to return; an interrupted request alone does
-not establish whether sign-out succeeded.
+If sign-out cannot be confirmed, workspace content stays hidden in this tab and
+other tabs of the same workspace, including after a reload. Retry sign-out or
+explicitly verify your session to return. A fresh hosted sign-in also clears the
+unconfirmed state after the server accepts it; browser notices alone do not
+authorize a view.
 
 ## Check your connection
 

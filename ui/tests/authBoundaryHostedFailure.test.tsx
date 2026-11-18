@@ -130,6 +130,16 @@ assert(host.textContent?.includes("We couldn’t confirm sign-out."), "lost sign
 await React.act(async () => { window.dispatchEvent(new Event("focus")); window.dispatchEvent(new Event("online")); });
 await flush();
 assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "automatic checks cannot undo an uncertain sign-out");
+await React.act(async () => { nextRoot.unmount(); });
+const recoveryRoot = createRoot(host);
+await React.act(async () => {
+  recoveryRoot.render(React.createElement(LocaleProvider, null, React.createElement(AuthBoundary, {
+    children: () => React.createElement("main", null, "PRIVATE WORKSPACE"),
+  })));
+});
+await flush();
+assert(button("Retry sign-out"), "reload retains the unconfirmed sign-out while the old cookie is still valid");
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "reload cannot silently restore the workspace");
 logout = new Promise<Response>((resolve) => { resolveLogout = resolve; });
 await React.act(async () => { button("Retry sign-out")?.click(); });
 signedIn = false;
@@ -143,7 +153,7 @@ const switchLink = links.find((link) => link.textContent?.includes("Use another 
 assert(continueLink && switchLink, "signed-out page offers continue and account switching");
 assert(new URL(continueLink.href).searchParams.get("to") === "https://fav-limited.cadencecloud.app/issues/12", "continue preserves the board destination");
 assert(new URL(switchLink.href).searchParams.get("mode") === "switch", "account switching requests a real switch");
-await React.act(async () => { nextRoot.unmount(); });
+await React.act(async () => { recoveryRoot.unmount(); });
 const reloadRoot = createRoot(host);
 await React.act(async () => {
   reloadRoot.render(React.createElement(LocaleProvider, null,
@@ -155,14 +165,13 @@ assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "marked reload does not
 await React.act(async () => { reloadRoot.unmount(); });
 document.cookie = "cadence_signed_out=; Max-Age=0; Path=/";
 
-// A delayed sibling notification cannot override a newer verified sign-in.
-const sibling = { receiver: null as ((event: { data: string }) => void) | null };
-class TestChannel {
-  set onmessage(handler: ((event: { data: string }) => void) | null) { sibling.receiver = handler; }
-  postMessage() {}
-  close() {}
-}
-Object.defineProperty(win, "BroadcastChannel", { configurable: true, value: TestChannel });
+// A same-origin logout intent hides existing views before the server answers.
+// A later identity signal also hides the old view and demands current proof.
+const publishNotice = (newValue: string) => {
+  const key = "cadence.hostedSessionNotice";
+  win.localStorage.setItem(key, newValue);
+  win.dispatchEvent(new win.StorageEvent("storage", { key, newValue }));
+};
 signedIn = true;
 let resolveMeta!: (response: Response) => void;
 let heldMeta: Promise<Response> | null = null;
@@ -179,13 +188,16 @@ await React.act(async () => {
 });
 for (let n = 0; n < 20 && !host.textContent?.includes("PRIVATE WORKSPACE"); n += 1) await flush();
 assert(host.textContent?.includes("PRIVATE WORKSPACE"), "newly verified session opens the workspace");
+await React.act(async () => { publishNotice("logout:fixture"); });
+assert(button("Retry sign-out"), "the sibling shows unresolved sign-out before any confirmation");
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "logout intent removes private content in the sibling");
 heldMeta = new Promise<Response>((resolve) => { resolveMeta = resolve; });
-assert(sibling.receiver, "hosted tab listens for sibling session changes");
-await React.act(async () => { sibling.receiver?.({ data: "signed-out" }); });
-assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "sibling notice hides private content during recheck");
-await React.act(async () => { resolveMeta(json({ signed_in: true, hosted: true, session })); });
+await React.act(async () => { publishNotice("changed:fixture"); });
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "a browser notice cannot admit an authenticated view");
+const newSession = { ...session, id: "session-2", user: { ...session.user, sub: "another" } };
+await React.act(async () => { resolveMeta(json({ signed_in: true, hosted: true, session: newSession })); });
 for (let n = 0; n < 20 && !host.textContent?.includes("PRIVATE WORKSPACE"); n += 1) await flush();
-assert(host.textContent?.includes("PRIVATE WORKSPACE"), "current server proof wins over a delayed sibling notice");
+assert(host.textContent?.includes("PRIVATE WORKSPACE"), "current server proof opens the sibling view");
 await React.act(async () => { siblingRoot.unmount(); });
 console.log("hosted gate failure checks passed");
 }
