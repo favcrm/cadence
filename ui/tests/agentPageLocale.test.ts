@@ -68,11 +68,52 @@ function laterLabels(source: string): string[] {
   return labels;
 }
 
+/**
+ * Calls that pass one argument to `t()` later: the skill drawer's
+ * `decide(job, doneMessage, …)` toasts its second argument.
+ */
+const TRANSLATED_ARGS: Record<string, number> = { decide: 1 };
+
+/** The literal at each translated argument position of those calls. */
+function translatedArgs(source: string): string[] {
+  const labels: string[] = [];
+  for (const [callee, position] of Object.entries(TRANSLATED_ARGS)) {
+    for (const start of source.matchAll(new RegExp(`\\b${callee}\\(`, "g"))) {
+      const args: string[] = [];
+      let depth = 1;
+      let quote: string | null = null;
+      let current = "";
+      for (let index = (start.index ?? 0) + start[0].length; index < source.length && depth > 0; index += 1) {
+        const char = source[index]!;
+        if (quote !== null) {
+          if (char === "\\") {
+            current += char + source[index + 1];
+            index += 1;
+            continue;
+          }
+          if (char === quote) quote = null;
+        } else if (char === '"' || char === "'" || char === "`") quote = char;
+        else if ("([{".includes(char)) depth += 1;
+        else if (")]}".includes(char)) depth -= 1;
+        if (depth === 0) break;
+        if (depth === 1 && quote === null && char === ",") {
+          args.push(current);
+          current = "";
+        } else current += char;
+      }
+      args.push(current);
+      const literal = /^\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(args[position] ?? "");
+      if (literal) labels.push(unquote(literal[1]!));
+    }
+  }
+  return labels;
+}
+
 /** Literals that are not English copy: file names and bare placeholders. */
 const NOT_COPY = /^(?:.*\.(?:md|json|tsx?|js)|\{[a-z]+\})$/;
 
 function englishLabels(source: string): string[] {
-  return [...insideT(source), ...laterLabels(source)].filter((label) => /[A-Za-z]/.test(label) && !NOT_COPY.test(label.trim()));
+  return [...insideT(source), ...laterLabels(source), ...translatedArgs(source)].filter((label) => /[A-Za-z]/.test(label) && !NOT_COPY.test(label.trim()));
 }
 
 function main() {

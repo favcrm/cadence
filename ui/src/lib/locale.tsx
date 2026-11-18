@@ -664,6 +664,11 @@ const LocaleContext = createContext<LocaleContextValue | null>(null);
 
 // CAD-2451: the agent page — Skills tab, skill panel, Access & security, runtime.
 Object.assign(zhTW, {
+  "Approved revision {n} of {name}.": "已核准 {name} 的版本 {n}。",
+  "Revoked {name}.": "已撤銷 {name}。",
+  "Deleted {name}.": "已刪除 {name}。",
+  "Revision {n} · approved": "版本 {n} · 已核准",
+  "Revision {n} · draft": "版本 {n} · 草稿",
   "Nothing queued.": "目前沒有排入佇列的項目。",
   "No results yet.": "尚無結果。",
   "Turned on {name}.": "已啟用 {name}。",

@@ -153,7 +153,7 @@ export function InstructionsPanel({ read }: { read: WorkspaceSkillRead }) {
           <div className="sk-doc-bar">
             <span className="sk-file">
               <b className="num">SKILL.md</b>
-              <small>{`${t("Revision {n}").replace("{n}", String(revision.revision))} · ${t(read.approved ? "approved" : "draft")}`}</small>
+              <small>{t(read.approved ? "Revision {n} · approved" : "Revision {n} · draft").replace("{n}", String(revision.revision))}</small>
             </span>
             <Segment
               label={t("View as")}
