@@ -55,6 +55,30 @@ check(parseToolCall('wiki_read {"path":') === null, "broken JSON is not a call")
 check(shortId("art-4cff6ebbaae44734856e9acb4549e320") === "art-4cff6ebb…", `a long artifact id is cut: ${shortId("art-4cff6ebbaae44734856e9acb4549e320")}`);
 check(shortId("art-1") === "art-1", "a short id stays whole");
 check(turnSources([call('artifact_read {"id":"art-4cff6ebbaae44734856e9acb4549e320"}')])[0]!.target === "art-4cff6ebbaae44734856e9acb4549e320", "the chip still targets the full id");
+// CAD-2456: the native runtime's `tool_summary` form, `name: <detail>`.
+{
+  check(parseToolCall("web_read: https://www.hubspot.com/pricing/crm")?.summary === "https://www.hubspot.com/pricing/crm", "a summary's detail is read");
+  check(parseToolCall("board_read_issue: {id}")?.summary === undefined, "a keys-only summary carries no detail");
+  const sources = turnSources([
+    call("web_read: https://www.hubspot.com/pricing/crm"),
+    call("wiki_read: policies/refunds"),
+    call('wiki_read {"path":"policies/refunds"}'),
+    call('web_read {"url":"https://www.hubspot.com/pricing/crm"}'),
+    call("web_read: javascript:alert(1)"),
+    call("web_read: not a url"),
+    call("wiki_list: projects"),
+    call("web_search: crm pricing"),
+    call("board_read_issue: {id}"),
+    call("chat_attachment_read: {id, offset}"),
+    call("app_call: {app, args, operation}"),
+    call("wiki_read: {path}"),
+  ]);
+  check(
+    JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`)) === JSON.stringify(["web:www.hubspot.com", "wiki:policies/refunds"]),
+    `summary-form sources, deduplicated across both forms: ${JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`))}`,
+  );
+  check(sources[0]!.target === "https://www.hubspot.com/pricing/crm", "a summary web source keeps its full URL");
+}
 check(turnSources([prose("No tools here.")]).length === 0, "a turn that read nothing has no sources");
 check(SOURCES_SHOWN === 8, "the row shows at most 8 chips");
 
