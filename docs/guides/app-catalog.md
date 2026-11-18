@@ -456,9 +456,10 @@ a small operator settings action to `/apps/manage/<id>`.
 On a compatible hosted board, use **Manage → Default app agent** to select an
 existing active profile for your own conversations in an approved installation.
 The choice adds context, not tool access, and does not change another owner's
-selection. Use **No default agent** to clear it. If the app or profile changes,
-review the current selection before saving again. If a save cannot be confirmed,
-check what the board read back before trying again.
+selection. Platform operator sessions cannot manage this private setting. Use
+**No default agent** to clear it. A package update reloads the current setting
+without applying an unsaved choice. If a save cannot be confirmed, check what
+the board read back before trying again.
 
 A verified operator selects an immutable published release, chooses **Review
 installation** or **Review update**, reviews the checked package and access

@@ -38,10 +38,12 @@ export default function ManageApp({
   installId,
   viewer,
   automaticUpdatesEnabled = true,
+  appAgentSession,
 }: {
   installId: string;
   viewer: Viewer;
   automaticUpdatesEnabled?: boolean;
+  appAgentSession: string | null;
 }) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
@@ -428,10 +430,10 @@ export default function ManageApp({
       {privateOpen && <PrivateAppDialog installation={inst} onClose={() => setPrivateOpen(false)} onInstalled={() => setReread((n) => n + 1)} />}
 
       <div className="mgrid mt-5">
-        {!removed && !off && inst.install_id === installId &&
+        {appAgentSession && !removed && !off && inst.install_id === installId &&
           (inst.state === undefined || inst.state === "active") &&
           (inst.approved === true || inst.approval?.state === "approved") &&
-          <AppAgentSettings key={installId} installId={installId} busy={applying || removing || restoring} />}
+          <AppAgentSettings key={appAgentSession} installId={installId} installedDigest={inst.digest} busy={applying || removing || restoring} />}
         <div className="card mcard">
           <h3>{t("App package")}</h3>
           {inst.source_kind === "private" ? (

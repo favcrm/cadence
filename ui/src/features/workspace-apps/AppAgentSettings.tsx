@@ -6,12 +6,12 @@ import Button from "../../ui/Button";
 import { workspaceApps, type AppAgentSelection } from "./workspaceApps";
 
 type Failure = "sign-in" | "unavailable";
-type Snapshot = { binding: AppAgentSelection; profiles: Map<string, string> };
+type Snapshot = { installedDigest: string; binding: AppAgentSelection; profiles: Map<string, string> };
 
-export function AppAgentSettings({ installId, busy }: { installId: string; busy: boolean }) {
+export function AppAgentSettings({ installId, installedDigest, busy }: { installId: string; installedDigest: string; busy: boolean }) {
   const t = useTranslate();
   const inFlight = useRef<AbortController | null>(null);
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [observed, setSnapshot] = useState<Snapshot | null>(null);
   // Undefined follows the current server value. An empty string is an explicit clear.
   const [draft, setDraft] = useState<string>();
   const [failure, setFailure] = useState<Failure | null>(null);
@@ -22,6 +22,10 @@ export function AppAgentSettings({ installId, busy }: { installId: string; busy:
   useEffect(() => {
     const controller = new AbortController();
     inFlight.current = controller;
+    setPending(true);
+    setFailure(null);
+    // A confirmed save on the previous package is no longer current.
+    setNotice(previous => previous === "saved" ? null : previous);
     const clearPrivate = () => {
       inFlight.current?.abort();
       inFlight.current = null;
@@ -38,7 +42,7 @@ export function AppAgentSettings({ installId, busy }: { installId: string; busy:
         // Read the private binding first; a host that doesn't offer it need not read the roster.
         const binding = await workspaceApps.appAgent(installId, controller.signal);
         const profiles = await workspaceApps.activeAgentProfiles(controller.signal);
-        if (!controller.signal.aborted) setSnapshot({ binding, profiles });
+        if (!controller.signal.aborted) setSnapshot({ installedDigest, binding, profiles });
       } catch (error) {
         if (!controller.signal.aborted) setFailure(error instanceof ApiError && error.status === 401 ? "sign-in" : "unavailable");
       } finally {
@@ -54,8 +58,10 @@ export function AppAgentSettings({ installId, busy }: { installId: string; busy:
       stopPause();
       stopReset();
     };
-  }, [installId, reload]);
+  }, [installId, installedDigest, reload]);
 
+  const packageChanged = observed !== null && observed.installedDigest !== installedDigest;
+  const snapshot = packageChanged ? null : observed;
   const binding = snapshot?.binding;
   const committed = binding?.agent?.id ?? "";
   const value = draft ?? committed;
@@ -105,8 +111,8 @@ export function AppAgentSettings({ installId, busy }: { installId: string; busy:
         <p className="wa-alert" role="alert">{failure === "sign-in" ? t("Sign in again to manage your default app agent.") : t("Default app agent settings are unavailable on this board.")}</p>
         <Button onClick={() => { setFailure(null); setPending(true); setReload(count => count + 1); }}>{t("Retry")}</Button>
       </div>}
-      {pending && !snapshot && !failure && <p role="status">{t("Loading…")}</p>}
-      {notice && <p role="status" className={notice === "saved" ? "wa-muted" : "wa-alert"}>{
+      {(pending || packageChanged) && !snapshot && !failure && <p role="status">{t("Loading…")}</p>}
+      {notice && !(packageChanged && notice === "saved") && <p role="status" className={notice === "saved" ? "wa-muted" : "wa-alert"}>{
         notice === "saved" ? t("Default app agent saved.") : notice === "conflict" ?
           t("The app or selection changed. Review the current setting before saving again.") :
           t("The save could not be confirmed. Check the current setting before trying again.")
