@@ -1990,12 +1990,17 @@ pub fn evaluate_worker(
 
     let risk = worker_risk(&argv);
     let req = with_doc(state_dir, now, |doc| {
-        if let Some(existing) = doc
-            .requests
-            .iter()
-            .find(|r| r.id == handle && r.status == "pending" && r.requested_by == alias)
-        {
-            return Ok(existing.clone());
+        if let Some(existing) = doc.requests.iter().find(|r| r.id == handle) {
+            // A handle names one request. Only the same agent's still-pending
+            // retry may reuse it; any other row with this id (Master's, another
+            // agent's, or a decided/expired one) is refused, so id-keyed
+            // decisions can never land on a different request.
+            if existing.status == "pending" && existing.requested_by == alias {
+                return Ok(existing.clone());
+            }
+            return Err(Error::rejected(format!(
+                "request handle '{handle}' already names another permission request — a handle belongs to one request"
+            )));
         }
         let req = Request {
             id: handle.to_string(),
@@ -2020,6 +2025,7 @@ pub fn evaluate_worker(
 pub fn settle_from_respond(
     state_dir: &Path,
     id: &str,
+    requested_by: &str,
     accepted: bool,
     reason: Option<&str>,
     now: i64,
@@ -2028,7 +2034,7 @@ pub fn settle_from_respond(
         let Some(req) = doc
             .requests
             .iter_mut()
-            .find(|r| r.id == id && r.status == "pending")
+            .find(|r| r.id == id && r.status == "pending" && r.requested_by == requested_by)
         else {
             return Ok(None);
         };
@@ -2049,12 +2055,12 @@ pub fn settle_from_respond(
 }
 
 /// Mark a still-pending request expired when `request_close` times out on the client side.
-pub fn expire_by_id(state_dir: &Path, id: &str, now: i64) -> Result<()> {
+pub fn expire_by_id(state_dir: &Path, id: &str, requested_by: &str, now: i64) -> Result<()> {
     with_doc(state_dir, now, |doc| {
         if let Some(req) = doc
             .requests
             .iter_mut()
-            .find(|r| r.id == id && r.status == "pending")
+            .find(|r| r.id == id && r.status == "pending" && r.requested_by == requested_by)
         {
             req.status = "expired".into();
         }
@@ -3898,5 +3904,95 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ok_prose, WorkerEval::Pending(_)));
+    }
+
+    #[test]
+    fn worker_handle_cannot_collide_with_another_request_id() {
+        let dir = tmp();
+        let state = dir.path().join("state");
+        let pm = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&pm).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let cwd = fs::canonicalize(&repo).unwrap();
+        let states = [state.as_path()];
+
+        let master_req = ask(
+            &state,
+            &[
+                "cadence".into(),
+                "issue".into(),
+                "comment".into(),
+                "T".into(),
+            ],
+            &cwd,
+            "master request",
+            "master",
+            &[],
+            &states,
+            1_000,
+        )
+        .unwrap();
+
+        let worker = |alias: &str, handle: &str, now: i64| {
+            evaluate_worker(
+                &state,
+                Some(pm.as_path()),
+                alias,
+                handle,
+                "Bash",
+                &serde_json::json!({"command": "cadence issue show CAD-1"}),
+                "cadence issue show CAD-1",
+                &cwd,
+                &states,
+                now,
+            )
+        };
+
+        // A worker cannot reuse Master's request id.
+        let err = worker("w1", &master_req.id, 1_001).unwrap_err().to_string();
+        assert!(
+            err.contains("already names another permission request"),
+            "{err}"
+        );
+
+        // The same worker's pending retry is idempotent; another worker cannot take it.
+        let first = worker("w1", "perm-abc", 1_002).unwrap();
+        assert!(matches!(first, WorkerEval::Pending(_)));
+        assert!(matches!(
+            worker("w1", "perm-abc", 1_003).unwrap(),
+            WorkerEval::Pending(_)
+        ));
+        let err = worker("w2", "perm-abc", 1_004).unwrap_err().to_string();
+        assert!(
+            err.contains("already names another permission request"),
+            "{err}"
+        );
+
+        // A decided row's id cannot be reopened, even by its own worker.
+        reject(&state, "perm-abc", false, 1_005).unwrap();
+        let err = worker("w1", "perm-abc", 1_006).unwrap_err().to_string();
+        assert!(
+            err.contains("already names another permission request"),
+            "{err}"
+        );
+
+        // Exactly one row per id remains, and Master's row is untouched.
+        let doc = load_doc(&state).unwrap();
+        assert_eq!(
+            doc.requests
+                .iter()
+                .filter(|r| r.id == master_req.id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            doc.requests.iter().filter(|r| r.id == "perm-abc").count(),
+            1
+        );
+        let m = doc.requests.iter().find(|r| r.id == master_req.id).unwrap();
+        assert_eq!(m.requested_by, "master");
+        assert_eq!(m.status, "pending");
     }
 }

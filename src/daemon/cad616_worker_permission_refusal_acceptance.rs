@@ -1704,6 +1704,72 @@ fn worker_interleaved_flags_tilde_wrappers_and_nested_inputs_refused() {
 }
 
 #[test]
+fn worker_request_open_handle_cannot_collide_with_existing_permission_request_id() {
+    let fx = Fixture::new("c616handle");
+    let w1 = fx.enroll_managed("w1", "worker", true);
+
+    let master_id = "mr-0123456789ab";
+    let decided_id = "perm-w2-decided";
+    let master_argv: Vec<String> = vec![
+        "ls".into(),
+        fx.repo_dir.join("master-ok").to_string_lossy().into_owned(),
+    ];
+    let w2_argv: Vec<String> = vec!["ls".into(), fx.repo_dir.to_string_lossy().into_owned()];
+    let master_req = request_record(master_id, "master", &master_argv, &fx.repo_dir, "pending");
+    let w2_req = request_record(decided_id, "w2", &w2_argv, &fx.repo_dir, "rejected");
+    let doc_path = seed_master_perm_doc(
+        &fx.state_dir,
+        json!({ "requests": [master_req, w2_req], "grants": [] }),
+    );
+
+    // A benign command that is neither Class::Never nor rule-covered, so the
+    // only reason to refuse is the colliding handle.
+    let cmd = format!("ls {}", fx.repo_dir.display());
+    for handle in [master_id, decided_id] {
+        let err = fx
+            .dispatch(
+                "request_open",
+                request_open_bash("w1", handle, &cmd),
+                w1.pid(),
+            )
+            .expect_err("worker request_open reusing an existing request id must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already names another permission request"),
+            "expected handle-collision refusal for '{handle}', got: {msg}"
+        );
+    }
+
+    assert!(
+        fx.pending_requests_for("w1").is_empty(),
+        "a refused colliding handle must never park a pending entry for w1"
+    );
+
+    let after: Value = serde_json::from_slice(&fs::read(&doc_path).unwrap()).unwrap();
+    let requests = after["requests"].as_array().unwrap();
+    for id in [master_id, decided_id] {
+        assert_eq!(
+            requests.iter().filter(|r| r["id"] == json!(id)).count(),
+            1,
+            "seeded id '{id}' must appear exactly once: {after}"
+        );
+    }
+    let m = requests
+        .iter()
+        .find(|r| r["id"] == json!(master_id))
+        .unwrap();
+    assert_eq!(m["requested_by"], json!("master"), "{after}");
+    assert_eq!(m["status"], json!("pending"), "{after}");
+    assert_eq!(m["argv"], json!(master_argv), "{after}");
+    let d = requests
+        .iter()
+        .find(|r| r["id"] == json!(decided_id))
+        .unwrap();
+    assert_eq!(d["requested_by"], json!("w2"), "{after}");
+    assert_eq!(d["status"], json!("rejected"), "{after}");
+}
+
+#[test]
 fn malformed_or_symlinked_worker_permissions_yaml_fails_closed() {
     let fx = Fixture::new("c616yaml");
     let w1 = fx.enroll_managed("w1", "worker", true);

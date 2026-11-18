@@ -170,6 +170,7 @@ impl Shared {
                 if let Ok(Some(_)) = crate::master_perm::settle_from_respond(
                     &self.state_dir,
                     handle,
+                    &alias,
                     accepted,
                     reason.as_deref(),
                     crate::master_perm::clock(),
@@ -566,6 +567,7 @@ impl Shared {
                 let _ = crate::master_perm::expire_by_id(
                     &self.state_dir,
                     handle,
+                    &alias,
                     crate::master_perm::clock(),
                 );
                 self.bump_master_rev();
