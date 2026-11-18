@@ -38,6 +38,9 @@ const POSTS_TOOL: &str = "read_instagram_posts";
 const POSTS_COUNT: u32 = 12;
 const IMAGE_TOOL: &str = "generate_image";
 const TEXT_TOOL: &str = "generate_text";
+pub(crate) const NATIVE_TEXT_WORKLOAD_REVIEW_REQUIRED: &str =
+    "native text requires exact workload approval for the new quote protocol";
+const LEGACY_TEXT_MODEL: &str = "z-ai/glm-5.3-flash";
 /// Historical in-flight quotes predate explicit model binding.
 pub(crate) const LEGACY_IMAGE_MODEL: &str = "openai/gpt-image-2.5";
 
@@ -508,7 +511,7 @@ impl AgenticosExternalAdapter {
                 .unwrap_or("unavailable");
             return Err(format!("AgenticOS provider quote refused: {code}"));
         }
-        let (total, revision, protocol, model) = quote_view(
+        let (total, revision, protocol) = quote_view(
             tool,
             mapping["effect"].as_str().unwrap_or(""),
             &envelope["data"],
@@ -520,7 +523,7 @@ impl AgenticosExternalAdapter {
             units: 1,
             total_price_micros: total,
             price_revision: revision,
-            model,
+            model: None,
             price_slug: None,
             pricing_revision: None,
             charge_protocol: protocol,
@@ -887,7 +890,12 @@ impl AgenticosExternalAdapter {
             return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
         }
         validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
-        let mut body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
+        if !authority["quote"]["charge_protocol"].is_null() {
+            return Err(AppCapabilityError::Refused(
+                NATIVE_TEXT_WORKLOAD_REVIEW_REQUIRED.into(),
+            ));
+        }
+        let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
             .map_err(AppCapabilityError::Refused)?;
@@ -896,64 +904,8 @@ impl AgenticosExternalAdapter {
                 "provider idempotency key is invalid".into(),
             ));
         }
-        let mut quote = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
-        let mut exact_quote = None;
-        if authority["quote"]["charge_protocol"] == "quote@2" {
-            let model = authority["quote"]["model"]
-                .as_str()
-                .filter(|model| valid_model_id(model))
-                .ok_or_else(|| {
-                    AppCapabilityError::Refused("the approved text model is unavailable".into())
-                })?;
-            if body
-                .get("model")
-                .is_some_and(|chosen| chosen.as_str() != Some(model))
-            {
-                return Err(AppCapabilityError::Refused(
-                    "the requested text model is not the approved model".into(),
-                ));
-            }
-            body["model"] = json!(model);
-            let mut response = authorized(
-                self.http.post(format!(
-                    "{}/v1/runtime/tools/generate_text/quote",
-                    self.base
-                )),
-                token,
-            )
-            .send_json(&body)
-            .map_err(|_| {
-                AppCapabilityError::Refused("AgenticOS text quote is unavailable".into())
-            })?;
-            let status = response.status().as_u16();
-            let bytes = response
-                .body_mut()
-                .with_config()
-                .limit(64 * 1024)
-                .read_to_vec()
-                .map_err(|_| {
-                    AppCapabilityError::Refused("AgenticOS text quote is unavailable".into())
-                })?;
-            let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
-                AppCapabilityError::Refused("AgenticOS text quote is malformed".into())
-            })?;
-            if status != 200 || envelope["ok"] != true {
-                return Err(AppCapabilityError::Refused(format!(
-                    "AgenticOS text quote refused: {}",
-                    refused_code(&envelope)
-                )));
-            }
-            let selected = &envelope["data"];
-            let (amount, _) =
-                checked_text_quote(selected, Some(model)).map_err(AppCapabilityError::Refused)?;
-            quote = amount;
-            exact_quote = Some(selected.clone());
-        }
-        let mut request = json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":quote});
-        if let Some(selected) = exact_quote {
-            request["charge_protocol"] = json!("quote@2");
-            request["text_quote"] = selected;
-        }
+        let quote = frozen_charge_quote(authority).map_err(AppCapabilityError::Refused)?;
+        let request = json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":quote});
         let mut response = authorized(self.http.post(format!("{}{CALL_PATH}", self.base)), token)
             .header("idempotency-key", idempotency_key)
             .send_json(request)
@@ -1692,34 +1644,6 @@ fn money_micros(value: &Value) -> Option<u64> {
     (micros <= MAX_SAFE_JSON_INTEGER).then_some(micros)
 }
 
-fn checked_text_quote<'a>(
-    quote: &'a Value,
-    requested_model: Option<&str>,
-) -> std::result::Result<(u64, &'a str), String> {
-    let model = quote["model"]
-        .as_str()
-        .filter(|model| valid_model_id(model))
-        .ok_or("AgenticOS text quote has an invalid model")?;
-    let amount = quote["maxChargeMinor"]
-        .as_u64()
-        .filter(|amount| *amount > 0 && *amount <= MAX_SAFE_JSON_INTEGER)
-        .ok_or("AgenticOS text quote has an invalid amount")?;
-    if quote["quoteVersion"] != "text-model-quote@1"
-        || quote["chargeProtocol"] != "quote@2"
-        || quote["currency"] != "USD"
-        || quote["scale"] != 6
-        || !matches!(
-            quote["basis"].as_str(),
-            Some("fixed_call" | "metered_actual")
-        )
-        || (!quote["publishedVersion"].is_null() && quote["publishedVersion"].as_u64().is_none())
-        || requested_model.is_some_and(|requested| requested != model)
-    {
-        return Err("AgenticOS text quote is malformed or changed model".into());
-    }
-    Ok((amount, model))
-}
-
 fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
     let fields = input
         .as_object()
@@ -1731,9 +1655,9 @@ fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
         return Err("text generation input has unsupported fields".into());
     }
     let model = match fields.get("model") {
-        None => None,
-        Some(Value::String(model)) if valid_model_id(model) => Some(model),
-        _ => return Err("text generation model is malformed".into()),
+        None => LEGACY_TEXT_MODEL,
+        Some(Value::String(model)) if model == LEGACY_TEXT_MODEL => LEGACY_TEXT_MODEL,
+        _ => return Err("text generation model is not reviewed on the legacy protocol".into()),
     };
     let messages = fields
         .get("messages")
@@ -1773,11 +1697,7 @@ fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
     if !(1..=8192).contains(&tokens) {
         return Err("text generation output token limit is invalid".into());
     }
-    let mut request = json!({"messages":clean,"maxOutputTokens":tokens});
-    if let Some(model) = model {
-        request["model"] = json!(model);
-    }
-    Ok(request)
+    Ok(json!({"model":model,"messages":clean,"maxOutputTokens":tokens}))
 }
 
 fn validate_text_result(result: &Value) -> std::result::Result<Value, String> {
@@ -1832,7 +1752,12 @@ fn quote_view(
     tool: &str,
     effect: &str,
     view: &Value,
-) -> std::result::Result<(u64, String, Option<String>, Option<String>), String> {
+) -> std::result::Result<(u64, String, Option<String>), String> {
+    if tool == TEXT_TOOL
+        && (view["chargePrecondition"] == "quote@2" || view.get("pricing").is_some())
+    {
+        return Err(NATIVE_TEXT_WORKLOAD_REVIEW_REQUIRED.into());
+    }
     let protocol = match view["chargePrecondition"].as_str() {
         Some("max_charge_minor@1") => None,
         Some("quote@2") => Some("quote@2".to_owned()),
@@ -1841,17 +1766,6 @@ fn quote_view(
     if view["slug"] != tool || view["effect"] != effect {
         return Err("AgenticOS provider quote changed tool or effect".into());
     }
-    let model = if tool == TEXT_TOOL && protocol.is_some() {
-        Some(
-            view["defaultModel"]
-                .as_str()
-                .filter(|model| valid_model_id(model))
-                .ok_or("AgenticOS text quote has no valid default model")?
-                .to_owned(),
-        )
-    } else {
-        None
-    };
     let per_call = money_micros(&view["price"])
         .ok_or("AgenticOS provider quote has invalid per-call price")?;
     let per_unit = if view["unitPrice"].is_null() {
@@ -1869,13 +1783,10 @@ fn quote_view(
     if let Some(protocol) = protocol.as_deref() {
         reviewed["chargeProtocol"] = json!(protocol);
     }
-    if let Some(model) = model.as_deref() {
-        reviewed["defaultModel"] = json!(model);
-    }
     let bytes = serde_json::to_vec(&reviewed)
         .map_err(|_| "AgenticOS provider quote cannot be serialized")?;
     let revision = format!("sha256:{:x}", Sha256::digest(&bytes));
-    Ok((total, revision, protocol, model))
+    Ok((total, revision, protocol))
 }
 
 fn frozen_charge_quote(authority: &Value) -> std::result::Result<u64, String> {
@@ -2466,7 +2377,7 @@ mod tests {
     #[test]
     fn quote_uses_admin_price_for_one_fixed_unit_and_detects_changes() {
         let view = json!({"slug":POSTS_TOOL,"effect":"read","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"0.001880"},"unitPrice":{"currency":"USD","scale":6,"amount":"0.000120"}});
-        let (amount, revision, _, _) = quote_view(POSTS_TOOL, "read", &view).unwrap();
+        let (amount, revision, _) = quote_view(POSTS_TOOL, "read", &view).unwrap();
         assert_eq!(amount, 2_000);
         assert!(revision.starts_with("sha256:"));
         let mut changed = view.clone();
@@ -2505,15 +2416,13 @@ mod tests {
 
     #[test]
     fn informational_quote_accepts_large_amounts_and_binds_the_protocol() {
-        let legacy = json!({"slug":TEXT_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"1000000.000000"},"unitPrice":null});
+        let legacy = json!({"slug":POSTS_TOOL,"effect":"read","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"1000000.000000"},"unitPrice":null});
         let mut current = legacy.clone();
         current["chargePrecondition"] = json!("quote@2");
-        current["defaultModel"] = json!("synthetic/new-text");
-        let (amount, revision, protocol, model) = quote_view(TEXT_TOOL, "draft", &current).unwrap();
+        let (amount, revision, protocol) = quote_view(POSTS_TOOL, "read", &current).unwrap();
         assert_eq!(amount, 1_000_000_000_000);
         assert_eq!(protocol.as_deref(), Some("quote@2"));
-        assert_eq!(model.as_deref(), Some("synthetic/new-text"));
-        assert_ne!(revision, quote_view(TEXT_TOOL, "draft", &legacy).unwrap().1);
+        assert_ne!(revision, quote_view(POSTS_TOOL, "read", &legacy).unwrap().1);
     }
 
     #[test]
@@ -2966,70 +2875,31 @@ mod tests {
             worker.join().unwrap();
         }
 
-        // The upgraded door quotes the actual workload and preserves the
-        // approved default, including when it is explicitly named.
-        let (base, seen, worker) = media_door(|request| match request.url.as_str() {
-            "/v1/runtime/tools/generate_text/quote" => json_response(
-                200,
-                json!({"ok":true,"data":{
-                    "quoteVersion":"text-model-quote@1","chargeProtocol":"quote@2",
-                    "model":request.body["model"],"publishedVersion":1,
-                    "basis":"fixed_call","currency":"USD","scale":6,"maxChargeMinor":2100
-                }}),
-            ),
-            CALL_PATH => {
-                assert_eq!(request.body["max_charge_minor"], 2100);
-                assert_eq!(request.body["charge_protocol"], "quote@2");
-                assert_eq!(
-                    request.body["body"]["model"],
-                    request.body["text_quote"]["model"]
-                );
-                json_response(
-                    200,
-                    json!({"ok":true,"data":{"slug":"generate_text","repeated":false,
-                        "price":{"currency":"USD","scale":6,"amount":"0.004200"},
-                        "result":{"text":"Synthetic caption","finishReason":"stop","usage":null}
-                    }}),
-                )
-            }
-            _ => panic!("unexpected text request {}", request.url),
-        });
+        // Retained or forged quote@2 authority cannot bypass native discovery.
+        let (base, seen, worker) =
+            media_door(|_| panic!("native quote@2 text must be refused before HTTP"));
         let adapter =
             AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN)).unwrap();
         let mut current = proof.clone();
         current["quote"]["charge_protocol"] = json!("quote@2");
         current["quote"]["model"] = json!("synthetic/default");
-        for (request, key) in [
-            (input.clone(), "app-call-default-1"),
-            (
-                json!({"model":"synthetic/default","messages":[{"role":"user","content":"Draft a caption."}]}),
-                "app-call-explicit-1",
-            ),
+        for request in [
+            input,
+            json!({"model":"synthetic/default","messages":[{"role":"user","content":"Draft a caption."}]}),
+            json!({"model":"synthetic/selected","messages":[{"role":"user","content":"Draft a caption."}]}),
         ] {
-            let output = adapter
-                .execute_app_capability_outcome(b"token", &current, &request, key)
-                .unwrap();
-            assert_eq!(
-                output.result,
-                json!({"text":"Synthetic caption","finishReason":"stop","usage":null})
-            );
-            assert_eq!(output.actual_charge_micros, Some(4200));
+            assert!(matches!(
+                adapter.execute_app_capability_outcome(
+                    b"token",
+                    &current,
+                    &request,
+                    "app-call-disabled-1"
+                ),
+                Err(AppCapabilityError::Refused(_))
+            ));
         }
-        let different = json!({"model":"synthetic/selected","messages":[{"role":"user","content":"Draft a caption."}]});
-        assert!(matches!(
-            adapter.execute_app_capability_outcome(
-                b"token",
-                &current,
-                &different,
-                "app-call-different-1"
-            ),
-            Err(AppCapabilityError::Refused(_))
-        ));
         worker.join().unwrap();
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 4);
-        assert_eq!(seen[1].body["body"]["model"], "synthetic/default");
-        assert_eq!(seen[3].body["body"]["model"], "synthetic/default");
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]

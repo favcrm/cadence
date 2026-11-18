@@ -356,7 +356,10 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     let audit = receipts.next().expect("retained receipt audit event");
     assert_eq!(audit.payload["digest"], first["digest"]);
     assert_eq!(audit.payload["actual_charge_micros"], 4_200);
-    assert!(receipts.next().is_none(), "a replay must not rewrite settlement");
+    assert!(
+        receipts.next().is_none(),
+        "a replay must not rewrite settlement"
+    );
     assert!(s
         .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
             id: "call-2",

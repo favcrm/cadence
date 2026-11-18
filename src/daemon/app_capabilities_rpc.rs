@@ -67,7 +67,6 @@ fn require_frozen_model_quote(
     run: &Value,
     slot: &str,
     quote: &crate::platform::AppCapabilityQuote,
-    input: &Value,
 ) -> Result<()> {
     let binding = &run["snapshot"]["capabilities"][slot]["config"];
     let provider = binding["provider"].as_str();
@@ -89,28 +88,9 @@ fn require_frozen_model_quote(
         return Err(Error::rejected("the approved model quote is unavailable"));
     }
     if text {
-        if saved["charge_protocol"] == "quote@2"
-            || quote.charge_protocol.as_deref() == Some("quote@2")
-        {
-            let approved = saved["model"]
-                .as_str()
-                .filter(|model| crate::platform::agenticos_external::valid_model_id(model))
-                .ok_or_else(|| Error::rejected("the approved text model is unavailable"))?;
-            if saved["charge_protocol"] != "quote@2"
-                || quote.charge_protocol.as_deref() != Some("quote@2")
-                || quote.model.as_deref() != Some(approved)
-                || input
-                    .get("model")
-                    .is_some_and(|model| model.as_str() != Some(approved))
-            {
-                return Err(Error::rejected(
-                    "the text model or protocol changed since approval; request a new quote",
-                ));
-            }
-        } else if input.get("model").is_none() && saved["model"].as_str() != quote.model.as_deref()
-        {
+        if !saved["charge_protocol"].is_null() || quote.charge_protocol.is_some() {
             return Err(Error::rejected(
-                "the text model changed since approval; request a new quote",
+                crate::platform::agenticos_external::NATIVE_TEXT_WORKLOAD_REVIEW_REQUIRED,
             ));
         }
         return Ok(());
@@ -382,7 +362,7 @@ impl Shared {
             if proof.config["provider"] != crate::platform::account_media::PLATFORM {
                 return Err(Error::rejected("account capability source changed"));
             }
-            require_frozen_model_quote(&run, slot, quote, input)?;
+            require_frozen_model_quote(&run, slot, quote)?;
             self.recheck_app_capability_quote(&proof, quote)?;
             Ok((step, proof))
         };
@@ -865,23 +845,34 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
-                // The next probe prices every frozen slot, not only the one
-                // the worker named. Lineage is offline and ignores non-account
-                // slots, so an unknown or mixed slot cannot skip it.
+                let config = &checked_run["snapshot"]["capabilities"][&slot]["config"];
                 self.account_frozen_lineage(&checked_run)?;
-                self.probe_app_run_prices(&checked_run)?;
-                let quote = self
-                    .prepare_app_run_quotes(&checked_run)?
-                    .remove(&slot)
-                    .ok_or_else(|| Error::rejected("run capability quote is absent"))??
-                    .fetch()?;
-                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
-                    == crate::platform::account_media::PLATFORM
-                {
+                let replaying_text = config["provider"]
+                    == crate::platform::agenticos_external::PLATFORM
+                    && config["mapping"]["capability"] == "text.generate"
+                    && self
+                        .store
+                        .app_capability_result_for_slot(&run_id, &slot)?
+                        .is_some();
+                let quote = if replaying_text {
+                    // A historical receipt does not depend on an old pricing door.
+                    None
+                } else {
+                    self.probe_app_run_prices(&checked_run)?;
+                    Some(
+                        self.prepare_app_run_quotes(&checked_run)?
+                            .remove(&slot)
+                            .ok_or_else(|| Error::rejected("run capability quote is absent"))??
+                            .fetch()?,
+                    )
+                };
+                if config["provider"] == crate::platform::account_media::PLATFORM {
                     return self.execute_account_run_capability(
                         &checked_run,
                         &slot,
-                        &quote,
+                        quote
+                            .as_ref()
+                            .ok_or_else(|| Error::rejected("run capability quote is absent"))?,
                         (input, &request),
                         Some((&alias, message, turn)),
                     );
@@ -912,7 +903,11 @@ impl Shared {
                             "run snapshot digest changed since run approval",
                         ));
                     }
-                    self.recheck_app_capability_quote(&proof, &quote)?;
+                    if let Some(quote) = &quote {
+                        self.recheck_app_capability_quote(&proof, quote)?;
+                    } else {
+                        self.app_capability_credential(&proof.config)?;
+                    }
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
                     let tool = required_str(&config["mapping"], "tool")?;
@@ -953,7 +948,10 @@ impl Shared {
                     }
                     // Price checks for a new dispatch must not invalidate a
                     // retained receipt under the same authorized identity.
-                    require_frozen_model_quote(&run, &slot, &quote, input)?;
+                    let quote = quote
+                        .as_ref()
+                        .ok_or_else(|| Error::rejected("retained text receipt is unavailable"))?;
+                    require_frozen_model_quote(&run, &slot, quote)?;
                     let call_id = format!(
                         "app-call-{}",
                         uuid::Uuid::new_v5(

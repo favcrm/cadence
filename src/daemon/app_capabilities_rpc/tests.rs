@@ -16,66 +16,32 @@ fn approved_image_quote_cannot_silently_switch_model_or_price() {
         "capabilities":{"image":{"config":{"provider":"agenticos_external","mapping":{"capability":"media.generate"}}}},
         "quotes":{"image":quote}
     }});
-    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_ok());
+    assert!(require_frozen_model_quote(&run, "image", &quote).is_ok());
     run["snapshot"]["quotes"]["image"]["model"] = json!("synthetic/image-two");
-    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_err());
+    assert!(require_frozen_model_quote(&run, "image", &quote).is_err());
     run["snapshot"]["quotes"]["image"]["model"] = json!("synthetic/image-one");
     run["snapshot"]["quotes"]["image"]["price_revision"] = json!("media:sha256:other");
-    assert!(require_frozen_model_quote(&run, "image", &quote, &json!({})).is_err());
+    assert!(require_frozen_model_quote(&run, "image", &quote).is_err());
 }
 
 #[test]
-fn approved_text_quote_cannot_silently_switch_defaults() {
+fn native_text_runs_refuse_retained_or_fresh_quote_v2() {
     let quote: crate::platform::AppCapabilityQuote = serde_json::from_value(json!({
         "schema":1,"currency":"USD","unit_price_micros":2000,"units":1,
-        "total_price_micros":2000,"price_revision":"sha256:quote",
-        "model":"synthetic/text-one","charge_protocol":"quote@2"
+        "total_price_micros":2000,"price_revision":"sha256:quote"
     }))
     .unwrap();
     let mut run = json!({"snapshot":{
         "capabilities":{"writer":{"config":{"provider":"agenticos_external","mapping":{"capability":"text.generate"}}}},
         "quotes":{"writer":quote}
     }});
-    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_ok());
-    assert!(require_frozen_model_quote(
-        &run,
-        "writer",
-        &quote,
-        &json!({"model":"synthetic/text-one"})
-    )
-    .is_ok());
-    assert!(require_frozen_model_quote(
-        &run,
-        "writer",
-        &quote,
-        &json!({"model":"synthetic/selected"})
-    )
-    .is_err());
-    let mut changed_quote = quote.clone();
-    changed_quote.model = Some("synthetic/text-two".into());
-    assert!(require_frozen_model_quote(
-        &run,
-        "writer",
-        &changed_quote,
-        &json!({"model":"synthetic/text-one"})
-    )
-    .is_err());
-    assert!(require_frozen_model_quote(
-        &run,
-        "writer",
-        &changed_quote,
-        &json!({"model":"synthetic/text-two"})
-    )
-    .is_err());
-    run["snapshot"]["quotes"]["writer"]["model"] = json!("synthetic/text-two");
-    assert!(require_frozen_model_quote(&run, "writer", &quote, &json!({})).is_err());
-    assert!(require_frozen_model_quote(
-        &run,
-        "writer",
-        &quote,
-        &json!({"model":"synthetic/text-two"})
-    )
-    .is_err());
+    assert!(require_frozen_model_quote(&run, "writer", &quote).is_ok());
+    let mut fresh = quote.clone();
+    fresh.charge_protocol = Some("quote@2".into());
+    assert!(require_frozen_model_quote(&run, "writer", &fresh).is_err());
+    run["snapshot"]["quotes"]["writer"]["charge_protocol"] = json!("quote@2");
+    assert!(require_frozen_model_quote(&run, "writer", &quote).is_err());
+    assert!(require_frozen_model_quote(&run, "writer", &fresh).is_err());
 }
 
 fn fixture() -> (

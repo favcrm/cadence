@@ -5,19 +5,20 @@ use serde_json::json;
 fn text_generation_contract_is_closed_and_bounded() {
     let input = json!({"messages":[{"role":"system","content":"Keep claims grounded."},{"role":"user","content":"Draft a caption."}]});
     let clean = validate_text_input(&input).unwrap();
-    assert!(clean.get("model").is_none());
+    assert_eq!(clean["model"], "z-ai/glm-5.3-flash");
     assert_eq!(clean["maxOutputTokens"], 4096);
     let selected =
-        json!({"model":"synthetic/new-text","messages":[{"role":"user","content":"Hello"}]});
+        json!({"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]});
     assert_eq!(
         validate_text_input(&selected).unwrap()["model"],
-        "synthetic/new-text"
+        "z-ai/glm-5.3-flash"
     );
     for bad in [
         json!({"messages":[{"role":"assistant","content":"x"}]}),
         json!({"messages":[{"role":"user","content":"x","tools":[]}]}),
         json!({"messages":[{"role":"user","content":"x"}],"query":{}}),
         json!({"messages":[{"role":"user","content":"x"}],"model":"other"}),
+        json!({"messages":[{"role":"user","content":"x"}],"model":"synthetic/new-text"}),
         json!({"messages":[{"role":"user","content":"x"}],"maxOutputTokens":8193}),
     ] {
         assert!(validate_text_input(&bad).is_err());
@@ -32,25 +33,30 @@ fn text_generation_contract_is_closed_and_bounded() {
 }
 
 #[test]
-fn text_quote_binds_model_and_rejects_malformed_or_changed_selection() {
-    let quote = json!({
-        "quoteVersion":"text-model-quote@1",
-        "chargeProtocol":"quote@2",
-        "model":"synthetic/new-text",
-        "publishedVersion":1,
-        "basis":"metered_actual",
-        "currency":"USD",
-        "scale":6,
-        "maxChargeMinor":1_200_000_000_u64
+fn native_text_discovery_refuses_quote_v2_and_accepts_legacy_fixed() {
+    let legacy = json!({
+        "slug":TEXT_TOOL,"effect":"draft",
+        "chargePrecondition":"max_charge_minor@1",
+        "price":{"currency":"USD","scale":6,"amount":"0.002000"},
+        "unitPrice":null
+    });
+    assert_eq!(quote_view(TEXT_TOOL, "draft", &legacy).unwrap().0, 2000);
+    let mut descriptor = legacy;
+    descriptor["chargePrecondition"] = json!("quote@2");
+    descriptor["defaultModel"] = json!("synthetic/new-text");
+    assert_eq!(
+        quote_view(TEXT_TOOL, "draft", &descriptor).unwrap_err(),
+        "native text requires exact workload approval for the new quote protocol"
+    );
+    let request_quote = json!({
+        "slug":TEXT_TOOL,"effect":"draft","displayName":"Generate text",
+        "defaultModel":"synthetic/new-text",
+        "pricing":{"mode":"request_quote","quoteVersion":"text-model-quote@1","chargeProtocol":"quote@2"}
     });
     assert_eq!(
-        checked_text_quote(&quote, None).unwrap(),
-        (1_200_000_000, "synthetic/new-text")
+        quote_view(TEXT_TOOL, "draft", &request_quote).unwrap_err(),
+        "native text requires exact workload approval for the new quote protocol"
     );
-    assert!(checked_text_quote(&quote, Some("synthetic/other")).is_err());
-    let mut invalid = quote;
-    invalid["chargeProtocol"] = json!("unknown");
-    assert!(checked_text_quote(&invalid, None).is_err());
 }
 
 #[test]
