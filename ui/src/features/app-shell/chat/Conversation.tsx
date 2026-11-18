@@ -23,6 +23,7 @@ import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
 import { PdfPageTarget } from "../../home/PdfPageAction";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
@@ -1994,10 +1995,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     [canReplyDraft, composerKey, focusPaneComposer],
   );
 
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (!canReplyDraft) return;
+      setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={canReplyDraft ? fillComposer : null}>
     <ImageConversation.Provider value={convId}>
     <PdfPageTarget.Provider value={hosted && canAttach && attachDestination
       ? { key: composerKey, destination: attachDestination, isCurrent: isCurrentUploadOrigin }
@@ -2533,6 +2544,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     </div>
     </PdfPageTarget.Provider>
     </ImageConversation.Provider>
+    </ComposerFillContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

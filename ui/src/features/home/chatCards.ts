@@ -57,6 +57,10 @@ export interface RecordRoles {
   amount?: string;
   /** The row is the account's own side when `String(row[key])` is in `self`. */
   side?: { key: string; self: string[] };
+  /** Raw badge/status value -> display text; null hides it. Display only. */
+  labels?: Record<string, string | null>;
+  /** A row is unread when its value at `key` (or any element) is in `values`. */
+  unread?: { key: string; values: string[] };
 }
 
 export interface RecordCardModel {
@@ -67,6 +71,11 @@ export interface RecordCardModel {
   roles: RecordRoles | null;
   items: Record<string, Cell>[];
   truncated: boolean;
+  /** CAD-2458 header data (agenticos-v2 #2252), each optional. */
+  toolLabel: string | null;
+  toolkitLabel: string | null;
+  account: string | null;
+  total: number | null;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
@@ -123,6 +132,24 @@ function parseRoles(v: unknown, fieldKeys: string[]): RecordRoles | null {
       if (!Array.isArray(self) || self.length < 1 || self.length > 10) return null;
       if (!self.every((s) => typeof s === "string" && s.length >= 1 && s.length <= 100)) return null;
       roles.side = { key, self: self as string[] };
+    } else if (name === "labels") {
+      if (!isObject(value)) return null;
+      const entries = Object.entries(value);
+      if (entries.length > 40) return null;
+      const map: Record<string, string | null> = Object.create(null);
+      for (const [raw, shown] of entries) {
+        if (raw.length < 1 || raw.length > 100) return null;
+        if (shown !== null && (typeof shown !== "string" || shown.length > 100)) return null;
+        map[raw] = shown;
+      }
+      roles.labels = map;
+    } else if (name === "unread") {
+      if (!isObject(value) || !exactKeys(value, ["key", "values"])) return null;
+      const { key, values } = value;
+      if (typeof key !== "string" || !fieldKeys.includes(key)) return null;
+      if (!Array.isArray(values) || values.length < 1 || values.length > 10) return null;
+      if (!values.every((s) => typeof s === "string" && s.length >= 1 && s.length <= 100)) return null;
+      roles.unread = { key, values: values as string[] };
     } else if ((ROLE_NAMES as readonly string[]).includes(name)) {
       if (typeof value !== "string" || !FIELD_KEY.test(value) || !fieldKeys.includes(value)) return null;
       roles[name as RoleName] = value;
@@ -136,7 +163,19 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
   if (!p) return null;
   const hasRoles = Object.prototype.hasOwnProperty.call(p, "roles");
   const base = ["v", "toolkit", "tool", "items", "fields", "view", "truncated"];
-  if (!exactKeys(p, hasRoles ? [...base, "roles"] : base)) return null;
+  const optional = ["roles", "tool_label", "toolkit_label", "account", "total"];
+  const present = optional.filter((k) => Object.prototype.hasOwnProperty.call(p, k));
+  if (!exactKeys(p, [...base, ...present])) return null;
+  const header = (key: string): string | null | undefined => {
+    if (!present.includes(key)) return null;
+    const v = p[key];
+    return typeof v === "string" && v.trim() !== "" && v.length <= 200 ? plainText(v, 200) : undefined;
+  };
+  const toolLabel = header("tool_label");
+  const toolkitLabel = header("toolkit_label");
+  const account = header("account");
+  if (toolLabel === undefined || toolkitLabel === undefined || account === undefined) return null;
+  if (present.includes("total") && !(Number.isInteger(p.total) && (p.total as number) >= 0)) return null;
   const { toolkit, tool, items, fields, view, truncated } = p;
   if (typeof toolkit !== "string" || !TOOLKIT.test(toolkit)) return null;
   if (typeof tool !== "string" || !TOOL.test(tool)) return null;
@@ -166,6 +205,10 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     roles,
     items: parsedItems,
     truncated,
+    toolLabel,
+    toolkitLabel,
+    account,
+    total: present.includes("total") ? (p.total as number) : null,
   };
 }
 
@@ -204,21 +247,54 @@ export interface TimeValue {
   instant: number | null;
 }
 
+/** A badge/status value to show; `muted` when the tool's `labels` map has no entry for it. */
+export interface RoleChip {
+  text: string;
+  muted: boolean;
+}
+
 export interface RoleRow {
+  /** The title as given, and its "Name <address>" split (name = title when it has no address). */
   title: string;
+  name: string;
+  address: string;
   subtitle: string;
   snippet: string;
   time: TimeValue | null;
-  /** Status then badge values, shown as chips. */
-  chips: string[];
+  /** Status then badge values that display as text. */
+  chips: RoleChip[];
+  /** A mapped label displayed "★". */
+  star: boolean;
+  /** The `unread` role matched this row. */
+  unread: boolean;
   amount: string;
 }
 
 export interface RoleMessage {
+  /** The actor's name; "" when absent or when it is the host's `api` marker. */
   actor: string;
   time: TimeValue | null;
+  /** Local calendar day of the time (`YYYY-MM-DD`); null when the time does not parse. */
+  day: string | null;
   text: string;
   own: boolean;
+  /** The actor value was `api`: sent by the assistant after approval. */
+  approved: boolean;
+}
+
+/** "Name <address>" split into its two parts; any other text is a name alone. */
+export function splitAddress(value: string): { name: string; address: string } {
+  const m = /^(.*?)\s*<([^<>\s/]{1,200})>$/.exec(value);
+  if (!m) return { name: value, address: "" };
+  const name = m[1].replace(/^["']+|["']+$/g, "").trim();
+  return name ? { name, address: m[2] } : { name: m[2], address: "" };
+}
+
+/** The local calendar day of an instant, for day separators. */
+export function dayKey(instant: number): string {
+  const d = new Date(instant);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
 }
 
 export type RecordLayout =
@@ -227,7 +303,7 @@ export type RecordLayout =
   /** Rows laid out from `payload.roles`. */
   | { view: "role-list"; rows: RoleRow[] }
   /** Bubbles laid out from `payload.roles`. */
-  | { view: "role-thread"; messages: RoleMessage[] }
+  | { view: "role-thread"; messages: RoleMessage[]; contact: string }
   /** Message-style rows. `outbound` is true when the board's side sent it. */
   | { view: "thread"; messages: { sender: string; time: string; text: string; outbound: boolean }[] }
   /** Key/value lines of one item. */
@@ -259,12 +335,29 @@ export function parseInstant(value: Cell | undefined): number | null {
   return ms < 1e11 ? ms * 1000 : ms;
 }
 
-/** Chip texts of a status or badge cell: an array gives one chip per tag. */
-function chipTexts(value: Cell | undefined, labels?: CellLabels): string[] {
-  if (Array.isArray(value)) return value.slice(0, TAGS_MAX).map((s) => plainText(s, 60)).filter(Boolean);
-  const text = cellText(value, labels);
-  return text ? [plainText(text, 60)] : [];
+/** Display values of a status or badge cell through `roles.labels`: null hides, "★" is the star, unmapped shows muted. */
+function chipValues(value: Cell | undefined, roles: RecordRoles, labels?: CellLabels): { chips: RoleChip[]; star: boolean } {
+  const raws = Array.isArray(value) ? value.slice(0, TAGS_MAX) : [cellText(value, labels)];
+  const chips: RoleChip[] = [];
+  let star = false;
+  for (const raw of raws) {
+    if (raw === "") continue;
+    const mapped = roles.labels && Object.hasOwn(roles.labels, raw) ? roles.labels[raw] : undefined;
+    if (mapped === null) continue;
+    const text = plainText(mapped === undefined ? raw : mapped, 60);
+    if (text === "") continue;
+    if (mapped !== undefined && text === "★") star = true;
+    else chips.push({ text, muted: mapped === undefined });
+  }
+  return { chips, star };
 }
+
+const isUnread = (item: Record<string, Cell>, unread: RecordRoles["unread"]): boolean => {
+  if (!unread) return false;
+  const v = item[unread.key];
+  const seen = Array.isArray(v) ? v : v === undefined || v === null ? [] : [String(v)];
+  return seen.some((s) => unread.values.includes(s));
+};
 
 const hasAnyRole = (roles: RecordRoles, names: RoleName[]): boolean => names.some((n) => roles[n] !== undefined);
 
@@ -283,31 +376,41 @@ function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLab
     const messages = model.items
       .map((item) => {
         const own = side !== undefined && item[side.key] != null && side.self.includes(String(item[side.key]));
+        const rawActor = text(item, roles.actor);
+        const approved = rawActor.toLowerCase() === "api";
+        const when = time(item);
         return {
-          actor: text(item, roles.actor),
-          time: time(item),
+          actor: approved ? "" : splitAddress(rawActor).name,
+          time: when,
+          day: when?.instant != null ? dayKey(when.instant) : null,
           text: text(item, roles.snippet) || text(item, roles.title) || text(item, roles.subtitle),
           own,
+          approved,
         };
       })
       .filter((m) => m.text !== "");
-    return messages.length ? { view: "role-thread", messages } : null;
+    const contact = messages.find((m) => !m.own && m.actor !== "")?.actor ?? "";
+    return messages.length ? { view: "role-thread", messages, contact } : null;
   }
   if (model.view === "list") {
     if (!hasAnyRole(roles, ["title", "subtitle", "snippet", "time", "status", "badge", "amount"])) return null;
     const rows = model.items
-      .map((item) => ({
-        title: text(item, roles.title),
-        subtitle: text(item, roles.subtitle),
-        snippet: text(item, roles.snippet),
-        time: time(item),
-        chips: [
-          ...(roles.status ? chipTexts(item[roles.status], labels) : []),
-          ...(roles.badge ? chipTexts(item[roles.badge], labels) : []),
-        ],
-        amount: text(item, roles.amount),
-      }))
-      .filter((r) => r.title || r.subtitle || r.snippet || r.time || r.chips.length || r.amount);
+      .map((item): RoleRow => {
+        const title = text(item, roles.title);
+        const shown = [roles.status, roles.badge].map((k) => (k ? chipValues(item[k], roles, labels) : { chips: [], star: false }));
+        return {
+          title,
+          ...splitAddress(title),
+          subtitle: text(item, roles.subtitle),
+          snippet: text(item, roles.snippet),
+          time: time(item),
+          chips: shown.flatMap((v) => v.chips),
+          star: shown.some((v) => v.star),
+          unread: isUnread(item, roles.unread),
+          amount: text(item, roles.amount),
+        };
+      })
+      .filter((r) => r.title || r.subtitle || r.snippet || r.time || r.chips.length || r.star || r.amount);
     return rows.length ? { view: "role-list", rows } : null;
   }
   return null;

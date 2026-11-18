@@ -17,7 +17,7 @@
         "id": "c_1002",
         "name": "Sam Sample",
         "visits": 1,
-        "tags": []
+        "tags": ["new", "internal"]
       }
     ],
     "fields": [
@@ -50,8 +50,21 @@
     "roles": {
       "title": "name",
       "subtitle": "id",
-      "badge": "tags"
+      "badge": "tags",
+      "labels": {
+        "vip": "VIP",
+        "new": "New",
+        "internal": null
+      },
+      "unread": {
+        "key": "tags",
+        "values": ["new"]
+      }
     },
-    "truncated": true
+    "truncated": true,
+    "tool_label": "List contacts",
+    "toolkit_label": "Synthetic CRM",
+    "account": "Main CRM",
+    "total": 120
   }
 }
