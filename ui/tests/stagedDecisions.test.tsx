@@ -43,7 +43,7 @@ const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import(".
 const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
+const { parseStagedRow, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
 
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
@@ -1076,6 +1076,115 @@ listStatus = 200;
   assert(drawerEl()!.querySelector("pre")?.textContent?.includes("revision_conflict"), "Audit Show raw discloses failure code");
   decideStatus.a1 = 200;
   await f.done();
+}
+
+// ---- 18. CAD-2406: a connected draft or send is decidable; args are plain text; every outcome is honest ----
+{
+  const ARGS = { to: "<b>Ana</b>@example.com", subject: "Quote", body: "Line one\n<img src=x onerror=alert(1)>", cc: null, n: 3, opts: { a: [1] } };
+  const effect = (id: string, extra: Record<string, unknown> = {}, input: Record<string, unknown> = {}) => ({
+    id, tool: "connected_effect", status: "pending", createdAt: Date.now() - AGO, decidedAt: null,
+    origin: { via: "mcp", kind: "agent", label: "Atlas" },
+    input: { slug: "gmail_send_email", toolkit: "gmail", effect: "send", connection_id: "ca_1", account: "ops@example.com", args: JSON.stringify(ARGS), ...input },
+    ...extra,
+  });
+  const good = parseStagedRow(effect("e1"));
+  assert(good !== null && good.kind === "connected_effect" && good.connected?.effect === "send", "a good row parses");
+  assert(good.changes.length === 6 && good.changes.find((c) => c.field === "opts")?.after === '{"a":[1]}', "every argument is kept, nested ones as JSON text");
+  for (const [why, row] of [
+    ["no input", { ...effect("e"), input: undefined }],
+    ["args not JSON", effect("e", {}, { args: "{nope" })],
+    ["args not an object", effect("e", {}, { args: "[1]" })],
+    ["args not text", effect("e", {}, { args: { to: "x" } })],
+    ["unknown effect", effect("e", {}, { effect: "delete" })],
+    ["no account", effect("e", {}, { account: " " })],
+    ["no slug", effect("e", {}, { slug: undefined })],
+    ["no connection", effect("e", {}, { connection_id: undefined })],
+  ] as const) assert(parseStagedRow(row) === null, `${why}: the row is dropped`);
+
+  actions = [effect("e1"), effect("e2", {}, { effect: "draft", slug: "gmail_create_email_draft" }), effect("bad", {}, { args: "{" })];
+  onDecide = (id, verb) => {
+    actions = actions.map((a: any) => a.id !== id ? a : {
+      ...a, status: verb === "approve" ? "approved" : "denied", decidedAt: Date.now(),
+      result: verb === "approve" ? (id === "e1" ? { ok: true } : { ok: false, code: "uncertain" }) : null,
+    });
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 2, "two cards; the unparseable row is not one"));
+  assert(text(v.cards()[0].querySelector(".todo-title")) === "Send · gmail_send_email", `verb and tool (got ${text(v.cards()[0].querySelector(".todo-title"))})`);
+  assert(text(v.cards()[1].querySelector(".todo-title")) === "Draft · gmail_create_email_draft", "the draft verb");
+  assert(text(v.cards()[0].querySelector(".todo-meta")).startsWith("ops@example.com (gmail) · Atlas (agent)"), "account, toolkit, asker");
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const d = drawerEl()!;
+  const rows = Array.from(d.querySelectorAll(".dx-row")).map((r) => `${text(r.querySelector("dt"))}: ${text(r.querySelector("dd"))}`);
+  assert(rows.includes("to: <b>Ana</b>@example.com") && rows.some((r) => r.startsWith("body: Line one") && r.includes("<img src=x onerror=alert(1)>")), `values are text (${rows.join("|")})`);
+  assert(!d.querySelector("b, img"), "no argument became markup");
+  assert(rows.includes("cc: Empty") && rows.includes("n: 3"), "null and numbers read as data");
+  assert(text(d.querySelector(".crm-drawer-sub")).includes("ops@example.com (gmail)") && /Asked by Atlas \(agent\), via mcp/.test(text(d)), "account, toolkit and asker in the detail");
+  assert(text(d).includes("Nothing has been sent yet"), "pending says nothing was sent");
+  await click(labelled(d, "Approve"));
+  await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Draft · gmail_create_email_draft", "advanced"));
+  assert(text(drawerEl()!).includes("Sent · gmail_send_email"), "ok:true reads Sent");
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(!drawerEl(), "closed"));
+  assert(/unconfirmed/.test(text(v.host)) && /may have acted/.test(text(v.host)) && !/Drafted/.test(text(v.host)), `uncertain is not success (${text(v.host)})`);
+  await click(labelled(v.host, "Updates"));
+  const lines = Array.from(v.host.querySelectorAll("[data-todo-decisions] li")).map((l) => text(l));
+  assert(lines.some((l) => l.includes("Sent") && l.includes("gmail_send_email")) && lines.some((l) => l.includes("Result not confirmed") && l.includes("do not assume it did not")), `Updates (${lines.join("|")})`);
+  onDecide = null;
+  await v.done();
+
+  // The server leaves an uncertain send pending, carrying the result.
+  const stuck = parseStagedRow(effect("u1", { result: { ok: false, code: "uncertain", retry: true } }));
+  assert(stuck !== null && outcomeOf(stuck) === "pending" && stuck.result?.code === "uncertain", "a pending row keeps its uncertain result");
+  const denied = parseStagedRow(effect("u2", { status: "denied", decidedAt: Date.now(), result: { ok: false, code: "uncertain", retry: true } }));
+  assert(denied !== null && outcomeOf(denied) === "unconfirmed", "denied after an uncertain attempt is not 'nothing ran'");
+  const lost = parseStagedRow(effect("u6", { status: "denied", decidedAt: Date.now(), result: { ok: false, code: "capability_unavailable", retry: true } }));
+  assert(lost !== null && outcomeOf(lost) === "unconfirmed", "denied after any unsettled (retry) attempt is not 'nothing ran'");
+  actions = [effect("u1", { result: { ok: false, code: "uncertain", retry: true } })];
+  {
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "still a card"));
+    await click(labelled(w.cards()[0], "Review"));
+    await settle(() => assert(drawerEl(), "open"));
+    const body = text(drawerEl());
+    assert(!body.includes("Nothing has been sent yet") && body.includes("may have acted"), `a pending uncertain row never says nothing was sent (${body.slice(0, 300)})`);
+    await click(labelled(drawerEl()!, "Audit"));
+    assert(text(drawerEl()!).includes("Result not confirmed: the provider may have acted") && !text(drawerEl()!).includes("Did not apply"), `the Audit receipt of a pending uncertain row (${text(drawerEl()!).slice(0, 400)})`);
+    await w.done();
+  }
+  {
+    actions = [effect("u3", { status: "denied", decidedAt: Date.now(), result: { ok: false, code: "uncertain", retry: true } }), effect("u4")];
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "the denied row is not waiting"));
+    await w.done();
+  }
+  // The real approve: the reply is fine, the row stays pending carrying the uncertain result.
+  actions = [effect("u5")];
+  onDecide = (id) => { actions = actions.map((a: any) => a.id === id ? { ...a, result: { ok: false, code: "uncertain", retry: true } } : a); };
+  {
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "one card"));
+    await click(labelled(w.cards()[0], "Review"));
+    await settle(() => assert(drawerEl(), "open"));
+    await click(labelled(drawerEl()!, "Approve"));
+    await settle(() => assert(labelled(drawerEl()!, "Check again"), "unsure after a pending reply"));
+    assert(sent() === 1, "one submit");
+    await click(labelled(drawerEl()!, "Check again"));
+    const n = text(drawerEl()!);
+    assert(sent() === 1 && n.includes("did not finish") && n.includes("may have acted") && !n.includes("Nothing was recorded"), `Check again does not claim nothing was recorded (${n.slice(0, 400)})`);
+    await w.done();
+  }
+  onDecide = null;
+
+  for (const [code, words] of [["expired", "expired"], ["insufficient_funds", "not enough funds"], ["toolkit_disabled", "turned off"], ["mystery", "refused (mystery)"]] as const) {
+    actions = [effect("f1", { status: "approved", decidedAt: Date.now(), result: { ok: false, code } })];
+    const w = await render();
+    await settle(() => assert(listCalls > 0, "read"));
+    await click(labelled(w.host, "Updates"));
+    assert(text(w.host.querySelector("[data-fail]")).includes(words), `${code} reads in plain words`);
+    await w.done();
+  }
 }
 
 console.log("staged decision checks passed");

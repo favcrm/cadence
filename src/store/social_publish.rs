@@ -41,6 +41,15 @@ CREATE INDEX IF NOT EXISTS social_publish_install
  ON social_publish_intents(install_id,context_id,intent_id);
 ";
 
+/// CAD-2379: the four facts of one intent a calendar entry is built from.
+#[derive(Debug, Clone)]
+pub struct CalendarIntent {
+    pub intent_id: String,
+    pub state: String,
+    pub due_epoch: i64,
+    pub toolkit: String,
+}
+
 /// Event kinds on the platform stream for intent lifecycle.
 pub const SOCIAL_PUBLISH_SCHEDULED_EVENT: &str = "social_publish_scheduled";
 pub const SOCIAL_PUBLISH_CANCELLED_EVENT: &str = "social_publish_cancelled";
@@ -533,6 +542,32 @@ impl Store {
             }
             Ok(changed)
         })
+    }
+
+    /// CAD-2379: the intents due in `[from_epoch, to_epoch)`, soonest first,
+    /// for the calendar read. A cancelled intent is not a dated item. Only
+    /// what a calendar entry needs leaves the store: never the frozen
+    /// material, caption digest, receipt or upstream evidence.
+    pub fn social_publish_calendar(
+        &self,
+        from_epoch: i64,
+        to_epoch: i64,
+        limit: usize,
+    ) -> Result<Vec<CalendarIntent>> {
+        let conn = self.conn();
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(conn.query_vec(
+            "SELECT intent_id,state,due_epoch,toolkit FROM social_publish_intents WHERE due_epoch>=?1 AND due_epoch<?2 AND state!='cancelled' ORDER BY due_epoch,intent_id LIMIT ?3",
+            params![from_epoch, to_epoch, cap],
+            |r| {
+                Ok(CalendarIntent {
+                    intent_id: r.get(0)?,
+                    state: r.get(1)?,
+                    due_epoch: r.get(2)?,
+                    toolkit: r.get(3)?,
+                })
+            },
+        )?)
     }
 
     pub fn social_publish_list(

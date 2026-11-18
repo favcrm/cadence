@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
+import { fmtInZone, sameDayClock, useTimeZones } from "../../lib/timeZone";
 import type { Connection, Routine, RoutineRun, StagedRoutineProposal } from "../../lib/types";
 import Button from "../../ui/Button";
 import DrawerShell, { type DrawerMenuItem } from "../app-shell/shared/DrawerShell";
@@ -18,16 +19,6 @@ const PRESET_CRON: Record<Exclude<FrequencyPreset, "hourly" | "custom">, string>
   weekly: "0 9 * * 1",
 };
 
-function defaultTimezone(): string {
-  try {
-    const z = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    if (z && z.includes("/")) return z;
-  } catch {
-    // Fallback to UTC when browser zone cannot be read.
-  }
-  return "UTC";
-}
-
 function statusMeta(r: Routine): { label: string; tone: "ok" | "warn" | "ink" } {
   switch (r.status) {
     case "on":
@@ -41,14 +32,24 @@ function statusMeta(r: Routine): { label: string; tone: "ok" | "warn" | "ink" } 
   }
 }
 
-function scheduleSummary(r: Routine, t: (s: string) => string): string {
+/** A preset's text with its 09:00 replaced by the viewer's clock, when the run keeps its day. */
+function presetSummary(r: Routine, text: string, tz: string, viewer: string): string {
+  if (viewer !== tz && r.next_due_at) {
+    const clock = sameDayClock(r.next_due_at, tz, viewer);
+    if (clock) return `${text.replace("09:00", clock.time)} ${clock.label}`;
+  }
+  return `${text} (${tz})`;
+}
+
+/** The schedule in the viewer's zone, labelled; a stored zone is never rewritten. */
+function scheduleSummary(r: Routine, t: (s: string) => string, viewer: string): string {
   if (r.trigger_kind === "event") {
     return `${t("On event:")} ${r.event_source ?? t("event")}`;
   }
   const tz = r.timezone ?? "UTC";
-  if (r.cron === "0 9 * * *") return `${t("Every day · 09:00")} (${tz})`;
-  if (r.cron === "0 9 * * 1-5") return `${t("Weekdays · 09:00")} (${tz})`;
-  if (r.cron === "0 9 * * 1") return `${t("Weekly · Mon 09:00")} (${tz})`;
+  if (r.cron === "0 9 * * *") return presetSummary(r, t("Every day · 09:00"), tz, viewer);
+  if (r.cron === "0 9 * * 1-5") return presetSummary(r, t("Weekdays · 09:00"), tz, viewer);
+  if (r.cron === "0 9 * * 1") return presetSummary(r, t("Weekly · Mon 09:00"), tz, viewer);
   if (r.cron) return `${r.cron} (${tz})`;
   if (r.interval_mins) return `${t("Every")} ${r.interval_mins}m (${tz})`;
   return tz;
@@ -73,6 +74,9 @@ function targetPathLabel(r: Routine): string {
 
 export default function RoutinesTab({ c }: { c: TabContext }) {
   const t = useTranslate();
+  const zones = useTimeZones();
+  const viewerZone = zones.effective;
+  const companyZone = zones.company ?? "UTC";
   const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [proposals, setProposals] = useState<StagedRoutineProposal[]>([]);
   const [waitingRuns, setWaitingRuns] = useState<RoutineRun[]>([]);
@@ -94,7 +98,9 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const [preset, setPreset] = useState<FrequencyPreset>("weekdays");
   const [customCron, setCustomCron] = useState("0 9 * * 1-5");
   const [customInterval, setCustomInterval] = useState("60");
-  const [timezone, setTimezone] = useState(defaultTimezone);
+  // null follows the company zone: a new routine runs in it, never in the browser's.
+  const [timezoneEdit, setTimezone] = useState<string | null>(null);
+  const timezone = timezoneEdit ?? companyZone;
   const [eventSource, setEventSource] = useState("github.pull_request");
   const [whatMode, setWhatMode] = useState<"playbook" | "script">("playbook");
   const [wakeWithPlaybook, setWakeWithPlaybook] = useState(true);
@@ -204,7 +210,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     setPreset("weekdays");
     setCustomCron("0 9 * * 1-5");
     setCustomInterval("60");
-    setTimezone(defaultTimezone());
+    setTimezone(null);
     setEventSource("github.pull_request");
     setWhatMode("playbook");
     setWakeWithPlaybook(true);
@@ -453,7 +459,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         <span className="rtn-row-main">
           <b>{r.name}</b>
           <small>
-            {scheduleSummary(r, t)} · {targetSummary(r, t)}
+            {scheduleSummary(r, t, viewerZone)} · {targetSummary(r, t)}
           </small>
           <span className="rtn-row-path">{targetPathLabel(r)}</span>
         </span>
@@ -746,7 +752,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                           placeholder="Asia/Hong_Kong"
                         />
                         <div className="rtn-presets">
-                          {["UTC", "Asia/Hong_Kong", "America/New_York", "Europe/London"].map((tz) => (
+                          {[...new Set([companyZone, "UTC", "Asia/Hong_Kong", "America/New_York", "Europe/London"])].map((tz) => (
                             <button
                               key={tz}
                               type="button"
@@ -896,7 +902,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
           kind="routine"
           label={activeRoutine.name}
           title={activeRoutine.name}
-          subtitle={`${scheduleSummary(activeRoutine, t)} · ${targetSummary(activeRoutine, t)}`}
+          subtitle={`${scheduleSummary(activeRoutine, t, viewerZone)} · ${targetSummary(activeRoutine, t)}`}
           pills={
             <span className="rtn-pill" data-tone={statusMeta(activeRoutine).tone}>
               <span className="rtn-pill-dot" aria-hidden />
@@ -1025,12 +1031,12 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     <dl className="space-y-1">
                       <div className="rtn-kv">
                         <dt>{t("Trigger")}</dt>
-                        <dd>{scheduleSummary(activeRoutine, t)}</dd>
+                        <dd>{scheduleSummary(activeRoutine, t, viewerZone)}</dd>
                       </div>
                       {activeRoutine.next_due_at && (
                         <div className="rtn-kv">
                           <dt>{t("Next slot")}</dt>
-                          <dd className="num">{fmtTime(activeRoutine.next_due_at)}</dd>
+                          <dd className="num">{fmtInZone(activeRoutine.next_due_at, viewerZone) ?? fmtTime(activeRoutine.next_due_at)}</dd>
                         </div>
                       )}
                       {activeRoutine.connection_account && (
@@ -1148,7 +1154,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                                 </Button>
                               </>
                             )}
-                            <small className="num">{fmtTime(run.started_at)}</small>
+                            <small className="num">{fmtInZone(run.started_at, viewerZone) ?? fmtTime(run.started_at)}</small>
                           </span>
                         </div>
                       ))}

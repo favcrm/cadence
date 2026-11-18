@@ -5,14 +5,13 @@ agent uses an installed native daemon and an outbound authenticated WSS
 connection; hosted board and conversation access do not require a local daemon.
 An assignment is not proof that a worker ran or reported a result.
 
-The company-container fleet was retired by AgenticOS AOS-374. The tenant
-Worker serves the hosted board and supported CLI operations; older references
-below to waking a company container describe historical integration evidence,
-not a current execution path. Unsupported operations must report unavailable;
-do not fall back to a local tracker or claim they ran.
+The tenant
+Worker serves the hosted board and supported CLI operations. Unsupported
+operations must report unavailable; do not fall back to a local tracker or claim
+they ran.
 
-See [verification and rollout](#verification-and-rollout) for the scope of
-earlier checkpoints, [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
+See [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
+[Delivery](delivery.md) for how work is reviewed and approved,
 and [Workspace app catalog](app-catalog.md) for local package rules.
 
 ## Check your connection
@@ -58,7 +57,7 @@ does not confer platform capabilities or native execution authority.
 
 **Storage limit:** hosted ticket and wiki data are not a backup of every native
 SQLite database, Git tracker or local file. A stored reference, metadata record
-or historical checkpoint does not establish that the referenced content or a
+or earlier checkpoint does not establish that the referenced content or a
 native execution runtime is available.
 
 Sources: native [`local_assignment/events.rs`](../../src/local_assignment/events.rs),
@@ -115,6 +114,28 @@ parts with an explicit notice to the model. The count defaults to one; a host
 may set `maxImagesPerRequest` from one to four only when every model its alias
 may resolve to permits that many. The private durable history is not changed.
 
+The owner-only diagnostic route `/api/assist/events` (forwarded to the
+runtime's `/events`) sends SSE data frames containing
+`{"type":"snapshot","version":1,"view":...}` followed by
+`{"type":"view","version":1,"view":...}`. Each view replaces the previous
+one; these are not the individual engine events sent by the older protocol.
+The host must authorize the owner on every connection. Views may contain
+private conversation, reasoning and tool data even though image bytes are
+redacted; they are not a member-facing feed.
+
+Pi Durable 1.5 upgrades stored conversation and task formats. A 1.4 runtime
+cannot read that upgraded state: before deploying, stop writes and take a
+consistent, restorable backup. Roll forward or restore the backup rather than
+starting 1.4 against upgraded data.
+
+`HostedSession.settledOperation(id)` inspects durable records without opening or
+waking the engine. It returns `settled`, `absent` or `unknown`; positive
+evidence requires all conversations and background tasks to be at rest.
+Malformed or inconsistent records return `unknown`, and failed reads throw.
+Absence is not a fence: the host must separately prevent or await admission
+before relying on it. The result is a point-in-time proof, not evidence of
+external effects or of another deployment's state.
+
 A gateway refuses image input for a model that cannot take it with a JSON error
 whose `error.code` is `image_input_unavailable`. A turn whose newest message holds
 the image fails with that named reason. A later request whose images are all older
@@ -140,9 +161,22 @@ their separate `acceptsToolImages` opt-in.
 
 **Context budget.** The runtime shortens long tool results from completed
 earlier turns in model requests, with an explicit incomplete-content notice.
-This shaping leaves the stored transcript and current operation's tool results
-unchanged. Artifact reads may be paged; use the returned continuation rather
-than assuming an earlier excerpt is complete.
+When a request would still exceed the gateway's 256 KiB text budget, it also
+shortens tool results, oldest first and including the running operation's,
+keeping the newest round and at least the two newest results whole, until the
+request fits (CAD-2414). This shaping never
+changes the stored transcript. Artifact reads may be paged; use the returned
+continuation rather than assuming an earlier excerpt is complete.
+
+Hosted sessions compact before that budget: the runtime sets Pi's compaction
+reserve so blocking compaction is due at about 48k tokens and background
+compaction at about 31.6k, and keeps an 8,000-token tail (CAD-2414). Measured
+on the hosted default model, a request costs 3.45 bytes a reported token in
+English and 3.85 in Chinese, so 256 KiB holds about 68–76k tokens. Where Pi
+estimates instead of reading reported usage (3.5 characters a token), Chinese
+costs about 10.5 bytes an estimated token; the 8,000-token tail keeps the
+first request after a compaction small, and the shortening above keeps a
+step's newest tool results in budget.
 
 When the gateway refuses its byte budget with a JSON 400 whose `error.type` is
 `invalid_request_error` and `error.code` is `context_budget_exceeded`, the
@@ -190,6 +224,19 @@ An `agent_profile` carries a name, role, revision, up to 8,000 UTF-16 code
 units of instructions and up to 32 declared skills. It is context only: it
 neither authenticates an agent nor grants capabilities. The host remains
 responsible for resolving the profile and authorizing every operation.
+
+**Workspace skills.** A host may supply `workspaceSkills()` on
+`HostedSessionOptions` (CAD-2395) to serve the skills a workspace owner has
+approved. Each entry is a name in the bundle tag grammar, a one-line
+description, a `SKILL.md` body, `references/<leaf>` text files and a version,
+within the bundle grammar's skill caps. The runtime reads it once when a
+conversation's harness opens and lists each kept skill as `ws-<name>` after the
+bundled skills, so a workspace skill never replaces a bundled procedure. Every
+catalog description, body and reference it returns is framed as untrusted
+guidance; references are always served as text. An entry that breaks a rule is
+dropped whole, and a host refusal leaves the bundled skills unchanged. Only
+approved revisions belong here; a draft never does, and a skill never grants,
+adds or selects a tool.
 
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
@@ -298,11 +345,14 @@ The thread stream also sends `preview` events with `{ "text": string | null }`
 for in-flight assistant text. They have no `id` and are not transcript
 entries: retry, cancellation or reconnect can replace them, while the committed
 entry and its `seq` remain authoritative. Thinking and tool arguments are not
-previewed. The preview stops at the first `{` or sensitive confirmation key
-anywhere in a message, including across text blocks; that suffix stays withheld
-until commit. This conservative rule also stops previews at benign braces.
-Preview text and tracked content blocks are bounded; an oversized partial is not
-a substitute for the final answer.
+previewed. After the connection's observer attaches, the preview stops at the
+first `{` or sensitive confirmation key anywhere in a message, including
+across text blocks; that suffix stays withheld until the generation or attempt changes.
+This conservative rule also stops previews at benign braces. A reconnect
+previews the current snapshot and cannot detect a sensitive marker overwritten
+before it attached; the operator accepted that tradeoff. Preview text and tracked
+content blocks are bounded; an oversized partial is not a substitute for the
+final answer.
 The run's first engine submission must resolve to the operation in the current
 `master` turn; an older snapshot or buffered batch is suppressed when they
 differ or the submission cannot be resolved. A turn change clears the previous
@@ -500,6 +550,25 @@ A replay without a recorded result is not a successful report. Hosted and
 local-device clients refuse to present a missing result as success and do not
 automatically dispatch another read.
 
+### Staging a draft or send tool for owner approval
+
+A connected draft/send tool (for example a Gmail send) never runs when an agent
+asks. `platform stage` sends `operation: connected_effect` (`cli.write`) and the
+board records the exact call as an action for the owner to approve:
+
+```sh
+cadence --org acme platform stage gmail_send --connection con_example --input @message.json [--request <handle>]
+```
+
+The answer is the staged action (`action_id`, `outcome`, `replayed`), never a
+provider result. `outcome` `pending` means the call did **not** run and waits
+for an owner's approval on the board. The same `--request` (or, when omitted,
+the same tool, connection and input) replays the same action; the same handle
+with a different call is refused (`key_reused`). A refusal prints its code, for
+example `not_allowlisted`, `no_decider` or `connection_unavailable`. A local
+org refuses the subcommand, and `platform call --connection` still sends only
+`connected_read`.
+
 ### Owner enrollment from the CLI (Search Console first)
 
 An owner enrolls a provider account from a plain shell, in three steps. The
@@ -636,6 +705,18 @@ cadence --org acme issue set <issue-id> status=doing --if-rev <issue-rev>
 cadence --org acme issue project timeline demo --since 7d
 ```
 
+On a board that supports retryable issue creation, add a stable caller-chosen
+`--request-id` to `issue new`. If the reply is lost, repeat the same command
+with the same ID and unchanged arguments, from the same user, assistant client,
+and acting agent or human identity; the board returns the same issue, not a
+duplicate. A changed request under the same ID is refused. A managed agent
+cannot fall back to its member's login for a keyed create. If the original
+acting identity is no longer available, inspect the board instead of retrying
+under a different one. An older board may reject the ID or omit the receipt.
+Never remove the ID and resend an ambiguous create: check the board or wait
+for the board upgrade instead. Without an ID, inspect the board before
+retrying. Local/native issue creation refuses this hosted-only option.
+
 Use the exact revision returned by each corresponding read, not a guessed one.
 To create a new wiki page, pass the create-only sentinel `--if-rev none`, which
 refuses the write if the path already exists; to update an existing page, pass
@@ -646,7 +727,7 @@ scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
 
 `wiki cp` copies a file or a folder into the hosted wiki and out of it on a
-board released since 2026-11-12 (AOS-566); see "Recursive copy" in
+board that supports it; see "Recursive copy" in
 `docs/guides/wiki-knowledge.md` for the board's limits, the timeout and what each
 exit code of a stopped job means. An older
 board answers `not_implemented` and copies nothing; there, write pages one at a
@@ -681,7 +762,7 @@ cadence --org acme agent report <assignment-id> --state blocked --text "waiting 
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
+`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile: no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
 
 Profile claims depend on the deployed board and client versions. An older
@@ -705,7 +786,7 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
-`cadence --org <name> issue finish <ID> [--worktree <path>]` (CAD-2178) releases
+`cadence --org <name> issue finish <ID> [--worktree <path>]` releases
 the lane this machine started for that issue, and only that lane: it removes the
 worktree and deletes the local branch. It takes no other option; `--force`,
 `--keep-branch`, `--remote`, `--merged` and `--dry-run` are refused on a hosted
@@ -731,9 +812,9 @@ because removal deletes them. It may delete top-level `target/`, any
 and the lane's `.env` while it is exactly what lane setup last wrote: when every
 line setup writes is its own (the cargo-shim `PATH`, the slot env), it records
 the file's sha256 in the worktree's own git dir, and one changed or extra line
-keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept
-(CAD-2290). Anything else ignored (for example `docs/*`, `claudedocs/`,
-`docs/target/`, or a lane's `.env` from before CAD-2290, which has no record)
+keeps the `.env`. A regular file named `node_modules` or `__pycache__` is kept.
+Anything else ignored (for example `docs/*`, `claudedocs/`,
+`docs/target/`, or a lane's `.env` from an older client, which has no record)
 refuses. Git reports an ignored directory as one entry, so a file kept inside
 one of those directories is deleted with it. When the
 refusal will not change (the ledger cannot identify the lane, or no PR or
@@ -744,7 +825,7 @@ refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays
 native-only.
 
 If the actor is gone but its assignment never ended, the assignment ID is shown
-by `cadence --org <name> agent assignments`. A client supporting CAD-2203 can
+by `cadence --org <name> agent assignments`. A client that supports it can
 cancel that exact assignment and attempt the same guarded release in one call:
 
 ```sh
@@ -824,7 +905,7 @@ longer registered with Git. It deletes no worktree or branch and does not verify
 merge evidence; its result reports those facts separately. A present, still
 registered, ambiguous or pending lane is refused.
 
-### Managing agent profiles from the CLI (CAD-2101)
+### Managing agent profiles from the CLI
 
 The owner can do from the CLI what the agent page does for a profile. Name the
 org with `--org` on every call. A saved default org or `CADENCE_ORG` does not
@@ -877,7 +958,7 @@ as the person whose login it uses. Treat the saved login as the person's, keep
 it out of agent environments, and have agents propose changes (`agent
 propose-hire`). The next paragraph is what a hosted kickoff adds.
 
-**A managed session has a credential of its own (CAD-2149, AOS-502).** On a
+**A managed session has a credential of its own.** On a
 hosted kickoff, the session's hosted CLI verbs are sent on an `agent` credential
 bound to its claim. A comment, an attachment and a review are recorded as the
 agent. `issue new`, `issue set` and `issue say` still record the member, as do
@@ -890,7 +971,7 @@ renewal is another mint, and the file goes when the assignment ends.
 
 Stays on the member's login: claim, daemon reports and `agent report`; every
 wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
-`audit_verdict_project`). `artifact types` and `artifact submit` (CAD-2286)
+`audit_verdict_project`). `artifact types` and `artifact submit`
 ride the agent credential like the other verbs. The credential carries the
 member's own subject, so the board's creator check still admits the member's
 files, and a reader or reviewer assignment's submit is refused by the board's
@@ -907,7 +988,7 @@ independence, and it still refuses the author's principal.
 
 **This is attribution and server-side refusal, not a security boundary.** The
 session runs as the same OS user and can still read the member's login file
-until CAD-2148 confines it.
+until the session is confined.
 
 What the client does when the credential is not available:
 
@@ -918,6 +999,55 @@ What the client does when the credential is not available:
 | any other mint answer, or an unusable `200` | refuses; nothing is sent and the login is not used in its place |
 | the agent's own refusals: `403 forbidden` and the rest | final, never retried on the login |
 | a `401` to a **cached** agent credential | drop the cache and re-mint once; a `401` to one just minted is final |
+
+### Workspace skills from the CLI (CAD-2396)
+
+A hosted workspace can keep its own skills: a `SKILL.md` package with optional
+`references/<file>` text files. An agent or a member drafts one; a live human
+owner approves one exact revision by its digest, and only an approved revision
+is served to the workspace's agents (see "Workspace skills" above). Name the
+org with `--org` on every call, as for profiles (`org_not_named` otherwise).
+
+```sh
+cadence --org acme workspace-skill check weekly-report ./weekly-report
+cadence --org acme workspace-skill draft weekly-report ./weekly-report --expect-rev 0
+cadence --org acme workspace-skill list
+cadence --org acme workspace-skill show weekly-report [--revision 2]
+cadence --org acme workspace-skill approve weekly-report --revision 2 --digest sha256:<hex>
+cadence --org acme workspace-skill revoke weekly-report --digest sha256:<hex>
+cadence --org acme workspace-skill delete weekly-report --expect-rev 3
+```
+
+- The package directory holds `SKILL.md` and, optionally, `references/` with
+  plain files directly inside it. `skill.json` is generated by the board, and
+  `scripts/`, a nested reference or any other file is refused before anything
+  is sent, with the board's own reason name (`member_reserved`,
+  `scripts_not_accepted`, `reference_path`, `member_not_accepted`).
+- `check` validates and prints the digest a draft would store; it saves
+  nothing. The board owns the rules and the limits, and a refused package
+  prints its reason (`skill_refused`, for example `description_missing` or
+  `package_too_large`).
+- `draft` needs `--expect-rev`: the latest revision you read, or `0` to create
+  the skill. A stale revision exits 5 with the board's `revision_conflict`. The
+  same bytes as the latest revision are not a new revision. A draft never moves
+  the approved revision.
+- `approve` names the revision and the digest `show` printed, and `revoke` the
+  approved digest; a different one is `digest_mismatch` and changes nothing. A
+  workspace can have at most 32 approved skills (`approved_limit`).
+- `delete` removes an unapproved skill and all its revisions, fenced on the
+  latest revision (a stale one exits 5). An approved skill is `approved_skill`
+  until it is revoked. A workspace holds at most 200 skills (`skill_limit` on a
+  new name) and keeps each skill's newest 10 revisions plus the approved one.
+- **Approve, revoke and delete are the owner's decision.** A managed agent
+  (`CADENCE_ALIAS`, a grant, or a pinned agent identity) is refused by the
+  client before any request (`managed_caller_refused`); drafting stays open to
+  it. As with profiles, this is a client check: the board refuses an agent or
+  service principal, but cannot tell a managed agent on the owner's saved login
+  from the owner. Keep that login out of agent environments.
+- A board that predates these commands answers "update the board first".
+  A native board has no workspace skill store and refuses every subcommand.
+  `cadence skill` is different: it installs this build's bundled guidance on
+  this machine.
 
 ### Leaving a message for a role on a ticket
 
@@ -943,7 +1073,7 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
 - `from` is a label. `sender_subject` is verified, and it is the member, not the
   session. A message approves nothing and changes nothing on the ticket.
 
-### Submitting a document for review (CAD-2286)
+### Submitting a document for review
 
 ```sh
 cadence --org acme artifact types
@@ -954,7 +1084,7 @@ cadence --org acme artifact submit <art-id>
   type follows until the owner confirms it. `artifact submit` (`cli.write`)
   puts a file you created into review, under its label as the type. It prints
   `stage`, `type`, `typeConfirmed` and, for an unconfirmed type, `baseline`.
-  The review flow is in the cadence skill ("Deliverables and review handoff");
+  The lifecycle is in [Delivery](delivery.md#document-review-for-non-code-work);
   the board side is in `docs/BOARD.md`.
 - Submitting again answers the current stage and does not submit twice, so
   after a lost answer (exit 1) repeat the same command.
@@ -977,134 +1107,19 @@ cadence --org acme artifact submit <art-id>
 
 ### Reviewing software changes
 
-Find out what a PR needs before starting reviews. The caller needs `gh` read
-access to the repository:
+The delivery gate, the policy and trusted lists, the evidence each review takes,
+the owner's approval and the refusals are in [Delivery](delivery.md). On a hosted
+org, check a PR before reviewing it, and read the gate again after:
 
 ```sh
 cadence --org acme delivery requirements --issue <issue-id> \
-  --pr https://github.com/<owner>/<name>/pull/<number> --head <full-sha>
+  --pr https://github.com/<owner>/<repo>/pull/<number> --head <full-sha>
+cadence --org acme delivery check --project <project-key> --issue <issue-id> \
+  --repo <owner>/<repo> --pr <number> --head <full-sha>
 ```
 
-`requirements.reviews`, `review_kind`, `operator_approval` and `browser_qa` are the
-requirement for that exact head, computed from the policy recorded on the board
-and the repository's path lists (`docs/roles/risk-paths.toml` and
-`docs/roles/one-review-paths.toml`), which are read at main's live tip (the PR's base for a
-non-main PR), so a PR cannot weaken its own rules. The merge gate can add an operator approval: when a
-head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
-(AGENTS.md "Review"). On a hosted org, an active `routine` class reports zero
-reviews and no approval here, but the merge gate also requires a pass from both
-review workflows, and those rows carry the auto-paths rule.
-
-The review standard (operator decision 2026-11-03) is a
-fresh-session review: a session that is not the author and inherits no
-conversation or context from the work, including a subagent (a fork or a
-resumed authoring session does not count). Record the actual reviewer/session,
-repository, full head, outcome, checks and limitations, and call it a
-fresh-session review, never an independent party. The gate does not enforce
-that standard yet: it counts hosted verdicts by attested principal and refuses
-the author's principal (local notes count by their self-declared `From:`
-alias, which is not attested), so a profile or separate session alone does not make a
-gate-counted verdict, and in-chat findings are not one either. Until the gate
-can tell a fresh session from the author (the workflow-issued reviews of
-CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
-schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
-`ui/**` PR takes two workflow passes, the operator's approval and `--browser-qa <url>`,
-naming an unedited comment on the PR by a repository member that is exactly the two lines
-`Browser QA: pass` and `Head: <full sha>`, with the report in another comment (CAD-2173). That binds the claim to the head but cannot prove the QA ran, which is
-what the approval accepts. Until it ends, it can instead merge with the temporary
-`--exception --advisory ...` path (exact-head operator approval and two
-advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change, even where the board asks for fewer or no approval; ends at
-`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
-A hosted `routine` PR has no readiness record, because a hosted board has no
-delivery record to prove it from. It takes a pass from both review workflows at
-its head and the operator approval a workflow row needs, unless the gate's dry run
-reports `class: auto`. Matching `docs/roles/workflow-auto-paths.toml` is not enough
-on its own: a path that is human-class (for example `docs/INSTALL-AGENT.md` and
-`docs/REMOTE-AUTH.md`, CAD-2256), never eligible, a case variant of a protected
-path, or not a plain add or modify still needs the operator
-(`docs/roles/risk-classes.md` trigger 7 states the rule). The gate's refusal names
-what to dispatch. The exception also still waives this until it ends. The exception
-only checks that the advisory links are separate https URLs; it proves neither
-head binding nor that Browser QA ran. Agents in this workspace do
-not run `audit verdict` below: they post findings as a PR comment and use it as
-the advisory link (AGENTS.md "Review"). The command is documented for what it does.
-
-```sh
-cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
-  --issue <issue-id> --pr <number> \
-  --head <full-sha> --kind standards --outcome pass --risk auto --file findings.md
-```
-
-`--project` is the issue's project and is required: the evidence is that
-project's, and the project is never inferred from `--repo` or the cwd. The org
-refuses a repo the project has not declared (`repo_not_bound`), an issue that
-resolves to another project (`project_mismatch`), a caller the owner has not
-made eligible for the project (`reviewer_not_bound`) and a caller with no
-attested login (`identity_unattested`). `--kind` is `standards`,
-`spec-security`, `combined` or `browser-qa` (the kinds the merge gate counts;
-`spec` is retired); `--outcome` is `pass` or `revise`, and `--title-outcome` /
-`--section-outcome` default to it. The reviewer is the authenticated caller,
-never an argument. A repeat of the same kind, head and findings returns the
-latest row with `duplicate: true`; a changed outcome appends a correction, and
-the gate reads the latest row per reviewer and kind.
-
-Read them back under the same org with `cadence --org acme audit verdicts
---project <project-key> --repo <owner/name> --issue <issue-id> --pr <number>
---head <full-sha>`; a hosted selection answers from the org, never from local
-notes, and refuses an answer naming another project, repository, issue or
-head. Add `--body` to also print each note's findings as `body` (with
-`body_truncated`), which is how a `REVISE` is read; the gate never passes it and
-the text never decides a count. The text is the reviewer's, so control
-characters, format characters (Unicode Cf), default-ignorable code points such
-as variation selectors, and line separators print as U+FFFD. Characters outside
-those sets that merely look blank, such as U+2800, and the note's `risk` print
-as sent. The text is bounded at 16 KiB per note and 128 KiB per answer on the
-board, with the newest notes' text kept first, so an older note can read empty
-with `body_truncated` set when the budget runs out. A board that predates the field still answers
-the rows, prints a line on stderr, and marks `bodies: "unavailable: …"`; local
-orgs refuse `--body` because their notes are files you can open. The merge
-gate also runs whichever `cadence` you point it at: set
-`CADENCE_BIN` when more than one build is on the host, or a stale client's
-missing hosted verb will read like a gate refusal.
-
-A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
-except a workflow-issued row (CAD-2081; the workflows are live), which
-has no login and counts only for a principal in
-`docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
-the workspace owner binds each principal's GitHub login once for the workspace,
-then admits principals to a project's review set. A code verdict needs both,
-because the gate counts a hosted document by principal and excludes the author
-by the attested login:
-
-```sh
-cadence --org acme audit identities set \
-  --identity <subject-id>=<github-login> [--identity ...]
-cadence --org acme audit reviewers set --project <project-key> \
-  --reviewer <subject-id> [--reviewer ...]
-cadence --org acme audit reviewers --project <project-key>   # read both joins back
-cadence --org acme audit identities                           # the workspace map
-```
-
-Both writes are the owner's own act: they need the opt-in `audit.approve`
-login (`cadence login --audit-approve`), and an agent's call is refused.
-Leaving a principal out of the project's set stops new verdicts for that
-project only; rows already filed keep their stored principal and login and
-stay countable for the head they reviewed. A principal listed with no attested
-login reads back with `github_login: null` and its verdicts cannot count yet.
-Never impersonate a reviewer: the verdict names the authenticated caller, and
-the owner's attestations are the only thing that makes that caller count.
-Where the org cannot answer, the gate refuses; a missing hosted read is not a
-pass, and the repository's approved merge path and any required operator
-decision remain in force.
-
-CAD-2001 release order: the tenant server must serve the project-scoped review
-verbs before this client sends them. An older tenant refuses the names
-(`not_implemented`/`invalid_request`/`container_required`/
-`capability_unavailable`) and the client says so — update the tenant server
-first, then this Cadence client. The client never falls back to the older
-repo-scoped evidence when the project is known, and the gate treats that
-refusal as a refusal, never as "no verdicts were filed".
+The caller needs `gh` read access to the repository. The owner's approval and
+enqueue are run from the owner's own terminal; an agent never runs them.
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:
@@ -1152,12 +1167,11 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
 - When the daemon's workspace worker picks up a kickoff from the board for a
   fenced default agent (`attention`, or holding an unknown message), it does not
   queue it: the assignment is reported `blocked` with that reason instead of
-  `running` (CAD-2259). Resume the agent (reconcile or `agent unfence` first if
+  `running`. Resume the agent (reconcile or `agent unfence` first if
   it holds an unknown message) or connect another default, then run
   `cadence --org acme agent connect --local --alias <alias>` again (the saved
   checkout is kept) to pick the blocked work up. `issue start <id> --repo`
-  without `--profile` sends from the CLI and is not checked this way yet
-  (CAD-2274).
+  without `--profile` sends from the CLI and is not checked this way yet.
 - Native custody is bounded to 512 entries / 4 MiB. The server limits unacknowledged
   events to 64 with a 30-second progress deadline. Slow consumers are disconnected,
   not treated as successful execution. When the inbox is full, inspect it and use
@@ -1267,76 +1281,11 @@ metadata/database operations, package storage, actual runtime wakes and model wo
 still have costs; workloads/provider tariffs decide the result. Reason's product
 claims are not Cadence price or performance evidence.
 
-## Verification and rollout
+## Rollout boundary
 
-### Observed scope at consolidation (2026-10-22)
-
-- The release owner's actual native-process checkpoint exercised standalone
-  daemon/status/stop, a genuine Worker OTP+PKCE-issued `hct_`, 66 FYIs over one
-  verified-CA outbound WSS connection with continuous ACK-window progress,
-  durable inbox/offline replay after native restart, and no root work messages
-  or provider invocation. Public and lower-level stopped-daemon inbox/clear
-  variants refused without restarting the daemon or doing outbound work.
-  The private fixture imported the genuine issued credential: this was **not**
-  proof of the interactive CLI `login` UX.
-- The release owner's later full app CLI journey passed through a genuine
-  owner `hct_`, real Worker, signed runtime relay and actual native UI/kernel.
-  It exercised `release-check`, install, list/show and operation readback; an
-  exact-old-pin update to a synthetic immutable `0.10.1` release; replay of the
-  original install UUID without overwriting the updated digest; stale-generation
-  revoke refusal; exact revoke readback as unapproved; and receipt/read-only
-  reconcile. Published package/version metadata and release bytes were isolated
-  fixtures served by the actual local Worker, not a production catalogue rollout.
-  This is app-lifecycle evidence, not approval to execute a provider or deploy.
-- The retained [native public app acceptance](../../tests/cad1739_hosted_app_public_acceptance.rs)
-  exercised seven RPC/loopback-HTTP guard groups: operation correlation is not
-  operator authority; stale update/revoke preserves consent/scopes; active-run
-  refusal permits a later standalone upgrade; and journal/entered-writer
-  uncertainty remains explicit, on both transports. These use synthetic
-  test-seam caller/grant fixtures, not production authentication or a provider.
-- A throwaway two-state native smoke on `5ed960195af9beda4e974014dd4f11c324ee1e07`
-  passed 1/1: separate company/teammate native states performed real
-  selected-remote wiki create/read/revision update (with stale-revision refusal)
-  and ticket create/update (with stale refusal and standalone isolation); an
-  explicit assignment dispatched, was read by bare GET, claimed, ACKed and
-  delivered to the inbox while reporting truthfully `running`→`blocked`; a
-  daemon restart preserved the original claim without duplicate delivery, and an
-  explicit default switch afterwards retained the original claim, generation and
-  member pins. The harness was removed after the run, so the retained evidence is
-  the pass summary and asserted inbox contents — the runner suppressed console
-  logs. This is one explicit collaboration path, not interactive CLI `login`
-  UX, a production deployment, or a measured cost result.
-- The [historical POC](https://github.com/agenticos-stack/agenticos-v2/commit/0aaafd244adbbad854ca74c4208ffb16bd67b4ee)
-  exercised 13 synthetic-authority/loopback **plain WS** groups. It is not WSS,
-  genuine-auth or abrupt-power-loss durability proof. Pure-kernel native/WASM
-  parity is a separate check, not a substitute for the integrated native adapter
-  path exercised by the two-state smoke above.
-
-The persistence, pagination, generation, same-member renewal and revocation
-mechanisms described above are source contracts; these checkpoints do not claim
-that every capacity/gap, identity-rotation, held-context cancellation, concurrent
-reassignment or abrupt-loss/whole-company restore case passed. The two-state smoke
-covers one explicit collaboration path; it is not interactive login UX, production
-deployment or a multi-host capacity trial. Restart replay is not proof of
-zero-loss multi-store recovery. No startup/cost benchmark was run.
-
-### Source and release boundary
-
-Native source links in this guide resolve within the revision containing the
-guide. The companion hosted work is [PR #949](https://github.com/agenticos-stack/agenticos-v2/pull/949):
-`apps/api/src/hosted-cadence/{agent-directory,local-events,app-lifecycle}.ts`,
-`apps/api/src/hosted-app-lifecycle.ts`, `apps/api/src/hosted-app-installations.ts`,
-and `docs/architecture/company-data-boundary.md` (the CAD-1739 storage limitation).
-Use the final release PR heads, not the historical POC SHA, to identify the
-implemented native/hosted pair. The final canonical native Git revision and
-source/WASM artifact hashes belong to the hosted packaging pin; a native source
-freeze alone is not proof that its final pinned artifact checks passed.
-
-Before rollout, the release owner must bind the matching native, hosted contract,
-migration and kernel artifact versions to the release and satisfy the
-repository's exact-head checks/reviews/approval and remaining outcome acceptance.
-Metadata/event migration rollout must retain its writer fences; do not expose
-mixed unsupported writers or interpret a capability-unavailable response as a
-fallback grant. Local operators retain native journal/business-data recovery
-responsibility. Package consent and credential enrollment do not approve a
-production deployment, live data migration, live send or installed-daemon restart.
+Package consent and credential enrollment do not approve a production
+deployment, live data migration, live send or installed-daemon restart. Do not
+expose mixed unsupported writers, and do not read a capability-unavailable
+response as a fallback grant. Local operators keep responsibility for native
+journal and business-data recovery. Restart replay is not proof of zero-loss
+multi-store recovery.

@@ -4,9 +4,8 @@ import type { ToolAuthority } from "./tool-policy.js";
  * `@cadence/hosted-runtime/testing`: the real guards an application test needs
  * and opaque record fixtures for the engine's stored and live shapes.
  *
- * This entry imports no engine SDK and no Workers platform module. The fixture
- * builders return `unknown`, so a consumer never handles a private record type
- * and the engine's own shapes stay inside this package.
+ * This entry imports no engine SDK and no Workers platform module. Record
+ * builders return `unknown`, so consumers do not handle private record types.
  */
 export { authorizeTool, authorizeTools };
 export type { ToolAuthority };
@@ -23,9 +22,55 @@ export type AssistantFixtureContent = readonly ({
 export declare function userRecord(id: number, text: string): unknown;
 /** One stored completed assistant turn, as the engine persists it. */
 export declare function assistantRecord(id: number, content: AssistantFixtureContent): unknown;
+type FixtureView = {
+    readonly entries: readonly unknown[];
+    readonly docs: {
+        readonly "pi.live": Record<string, never>;
+    };
+};
+type FixtureChange = {
+    readonly kind: "value";
+    readonly value: FixtureView;
+    readonly ops: readonly [readonly ["r", FixtureView]];
+    readonly retired: false;
+};
+type FixtureObserver = {
+    advance(change: FixtureChange): void;
+};
+type FixtureEnd = {
+    readonly kind: "ended";
+} | {
+    readonly kind: "listener_error";
+    readonly error: unknown;
+};
 /**
- * The engine's committed batch for one live assistant turn: a thinking delta
- * and block per thinking part, then the committed message. A test hands this
- * to a stream listener so the real transcript mapping runs over live records.
+ * A finite engine-shaped conversation for host integration tests. Records and
+ * watch views remain opaque to the host, and this fixture never filters them.
  */
-export declare function liveBatch(entry: unknown): readonly unknown[];
+export declare function conversationFixture(stored: () => readonly unknown[], live: () => unknown | undefined): {
+    session: () => {
+        id: string;
+        messages: () => Promise<readonly unknown[]>;
+        busy: () => Promise<boolean>;
+        watch: () => Promise<{
+            readonly value: FixtureView;
+            closed: Promise<FixtureEnd>;
+            start(listener: (change: FixtureChange) => Promise<void>): void;
+            stop(): Promise<{
+                readonly kind: "ended";
+            }>;
+        }>;
+    };
+    conversation: () => Promise<{
+        entries: () => Promise<{
+            items: readonly unknown[];
+        }>;
+    }>;
+    pending: () => Promise<never[]>;
+    pi: () => Promise<{
+        observeConversation: (_id: unknown, observer: FixtureObserver) => Promise<{
+            value: FixtureView;
+            detach: () => void;
+        }>;
+    }>;
+};

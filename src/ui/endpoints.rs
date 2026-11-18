@@ -62,6 +62,7 @@ pub(super) enum RouteId {
     SettingsAgentsPreview,
     ModelDefaults,
     Locale,
+    TimeZone,
     Reports,
     AgentRegister,
     AgentProfileCreate,
@@ -442,6 +443,7 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         &[]
     ),
     row!(Locale, "/api/locale", CallerScoped, &[]),
+    row!(TimeZone, "/api/time-zone", CallerScoped, &[]),
     row!(
         ProjectPolicy,
         "/api/projects/{key}/policy",

@@ -1,6 +1,6 @@
 import Button from "../../ui/Button";
 import { useTranslate } from "../../lib/locale";
-import { readinessAction, readinessFor } from "./bindingChoices";
+import { declaredSlots, isCatalogSlot, readinessAction, readinessFor } from "./bindingChoices";
 import type {
   AppBinding,
   BindingChange,
@@ -38,11 +38,12 @@ export function ReadinessPanel({
 }) {
   const t = useTranslate();
   const rows = readinessFor(installation, bindings, connections, contextId, t);
+  const title = installation.source_kind === "private" && declaredSlots(installation).some(isCatalogSlot) ? t("Connection readiness") : t("Ready to run");
   if (rows.length === 0) return null;
   const blockers = rows.filter((row) => !row.ready);
   return (
-    <section className="wa-panel wa-stack" aria-label={t("Ready to run")}>
-      <h2>{t("Ready to run")}</h2>
+    <section className="wa-panel wa-stack" aria-label={title}>
+      <h2>{title}</h2>
       <p className="wa-kicker" data-tone={blockers.length ? "warn" : "ok"}>
         {blockers.length
           ? t("Something still needs you before this app can run.")

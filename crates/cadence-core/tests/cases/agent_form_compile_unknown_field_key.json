@@ -1,0 +1,26 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "fields": [
+          {
+            "id": "name",
+            "label": "Name",
+            "type": "text",
+            "colour": "red"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": false,
+      "message": "spec /fields/0/colour: is not accepted"
+    }
+  }
+}

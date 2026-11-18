@@ -22,7 +22,9 @@
 //! - `routine` — the narrow allowlist: required base CI plus ticket
 //!   outcome evidence, zero mandatory reviews, no fabricated PASS.
 //! - `consequential` — known ordinary paths: one independent combined
-//!   review and the full check floor, no operator approval.
+//!   review and the full check floor, no operator approval. A repository
+//!   that declares no trusted lists gets this class plus the operator's
+//!   approval ([`classify_without_lists`], the product default).
 //! - `strict` — the fail-closed floor: an activation other than the
 //!   default lean policy (a malformed section, a custom section that is
 //!   not operator-approved or was removed after approval, or a policy that
@@ -30,11 +32,19 @@
 //!   fields are cleared), lists unreadable, incomplete or unsafe diff
 //!   evidence, a delete/rename/type/mode change, a path or change shape
 //!   outside the known one-review include list, or a risk-trigger,
-//!   human-class, excluded or oversize path. It reports exactly today's
-//!   legacy requirements and never fewer: one combined review on the
-//!   one-review list else two (Standards + Spec/security), and the
-//!   operator floor on human-class paths and over `HUMAN_LINES` changed
-//!   lines.
+//!   human-class, excluded or oversize path. It reports the legacy
+//!   requirements: one combined review on the one-review list else two
+//!   (Standards + Spec/security), and the operator floor on human-class
+//!   paths and over `HUMAN_LINES` changed lines. With unreadable lists it
+//!   asks no Browser QA (operator decision 2026-11-17, CAD-2386): the
+//!   operator floor they force is the human check.
+//!
+//! An owner-approved custom delivery policy (CAD-2413) is evaluated instead:
+//! its applying `risk` rules name the reviews (`required_reviews`,
+//! `required_checks`) and the class is `consequential`, but every strict
+//! condition above except "outside the one-review include list" still
+//! applies as a floor that the policy cannot lower (operator decision D1,
+//! 2026-11-17).
 //!
 //! `DeliveryClass::Sensitive` exists in the type but `classify` does not
 //! currently return it: sensitive conditions resolve to `strict`. No class
@@ -61,7 +71,7 @@ pub struct Change {
 /// The trusted list texts, read at the PR's anchor commit (the same
 /// reads `scripts/enqueue-reviewed` makes through
 /// `gh api repos/<repo>/contents/<file>?ref=<anchor>`). `None` means
-/// unreadable — which fails closed, never to a weaker requirement.
+/// unreadable — which fails closed to the strict floor with the operator.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrustedLists<'a> {
     pub risk_paths: Option<&'a str>,
@@ -99,7 +109,7 @@ pub enum DeliveryClass {
     Sensitive,
     /// No relaxation applies: the profile is not in force, the trusted
     /// lists are unavailable, or the diff evidence is incomplete. The
-    /// requirements are exactly the legacy ones.
+    /// requirements are the legacy ones (see the module header).
     Strict,
 }
 
@@ -114,20 +124,52 @@ pub enum ReviewKind {
     /// Two verdicts — Standards and Spec/security — by distinct
     /// reviewers.
     StandardsAndSpec,
+    /// CAD-2413: an approved policy requires only the Standards review.
+    Standards,
+    /// CAD-2413: an approved policy requires only the Spec/security review.
+    SpecSecurity,
+}
+
+/// CAD-2413: one review an approved policy's applying rules require, so a
+/// gate can count it by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredReview {
+    /// The review's name in the policy's `reviews` map.
+    pub name: String,
+    /// `agent`, `check` or `operator`.
+    pub kind: String,
+    /// An `agent` review's focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// A `check` review's GitHub App.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A `check` review's mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// CAD-2413: a GitHub App check an approved policy requires on the head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredCheck {
+    pub name: String,
+    pub app: String,
 }
 
 /// What a delivery needs to merge, derived from the class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Requirements {
     pub class: DeliveryClass,
-    /// Independent verdict count on the exact head: `0` only for
-    /// routine under a valid default-equivalent policy.
+    /// Independent verdict count on the exact head: `0` for routine under a
+    /// valid default-equivalent policy, or when an approved policy's applying
+    /// rules name no code review (CAD-2413).
     pub reviews: u32,
     pub review_kind: ReviewKind,
     /// The combined review must be filed by a security-capable
     /// reviewer (sensitive class).
     pub security_capable: bool,
-    /// A `ui/` change additionally needs a Browser QA pass.
+    /// A change to a path in the repository's `browser_qa` table needs a
+    /// Browser QA pass (never when the lists are unreadable).
     pub browser_qa: bool,
     /// An exact-head operator-connection approval is required.
     pub operator_approval: bool,
@@ -140,88 +182,22 @@ pub struct Requirements {
     /// evidence binds to it and a policy change invalidates them.
     pub policy_digest: String,
     pub activation: Activation,
+    /// CAD-2413: the reviews an approved custom policy's applying rules
+    /// require, in rule order. Absent when no approved policy was evaluated,
+    /// so a gate can tell "the policy requires none" from "no policy".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_reviews: Option<Vec<RequiredReview>>,
+    /// CAD-2413: the GitHub App checks those rules require; absent likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_checks: Option<Vec<RequiredCheck>>,
 }
 
-/// The initial routine allowlist (CAD-1298, deliberately narrow):
-/// ordinary `docs/**/*.md` plus the two top-level project docs. Every
-/// routine path must additionally be a regular file (`100644`, never
-/// `100755` — an executable doc is not routine), status `A`/`M` with no
-/// mode change, and survive the sensitive check (policy/role/security
-/// docs are in `risk-paths.toml` `trigger7` and excluded before they
-/// can read as routine).
-const ROUTINE_EXACT: &[&str] = &["README.md", "CONTRIBUTING.md"];
+// CAD-2386: this module carries no repository's path rules. The routine
+// allowlist, the operator floor and the Browser QA paths are tables of the
+// repository's own trusted `risk-paths.toml` (`routine`, `operator`,
+// `browser_qa`), read at the anchor like the trigger tables. A missing or
+// malformed table fails closed.
 
-/// Legacy human-class path triggers — the same lists
-/// `scripts/enqueue-reviewed` encodes (AGENTS.md and
-/// `docs/roles/risk-classes.md` triggers 4/6/7). This module is the one
-/// Rust home for them; the script keeps its copy until it consumes the
-/// shared evaluator.
-const HUMAN_PREFIXES: &[&str] = &[
-    ".github/",
-    "scripts/",
-    "docs/roles/",
-    ".config/",
-    ".cargo/",
-    "src/audit/",
-    "src/delegation/",
-    "src/delivery/",
-    "tests/common/",
-    "config/",
-];
-const HUMAN_EXACT: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "ui/package.json",
-    "cadence-review.toml",
-    "src/review.rs",
-    "docs/TEAM.md",
-    "docs/CHARTER.md",
-    "AGENTS.md",
-    "build.rs",
-    "rust-toolchain.toml",
-    "clippy.toml",
-    "src/rollout.rs",
-    "src/update.rs",
-    "src/upgrade.rs",
-    "src/cli/rollout.rs",
-    "src/cli/daemon.rs",
-    "src/cli/update.rs",
-    "src/cli/upgrade.rs",
-    "src/delegation.rs",
-    "src/issue/delivery_policy.rs",
-    "src/issue/delivery_requirements.rs",
-    // The classifier itself (CAD-2117): `src/issue/delivery_requirements.rs`
-    // is now a re-export shim, so name the files that hold the rules.
-    "crates/cadence-core/src/delivery_requirements.rs",
-    "crates/cadence-core/src/delivery_rules.rs",
-    "src/daemon/delivery_requirements_rpc.rs",
-    // Also CAD-2117: the policy, the crate root, the hosted evaluator entry
-    // and the unattended-landing gate.
-    "crates/cadence-core/src/delivery.rs",
-    "crates/cadence-core/src/lib.rs",
-    "crates/cadence-core/src/evaluate.rs",
-    "src/daemon/unattended_landing.rs",
-    // Module roots that can redirect `delivery_requirements`, the hosted
-    // wrapper of `evaluate`, and the approve route. A floor, not a complete list.
-    "src/issue/mod.rs",
-    "src/lib.rs",
-    "crates/cadence-core/src/wasm.rs",
-    "src/daemon/delivery_rpc.rs",
-    "docs/AUDIT.md",
-    "tests/safety_floor.rs",
-];
-const HUMAN_BASENAMES: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "package.json",
-    "pnpm-lock.yaml",
-    "package-lock.json",
-    ".npmrc",
-    "yarn.lock",
-    "bun.lockb",
-    "build.rs",
-    "rust-toolchain.toml",
-];
 /// risk-classes trigger 5: a diff over this many changed lines is
 /// human-class.
 const HUMAN_LINES: u64 = 1500;
@@ -234,6 +210,12 @@ const SENSITIVE_TABLES: &[&str] = &[
     "schema", "trigger1", "trigger3", "trigger4", "trigger6", "trigger7",
 ];
 
+/// CAD-2386: the repository's operator floor, Browser QA and routine tables.
+/// Required like [`SENSITIVE_TABLES`]: a missing one refuses the parse.
+const OPERATOR_TABLE: &str = "operator";
+const BROWSER_QA_TABLE: &str = "browser_qa";
+const ROUTINE_TABLE: &str = "routine";
+
 /// The parsed trusted lists (read at the diff's anchor: main's live tip for a
 /// main-based PR, else the PR's base). `None` anywhere refuses the parse —
 /// a partial list is never matched as if complete.
@@ -242,6 +224,13 @@ struct Lists {
     /// [`crate::delivery_rules::glob_match`], the grammar that file declares).
     sensitive: Vec<String>,
     human: Vec<String>,
+    /// The `operator` table: the repository's operator-class paths. It may
+    /// repeat trigger-table entries; both are human-class.
+    operator: Vec<String>,
+    /// The `browser_qa` table: paths whose change needs a Browser QA pass.
+    browser_qa: Vec<String>,
+    /// The `routine` table: ordinary documentation the routine class admits.
+    routine: Vec<String>,
     one_review_include: Vec<String>,
     one_review_exclude: Vec<String>,
 }
@@ -259,18 +248,26 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
             .map(|v| v.as_str().map(str::to_string))
             .collect()
     };
-    let mut sensitive = Vec::new();
-    let mut human = Vec::new();
-    for table in SENSITIVE_TABLES {
-        let paths = strings(&risk, &[table, "paths"])?;
+    // One `risk-paths.toml` table's checked globs; any defect refuses.
+    let table = |name: &str| -> Option<Vec<String>> {
+        let paths = strings(&risk, &[name, "paths"])?;
         for path in &paths {
             crate::delivery_rules::check_path(path).ok()?;
         }
-        if matches!(*table, "schema" | "trigger4" | "trigger6" | "trigger7") {
+        Some(paths)
+    };
+    let mut sensitive = Vec::new();
+    let mut human = Vec::new();
+    for name in SENSITIVE_TABLES {
+        let paths = table(name)?;
+        if matches!(*name, "schema" | "trigger4" | "trigger6" | "trigger7") {
             human.extend(paths.iter().cloned());
         }
         sensitive.extend(paths);
     }
+    let operator = table(OPERATOR_TABLE)?;
+    let browser_qa = table(BROWSER_QA_TABLE)?;
+    let routine = table(ROUTINE_TABLE)?;
     let include = strings(&one, &["one_review_include"])?;
     let exclude = strings(&one, &["one_review_exclude"])?;
     for path in include.iter().chain(&exclude) {
@@ -279,6 +276,9 @@ fn parse_lists(lists: &TrustedLists) -> Option<Lists> {
     Some(Lists {
         sensitive,
         human,
+        operator,
+        browser_qa,
+        routine,
         one_review_include: include,
         one_review_exclude: exclude,
     })
@@ -400,34 +400,38 @@ fn one_review_qualifies(changes: &[Change], lists: &Lists) -> bool {
         })
 }
 
-/// Legacy human-class by path: the prefix/exact/basename lists plus the
-/// sensitive `risk-paths` globs (matched with that file's own grammar,
+/// Does any glob of `globs` (this file's grammar) match `path`?
+fn any_glob<'a>(mut globs: impl Iterator<Item = &'a String>, path: &str) -> bool {
+    globs.any(|g| crate::delivery_rules::glob_match(g, path))
+}
+
+/// Human-class by path: the repository's `operator` table plus its human
+/// trigger tables (matched with that file's own grammar,
 /// `crate::delivery_rules::glob_match`).
 fn human_path(path: &str, lists: Option<&Lists>) -> bool {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    let segs: Vec<&str> = path.split('/').collect();
-    if HUMAN_EXACT.contains(&path)
-        || HUMAN_PREFIXES.iter().any(|p| path.starts_with(p))
-        || HUMAN_BASENAMES.contains(&base)
-        || segs[..segs.len() - 1]
-            .iter()
-            .any(|s| *s == ".github" || *s == ".cargo")
-    {
-        return true;
-    }
     match lists {
         // Unreadable lists fail closed: treat the path as human.
         None => true,
-        Some(l) => l
-            .human
-            .iter()
-            .any(|g| crate::delivery_rules::glob_match(g, path)),
+        Some(l) => any_glob(l.operator.iter().chain(&l.human), path),
     }
 }
 
-/// The `docs/**` ordinary-markdown admit rule of the routine allowlist.
-fn routine_path(path: &str) -> bool {
-    (path.starts_with("docs/") || ROUTINE_EXACT.contains(&path)) && path.ends_with(".md")
+/// Does any change need a Browser QA pass? The repository's `browser_qa`
+/// table decides. Unreadable lists require none (operator decision
+/// 2026-11-17, CAD-2386): they already force the operator's approval, which
+/// is the human check there.
+fn browser_qa_needed(changes: &[Change], lists: Option<&Lists>) -> bool {
+    match lists {
+        None => false,
+        Some(l) => changes
+            .iter()
+            .any(|c| any_glob(l.browser_qa.iter(), &c.path)),
+    }
+}
+
+/// The repository's `routine` table: ordinary documentation.
+fn routine_path(path: &str, lists: &Lists) -> bool {
+    any_glob(lists.routine.iter(), path)
 }
 
 pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
@@ -458,25 +462,30 @@ pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
 }
 
 /// The requirements today's loop demands — the `strict` answer. `lists`
-/// may be partially absent: each absent input fails closed the same way
-/// `scripts/enqueue-reviewed` does (an unreadable one-review list keeps
-/// two reviews; unreadable risk lists make every path human; verdict
-/// notes declaring `Risk: human` still add the operator check
-/// downstream, noted in `reasons`).
+/// may be unreadable: an unreadable one-review list keeps two reviews and
+/// unreadable risk lists make every path human, like
+/// `scripts/enqueue-reviewed` (which, unlike this engine, still asks Browser
+/// QA for `ui/` then). `absent` says the caller proved the repository
+/// declares no lists, which the reasons report instead of "unreadable".
+/// Verdict notes declaring `Risk: human` still add the operator check
+/// downstream, noted in `reasons`.
 fn strict_requirements(
     resolved: &Resolved,
     activation: Activation,
     changes: &[Change],
     lines: u64,
     lists: Option<&Lists>,
+    absent: bool,
     mut reasons: Vec<String>,
 ) -> Requirements {
     let qualifies = lists.is_some_and(|l| one_review_qualifies(changes, l));
     if lists.is_none() {
-        reasons.push(
-            "the trusted lists are unreadable — two reviews and the operator floor hold"
-                .to_string(),
-        );
+        reasons.push(if absent {
+            "the repository declares no trusted lists — two reviews and the operator floor hold"
+                .to_string()
+        } else {
+            "the trusted lists are unreadable — two reviews and the operator floor hold".to_string()
+        });
     }
     let human_paths: Vec<&str> = changes
         .iter()
@@ -507,12 +516,14 @@ fn strict_requirements(
             ReviewKind::StandardsAndSpec
         },
         security_capable: false,
-        browser_qa: changes.iter().any(|c| c.path.starts_with("ui/")),
+        browser_qa: browser_qa_needed(changes, lists),
         operator_approval: operator,
         full_checks: true,
         reasons,
         policy_digest: resolved.digest.clone(),
         activation,
+        required_reviews: None,
+        required_checks: None,
     }
 }
 
@@ -530,6 +541,12 @@ pub fn classify(
     let parsed = parse_lists(lists);
     let mut reasons = Vec::new();
 
+    // CAD-2413: an owner-approved custom policy is evaluated (opt-in, operator
+    // decision 2026-11-17). Anything else not Active keeps the strict floor.
+    if activation == Activation::NoProfile && resolved.source == "approved" {
+        return classify_approved(resolved, activation, changes, lines, parsed.as_ref());
+    }
+
     if activation != Activation::Active {
         reasons.push(format!(
             "default lean classification does not apply ({activation:?}) — \
@@ -541,6 +558,7 @@ pub fn classify(
             changes,
             lines,
             parsed.as_ref(),
+            false,
             reasons,
         );
     }
@@ -554,19 +572,36 @@ pub fn classify(
             changes,
             lines,
             parsed.as_ref(),
+            false,
             reasons,
         );
     };
     if let Some(why) = evidence_refusal(changes) {
         reasons.push(format!("incomplete diff evidence: {why}"));
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     if changes.iter().any(|c| !reviewable_change(c)) {
         reasons.push(
             "deletion, rename, type or mode change requires legacy strict review".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Sensitive wins over everything: risk triggers, the human lists,
@@ -595,7 +630,15 @@ pub fn classify(
             reasons.push(format!("{lines} changed lines is over {HUMAN_LINES}"));
         }
         reasons.push("sensitive or policy-triggering changes retain the existing strict review, operator, Browser QA and full-check floors".to_string());
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Anything outside the known include list — or a change shape the
@@ -605,7 +648,15 @@ pub fn classify(
         reasons.push(
             "a path or change shape is outside the known one-review include list".to_string(),
         );
-        return strict_requirements(resolved, activation, changes, lines, Some(&lists), reasons);
+        return strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            Some(&lists),
+            false,
+            reasons,
+        );
     }
 
     // Routine: every change a regular 100644 `A`/`M` ordinary-doc
@@ -613,7 +664,7 @@ pub fn classify(
     // extension is consequential, never routine.
     if changes
         .iter()
-        .all(|c| reviewable_change(c) && c.new_mode == "100644" && routine_path(&c.path))
+        .all(|c| reviewable_change(c) && c.new_mode == "100644" && routine_path(&c.path, &lists))
     {
         reasons.push("every change is ordinary documentation on the routine allowlist".to_string());
         return Requirements {
@@ -627,6 +678,8 @@ pub fn classify(
             reasons,
             policy_digest: resolved.digest.clone(),
             activation,
+            required_reviews: None,
+            required_checks: None,
         };
     }
 
@@ -636,12 +689,257 @@ pub fn classify(
         reviews: 1,
         review_kind: ReviewKind::Combined,
         security_capable: false,
-        browser_qa: changes.iter().any(|c| c.path.starts_with("ui/")),
+        browser_qa: browser_qa_needed(changes, Some(&lists)),
         operator_approval: false,
         full_checks: true,
         reasons,
         policy_digest: resolved.digest.clone(),
         activation,
+        required_reviews: None,
+        required_checks: None,
+    }
+}
+
+/// The reviews an approved policy's applying rules require, in rule order,
+/// each name once, with the reasons naming the rules that applied.
+fn applying_reviews(
+    policy: &crate::delivery::DeliveryPolicy,
+    changes: &[Change],
+    lines: u64,
+    reasons: &mut Vec<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (i, rule) in policy.risk.iter().enumerate() {
+        let why = match &rule.when {
+            None => Some("always".to_string()),
+            Some(when) => {
+                let path = changes
+                    .iter()
+                    .find(|c| {
+                        when.paths
+                            .iter()
+                            .any(|g| crate::delivery_rules::area_match(g, &c.path))
+                    })
+                    .map(|c| format!("path {}", c.path));
+                let over_lines = when
+                    .lines_over
+                    .filter(|n| lines > *n)
+                    .map(|n| format!("{lines} changed lines over {n}"));
+                let over_files = when
+                    .files_over
+                    .filter(|n| changes.len() as u64 > *n)
+                    .map(|n| format!("{} changed files over {n}", changes.len()));
+                path.or(over_lines).or(over_files)
+            }
+        };
+        if let Some(why) = why {
+            reasons.push(format!("policy rule {i} applies: {why}"));
+            for name in &rule.require {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The review that satisfies both `a` and `b`. A single-axis review never
+/// stands in for `Combined` (one verdict covering both axes), so joining a
+/// single axis with anything other than itself or `None` needs both axes.
+fn review_join(a: ReviewKind, b: ReviewKind) -> ReviewKind {
+    use ReviewKind::*;
+    match (a, b) {
+        (x, None) | (None, x) => x,
+        (x, y) if x == y => x,
+        _ => StandardsAndSpec,
+    }
+}
+
+/// The verdict count a review kind needs.
+fn review_count(kind: ReviewKind) -> u32 {
+    match kind {
+        ReviewKind::None => 0,
+        ReviewKind::Combined | ReviewKind::Standards | ReviewKind::SpecSecurity => 1,
+        ReviewKind::StandardsAndSpec => 2,
+    }
+}
+
+/// CAD-2413: requirements under an owner-approved custom policy. The policy's
+/// applying rules decide the reviews; the trusted lists' floor is applied on
+/// top and never lowered (operator decision 2026-11-17).
+fn classify_approved(
+    resolved: &Resolved,
+    activation: Activation,
+    changes: &[Change],
+    lines: u64,
+    lists: Option<&Lists>,
+) -> Requirements {
+    use crate::delivery::{CheckMode, Review};
+    let mut reasons = vec!["an approved delivery policy is in force".to_string()];
+    let names = applying_reviews(&resolved.policy, changes, lines, &mut reasons);
+    let (mut standards, mut spec, mut general) = (false, false, false);
+    let (mut operator, mut browser_qa) = (false, false);
+    let mut required_reviews = Vec::new();
+    let mut required_checks = Vec::new();
+    for name in &names {
+        let Some(review) = resolved.policy.reviews.get(name) else {
+            continue;
+        };
+        let mut entry = RequiredReview {
+            name: name.clone(),
+            kind: String::new(),
+            focus: None,
+            app: None,
+            mode: None,
+        };
+        match review {
+            Review::Agent { focus } => {
+                entry.kind = "agent".into();
+                entry.focus = Some(focus.clone());
+                match focus.as_str() {
+                    "standards" => standards = true,
+                    "spec-security" => spec = true,
+                    "browser-qa" => browser_qa = true,
+                    "general" => general = true,
+                    // `parse` admits only `FOCI`; anything else fails closed
+                    // to both axes.
+                    _ => (standards, spec) = (true, true),
+                }
+            }
+            Review::Check { app, mode } => {
+                entry.kind = "check".into();
+                entry.app = Some(app.clone());
+                let required = matches!(mode, CheckMode::Required);
+                entry.mode = Some(if required { "required" } else { "advisory" }.into());
+                if required {
+                    required_checks.push(RequiredCheck {
+                        name: name.clone(),
+                        app: app.clone(),
+                    });
+                }
+            }
+            Review::Operator => {
+                entry.kind = "operator".into();
+                operator = true;
+            }
+        }
+        required_reviews.push(entry);
+    }
+    let (reviews, review_kind) = match (standards, spec, general) {
+        (true, true, _) => (2, ReviewKind::StandardsAndSpec),
+        (true, false, _) => (1, ReviewKind::Standards),
+        (false, true, _) => (1, ReviewKind::SpecSecurity),
+        (false, false, true) => (1, ReviewKind::Combined),
+        (false, false, false) => (0, ReviewKind::None),
+    };
+    // The repository's own `[browser_qa]` table applies on top of a policy.
+    browser_qa |= browser_qa_needed(changes, lists);
+
+    // The floor (operator decision D1): anything the trusted lists, the size
+    // limit or the diff evidence would make strict stays at least strict.
+    let floor = match lists {
+        None => true,
+        Some(l) => {
+            evidence_refusal(changes).is_some()
+                || changes.iter().any(|c| !reviewable_change(c))
+                || lines > HUMAN_LINES
+                || changes.iter().any(|c| {
+                    let p = c.path.as_str();
+                    human_path(p, Some(l))
+                        || l.sensitive
+                            .iter()
+                            .any(|g| crate::delivery_rules::glob_match(g, p))
+                        || l.one_review_exclude.iter().any(|g| one_glob(g, p))
+                })
+        }
+    };
+    if floor {
+        let mut floor_reasons = reasons.clone();
+        floor_reasons.push(
+            "the trusted-list floor applies: the policy cannot lower these requirements"
+                .to_string(),
+        );
+        let strict = strict_requirements(
+            resolved,
+            activation,
+            changes,
+            lines,
+            lists,
+            false,
+            floor_reasons,
+        );
+        let review_kind = review_join(strict.review_kind, review_kind);
+        let reviews = review_count(review_kind).max(strict.reviews).max(reviews);
+        return Requirements {
+            class: DeliveryClass::Strict,
+            reviews,
+            review_kind,
+            browser_qa: strict.browser_qa || browser_qa,
+            operator_approval: strict.operator_approval || operator,
+            full_checks: true,
+            required_reviews: Some(required_reviews),
+            required_checks: Some(required_checks),
+            ..strict
+        };
+    }
+    reasons.push("the approved policy decides: no trusted-list floor applies".to_string());
+    Requirements {
+        class: DeliveryClass::Consequential,
+        reviews,
+        review_kind,
+        security_capable: false,
+        browser_qa,
+        operator_approval: operator,
+        full_checks: true,
+        reasons,
+        policy_digest: resolved.digest.clone(),
+        activation,
+        required_reviews: Some(required_reviews),
+        required_checks: Some(required_checks),
+    }
+}
+
+/// CAD-2386: the product default for a repository that declares no trusted
+/// lists — the caller proved both files are absent at the anchor (a definite
+/// "not found", never a failed read). Under the default lean policy it is one
+/// combined review plus the operator's approval, with no path rules and no
+/// Browser QA. Anything else keeps the fail-closed strict floor: a custom or
+/// unapproved policy (only an approved one's rules are evaluated, and only with lists) and incomplete diff
+/// evidence.
+pub fn classify_without_lists(resolved: &Resolved, changes: &[Change], lines: u64) -> Requirements {
+    let activation = activation_of(resolved);
+    let mut reasons = Vec::new();
+    if activation != Activation::Active {
+        reasons.push(format!(
+            "default lean classification does not apply ({activation:?}) — \
+             the strict requirements apply"
+        ));
+        return strict_requirements(resolved, activation, changes, lines, None, true, reasons);
+    }
+    reasons.push("default lean delivery policy in force".to_string());
+    if let Some(why) = evidence_refusal(changes) {
+        reasons.push(format!("incomplete diff evidence: {why}"));
+        return strict_requirements(resolved, activation, changes, lines, None, true, reasons);
+    }
+    reasons.push(
+        "the repository declares no trusted lists — the product default applies: \
+         one combined review and the operator's approval"
+            .to_string(),
+    );
+    Requirements {
+        class: DeliveryClass::Consequential,
+        reviews: 1,
+        review_kind: ReviewKind::Combined,
+        security_capable: false,
+        browser_qa: false,
+        operator_approval: true,
+        full_checks: true,
+        reasons,
+        policy_digest: resolved.digest.clone(),
+        activation,
+        required_reviews: None,
+        required_checks: None,
     }
 }
 

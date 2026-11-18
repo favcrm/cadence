@@ -167,8 +167,8 @@ const declaredLicense = (owner) =>
 // These published packages omit license files. Preserve their pinned upstream
 // texts offline; NOTICE records the exact sources and declaration discrepancy.
 const omittedLicenses = new Map(
-  ["chord", "pi-ai", "pi-durable", "pi-telemetry"].map((name) => [
-    `@earendil-works/${name}@1.4.0`,
+  ["chord", "pi-ai", "pi-codemode", "pi-durable", "pi-schema", "pi-telemetry"].map((name) => [
+    `@earendil-works/${name}@1.5.2`,
     "pi-1.4.0.LICENSE",
   ]),
 );

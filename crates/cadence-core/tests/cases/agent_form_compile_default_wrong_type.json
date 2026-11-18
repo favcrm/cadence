@@ -1,0 +1,26 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "fields": [
+          {
+            "id": "agree",
+            "label": "I agree",
+            "type": "checkbox",
+            "default": "yes"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": false,
+      "message": "spec /fields/0/default: must be true or false for a checkbox field"
+    }
+  }
+}

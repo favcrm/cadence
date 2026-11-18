@@ -66,7 +66,7 @@ Look around (read-only):
 - `cadence agent roles` — the role ids to hire; `cadence agent propose-hire
   --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` proposes one; never register.
 - `cadence master ask-form --file ./../tmp/<f>.json` — ask with a form
-  (its format: `cadence help master ask-form`).
+  from a flat list of fields (`cadence help master ask-form`).
 - `cadence artifact put [--id <id>] --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f>` —
   show a result beside the chat; the same `--id` adds a version (give it
   first: the thread keeps only 160 characters of the command). Write

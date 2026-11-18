@@ -1035,6 +1035,38 @@ impl Shared {
         }))
     }
 
+    /// Whether a scoped read of `target` is by the agent itself or its group
+    /// root, on its own connection (CAD-2310, CAD-2323): true only when
+    /// `authorize_agent_mutation(SelfService)` admits an AGENT caller. Every
+    /// relayed read (`read_as`, `cli_envelope`, `public_session`) rides an
+    /// operator-proven connection, so its reader is never the caller the rule
+    /// judged. A refusal is false; any other error is logged and false.
+    pub(super) fn owner_read(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+        target: &Agent,
+    ) -> bool {
+        match self.authorize_agent_mutation(
+            params,
+            peer_pid,
+            verb,
+            target,
+            AgentMutation::SelfService,
+        ) {
+            Ok(AgentCaller::Agent(_)) => true,
+            Ok(AgentCaller::Operator) | Err(Error::Rejected(_)) => false,
+            Err(error) => {
+                eprintln!(
+                    "{verb}: owner fields withheld for '{}': {error}",
+                    target.alias
+                );
+                false
+            }
+        }
+    }
+
     /// Authorize one agent-mutating request against `target` (CAD-149,
     /// CAD-304 S3): identity-shaped request fields are refused, the
     /// caller is derived ([`Self::agent_caller`]) and the one policy

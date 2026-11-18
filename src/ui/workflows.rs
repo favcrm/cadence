@@ -55,6 +55,15 @@ pub(super) enum ReadRoute<'a> {
     Preview(&'a str, &'a str),
 }
 
+impl ReadRoute<'_> {
+    /// The project the route names.
+    pub(super) fn project(&self) -> &str {
+        match self {
+            ReadRoute::List(key) | ReadRoute::Preview(key, _) => key,
+        }
+    }
+}
+
 /// `(key, name)` for `POST /api/projects/<key>/workflows/<name>/propose`
 /// — `<name>` may be `<app>/<wf>` for an installed app's workflow
 /// (CAD-547) — `None` when the path is not that route.

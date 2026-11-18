@@ -1588,6 +1588,7 @@ export default function WorkspaceApp({
                   busy={busy}
                   onConfirm={(value) =>
                     void mutate(async () => {
+                      if (!value.config.connection_id) throw new Error("The connection is unavailable.");
                       await workspaceApps.updateBinding(installId, value.id, {
                         expected_revision: value.revision,
                         connection_id: value.config.connection_id,
@@ -1605,6 +1606,7 @@ export default function WorkspaceApp({
                 />
                 <SlotBindings
                   installId={installId}
+                  privateApp={data.installation.source_kind === "private"}
                   digest={data.installation.digest}
                   contextId={contextId || null}
                   contextLabel={

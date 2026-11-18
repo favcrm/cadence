@@ -1,5 +1,5 @@
 import type { NeedsMe, ThreadRef } from "../../lib/types";
-import { sourceLine, type StagedWrite } from "../decisions/stagedWrite";
+import { sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
  * The Home rail's "Needs you" (CAD-328), built from the overview's
@@ -513,8 +513,8 @@ export function stagedNeed(write: StagedWrite, t: (english: string) => string, n
     key: `staged:${write.id}`,
     kind: "staged_write",
     label: "write",
-    title: write.title,
-    shortTitle: write.title,
+    title: titleOf(write, t),
+    shortTitle: titleOf(write, t),
     why: sourceLine(write, t) || null,
     owner: "operator",
     age: Math.max(0, Math.floor((nowMs - write.createdAt) / 1000)),

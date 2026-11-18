@@ -389,29 +389,63 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
-/// (AOS-274 / SEC-003). A project that does not exist is left to the
-/// verb's own unknown-project answer; an unreadable tracker refuses, and
+/// (AOS-274 / SEC-003). A project that does not exist gets the same
+/// refusal for anyone but the Owner, whose request reaches the verb's own
+/// unknown-project answer (CAD-2212); an unreadable tracker refuses, and
 /// so does a caller whose principal kind and actor disagree.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
+    // An absent project answers the same way for anyone but the Owner: the
+    // verbs' own unknown-project error lists every registered key, private
+    // ones included (CAD-2212).
     let refused = match actor.policy_actor() {
-        Some(spelling) => super::project_policy::refused(pm, key, &spelling),
+        Some(spelling) if spelling == "operator" => {
+            super::project_policy::refused(pm, key, &spelling)
+        }
+        Some(spelling) => !super::project_policy::readable(pm, &spelling).contains(key),
         None => true,
     };
-    if refused {
-        Some(cli_fail(404, "not_found", "unknown project"))
-    } else {
-        None
-    }
+    refused.then(hidden)
+}
+
+/// The one refusal for anything a caller may not read: a project key or
+/// issue id that is refused or absent. It names no id and no project, so
+/// a private project or issue cannot be told apart from a missing one. An
+/// issue verb gives it too: CAD-2321 fixed "unknown project" as the answer
+/// to a refused project read, and CAD-2357 gives an absent id the same
+/// bytes, since any other text would mark the private ones.
+fn hidden() -> HttpResp {
+    cli_fail(404, "not_found", "unknown project")
 }
 
 /// [`restricted`] for a verb that names an issue id rather than a project
-/// key: resolve the issue's project first. An unknown id is left to the
-/// verb's own not-found answer.
+/// key. The Owner's request resolves the issue's project and is otherwise
+/// left to the verb, whose own answer covers an unknown id. Anyone else is
+/// looked up only inside the projects they may read: an id found nowhere
+/// there gets [`hidden`], whether it is absent or private, and an
+/// unresolved caller gets it too. Every issue verb calls this before its
+/// own lookup, so no verb's not-found text reaches a non-owner.
 fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
-    let Ok(issue) = board::find_issue(&pm.dir, id) else {
-        return None;
-    };
-    restricted(pm, &issue.project, actor)
+    match actor.policy_actor() {
+        Some(spelling) if spelling == "operator" => {
+            let Ok(issue) = board::find_issue(&pm.dir, id) else {
+                return None;
+            };
+            restricted(pm, &issue.project, actor)
+        }
+        // An id that is not well formed is never joined into a path: it
+        // could climb out of a readable project and test for a private one.
+        Some(_) if model::check_id(id).is_err() => Some(hidden()),
+        Some(spelling) => {
+            let found = super::project_policy::readable(pm, &spelling)
+                .iter()
+                .any(|key| {
+                    let dir = pm.dir.join(key).join(id);
+                    board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md"))
+                });
+            (!found).then(hidden)
+        }
+        None => Some(hidden()),
+    }
 }
 
 /// The project keys this verified caller may read. Fail closed: an
@@ -587,6 +621,9 @@ fn dispatch(
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
                     Ok(pm) => {
+                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
+                            return resp;
+                        }
                         let read = read_model::get(state_dir, pm_dir).board(&pm, None);
                         let by_id = read.by_id();
                         match by_id.get(&id) {
@@ -621,18 +658,23 @@ fn dispatch(
                 };
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
-                    Ok(pm) => match board::find_issue(&pm.dir, &id) {
-                        Ok(issue) => {
-                            if let Some(resp) = restricted(&pm, &issue.project, actor) {
-                                return resp;
-                            }
-                            match history::log(&pm.dir, &issue, limit.max(1)) {
-                                Ok(h) => json_ok(json!({"id": id, "history": h})),
-                                Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
-                            }
+                    Ok(pm) => {
+                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
+                            return resp;
                         }
-                        Err(e) => cli_fail(404, "not_found", &e.to_string()),
-                    },
+                        match board::find_issue(&pm.dir, &id) {
+                            Ok(issue) => {
+                                if let Some(resp) = restricted(&pm, &issue.project, actor) {
+                                    return resp;
+                                }
+                                match history::log(&pm.dir, &issue, limit.max(1)) {
+                                    Ok(h) => json_ok(json!({"id": id, "history": h})),
+                                    Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
+                                }
+                            }
+                            Err(e) => cli_fail(404, "not_found", &e.to_string()),
+                        }
+                    }
                 }
             }
             _ => cli_fail(400, "invalid_request", "issue_history needs arguments.id"),
@@ -778,6 +820,15 @@ fn dispatch(
                 if let Some(resp) = restricted(&pm, &req.project, actor) {
                     return resp;
                 }
+                // A linked id is an issue id the caller names too: one it
+                // may not read, or a malformed one, answers as an absent one
+                // (CAD-2357) and is never linked.
+                let linked = req.parent.iter().chain(req.blocked_by.iter().flatten());
+                for id in linked {
+                    if let Some(resp) = restricted_issue(&pm, id, actor) {
+                        return resp;
+                    }
+                }
                 match issue_write::new_issue(
                     &pm,
                     &pm.dir,
@@ -876,6 +927,9 @@ fn dispatch(
                     }
                     Err(resp) => return resp,
                 };
+                if model::check_id(&ids[0]).is_err() {
+                    return cli_fail(400, "invalid_request", "bad issue id");
+                }
                 match pm_at(pm_dir) {
                     Err(resp) => resp,
                     Ok(pm) => {
@@ -1063,9 +1117,14 @@ mod policy_tests {
                 .unwrap_or_else(|| panic!("{spelling} was admitted"));
             assert_eq!(refusal.status_code(), 404, "{spelling}");
         }
-        // An absent project is not this guard's business — the verb keeps
-        // its own unknown-project answer.
-        assert!(restricted(&pm, "ghost", &actor("users/stranger")).is_none());
+        // An absent project gives everyone but the Owner the same refusal,
+        // because the verb's own unknown-project error names every key
+        // (CAD-2212). The Owner keeps the verb's answer.
+        let refusal = restricted(&pm, "ghost", &actor("users/stranger"))
+            .expect("an absent project reached the verb for a member");
+        assert_eq!(refusal.status_code(), 404);
+        assert!(restricted(&pm, "ghost", &actor("users/mia")).is_some());
+        assert!(restricted(&pm, "ghost", &actor("operator")).is_none());
     }
 
     #[test]

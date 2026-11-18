@@ -344,6 +344,174 @@ export function readHeldSubmission(
   return { id, type, status, text: entryText(entry.model), entry };
 }
 
+type SubmissionSettlement =
+  | { readonly state: "settled"; readonly submission: number; readonly status: "done" | "unanswered" }
+  | { readonly state: "absent" | "unknown" };
+
+function isEntryId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function terminalOutcome(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const outcome = value as Record<string, unknown>;
+  switch (outcome.status) {
+    case "completed":
+      return Object.hasOwn(outcome, "result") && outcome.error === undefined && outcome.reason === undefined;
+    case "failed":
+    case "faulted": {
+      const error = outcome.error;
+      return typeof error === "object" && error !== null && !Array.isArray(error) &&
+        typeof (error as Record<string, unknown>).message === "string" &&
+        outcome.reason === undefined && (outcome.status === "failed" || outcome.result === undefined);
+    }
+    case "aborted":
+      return outcome.error === undefined && (outcome.reason === undefined || typeof outcome.reason === "string");
+    case "orphaned":
+      return typeof outcome.reason === "string" && outcome.result === undefined && outcome.error === undefined;
+    default:
+      return false;
+  }
+}
+
+function entryHasRole(sql: TaskSql, id: number, conversationId: number, role: string): boolean {
+  const rows = sql.exec(
+    "SELECT id, conversation_id, record FROM pi_entries WHERE id=?",
+    id,
+  ).toArray();
+  if (rows.length !== 1) return false;
+  const row = rows[0]!;
+  const entry = parseRecord(row.record);
+  return Number(row.id) === id && Number(row.conversation_id) === conversationId &&
+    entry !== null && entry.id === id && entry.conversationId === conversationId &&
+    Array.isArray(entry.model) && entry.model.some((message: unknown) =>
+      typeof message === "object" && message !== null && !Array.isArray(message) &&
+      (message as Record<string, unknown>).role === role);
+}
+
+/**
+ * Prove one submission's terminal state without opening the engine. Both
+ * positive and absent evidence require every conversation and task to be at
+ * rest. Inconsistent indexes or records cannot prove either result.
+ */
+export function readSubmissionSettlement(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): SubmissionSettlement {
+  const schema = sql.exec(
+    `SELECT name, type FROM sqlite_master
+      WHERE name IN ('pi_submissions','pi_tasks','pi_entries','pi_submissions_by_request')
+         OR (type='table' AND name GLOB 'pi_*')`,
+  ).toArray();
+  const submissions = schema.find((row) => row.name === "pi_submissions");
+  const tasks = schema.find((row) => row.name === "pi_tasks");
+  const entries = schema.find((row) => row.name === "pi_entries");
+  const requestIndex = schema.find((row) => row.name === "pi_submissions_by_request");
+  if (submissions === undefined && tasks === undefined)
+    return { state: schema.length === 0 ? "absent" : "unknown" };
+  if (submissions?.type !== "table" || tasks?.type !== "table" ||
+      entries?.type !== "table" || requestIndex?.type !== "index")
+    return { state: "unknown" };
+
+  // Check every task, including nested conversations and background work.
+  // Indexed fields and terminal outcomes must agree with their stored bodies.
+  const taskColumns = "SELECT id, conversation_id, kind, status, background, abort_requested, record FROM pi_tasks";
+  let taskAfter: number | undefined;
+  for (;;) {
+    const rows = taskAfter === undefined
+      ? sql.exec(`${taskColumns} ORDER BY id LIMIT 500`).toArray()
+      : sql.exec(`${taskColumns} WHERE id>? ORDER BY id LIMIT 500`, taskAfter).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (
+        !isEntryId(id) || !isEntryId(conversation) || record === null ||
+        record.id !== id || record.conversationId !== conversation ||
+        typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind ||
+        typeof record.version !== "number" ||
+        !Object.hasOwn(record, "input") ||
+        typeof record.background !== "boolean" || Number(record.background) !== row.background ||
+        typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested ||
+        row.status !== "terminal"
+      )
+        return { state: "unknown" };
+      const state = record.state;
+      if (typeof state !== "object" || state === null || Array.isArray(state))
+        return { state: "unknown" };
+      const terminal = state as Record<string, unknown>;
+      if (terminal.status !== "terminal" || terminal.checkpoint !== undefined || !terminalOutcome(terminal.outcome))
+        return { state: "unknown" };
+      taskAfter = id;
+    }
+    if (rows.length < 500) break;
+  }
+
+  // The indexed request id and its JSON body must agree, even on other rows:
+  // an inconsistent index must not turn a held id into apparent absence.
+  // Parse bounded pages in JavaScript so lone surrogates survive unchanged.
+  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
+  let after: number | undefined;
+  let settled: Extract<SubmissionSettlement, { state: "settled" }> | undefined;
+  for (;;) {
+    const rows = after === undefined
+      ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray()
+      : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (
+        !Number.isSafeInteger(id) || id <= 0 ||
+        !Number.isSafeInteger(conversation) || conversation <= 0 ||
+        record === null || record.id !== id ||
+        record.conversationId !== conversation ||
+        record.status !== row.status ||
+        (record.status !== "done" && record.status !== "unanswered") ||
+        (record.requestId === undefined
+          ? row.request_id !== null
+          : typeof record.requestId !== "string" ||
+            row.request_id !== JSON.stringify(record.requestId))
+      )
+        return { state: "unknown" };
+      if (conversation === conversationId && record.requestId === operationId) {
+        if (settled !== undefined || record.type !== "input") return { state: "unknown" };
+        if (record.status === "done") {
+          if (!isEntryId(record.entry) || !isEntryId(record.answer) ||
+              record.reason !== undefined || record.detail !== undefined)
+            return { state: "unknown" };
+        } else if (
+          (record.entry !== undefined && !isEntryId(record.entry)) ||
+          record.answer !== undefined || typeof record.reason !== "string"
+        )
+          return { state: "unknown" };
+        if (
+          (record.entry !== undefined && !entryHasRole(sql, record.entry as number, conversationId, "user")) ||
+          (record.status === "done" && !entryHasRole(sql, record.answer as number, conversationId, "assistant"))
+        )
+          return { state: "unknown" };
+        settled = { state: "settled", submission: id, status: record.status };
+      }
+      after = id;
+    }
+    if (rows.length < 500) break;
+  }
+  // Pi's own request lookup uses this index. It must agree with the table
+  // scan before either a terminal or an absent result is trusted.
+  const indexed = sql.exec(
+    `SELECT id FROM pi_submissions INDEXED BY pi_submissions_by_request
+      WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+    conversationId,
+    JSON.stringify(operationId),
+  ).toArray();
+  if (settled === undefined)
+    return { state: indexed.length === 0 ? "absent" : "unknown" };
+  if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
+    return { state: "unknown" };
+  return settled;
+}
+
 /** Whether the engine's submissions table exists; without it, none is held. */
 function hasSubmissions(sql: TaskSql): boolean {
   const table = sql

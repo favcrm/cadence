@@ -328,7 +328,7 @@ function serve(opts) {
   const state = readJson(path.join(root, "state.json"));
   const fx = Object.fromEntries(fs.readdirSync(path.join(root, "served")).map((f) => [f.slice(0, -5), readJson(path.join(root, "served", f))]));
   // The UI's own parser, compiled at `up`: a state set mid-run is checked too.
-  const { checkBrowser, BROWSER_PRESETS, DEFAULT_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, VIEWER_PRESETS, boardMeta, documentsResponder, isDocumentsRoute, servesRoster } = createRequire(SCRIPT)(state.validator);
+  const { appInstallations, checkBrowser, BROWSER_PRESETS, DEFAULT_PRESETS, DOCUMENT_PROBES, DOCUMENT_WRITES, SETTINGS_PRESETS, SKILL_PROBES, VIEWER_PRESETS, boardMeta, documentsResponder, isDocumentsRoute, isSkillsRoute, servesRoster, skillsResponder } = createRequire(SCRIPT)(state.validator);
   const { sandbox, viewer } = state.ports;
   let browser = { ...fx["browser-handoff"] };
   const locale = { ...fx.locale };
@@ -343,6 +343,8 @@ function serve(opts) {
   // types again from the fixtures and clears the refusals.
   let presets = { ...DEFAULT_PRESETS };
   let documents = documentsResponder(fx, () => presets);
+  // CAD-2419: the workspace skill library and the hosted profile it assigns through.
+  let skills = skillsResponder(fx, () => presets.viewer);
   const counts = { routes: {}, proxied: 0, masked_401: {}, views: 0, viewer_loads: 0, viewer_done: 0 };
   const count = (key) => (counts.routes[key] = (counts.routes[key] ?? 0) + 1);
 
@@ -394,6 +396,8 @@ function serve(opts) {
     },
     // The member app screen: one installed app with one context and run.
     "GET /api/app-home": () => fx["app-home"],
+    // CAD-2314: the sidebar's app menu reads the operator's installed-app list.
+    "GET /api/app-installations": () => appInstallations(fx),
     [`GET ${app}`]: () => fx["app-installation"],
     [`GET ${app}/contexts`]: () => fx["app-contexts"],
     [`GET ${app}/effects`]: () => fx["app-effects"],
@@ -449,6 +453,8 @@ function serve(opts) {
       if (refusals !== undefined && (!Array.isArray(refusals) || refusals.some((route) => !DOCUMENT_WRITES.includes(route)))) {
         return send(res, 400, { error: `document_refusals must be a list of ${DOCUMENT_WRITES.join(", ")}` });
       }
+      if (b.skills !== undefined && !SKILL_PROBES.includes(b.skills)) return send(res, 400, { error: `skills preset must be one of ${SKILL_PROBES.join(", ")}` });
+      if (b.profile_changed !== undefined && b.profile_changed !== true) return send(res, 400, { error: "profile_changed must be true" });
       browser = next;
       if ("locale" in b) locale.user_locale = b.locale;
       if (b.viewer !== undefined) presets = { ...presets, viewer: b.viewer };
@@ -458,9 +464,15 @@ function serve(opts) {
         documents = documentsResponder(fx, () => presets);
       }
       if (refusals !== undefined) presets = { ...presets, refusals: [...new Set(refusals)] };
+      if (b.skills !== undefined) {
+        skills = skillsResponder(fx, () => presets.viewer);
+        skills.setProbe(b.skills);
+      }
+      if (b.profile_changed === true) skills.bumpProfile();
     } else if (req.method !== "GET") return send(res, 405, { error: "GET or POST" });
     const { viewer, settings, probe, refusals } = presets;
-    return send(res, 200, { browser, locale, views, viewer, settings, documents: { probe, refusals, changed: documents.changes() } });
+    const { revision, skills: assigned } = skills.profile();
+    return send(res, 200, { browser, locale, views, viewer, settings, documents: { probe, refusals, changed: documents.changes() }, skills: { probe: skills.probe(), profile: { revision, skills: assigned } } });
   }
 
   http.createServer(async (req, res) => {
@@ -471,6 +483,27 @@ function serve(opts) {
       const answer = documents.answer(req.method, url, req.method === "POST" ? await body(req) : null);
       count(answer.route);
       return send(res, answer.status, answer.body);
+    }
+    if (isSkillsRoute(pathname)) {
+      const answer = skills.answer(req.method, url, req.method === "POST" ? await body(req) : null);
+      count(answer.route);
+      return send(res, answer.status, answer.body);
+    }
+    // The roster: the sandbox's, with the fixture's hosted profile on it.
+    if (pathname === "/api/agents" && req.method === "GET") {
+      count("GET /api/agents");
+      // A fresh read: a 304 would carry no body to add the profile to.
+      const { "if-none-match": _etag, "if-modified-since": _since, ...headers } = req.headers;
+      const listed = await new Promise((resolve) => {
+        const upstream = http.get({ host: "127.0.0.1", port: sandbox, path: req.url, headers: { ...headers, host: `127.0.0.1:${sandbox}`, "accept-encoding": "identity" } }, (up) => {
+          let raw = "";
+          up.setEncoding("utf8");
+          up.on("data", (c) => (raw += c));
+          up.on("end", () => { try { resolve(up.statusCode === 200 ? JSON.parse(raw) : null); } catch { resolve(null); } });
+        });
+        upstream.on("error", () => resolve(null));
+      });
+      return send(res, 200, skills.roster(listed));
     }
     if (pathname === "/api/team/members" && req.method === "GET" && servesRoster(presets)) {
       count("GET /api/team/members");

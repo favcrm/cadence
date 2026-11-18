@@ -182,6 +182,13 @@ fn verb_for(
             args = built;
             verb
         }
+        // CAD-2396: a hosted workspace's own skills. The board owns the
+        // package rules, the revision fence and who may approve.
+        Commands::WorkspaceSkill { action } => {
+            let (verb, built) = super::workspace_skill::request(action)?;
+            args = built;
+            verb
+        }
         Commands::Agent {
             action: AgentAction::Context { id },
         } => {
@@ -331,6 +338,7 @@ fn verb_for(
                     id,
                     file,
                     status,
+                    request_id,
                 },
         } => {
             // Every flag the hosted `issue_new` cannot honour is refused
@@ -357,6 +365,14 @@ fn verb_for(
                     "remote `issue new` does not support {} — nothing was sent",
                     unsupported.join(" ")
                 )));
+            }
+            if request_id
+                .as_ref()
+                .is_some_and(|key| key.trim().is_empty() || key.len() > 128)
+            {
+                return Err(Error::rejected(
+                    "--request-id must be nonblank and at most 128 UTF-8 bytes — nothing was sent",
+                ));
             }
             // `--file` is read client-side (an unmanaged remote caller
             // has no master confinement); `-` reads stdin — never a
@@ -403,6 +419,9 @@ fn verb_for(
             }
             if let Some(b) = body {
                 args.insert("body".into(), json!(b));
+            }
+            if let Some(key) = request_id {
+                args.insert("request_id".into(), json!(key));
             }
             "issue_new"
         }
@@ -1314,6 +1333,43 @@ fn verb_for(
                     if let Some(query) = query {
                         args.insert("query".into(), query);
                     }
+                }
+                PlatformAction::Stage {
+                    tool,
+                    input,
+                    connection,
+                    request,
+                } => {
+                    super::connection::validate_connection_id(connection).map_err(|_| {
+                        Error::invalid(
+                            "platform_call",
+                            "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                        )
+                    })?;
+                    if !valid_platform_tool_slug(tool) {
+                        return Err(Error::invalid(
+                            "platform_call",
+                            "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                        ));
+                    }
+                    let body = super::platform::parse_platform_input(input)?;
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_call",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            request.clone()
+                        }
+                        None => platform_replay_key(tool, None, Some(&body), Some(connection)),
+                    };
+                    args.insert("operation".into(), json!("connected_effect"));
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("connectionId".into(), json!(connection));
+                    args.insert("body".into(), body);
+                    args.insert("key".into(), json!(key));
                 }
                 PlatformAction::Status {
                     request,
@@ -3394,7 +3450,14 @@ where
         super::agent_profile::refuse_managed_write(action, target.identity.is_some())?;
         super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
     }
+    if let Commands::WorkspaceSkill { action } = &command {
+        // CAD-2396: approve and revoke are an owner's decision, refused for a
+        // managed caller before any request exists; the board cannot tell a
+        // managed agent on its owner's login from the owner.
+        super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
+    }
     let (verb, args) = verb_for(&command, command_path.as_deref())?;
+    let keyed_issue_create = verb == "issue_new" && args.contains_key("request_id");
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
     // the call was attempted — may have recorded the message anyway; the
@@ -3408,6 +3471,7 @@ where
                 .map(str::to_string)
         })
         .flatten();
+    let stage_operation = args.get("operation") == Some(&json!("connected_effect"));
     let platform_key = (verb == "platform_call")
         .then(|| args.get("key").and_then(Value::as_str).map(str::to_string))
         .flatten();
@@ -3478,6 +3542,22 @@ where
                     Err(retry_err) => return remote_failure(retry_err),
                 }
             } else {
+                if verb == "issue_new" && error.kind() == "unknown" {
+                    if keyed_issue_create {
+                        eprint_line(
+                            "Issue creation was not confirmed. If the board supports retry IDs, \
+                             repeat the same command with the same --request-id, unchanged \
+                             arguments, and the same user and acting agent or human identity. \
+                             If that identity is unavailable, inspect the board instead. \
+                             Do not remove the ID after an unknown outcome.",
+                        );
+                    } else {
+                        eprint_line(
+                            "Issue creation was not confirmed. Inspect the board before \
+                             repeating the create; it may already have succeeded.",
+                        );
+                    }
+                }
                 if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
                     eprint_line(&format!(
                         "remote send `{id}` was not confirmed — it may or may not have \
@@ -3488,7 +3568,22 @@ where
                         target.org
                     ));
                 }
-                if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+                if let Some(key) = platform_key
+                    .as_deref()
+                    .filter(|_| error.kind() == "unknown")
+                    .filter(|_| stage_operation)
+                {
+                    eprint_line(&format!(
+                        "remote stage `{key}` on org `{}` was not confirmed — nothing runs \
+                         without an owner's approval, and repeating the same `platform stage` \
+                         with `--request {key}` replays the same staged action instead of \
+                         staging a second one.",
+                        target.org
+                    ));
+                }
+                if let Some(key) =
+                    platform_key.filter(|_| error.kind() == "unknown" && !stage_operation)
+                {
                     eprint_line(&format!(
                         "remote platform call `{key}` on org `{}` was not confirmed — \
                          reconcile read-only with `cadence --org {} platform status --request {key}` \
@@ -3673,6 +3768,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     pr,
                     head,
                     browser_qa,
+                    approve,
                 },
         } => {
             refuse_managed(target, "delivery enqueue")?;
@@ -3687,6 +3783,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 *pr,
                 &head,
                 *browser_qa,
+                approve.as_deref(),
             )
             .map_err(|error| {
                 scope_hint(
@@ -4667,6 +4764,65 @@ mod read_contract_tests {
         assert_ne!(first["key"], different["key"]);
     }
 
+    fn stage(tool: &str, input: &str, connection: &str, request: Option<&str>) -> Commands {
+        platform(PlatformAction::Stage {
+            tool: tool.into(),
+            input: input.into(),
+            connection: connection.into(),
+            request: request.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn hosted_stage_sends_exactly_the_connected_effect_arguments() {
+        let (verb, args) = outcome(&stage(
+            "gmail_send",
+            r#"{"to":"a@b.test"}"#,
+            "con_one",
+            Some("req-1"),
+        ))
+        .expect("stage is accepted");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(
+            args,
+            json!({
+                "operation": "connected_effect",
+                "tool": "gmail_send",
+                "connectionId": "con_one",
+                "body": {"to": "a@b.test"},
+                "key": "req-1",
+            })
+        );
+    }
+
+    #[test]
+    fn hosted_stage_derives_its_key_from_tool_connection_and_input() {
+        let key = |tool, input, con| {
+            outcome(&stage(tool, input, con, None)).unwrap().1["key"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = key("gmail_send", r#"{"to":"a"}"#, "con_one");
+        assert!(valid_platform_handle(&first));
+        assert_eq!(first, key("gmail_send", r#"{"to":"a"}"#, "con_one"));
+        assert_ne!(first, key("gmail_send", r#"{"to":"b"}"#, "con_one"));
+        assert_ne!(first, key("gmail_send", r#"{"to":"a"}"#, "con_two"));
+    }
+
+    #[test]
+    fn local_stage_refuses_before_contacting_anything() {
+        let missing = std::path::Path::new("/nonexistent-cadence-state-dir");
+        let action = PlatformAction::Stage {
+            tool: "gmail_send".into(),
+            input: "{}".into(),
+            connection: "con_one".into(),
+            request: None,
+        };
+        let error = super::super::platform::run_platform(missing, &action).unwrap_err();
+        assert!(error.to_string().contains("Nothing was sent"), "{error}");
+    }
+
     #[test]
     fn hosted_connected_read_status_uses_the_same_connection_bound_key() {
         let input = r#"{"site_url":"sc-domain:example.test"}"#;
@@ -5422,6 +5578,48 @@ mod read_contract_tests {
         .unwrap();
         assert_eq!(verb, "status");
         assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn issue_new_preserves_optional_retry_id() {
+        let parse = |key: &str| {
+            Cli::try_parse_from([
+                "cadence",
+                "issue",
+                "new",
+                "Synthetic issue",
+                "--project",
+                "demo",
+                "--request-id",
+                key,
+            ])
+            .expect("issue new accepts a retry ID")
+        };
+        let (verb, args) = outcome(&parse(" create-1 ").command).unwrap();
+        assert_eq!(verb, "issue_new");
+        assert_eq!(
+            args,
+            json!({
+                "project": "demo",
+                "title": "Synthetic issue",
+                "request_id": " create-1 "
+            })
+        );
+        for invalid in [" ", &"x".repeat(129)] {
+            let err = outcome(&parse(invalid).command).unwrap_err();
+            assert!(err.contains("--request-id"), "{err}");
+        }
+        let without_key = Cli::try_parse_from([
+            "cadence",
+            "issue",
+            "new",
+            "Synthetic issue",
+            "--project",
+            "demo",
+        ])
+        .unwrap();
+        let (_, args) = outcome(&without_key.command).unwrap();
+        assert!(args.get("request_id").is_none());
     }
 
     #[test]

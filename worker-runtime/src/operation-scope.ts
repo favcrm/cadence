@@ -94,7 +94,7 @@ function requirePart(value: unknown, label: string, pattern: RegExp): string {
   return value;
 }
 
-function requireOperationId(value: unknown): string {
+export function requireOperationId(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.length === 0 ||

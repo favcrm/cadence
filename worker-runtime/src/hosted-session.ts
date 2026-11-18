@@ -1,8 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Op } from "@earendil-works/chord/delta";
 import {
-  type AgentEvent,
+  type LiveState,
   type Cursor,
   CompactionTask,
   createRegistry,
@@ -22,6 +23,7 @@ import type {
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
+  OperationSettlement,
   PendingOperation,
   ThreadContext,
   ThreadEntry,
@@ -42,6 +44,7 @@ import {
   readHeldSubmission,
   readSubmissionEntry,
   readSubmissionRequestId,
+  readSubmissionSettlement,
   type HeldSubmission,
   type TaskSql,
 } from "./identity.ts";
@@ -54,7 +57,7 @@ import {
   type IdentitySnapshotSql,
 } from "./identity-snapshots.ts";
 import { masterState, operationStatus } from "./master.ts";
-import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
+import { defaultModel, HOSTED_COMPACTION_POLICY, meteredBinding, withDefaultModel } from "./model.ts";
 import { ModelTaskContext } from "./model-task-context.ts";
 import {
   guardOperationRequests,
@@ -65,17 +68,14 @@ import {
   OperationScopes,
   parseEntryAppScope,
   parseEntryOperationId,
+  requireOperationId,
   type EngineEvidence,
   type OperationEnvelope,
   type OperationScopeSql,
 } from "./operation-scope.ts";
-import {
-  companyOutputSkills,
-  operationalSkills,
-  runtimeHealthSkills,
-  runtimeProfile,
-} from "./profile.ts";
-import { ThreadPreview } from "./preview.ts";
+import { runtimeProfile } from "./profile.ts";
+import { runtimeSkillSources } from "./workspace-skills.ts";
+import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -88,71 +88,38 @@ import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
 const RESOLVED_MODEL_KEY = "tenant_resolved_model";
 
 /**
- * What one engine batch can change for the board's thread stream.
- *
- * The engine's batches only say that something changed, so the stream decides
- * what to re-project from its durable records. Most batches are partial text:
- * `message_start`, `message_update` (text, thinking or tool-argument deltas),
- * retries, deferred polls, tool progress, usage and agent-document changes.
- * Those change neither the header's turn facts nor the committed transcript, so
- * a token must never cost a full transcript read per reader. The commits below
- * do change one of them.
- *
- * `snapshot` is the engine's overflow replacement, so it can replace both. The
- * entry-producing events — `message_end`, `entry_appended`, and a
- * `tool_execution_end` that carries the result entry — reconcile the
- * transcript, and so do the ends of a run and of a turn: a connection settles
- * whatever its cursor has not caught up with at the boundary of the work that
- * produced it, even when the entry's own event was not observable. `run_start`,
- * `run_end`, `submission` and `inbox_update` change which operations are
- * running or queued, and a failed generation can park a turn the run did not
- * end; a queued input has no transcript entry until it is placed.
+ * Re-read durable projections only when a view change can affect them. Partial
+ * generation text alone must not trigger a transcript read for every token.
  */
-function engineBatchChanges(events: readonly AgentEvent[]): {
+function engineViewChanges(ops: readonly Op[]): {
   readonly master: boolean;
   readonly entries: boolean;
 } {
   let master = false;
   let entries = false;
-  for (const event of events) {
-    switch (event.type) {
-      case "snapshot":
+  for (const op of ops) {
+    if (op[0] === "r" || op[1].length === 0) return { master: true, entries: true };
+    const path = op[1];
+    if (path[0] === "entries" || path[0] === "before") entries = true;
+    if (path[0] === "conversation") {
+      master = true;
+      entries = true;
+    }
+    if (path[0] !== "docs") continue;
+    if (path.length === 1) return { master: true, entries: true };
+    if (path[1] === "pi.inbox") master = true;
+    if (path[1] === "pi.live") {
+      if (path.length === 2 || path[2] === "run" || path[2] === "runFailure") {
         master = true;
         entries = true;
-        break;
-      case "run_start":
-      case "submission":
-      case "inbox_update":
+      } else if (path[2] === "compactionFailure") {
         master = true;
-        break;
-      case "run_end":
-        // The run's inputs settled: its header facts changed and the entries
-        // committed with that settlement are the final ones for the run.
-        master = true;
-        entries = true;
-        break;
-      case "turn_end":
-        entries = true;
-        break;
-      case "message_end":
-      case "entry_appended":
-        entries = true;
-        break;
-      case "tool_execution_end":
-        if (event.entry !== undefined) entries = true;
-        break;
-      case "task_failed":
-        if (event.kind === "pi.generation") {
-          master = true;
-          entries = true;
-        }
-        break;
-      default:
-        break;
+      }
     }
   }
   return { master, entries };
 }
+
 
 /**
  * One agent conversation, one Durable Object.
@@ -327,18 +294,22 @@ export class HostedSession<
       harness: async ({ storage, context, onWake }) => {
         // The bundled skills are engine-owned, so they are wrapped here with
         // the same refusal and live authorization an application tool gets.
-        this.registry.install(
-          authorizeExtension(
-            await skills([operationalSkills, runtimeHealthSkills, companyOutputSkills]),
-            authority,
-          ),
+        // CAD-2395: a workspace's approved skills come last, so a bundled
+        // skill of the same name always wins.
+        const sources = await runtimeSkillSources(
+          options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills!(),
         );
+        this.registry.install(authorizeExtension(await skills(sources), authority));
         return Harness.open(
           storage,
           {
             models: this.models,
             registry: this.registry,
             onWake,
+            // Keep the deferred progress window at zero, rather than adopting
+            // the new one-second default for hosted conversation state.
+            // CAD-2414: compact before the gateway's 256 KiB request limit.
+            settings: { progress: { persistWithinMs: 0 }, compaction: HOSTED_COMPACTION_POLICY },
             telemetry: this.modelTaskContext.telemetry,
           },
           context,
@@ -350,9 +321,8 @@ export class HostedSession<
   }
 
   /**
-   * SSE for this conversation: the engine's snapshot, then one batch per
-   * committed change. The stream lives in memory, so a client that reconnects
-   * gets a fresh snapshot rather than a cursor.
+   * Board transcript SSE and owner-only diagnostic views. Diagnostic reconnects
+   * get a fresh full view; board reconnects resume from a transcript cursor.
    */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -360,13 +330,9 @@ export class HostedSession<
       return new Response("not found", { status: 404 });
 
     // The board's own thread stream: one `entry` frame per stored message,
-    // `id:` the entry's `seq` so the client's `?after=` resume skips what it
-    // already has. The engine's batches say "something changed", not "which
-    // entry"; the transcript is the authority, so a batch that can have
-    // committed or replaced entries re-reads it and emits whatever is past
-    // `last`. A partial-text batch reads nothing. The `master` frame is
-    // likewise re-sent when a batch changes the turn or queue facts, before any
-    // of that batch's preview text.
+    // `id:` the entry's `seq` so `?after=` resumes after the last receipt.
+    // View operations determine when to re-read the authoritative transcript
+    // or header. Partial generation updates need neither read.
     if (url.pathname === "/thread-stream") {
       // Raw thinking is an owner view; anything but an explicit owner reader
       // (set by the trusted HTTP adapter) gets none.
@@ -374,14 +340,65 @@ export class HostedSession<
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last =
         Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
-      // Attach the watch before reading anything else. The engine captures its
-      // snapshot and its registration for later commits atomically, so a run
-      // another participant starts while this connection is being set up is
-      // either already in the state read below or delivered as a batch: there
-      // is no window between a status read and the subscription in which a run
-      // starts unseen. A run that starts later is announced by the fresh
-      // `master` frame its batch sends before any of that run's preview text.
-      const stream = await this.harness.session().events();
+      // Observe every publication synchronously before attaching the async
+      // watch: its folded updates alone cannot preserve privacy quarantine.
+      const guard = new PreviewGuard();
+      const pi = await this.harness.pi();
+      let observerEnded = false;
+      let stopWatch: (() => void) | undefined;
+      const stopPreview = () => {
+        observerEnded = true;
+        stopWatch?.();
+      };
+      const observation = await pi.observeConversation(
+        ROOT_CONVERSATION_ID,
+        {
+          advance: (call) => {
+            if (call.kind === "failed" || call.retired) return stopPreview();
+            try {
+              guard.advance(call.value.docs["pi.live"] as LiveState | undefined);
+            } catch {
+              stopPreview();
+            }
+          },
+          end: stopPreview,
+        },
+        BACKGROUND_CONTEXT,
+      );
+      try {
+        guard.attach(observation.value.docs["pi.live"] as LiveState | undefined);
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      let watch;
+      try {
+        watch = await this.harness.session().watch();
+      } catch (error) {
+        observation.detach();
+        throw error;
+      }
+      stopWatch = () => { void watch.stop(); };
+      if (observerEnded) {
+        observation.detach();
+        await watch.stop();
+        return Response.json(
+          { ok: false, error: { code: "capability_unavailable", message: "The thread observation is unavailable." } },
+          { status: 503 },
+        );
+      }
+      const stream = {
+        value: watch.value,
+        start: watch.start.bind(watch),
+        stop: () => {
+          observation.detach();
+          return watch.stop();
+        },
+        closed: watch.closed.finally(() => {
+          stopWatch = undefined;
+          observation.detach();
+        }),
+      };
       // Read the projection now, at this connection's snapshot. A reconnect
       // reads the host's store again, so a connection never pins an older
       // revision/avatar/name over a newer committed edit; an unavailable,
@@ -409,7 +426,10 @@ export class HostedSession<
       // The watch snapshot can precede this independently read header. Never
       // attach one run's partial to another run's current turn.
       let masterOperation = master.operationId;
-      let previewOperation = this.previewOperation(stream.snapshot.run?.inputs);
+      const initialLive = stream.value.docs["pi.live"] as LiveState | undefined;
+      let previewOperation = this.previewOperation(initialLive?.run?.inputs);
+      let previewGeneration = initialLive?.run?.taskId;
+      let previewAttempt = initialLive?.generation?.attempt;
       let lastMasterFrame = masterFrame;
       // Read and project before SSE 200, so a failure refuses like the master
       // projection above rather than opening a body that errors and reconnects.
@@ -445,9 +465,10 @@ export class HostedSession<
         last = entry.seq;
         return true;
       }
-      const preview = new ThreadPreview();
+      let shownPreview: string | null = null;
       return sessionEventResponse(stream, {
         snapshot: (send, sendPreview) => {
+          if (observerEnded) return;
           // The board flips its link to `live` on a `master` frame and on
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
@@ -459,28 +480,18 @@ export class HostedSession<
           // header was read later. A queued successor may already be running.
           // Only show a partial whose engine submission proves the same turn.
           if (masterOperation !== null && previewOperation === masterOperation)
-            preview.applySnapshot(stream.snapshot);
-          sendPreview(preview.text);
+            shownPreview = guard.text(initialLive);
+          sendPreview(shownPreview);
         },
-        events: async (events, send, sendPreview) => {
-          const changes = engineBatchChanges(events);
-          // A turn or queue transition is announced before any transient text
-          // of the same batch, so a viewer that connected while the
-          // conversation was idle never renders preview bytes under an idle
-          // header. The turn facts are re-read from the engine rather than
-          // inferred from the event, so a frame reports only what the durable
-          // records prove; a repeated payload is not sent again, which keeps a
-          // slow reader from accumulating identical header frames. A failing
-          // read is not swallowed: it rejects the listener, which ends the
-          // watch and the stream, so the browser clears its preview and
-          // reconnects instead of keeping stale turn controls.
+        change: async (change, send, sendPreview) => {
+          const changes = engineViewChanges(change.ops);
+          const live = change.value.docs["pi.live"] as LiveState | undefined;
           if (changes.master) {
             const next = await this.composedMasterFrame(pinned);
+            if (observerEnded) return;
             if (next.operationId !== masterOperation) {
-              // Clear before the new header so an old preview is never painted
-              // under its successor, even when the consumer renders each frame.
-              if (preview.text !== null) sendPreview(null);
-              preview.reset();
+              if (shownPreview !== null) sendPreview(null);
+              shownPreview = null;
               masterOperation = next.operationId;
             }
             if (next.frame !== lastMasterFrame) {
@@ -488,79 +499,53 @@ export class HostedSession<
               if (!send(next.frame)) return;
             }
           }
-          // The engine reports run boundaries at the end of a commit batch.
-          // Its message changes describe the resulting view, so take the last
-          // boundary first; a replacement snapshot carries its own run.
-          let source = previewOperation;
-          for (const event of events) {
-            if (event.type === "snapshot")
-              source = this.previewOperation(event.run?.inputs);
-            else if (event.type === "run_start")
-              source = this.previewOperation(event.inputs);
-            else if (event.type === "run_end") source = null;
-          }
-          if (source !== previewOperation) {
-            if (preview.text !== null) sendPreview(null);
-            preview.reset();
+          const source = changes.master
+            ? this.previewOperation(live?.run?.inputs)
+            : previewOperation;
+          const generation = live?.run?.taskId;
+          const attempt = live?.generation?.attempt;
+          if (
+            source !== previewOperation ||
+            generation !== previewGeneration ||
+            attempt !== previewAttempt
+          ) {
+            if (shownPreview !== null) sendPreview(null);
+            shownPreview = null;
           }
           previewOperation = source;
-          const before = preview.text;
-          // Pi reports the resulting partial before the retiring run's
-          // committed entries. On a same-commit run replacement, retire those
-          // entries first so they cannot erase the successor's new partial.
-          const replacing =
-            events.some((event) => event.type === "run_end") &&
-            events.some((event) => event.type === "run_start");
-          const retired = (event: AgentEvent) =>
-            event.type === "message_end" ||
-            (event.type === "task_failed" && event.kind === "pi.generation");
-          const projected = replacing
-            ? [...events.filter(retired), ...events.filter((event) => !retired(event))]
-            : events;
-          const batch =
-            masterOperation !== null && source === masterOperation
-              ? preview.apply(projected)
-              : { current: null, latest: null };
-          // A committed predecessor can share a batch with its successor's
-          // partial. The browser retires a preview on a terminal entry, so
-          // reconcile entries first and then announce the current partial,
-          // even when its text did not change in this batch.
-          if (changes.entries)
-            for (const entry of await this.transcript(thinking))
-              if (!emit(entry, send)) break;
-          let shown = before;
-          if (batch.current !== null) {
-            if (batch.current !== before || changes.entries) {
-              sendPreview(batch.current);
-              shown = batch.current;
-            }
-          } else if (
-            !changes.entries &&
-            before !== null &&
-            batch.latest !== null &&
-            batch.latest !== before
-          ) {
-            sendPreview(batch.latest);
-            shown = batch.latest;
+          previewGeneration = generation;
+          previewAttempt = attempt;
+          const before = shownPreview;
+          // A predecessor's committed entry must precede a successor's partial.
+          if (changes.entries) {
+            const entries = await this.transcript(thinking);
+            if (observerEnded) return;
+            for (const entry of entries) if (!emit(entry, send)) break;
           }
-          // A committed answer replaces its transient text. Its clear follows
-          // the entry, while a successor's partial above stays visible.
-          if (batch.current === null && shown !== null) sendPreview(null);
+          if (observerEnded) return;
+          const current = masterOperation !== null && source === masterOperation
+            ? guard.text(live)
+            : null;
+          if (current !== null) {
+            if (current !== before || changes.entries) sendPreview(current);
+            shownPreview = current;
+          } else if (before !== null) {
+            sendPreview(null);
+            shownPreview = null;
+          }
         },
       }, { overflow: "after-cursor" });
     }
 
     if (url.pathname !== "/events")
       return new Response("not found", { status: 404 });
-    const stream = await this.harness.session().events();
+    const stream = await this.harness.session().watch();
     return sessionEventResponse(stream, {
       snapshot: (send) => {
-        send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
+        send(rawSessionFrame({ type: "snapshot", version: 1, view: stream.value }));
       },
-      events: async (events, send) => {
-        // A bounded response ends once its queue passes the mark; stop
-        // producing rather than stringifying events no one will receive.
-        for (const event of events) if (!send(rawSessionFrame(event))) break;
+      change: async (change, send) => {
+        send(rawSessionFrame({ type: "view", version: 1, view: change.value }));
       },
     });
   }
@@ -987,6 +972,29 @@ export class HostedSession<
         ? COMPACTION_FAILURE_TEXT
         : null,
     };
+  }
+
+  /**
+   * Inspect durable settlement without opening the engine or waking work.
+   * Absence is evidence only; the host must separately fence admission.
+   */
+  async settledOperation(operationId: string): Promise<OperationSettlement> {
+    const id = requireOperationId(operationId);
+    const conversation = String(ROOT_CONVERSATION_ID);
+    const settlement = readSubmissionSettlement(
+      this.ctx.storage.sql as unknown as TaskSql,
+      ROOT_CONVERSATION_ID,
+      id,
+    );
+    if (settlement.state === "settled")
+      return {
+        state: "settled",
+        operationId: id,
+        conversation,
+        submission: String(settlement.submission),
+        status: settlement.status,
+      };
+    return { state: settlement.state, operationId: id, conversation };
   }
 
   /**

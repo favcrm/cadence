@@ -131,6 +131,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "agent_profile_context",
     // CAD-2101: one stored profile with its revision.
     "agent_profile_show",
+    // CAD-2396: a hosted workspace's own skills. `check` validates and saves
+    // nothing.
+    "workspace_skill_list",
+    "workspace_skill_show",
+    "workspace_skill_check",
     "issue_ls",
     "issue_show",
     "issue_history",
@@ -187,6 +192,13 @@ pub const REMOTE_VERBS: &[&str] = &[
     // human owner and owns the field limits and the revision fence.
     "agent_profile_create",
     "agent_profile_update",
+    // CAD-2396: any cli.write caller saves a draft; approving one revision by
+    // digest, and revoking it, need a live human owner on the board.
+    "workspace_skill_draft",
+    "workspace_skill_approve",
+    "workspace_skill_revoke",
+    // agenticos-v2 #2147: owner-only, removes an unapproved skill.
+    "workspace_skill_delete",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
@@ -271,6 +283,9 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
         | "agent_roles"
         | "project_ls"
         | "project_timeline"
@@ -288,6 +303,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
         "project_new" | "agent_profile_create" | "agent_profile_update" => &["cli.write"],
+        "workspace_skill_draft"
+        | "workspace_skill_approve"
+        | "workspace_skill_revoke"
+        | "workspace_skill_delete" => &["cli.write"],
         // CAD-2001: attesting project eligibility or a principal's GitHub
         // identity decides whose verdicts count, so both writes need the same
         // `audit.approve` login as the merge approval — and the tenant admits
@@ -369,8 +388,11 @@ const RECONCILE_ISSUE_MESSAGES_READ: &str =
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
+const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved — read `workspace-skill show <name>` with the same explicit --org before repeating it; its latest revision says whether the draft landed";
+const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
@@ -418,6 +440,9 @@ fn cli_effect(verb: &str) -> Effect {
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
         | "issue_ls"
         | "issue_show"
         | "issue_history"
@@ -460,6 +485,10 @@ fn cli_effect(verb: &str) -> Effect {
         "project_new" => mutation(RECONCILE_PROJECT_NEW),
         "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
         "agent_profile_update" => mutation(RECONCILE_PROFILE_UPDATE),
+        "workspace_skill_draft" => mutation(RECONCILE_SKILL_DRAFT),
+        "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete" => {
+            mutation(RECONCILE_SKILL_DECISION)
+        }
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
         // `settings_agents` is refined per operation by [`call_effect`]; without
@@ -522,6 +551,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 // link, so its lost or unusable answer is a possible mutation; the
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 _ => cli_effect(verb),
             }
         }
@@ -759,6 +789,38 @@ pub fn connection_providers_answer(answer: &Value) -> bool {
     connection_rows(answer, "providers", connection_provider_row)
 }
 
+/// AOS-627: the strict `connected_effect` answer: `data` is exactly
+/// `{action_id, outcome, replayed, result?}`. It is the staged action's state,
+/// never a provider result.
+pub fn connected_effect_stage_answer(answer: &Value) -> bool {
+    let Some(data) = answer
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|_| answer.get("ok").and_then(Value::as_bool) == Some(true))
+    else {
+        return false;
+    };
+    data.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action_id" | "outcome" | "replayed" | "result"
+        )
+    }) && data
+        .get("action_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && matches!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("pending" | "applied" | "failed" | "denied")
+        )
+        && data.get("replayed").is_some_and(Value::is_boolean)
+        && data.get("result").is_none_or(Value::is_object)
+}
 pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
 }
@@ -857,8 +919,21 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
         return false;
     }
     match verb {
-        // The server allocates the id, so a create is bound by the project and
-        // title. The tenant trims both; the native route preserves the title.
+        // A keyed tenant create is correlated by its immutable request receipt:
+        // the current issue's title and project may have changed since creation.
+        "issue_new" if arguments.contains_key("request_id") => {
+            object("card")
+                && card_id == issue_id
+                && arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .zip(reply.get("request_id").and_then(Value::as_str))
+                    .is_some_and(|(sent, got)| sent == got)
+        }
+        // Unkeyed creates have no receipt, so bind the allocated id to the
+        // project and title. The tenant trims both; the native route preserves
+        // the title.
         "issue_new" => {
             let project = arguments
                 .get("project")
@@ -4646,6 +4721,62 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "capability_unavailable",
             "the board could not reach its profile store; nothing was read. Try again later",
         )),
+        // CAD-2396: workspace skills. A package refusal (`skill_refused`) is
+        // answered with its reason by `skill_refusal`, before this table.
+        (
+            "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete",
+            Some("not_permitted" | "unauthorized" | "owner_required"),
+        ) => Some((
+            "not_permitted",
+            "approving, revoking or deleting a workspace skill is a live human workspace \
+             owner's decision; this login is not one. Nothing was changed",
+        )),
+        (
+            "workspace_skill_show"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("not_found"),
+        ) => Some((
+            "not_found",
+            "this workspace has no such skill, or no such revision of it; nothing was read or \
+             changed",
+        )),
+        ("workspace_skill_approve" | "workspace_skill_revoke", Some("digest_mismatch")) => Some((
+            "digest_mismatch",
+            "the digest is not the one this decision needs — read `workspace-skill show` again \
+             and pass the digest it prints. Nothing was changed",
+        )),
+        ("workspace_skill_delete", Some("approved_skill")) => Some((
+            "approved_skill",
+            "that skill is approved, so agents may be reading it — revoke it first, then \
+             delete. Nothing was changed",
+        )),
+        ("workspace_skill_draft", Some("skill_limit")) => Some((
+            "skill_limit",
+            "this workspace holds the most skills it can; the owner deletes an unused one to \
+             make room, or draft a new revision of an existing skill. Nothing was written",
+        )),
+        ("workspace_skill_approve", Some("approved_limit")) => Some((
+            "approved_limit",
+            "this workspace already has the most approved skills an agent can list; revoke one \
+             first. Nothing was changed",
+        )),
+        (
+            "workspace_skill_list"
+            | "workspace_skill_show"
+            | "workspace_skill_check"
+            | "workspace_skill_draft"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value was not accepted, or this workspace's \
+             board predates workspace skills — if the values are right, update the board \
+             first. Nothing was written",
+        )),
         // CAD-1999: the hosted project registry's own typed refusals. A key
         // that already exists as a ticket-only project conflicts exactly like
         // a registered one; only the identical key+name+prefix is a reuse.
@@ -5544,13 +5675,69 @@ fn profile_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<Strin
     named && profile.get("revision").is_some_and(Value::is_u64)
 }
 
+/// CAD-2396: the board names why it refused a package, and the reason is the
+/// fix, so it is shown. `refusal_fields` keeps only a safe lowercase code; no
+/// package text is ever echoed.
+fn skill_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    reason: Option<&str>,
+) -> Option<Error> {
+    if !matches!(verb, "workspace_skill_check" | "workspace_skill_draft")
+        || code != Some("skill_refused")
+    {
+        return None;
+    }
+    let reason = reason.unwrap_or("unnamed");
+    Some(Error::invalid(
+        "skill_refused",
+        format!(
+            "the board refused the package: {reason} (skill_refused, HTTP {status}). Fix the \
+             package and run `workspace-skill check` again. Nothing was written"
+        ),
+    ))
+}
+
+/// CAD-2396: a workspace-skill write's 2xx names the skill it wrote. A draft
+/// carries the revision it saved; an approve carries exactly the approved
+/// revision and digest that were asked for; a revoke carries no approval.
+fn skill_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    // A delete answers `{name, deleted: true}` for exactly the skill it removed.
+    if verb == "workspace_skill_delete" {
+        return arguments.get("name").and_then(Value::as_str).is_some()
+            && reply.get("name") == arguments.get("name")
+            && reply.get("deleted") == Some(&Value::Bool(true));
+    }
+    let Some(skill) = reply.get("skill") else {
+        return false;
+    };
+    let name = arguments.get("name").and_then(Value::as_str);
+    if name.is_none() || skill.get("name").and_then(Value::as_str) != name {
+        return false;
+    }
+    match verb {
+        "workspace_skill_draft" => reply.get("revision").is_some_and(Value::is_u64),
+        "workspace_skill_approve" => {
+            let approved = skill.get("approved");
+            approved.and_then(|a| a.get("revision")) == arguments.get("revision")
+                && approved.and_then(|a| a.get("digest")) == arguments.get("digest")
+                && arguments.contains_key("revision")
+        }
+        "workspace_skill_revoke" => skill.get("approved").is_some_and(Value::is_null),
+        _ => false,
+    }
+}
+
 /// CAD-2101: a tenant board that predates the profile verbs answers
 /// `501 not_implemented` before it reads anything. Say to update the board,
 /// never that coordination is unavailable. A newer tenant behind an older
 /// control answers a bare `400 invalid_request`, which a bad value gets too,
 /// so that case is left to the verb's own refusal text.
 fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
-    if !verb.starts_with("agent_profile_") || status != 501 {
+    if !(verb.starts_with("agent_profile_") || verb.starts_with("workspace_skill_"))
+        || status != 501
+    {
         return None;
     }
     let nothing = if mutating_cli_verb(verb) {
@@ -5998,17 +6185,33 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let keyed_create = matches!(surface, Surface::Cli)
+        && verb == "issue_new"
+        && arguments.contains_key("request_id");
+    let identity_changed = || {
+        reject(
+            "retryable issue creation requires the same acting identity; this attempt was not \
+             run. If an earlier result is unknown, inspect the board before trying from a \
+             different agent or login",
+        )
+    };
+    if keyed_create && agent.is_some() && on_agent.is_none() {
+        return Err(identity_changed());
+    }
     let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
         let (agent_cred, from_cache) = match on_agent {
-            Some(slot) => match agent_credential::bearer(slot, target, dir, deadline, &note)? {
-                Some((credential, source)) => (
-                    Some(credential),
-                    matches!(source, agent_credential::Source::Cached),
-                ),
-                None => (None, false),
-            },
+            Some(slot) => {
+                match agent_credential::bearer(slot, target, dir, deadline, &note, !keyed_create)? {
+                    Some((credential, source)) => (
+                        Some(credential),
+                        matches!(source, agent_credential::Source::Cached),
+                    ),
+                    None if keyed_create => return Err(identity_changed()),
+                    None => (None, false),
+                }
+            }
             None => (None, false),
         };
         let using_agent = agent_cred.is_some();
@@ -6088,6 +6291,9 @@ fn call_verb_until_retry(
             _ => false,
         };
         if refused_agent {
+            if keyed_create {
+                return Err(identity_changed());
+            }
             if let Some(slot) = on_agent.take() {
                 slot.keep_login(&note, "this workspace has not been updated to accept it");
             }
@@ -6152,6 +6358,14 @@ fn call_verb_until_retry(
                 {
                     return Err(Error::unknown(format!(
                         "remote connected read returned no usable settled receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("connected_effect")
+                    if !body.as_ref().is_some_and(connected_effect_stage_answer) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected-effect stage returned no usable answer — {}",
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
@@ -6332,6 +6546,10 @@ fn call_verb_until_retry(
                 "agent_profile_create" | "agent_profile_update" => {
                     !profile_receipt_correlates(verb, reply, &arguments)
                 }
+                "workspace_skill_draft"
+                | "workspace_skill_approve"
+                | "workspace_skill_revoke"
+                | "workspace_skill_delete" => !skill_receipt_correlates(verb, reply, &arguments),
                 "document_submit" => !document_submit_receipt(reply),
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)
@@ -6356,6 +6574,7 @@ fn call_verb_until_retry(
             )));
         }
         let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
+        let refusal_reason = refusal_fields(body.as_ref()).1.map(str::to_owned);
         // A 5xx with no pre-forward proof may come from the platform *after*
         // the mutation was attempted: the write may have landed behind an
         // unanswerable reply, so it is an unknown outcome, never availability
@@ -6493,6 +6712,39 @@ fn call_verb_until_retry(
                  the hosted tenant server if it predates connected-read support",
             ));
         }
+        // AOS-627: the stage's refusals are named by the board (`not_allowlisted`,
+        // `connection_access_denied`, `capability_unavailable`, ...). The generic
+        // classification drops the code of a 403, 404 or 503, so print it here.
+        // A board that predates the operation refuses it as `invalid_request`.
+        // Only the stage's own pre-effect refusals are definite: 400/403/404/409,
+        // and the two 503 codes the board returns before staging. A 401 keeps its
+        // login remedy, a waking answer keeps its wake path, and any other 5xx
+        // stays an unknown outcome (the row may exist), reconciled by replaying
+        // the same stage.
+        if platform_operation == Some("connected_effect")
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+        {
+            let definite = match (status, refusal_code.as_deref()) {
+                (400 | 403 | 404 | 409, Some(code)) => Some(code),
+                (503, Some(code @ ("capability_unavailable" | "authority_unavailable"))) => {
+                    Some(code)
+                }
+                _ => None,
+            };
+            if let Some(code) = definite {
+                let hint = if code == "invalid_request" {
+                    " — check the input and connection, or update the hosted tenant server if \
+                     it predates connected-effect support"
+                } else {
+                    ""
+                };
+                return Err(reject(format!(
+                    "the stage was refused (HTTP {status}, {code}){hint}; nothing was staged \
+                     and nothing ran"
+                )));
+            }
+        }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
                 || (status == 400
@@ -6558,6 +6810,14 @@ fn call_verb_until_retry(
                 ));
             }
             Verdict::Done(Err(e)) => {
+                if let Some(error) = skill_refusal(
+                    verb,
+                    status,
+                    refusal_code.as_deref(),
+                    refusal_reason.as_deref(),
+                ) {
+                    return Err(error);
+                }
                 return Err(message_family_refusal(
                     verb,
                     status,

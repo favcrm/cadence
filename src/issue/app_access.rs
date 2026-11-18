@@ -115,7 +115,7 @@ fn capability_row(slot: &str, capability: &str, effect: &str, note: Option<&str>
 /// The "never" line: what the app CANNOT do, from what's absent.
 /// Absent a `send` effect: "Can't post or send anything". Personal
 /// data absence is stated per-access, not here.
-fn never_line(manifest: &Manifest) -> String {
+fn never_line(manifest: &Manifest, dated_reads: bool) -> String {
     let sends = manifest
         .capabilities
         .values()
@@ -131,7 +131,11 @@ fn never_line(manifest: &Manifest) -> String {
     if !drafts && !sends {
         clauses.push("can't act outside this workspace".to_string());
     }
-    clauses.push("can't see other apps' data".to_string());
+    // CAD-2379: an app that reads dates across apps no longer claims it
+    // cannot see other apps' data; its own row says what it does see.
+    if !dated_reads {
+        clauses.push("can't see other apps' data".to_string());
+    }
     clauses.push("your logins stay with Cadence; the app never sees a password".to_string());
     let mut line = String::new();
     for (index, clause) in clauses.iter().enumerate() {
@@ -157,13 +161,17 @@ fn capitalize(text: &str) -> String {
 /// The whole "What it can access" projection for one manifest: a row
 /// per declared capability slot, a row per legacy connection slot
 /// (untyped, still host-worded), a host-facts row when the app holds
-/// records, then the never-line. `notes` is `listing.access_notes`
-/// keyed by slot — appended under the host sentence, never replacing.
+/// records, a dates row when the app declares `calendar.query`
+/// (`dated_reads`, computed by the host from its screen packages), then the
+/// never-line. `notes` is `listing.access_notes` keyed by slot — appended
+/// under the host sentence, never replacing.
 pub fn access_rows(
     manifest: &Manifest,
     notes: Option<&serde_json::Map<String, Value>>,
     holds_records: bool,
     personal: bool,
+    dated_reads: bool,
+    routines_list: bool,
 ) -> Value {
     let mut rows = Vec::new();
     for (slot, need) in &manifest.capabilities {
@@ -189,8 +197,89 @@ pub fn access_rows(
             None,
         ));
     }
+    if dated_reads {
+        rows.push(row(
+            "cal",
+            "Dates across your apps",
+            "Sees dates from your apps and work: titles, times and status only",
+            Some(chip(Level::Warn, "Reads across apps")),
+            None,
+        ));
+    }
+    // CAD-2402: the host's own sentence for an app that lists routines. It
+    // reads names, schedules and status only, so it carries no warn chip.
+    if routines_list {
+        rows.push(row(
+            "clock",
+            "Routines",
+            "Lists your routines: names, schedules and status only",
+            None,
+            None,
+        ));
+    }
     json!({
         "access": rows,
-        "never": never_line(manifest),
+        "never": never_line(manifest, dated_reads),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        crate::issue::app::parse_manifest(
+            "---\napp: demo\ntitle: Demo\nversion: '0.1.0'\nneeds:\n  connections: []\nlisting:\n  tagline: t\n---\n\nbody\n",
+        )
+        .unwrap()
+    }
+
+    /// CAD-2379: an app that declares the dated read shows the host's row and
+    /// no never-line that contradicts it; any other app keeps both as before.
+    #[test]
+    fn a_dated_read_adds_its_row_and_drops_the_contradicting_never_line() {
+        let with = access_rows(&manifest(), None, false, false, true, false);
+        let rows = with["access"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["title"] == "Dates across your apps")
+            .expect("the dates row");
+        assert_eq!(
+            row["sentence"],
+            "Sees dates from your apps and work: titles, times and status only"
+        );
+        assert_eq!(row["chip"]["level"], "warn");
+        assert_eq!(row["chip"]["text"], "Reads across apps");
+        let never = with["never"].as_str().unwrap();
+        assert!(!never.contains("other apps"), "{never}");
+        assert!(never.contains("your logins stay with Cadence"), "{never}");
+
+        let without = access_rows(&manifest(), None, false, false, false, false);
+        assert!(!without["access"].to_string().contains("Dates across"));
+        assert!(without["never"]
+            .as_str()
+            .unwrap()
+            .contains("can't see other apps' data"));
+    }
+
+    /// CAD-2402: an app that declares `routines.list` shows the host's row,
+    /// worded exactly, with no warn chip; any other app shows none.
+    #[test]
+    fn a_routines_list_declaration_adds_its_row_with_no_chip() {
+        let with = access_rows(&manifest(), None, false, false, false, true);
+        let rows = with["access"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["title"] == "Routines")
+            .expect("the routines row");
+        assert_eq!(
+            row["sentence"],
+            "Lists your routines: names, schedules and status only"
+        );
+        assert!(row.get("chip").is_none_or(Value::is_null), "{row}");
+        let without = access_rows(&manifest(), None, false, false, false, false);
+        assert!(!without["access"]
+            .to_string()
+            .contains("Lists your routines"));
+    }
 }

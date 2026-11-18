@@ -1,7 +1,11 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { diffRevisions, type Op } from "@earendil-works/chord/delta";
+import type { JsonValue } from "@earendil-works/chord/json";
+import { Watch, type WatchCall } from "@earendil-works/chord/watch";
 import { describe, expect, it, mock } from "bun:test";
 import { BOARD_MESSAGE_KIND, type PendingOperation, type ThreadEntry } from "../src/contract.ts";
+import { MAX_PREVIEW_BLOCKS, MAX_PREVIEW_CHARS } from "../src/preview.ts";
 
 /**
  * CAD-2228 acceptance check. Authored by the independent checker, not by the
@@ -477,6 +481,39 @@ const scenarios: readonly Scenario[] = [
       { type: "text", text: `${EXPANDING}${BARE_SECRET}` },
     ],
   },
+  {
+    name: "request id split across distinct view publications",
+    attached: [],
+    batches: [
+      [
+        update(
+          { type: "text_start", contentIndex: 0, block: textBlock("") },
+          { type: "text_delta", contentIndex: 0, delta: PROSE },
+          { type: "block", contentIndex: 0, block: textBlock(PROSE) },
+        ),
+      ],
+      [
+        update(
+          { type: "text_start", contentIndex: 1, block: textBlock("") },
+          { type: "text_delta", contentIndex: 1, delta: "request_" },
+        ),
+      ],
+      [update({ type: "text_delta", contentIndex: 1, delta: "id: SECRET_SPLIT_" })],
+      [
+        update(
+          { type: "text_delta", contentIndex: 1, delta: "VIEW_5k6m" },
+          { type: "block", contentIndex: 1, block: textBlock("request_id: SECRET_SPLIT_VIEW_5k6m") },
+        ),
+      ],
+    ],
+    prose: PROSE,
+    withheld: ["request_id", "SECRET_SPLIT_", "VIEW_5k6m", "5k6m"],
+    finalText: `${PROSE}request_id: SECRET_SPLIT_VIEW_5k6m`,
+    committed: [
+      { type: "text", text: PROSE },
+      { type: "text", text: "request_id: SECRET_SPLIT_VIEW_5k6m" },
+    ],
+  },
 ];
 
 /** The one real method this check drives; everything else is stubbed. */
@@ -506,39 +543,12 @@ async function streamScenario(
   Session: { prototype: object },
   scenario: Scenario,
 ): Promise<Observation> {
-  const completion = Promise.withResolvers<{ reason: "session_closed" }>();
   const committed: ThreadEntry[] = [];
-  let deliver:
-    | ((events: readonly unknown[], context: unknown) => Promise<void>)
-    | undefined;
-
-  const watch = {
-    snapshot: {
-      type: "snapshot" as const,
-      entries: [],
-      // The snapshot is the in-flight turn of the operation this scenario runs
-      // as: its run input is the engine submission bound to that operation id.
-      run: { inputs: [PREVIEW_SUBMISSION] },
-      tools: [],
-      nestedTools: [],
-      compactions: [],
-      inbox: [],
-      agent: {},
-      usage: { models: {}, tools: {} },
-      generation: { attempt: 1, message: assistant(scenario.attached) },
-    },
-    closed: completion.promise,
-    start(
-      listener: (events: readonly unknown[], context: unknown) => Promise<void>,
-    ) {
-      deliver = listener;
-    },
-    async stop() {
-      const end = { reason: "cancelled" as const };
-      completion.resolve(end);
-      return end;
-    },
-  };
+  const connection = watchDouble({
+    ...idleSnapshot(),
+    run: { inputs: [PREVIEW_SUBMISSION] },
+    generation: { attempt: 1, message: assistant(scenario.attached) },
+  });
 
   // The session module was imported dynamically (the platform module has to be
   // mocked first), so the constructor arrives as an argument. `Object.create`
@@ -563,10 +573,14 @@ async function streamScenario(
     harness: {
       // The scenarios' message is written by a turn this conversation is
       // running, and the snapshot's run names the same operation.
+      pi: async () => ({
+        observeConversation: async (_id: unknown, observer: ScriptObserver) =>
+          connection.watch.observe(observer),
+      }),
       pending: async () => [
         { operationId: PREVIEW_OPERATION, status: "running" as const },
       ],
-      session: () => ({ id: "1", events: async () => watch }),
+      session: () => ({ id: "1", watch: async () => connection.watch }),
     },
     // The durable projection has its own tests; this check owns the stream
     // boundary, so the transcript the handler re-reads is scripted here.
@@ -580,9 +594,6 @@ async function streamScenario(
     throw new Error(`[${scenario.name}] the stream did not open: ${response.status}`);
   if (response.headers.get("content-type") !== "text/event-stream")
     throw new Error(`[${scenario.name}] the stream is not SSE`);
-  const send = deliver;
-  if (send === undefined)
-    throw new Error(`[${scenario.name}] the watch was never started`);
 
   // Read continuously, so the reader is never the slow one under test and
   // every enqueued byte is captured before the body closes.
@@ -650,9 +661,9 @@ async function streamScenario(
   for (const [index, batch] of batches.entries()) {
     committed.length = 0;
     committed.push(...(transcriptAt[index] ?? []));
-    await send(batch, BACKGROUND_CONTEXT);
+    await connection.send(batch);
   }
-  completion.resolve({ reason: "session_closed" });
+  connection.retire();
   await reading;
 
   const frames = parseFrames(chunks.join(""));
@@ -740,78 +751,215 @@ function inspect(observation: Observation, issues: string[]): void {
   }
 }
 
-/** How one watch ends, as `sessionEventResponse` reads it. */
+type ScriptRecord = Record<string, any>;
+type ScriptView = {
+  conversation: { id: number };
+  entries: ScriptRecord[];
+  docs: { "pi.live": ScriptRecord };
+};
 type WatchEnd =
-  | { readonly reason: "session_closed" | "cancelled" }
-  | { readonly reason: "session_failed"; readonly error: unknown };
-
+  | { readonly kind: "ended" | "stopped" }
+  | { readonly kind: "listener_error"; readonly error: Error };
 type WatchListener = (
-  events: readonly unknown[],
+  call: {
+    readonly kind: "value";
+    readonly value: ScriptView;
+    readonly ops: ReturnType<typeof diffRevisions>;
+    readonly retired: boolean;
+  },
   context: unknown,
 ) => Promise<void>;
-
-/**
- * A scripted engine watch: one connection's snapshot plus a handle that
- * delivers batches exactly as the durable engine publishes them. No network,
- * no model, no live service.
- */
 type WatchDouble = {
-  readonly snapshot: Record<string, unknown>;
+  readonly value: ScriptView;
   readonly closed: Promise<WatchEnd>;
   start(listener: WatchListener): void;
-  stop(): Promise<{ reason: "cancelled" }>;
+  stop(): Promise<WatchEnd>;
+  observe(observer: ScriptObserver): Promise<{
+    readonly value: ScriptView;
+    detach(): void;
+  }>;
 };
 
+type ScriptObserver = {
+  advance(call: Parameters<WatchListener>[0], context: unknown): void;
+  end(end: WatchEnd): void;
+};
+
+/** Make one immutable 1.5.2 view from the old fixture's initial snapshot. */
+function scriptView(snapshot: Record<string, unknown>): ScriptView {
+  const source = snapshot as ScriptRecord;
+  const live: ScriptRecord = {};
+  if (source.run !== undefined) {
+    const inputs = structuredClone(source.run.inputs) as number[];
+    live.run = { taskId: inputs[0] ?? 1, inputs, turns: 0 };
+  }
+  if (source.generation !== undefined)
+    live.generation = structuredClone(source.generation);
+  return {
+    conversation: { id: 1 },
+    entries: structuredClone(source.entries ?? []),
+    docs: { "pi.live": live },
+  };
+}
+
+/** Apply one old fixture batch as one resulting view publication. */
+function advanceScript(previous: ScriptView, events: readonly unknown[]): ScriptView {
+  const next = structuredClone(previous);
+  const live = next.docs["pi.live"];
+  const batch = events as readonly ScriptRecord[];
+  const previousInputs = JSON.stringify(live.run?.inputs ?? null);
+  let finalInputs: number[] | null | undefined;
+  let hasEnd = false;
+  let hasStart = false;
+  for (const event of batch) {
+    if (event.type === "run_start") {
+      finalInputs = structuredClone(event.inputs);
+      hasStart = true;
+    } else if (event.type === "run_end") {
+      finalInputs = null;
+      hasEnd = true;
+    }
+  }
+  // The live message in a batch describes its resulting run, not the run
+  // whose older entry may also be committed by the same publication.
+  if (finalInputs !== undefined) {
+    if (finalInputs === null) {
+      delete live.run;
+      delete live.generation;
+    } else {
+      if (JSON.stringify(finalInputs) !== previousInputs) delete live.generation;
+      live.run = { taskId: finalInputs[0] ?? 1, inputs: finalInputs, turns: 0 };
+    }
+  }
+  const replacing = hasEnd && hasStart && finalInputs !== null;
+  const ensureMessage = (): ScriptRecord => {
+    live.generation ??= { attempt: 1 };
+    live.generation.message ??= assistant([]);
+    return live.generation.message;
+  };
+  const appendEntry = (entry: ScriptRecord): void => {
+    if (!next.entries.some((existing) => existing.id === entry.id))
+      next.entries.push(structuredClone(entry));
+  };
+  for (const event of batch) {
+    switch (event.type) {
+      case "message_start":
+        ensureMessage();
+        live.generation.message = structuredClone(event.message);
+        break;
+      case "message_update": {
+        const message = ensureMessage();
+        for (const change of event.changes as ScriptRecord[]) {
+          const index = change.contentIndex as number;
+          if (change.type === "text_start" || change.type === "block") {
+            message.content[index] = structuredClone(change.block);
+          } else if (change.type === "text_delta") {
+            message.content[index].text += change.delta;
+          } else if (change.type === "thinking_delta") {
+            message.content[index].thinking += change.delta;
+          } else if (change.type === "toolcall_delta") {
+            let target = message.content[index].arguments as ScriptRecord;
+            const path = change.path as string[];
+            for (const key of path.slice(0, -1)) target = target[key] ??= {};
+            const key = path[path.length - 1]!;
+            target[key] = (target[key] ?? "") + change.delta;
+          } else {
+            throw new Error(`Unsupported scripted message change: ${change.type}`);
+          }
+        }
+        break;
+      }
+      case "message_end":
+        appendEntry(event.entry);
+        if (!replacing) delete live.generation;
+        break;
+      case "entry_appended":
+        appendEntry(event.entry);
+        break;
+      case "run_start":
+      case "run_end":
+      case "turn_end":
+      case "tool_execution_end":
+        break;
+      default:
+        throw new Error(`Unsupported scripted event: ${event.type}`);
+    }
+  }
+  return next;
+}
+
+/** Serialized scripted view watch, with buffered publications replayed first. */
 function watchDouble(
   snapshot: Record<string, unknown>,
   buffered: readonly (readonly unknown[])[] = [],
 ): {
   readonly watch: WatchDouble;
   send(events: readonly unknown[]): Promise<void>;
+  retireView(): Promise<void>;
   retire(): void;
 } {
   const completion = Promise.withResolvers<WatchEnd>();
+  let value = scriptView(snapshot);
   let deliver: WatchListener | undefined;
-  /**
-   * Deliveries are serialized, and batches the engine committed between this
-   * watch's atomic capture and the consumer's subscription are replayed first:
-   * that is the real order a reconnecting or slow listener sees, and it makes
-   * the wire order of this check deterministic.
-   */
   let queue: Promise<void> = Promise.resolve();
-  const enqueue = (events: readonly unknown[]): Promise<void> => {
+  let ended = false;
+  let observer: ScriptObserver | undefined;
+  const enqueue = (events: readonly unknown[], retired = false): Promise<void> => {
     queue = queue.then(async () => {
-      if (deliver === undefined)
-        throw new Error("The watch was never started.");
+      if (ended) return;
+      if (deliver === undefined) throw new Error("The watch was never started.");
+      const next = advanceScript(value, events);
+      const ops = diffRevisions(value as unknown as JsonValue, next as unknown as JsonValue);
+      value = next;
       try {
-        await deliver(events, BACKGROUND_CONTEXT);
-      } catch (error) {
-        // A listener failure ends the response exactly like the engine's own
-        // `session_failed`, so a reader never waits on a stream that will not
-        // produce another frame.
-        completion.resolve({ reason: "session_failed", error });
+        const call = { kind: "value" as const, value, ops, retired };
+        observer?.advance(call, BACKGROUND_CONTEXT);
+        await deliver(call, BACKGROUND_CONTEXT);
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        ended = true;
+        completion.resolve({ kind: "listener_error", error });
         throw error;
       }
     });
     return queue;
   };
-  return {
-    watch: {
-      snapshot,
-      closed: completion.promise,
-      start(listener) {
-        deliver = listener;
-        for (const events of buffered) void enqueue(events).catch(() => {});
-      },
-      async stop() {
-        const end = { reason: "cancelled" as const };
-        completion.resolve(end);
-        return end;
-      },
+  const watch: WatchDouble = {
+    get value() { return value; },
+    closed: completion.promise,
+    async observe(nextObserver) {
+      if (observer !== undefined) throw new Error("observer already attached");
+      observer = nextObserver;
+      const captured = value;
+      return {
+        value: captured,
+        detach() {
+          if (observer === nextObserver) observer = undefined;
+        },
+      };
     },
+    start(listener) {
+      deliver = listener;
+      for (const events of buffered) void enqueue(events).catch(() => {});
+    },
+    async stop() {
+      ended = true;
+      const end = { kind: "stopped" as const };
+      completion.resolve(end);
+      return end;
+    },
+  };
+  return {
+    watch,
     send: enqueue,
+    retireView() {
+      return enqueue([], true);
+    },
     retire() {
-      completion.resolve({ reason: "session_closed" });
+      ended = true;
+      observer?.end({ kind: "ended" });
+      observer = undefined;
+      completion.resolve({ kind: "ended" });
     },
   };
 }
@@ -995,10 +1143,14 @@ function boundarySession(
     },
     options: { modelAlias: "alias" },
     harness: {
+      pi: async () => ({
+        observeConversation: async (_id: unknown, observer: ScriptObserver) =>
+          script.connect().observe(observer),
+      }),
       pending: async () => script.pending(),
       session: () => ({
         id: "1",
-        events: async () => script.connect(),
+        watch: async () => script.connect(),
         busy: async () =>
           script.pending().some((operation) => operation.status === "running"),
       }),
@@ -1628,6 +1780,186 @@ describe("thread stream stale turn", () => {
   });
 });
 
+describe("thread stream retired view", () => {
+  it("ends instead of retaining or re-emitting a retired live preview", async () => {
+    // A static import is hoisted above the cloudflare:workers mock, which
+    // bun test cannot resolve.
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const privateText = "Previously live text that is private after retirement.";
+    const pending: PendingOperation[] = [
+      { operationId: "op-retired", status: "running" },
+    ];
+    const connection = watchDouble({
+      ...idleSnapshot(),
+      run: { inputs: [31] },
+      generation: {
+        attempt: 1,
+        message: assistant([{ type: "text", text: privateText }]),
+      },
+    });
+    const session = boundarySession(HostedSession, {
+      pending: () => pending,
+      connect: () => connection.watch,
+      transcript: () => [],
+      sql: engineTables([
+        { id: 31, operationId: "op-retired", text: "Ask for the run." },
+      ]),
+    });
+    const response = await session.fetch(new Request("https://board.test/thread-stream"));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let before = "";
+    // Positive control: consume the real active snapshot preview before the
+    // retirement call, rather than passing on a stream that never previews.
+    while (!parseFrames(before).some(
+      (frame) => frame.event === "preview" && previewText(frame) === privateText,
+    )) {
+      const part = await reader.read();
+      if (part.done) throw new Error("stream ended before the active preview");
+      before += decoder.decode(part.value, { stream: true });
+    }
+    expect(parseFrames(before).some(
+      (frame) => frame.event === "master" &&
+        turnMessage(frameBody(frame)) === "op-retired",
+    )).toBe(true);
+
+    // This is a *value call*, not watch.closed. Its value still contains the
+    // old message and its ops are empty. The stream must itself terminate or
+    // fail; manually ending the watch here would hide a failure to react.
+    await connection.retireView().catch(() => {});
+    const timeout = Promise.withResolvers<{ kind: "timeout"; after: string }>();
+    const timer = setTimeout(
+      () => timeout.resolve({ kind: "timeout", after: "" }),
+      1000,
+    );
+    const afterRead = (async () => {
+      let after = "";
+      try {
+        for (;;) {
+          const part = await reader.read();
+          if (part.done) return { kind: "closed" as const, after };
+          after += decoder.decode(part.value, { stream: true });
+        }
+      } catch {
+        return { kind: "failed" as const, after };
+      }
+    })();
+    const result = await Promise.race([afterRead, timeout.promise]);
+    clearTimeout(timer);
+    if (result.kind === "timeout") {
+      await reader.cancel();
+      throw new Error("retired view left the response open");
+    }
+    const afterFrames = parseFrames(result.after);
+    expect(afterFrames.some(
+      (frame) => frame.event === "preview" && previewText(frame) !== null,
+    )).toBe(false);
+    expect(result.after).not.toContain(privateText);
+  });
+});
+
+describe("thread stream full-view preview limits", () => {
+  it("caps the preview without splitting an astral character and keeps the whole committed answer", async () => {
+    // A static import is hoisted above the cloudflare:workers mock, which
+    // bun test cannot resolve.
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const filler = "x".repeat(MAX_PREVIEW_CHARS - PROSE.length - 1);
+    const tail = `${filler}😀after the cap`;
+    const finalText = `${PROSE}${tail}`;
+    const scenario: Scenario = {
+      name: "full-view character cap",
+      attached: [],
+      batches: [
+        [
+          update(
+            { type: "text_start", contentIndex: 0, block: textBlock("") },
+            { type: "text_delta", contentIndex: 0, delta: PROSE },
+            { type: "block", contentIndex: 0, block: textBlock(PROSE) },
+          ),
+        ],
+        [
+          update(
+            { type: "text_start", contentIndex: 1, block: textBlock("") },
+            { type: "text_delta", contentIndex: 1, delta: tail },
+            { type: "block", contentIndex: 1, block: textBlock(tail) },
+          ),
+        ],
+      ],
+      prose: PROSE,
+      withheld: [],
+      finalText,
+      committed: [
+        { type: "text", text: PROSE },
+        { type: "text", text: tail },
+      ],
+    };
+    const observation = await streamScenario(HostedSession, scenario);
+    const issues: string[] = [];
+    // The regular positive, ordering, clear, and durable-answer checks apply.
+    inspect(observation, issues);
+    expect(issues).toEqual([]);
+    const texts = observation.texts.filter((text): text is string => text !== null);
+    // This forces the cap boundary to bisect the surrogate pair and proves
+    // the overlong full view itself was previewed, not just its early prose.
+    expect(texts).toContain(`${PROSE}${filler}`);
+    for (const text of texts) {
+      expect(text.length).toBeLessThanOrEqual(MAX_PREVIEW_CHARS);
+      expect(text).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+      );
+    }
+  });
+
+  it("withholds an over-block-limit partial while committing its answer verbatim", async () => {
+    // A static import is hoisted above the cloudflare:workers mock, which
+    // bun test cannot resolve.
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const control: Scenario = {
+      name: "within-block-limit positive control",
+      attached: [{ type: "text", text: PROSE }],
+      batches: [],
+      prose: PROSE,
+      withheld: [],
+      finalText: PROSE,
+      committed: [{ type: "text", text: PROSE }],
+    };
+    const controlObservation = await streamScenario(HostedSession, control);
+    const issues: string[] = [];
+    inspect(controlObservation, issues);
+    expect(issues).toEqual([]);
+
+    const blocks: AssistantMessage["content"] = [
+      { type: "text", text: PROSE },
+      ...Array.from({ length: MAX_PREVIEW_BLOCKS }, () => ({
+        type: "thinking" as const,
+        thinking: "",
+      })),
+    ];
+    expect(blocks.length).toBe(MAX_PREVIEW_BLOCKS + 1);
+    const overflow: Scenario = {
+      name: "full-view block overflow",
+      attached: blocks,
+      batches: [],
+      prose: PROSE,
+      withheld: [],
+      finalText: PROSE,
+      committed: blocks,
+    };
+    const observation = await streamScenario(HostedSession, overflow);
+    expect(observation.frames.some(
+      (frame) => frame.event === "master" && isWorking(frameBody(frame)),
+    )).toBe(true);
+    expect(observation.texts.every((text) => text === null)).toBe(true);
+    const entry = observation.frames.find(
+      (frame) => frame.event === "entry" && frame.id === "1",
+    );
+    expect(entry).toBeDefined();
+    expect(entryText(entry!)).toBe(PROSE);
+  });
+});
+
 describe("thread stream in-flight preview", () => {
   it("previews eligible prose and never a token-bearing JSON confirmation in any streamed form, reasoning, or tool arguments", async () => {
     // The import has to be dynamic: a static one is hoisted above the
@@ -1642,4 +1974,365 @@ describe("thread stream in-flight preview", () => {
       inspect(await streamScenario(HostedSession, scenario), issues);
     expect(issues).toEqual([]);
   });
+});
+
+describe("thread stream folded watch privacy", () => {
+  for (const overflow of [false, true]) {
+    it(
+      overflow
+        ? "withholds a replaced secret after real PendingOps overflow"
+        : "withholds a replaced secret when real Watch folds revisions",
+      async () => {
+        const { HostedSession } = await import("../src/hosted-session.ts");
+        const secret = ["SECRET", "FOLDED", "4c7d"].join("_");
+        const unsafe = `${PROSE} {"confirm_token":"${secret}"}`;
+        const replacement = `${PROSE} ${secret}`;
+        const recovered = "A new generation streams ordinary prose.";
+        const input = 21;
+        const operation = "op-folded";
+
+        let value = scriptView({
+          ...idleSnapshot(),
+          entries: [{ id: 1 }],
+          run: { inputs: [input] },
+          generation: {
+            attempt: 1,
+            message: assistant([{ type: "text", text: PROSE }]),
+          },
+        });
+        let observer: ScriptObserver | undefined;
+        let detached = 0;
+        const reported: unknown[] = [];
+        const real = new Watch<ScriptView>(value, () => {}, (error) => {
+          reported.push(error);
+        });
+        const seen: WatchCall<ScriptView>[] = [];
+        const folded = Promise.withResolvers<WatchCall<ScriptView>>();
+        const resumed = Promise.withResolvers<void>();
+        const watch = {
+          get value() { return real.value; },
+          get closed() { return real.closed; },
+          stop: () => real.stop(),
+          start(listener: (call: WatchCall<ScriptView>, context: typeof BACKGROUND_CONTEXT) => Promise<void>) {
+            real.start(async (call, context) => {
+              seen.push(call);
+              await listener(call, context);
+              if (call.kind !== "value") return;
+              const text = call.value.docs["pi.live"].generation?.message?.content?.[0]?.text;
+              if (text === replacement) folded.resolve(call);
+              if (text === recovered) resumed.resolve();
+            });
+          },
+        };
+        const publish = (next: ScriptView, ops?: Op[]) => {
+          const changes = ops ?? diffRevisions(
+            value as unknown as JsonValue,
+            next as unknown as JsonValue,
+          );
+          value = next;
+          const call = { kind: "value" as const, value, ops: changes, retired: false };
+          // An actual pi observer sees each commit synchronously, before a
+          // serialized watch listener can fold it with another commit.
+          observer?.advance(call, BACKGROUND_CONTEXT);
+          real.advance(call, BACKGROUND_CONTEXT);
+        };
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let blockTranscript = false;
+        const session = Object.assign(Object.create(HostedSession.prototype), {
+          ctx: {
+            storage: {
+              get: async () => undefined,
+              sql: engineTables([{ id: input, operationId: operation, text: "Ask." }]),
+            },
+          },
+          options: { modelAlias: "alias" },
+          harness: {
+            pi: async () => ({
+              observeConversation: async (_id: unknown, nextObserver: ScriptObserver) => {
+                observer = nextObserver;
+                const captured = value;
+                return {
+                  value: captured,
+                  detach() {
+                    if (observer === nextObserver) {
+                      observer = undefined;
+                      detached += 1;
+                    }
+                  },
+                };
+              },
+            }),
+            pending: async () => [{ operationId: operation, status: "running" as const }],
+            session: () => ({ id: "1", watch: async () => watch }),
+          },
+          transcript: async () => {
+            if (blockTranscript) {
+              blockTranscript = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return [];
+          },
+        }) as BoundarySession;
+
+        const thread = await openThread(session);
+        try {
+          // Hold the *actual stream listener* inside its transcript read.
+          // The snapshot already positively controls an eligible preview.
+          blockTranscript = true;
+          const blockedRevision = structuredClone(value);
+          blockedRevision.entries = [{ id: 2 }];
+          publish(blockedRevision);
+          await entered.promise;
+
+          const first = structuredClone(value);
+          first.docs["pi.live"].generation.message = assistant([{ type: "text", text: unsafe }]);
+          publish(first);
+
+          if (overflow) {
+            // Splices are structural ops and cannot fold like repeated sets
+            // of one scalar. Each value matches its single-element splice.
+            for (let i = 0; i <= 10_000; i += 1) {
+              const next: ScriptView = {
+                ...value,
+                entries: [{ id: i % 2 === 0 ? 3 : 2 }],
+              };
+              publish(next, [["p", ["entries"], 0, 1, next.entries]]);
+            }
+          }
+
+          const second = structuredClone(value);
+          second.docs["pi.live"].generation.message = assistant([{ type: "text", text: replacement }]);
+          publish(second);
+          release.resolve();
+          const delivered = await folded.promise;
+          expect(delivered.kind).toBe("value");
+          if (delivered.kind !== "value") throw new Error("expected a value call");
+          expect(delivered.value.docs["pi.live"].generation.message.content[0].text).toBe(replacement);
+          expect(seen.some((call) => call.kind === "value" &&
+            call.value.docs["pi.live"].generation?.message?.content?.[0]?.text === unsafe)).toBe(false);
+          if (overflow) expect(delivered.ops[0]?.[0]).toBe("r");
+
+          // A distinct generation must be able to preview again; withholding
+          // all later text is not a privacy fix.
+          const nextGeneration = structuredClone(value);
+          nextGeneration.docs["pi.live"].run.taskId += 1;
+          nextGeneration.docs["pi.live"].generation.message = assistant([{ type: "text", text: recovered }]);
+          publish(nextGeneration);
+          await resumed.promise;
+          real.end({ kind: "ended" });
+          const frames = await thread.frames();
+          const texts = frames.filter((frame) => frame.event === "preview").map(previewText);
+          expect(texts).toContain(PROSE);
+          expect(texts).toContain(recovered);
+          for (const text of texts) {
+            expect(text ?? "").not.toContain(secret);
+            expect(text ?? "").not.toContain("confirm_token");
+          }
+          expect(reported).toEqual([]);
+          expect(detached).toBe(1);
+        } finally {
+          release.resolve();
+          await real.stop();
+        }
+      },
+    );
+  }
+});
+
+/** Real watch plus synchronous observation with controllable attachment timing. */
+function observerLifecycleFixture(
+  Session: { prototype: object },
+  options: { early?: boolean; setupFailure?: "watch" | "transcript" } = {},
+) {
+  const input = 21;
+  const operation = "op-observer";
+  const secret = "SECRET_EARLY_42";
+  const recovered = "Fresh generation preview after attachment.";
+  let value = scriptView({
+    ...idleSnapshot(),
+    run: { inputs: [input] },
+    generation: {
+      attempt: 1,
+      message: assistant([{ type: "text", text: PROSE }]),
+    },
+  });
+  let observer: ScriptObserver | undefined;
+  let real: Watch<ScriptView> | undefined;
+  let detaches = 0;
+  let advances = 0;
+  const recoveredDelivery = Promise.withResolvers<void>();
+
+  const publish = (next: ScriptView) => {
+    const ops = diffRevisions(value as unknown as JsonValue, next as unknown as JsonValue);
+    value = next;
+    const call = { kind: "value" as const, value, ops, retired: false };
+    if (observer !== undefined) {
+      advances += 1;
+      observer.advance(call, BACKGROUND_CONTEXT);
+    }
+    real?.advance(call, BACKGROUND_CONTEXT);
+  };
+  const publishText = (text: string, nextTask = false) => {
+    const next = structuredClone(value);
+    if (nextTask) next.docs["pi.live"].run.taskId += 1;
+    next.docs["pi.live"].generation.message = assistant([{ type: "text", text }]);
+    publish(next);
+  };
+
+  const session = Object.assign(Object.create(Session.prototype), {
+    ctx: {
+      storage: {
+        get: async () => undefined,
+        sql: engineTables([{ id: input, operationId: operation, text: "Ask." }]),
+      },
+    },
+    options: { modelAlias: "alias" },
+    harness: {
+      pi: async () => ({
+        observeConversation: async (_id: unknown, nextObserver: ScriptObserver) => {
+          observer = nextObserver;
+          // Durable captures this value atomically, but callbacks can run
+          // before the returned promise resolves.
+          const captured = value;
+          if (options.early) {
+            publishText(`${PROSE} {"confirm_token":"${secret}"}`);
+            publishText(`${PROSE} ${secret}`);
+          }
+          return {
+            value: captured,
+            detach() {
+              if (observer === nextObserver) {
+                observer = undefined;
+                detaches += 1;
+              }
+            },
+          };
+        },
+      }),
+      pending: async () => [{ operationId: operation, status: "running" as const }],
+      session: () => ({
+        id: "1",
+        watch: async () => {
+          if (options.setupFailure === "watch") throw new Error("watch unavailable");
+          real = new Watch<ScriptView>(value, () => {}, () => {});
+          const actual = real;
+          return {
+            get value() { return actual.value; },
+            get closed() { return actual.closed; },
+            stop: () => actual.stop(),
+            start(listener: (call: WatchCall<ScriptView>, context: typeof BACKGROUND_CONTEXT) => Promise<void>) {
+              actual.start(async (call, context) => {
+                await listener(call, context);
+                if (call.kind === "value" &&
+                    call.value.docs["pi.live"].generation?.message?.content?.[0]?.text === recovered)
+                  recoveredDelivery.resolve();
+              });
+            },
+          };
+        },
+      }),
+    },
+    transcript: async () => {
+      if (options.setupFailure === "transcript") throw new Error("transcript unavailable");
+      return [];
+    },
+  }) as BoundarySession;
+
+  return {
+    session, secret, recovered, publishText,
+    recoveredDelivery: recoveredDelivery.promise,
+    detaches: () => detaches,
+    advances: () => advances,
+    watch: () => {
+      if (real === undefined) throw new Error("watch was not acquired");
+      return real;
+    },
+  };
+}
+
+/** Consume until the positive snapshot control is actually on the wire. */
+async function readSnapshotPreview(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  const decoder = new TextDecoder();
+  let wire = "";
+  while (!parseFrames(wire).some((frame) =>
+    frame.event === "preview" && previewText(frame) === PROSE)) {
+    const part = await reader.read();
+    if (part.done) throw new Error("stream ended before the positive preview");
+    wire += decoder.decode(part.value, { stream: true });
+  }
+}
+
+describe("thread stream observer attachment and cleanup", () => {
+  it("does not overwrite an early observer callback and resumes on a new generation", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession, { early: true });
+    const thread = await openThread(fixture.session);
+    try {
+      expect(fixture.advances()).toBe(2);
+      fixture.publishText(fixture.recovered, true);
+      await fixture.recoveredDelivery;
+      fixture.watch().end({ kind: "ended" });
+      const frames = await thread.frames();
+      const previews = frames.filter((frame) => frame.event === "preview").map(previewText);
+      // The safe new generation is a positive control; the earlier generation
+      // was observed before the attachment promise resolved and is withheld.
+      expect(previews).toContain(fixture.recovered);
+      for (const text of previews) {
+        expect(text ?? "").not.toContain(fixture.secret);
+        expect(text ?? "").not.toContain("confirm_token");
+      }
+      expect(fixture.detaches()).toBe(1);
+    } finally {
+      await fixture.watch().stop();
+    }
+  });
+
+  it("detaches the observer when the client cancels", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession);
+    const response = await fixture.session.fetch(new Request("https://board.test/thread-stream"));
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    await readSnapshotPreview(reader);
+    await reader.cancel();
+    expect(fixture.detaches()).toBe(1);
+    const before = fixture.advances();
+    fixture.publishText("A publication after detach.");
+    expect(fixture.advances()).toBe(before);
+  });
+
+  it("detaches the observer and fails the body when the watch fails", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+    const fixture = observerLifecycleFixture(HostedSession);
+    const response = await fixture.session.fetch(new Request("https://board.test/thread-stream"));
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    await readSnapshotPreview(reader);
+    fixture.watch().end({ kind: "failed", error: new Error("watch failed") });
+    await expect(reader.read()).rejects.toThrow("watch failed");
+    expect(fixture.detaches()).toBe(1);
+    const before = fixture.advances();
+    fixture.publishText("A publication after failure.");
+    expect(fixture.advances()).toBe(before);
+  });
+
+  for (const setupFailure of ["watch", "transcript"] as const) {
+    it(`detaches the observer on ${setupFailure} setup failure`, async () => {
+      const { HostedSession } = await import("../src/hosted-session.ts");
+      const fixture = observerLifecycleFixture(HostedSession, { setupFailure });
+      const request = new Request("https://board.test/thread-stream");
+      if (setupFailure === "watch") {
+        await expect(fixture.session.fetch(request)).rejects.toThrow("watch unavailable");
+      } else {
+        const response = await fixture.session.fetch(request);
+        expect(response.status).toBe(503);
+      }
+      expect(fixture.detaches()).toBe(1);
+      const before = fixture.advances();
+      fixture.publishText("A publication after setup failure.");
+      expect(fixture.advances()).toBe(before);
+    });
+  }
 });

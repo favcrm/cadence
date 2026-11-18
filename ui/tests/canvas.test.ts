@@ -90,33 +90,30 @@ equal([canvasSnapshot().open, canvasSnapshot().tabs.length], [false, 0], "switch
 
 // Geometry: the chat keeps its room on each surface; cover never lies over it.
 equal(drawerLayout(1440, 480, "home", null), { mode: "push", width: 480 }, "home pushes at desktop");
-equal(drawerLayout(1440, 480, "app", 700), { mode: "push", width: 480 }, "app pushes at desktop");
+equal(drawerLayout(1440, 480, "app", { left: 208, right: 1100 }), { mode: "cover", width: 480, right: 340 }, "app canvas ends before the right assistant");
 equal(drawerLayout(900, 480, "home", null), { mode: "push", width: 480 }, "home still pushes at 900 (chat keeps 420)");
-// Tablet app shell: the chat pane is narrowed to 352px, the drawer covers beside it.
-equal(drawerLayout(900, 480, "app", 860), { mode: "cover", width: 480 }, "app at 900 covers beside the narrowed chat");
-equal(drawerLayout(768, 480, "app", 752), { mode: "cover", width: 388 }, "app at 768 covers with what is left of the chat");
-equal(drawerLayout(639, 480, "app", 623).mode, "sheet", "a phone gets the sheet");
-equal(drawerLayout(660, 480, "app", 644).mode, "sheet", "too narrow to keep 320px of chat beside 360px of canvas: sheet");
-equal(drawerLayout(1100, 660, "app", 700), { mode: "cover", width: 388 }, "app cover stops at the chat's right edge");
+equal(drawerLayout(900, 480, "app", null), { mode: "sheet", width: 900 }, "a narrow app canvas uses a sheet");
+equal(drawerLayout(768, 480, "app", null), { mode: "sheet", width: 768 }, "tablet app chat remains reachable through the sheet back control");
+equal(drawerLayout(639, 480, "app", null).mode, "sheet", "a phone gets the sheet");
+equal(drawerLayout(660, 480, "app", null).mode, "sheet", "a narrow app does not force three columns");
+equal(drawerLayout(1100, 660, "app", { left: 208, right: 760 }), { mode: "cover", width: 552, right: 340 }, "app canvas width is bounded by the workspace");
 equal(drawerLayout(1100, 660, "home", null), { mode: "cover", width: 544 }, "home cover keeps the chat's first 320px");
 equal(drawerLayout(375, 480, "home", null).mode, "sheet", "phone sheet");
 // No chat pane in the page (navigated away from the app): never a desktop sheet.
 equal(drawerLayout(1280, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 1280 covers");
-equal(drawerLayout(900, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 900 covers");
+equal(drawerLayout(900, 480, "app", null), { mode: "sheet", width: 900 }, "an app canvas remains a sheet at narrow widths");
 equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app, no chat pane, narrow room covers by the page rule");
 // Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
 equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
 equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
-// Expand: cover taking most of the page, leaving a ~64px chat strip. The app shell keeps the chat pane's edge when that gains 96px or more; otherwise it covers the pane down to the strip.
+// Home expansion keeps its chat strip; app expansion fills only the workspace.
 equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1136 }, "home expands beside a chat strip");
-equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand keeps the chat pane edge when it gains 96px or more");
-equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900 stays beside the narrowed chat");
+equal(drawerLayout(1440, 480, "app", { left: 208, right: 1100 }, true), { mode: "cover", width: 892, right: 340 }, "expanded app canvas leaves the full assistant accessible");
+equal(drawerLayout(900, 480, "app", null, true).mode, "sheet", "narrow app expansion retains the sheet");
 equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
-// Expand never does nothing: where the chat pane's edge leaves no more room than cover has, it covers the chat down to the strip.
-const crmCover = drawerLayout(1280, 704, "app", 640);
-const crmExpand = drawerLayout(1280, 704, "app", 640, true);
-equal([crmCover.width, crmExpand.width > crmCover.width + 96], [628, true], "expand widens a drawer already at the chat pane's edge (1280)");
-equal(drawerLayout(900, 560, "app", 860, true).width > drawerLayout(900, 560, "app", 860).width, true, "expand widens at 900 too");
+const crmCover = drawerLayout(1280, 480, "app", { left: 208, right: 940 });
+const crmExpand = drawerLayout(1280, 480, "app", { left: 208, right: 940 }, true);
+equal([crmCover.width, crmExpand.width], [480, 732], "app expansion uses remaining workspace without covering chat");
 // A document kind keeps its 560px floor at 900; the cap follows the floor.
 equal([defaultWidthFor("csv", 900), defaultWidthFor("md", 900), defaultWidthFor("html", 1280)], [560, 480, 704], "default widths hold their floors at 900");
 equal(clampWidth(100, 900, 560), 560, "a floor lifts the minimum");

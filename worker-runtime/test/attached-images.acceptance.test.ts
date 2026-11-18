@@ -251,6 +251,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
     async run(sql: string, ...params: SqliteValue[]) {
       database.prepare(sql).run(...(params as never[]));
     },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       const row = database.prepare(sql).get(...(params as never[])) as
         | T

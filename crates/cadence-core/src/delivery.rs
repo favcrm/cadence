@@ -147,8 +147,9 @@ pub struct RiskWhen {
     /// Repo-relative, file-level globs — the same grammar as the
     /// `areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):
     /// `*` and `?` match inside one segment, a `**` segment any number,
-    /// a trailing `/` everything under it. Slice 3 matches them with
-    /// `areas::matches`, so the two grammars must agree.
+    /// a trailing `/` everything under it, and a glob without wildcards
+    /// is a file or a directory covering everything under it. Matched with
+    /// [`crate::delivery_rules::area_match`], the same function as `areas:`.
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]

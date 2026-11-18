@@ -1193,6 +1193,8 @@ jobs:
             scripts/install.sh
             ui/package.json
             ui/app-kit/
+            app-toolchain/template/
+            app-toolchain/checklist/
           sparse-checkout-cone-mode: false
           path: src
           persist-credentials: false
@@ -1223,10 +1225,19 @@ jobs:
           app_kit_files = ("README.md", "package.json", "src/forms.mjs", "src/index.mjs",
                            "src/react.mjs", "src/receiver.mjs", "src/refusal.mjs",
                            "types/index.d.ts", "types/react.d.ts")
+          template_files = ("README.md", "package.json", "preview.html", "app/app.md",
+                            "app/workflows/hello.md", "scripts/build.mjs", "scripts/dev-preview.mjs",
+                            "scripts/package.mjs", "scripts/pre-push", "src/main.js",
+                            "src/styles.css", "tests/template.test.mjs")
+          checklist_files = ("README.md", "package.json", "app/app.md", "app/app-storage.json",
+                             "app/storage/001-tasks.json", "app/workflows/plan.md",
+                             "src/main.js", "src/styles.css")
           expected = {
               "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
               "frame-kit/metadata.json", "package.json", "bun.lock", "toolchain.json",
               *(f"app-kit/{relative}" for relative in app_kit_files),
+              *(f"template/{relative}" for relative in template_files),
+              *(f"checklist/{relative}" for relative in checklist_files),
           }
           if not re.fullmatch(r"v[0-9][0-9A-Za-z.+_-]*", tag) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
               raise SystemExit("invalid release tag or source commit")
@@ -1245,6 +1256,10 @@ jobs:
                   relative: tar.extractfile(f"app-kit/{relative}").read()
                   for relative in app_kit_files
               }
+              archived_examples = {
+                  group: {relative: tar.extractfile(f"{group}/{relative}").read() for relative in files}
+                  for group, files in (("template", template_files), ("checklist", checklist_files))
+              }
           ui = json.load(open(ui_manifest_path, encoding="utf-8"))
           ui_pins = {**ui["dependencies"], **ui["devDependencies"]}
           pin_names = ("react", "react-dom", "vite", "@vitejs/plugin-react")
@@ -1258,13 +1273,24 @@ jobs:
               if archived_app_kit[relative] != (app_kit_dir / relative).read_bytes():
                   raise SystemExit(f"app-kit archive bytes differ from source: {relative}")
           app_kit_version = json.loads((app_kit_dir / "package.json").read_text())["version"]
+          example_hashes = {}
+          for group, files in (("template", template_files), ("checklist", checklist_files)):
+              source_dir = Path(ui_manifest_path).parent.parent / "app-toolchain" / group
+              example_hashes[group] = {}
+              for relative in files:
+                  source = (source_dir / relative).read_bytes()
+                  if archived_examples[group][relative] != source:
+                      raise SystemExit(f"{group} archive bytes differ from source: {relative}")
+                  example_hashes[group][relative] = hashlib.sha256(source).hexdigest()
           manager = ui.get("packageManager")
           if not isinstance(manager, str) or not re.fullmatch(r"bun@[0-9]+(?:\.[0-9]+){2}", manager):
               raise SystemExit("UI package manager must be an exact bun major.minor.patch version")
           if metadata != {"schema": "cadence-app-toolchain/1", "tag": tag,
                           "source_sha": source_sha, "package_manager": manager, "pins": pins,
-                          "app_kit": {"version": app_kit_version, "files": app_kit_hashes}}:
-              raise SystemExit("app-toolchain version, source, schema, package manager, pins or app-kit do not match")
+                          "app_kit": {"version": app_kit_version, "files": app_kit_hashes},
+                          "template": {"files": example_hashes["template"]},
+                          "checklist": {"files": example_hashes["checklist"]}}:
+              raise SystemExit("app-toolchain metadata or source bytes do not match")
           expected_package = {
               "name": "cadence-app-toolchain", "private": True,
               "version": tag[1:], "type": "module", "packageManager": manager,

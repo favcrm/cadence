@@ -67,21 +67,6 @@ impl Drop for Rig {
     }
 }
 
-/// Block SIGCHLD on the test thread (inherited by spawned daemon/board threads)
-/// so child `git` exits cannot interrupt timed `ureq` socket reads with EINTR.
-fn block_sigchld() {
-    // SAFETY: local signal set applied to the calling thread's mask.
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGCHLD);
-        assert_eq!(
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
-            0
-        );
-    }
-}
-
 fn start() -> Rig {
     block_sigchld();
     let dir = tempfile::Builder::new()

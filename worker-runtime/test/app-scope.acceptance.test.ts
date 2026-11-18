@@ -294,6 +294,9 @@ function sqliteFacade(database: Database): SqliteDatabase {
     async run(sql: string, ...params: SqliteValue[]) {
       database.prepare(sql).run(...(params as never[]));
     },
+    async runCounted(sql: string, ...params: SqliteValue[]) {
+      return Number(database.prepare(sql).run(...(params as never[])).changes);
+    },
     async get<T extends object>(sql: string, ...params: SqliteValue[]) {
       // The portable facade answers `undefined` for no row; Bun's `get`
       // answers `null`. The engine branches on `undefined`, so translate.
@@ -2326,4 +2329,301 @@ describe("session wiring", () => {
     expect(() => parseEntryAppScope(BOARD_MESSAGE_KIND, undefined)).toThrow();
     database.close();
   });
+});
+
+describe("no-wake settlement acceptance", () => {
+  it("proves only unambiguous, idle settlement without opening the session", async () => {
+    const { database } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged");
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const engine = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    let engineClosed = false;
+    try {
+      const root = await engine.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      expect(root.id).toBe(1);
+      const first = await root.submit(
+        { type: "input", requestId: "op-finished", content: "first" },
+        BACKGROUND_CONTEXT,
+      );
+      await scripted.started;
+      scripted.release();
+      expect((await first.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await engine.waitForIdle(BACKGROUND_CONTEXT);
+
+      // Construct a separate, cold HostedSession over the engine's SQLite.
+      // Any path via its PiHarness (including pi(), pending(), session(), or
+      // a wake/resume path) throws; the real inspection must use storage only.
+      const session = (await constructedSession(database, { tools: [] })) as unknown as {
+        settledOperation(id: string): Promise<
+          | { state: "settled"; operationId: string; conversation: string; submission: string; status: "done" | "unanswered" }
+          | { state: "absent" | "unknown"; operationId: string; conversation: string }
+        >;
+      };
+      Object.defineProperty(session, "harness", {
+        get() { throw new Error("settlement opened the engine"); },
+      });
+      const rows = () => ({
+        submissions: database.prepare("SELECT * FROM pi_submissions ORDER BY id").all(),
+        tasks: database.prepare("SELECT * FROM pi_tasks ORDER BY id").all(),
+      });
+      const changes = () => (database.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+      const inspect = async (id: string) => {
+        const before = rows();
+        const writes = changes();
+        const requests = scripted.requests.length;
+        const result = await session.settledOperation(id);
+        expect(rows()).toEqual(before);
+        expect(changes()).toBe(writes);
+        expect(scripted.requests.length).toBe(requests);
+        return result;
+      };
+
+      const proof = await inspect("op-finished");
+      expect(proof.state).toBe("settled");
+      if (proof.state !== "settled") throw new Error("expected settlement");
+      expect(proof.operationId).toBe("op-finished");
+      expect(proof.conversation).toBe("1");
+      expect(proof.status).toBe("done");
+      expect(Number.isSafeInteger(Number(proof.submission))).toBe(true);
+      expect(Number(proof.submission)).toBeGreaterThan(0);
+      expect(String(Number(proof.submission))).toBe(proof.submission);
+      const stored = database.prepare(
+        "SELECT id FROM pi_submissions WHERE conversation_id=? AND request_id=?",
+      ).get(1, JSON.stringify("op-finished")) as { id: number };
+      expect(proof.submission).toBe(String(stored.id));
+      // Absence is evidence only, not the host's separate dispatch refusal.
+      expect(await inspect("op-missing")).toEqual({
+        state: "absent", operationId: "op-missing", conversation: "1",
+      });
+
+      // Hold a real provider request and queue another input. Neither a
+      // terminal id nor an absent id is safe while any work is outstanding.
+      const started = scripted.hold();
+      await root.submit(
+        { type: "input", requestId: "op-live", content: "hold" },
+        BACKGROUND_CONTEXT,
+      );
+      await started;
+      const queued = await root.submit(
+        { type: "input", requestId: "op-queued", content: "queued" },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await queued.status(BACKGROUND_CONTEXT)).status).toBe("queued");
+      expect((database.prepare("SELECT COUNT(*) AS n FROM pi_tasks WHERE status <> 'terminal'").get() as { n: number }).n).toBeGreaterThan(0);
+      for (const id of ["op-finished", "op-missing", "op-live", "op-queued"]) {
+        expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+      }
+      // Withdraw a real queued input while the provider gate prevents placement.
+      const withdrawn = await root.submit(
+        { type: "input", requestId: "op-withdrawn", content: "withdraw" },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await withdrawn.status(BACKGROUND_CONTEXT)).status).toBe("queued");
+      expect(await withdrawn.abort(BACKGROUND_CONTEXT)).toBe("aborted");
+      expect((await withdrawn.wait(BACKGROUND_CONTEXT)).status).toBe("unanswered");
+      scripted.release();
+      expect((await queued.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await engine.waitForIdle(BACKGROUND_CONTEXT);
+
+      const withdrawnProof = await inspect("op-withdrawn");
+      expect(withdrawnProof).toEqual({
+        state: "settled",
+        operationId: "op-withdrawn",
+        conversation: "1",
+        submission: String(withdrawn.id),
+        status: "unanswered",
+      });
+
+      // Two durable rows with the same engine deduplication key are
+      // ambiguous even when the original row is a valid terminal submission.
+      database.prepare(
+        `INSERT INTO pi_submissions (id, conversation_id, request_id, status, record)
+         SELECT id + 1000000, conversation_id, request_id, status, record
+           FROM pi_submissions WHERE id=?`,
+      ).run(stored.id);
+      expect(await inspect("op-finished")).toEqual({
+        state: "unknown", operationId: "op-finished", conversation: "1",
+      });
+      database.prepare("DELETE FROM pi_submissions WHERE id=?").run(stored.id + 1000000);
+
+      // An independently malformed body also cannot prove the indexed key.
+      const original = (database.prepare("SELECT record FROM pi_submissions WHERE id=?").get(stored.id) as { record: string }).record;
+      database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.requestId', ?) WHERE id=?").run("different-id", stored.id);
+      expect(await inspect("op-finished")).toEqual({
+        state: "unknown", operationId: "op-finished", conversation: "1",
+      });
+      database.prepare("UPDATE pi_submissions SET record=? WHERE id=?").run(original, stored.id);
+
+      // A terminal status alone is not a complete finished input record.
+      const decoded = JSON.parse(original) as { entry?: unknown; answer?: unknown };
+      for (const field of ["entry", "answer"] as const) {
+        expect(typeof decoded[field]).toBe("number");
+        expect(Number.isSafeInteger(Number(decoded[field]))).toBe(true);
+        expect(Number(decoded[field])).toBeGreaterThan(0);
+        database.prepare("UPDATE pi_submissions SET record=json_remove(record, ?) WHERE id=?").run(`$.${field}`, stored.id);
+        expect(await inspect("op-finished")).toEqual({
+          state: "unknown", operationId: "op-finished", conversation: "1",
+        });
+        database.prepare("UPDATE pi_submissions SET record=? WHERE id=?").run(original, stored.id);
+      }
+
+      // The requested id remains in the body but is no longer indexed under
+      // that id. The missing index match must not become a false absence.
+      database.prepare("UPDATE pi_submissions SET request_id=? WHERE id=?").run(JSON.stringify("different-index"), stored.id);
+      expect(await inspect("op-finished")).toEqual({
+        state: "unknown", operationId: "op-finished", conversation: "1",
+      });
+      database.prepare("UPDATE pi_submissions SET request_id=? WHERE id=?").run(JSON.stringify("op-finished"), stored.id);
+
+      // Positive entry ids alone are not evidence that the input and answer
+      // entries exist or belong to this submission's root conversation.
+      for (const field of ["entry", "answer"] as const) {
+        const entryId = Number(decoded[field]);
+        const entry = database.prepare(
+          "SELECT conversation_id, record FROM pi_entries WHERE id=?",
+        ).get(entryId) as { conversation_id: number; record: string } | undefined;
+        expect(entry).toBeDefined();
+        if (entry === undefined) throw new Error(`missing original ${field} entry`);
+        expect(entry.conversation_id).toBe(1);
+
+        // This id is outside the current table and remains a valid positive
+        // integer, unlike the missing-field cases above.
+        const max = database.prepare("SELECT MAX(id) AS id FROM pi_entries").get() as { id: number };
+        const danglingId = max.id + 1000000;
+        expect(Number.isSafeInteger(danglingId)).toBe(true);
+        database.prepare(
+          "UPDATE pi_submissions SET record=json_set(record, ?, ?) WHERE id=?",
+        ).run(`$.${field}`, danglingId, stored.id);
+        expect(await inspect("op-finished")).toEqual({
+          state: "unknown", operationId: "op-finished", conversation: "1",
+        });
+        database.prepare("UPDATE pi_submissions SET record=? WHERE id=?").run(original, stored.id);
+
+        database.prepare(
+          "UPDATE pi_entries SET conversation_id=?, record=json_set(record, '$.conversationId', ?) WHERE id=?",
+        ).run(2, 2, entryId);
+        expect(await inspect("op-finished")).toEqual({
+          state: "unknown", operationId: "op-finished", conversation: "1",
+        });
+        database.prepare("UPDATE pi_entries SET conversation_id=?, record=? WHERE id=?")
+          .run(entry.conversation_id, entry.record, entryId);
+      }
+
+      // Task index columns and the JSON body must agree, even for terminal
+      // nested/background tasks and even when the requested id is absent.
+      const terminalTask = database.prepare(
+        "SELECT id, kind, background, abort_requested FROM pi_tasks WHERE status='terminal' ORDER BY id LIMIT 1",
+      ).get() as { id: number; kind: string; background: number; abort_requested: number } | undefined;
+      expect(terminalTask).toBeDefined();
+      if (terminalTask === undefined) throw new Error("missing terminal task");
+      for (const [column, bad, originalValue] of [
+        ["kind", JSON.stringify("pi.corrupted-kind"), terminalTask.kind],
+        ["background", 1 - terminalTask.background, terminalTask.background],
+        ["abort_requested", 1 - terminalTask.abort_requested, terminalTask.abort_requested],
+      ] as const) {
+        database.prepare(`UPDATE pi_tasks SET ${column}=? WHERE id=?`).run(bad, terminalTask.id);
+        for (const id of ["op-finished", "op-missing"]) {
+          expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+        }
+        database.prepare(`UPDATE pi_tasks SET ${column}=? WHERE id=?`).run(originalValue, terminalTask.id);
+      }
+
+      // A different, terminal submission with a conflicting body status
+      // makes both a settled proof and an absence proof unsafe.
+      const unrelated = database.prepare(
+        "SELECT id, status FROM pi_submissions WHERE conversation_id=? AND request_id=?",
+      ).get(1, JSON.stringify("op-live")) as { id: number; status: string };
+      expect(unrelated.status).toBe("done");
+      database.prepare("UPDATE pi_submissions SET status=? WHERE id=?").run("unanswered", unrelated.id);
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+      }
+      database.prepare("UPDATE pi_submissions SET status=? WHERE id=?").run(unrelated.status, unrelated.id);
+
+      // A terminal status without its required outcome is not proof of rest.
+      const terminalOutcomeTask = database.prepare(
+        "SELECT id, record FROM pi_tasks WHERE status='terminal' ORDER BY id LIMIT 1",
+      ).get() as { id: number; record: string } | undefined;
+      expect(terminalOutcomeTask).toBeDefined();
+      if (terminalOutcomeTask === undefined) throw new Error("missing terminal task");
+      const terminalBody = JSON.parse(terminalOutcomeTask.record) as {
+        state?: { status?: unknown; outcome?: unknown };
+      };
+      expect(terminalBody.state?.status).toBe("terminal");
+      expect(terminalBody.state?.outcome).toBeDefined();
+      database.prepare(
+        "UPDATE pi_tasks SET record=json_remove(record, '$.state.outcome') WHERE id=?",
+      ).run(terminalOutcomeTask.id);
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await inspect(id)).toEqual({ state: "unknown", operationId: id, conversation: "1" });
+      }
+      database.prepare("UPDATE pi_tasks SET record=? WHERE id=?")
+        .run(terminalOutcomeTask.record, terminalOutcomeTask.id);
+
+      // The engine writes this request id; the inspector must compare its
+      // unpaired UTF-16 surrogate without normalizing it through SQLite JSON.
+      const surrogateId = "op-\ud800";
+      const special = await root.submit(
+        { type: "input", requestId: surrogateId, content: "surrogate" },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await special.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await engine.waitForIdle(BACKGROUND_CONTEXT);
+      const specialProof = await inspect(surrogateId);
+      expect(specialProof.state).toBe("settled");
+      if (specialProof.state !== "settled") throw new Error("expected surrogate settlement");
+      expect(specialProof.operationId).toBe(surrogateId);
+      expect(specialProof.conversation).toBe("1");
+      expect(specialProof.status).toBe("done");
+      expect(specialProof.submission).toMatch(/^[1-9][0-9]*$/);
+
+      // Start from the genuine migrated schema, then make it partial only
+      // after closing the writer. A terminal row must not mask a missing task
+      // table. Do not use rows() here because the table is intentionally gone.
+      await engine.close(BACKGROUND_CONTEXT);
+      engineClosed = true;
+
+      // Missing-schema refusal: this is not physical B-tree corruption.
+      // Restore the exact index before testing the separate missing-table case.
+      const requestIndex = database.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='pi_submissions_by_request'",
+      ).get() as { sql: string } | undefined;
+      expect(typeof requestIndex?.sql).toBe("string");
+      if (requestIndex === undefined || typeof requestIndex.sql !== "string") {
+        throw new Error("missing original submissions request index");
+      }
+      database.exec("DROP INDEX pi_submissions_by_request");
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await inspect(id)).toEqual({
+          state: "unknown", operationId: id, conversation: "1",
+        });
+      }
+      database.exec(requestIndex.sql);
+
+      database.exec("DROP TABLE pi_tasks");
+      const before = database.prepare("SELECT * FROM pi_submissions ORDER BY id").all();
+      const writes = changes();
+      const requests = scripted.requests.length;
+      for (const id of ["op-finished", "op-missing"]) {
+        expect(await session.settledOperation(id)).toEqual({
+          state: "unknown", operationId: id, conversation: "1",
+        });
+      }
+      expect(database.prepare("SELECT * FROM pi_submissions ORDER BY id").all()).toEqual(before);
+      expect(changes()).toBe(writes);
+      expect(scripted.requests.length).toBe(requests);
+    } finally {
+      scripted.release();
+      if (!engineClosed) await engine.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
 });

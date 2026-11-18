@@ -18,7 +18,7 @@ const WRITES = new Set([
 const SLOTS = new Set<string>(RECORD_SLOT_VERBS);
 /** Mirrors `ScreenOperation::is_screen_read` in `crates/cadence-core/src/app_screen_decl.rs`. */
 export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
-  "records.list", "records.show", "segments.list", "segments.show",
+  "records.list", "records.show", "catalog.status", "segments.list", "segments.show",
   "exclusions.list", "exclusions.show", "suppressions.list", "audience.preview",
   "content.list", "content.show", "content.render", "proposals.list",
   "proposals.show", "proposals.render", "sends.list", "sends.show",
@@ -27,7 +27,7 @@ export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
   "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.status",
   "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
   "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate",
-  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show",
+  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "calendar.query",
 ]);
 const READ_ONLY_CALL_MESSAGE = "a read-only screen admits only read operations";
 
@@ -99,6 +99,9 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   if (operation?.startsWith("works.") && error instanceof ApiError && status === 400 && error.code && WORKS_CODES.includes(error.code)) {
     return { code: error.code, text: "Cadence refused this Works request. Refresh before trying again." };
   }
+  if (operation?.startsWith("catalog.") && error instanceof ApiError && status === 409 &&
+      ["confirmation_required", "quote_changed", "grant_changed", "uncertain", "confirmation_invalid"].includes(error.code ?? ""))
+    return { code: error.code!, text: error.message };
    if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
   // CAD-1827: a stale campaign-work revision keeps its own code through the
   // bridge too. The app's stale-save recovery (re-read the row, keep the
@@ -125,9 +128,12 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
   let latestShow: { id: string; revision: number } | null = null;
   const current = () => !retired && host.current();
   const permitted = (op: string) => current() && receipt.host_contract === "screen-records.v1" && receipt.operations?.includes(op) && receipt.action_token;
-  async function post(path: "call" | "slot-prepare" | "slot-confirm", body: ActionArgs): Promise<unknown> {
+  async function post(path: "call" | "slot-prepare" | "slot-confirm" | "status", body: ActionArgs, catalog = false): Promise<unknown> {
     if (!current()) throw new ApiError("Mount retired", 403);
-    const response = await fetch(`/api/app-screen-services/${path}`, {
+    const target = catalog
+      ? `/api/app-screen-catalog/${path === "slot-prepare" ? "prepare" : path === "slot-confirm" ? "confirm" : path}`
+      : `/api/app-screen-services/${path}`;
+    const response = await fetch(target, {
       method: "POST", credentials: "same-origin", cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
       body: JSON.stringify({ action_token: receipt.action_token, ...body }),
@@ -148,6 +154,12 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
       );
     }
     return value;
+  }
+  function catalogArgs(args: ActionArgs): ActionArgs {
+    if (!exact(args, ["slot", "request_id", "input"]) || typeof args.slot !== "string" ||
+        typeof args.request_id !== "string" || !object(args.input))
+      throw new ApiError("Invalid app tool request", 400);
+    return { slot: args.slot, request_id: args.request_id, input: args.input };
   }
   function failed(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
     csv.clear();
@@ -183,11 +195,17 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         latestShow = { id: previewId, revision };
       } else if (previewId && operation === "screen.preview.clear" && latestShow?.id === previewId) latestShow = null;
       try {
-        const raw = await post("call", { operation, args });
+        const raw = operation === "catalog.call" || operation === "catalog.status"
+          ? await post(operation === "catalog.status" ? "status" : "call", catalogArgs(args), true)
+          : await post("call", { operation, args });
         const stalePreview = !!previewId && ((operation === "screen.preview.show" && (latestShow?.id !== previewId || latestShow.revision !== revision)) || (operation === "screen.preview.clear" && latestShow?.id === previewId && latestShow.revision > revision));
-        const data = deliver(raw, !stalePreview);
+        let data = deliver(raw, !stalePreview);
+        if (operation === "catalog.status" && object(data) && (data.state === "not_started" || data.state === "review_required")) {
+          if (!exact(data, ["state"])) throw new ApiError("Invalid app tool status", 502);
+          data = { state: "uncertain" };
+        }
         if (WRITES.has(operation)) invalidateDisplay(domain);
-        else if (receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
+        else if (operation !== "catalog.status" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
       } catch (error) {
         const refusal = failed(error, operation);
@@ -198,7 +216,9 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     async planner(operation: RecordSlotVerb, args: ActionArgs): Promise<SlotPlan | ActionRefusal> {
       if (!permitted(operation) || !(RECORD_SLOT_VERBS as readonly string[]).includes(operation)) return { code: "forbidden", text: "This operation is unavailable." };
       try {
-        const raw = await post("slot-prepare", { operation, args });
+        const raw = operation === "catalog.confirm"
+          ? await post("slot-prepare", catalogArgs(args), true)
+          : await post("slot-prepare", { operation, args });
         if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" || operation === "whatsapp.handoff.release" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
         const facts = raw.card.facts;
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
@@ -221,7 +241,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
               if (!held || Date.now() >= held.expires) throw new ApiError("Confirm this exact CSV plan first", 409);
               confirmation.csv_confirm_token = held.token;
             }
-            const result = await post("slot-confirm", { confirmation_token: raw.confirmation_token, confirmation });
+            const result = await post("slot-confirm", { confirmation_token: raw.confirmation_token, confirmation }, operation === "catalog.confirm");
             if (operation === "records.csv.confirm") {
               if (!object(result) || typeof result.confirm_token !== "string" || !/^confirm-[a-f0-9]{32}$/.test(result.confirm_token)) throw new ApiError("Missing private CSV receipt", 502);
               for (const [key, held] of csv) if (Date.now() >= held.expires) csv.delete(key);
@@ -291,6 +311,23 @@ function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-s
 
 function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
   const rows: RecordCard["facts"] = [];
+  if (operation === "catalog.confirm") {
+    const price = object(facts.price) ? facts.price : null;
+    if (!exact(facts, ["tool", "slug", "effect", "price", "input", "account"]) ||
+        typeof facts.tool !== "string" || !facts.tool || facts.tool.length > 120 ||
+        typeof facts.slug !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(facts.slug) ||
+        (facts.effect !== "read" && facts.effect !== "draft") || !price ||
+        !exact(price, ["currency", "scale", "amount"]) || price.currency !== "USD" || price.scale !== 6 ||
+        typeof price.amount !== "string" || !/^(0|[1-9]\d{0,9})\.\d{6}$/.test(price.amount) || !object(facts.input) ||
+        (facts.account !== undefined && (typeof facts.account !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$/.test(facts.account))))
+      throw new ApiError("Invalid app tool confirmation", 502);
+    return { operation, title: "Run this app tool?", confirm: "Run tool",
+      note: "The listed input is sent to the selected tool. Charges use the workspace balance.",
+      retry: "If the outcome is uncertain, check it before requesting another call.",
+      facts: [{ label: "Tool", value: facts.tool }, { label: "Effect", value: facts.effect === "read" ? "Read" : "Draft" },
+        ...(typeof facts.account === "string" ? [{ label: "Connected account", value: facts.account }] : []),
+        { label: "Price", value: `USD ${price.amount}` }, { label: "Input", value: JSON.stringify(facts.input) }] };
+  }
   const show = (label: string, value: unknown) => { if (value !== undefined && value !== null) rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
   const contentOuter = object(facts.content) ? facts.content : facts;
   const content = object(contentOuter.content) ? contentOuter.content : contentOuter;

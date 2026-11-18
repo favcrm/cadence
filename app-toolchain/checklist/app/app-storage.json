@@ -1,0 +1,15 @@
+{
+  "contract": "app-storage/v1",
+  "app": "private-checklist",
+  "schema_version": 1,
+  "compatible_schema_versions": [1],
+  "default_table": "tasks",
+  "record_kind": "task",
+  "migrations": [
+    {
+      "version": 1,
+      "path": "storage/001-tasks.json",
+      "sha256": "sha256:e9c6cc949ae744fcb93f4d1ebcb1859f71df107156672eaaa3004f7a3837211c"
+    }
+  ]
+}

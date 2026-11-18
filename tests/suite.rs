@@ -11088,6 +11088,56 @@ mod cad2088_review_workflows {
 import fs from 'node:fs';
 const sc = JSON.parse(fs.readFileSync(process.env.STUB_SCENARIO, 'utf8'));
 const logf = process.env.STUB_LOG;
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+// Synthetic process boundary; the separate real-Git acceptance checks object binding.
+const gitLog = process.env.STUB_GIT_LOG;
+let gitStep = 0, gitRepo = null;
+const treeA = '1'.repeat(40), treeB = '2'.repeat(40);
+const failGit = () => { throw new Error('synthetic git failure'); };
+childProcess.execFileSync = (program, args, options = {}) => {
+  fs.appendFileSync(gitLog, JSON.stringify({program, args, input_matches: options.input === sc.git_diff}) + '\n');
+  if (program !== 'git' || !Array.isArray(args) || !sc.git_base || !sc.git_head) return failGit();
+  const env = options.env || {};
+  const keys = ['PATH','HOME','LANG','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_GLOBAL','GIT_ATTR_NOSYSTEM',
+    'GIT_TERMINAL_PROMPT','GIT_INDEX_FILE','GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'].sort();
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!eq(Object.keys(env).sort(), keys) || !env.PATH || !env.HOME || env.LANG !== 'C' ||
+      env.GIT_CONFIG_NOSYSTEM !== '1' || env.GIT_CONFIG_GLOBAL !== '/dev/null' ||
+      env.GIT_ATTR_NOSYSTEM !== '1' || env.GIT_TERMINAL_PROMPT !== '0' ||
+      env.GIT_INDEX_FILE !== env.HOME + '/index' || env.GIT_CONFIG_COUNT !== '1' ||
+      env.GIT_CONFIG_KEY_0 !== 'http.https://github.com/.extraheader' ||
+      env.GIT_CONFIG_VALUE_0 !== 'AUTHORIZATION: basic ' + Buffer.from('x-access-token:gh-test-token').toString('base64') ||
+      options.stdio !== 'pipe') return failGit();
+  const current = gitStep++;
+  if (sc.git_failure === current) return failGit();
+  if (current === 0) {
+    if (args.length !== 5 || !eq(args.slice(0,4), ['init','--bare','--quiet','--template='])) return failGit();
+    gitRepo = args[4];
+    if (gitRepo !== env.HOME + '/repo.git') return failGit();
+    return Buffer.alloc(0);
+  }
+  const p = ['-C', gitRepo];
+  let expected;
+  switch (current) {
+    case 1: expected = [...p,'remote','add','origin','https://github.com/favcrm/cadence.git']; break;
+    case 2: expected = [...p,'config','remote.origin.promisor','true']; break;
+    case 3: expected = [...p,'config','remote.origin.partialclonefilter','blob:none']; break;
+    case 4: expected = [...p,'fetch','--no-tags','--depth=1','--filter=blob:none','origin',sc.git_base,sc.git_head]; break;
+    case 5: expected = [...p,'read-tree',sc.git_base]; break;
+    case 6: expected = [...p,'apply','--cached','--whitespace=nowarn','-']; break;
+    case 7: expected = [...p,'write-tree','--missing-ok']; break;
+    case 8: expected = [...p,'rev-parse',sc.git_head+'^{tree}']; break;
+    case 9: expected = [...p,'diff','--no-ext-diff','--no-textconv','--no-color','--no-renames','--full-index',sc.git_base,sc.git_head,'--']; break;
+    default: return failGit();
+  }
+  if (!eq(args, expected) || (current === 6 && options.input !== sc.git_diff)) return failGit();
+  if (current === 7) return Buffer.from(treeA+'\n');
+  if (current === 8) return Buffer.from((sc.git_mismatch ? treeB : treeA)+'\n');
+  if (current === 9) return Buffer.from(sc.git_canonical_diff, 'utf8');
+  return Buffer.alloc(0);
+};
+syncBuiltinESMExports();
 const hits = new Map();
 let minted = 0;
 const realSet = globalThis.setTimeout;
@@ -11323,6 +11373,7 @@ if (mode === 'keys') {
         code: Option<i32>,
         out: String,
         reqs: Vec<Value>,
+        git_calls: Vec<Value>,
         runner: std::path::PathBuf,
         _dir: tempfile::TempDir,
     }
@@ -11413,9 +11464,11 @@ if (mode === 'keys') {
         setup(&runner);
         let sc = dir.path().join("sc.json");
         let log = dir.path().join("log.jsonl");
+        let git_log = dir.path().join("git.jsonl");
         let stub = dir.path().join("stub.mjs");
         std::fs::write(&sc, scenario.to_string()).unwrap();
         std::fs::write(&log, "").unwrap();
+        std::fs::write(&git_log, "").unwrap();
         std::fs::write(&stub, STUB).unwrap();
         let mut ctx = std::collections::HashMap::new();
         for (a, b) in [
@@ -11463,6 +11516,7 @@ if (mode === 'keys') {
             .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
             .env("STUB_SCENARIO", &sc)
             .env("STUB_LOG", &log)
+            .env("STUB_GIT_LOG", &git_log)
             .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -11481,6 +11535,12 @@ if (mode === 'keys') {
             .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
             .collect();
+        let git_calls = std::fs::read_to_string(&git_log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+
         let out = format!(
             "{}{}",
             String::from_utf8_lossy(&o.stdout),
@@ -11490,6 +11550,7 @@ if (mode === 'keys') {
             code: o.status.code(),
             out,
             reqs,
+            git_calls,
             runner,
             _dir: dir,
         }
@@ -11587,7 +11648,15 @@ if (mode === 'keys') {
             "contents/docs/roles/risk-classes.md",
             json!([{ "text": "risk classes text" }]),
         ));
-        json!({ "routes": routes })
+        json!({
+            "routes": routes,
+            "git_base": cmp["merge_base"],
+            "git_head": HEAD,
+            "git_diff": w["diff"],
+            "git_canonical_diff": w.get("canonical_diff").unwrap_or(&w["diff"]),
+            "git_failure": w.get("git_failure").cloned().unwrap_or(Value::Null),
+            "git_mismatch": w.get("git_mismatch").cloned().unwrap_or(json!(false)),
+        })
     }
 
     // Replace the answers of the route with this URL part (and Accept header).
@@ -11940,8 +12009,8 @@ if (mode === 'keys') {
             "const AXIS",
             "//",
         ];
-        let strip = |w: &Wf| -> Vec<String> {
-            let lines: Vec<&str> = w.raw.lines().collect();
+        let strip = |w: &Wf, raw: &str| -> Vec<String> {
+            let lines: Vec<&str> = raw.lines().collect();
             let on = lines
                 .iter()
                 .position(|l| *l == "on:")
@@ -11969,7 +12038,62 @@ if (mode === 'keys') {
             }
             out
         };
-        let (sa, sb) = (strip(&a), strip(&b));
+        // Bind each CAD-2359 fragment to its original shared-code neighbors.
+        assert!(b.raw.contains(concat!(
+            "            let text = '', stop = null, buf = '', failed = false, big = false, refused = false;\n",
+            "            let nonStringContent = false;\n",
+            "            let sawMetadata = false, sawDone = false;\n",
+            "            const dec = new TextDecoder();\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "                  if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }\n",
+            "                  else if (c.delta?.content != null) nonStringContent = true;\n",
+            "                  if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "            }\n",
+            "            if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;\n",
+            "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+            "          }\n",
+            "          let res = null;\n",
+        )));
+        assert!(b.raw.contains(concat!(
+            "          let parsed;\n",
+            "          try { parsed = JSON.parse(res.text); } catch {\n",
+            "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+            "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+            "            die('model output is not JSON; nothing filed');\n",
+            "          }\n",
+            "          fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });\n",
+        )));
+        let mut spec = b.raw.clone();
+        for (from, to) in [
+            ("            let nonStringContent = false;\n", ""),
+            ("                  else if (c.delta?.content != null) nonStringContent = true;\n", ""),
+            (
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
+                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };\n",
+            ),
+            (
+                concat!(
+                    "          try { parsed = JSON.parse(res.text); } catch {\n",
+                    "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
+                    "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
+                    "            die('model output is not JSON; nothing filed');\n",
+                    "          }\n",
+                ),
+                "          try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }\n",
+            ),
+        ] {
+            assert_eq!(
+                spec.matches(from).count(),
+                1,
+                "{}: expected exactly one occurrence of the CAD-2359 diagnostic fragment",
+                b.file
+            );
+            spec = spec.replacen(from, to, 1);
+        }
+        let (sa, sb) = (strip(&a, &a.raw), strip(&b, &spec));
         assert_eq!(
             sa.len(),
             sb.len(),
@@ -12158,10 +12282,10 @@ if (mode === 'keys') {
             ),
             ("missing final newline", json!(no_newline), 1, "incomplete"),
             (
-                "over 300 KB",
-                json!(format!("{one}+{}\n", "x".repeat(300_000))),
+                "over 2.5 MB",
+                json!(format!("{one}+{}\n", "x".repeat(2_500_000))),
                 1,
-                "300 KB",
+                "2.5 MB",
             ),
         ];
         for wf in all() {
@@ -12182,7 +12306,7 @@ if (mode === 'keys') {
                     wf.file
                 );
                 // The file job applies the same walk to the diff it was handed.
-                if *name != "over 300 KB" {
+                if *name != "over 2.5 MB" {
                     let mut input = file_input(&world(&wf));
                     input["diff"] = diff.clone();
                     let f = run_file(
@@ -12253,6 +12377,94 @@ if (mode === 'keys') {
                     wf.file
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prepare_binds_small_and_large_diffs_to_the_pinned_trees() {
+        let large = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(large.len() > 300_000 && large.len() < 2_500_000);
+        for wf in all() {
+            for (name, diff, count) in [("small", DIFF.to_string(), 2), ("large", large.clone(), 1)]
+            {
+                let mut w = world(&wf);
+                w["diff"] = json!(diff);
+                w["cmp"]["files_n"] = json!(count);
+                let r = prepare(&wf, &w, &[]);
+                assert_eq!(r.code, Some(0), "{} {name}: {}", wf.file, r.out);
+                assert_eq!(
+                    r.git_calls.len(),
+                    10,
+                    "{} {name}: {:?}",
+                    wf.file,
+                    r.git_calls
+                );
+                assert_eq!(r.git_calls[6]["input_matches"], json!(true));
+                assert_eq!(r.read("out/review-input.json").unwrap()["diff"], w["diff"]);
+                assert_eq!(r.read("out/file-input.json").unwrap()["diff"], w["diff"]);
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_uses_the_git_generated_diff_in_both_artifacts() {
+        for wf in all() {
+            let mut w = world(&wf);
+            let canonical = DIFF.replace("+hello\n", "+canonical hello\n");
+            assert_ne!(canonical, DIFF);
+            w["canonical_diff"] = json!(canonical);
+            let r = prepare(&wf, &w, &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert_eq!(r.git_calls.len(), 10, "{}: {:?}", wf.file, r.git_calls);
+            assert_eq!(r.git_calls[6]["input_matches"], json!(true));
+            assert_eq!(
+                r.read("out/review-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+            assert_eq!(
+                r.read("out/file-input.json").unwrap()["diff"],
+                w["canonical_diff"]
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_each_git_failure_and_a_tree_mismatch() {
+        for wf in all() {
+            for step in 0..10 {
+                let mut w = world(&wf);
+                w["git_failure"] = json!(step);
+                let r = prepare(&wf, &w, &[]);
+                assert!(r.failed(), "{} git step {step}: {}", wf.file, r.out);
+                assert!(
+                    r.out.contains("cannot be bound to the compared Git trees"),
+                    "{}",
+                    r.out
+                );
+                assert_eq!(r.git_calls.len(), step as usize + 1);
+                assert!(
+                    r.files().is_empty()
+                        && r.hits("openrouter").is_empty()
+                        && r.hits("/verdict").is_empty()
+                );
+            }
+            let mut w = world(&wf);
+            w["git_mismatch"] = json!(true);
+            let r = prepare(&wf, &w, &[]);
+            assert!(
+                r.failed() && r.out.contains("cannot be bound to the compared Git trees"),
+                "{}",
+                r.out
+            );
+            assert_eq!(r.git_calls.len(), 9);
+            assert!(
+                r.files().is_empty()
+                    && r.hits("openrouter").is_empty()
+                    && r.hits("/verdict").is_empty()
+            );
         }
     }
 
@@ -12729,6 +12941,259 @@ if (mode === 'keys') {
                 "{}: provider controls",
                 wf.file
             );
+        }
+    }
+
+    #[test]
+    fn large_review_accepts_only_content_free_repeated_stop_usage() {
+        // Generate a valid full-index patch from real Git trees. The workflow
+        // harness still substitutes its fixed Git transport and dispatch IDs.
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| git_in(dir.path(), args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(
+            dir.path().join("big.txt"),
+            format!("{}\n", "x".repeat(80)).repeat(4000),
+        )
+        .unwrap();
+        git(&["add", "big.txt"]);
+        git(&["commit", "-q", "-m", "head"]);
+        let diff = git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--full-index",
+            "HEAD~1",
+            "HEAD",
+            "--",
+        ]);
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+        assert!(diff.contains("new file mode 100644\nindex "));
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+            let mut output = good_output(&wf);
+            for check in output["checks"].as_array_mut().unwrap() {
+                check["citations"] = json!([{ "file": "big.txt", "line": 1 }]);
+            }
+            let output_text = output.to_string();
+
+            for (content, should_succeed) in [("", true), ("unexpected output", false)] {
+                let mut events = model_events(&output_text, Some("stop"));
+                // Replace the ordinary empty-choice usage fixture and DONE.
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage = or_chunk(
+                    json!({ "content": content, "role": "assistant" }),
+                    json!("stop"),
+                );
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(r.hits("openrouter").len(), 1, "{}: {}", wf.file, r.out);
+                assert!(r.hits("/verdict").is_empty(), "{}: {}", wf.file, r.out);
+                if should_succeed {
+                    assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+                    let sealed = r
+                        .read("out/review-output.json")
+                        .expect("successful review must seal its output");
+                    let filed = run_file(
+                        &wf,
+                        &file_input(&w),
+                        Some(&sealed),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    );
+                    assert_eq!(filed.code, Some(0), "{}: {}", wf.file, filed.out);
+                    assert_eq!(
+                        filed.hits("/__platform/review-jobs/verdict").len(),
+                        1,
+                        "{}: {}",
+                        wf.file,
+                        filed.out
+                    );
+                } else {
+                    assert!(r.failed(), "{}: post-stop content was accepted", wf.file);
+                    assert!(
+                        r.read("out/review-output.json").is_none(),
+                        "{}: {}",
+                        wf.file,
+                        r.out
+                    );
+                    assert!(r.files().is_empty(), "{}: {}", wf.file, r.out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_unproven_routing_after_accounting() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            let model = wf.env_str("REVIEW_MODEL");
+            let cases = [
+                ("missing metadata", None),
+                (
+                    "mismatched model",
+                    Some(json!({ "requested": "other/model", "pipeline": [] })),
+                ),
+                (
+                    "nonempty pipeline",
+                    Some(json!({
+                        "requested": model,
+                        "pipeline": [{ "type": "context_compression" }]
+                    })),
+                ),
+            ];
+            for (name, metadata) in cases {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                let mut usage =
+                    or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                usage["choices"][0]["native_finish_reason"] = json!("stop");
+                usage["usage"] =
+                    json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
+                events.push(usage);
+                if let Some(metadata) = metadata {
+                    events.push(json!({
+                        "type": "metadata",
+                        "openrouter_metadata": metadata
+                    }));
+                }
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_review_refuses_hidden_choice_message_and_null_usage() {
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big.txt\n@@ -0,0 +1,4000 @@\n{}",
+            format!("+{}\n", "x".repeat(80)).repeat(4000)
+        );
+        assert!(diff.len() > 300_000 && diff.len() < 2_500_000);
+
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            w["cmp"]["files_n"] = json!(1);
+            let (input, _prepare_run) = prepared_from(&wf, &w);
+            assert_eq!(input["diff"], w["diff"]);
+
+            for name in [
+                "message on first stop",
+                "null post-stop usage",
+                "missing usage",
+                "inconsistent token counts",
+            ] {
+                let mut events = model_events("{}", Some("stop"));
+                events.pop().unwrap();
+                events.pop().unwrap();
+                if name == "message on first stop" {
+                    let stop = events.last_mut().unwrap();
+                    stop["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    });
+                    stop["choices"][0]["message"] = json!({
+                        "role": "assistant",
+                        "content": "hidden output"
+                    });
+                } else if name == "null post-stop usage" {
+                    events.push(json!({ "type": "usage", "choices": [], "usage": null }));
+                } else if name == "inconsistent token counts" {
+                    let mut usage =
+                        or_chunk(json!({ "content": "", "role": "assistant" }), json!("stop"));
+                    usage["choices"][0]["native_finish_reason"] = json!("stop");
+                    usage["usage"] = json!({
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 999
+                    });
+                    events.push(usage);
+                }
+                events.push(json!({
+                    "type": "metadata",
+                    "openrouter_metadata": {
+                        "requested": wf.env_str("REVIEW_MODEL"),
+                        "pipeline": []
+                    }
+                }));
+                events.push(json!({ "type": "done", "raw": "[DONE]" }));
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": events }]), &[]);
+                assert_eq!(
+                    r.hits("openrouter").len(),
+                    1,
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.failed(), "{} {name}: accepted", wf.file);
+                assert!(
+                    r.read("out/review-output.json").is_none(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty(), "{} {name}: {}", wf.file, r.out);
+                assert!(
+                    r.hits("/verdict").is_empty(),
+                    "{} {name}: {}",
+                    wf.file,
+                    r.out
+                );
+            }
         }
     }
 

@@ -18,9 +18,15 @@ test("every reference the skill names is carried, and none points into a reposit
 });
 
 test("the session can list, load and read the skill", async () => {
-  const [listed] = await companyOutputSkills.list();
-  expect(listed?.name).toBe("company-outputs");
-  expect((await companyOutputSkills.load("company-outputs"))?.body).toContain("# Company outputs");
-  const reference = await companyOutputSkills.readResource?.("company-outputs", "references/quotation.md");
-  expect(reference?.content).toContain("Draft view");
+  const listing = await companyOutputSkills.list();
+  if (!listing.ok) throw listing.error;
+  expect(listing.value.invalid).toEqual([]);
+  const listed = listing.value.skills[0];
+  expect(listed?.skill.name).toBe("company-outputs");
+  expect(listed?.skill.body).toContain("# Company outputs");
+  const info = listed?.resources.find((resource) => resource.path === "references/quotation.md");
+  if (listed === undefined || info === undefined) throw new Error("skill reference is missing");
+  const reference = await companyOutputSkills.readResource(listed.skill.name, info.path);
+  if (!reference.ok) throw reference.error;
+  expect(reference.value.content).toContain("Draft view");
 });

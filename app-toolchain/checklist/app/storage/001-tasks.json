@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "operations": [
+    {
+      "op": "create_table",
+      "table": "tasks",
+      "columns": [
+        { "name": "title", "type": "text", "nullable": false, "max_length": 200 },
+        { "name": "status", "type": "text", "nullable": false, "max_length": 16 }
+      ]
+    }
+  ]
+}

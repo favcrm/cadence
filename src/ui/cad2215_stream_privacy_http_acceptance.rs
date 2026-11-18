@@ -14,6 +14,8 @@ mod cad2215_board_shared_job_http_acceptance;
 mod cad2215_job_legacy_http_acceptance;
 #[path = "cad2215_stream_demotion_http_acceptance.rs"]
 mod cad2215_stream_demotion_http_acceptance;
+#[path = "cad2347_stream_retry_http_acceptance.rs"]
+mod cad2347_stream_retry_http_acceptance;
 
 struct EventStream {
     reader: BufReader<TcpStream>,

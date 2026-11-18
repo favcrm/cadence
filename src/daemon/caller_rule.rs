@@ -497,6 +497,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("endpoint_enable", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
     ("endpoint_disable", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
     ("endpoint_remove", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
+    ("company_zone_get", Rule::Read),
+    ("company_zone_set", Rule::Handler("operator_connection: the operator only (CAD-2378)")),
     ("routine_list", Rule::Handler("admit_routine_read: operator_connection or master (CAD-2317)")),
     ("routine_show", Rule::Handler("admit_routine_read: operator_connection or master (CAD-2317)")),
     ("routine_create", Rule::Handler("operator_connection: the operator only (CAD-2317)")),

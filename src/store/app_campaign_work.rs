@@ -47,6 +47,16 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
         .map_err(|e| Error::internal(format!("campaign work schema unavailable: {e}")))
 }
 
+/// CAD-2379: one campaign work row as the calendar read sees it.
+#[derive(Debug, Clone)]
+pub struct CampaignDue {
+    pub context_id: String,
+    pub campaign_id: String,
+    pub due_at: String,
+    pub status: Option<String>,
+    pub name: Option<String>,
+}
+
 /// One stored row before it becomes a [`WorkRecord`].
 type StoredRow = (
     i64,
@@ -161,6 +171,47 @@ impl RecordStore {
             work.as_ref(),
             content.as_ref(),
         ))
+    }
+
+    /// CAD-2379: campaign work due in `[from, to)` (`YYYY-MM-DD` strings
+    /// compare as dates), soonest first, for the calendar read. A record file
+    /// opened read-only may predate the work table; that is no rows, not an
+    /// error. Only the campaign, its due day, status and name leave here.
+    pub fn app_campaign_work_due(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<CampaignDue>> {
+        let conn = self.conn();
+        let has_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_campaign_work'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if has_table == 0 {
+            return Ok(Vec::new());
+        }
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        conn.query_vec(
+            "SELECT w.context_id,w.campaign_id,w.due_at,w.status,d.name \
+             FROM app_campaign_work w LEFT JOIN app_content_docs d \
+             ON d.context_id=w.context_id AND d.campaign_id=w.campaign_id \
+             WHERE w.due_at>=?1 AND w.due_at<?2 ORDER BY w.due_at,w.context_id,w.campaign_id LIMIT ?3",
+            params![from, to, cap],
+            |r| {
+                Ok(CampaignDue {
+                    context_id: r.get(0)?,
+                    campaign_id: r.get(1)?,
+                    due_at: r.get(2)?,
+                    status: r.get(3)?,
+                    name: r.get(4)?,
+                })
+            },
+        )
+        .map_err(|e| Error::internal(e.to_string()))
     }
 
     /// The caller-facing read for an authorized caller: the recorded facts

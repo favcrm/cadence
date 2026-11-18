@@ -154,6 +154,8 @@ globalThis.fetch = async (input, init) => {
     });
   }
   reads.push(path);
+  // A board that predates the CAD-2419 workspace skill library.
+  if (path.startsWith("/api/workspace-skills")) return new Response(JSON.stringify({ error: { code: "not_found", message: "Not found" } }), { status: 404 });
   if (path === "/api/agent-roles") {
     if (rolesGate) await rolesGate;
     return rolesPayload

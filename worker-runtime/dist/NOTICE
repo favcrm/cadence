@@ -22,9 +22,9 @@ from the bundle's own input list.
 
 Upstream package license texts omitted from the published npm archives:
 
-- @earendil-works/{chord,pi-ai,pi-durable,pi-telemetry}@1.4.0 declare MIT.
-  licenses/pi-1.4.0.LICENSE is the upstream release's unchanged MIT text:
-  https://github.com/earendil-works/pi/blob/4a080252f06caf63a525d7873c5d94d3c23887e0/LICENSE
+- @earendil-works/{chord,pi-ai,pi-codemode,pi-durable,pi-schema,pi-telemetry}@1.5.2
+  declare MIT. licenses/pi-1.4.0.LICENSE is the unchanged upstream MIT text:
+  https://github.com/earendil-works/pi/blob/v1.5.2/LICENSE
   Git blob b0a8e9b81083294360c69b4ec45d3d39a2b28197.
 - standardwebhooks@1.1.1 declares MIT in its npm metadata, while its publisher
   gitHead supplies an Apache-2.0 repository license. Preserve both declarations,

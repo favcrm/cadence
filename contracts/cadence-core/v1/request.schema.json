@@ -147,6 +147,23 @@
         "op",
         "input"
       ]
+    },
+    {
+      "description": "Compile an agent's flat field list into the A2UI envelope and check it\n(CAD-2345). The same answer shape as `agent.form.check`, plus `form`.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FormCompileInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "agent.form.compile"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
     }
   ],
   "required": [
@@ -320,6 +337,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "lists_absent": {
+          "description": "CAD-2386: the caller proved both list files are absent at the anchor\n(a definite \"not found\", never a failed read), so the product default\napplies. Absent or `false` keeps today's reading: a missing text is\nunreadable and fails closed. `true` with either text present refuses.",
+          "type": "boolean",
+          "default": false
+        },
         "one_review_paths": {
           "description": "The trusted base's `docs/roles/one-review-paths.toml` text.",
           "type": [
@@ -333,6 +355,11 @@
             "string",
             "null"
           ]
+        },
+        "policy_owner_approved": {
+          "description": "CAD-2417: the host vouches that `policy` is owner-approved as sent (on\nhosted Cadence only a live owner can save a project's delivery policy).\nA policy that parses is then resolved as approved at its own digest,\nexactly as an `approval` of it would be; an absent or malformed text\nchanges nothing. Absent or `false` keeps today's answers; `true` with an\n`approval` refuses as contradictory. Set it only for an owner-written\nhost record, never for text read from a repository or a PR head.",
+          "type": "boolean",
+          "default": false
         },
         "risk_paths": {
           "description": "The trusted base's `docs/roles/risk-paths.toml` text.",
@@ -359,6 +386,19 @@
       "additionalProperties": false,
       "required": [
         "form"
+      ]
+    },
+    "FormCompileInput": {
+      "description": "Input of `agent.form.compile`.",
+      "type": "object",
+      "properties": {
+        "spec": {
+          "description": "The agent's `FormSpec`: optional `id`, `title`, `intro` and `submit`,\nand 1-12 `fields`. Unknown keys are refused."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "spec"
       ]
     },
     "ManifestPreflightInput": {
@@ -546,7 +586,7 @@
           "minimum": 0
         },
         "paths": {
-          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it. Slice 3 matches them with\n`areas::matches`, so the two grammars must agree.",
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it, and a glob without wildcards\nis a file or a directory covering everything under it. Matched with\n[`crate::delivery_rules::area_match`], the same function as `areas:`.",
           "type": "array",
           "default": [],
           "items": {

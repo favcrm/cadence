@@ -28,15 +28,17 @@ import {
   type DocumentsResult,
 } from "../../src/features/documents/documentsClient";
 import { memberHistory, memberThreadStore, sendToAssistant } from "../../src/features/home/memberThread";
+import { classifyFailure } from "../../src/features/agents/instructionsDoc";
+import { libraryAbsent, liveSkillDeps, refusal, skillFiles, statusParts, unapprovedNames } from "../../src/features/agents/workspaceSkills";
 import { settingsRedirect } from "../../src/features/settings/settingsNav";
 import { parseMount } from "../../src/features/workspace-apps/screen/screenLifecycle";
 import { screenProjection, screenTag } from "../../src/features/workspace-apps/screen/screenProjection";
 import { shapeFor } from "../../src/features/workspace-apps/screen/screenProtocol";
-import type { AppContext, AppEffect, HomeInstallation, Installation, WorkspaceRun } from "../../src/features/workspace-apps/workspaceApps";
+import { workspaceApps, type AppContext, type AppEffect, type HomeInstallation, type Installation, type WorkspaceRun } from "../../src/features/workspace-apps/workspaceApps";
 import { api } from "../../src/lib/api";
 import { allowPrivateReads } from "../../src/lib/privateSession";
 import { readTeamMembers } from "../../src/lib/teamRoster";
-import type { Meta } from "../../src/lib/types";
+import type { Meta, StoredAgentProfile, WorkspaceSkillRead, WorkspaceSkillSummary } from "../../src/lib/types";
 
 declare const require: { (name: string): any; main: unknown };
 declare const module: unknown;
@@ -98,6 +100,12 @@ export function boardViewer(fx: Fixtures, viewer: ViewerPreset): { sub: string; 
   if (viewer === "owner") return { sub: roster(fx).find((row) => row.role === "owner")?.userId ?? "", owner: true };
   const meta = fx.meta as { session?: { user?: { sub?: string } } };
   return { sub: meta.session?.user?.sub ?? "", owner: false };
+}
+
+/** `GET /api/app-installations`: the operator's installed-app list, which the
+ *  sidebar's app menu reads (CAD-2314). The one installed app is the list. */
+export function appInstallations(fx: Fixtures): unknown {
+  return [fx["app-installation"]];
 }
 
 /** `/api/meta` for these presets. The default presets return the fixture itself. */
@@ -365,6 +373,154 @@ export function documentsResponder(fx: Fixtures, presets: () => BoardPresets) {
   return { answer, changes };
 }
 
+/** CAD-2419: the workspace skill library presets. `not-served` is a board
+ *  that predates it (every library route answers 404); `failing` answers its
+ *  list with 503, so the read failure and its Retry can be seen. */
+export const SKILL_PROBES = ["available", "not-served", "failing"] as const;
+export type SkillProbe = (typeof SKILL_PROBES)[number];
+
+type SkillRevision = WorkspaceSkillRead["revision"];
+type FixtureSkill = Omit<WorkspaceSkillSummary, "latest_revision" | "latest_digest" | "description" | "approved" | "updated_at"> & {
+  approved: { revision: number; by: string; at: number } | null;
+  revisions: Omit<SkillRevision, "name">[];
+};
+
+/** The paths the skills responder answers: the library and the profile it assigns through. */
+export function isSkillsRoute(pathname: string): boolean {
+  return /^\/api\/(workspace-skills|agent-profiles\/[^/]+$)/.test(pathname);
+}
+
+/**
+ * CAD-2419: the workspace skill library and the one hosted profile the agent
+ * page assigns its skills through, answered as agenticos-v2's
+ * `workspace-skill-routes.ts` and the profile route answer the preset viewer.
+ * The owner decides (approve, revoke, delete) and saves the profile; a member
+ * is answered `403 owner_required`. The QA board refuses an approval past
+ * `approved_max`, so `approved_limit` can be seen. Writes change this
+ * responder's own copy; a new responder starts again from the fixtures.
+ */
+export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
+  const fixture = JSON.parse(JSON.stringify(fx["workspace-skills"])) as { notice: string; approved_max: number; skills: FixtureSkill[] };
+  const library = fixture.skills;
+  const seed = JSON.parse(JSON.stringify(fx["skills-profile"])) as { profile: StoredAgentProfile };
+  let profile = seed.profile;
+  let probe: SkillProbe = "available";
+  const answer = (route: string, status: number, body: unknown): DocumentsAnswer => ({ route, status, body });
+  const no = (route: string, status: number, code: string, message: string) => answer(route, status, { error: { code, message } });
+  const latest = (skill: FixtureSkill) => skill.revisions[skill.revisions.length - 1]!;
+  const summary = (skill: FixtureSkill): WorkspaceSkillSummary => {
+    const last = latest(skill);
+    const approved = skill.approved && skill.revisions.find((r) => r.revision === skill.approved!.revision);
+    return {
+      name: skill.name,
+      latest_revision: last.revision,
+      latest_digest: last.digest,
+      description: last.description,
+      approved: skill.approved && approved ? { ...skill.approved, digest: approved.digest } : null,
+      created_by: skill.created_by,
+      created_at: skill.created_at,
+      updated_at: last.created_at,
+    };
+  };
+  const exact = (body: unknown, keys: readonly string[]): Record<string, unknown> | null => {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    const found = Object.keys(body);
+    return found.length === keys.length && keys.every((name) => found.includes(name)) ? (body as Record<string, unknown>) : null;
+  };
+
+  function respond(method: string, url: URL, body: unknown): DocumentsAnswer {
+    const { pathname } = url;
+    const owner = viewer() === "owner";
+    const profileRoute = /^\/api\/agent-profiles\/([^/]+)$/.exec(pathname);
+    if (profileRoute) {
+      const route = `${method} /api/agent-profiles/:id`;
+      if (decodeURIComponent(profileRoute[1]!) !== profile.id) return no(route, 404, "not_found", "Unknown agent profile.");
+      if (method === "GET") return answer(route, 200, { profile });
+      if (!owner) return no(route, 403, "owner_required", "Only owners edit agent profiles.");
+      const fields = exact(body, ["name", "role", "responsibilities", "skills", "status", "expectedRevision"]);
+      if (!fields || !Array.isArray(fields.skills) || fields.skills.some((name) => typeof name !== "string")) {
+        return no(route, 400, "invalid_request", "Invalid agent profile.");
+      }
+      if (fields.expectedRevision !== profile.revision) return no(route, 409, "revision_conflict", "Reload the agent profile.");
+      profile = {
+        ...profile,
+        name: String(fields.name),
+        role: String(fields.role),
+        responsibilities: String(fields.responsibilities).trim(),
+        skills: [...new Set(fields.skills as string[])],
+        revision: profile.revision + 1,
+        updated_at: Date.now(),
+      };
+      return answer(route, 200, { profile });
+    }
+    if (probe === "not-served") return no(`${method} ${pathname}`, 404, "not_found", "Not found.");
+    if (method === "GET" && pathname === "/api/workspace-skills") {
+      const route = "GET /api/workspace-skills";
+      if (probe === "failing") return no(route, 503, "unavailable", "The workspace is unavailable.");
+      return answer(route, 200, { skills: library.map(summary) });
+    }
+    const one = /^\/api\/workspace-skills\/([^/]+)(?:\/(approve|revoke|delete))?$/.exec(pathname);
+    if (!one || (method === "GET") === Boolean(one[2])) return no(`${method} ${pathname}`, 404, "not_found", "Not found.");
+    const name = decodeURIComponent(one[1]!);
+    const skill = library.find((entry) => entry.name === name);
+    if (method === "GET") {
+      const route = "GET /api/workspace-skills/:name";
+      const asked = url.searchParams.get("revision");
+      const revision = skill && (asked === null ? latest(skill) : skill.revisions.find((r) => String(r.revision) === asked));
+      if (!skill || !revision) return no(route, 404, "not_found", "Unknown skill or revision.");
+      return answer(route, 200, { notice: fixture.notice, skill: summary(skill), revision: { name, ...revision }, approved: skill.approved?.revision === revision.revision });
+    }
+    const verb = one[2]!;
+    const route = `POST /api/workspace-skills/:name/${verb}`;
+    if (!owner) return no(route, 403, "owner_required", "Only owners decide workspace skills.");
+    const fields = exact(body, verb === "approve" ? ["revision", "digest"] : verb === "revoke" ? ["digest"] : ["expectedRevision"]);
+    if (!fields) return no(route, 400, "invalid_request", "Invalid request.");
+    if (!skill) return no(route, 404, "not_found", "Unknown skill or revision.");
+    if (verb === "approve") {
+      const revision = skill.revisions.find((r) => r.revision === fields.revision);
+      if (!revision) return no(route, 404, "not_found", "Unknown skill or revision.");
+      if (revision.digest !== fields.digest) return no(route, 409, "digest_mismatch", "Reload the skill and review it again.");
+      if (!skill.approved && library.filter((entry) => entry.approved).length >= fixture.approved_max) {
+        return no(route, 409, "approved_limit", "Revoke an approved skill first.");
+      }
+      skill.approved = { revision: revision.revision, by: boardViewer(fx, "owner").sub, at: Date.now() };
+      return answer(route, 200, { skill: summary(skill) });
+    }
+    if (verb === "revoke") {
+      const current = summary(skill).approved;
+      if (!current || current.digest !== fields.digest) return no(route, 409, "digest_mismatch", "Reload the skill and review it again.");
+      skill.approved = null;
+      return answer(route, 200, { skill: summary(skill) });
+    }
+    if (skill.approved) return no(route, 409, "approved_skill", "Revoke the skill before deleting it.");
+    if (fields.expectedRevision !== latest(skill).revision) return no(route, 409, "revision_conflict", "Reload the skill.");
+    library.splice(library.indexOf(skill), 1);
+    return answer(route, 200, { name, deleted: true });
+  }
+
+  return {
+    answer: respond,
+    probe: () => probe,
+    setProbe: (next: SkillProbe) => {
+      probe = next;
+    },
+    /** Someone else saved the profile: its revision moves on, so the page's next save is stale. */
+    bumpProfile: () => {
+      profile = { ...profile, revision: profile.revision + 1, updated_at: Date.now() };
+    },
+    profile: () => profile,
+    /** `GET /api/agents` with the fixture profile on the roster, on top of what the sandbox listed. */
+    roster: (sandbox: unknown) => {
+      const row = (fx["skills-profile"] as { row: { id: string } }).row;
+      const base = sandbox && typeof sandbox === "object" && Array.isArray((sandbox as { agents?: unknown }).agents)
+        ? (sandbox as Record<string, unknown>)
+        : { agents: [], by_issue: {}, daemon: "reachable", profiles: [], refresh_error: false, snapshot_age_secs: 0, stale: false, totals: null };
+      const profiles = Array.isArray(base.profiles) ? (base.profiles as { id: string }[]).filter((p) => p.id !== row.id) : [];
+      return { ...base, profiles: [...profiles, row] };
+    },
+  };
+}
+
 const CONVERSATION = "qa-board-conversation";
 
 export function loadFixtures(dir: string): Fixtures {
@@ -397,16 +553,21 @@ function fixtureFetch(
   fx: Fixtures,
   browser: () => unknown,
   viewUrl: string,
-  board: () => { presets: BoardPresets; documents: ReturnType<typeof documentsResponder> },
+  board: () => Board,
 ): typeof fetch {
   return (async (input: unknown, init?: { method?: string; body?: unknown }) => {
     const url = new URL(String(input), "http://qa-board.invalid");
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     const request = typeof init?.body === "string" ? JSON.parse(init.body) as Record<string, unknown> : {};
+    if (isSkillsRoute(url.pathname)) {
+      const skill = board().skills.answer(init?.method ?? "GET", url, request);
+      return json(skill.body, skill.status);
+    }
     const document = board().documents.answer(init?.method ?? "GET", url, typeof init?.body === "string" ? request : null);
     if (document) return json(document.body, document.status);
     if (url.pathname === "/api/team/members" && servesRoster(board().presets)) return json(fx["team-members"]);
     switch (`${init?.method ?? "GET"} ${url.pathname}`) {
+      case "GET /api/app-installations": return json(appInstallations(fx));
       case "GET /api/browser": return json(browser());
       case "POST /api/browser/view": return json({ url: viewUrl });
       case "POST /api/browser/stop": return json(fx["browser-stop"]);
@@ -422,7 +583,7 @@ function fixtureFetch(
 const failed = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const failureText = (result: DocumentsResult<unknown>) => (result.ok ? "ok" : `${result.failure.kind} ${result.failure.status}: ${result.failure.message}`);
 
-type Board = { presets: BoardPresets; documents: ReturnType<typeof documentsResponder> };
+type Board = { presets: BoardPresets; documents: ReturnType<typeof documentsResponder>; skills: ReturnType<typeof skillsResponder> };
 type Fail = (payload: string, why: string) => void;
 
 /**
@@ -430,6 +591,87 @@ type Fail = (payload: string, why: string) => void;
  * access rules, for each viewer preset, each on a fresh responder. `board` is
  * what the fetch shim answers from; this swaps it per scenario.
  */
+/**
+ * CAD-2419: the skill library and the profile through the agent page's own
+ * calls (`liveSkillDeps`, `api.agentProfile`/`saveAgentProfile`) and its
+ * readers, for the member and the owner, each on a fresh responder.
+ */
+async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
+  const fresh = (viewer: ViewerPreset) => {
+    board.presets = { ...DEFAULT_PRESETS, viewer };
+    board.skills = skillsResponder(fx, () => board.presets.viewer);
+  };
+  const code = (error: unknown) => refusal(error).code;
+  const row = (fx["skills-profile"] as { row: { id: string } }).row;
+  try {
+    fresh("member");
+    const skills = await liveSkillDeps.list();
+    if (!skills.some((s) => s.approved) || !skills.some((s) => !s.approved) || !skills.some((s) => s.approved && s.latest_revision > s.approved.revision)) {
+      fail("workspace-skills", "the library needs an approved skill, a draft and an approved skill with a newer draft");
+    }
+    for (const skill of skills) {
+      if (statusParts(skill).length === 0) fail("workspace-skills", `${skill.name}: no status line`);
+      const read = await liveSkillDeps.read(skill.name);
+      if (skillFiles(read.revision.files)[0]?.[0] !== "SKILL.md") fail("workspace-skills", `${skill.name}: no SKILL.md`);
+      if (skill.approved) {
+        const approved = await liveSkillDeps.read(skill.name, skill.approved.revision);
+        if (!approved.approved || approved.revision.digest !== skill.approved.digest) fail("workspace-skills", `${skill.name}: the approved revision does not read back as approved`);
+      }
+    }
+    const { profile } = await api.agentProfile(row.id);
+    if (profile.id !== row.id) fail("skills-profile", "the stored profile is not the roster row's");
+    if (unapprovedNames(profile.skills, skills).length === 0 || unapprovedNames(profile.skills, skills).length === profile.skills.length) {
+      fail("skills-profile", "the profile should list one approved skill and one name with no approved skill");
+    }
+    const draft = skills.find((s) => !s.approved)!;
+    await liveSkillDeps.approve(draft.name, draft.latest_revision, draft.latest_digest).then(
+      () => fail("workspace-skills", "a member's approve was accepted"),
+      (error) => code(error) !== "owner_required" && fail("workspace-skills", `a member's approve answered ${code(error)}`),
+    );
+
+    fresh("owner");
+    const drafts = skills.filter((s) => !s.approved);
+    const approvedCount = skills.filter((s) => s.approved).length;
+    const max = (fx["workspace-skills"] as { approved_max: number }).approved_max;
+    // Approving drafts up to the QA board's limit, then one more is approved_limit.
+    for (const [i, s] of drafts.entries()) {
+      const over = approvedCount + i >= max;
+      await liveSkillDeps.approve(s.name, s.latest_revision, s.latest_digest).then(
+        () => over && fail("workspace-skills", `approving ${s.name} past approved_max was accepted`),
+        (error) => (!over || code(error) !== "approved_limit") && fail("workspace-skills", `approving ${s.name} answered ${code(error)}`),
+      );
+    }
+    if (approvedCount + drafts.length <= max) fail("workspace-skills", "approved_max is never reached, so approved_limit cannot be seen");
+    const approved = skills.find((s) => s.approved)!;
+    await liveSkillDeps.remove(approved.name, approved.latest_revision).then(
+      () => fail("workspace-skills", "deleting an approved skill was accepted"),
+      (error) => code(error) !== "approved_skill" && fail("workspace-skills", `deleting an approved skill answered ${code(error)}`),
+    );
+    await liveSkillDeps.approve(approved.name, approved.latest_revision, "0".repeat(64)).then(
+      () => fail("workspace-skills", "approving with a wrong digest was accepted"),
+      (error) => code(error) !== "digest_mismatch" && fail("workspace-skills", `a wrong digest answered ${code(error)}`),
+    );
+    await liveSkillDeps.revoke(approved.name, approved.approved!.digest);
+    await liveSkillDeps.remove(approved.name, approved.latest_revision);
+    const saved = (await api.saveAgentProfile(row.id, { name: profile.name, role: profile.role, responsibilities: profile.responsibilities, skills: [], status: profile.status, expectedRevision: profile.revision })).profile;
+    if (saved.revision !== profile.revision + 1 || saved.skills.length !== 0) fail("skills-profile", "a profile save did not advance the revision");
+    await api.saveAgentProfile(row.id, { name: profile.name, role: profile.role, responsibilities: profile.responsibilities, skills: [], status: profile.status, expectedRevision: profile.revision }).then(
+      () => fail("skills-profile", "a stale profile revision was accepted"),
+      (error) => classifyFailure(error, "hosted") !== "conflict" && fail("skills-profile", "a stale profile revision is not read as a conflict"),
+    );
+
+    board.skills.setProbe("not-served");
+    await liveSkillDeps.list().then(() => fail("workspace-skills", "not-served still lists"), (error) => !libraryAbsent(error) && fail("workspace-skills", "not-served is not read as absent"));
+    board.skills.setProbe("failing");
+    await liveSkillDeps.list().then(() => fail("workspace-skills", "failing still lists"), (error) => libraryAbsent(error) && fail("workspace-skills", "failing is read as absent, which hides the section"));
+  } catch (error) {
+    fail("workspace-skills", `the agent page's calls refused it: ${failed(error)}`);
+  } finally {
+    board.presets = { ...DEFAULT_PRESETS };
+    board.skills = skillsResponder(fx, () => board.presets.viewer);
+  }
+}
+
 async function validateDocuments(fx: Fixtures, board: Board, fail: Fail) {
   const start = (viewer: ViewerPreset) => {
     board.presets = { ...DEFAULT_PRESETS, viewer };
@@ -627,7 +869,8 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
   const fail = (payload: string, why: string) => failures.push(`${payload}.json: ${why}`);
   for (const name of ["meta", "locale", "browser-stop", "member-assistant-state", "member-assistant-history", "member-assistant-profile", "member-assistant-send", ...BROWSER_PRESETS.map((p) => `browser-${p}`),
     "app-home", "app-installation", "app-contexts", "app-runs", "app-effects", "app-screen-mount",
-    "team-members", "document-types", "documents-active", "documents-archived", "document-authors", "document-refusals"]) {
+    "team-members", "document-types", "documents-active", "documents-archived", "document-authors", "document-refusals",
+    "workspace-skills", "skills-profile"]) {
     if (!(name in fx)) fail(name, "missing");
   }
   if (failures.length > 0) return failures;
@@ -700,7 +943,11 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
 
   const original = globalThis.fetch;
   let browser: unknown = fx["browser-handoff"];
-  const board: Board = { presets: { ...DEFAULT_PRESETS }, documents: documentsResponder(fx, () => board.presets) };
+  const board: Board = {
+    presets: { ...DEFAULT_PRESETS },
+    documents: documentsResponder(fx, () => board.presets),
+    skills: skillsResponder(fx, () => board.presets.viewer),
+  };
   globalThis.fetch = fixtureFetch(fx, () => browser, viewUrl, () => board);
   allowPrivateReads();
   try {
@@ -736,7 +983,16 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
     const sent = await sendToAssistant("qa-board:validate", "hello", "qa-board-check");
     if (!sent.ok) fail("member-assistant-send", `sendToAssistant refused it: ${sent.error}`);
 
+    // The sidebar's app menu, as App.tsx builds it from the operator's list.
+    try {
+      const rows = await workspaceApps.installations();
+      const row = Array.isArray(rows) ? rows.find((i) => i.install_id === installation.install_id && i.name === installation.name) : undefined;
+      if (!row) fail("app-installation", "the installed-app list has no row for it: the sidebar would list no app");
+      else if (row.removed != null || (row.state ?? "active") !== "active") fail("app-installation", "the sidebar's menu drops it as removed or inactive");
+    } catch (error) { fail("app-installation", `workspaceApps.installations refused the list: ${failed(error)}`); }
+
     await validateDocuments(fx, board, fail);
+    await validateSkills(fx, board, fail);
   } finally {
     globalThis.fetch = original;
   }

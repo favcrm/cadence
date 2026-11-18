@@ -62,6 +62,21 @@ interface KindSections {
   href: (base: string, section: string) => string;
 }
 
+/** Section navigation and app breadcrumbs share the same context-preserving URL. */
+export function appSectionHref(base: string, navigation: ScreenNavigation | null, section = navigation?.default_section): string {
+  const [path, search] = base.split("?");
+  const query = new URLSearchParams(search ?? "");
+  if (navigation) {
+    if (section === navigation.default_section) query.delete(navigation.section_query);
+    else if (section !== undefined) query.set(navigation.section_query, section);
+  }
+  query.delete("appview");
+  query.delete("record");
+  query.delete("segment");
+  const next = query.toString();
+  return path + (next ? `?${next}` : "");
+}
+
 /** The section the URL is on, for a screen that declares sections. */
 function declaredSections(
   navigation: ScreenNavigation,
@@ -74,13 +89,7 @@ function declaredSections(
       const selected = new URLSearchParams(search).get(navigation.section_query);
       return navigation.sections.find(s => s.id === selected)?.id ?? navigation.default_section;
     },
-    href: (base, section) => {
-      const [path, search] = base.split("?");
-      const q = new URLSearchParams(search ?? "");
-      if (section === navigation.default_section) q.delete(navigation.section_query); else q.set(navigation.section_query, section);
-      q.delete("appview"); q.delete("record"); q.delete("segment");
-      const next = q.toString(); return path + (next ? `?${next}` : "");
-    },
+    href: (base, section) => appSectionHref(base, navigation, section),
   };
 }
 export function sectionFromSearch(search: string, navigation?: ScreenNavigation | null): string | null {
