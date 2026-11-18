@@ -34,6 +34,8 @@ import {
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 import { fileKind } from "./fileKind";
+import { TurnSources, TurnStagedCards } from "./TurnRichCards";
+import { turnSources } from "./turnCards";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -1234,6 +1236,7 @@ export function ThreadTurn({
       : undefined;
   const interimText =
     interim && !carriesSecret(interim.entry.text) ? interimLine(interim.entry.text) : null;
+  const toolEntries = trace.flatMap((item) => (item.type === "tools" ? item.entries : []));
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -1300,6 +1303,16 @@ export function ThreadTurn({
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
         </div>
       )}
+      {/* CAD-2441: what the finished turn read, then what it staged. Both
+          come from its recorded tool calls and results, never its prose. */}
+      {shown && !streaming && (
+        <TurnSources
+          sources={turnSources(toolEntries)}
+          onOpenIssue={onOpenIssue}
+          artifacts={artifacts.flatMap((item) => (item.type === "artifact" ? [item.entry] : []))}
+        />
+      )}
+      {!streaming && <TurnStagedCards toolEntries={toolEntries} density={density} />}
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>

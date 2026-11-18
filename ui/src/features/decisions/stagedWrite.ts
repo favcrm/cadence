@@ -68,7 +68,47 @@ export interface StagedWrite {
   /** The record behind "Open record", when the API names a link. */
   recordLink: string | null;
   /** `connected_effect`: the draft or send a connected tool would make. */
-  connected: { effect: "draft" | "send"; slug: string; toolkit: string; account: string } | null;
+  connected: {
+    effect: "draft" | "send";
+    slug: string;
+    toolkit: string;
+    account: string;
+    /** AOS-647/CAD-2441: display-only fields; `args` (in `raw`) is what runs. */
+    preview?: ConnectedPreview;
+  } | null;
+}
+
+/** A connected effect's display preview (AOS-647). Every value is untrusted text. */
+export interface ConnectedPreview {
+  title: string | null;
+  toolkitLabel: string | null;
+  kind: "email" | "message" | "fields";
+  fields: { role: string; label: string; value: string }[];
+}
+
+/** AOS-647 caps a preview at 12 fields of 2,000 characters; the board holds it to the same. */
+const PREVIEW_FIELDS_MAX = 12;
+const PREVIEW_VALUE_MAX = 2000;
+
+/** The row's `input.preview`, or undefined when it is absent or malformed (the args fallback stays). */
+export function parsePreview(value: unknown): ConnectedPreview | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const p = value as Record<string, unknown>;
+  const kind = p.kind === "email" || p.kind === "message" || p.kind === "fields" ? p.kind : null;
+  if (kind === null || !Array.isArray(p.fields)) return undefined;
+  const fields: ConnectedPreview["fields"] = [];
+  for (const f of p.fields.slice(0, PREVIEW_FIELDS_MAX)) {
+    if (typeof f !== "object" || f === null) return undefined;
+    const field = f as Record<string, unknown>;
+    if (typeof field.label !== "string" || typeof field.value !== "string") return undefined;
+    fields.push({
+      role: typeof field.role === "string" ? field.role : "",
+      label: field.label.slice(0, 80),
+      value: field.value.slice(0, PREVIEW_VALUE_MAX),
+    });
+  }
+  const text = (v: unknown) => (typeof v === "string" && v.trim() !== "" ? v.slice(0, 200) : null);
+  return { title: text(p.title), toolkitLabel: text(p.toolkit_label), kind, fields };
 }
 
 const STATUSES: readonly string[] = ["pending", "approved", "denied"];
@@ -263,6 +303,7 @@ function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "created
     return null;
   }
   if (!isRecord(args)) return null;
+  const preview = parsePreview(input.preview);
   return {
     ...base,
     kind: "connected_effect",
@@ -280,7 +321,7 @@ function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "created
     origin: parseOrigin(row.origin),
     result,
     recordLink: null,
-    connected: { effect, slug, toolkit, account },
+    connected: { effect, slug, toolkit, account, ...(preview ? { preview } : {}) },
   };
 }
 
