@@ -35,7 +35,7 @@ import {
 } from "../src/contract.ts";
 import { runtimeExtension, type AppScopeResolver } from "../src/engine.ts";
 import type { HostedSession } from "../src/hosted-session.ts";
-import { readSubmissionEntry, type TaskSql } from "../src/identity.ts";
+import { installOperationReplyCapture, readSubmissionEntry, type TaskSql } from "../src/identity.ts";
 import { threadEntries } from "../src/transcript.ts";
 import {
   guardOperationRequests,
@@ -1887,6 +1887,7 @@ async function constructedSession(
   database: Database,
   options: {
     tools: RuntimeTool[];
+    captureOperationReplies?: boolean;
     authorizeTool?: (name: string) => Promise<void>;
   },
 ) {
@@ -1899,13 +1900,14 @@ async function constructedSession(
     {},
     {
       modelAlias: "scripted",
+      captureOperationReplies: options.captureOperationReplies,
       requestModel: async () => new Response(null, { status: 500 }),
       tools: [{ name: "wiring-tools", tools: options.tools }],
       authorizeTool: options.authorizeTool ?? (async () => {}),
       toolRefusal: () => undefined,
     },
   );
-  return session as unknown as {
+  return session as unknown as Pick<HostedSession, "operationReply"> & {
     models: ReturnType<typeof createModels>;
     registry: ReturnType<typeof createRegistry>;
     toolAppScope: AppScopeResolver;
@@ -2346,14 +2348,23 @@ describe("no-wake settlement acceptance", () => {
       const root = await engine.root(BACKGROUND_CONTEXT, {
         agent: { model: { provider: "scripted", modelId: "scripted" } },
       });
-      const first = await root.submit(
-        { type: "input", requestId: "handoff:first", content: "January" }, BACKGROUND_CONTEXT,
+      // A completed operation from before opt-in has no terminal receipt.
+      const old = await root.submit(
+        { type: "input", requestId: "handoff:legacy", content: "Legacy" }, BACKGROUND_CONTEXT,
       );
       await scripted.started;
       scripted.release();
+      expect((await old.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      installOperationReplyCapture(sqlStore(database));
+      const firstStarted = scripted.hold();
+      const first = await root.submit(
+        { type: "input", requestId: "handoff:first", content: "January" }, BACKGROUND_CONTEXT,
+      );
+      await firstStarted;
+      scripted.release();
       expect((await first.wait(BACKGROUND_CONTEXT)).status).toBe("done");
 
-      const session = (await constructedSession(database, { tools: [] })) as unknown as HostedSession;
+      const session = await constructedSession(database, { tools: [], captureOperationReplies: true });
       Object.defineProperty(session, "harness", {
         get() { throw new Error("reply read opened the engine"); },
       });
@@ -2369,7 +2380,12 @@ describe("no-wake settlement acceptance", () => {
       expect((await withdrawn.wait(BACKGROUND_CONTEXT)).status).toBe("unanswered");
       const reply = { state: "answered", operationId: "handoff:first", text: "Reply to January" };
       const unconfirmed = (operationId: string) => ({ state: "unconfirmed", operationId });
-      for (const id of ["handoff:first", "handoff:later", "handoff:absent", "handoff:withdrawn"])
+      expect(await session.operationReply("handoff:legacy")).toEqual(unconfirmed("handoff:legacy"));
+      const ordinary = await constructedSession(database, { tools: [] });
+      expect(await ordinary.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      expect(await session.operationReply("handoff:first")).toEqual(reply);
+      expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "unanswered", operationId: "handoff:withdrawn" });
+      for (const id of ["handoff:later", "handoff:absent"])
         expect(await session.operationReply(id)).toEqual(unconfirmed(id));
       scripted.release();
       expect((await later.wait(BACKGROUND_CONTEXT)).status).toBe("done");
@@ -2381,7 +2397,7 @@ describe("no-wake settlement acceptance", () => {
       expect(await session.operationReply("handoff:later")).toEqual({ state: "answered", operationId: "handoff:later", text: "Reply to February" });
       expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "unanswered", operationId: "handoff:withdrawn" });
       expect(changes()).toBe(before);
-      expect(scripted.requests).toEqual(["January", "February"]);
+      expect(scripted.requests).toEqual(["Legacy", "January", "February"]);
 
       const stored = database.query<{ record: string }, [number]>(
         "SELECT record FROM pi_submissions WHERE id=?",
@@ -2402,20 +2418,28 @@ describe("no-wake settlement acceptance", () => {
       expect(await session.operationReply("handoff:withdrawn")).toEqual(unconfirmed("handoff:withdrawn"));
       database.prepare("UPDATE pi_submissions SET record=json_remove(record, '$.entry') WHERE id=?").run(withdrawn.id);
 
-      // In a coalesced run the engine links both inputs to the same answer.
-      database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.answer', ?) WHERE id=?").run(answer, later.id);
+      const other = database.query<{ record: string }, [number]>(
+        "SELECT record FROM pi_submissions WHERE id=?",
+      ).get(later.id);
+      const { answer: otherAnswer }: { answer: number } = JSON.parse(other!.record);
+      const setAnswer = database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.answer', ?) WHERE id=?");
+      setAnswer.run(otherAnswer, first.id);
+      setAnswer.run(answer, later.id);
       expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
       expect(await session.operationReply("handoff:later")).toEqual(unconfirmed("handoff:later"));
-      database.prepare("DELETE FROM pi_submissions WHERE id=?").run(later.id);
+      setAnswer.run(answer, first.id);
+      setAnswer.run(otherAnswer, later.id);
       expect(await session.operationReply("handoff:first")).toEqual(reply);
 
+      // A second submission receiving the same answer in settlement disqualifies it.
       database.prepare(
         `INSERT INTO pi_submissions (id, conversation_id, request_id, status, record)
-         SELECT id + 1000000, conversation_id, '\"different-indexed-id\"', status,
-                json_set(record, '$.id', id + 1000000)
+         SELECT id + 1000000, conversation_id, '"steering:input"', status,
+                json_set(record, '$.id', id + 1000000, '$.requestId', 'steering:input')
            FROM pi_submissions WHERE id=?`,
       ).run(first.id);
       expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      expect(await session.operationReply("steering:input")).toEqual(unconfirmed("steering:input"));
     } finally {
       scripted.release();
       await engine.close(BACKGROUND_CONTEXT);

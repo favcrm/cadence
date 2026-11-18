@@ -272,6 +272,8 @@ export interface HostedSessionOptions {
   readonly projectThread?: ThreadProjection;
   /** The platform default alias this deployment sends. */
   readonly modelAlias: string;
+  /** Retain settlement evidence in a host-authorized dedicated conversation. */
+  readonly captureOperationReplies?: boolean;
   /**
    * The model transport accepts image input. Default false: image tool results
    * become an explicit error. A host opting in must validate the resolved

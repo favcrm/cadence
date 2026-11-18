@@ -295,13 +295,16 @@ stored scope that does not validate fails that read or stream instead of being
 presented as Home.
 
 **Recovering an exact reply.** `HostedSession.operationReply(operationId)` is a
-read-only host RPC. Once the session is at rest, it proves the submission and
-reads its uniquely linked answer without opening the engine. `answered`
-carries only that answer's assistant text; `unanswered` proves the input
-finished without an answer. `unconfirmed` covers active work, shared answers
-from coalesced inputs, missing evidence, and results the runtime cannot verify.
-It is never permission to start another operation. The host must prove the
-reader is entitled to this conversation and bind the lookup to its own
+read-only host RPC. Opt in with `captureOperationReplies` only for a
+host-authorized dedicated conversation. The runtime records the input and
+answer IDs when the engine commits terminal settlement, in the same
+transaction; it never copies reply text into the receipt or backfills old
+operations. The lookup uses that receipt to verify the exact assistant entry
+even if unrelated work is active. `unanswered` proves the input finished
+without an answer. `unconfirmed` means the runtime cannot prove an outcome
+(including active work, missing receipts, conflicting links, or shared
+answers). It is never permission to resend. The host must prove the reader
+is entitled to the conversation and bind the lookup to its own approved
 receipt. This RPC does not accept or deliver a handoff.
 
 Inside a turn, the operation's scope reaches both the model and its tools. A
