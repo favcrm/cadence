@@ -42,11 +42,29 @@ export interface RecordField {
   untrusted: boolean;
 }
 
+const ROLE_NAMES = ["title", "subtitle", "snippet", "time", "actor", "status", "badge", "amount"] as const;
+type RoleName = (typeof ROLE_NAMES)[number];
+
+/** agenticos-v2 AOS-647: optional layout roles, each naming a `fields[].key`. */
+export interface RecordRoles {
+  title?: string;
+  subtitle?: string;
+  snippet?: string;
+  time?: string;
+  actor?: string;
+  status?: string;
+  badge?: string;
+  amount?: string;
+  /** The row is the account's own side when `String(row[key])` is in `self`. */
+  side?: { key: string; self: string[] };
+}
+
 export interface RecordCardModel {
   toolkit: string;
   tool: string;
   view: RecordView;
   fields: RecordField[];
+  roles: RecordRoles | null;
   items: Record<string, Cell>[];
   truncated: boolean;
 }
@@ -93,9 +111,32 @@ function parseField(v: unknown): RecordField | null {
   return { key, label: label || key, type: type as RecordFieldType, untrusted };
 }
 
+/** Strict like the contract's `recordCardRolesSchema`; every key must be a field. */
+function parseRoles(v: unknown, fieldKeys: string[]): RecordRoles | null {
+  if (!isObject(v)) return null;
+  const roles: RecordRoles = {};
+  for (const [name, value] of Object.entries(v)) {
+    if (name === "side") {
+      if (!isObject(value) || !exactKeys(value, ["key", "self"])) return null;
+      const { key, self } = value;
+      if (typeof key !== "string" || !fieldKeys.includes(key)) return null;
+      if (!Array.isArray(self) || self.length < 1 || self.length > 10) return null;
+      if (!self.every((s) => typeof s === "string" && s.length >= 1 && s.length <= 100)) return null;
+      roles.side = { key, self: self as string[] };
+    } else if ((ROLE_NAMES as readonly string[]).includes(name)) {
+      if (typeof value !== "string" || !FIELD_KEY.test(value) || !fieldKeys.includes(value)) return null;
+      roles[name as RoleName] = value;
+    } else return null;
+  }
+  return roles;
+}
+
 export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
   const p = payloadOf(entry, "record_ref");
-  if (!p || !exactKeys(p, ["v", "toolkit", "tool", "items", "fields", "view", "truncated"])) return null;
+  if (!p) return null;
+  const hasRoles = Object.prototype.hasOwnProperty.call(p, "roles");
+  const base = ["v", "toolkit", "tool", "items", "fields", "view", "truncated"];
+  if (!exactKeys(p, hasRoles ? [...base, "roles"] : base)) return null;
   const { toolkit, tool, items, fields, view, truncated } = p;
   if (typeof toolkit !== "string" || !TOOLKIT.test(toolkit)) return null;
   if (typeof tool !== "string" || !TOOL.test(tool)) return null;
@@ -115,11 +156,14 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     for (const v of Object.values(item)) if (!isCell(v)) return null;
     parsedItems.push(item as Record<string, Cell>);
   }
+  const roles = hasRoles ? parseRoles(p.roles, parsedFields.map((f) => f.key)) : null;
+  if (hasRoles && !roles) return null;
   return {
     toolkit,
     tool,
     view: view as RecordView,
     fields: parsedFields,
+    roles,
     items: parsedItems,
     truncated,
   };
@@ -154,9 +198,36 @@ export interface LabeledValue {
   value: string;
 }
 
+/** A role-mapped time: the text as given, and the instant when it parses. */
+export interface TimeValue {
+  text: string;
+  instant: number | null;
+}
+
+export interface RoleRow {
+  title: string;
+  subtitle: string;
+  snippet: string;
+  time: TimeValue | null;
+  /** Status then badge values, shown as chips. */
+  chips: string[];
+  amount: string;
+}
+
+export interface RoleMessage {
+  actor: string;
+  time: TimeValue | null;
+  text: string;
+  own: boolean;
+}
+
 export type RecordLayout =
   /** Compact rows: each row is the first columns of one item. */
   | { view: "list"; rows: LabeledValue[][] }
+  /** Rows laid out from `payload.roles`. */
+  | { view: "role-list"; rows: RoleRow[] }
+  /** Bubbles laid out from `payload.roles`. */
+  | { view: "role-thread"; messages: RoleMessage[] }
   /** Message-style rows. `outbound` is true when the board's side sent it. */
   | { view: "thread"; messages: { sender: string; time: string; text: string; outbound: boolean }[] }
   /** Key/value lines of one item. */
@@ -170,6 +241,78 @@ const OUT = new Set(["out", "outbound", "sent", "agent", "me"]);
 const firstKey = (fields: RecordField[], names: string[]): string | null =>
   names.find((n) => fields.some((f) => f.key === n)) ?? null;
 
+const ISO = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
+/** An ISO string or an epoch (seconds, or milliseconds from 1e11) as an instant; else null. */
+export function parseInstant(value: Cell | undefined): number | null {
+  let ms: number | null = null;
+  if (typeof value === "number") ms = value;
+  else if (typeof value === "string") {
+    const v = value.trim();
+    if (/^\d{9,13}$/.test(v)) ms = Number(v);
+    else if (ISO.test(v)) {
+      const parsed = Date.parse(v.replace(" ", "T"));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+  }
+  if (ms === null || !Number.isFinite(ms) || ms <= 0) return null;
+  return ms < 1e11 ? ms * 1000 : ms;
+}
+
+/** Chip texts of a status or badge cell: an array gives one chip per tag. */
+function chipTexts(value: Cell | undefined, labels?: CellLabels): string[] {
+  if (Array.isArray(value)) return value.slice(0, TAGS_MAX).map((s) => plainText(s, 60)).filter(Boolean);
+  const text = cellText(value, labels);
+  return text ? [plainText(text, 60)] : [];
+}
+
+const hasAnyRole = (roles: RecordRoles, names: RoleName[]): boolean => names.some((n) => roles[n] !== undefined);
+
+/** The roles layout of a list or thread; null when the roles cannot lay it out. */
+function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLabels): RecordLayout | null {
+  const text = (item: Record<string, Cell>, key: string | undefined) =>
+    key === undefined ? "" : cellText(item[key], labels);
+  const time = (item: Record<string, Cell>): TimeValue | null => {
+    if (roles.time === undefined) return null;
+    const t = text(item, roles.time);
+    return t ? { text: t, instant: parseInstant(item[roles.time]) } : null;
+  };
+  if (model.view === "thread") {
+    if (!hasAnyRole(roles, ["snippet", "title", "subtitle"])) return null;
+    const side = roles.side;
+    const messages = model.items
+      .map((item) => {
+        const own = side !== undefined && item[side.key] != null && side.self.includes(String(item[side.key]));
+        return {
+          actor: text(item, roles.actor),
+          time: time(item),
+          text: text(item, roles.snippet) || text(item, roles.title) || text(item, roles.subtitle),
+          own,
+        };
+      })
+      .filter((m) => m.text !== "");
+    return messages.length ? { view: "role-thread", messages } : null;
+  }
+  if (model.view === "list") {
+    if (!hasAnyRole(roles, ["title", "subtitle", "snippet", "time", "status", "badge", "amount"])) return null;
+    const rows = model.items
+      .map((item) => ({
+        title: text(item, roles.title),
+        subtitle: text(item, roles.subtitle),
+        snippet: text(item, roles.snippet),
+        time: time(item),
+        chips: [
+          ...(roles.status ? chipTexts(item[roles.status], labels) : []),
+          ...(roles.badge ? chipTexts(item[roles.badge], labels) : []),
+        ],
+        amount: text(item, roles.amount),
+      }))
+      .filter((r) => r.title || r.subtitle || r.snippet || r.time || r.chips.length || r.amount);
+    return rows.length ? { view: "role-list", rows } : null;
+  }
+  return null;
+}
+
 /**
  * The model laid out for its view, or null when a view cannot be laid out
  * (a thread with no text field, an empty table): the caller falls back to
@@ -182,6 +325,10 @@ export function recordLayout(model: RecordCardModel, labels?: CellLabels): Recor
     fields
       .map((f) => ({ label: plainText(f.label, 100), value: text(item, f.key) }))
       .filter((p) => p.value !== "");
+  if (model.roles) {
+    const withRoles = roleLayout(model, model.roles, labels);
+    if (withRoles) return withRoles;
+  }
   if (model.view === "thread") {
     const textKey = firstKey(model.fields, TEXT_KEYS);
     if (!textKey) return null;

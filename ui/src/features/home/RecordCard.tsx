@@ -1,6 +1,6 @@
-import { useTranslate } from "../../lib/locale";
+import { useLocale, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
-import { parseRecordRef, plainText, recordLayout, type LabeledValue } from "./chatCards";
+import { parseRecordRef, plainText, recordLayout, type LabeledValue, type TimeValue } from "./chatCards";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -21,6 +21,16 @@ function Pairs({ pairs }: { pairs: LabeledValue[] }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+function Time({ value }: { value: TimeValue }) {
+  const { formatRelativeTime } = useLocale();
+  const shown = value.instant === null ? value.text : formatRelativeTime(value.instant);
+  return (
+    <time className="recordcard-time" dateTime={value.instant === null ? undefined : new Date(value.instant).toISOString()} title={value.text}>
+      {shown}
+    </time>
   );
 }
 
@@ -46,6 +56,46 @@ export function RecordCard({ entry, density = "full" }: { entry: ThreadEntry; de
           {layout.rows.map((row, i) => (
             <li key={i}>
               <Pairs pairs={row} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {layout.view === "role-list" && (
+        <ul className="recordcard-list recordcard-rows">
+          {layout.rows.map((r, i) => (
+            <li key={i} className="recordcard-row">
+              <div className="recordcard-row-main">
+                {r.title && <span className="recordcard-title">{r.title}</span>}
+                {r.subtitle && <span className="recordcard-subtitle">{r.subtitle}</span>}
+                {r.snippet && <span className="recordcard-snippet">{r.snippet}</span>}
+              </div>
+              <div className="recordcard-row-side">
+                {r.time && <Time value={r.time} />}
+                {r.amount && <span className="recordcard-amount">{r.amount}</span>}
+              </div>
+              {r.chips.length > 0 && (
+                <div className="recordcard-chips">
+                  {r.chips.map((c, j) => (
+                    <span key={j} className="recordcard-chip">{c}</span>
+                  ))}
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {layout.view === "role-thread" && (
+        <ul className="recordcard-thread recordcard-bubbles">
+          {layout.messages.map((m, i) => (
+            <li key={i} data-own={m.own || undefined}>
+              <span className="recordcard-text">{m.text}</span>
+              {(m.actor || m.time) && (
+                <span className="recordcard-meta">
+                  {m.actor}
+                  {m.actor && m.time ? " · " : ""}
+                  {m.time && <Time value={m.time} />}
+                </span>
+              )}
             </li>
           ))}
         </ul>
