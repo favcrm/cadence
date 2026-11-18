@@ -50,6 +50,7 @@ import "./explorer.css";
 type Phase =
   | { kind: "loading" }
   | { kind: "readonly" }
+  | { kind: "unsupported" }
   | { kind: "blocked"; message: string }
   | { kind: "error"; message: string }
   | { kind: "ready"; data: MemberAccess };
@@ -119,6 +120,10 @@ export default function MemberAccessPanel({
       })
       .catch((cause: unknown) => {
         if (!live || controller.signal.aborted) return;
+        if (cause instanceof ApiError && cause.status === 501) {
+          setPhase({ kind: "unsupported" });
+          return;
+        }
         const denied = cause instanceof ApiError && (cause.status === 401 || cause.status === 403);
         const known = cause instanceof ApiError ? reasonCopyFor(cause.code) : null;
         setPhase(
@@ -542,7 +547,7 @@ export default function MemberAccessPanel({
             {t("Each grant is one member and one conversation. Projects and private jobs are not affected.")}
           </p>
         </div>
-        {operator && (
+        {operator && phase.kind !== "unsupported" && (
           <div className="ma-head-actions">
             <button
               type="button"
@@ -596,6 +601,10 @@ export default function MemberAccessPanel({
             {t("Reading the member access list…")}
           </p>
         </div>
+      )}
+
+      {phase.kind === "unsupported" && (
+        <p className="ma-count" role="status">{t("This workspace does not support managing app conversation access here.")}</p>
       )}
 
       {phase.kind === "blocked" && (

@@ -16,6 +16,7 @@ type ScreenAccess = {
 export type PrivateReview = {
   name: string;
   title: string;
+  summary: string | null;
   version: string;
   digest: string;
   files: string[];
@@ -96,6 +97,7 @@ function invalid(): ApiError {
 function parseReview(value: unknown, target: PrivateTarget | null, sessionGeneration: number): PrivateReview {
   if (!object(value) || value.schema !== 1 || value.committed !== false || value.visibility !== "workspace" ||
       typeof value.name !== "string" || !value.name || typeof value.title !== "string" || !value.title ||
+      (value.summary !== undefined && (typeof value.summary !== "string" || value.summary.length > 600)) ||
       typeof value.version !== "string" || !value.version || typeof value.digest !== "string" || !DIGEST.test(value.digest) ||
       typeof value.catalog_generation !== "string" || !value.catalog_generation || !strings(value.files) ||
       !access(value.access_diff) || !declaredAccess(value.declared_access) || !screens(value.screen_access) || value.screen_access.length !== 1 ||
@@ -107,6 +109,7 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
   return {
     name: value.name,
     title: value.title,
+    summary: typeof value.summary === "string" ? value.summary.trim() || null : null,
     version: value.version,
     digest: value.digest,
     files: value.files,
