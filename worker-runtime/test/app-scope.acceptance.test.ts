@@ -2368,10 +2368,9 @@ describe("no-wake settlement acceptance", () => {
       expect(await withdrawn.abort(BACKGROUND_CONTEXT)).toBe("aborted");
       expect((await withdrawn.wait(BACKGROUND_CONTEXT)).status).toBe("unanswered");
       const reply = { state: "answered", operationId: "handoff:first", text: "Reply to January" };
-      expect(await session.operationReply("handoff:first")).toEqual(reply);
-      expect(await session.operationReply("handoff:later")).toEqual({ state: "unconfirmed", operationId: "handoff:later" });
-      expect(await session.operationReply("handoff:absent")).toEqual({ state: "unconfirmed", operationId: "handoff:absent" });
-      expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "unanswered", operationId: "handoff:withdrawn" });
+      const unconfirmed = (operationId: string) => ({ state: "unconfirmed", operationId });
+      for (const id of ["handoff:first", "handoff:later", "handoff:absent", "handoff:withdrawn"])
+        expect(await session.operationReply(id)).toEqual(unconfirmed(id));
       scripted.release();
       expect((await later.wait(BACKGROUND_CONTEXT)).status).toBe("done");
       await engine.waitForIdle(BACKGROUND_CONTEXT);
@@ -2380,22 +2379,43 @@ describe("no-wake settlement acceptance", () => {
       const before = changes();
       expect(await session.operationReply("handoff:first")).toEqual(reply);
       expect(await session.operationReply("handoff:later")).toEqual({ state: "answered", operationId: "handoff:later", text: "Reply to February" });
+      expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "unanswered", operationId: "handoff:withdrawn" });
       expect(changes()).toBe(before);
       expect(scripted.requests).toEqual(["January", "February"]);
 
       const stored = database.query<{ record: string }, [number]>(
         "SELECT record FROM pi_submissions WHERE id=?",
       ).get(first.id);
-      const { answer }: { answer: number } = JSON.parse(stored!.record);
+      const { answer, entry }: { answer: number; entry: number } = JSON.parse(stored!.record);
       database.prepare("UPDATE pi_entries SET record=json_set(record, '$.conversationId', 2) WHERE id=?").run(answer);
-      expect(await session.operationReply("handoff:first")).toEqual({ state: "unconfirmed", operationId: "handoff:first" });
+      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
       database.prepare("UPDATE pi_entries SET record=json_set(record, '$.conversationId', 1) WHERE id=?").run(answer);
+      database.prepare("UPDATE pi_entries SET record=json_set(record, '$.model[0].stopReason', 'error') WHERE id=?").run(answer);
+      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      database.prepare("UPDATE pi_entries SET record=json_set(record, '$.model[0].stopReason', 'stop') WHERE id=?").run(answer);
+
+      const setInput = database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.entry', ?) WHERE id=?");
+      setInput.run(answer, first.id);
+      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      setInput.run(entry, first.id);
+      setInput.run(answer, withdrawn.id);
+      expect(await session.operationReply("handoff:withdrawn")).toEqual(unconfirmed("handoff:withdrawn"));
+      database.prepare("UPDATE pi_submissions SET record=json_remove(record, '$.entry') WHERE id=?").run(withdrawn.id);
+
+      // In a coalesced run the engine links both inputs to the same answer.
+      database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.answer', ?) WHERE id=?").run(answer, later.id);
+      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      expect(await session.operationReply("handoff:later")).toEqual(unconfirmed("handoff:later"));
+      database.prepare("DELETE FROM pi_submissions WHERE id=?").run(later.id);
+      expect(await session.operationReply("handoff:first")).toEqual(reply);
 
       database.prepare(
         `INSERT INTO pi_submissions (id, conversation_id, request_id, status, record)
-         SELECT id + 1000000, conversation_id, request_id, status, record FROM pi_submissions WHERE id=?`,
+         SELECT id + 1000000, conversation_id, '\"different-indexed-id\"', status,
+                json_set(record, '$.id', id + 1000000)
+           FROM pi_submissions WHERE id=?`,
       ).run(first.id);
-      expect(await session.operationReply("handoff:first")).toEqual({ state: "unconfirmed", operationId: "handoff:first" });
+      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
     } finally {
       scripted.release();
       await engine.close(BACKGROUND_CONTEXT);

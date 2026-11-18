@@ -398,6 +398,7 @@ export function readSubmissionSettlement(
   sql: TaskSql,
   conversationId: number,
   operationId: string,
+  exclusiveAnswer?: { submission: number; entry: number },
 ): SubmissionSettlement {
   const schema = sql.exec(
     `SELECT name, type FROM sqlite_master
@@ -475,10 +476,16 @@ export function readSubmissionSettlement(
             row.request_id !== JSON.stringify(record.requestId))
       )
         return { state: "unknown" };
+      // A run may contain several steering inputs. Do not attribute their
+      // shared answer to any single input when exact reply evidence is needed.
+      if (exclusiveAnswer && record.answer === exclusiveAnswer.entry && id !== exclusiveAnswer.submission)
+        return { state: "unknown" };
       if (conversation === conversationId && record.requestId === operationId) {
         if (settled !== undefined || record.type !== "input") return { state: "unknown" };
         if (record.status === "done") {
           if (!isEntryId(record.entry) || !isEntryId(record.answer) ||
+              (exclusiveAnswer !== undefined &&
+                (id !== exclusiveAnswer.submission || record.answer !== exclusiveAnswer.entry)) ||
               record.reason !== undefined || record.detail !== undefined)
             return { state: "unknown" };
         } else if (
@@ -512,7 +519,7 @@ export function readSubmissionSettlement(
   return settled;
 }
 
-/** Return positive evidence for one exact input, without needing other work to settle. */
+/** Read a uniquely attributed reply from the same evidence as no-wake settlement. */
 export function readOperationReply(
   sql: TaskSql,
   conversationId: number,
@@ -521,7 +528,7 @@ export function readOperationReply(
   const unconfirmed = { state: "unconfirmed", operationId } as const;
   try {
     const rows = sql.exec(
-      `SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+      `SELECT id, record FROM pi_submissions INDEXED BY pi_submissions_by_request
         WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
       conversationId,
       JSON.stringify(operationId),
@@ -529,29 +536,32 @@ export function readOperationReply(
     const row = rows[0];
     if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
     const submission = parseRecord(row.record);
-    if (submission === null || submission.id !== row.id || submission.conversationId !== conversationId ||
-        submission.requestId !== operationId || submission.type !== "input" || submission.status !== row.status)
-      return unconfirmed;
-    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
-      return { state: "unanswered", operationId };
-    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(submission.answer) ||
-        submission.reason !== undefined || submission.detail !== undefined)
-      return unconfirmed;
+    if (submission === null) return unconfirmed;
+    const entryId = submission.answer;
+    const exclusiveAnswer = submission.status === "done" && isEntryId(entryId)
+      ? { submission: row.id, entry: entryId }
+      : undefined;
+    const settlement = readSubmissionSettlement(sql, conversationId, operationId, exclusiveAnswer);
+    if (settlement.state !== "settled" || settlement.submission !== row.id) return unconfirmed;
+    if (settlement.status === "unanswered") return { state: "unanswered", operationId };
+    if (!exclusiveAnswer) return unconfirmed;
 
     // The engine commits the answer pointer in the submission. Do not read the
     // conversation tail: it can already contain another operation's reply.
     const answer = sql.exec(
       "SELECT conversation_id, record FROM pi_entries WHERE id=?",
-      submission.answer,
+      exclusiveAnswer.entry,
     ).toArray()[0];
     if (answer?.conversation_id !== conversationId) return unconfirmed;
     const entry = parseRecord(answer.record);
-    if (entry === null || entry.id !== submission.answer || entry.conversationId !== conversationId ||
+    if (entry === null || entry.id !== exclusiveAnswer.entry || entry.conversationId !== conversationId ||
         !Array.isArray(entry.model)) return unconfirmed;
     const message: unknown = entry.model[0];
     if (typeof message !== "object" || message === null || !("role" in message) ||
         message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
       return unconfirmed;
+    if (!("stopReason" in message) || (message.stopReason !== "stop" &&
+        message.stopReason !== "length" && message.stopReason !== "toolUse")) return unconfirmed;
     let text = "";
     for (const part of message.content as unknown[]) {
       if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
