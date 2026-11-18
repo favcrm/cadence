@@ -17,7 +17,8 @@ use crate::protected_runtime::strict;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 
 pub(super) const CHAT_PATH: &str = "/v1/runtime/inference/chat/completions";
-const MAX_GATEWAY_REQUEST: usize = 512 * 1024;
+// AgenticOS's text-context budget; this broker never sends image data.
+const MAX_GATEWAY_REQUEST: usize = 256 * 1024;
 
 fn unsupported() -> Error {
     Error::invalid("unsupported_content", "the model content is not supported")
@@ -178,13 +179,22 @@ fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
             "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
         }));
     }
-    let body = serde_json::to_vec(&json!({
-        "model": turn.model_id,
-        "messages": messages,
-        "tools": tools,
-        "max_tokens": turn.max_output_tokens,
-        "stream": false,
-    }))
+    #[derive(serde::Serialize)]
+    struct ChatRequest<'a> {
+        model: &'a str,
+        messages: Vec<Value>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<Value>,
+        max_tokens: u32,
+        stream: bool,
+    }
+    let body = serde_json::to_vec(&ChatRequest {
+        model: turn.model_id,
+        messages,
+        tools,
+        max_tokens: turn.max_output_tokens,
+        stream: false,
+    })
     .map_err(|_| unsupported())?;
     if body.len() > MAX_GATEWAY_REQUEST {
         return Err(Error::invalid(
@@ -200,6 +210,13 @@ fn unknown() -> ChildOutcome {
         error: ClosedModelTurnErrorV1::outcome_unknown(),
         auth_requests: 0,
         inference_requests: 1,
+    }
+}
+
+fn nullable_count(value: &Value) -> Option<Option<u64>> {
+    match value {
+        Value::Null => Some(None),
+        other => other.as_u64().map(Some),
     }
 }
 
@@ -256,21 +273,36 @@ fn response(value: &Value, turn: &GatewayTurn<'_>) -> Option<ChildOutcome> {
         _ => return None,
     };
     let usage = value.get("usage")?;
-    let input = usage.get("prompt_tokens")?.as_u64()?;
-    let output = usage.get("completion_tokens")?.as_u64()?;
-    let total = usage.get("total_tokens")?.as_u64()?;
+    let input = nullable_count(usage.get("prompt_tokens")?)?;
+    let output = nullable_count(usage.get("completion_tokens")?)?;
+    let total = nullable_count(usage.get("total_tokens")?)?;
     let cached = match usage.get("prompt_tokens_details") {
         None | Some(Value::Null) => 0,
         Some(details) => details.get("cached_tokens")?.as_u64()?,
     };
-    if cached > input || input.checked_add(output)? != total {
+    if input.is_some_and(|input| cached > input) {
         return None;
     }
     if let Some(details) = usage.get("completion_tokens_details") {
-        if !details.is_null() && details.get("reasoning_tokens")?.as_u64()? > output {
-            return None;
+        if !details.is_null() {
+            let reasoning = details.get("reasoning_tokens")?.as_u64()?;
+            if output.is_some_and(|output| reasoning > output) {
+                return None;
+            }
         }
     }
+    let observed = match (input, output, total) {
+        (Some(input), Some(output), Some(total)) => {
+            if input.checked_add(output)? != total {
+                return None;
+            }
+            Some((input - cached, output, cached, total))
+        }
+        _ => None,
+    };
+    // Pi requires numeric usage on assistant history. This placeholder
+    // never becomes a usage observation or a local billing decision.
+    let (input, output, cached, total) = observed.unwrap_or_default();
     let timestamp: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
@@ -285,7 +317,7 @@ fn response(value: &Value, turn: &GatewayTurn<'_>) -> Option<ChildOutcome> {
         "model": turn.configured_model,
         "responseModel": model,
         "usage": {
-            "input": input-cached, "output": output, "cacheRead": cached, "cacheWrite": 0,
+            "input": input, "output": output, "cacheRead": cached, "cacheWrite": 0,
             "totalTokens": total, "cost": {"input":0, "output":0, "cacheRead":0, "cacheWrite":0, "total":0},
         },
         "stopReason": stop,
@@ -298,7 +330,10 @@ fn response(value: &Value, turn: &GatewayTurn<'_>) -> Option<ChildOutcome> {
         assistant["responseId"] = json!(id);
     }
     let assistant = NativeAssistantV1::parse(&assistant).ok()?;
-    let usage = NativeUsageObservationV1::from_assistant(&assistant)?;
+    let usage = match observed {
+        Some(_) => Some(NativeUsageObservationV1::from_assistant(&assistant)?),
+        None => None,
+    };
     Some(ChildOutcome::Done {
         assistant,
         usage,
@@ -367,6 +402,81 @@ pub(super) fn invoke(turn: GatewayTurn<'_>) -> crate::Result<ChildOutcome> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn fixture_turn<'a>(tls: &'a GatewayTls, messages: &'a [NativeMessageV1]) -> GatewayTurn<'a> {
+        GatewayTurn {
+            origin: PRODUCTION_ORIGIN,
+            tls,
+            configured_model: "agenticos/example/model",
+            model_id: "example/model",
+            request_id: "synthetic-request",
+            workspace_id: "ws_synthetic",
+            max_output_tokens: 64,
+            tool_choice: "none",
+            messages,
+            tools: &[],
+            bearer: b"synthetic-bearer",
+            deadline: Duration::from_secs(1),
+        }
+    }
+
+    fn user_message(text: String) -> NativeMessageV1 {
+        NativeMessageV1::User {
+            content: vec![TextPartV1 {
+                text,
+                signature: None,
+            }],
+            timestamp: 1,
+        }
+    }
+
+    #[test]
+    fn gateway_omits_empty_declarations_and_refuses_oversize_without_dispatch() {
+        let small = [user_message("Reply plainly".into())];
+        let turn = fixture_turn(&GatewayTls::Production, &small);
+        let wire: Value = serde_json::from_slice(&request(&turn).unwrap()).unwrap();
+        assert_eq!(wire["messages"][0]["content"], "Reply plainly");
+        assert!(wire.get("tools").is_none());
+
+        let large: Vec<_> = (0..5).map(|_| user_message("x".repeat(60_000))).collect();
+        let error = request(&fixture_turn(&GatewayTls::Production, &large)).unwrap_err();
+        assert_eq!(error.code(), Some("payload_too_large"));
+    }
+
+    #[test]
+    fn gateway_delivers_completion_without_fabricating_metered_usage() {
+        let turn = fixture_turn(&GatewayTls::Production, &[]);
+        let mut wire = json!({
+            "object":"chat.completion",
+            "model":"example/model",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"The answer"},
+                "finish_reason":"stop"
+            }],
+            "usage":{"prompt_tokens":12,"completion_tokens":null,"total_tokens":null},
+        });
+        let Some(ChildOutcome::Done {
+            assistant, usage, ..
+        }) = response(&wire, &turn)
+        else {
+            panic!("a successful reply with unavailable usage was discarded");
+        };
+        assert_eq!(assistant.to_json()["content"][0]["text"], "The answer");
+        assert!(usage.is_none());
+
+        wire["usage"] = json!({"prompt_tokens":12,"completion_tokens":3,"total_tokens":15});
+        let Some(ChildOutcome::Done {
+            usage: Some(usage), ..
+        }) = response(&wire, &turn)
+        else {
+            panic!("valid observed usage was not preserved");
+        };
+        assert_eq!((usage.input, usage.output, usage.total), (12, 3, 15));
+
+        wire["usage"]["total_tokens"] = json!(16);
+        assert!(response(&wire, &turn).is_none());
+    }
 
     #[test]
     fn transport_binds_origin_to_owner_tls_mode_before_sending_credentials() {

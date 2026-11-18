@@ -1231,6 +1231,7 @@ impl NativeModelBroker {
             sdk::ChildOutcome::Done {
                 assistant, usage, ..
             } => {
+                let usage_json = usage.as_ref().map(|usage| usage.to_json().to_string());
                 let leaks = crate::platform::refuse_leak(
                     "native model result",
                     &assistant.to_json().to_string(),
@@ -1248,9 +1249,8 @@ impl NativeModelBroker {
                     )
                     .is_err()
                 {
-                    // The upstream turn completed and consumed real usage: a
-                    // result refusal retains it. The unsafe assistant stays
-                    // private and is never projected to the guest.
+                    // The upstream turn completed; a result refusal retains
+                    // the usage observation if the provider supplied one.
                     let row = shared.store.write_tx(|tx| {
                         let row = durable::request_in(tx, &request_id)?
                             .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
@@ -1262,7 +1262,7 @@ impl NativeModelBroker {
                             // persisted: the credential echo must not reach
                             // core SQLite or WAL.
                             None,
-                            Some(usage.to_json().to_string().as_str()),
+                            usage_json.as_deref(),
                             Some(
                                 ClosedModelTurnErrorV1::result_refused()
                                     .to_json()
@@ -1287,7 +1287,7 @@ impl NativeModelBroker {
                         &row,
                         durable::STATE_DONE,
                         Some(assistant.to_json().to_string().as_str()),
-                        Some(usage.to_json().to_string().as_str()),
+                        usage_json.as_deref(),
                         None,
                         &billing.to_json().to_string(),
                         auth_requests,
@@ -2478,5 +2478,71 @@ impl Shared {
                 "the native model broker is not installed on this daemon",
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod agenticos_authorization_acceptance {
+    use super::*;
+    use cadence_core::connection_dispatch::RoleModelPolicyV1;
+
+    #[test]
+    fn agenticos_route_refuses_allowlisted_worker_but_allows_master() {
+        let model = ModelId::try_from("agenticos/example/model".to_string()).unwrap();
+        let policy = RoleModelPolicyV1 {
+            allow: vec![],
+            master_allow: Some(vec![model.clone()]),
+            worker_allow: Some(vec![model.clone()]),
+            agentic_providers: vec![],
+        };
+        let limit = catalog::ScopeLimit {
+            requests_per_minute: 1,
+            unresolved: 1,
+        };
+        let origin = "https://api-v2.agenticos.hk".to_string();
+        let route = catalog::RouteFacts {
+            provider: AGENTICOS.to_string(),
+            origins: vec![origin.clone()],
+            default_origin: origin,
+            catalog_revision: 1,
+            families: vec![catalog::FamilyFacts {
+                family_uid: "example/model".to_string(),
+                family_label: "Example model".to_string(),
+                variants: vec![catalog::VariantFacts {
+                    model_uid: "example/model".to_string(),
+                    max_context_tokens: Some(131_072),
+                    max_output_tokens: Some(8192),
+                }],
+                model_id: "example/model".to_string(),
+                thinking_level_map: vec![],
+                reasoning: false,
+            }],
+            max_output_tokens: 8192,
+            limits: catalog::OwnerLimits {
+                agent: limit,
+                account: limit,
+                workspace: limit,
+            },
+            backend: RouteBackend::AgenticOs {
+                tls: agenticos_gateway::GatewayTls::Production,
+                workspace_id: "ws_example".to_string(),
+            },
+            approved_tools: vec![],
+            approved_tools_digest: format!("sha256:{}", "0".repeat(64)),
+        };
+
+        assert!(pi_model_decision(RoleV1::Worker, &model, Some(&policy)).is_ok());
+        assert!(!native_model_allowed(
+            RoleV1::Worker,
+            &model,
+            Some(&policy),
+            &route,
+        ));
+        assert!(native_model_allowed(
+            RoleV1::Master,
+            &model,
+            Some(&policy),
+            &route,
+        ));
     }
 }
