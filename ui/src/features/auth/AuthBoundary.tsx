@@ -14,9 +14,9 @@ import Login from "./Login";
 import { SIGN_IN_COMMAND, sessionAdmissible } from "./gate";
 import { hostedOrigin } from "./hosted";
 import "./auth.css";
-import { captureLoginNonce } from "./session";
+import { captureLoginNonce, closeSession } from "./session";
 
-type Status = "checking" | "signedout" | "unavailable" | "expired" | "refused" | "ready";
+type Status = "checking" | "signedout" | "signedoutexplicit" | "signingout" | "logoutunknown" | "unavailable" | "expired" | "refused" | "ready";
 type BoundaryState = { status: Status; meta: Meta | null; accepted: Meta | null; generation: number; hosted: boolean };
 const IDENTITY_STORE = "cadence.privateSessionIdentity";
 
@@ -37,6 +37,10 @@ function returnDestination(): string {
 }
 function rememberedIdentity(): string | null {
   try { return sessionStorage.getItem(IDENTITY_STORE); } catch { return null; }
+}
+
+function explicitlySignedOut(): boolean {
+  return document.cookie.split(";").some((part) => part.trim() === "cadence_signed_out=1");
 }
 
 /** Safe bootstrap only. The workspace is first mounted after read admission.
@@ -65,6 +69,7 @@ export default function AuthBoundary({ children }: {
   const retryFocus = useRef(false);
   const privateFocus = useRef<HTMLElement | null>(null);
   const logoutPending = useRef(false);
+  const logoutUncertain = useRef(false);
 
   const publish = useCallback((next: BoundaryState) => {
     stateRef.current = next;
@@ -80,7 +85,7 @@ export default function AuthBoundary({ children }: {
   }, [setSession]);
 
   const recheck = useCallback((): Promise<boolean> => {
-    if (logoutPending.current) return Promise.resolve(false);
+    if (logoutPending.current || logoutUncertain.current) return Promise.resolve(false);
     const key = sessionKey();
     if (key !== credential.current) {
       credential.current = key;
@@ -142,14 +147,14 @@ export default function AuthBoundary({ children }: {
         credential.current = null;
         setSessionKey(null);
       }
-      publish({ status: expired ? "expired" : "signedout", meta, accepted: null, generation: privateSessionGeneration(), hosted });
+      publish({ status: hosted && explicitlySignedOut() ? "signedoutexplicit" : expired ? "expired" : "signedout", meta, accepted: null, generation: privateSessionGeneration(), hosted });
       return false;
     }).catch((error: unknown) => {
       if (!current()) return false;
       if (error instanceof ApiError && (error.status === 403 || (error.status === 401 && error.code === "board_session_required"))) {
         const expired = stateRef.current.accepted !== null || identity.current !== null || stateRef.current.status === "expired";
         discard();
-        publish({ ...stateRef.current, status: error.status === 403 ? "refused" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
+        publish({ ...stateRef.current, status: error.status === 403 ? "refused" : explicitlySignedOut() ? "signedoutexplicit" : expired ? "expired" : "signedout", accepted: null, meta: null, hosted: true, generation: privateSessionGeneration() });
       } else unavailable();
       return false;
     }).finally(() => {
@@ -165,7 +170,7 @@ export default function AuthBoundary({ children }: {
     void recheck();
     const changed = () => {
       const key = sessionKey();
-      if (logoutPending.current && key === null) return;
+      if (logoutUncertain.current || (logoutPending.current && key === null)) return;
       if (key !== credential.current) {
         logoutPending.current = false;
         void recheck();
@@ -178,14 +183,25 @@ export default function AuthBoundary({ children }: {
       discard();
       publish({ ...stateRef.current, status: "signedout", accepted: null, generation: privateSessionGeneration() });
     };
-    const ending = () => { logoutPending.current = true; ended(); };
-    const finished = () => { logoutPending.current = false; ended(); };
+    const ending = () => {
+      logoutPending.current = true;
+      logoutUncertain.current = false;
+      ended();
+      if (stateRef.current.hosted) publish({ ...stateRef.current, status: "signingout" });
+    };
+    const finished = () => {
+      logoutPending.current = false;
+      ended();
+      if (stateRef.current.hosted) publish({ ...stateRef.current, status: "signedoutexplicit" });
+    };
     const logoutUnavailable = () => {
       logoutPending.current = false;
+      logoutUncertain.current = stateRef.current.hosted;
       pausePrivateReads();
-      publish({ ...stateRef.current, status: "unavailable" });
+      publish({ ...stateRef.current, status: stateRef.current.hosted ? "logoutunknown" : "unavailable" });
     };
     const required = () => {
+      if (logoutPending.current || logoutUncertain.current) return;
       // A confirmed refusal supersedes even an older successful proof still
       // in flight. Recovery must verify anew, never join that stale probe.
       const previous = stateRef.current;
@@ -198,7 +214,7 @@ export default function AuthBoundary({ children }: {
         credential.current = null;
         setSessionKey(null);
       }
-      publish({ ...previous, status: expired ? "expired" : "signedout", accepted: null, generation: privateSessionGeneration() });
+      publish({ ...previous, status: previous.hosted && explicitlySignedOut() ? "signedoutexplicit" : expired ? "expired" : "signedout", accepted: null, generation: privateSessionGeneration() });
     };
     const focused = () => { if (!document.hidden) void recheck(); };
     const online = () => { void recheck(); };
@@ -208,6 +224,21 @@ export default function AuthBoundary({ children }: {
       // further private work.
       if (applySharedSessionChange(event)) changed();
     };
+    let channel: BroadcastChannel | null = null;
+    if (typeof window.BroadcastChannel === "function") {
+      try {
+        channel = new window.BroadcastChannel("cadence-workspace-session");
+        channel.onmessage = (event: MessageEvent) => {
+          if (!stateRef.current.hosted || event.data !== "signed-out" || logoutPending.current || logoutUncertain.current) return;
+          sequence.current += 1;
+          inFlight.current?.controller.abort();
+          inFlight.current = null;
+          discard();
+          publish({ ...stateRef.current, status: "checking", accepted: null, generation: privateSessionGeneration() });
+          void recheck();
+        };
+      } catch { /* Focus and periodic verification remain available. */ }
+    }
     window.addEventListener("online", online);
     window.addEventListener("storage", shared);
     window.addEventListener("cadence:session-changed", changed);
@@ -223,6 +254,7 @@ export default function AuthBoundary({ children }: {
       inFlight.current?.controller.abort();
       inFlight.current = null;
       pausePrivateReads();
+      channel?.close();
       window.clearInterval(timer);
       window.removeEventListener("cadence:session-changed", changed);
       window.removeEventListener("cadence:session-ending", ending);
@@ -282,10 +314,14 @@ export default function AuthBoundary({ children }: {
 
   const hosted = state.hosted;
   const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(href) ?? "/", location.origin).href)}`;
-  const checking = state.status === "checking";
+  const checking = state.status === "checking" || state.status === "signingout";
+  const switchLogin = `${hostedLogin}&mode=switch`;
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
     checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
     signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Your work, behind a sign-in." : "Sign in to your local board.", text: hosted ? "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
+    signedoutexplicit: { eyebrow: "Workspace signed out", heading: "You signed out of this workspace.", text: "Your AgenticOS sign-in is unchanged. Continuing may select the same account; choose another account to switch.", icon: "lock" },
+    signingout: { eyebrow: "Secure workspace", heading: "Signing out of this workspace", text: "Your workspace is hidden while we confirm sign-out.", icon: "lock" },
+    logoutunknown: { eyebrow: "Sign-out unconfirmed", heading: "We couldn’t confirm sign-out.", text: "Your workspace is hidden. Retry sign-out, or explicitly verify your session to return. Your AgenticOS sign-in is unchanged.", icon: "alert" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
     expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
@@ -306,17 +342,20 @@ export default function AuthBoundary({ children }: {
             <h1 id="auth-title" ref={title} tabIndex={-1}>{t(gate.heading)}</h1>
             <p className="auth-intro">{t(gate.text)}</p>
             {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
-              {state.status === "unavailable" ? <>
+              {state.status === "logoutunknown" ? <>
+                <Button variant="primary" full onClick={() => { void closeSession(true).catch(() => undefined); }}>{t("Retry sign-out")}</Button>
+                <button className="auth-back-link" onClick={() => { logoutUncertain.current = false; retryFocus.current = true; void recheck(); }}>{t("Verify session and return")}</button>
+              </> : state.status === "unavailable" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
-                {hosted ? <a className="auth-back-link" href={hostedLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">
+                {hosted ? <a className="auth-back-link" href={switchLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>
                   <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
                   <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
                   {state.meta?.device_login === true && <DeviceSignIn onSignedIn={onSignedIn} />}
                 </details>}
               </> : hosted ? <>
-                <a className="btn btn-primary btn-full" href={hostedLogin}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
-                <p className="auth-quiet auth-centered">{t("No separate Cadence account needed.")}</p>
+                <a className="btn btn-primary btn-full" href={state.status === "refused" ? switchLogin : hostedLogin}>{t(state.status === "refused" ? "Use another account" : "Continue with AgenticOS")}<span aria-hidden="true">→</span></a>
+                {state.status === "signedoutexplicit" ? <a className="auth-back-link" href={switchLogin}>{t("Use another account")}</a> : <p className="auth-quiet auth-centered">{t("No separate Cadence account needed.")}</p>}
               </> : <>
                 <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
                 <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>

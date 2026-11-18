@@ -109,25 +109,39 @@ export async function pollDeviceSignIn(pendingId: string): Promise<DevicePollOut
 }
 
 /** `POST /api/session/logout` — end this browser's session. */
-export async function closeSession(): Promise<void> {
+export async function closeSession(hosted = false): Promise<void> {
   nonceRequest?.abort();
   const key = sessionKey();
-  // Hide private observations immediately, including hosted cookie-only sessions.
   window.dispatchEvent(new Event("cadence:session-ending"));
   const generation = privateSessionGeneration();
   const controller = new AbortController();
   const changed = () => { if (sessionKey() !== key && sessionKey() !== null) controller.abort(); };
   window.addEventListener("cadence:session-changed", changed);
+  let timer: number | undefined;
   let completed = false;
   try {
-    await sessionPost("/api/session/logout", {}, controller.signal);
+    const request = sessionPost("/api/session/logout", {}, controller.signal);
+    // ES2023 is the board's supported library target.
+    const deadline = hosted ? new Promise<never>((_, reject) => {
+      timer = window.setTimeout(() => { controller.abort(); reject(new Error("Sign-out timed out")); }, 8_000);
+    }) : null;
+    const result = deadline ? await Promise.race([request, deadline]) : await request;
+    if (hosted && (result as { ok?: unknown } | null)?.ok !== true) throw new Error("Sign-out was not confirmed");
     completed = true;
   } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
     window.removeEventListener("cadence:session-changed", changed);
     if (generation === privateSessionGeneration() && sessionKey() === key) {
       if (completed) {
         setSessionKey(null);
         window.dispatchEvent(new Event("cadence:session-ended"));
+        if (hosted && typeof window.BroadcastChannel === "function") {
+          try {
+            const channel = new window.BroadcastChannel("cadence-workspace-session");
+            channel.postMessage("signed-out");
+            channel.close();
+          } catch { /* A sibling tab still rechecks its session on focus. */ }
+        }
       } else {
         window.dispatchEvent(new Event("cadence:session-logout-unavailable"));
       }

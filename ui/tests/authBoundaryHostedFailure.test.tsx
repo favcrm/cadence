@@ -11,6 +11,7 @@ import type * as ReactNs from "react";
 import type * as ReactDomClient from "react-dom/client";
 import type * as LocaleModule from "../src/lib/locale";
 import type AuthBoundaryType from "../src/features/auth/AuthBoundary";
+import type AccountMenuType from "../src/ui/AccountMenu";
 
 declare function require(name: string): unknown;
 declare const process: { exit(code: number): never };
@@ -91,6 +92,101 @@ assert(!settled.includes("Browser-bound Cadence session"), "no local session foo
 assert(!settled.includes("cadence ui login"), "no CLI instruction on a hosted board");
 assert(!(host.textContent ?? "").includes("PRIVATE WORKSPACE"), "no workspace content before admission");
 await React.act(async () => { root.unmount(); });
+
+// A lost logout reply is not a sign-out or permission to reopen the board.
+const AccountMenu = namedExport(require("../src/ui/AccountMenu"), "default") as typeof AccountMenuType;
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const session = {
+  id: "session-1", origin: "public", created: 1700000000, last_used: 1700000000,
+  idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test",
+  user: { sub: "member", name: "Member", role: "member" },
+};
+let signedIn = true;
+let resolveLogout!: (response: Response) => void;
+let logout = new Promise<Response>((resolve) => { resolveLogout = resolve; });
+globalThis.fetch = async (input) => {
+  const path = new URL(String(input), location.origin).pathname;
+  if (path === "/api/meta") return json({ signed_in: signedIn, hosted: true, session: signedIn ? session : null });
+  if (path === "/api/session/logout") return logout;
+  if (path === "/api/locale") return json({ organization_locale: "en", user_locale: "en" });
+  throw new Error(`Unexpected request: ${path}`);
+};
+const nextRoot = createRoot(host);
+await React.act(async () => {
+  nextRoot.render(React.createElement(LocaleProvider, null, React.createElement(AuthBoundary, {
+    children: (meta) => React.createElement("main", null, "PRIVATE WORKSPACE",
+      React.createElement(AccountMenu, { meta, onChange: () => undefined, trigger: "avatar", placement: "below-end" })),
+  })));
+});
+for (let n = 0; n < 20 && !host.querySelector("[data-account-menu]"); n += 1) await flush();
+assert(host.querySelector("[data-account-menu]"), "verified hosted session opens the workspace");
+await React.act(async () => { (host.querySelector("[data-account-menu] button") as HTMLButtonElement).click(); });
+const button = (label: string) => Array.from(host.querySelectorAll("button")).find((item) => item.textContent === label);
+await React.act(async () => { button("Sign out")?.click(); });
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "private workspace is removed while sign-out is pending");
+await React.act(async () => { resolveLogout(json({ error: "unavailable" }, 503)); });
+for (let n = 0; n < 20 && !button("Retry sign-out"); n += 1) await flush();
+assert(host.textContent?.includes("We couldn’t confirm sign-out."), "lost sign-out confirmation is explained truthfully");
+await React.act(async () => { window.dispatchEvent(new Event("focus")); window.dispatchEvent(new Event("online")); });
+await flush();
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "automatic checks cannot undo an uncertain sign-out");
+logout = new Promise<Response>((resolve) => { resolveLogout = resolve; });
+await React.act(async () => { button("Retry sign-out")?.click(); });
+signedIn = false;
+document.cookie = "cadence_signed_out=1; Path=/";
+await React.act(async () => { resolveLogout(json({ ok: true })); });
+for (let n = 0; n < 20 && !host.textContent?.includes("You signed out of this workspace."); n += 1) await flush();
+assert(host.textContent?.includes("You signed out of this workspace."), "confirmed sign-out is distinct from a first visit");
+const links = Array.from(host.querySelectorAll<HTMLAnchorElement>("a"));
+const continueLink = links.find((link) => link.textContent?.includes("Continue with AgenticOS"));
+const switchLink = links.find((link) => link.textContent?.includes("Use another account"));
+assert(continueLink && switchLink, "signed-out page offers continue and account switching");
+assert(new URL(continueLink.href).searchParams.get("to") === "https://fav-limited.cadencecloud.app/issues/12", "continue preserves the board destination");
+assert(new URL(switchLink.href).searchParams.get("mode") === "switch", "account switching requests a real switch");
+await React.act(async () => { nextRoot.unmount(); });
+const reloadRoot = createRoot(host);
+await React.act(async () => {
+  reloadRoot.render(React.createElement(LocaleProvider, null,
+    React.createElement(AuthBoundary, { children: () => React.createElement("main", null, "PRIVATE WORKSPACE") })));
+});
+for (let n = 0; n < 20 && !host.textContent?.includes("You signed out of this workspace."); n += 1) await flush();
+assert(host.textContent?.includes("You signed out of this workspace."), "marked anonymous reload explains explicit sign-out");
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "marked reload does not mount private content");
+await React.act(async () => { reloadRoot.unmount(); });
+document.cookie = "cadence_signed_out=; Max-Age=0; Path=/";
+
+// A delayed sibling notification cannot override a newer verified sign-in.
+const sibling = { receiver: null as ((event: { data: string }) => void) | null };
+class TestChannel {
+  set onmessage(handler: ((event: { data: string }) => void) | null) { sibling.receiver = handler; }
+  postMessage() {}
+  close() {}
+}
+Object.defineProperty(win, "BroadcastChannel", { configurable: true, value: TestChannel });
+signedIn = true;
+let resolveMeta!: (response: Response) => void;
+let heldMeta: Promise<Response> | null = null;
+globalThis.fetch = async (input) => {
+  const path = new URL(String(input), location.origin).pathname;
+  if (path === "/api/meta") return heldMeta ?? json({ signed_in: signedIn, hosted: true, session });
+  if (path === "/api/locale") return json({ organization_locale: "en", user_locale: "en" });
+  throw new Error(`Unexpected request: ${path}`);
+};
+const siblingRoot = createRoot(host);
+await React.act(async () => {
+  siblingRoot.render(React.createElement(LocaleProvider, null,
+    React.createElement(AuthBoundary, { children: () => React.createElement("main", null, "PRIVATE WORKSPACE") })));
+});
+for (let n = 0; n < 20 && !host.textContent?.includes("PRIVATE WORKSPACE"); n += 1) await flush();
+assert(host.textContent?.includes("PRIVATE WORKSPACE"), "newly verified session opens the workspace");
+heldMeta = new Promise<Response>((resolve) => { resolveMeta = resolve; });
+assert(sibling.receiver, "hosted tab listens for sibling session changes");
+await React.act(async () => { sibling.receiver?.({ data: "signed-out" }); });
+assert(!host.textContent?.includes("PRIVATE WORKSPACE"), "sibling notice hides private content during recheck");
+await React.act(async () => { resolveMeta(json({ signed_in: true, hosted: true, session })); });
+for (let n = 0; n < 20 && !host.textContent?.includes("PRIVATE WORKSPACE"); n += 1) await flush();
+assert(host.textContent?.includes("PRIVATE WORKSPACE"), "current server proof wins over a delayed sibling notice");
+await React.act(async () => { siblingRoot.unmount(); });
 console.log("hosted gate failure checks passed");
 }
 void main().catch((e: unknown) => { console.error(e); process.exit(1); });
