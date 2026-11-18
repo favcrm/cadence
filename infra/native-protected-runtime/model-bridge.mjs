@@ -391,7 +391,7 @@ const assistantMessage = (stream, configured, receipt) => {
     content: Array.isArray(message.content) ? message.content : [],
     api: message.api,
     provider: message.provider,
-    model: message.model ?? configured.model,
+    model: configured.provider === 'agenticos' ? configured.model : (message.model ?? configured.model),
     usage: message.usage ?? emptyUsage(),
     stopReason: message.stopReason,
     timestamp: safeInt(message.timestamp) ? message.timestamp : Date.now(),
@@ -477,8 +477,8 @@ const emitError = (stream, configured, error) => {
   const message = {
     role: 'assistant',
     content: [],
-    api: 'devin',
-    provider: 'devin',
+    api: configured.provider,
+    provider: configured.provider,
     model: configured.model,
     usage: emptyUsage(),
     stopReason: 'error',
@@ -510,8 +510,10 @@ export function createNativeModelProvider({
   effort,
   piAi,
 } = {}) {
-  if (provider !== NATIVE_MODEL_PROVIDER || !model || model.provider !== provider
-      || typeof model.id !== 'string' || !model.id || typeof model.api !== 'string') {
+  if ((provider !== NATIVE_MODEL_PROVIDER && provider !== 'agenticos')
+      || !model || model.provider !== provider
+      || typeof model.id !== 'string' || !model.id || typeof model.api !== 'string'
+      || (provider === 'agenticos' && (model.api !== provider || effort !== 'off'))) {
     throw closed('unsupported_transport', 'the native model provider is not qualified');
   }
   // The bootstrap passes its own public Pi 1.4 module namespace; the bridge
@@ -523,6 +525,7 @@ export function createNativeModelProvider({
   const runTurn = (requestedModel, context, options) => {
     const stream = createAssistantMessageEventStream();
     const configured = {
+      provider,
       model: model.id,
       effort: effort ?? '',
     };
@@ -579,7 +582,7 @@ export function createNativeModelProvider({
     return stream;
   };
   return piAi.createProvider({
-    id: NATIVE_MODEL_PROVIDER,
+    id: provider,
     name: 'Cadence protected native model',
     auth: {
       apiKey: {

@@ -52,7 +52,7 @@ pub(crate) struct ChildRequest<'a> {
 pub(crate) enum ChildOutcome {
     Done {
         assistant: NativeAssistantV1,
-        usage: NativeUsageObservationV1,
+        usage: Option<NativeUsageObservationV1>,
         auth_requests: u8,
         inference_requests: u8,
     },
@@ -359,7 +359,7 @@ fn parse_reply(raw: &[u8]) -> Result<ChildOutcome> {
             })?;
             Ok(ChildOutcome::Done {
                 assistant,
-                usage,
+                usage: Some(usage),
                 auth_requests: auth_requests as u8,
                 inference_requests: inference_requests as u8,
             })

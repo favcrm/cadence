@@ -25,6 +25,7 @@
     not(all(target_os = "linux", target_arch = "x86_64")),
     allow(dead_code, unused_imports)
 )]
+mod agenticos_gateway;
 pub(crate) mod catalog;
 pub(crate) mod dto;
 pub(crate) mod sdk;
@@ -50,7 +51,7 @@ use crate::protected_runtime::ops::{OpsMethod, RuntimeCaller};
 use crate::protected_runtime::strict;
 use crate::store::native_model_turn as durable;
 
-use self::catalog::NativeModelProfile;
+use self::catalog::{NativeModelProfile, RouteBackend, AGENTICOS, DEVIN};
 use self::dto::{
     ClosedModelTurnErrorV1, InvokeArgsV1, NativeAssistantV1, NativeBillingProjectionV1,
     NativeMessageV1, NativeToolV1,
@@ -61,8 +62,6 @@ use self::dto::{
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(60);
 /// The vault `exchange` identity of a broker-private native model source.
 const SOURCE_EXCHANGE: &str = "native-model-v1";
-/// The one provider this initial qualified profile supports.
-const PROVIDER: &str = "devin";
 /// Prepare is finite even though it is not inference admission.
 const PREPARE_PER_MINUTE: usize = 60;
 const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -80,11 +79,15 @@ fn native_model_allowed(
     role: RoleV1,
     model: &ModelId,
     policy: Option<&cadence_core::connection_dispatch::RoleModelPolicyV1>,
+    route: &catalog::RouteFacts,
 ) -> bool {
+    if route.provider == AGENTICOS && role != RoleV1::Master {
+        return false;
+    }
     if pi_model_decision(role, model, policy).is_ok() {
         return true;
     }
-    let bare = catalog_model_id(model.as_str());
+    let bare = catalog_model_id(model.as_str(), &route.provider);
     bare != model.as_str()
         && ModelId::try_from(bare.to_string())
             .map(|id| pi_model_decision(role, &id, policy).is_ok())
@@ -94,9 +97,9 @@ fn native_model_allowed(
 /// The settings catalog row is keyed by the bare model id; the launch/agent
 /// model carries `provider/id`. The native route fixes the provider, so the
 /// catalog lookup uses the bare id only when the prefix is this route's.
-fn catalog_model_id(model: &str) -> &str {
+fn catalog_model_id<'a>(model: &'a str, expected_provider: &str) -> &'a str {
     match model.split_once('/') {
-        Some((provider, bare)) if provider == PROVIDER => bare,
+        Some((provider, bare)) if provider == expected_provider => bare,
         _ => model,
     }
 }
@@ -198,13 +201,8 @@ impl NativeModelBroker {
         })
     }
 
-    fn route(&self, provider: &str) -> Result<&catalog::RouteFacts> {
-        self.profile()?.route(provider).ok_or_else(|| {
-            refused(
-                "route_unavailable",
-                "the configured provider has no qualified native model route",
-            )
-        })
+    fn route(&self) -> Result<&catalog::RouteFacts> {
+        Ok(&self.profile()?.route)
     }
 
     fn runtime_key(runtime_id: &str, session_binding: &str) -> String {
@@ -419,7 +417,7 @@ impl NativeModelBroker {
         let task = self.active_task(&evidence)?;
         self.pace_prepare(&evidence.agent_uid)?;
         let shared = self.shared()?;
-        let route = self.route(PROVIDER)?.clone();
+        let route = self.route()?.clone();
 
         struct Prepared {
             request_id: String,
@@ -488,7 +486,7 @@ impl NativeModelBroker {
                     "the configured native model is malformed",
                 )
             })?;
-            if !native_model_allowed(role, &model_id, role_policy.as_ref()) {
+            if !native_model_allowed(role, &model_id, role_policy.as_ref(), &route) {
                 return Err(refused(
                     "operation_not_granted",
                     "the configured native model is not allowed for this role",
@@ -496,15 +494,17 @@ impl NativeModelBroker {
             }
             crate::store::connection_dispatch::require_model_provider_in(
                 tx,
-                catalog_model_id(model_id.as_str()),
+                catalog_model_id(model_id.as_str(), &route.provider),
                 &route.provider,
             )?;
-            let source = durable::active_source_in(tx, &workspace, PROVIDER)?.ok_or_else(|| {
-                refused(
-                    "auth_unavailable",
-                    "no positive-human native model source is linked",
-                )
-            })?;
+            let source =
+                durable::active_source_in(tx, &workspace, &route.provider)?.ok_or_else(|| {
+                    refused(
+                        "auth_unavailable",
+                        "no positive-human native model source is linked",
+                    )
+                })?;
+            require_source_account(&route, &source.account)?;
             let resolved = route
                 .resolve(model, agent.effort.as_deref(), Some(source.origin.as_str()))
                 .map_err(|_| {
@@ -531,13 +531,17 @@ impl NativeModelBroker {
                 model: model.to_string(),
                 model_uid: resolved.model_uid.clone(),
                 effort: resolved.effort.clone(),
-                provider: PROVIDER.to_string(),
+                provider: route.provider.clone(),
                 source_id: source.source_id.clone(),
                 source_revision: source.revision,
                 account: source.account.clone(),
                 origin: resolved.origin.clone(),
-                destination: destination(&resolved.origin),
-                billing_route: "subscription".to_string(),
+                destination: destination(&route, &resolved.origin),
+                billing_route: match route.backend {
+                    RouteBackend::Devin(_) => "subscription",
+                    RouteBackend::AgenticOs { .. } => "gateway",
+                }
+                .to_string(),
                 sdk_graph_digest: evidence.sdk_graph_digest.clone(),
                 approved_tools_json: approved_tools,
                 manifest_digest: evidence.manifest_digest.clone(),
@@ -623,8 +627,14 @@ impl NativeModelBroker {
                 "the model request was already bound to different selectors",
             ));
         }
-        let route = self.route(PROVIDER)?.clone();
-        let active = authorize_tools(&parsed.messages, evidence, &route)?;
+        let route = self.route()?;
+        if configuration.provider != route.provider {
+            return Err(refused(
+                "route_unavailable",
+                "the recorded model provider is not configured",
+            ));
+        }
+        let active = authorize_tools(&parsed.messages, evidence, route)?;
         let binding = dto::operation_binding(parsed, &active)?;
         let digest = operation_input_digest(
             &binding,
@@ -646,7 +656,7 @@ impl NativeModelBroker {
         let evidence = self.measured(caller)?;
         let task = self.active_task(&evidence)?;
         let shared = self.shared()?;
-        let route = self.route(PROVIDER)?.clone();
+        let route = self.route()?;
 
         let row = shared
             .store
@@ -762,7 +772,8 @@ impl NativeModelBroker {
                 "the model source changed or is not active",
             ));
         }
-        if configuration.approved_tools_json != approved_tool_bindings(&route)? {
+        require_source_account(route, &configuration.account)?;
+        if configuration.approved_tools_json != approved_tool_bindings(route)? {
             return Err(refused(
                 "stale_configuration",
                 "the approved tool declarations changed",
@@ -787,7 +798,7 @@ impl NativeModelBroker {
             ));
         }
 
-        let active = authorize_tools(&parsed.messages, &evidence, &route)?;
+        let active = authorize_tools(&parsed.messages, &evidence, route)?;
         let binding = dto::operation_binding(&parsed, &active)?;
         let input_digest = operation_input_digest(
             &binding,
@@ -831,7 +842,7 @@ impl NativeModelBroker {
             &shared,
             &evidence,
             &task,
-            &route,
+            route,
             &source,
             &configuration,
             &parsed,
@@ -955,7 +966,7 @@ impl NativeModelBroker {
             let model_id = ModelId::try_from(current.model)
                 .map_err(|_| refused("stale_configuration", "the configured model is malformed"))?;
             let role_policy = crate::store::connection_dispatch::role_model_policy_in(tx)?;
-            if !native_model_allowed(role_of(&agent.role), &model_id, role_policy.as_ref()) {
+            if !native_model_allowed(role_of(&agent.role), &model_id, role_policy.as_ref(), route) {
                 return Err(refused(
                     "operation_not_granted",
                     "the configured model is not allowed for this role",
@@ -963,7 +974,7 @@ impl NativeModelBroker {
             }
             crate::store::connection_dispatch::require_model_provider_in(
                 tx,
-                catalog_model_id(model_id.as_str()),
+                catalog_model_id(model_id.as_str(), &route.provider),
                 &route.provider,
             )?;
             let resolved = route.resolve(
@@ -975,6 +986,7 @@ impl NativeModelBroker {
                 || resolved.origin != current.origin
                 || resolved.effort != current.effort
                 || resolved.provider != current.provider
+                || destination(route, &resolved.origin) != current.destination
                 || i64::from(resolved.max_output_tokens) != current.max_output_tokens
             {
                 return Err(refused(
@@ -982,6 +994,7 @@ impl NativeModelBroker {
                     "the effective model route changed before commitment",
                 ));
             }
+            require_source_account(route, &current.account)?;
             let source_row = durable::source_in(tx, &workspace, &source_id)?
                 .ok_or_else(|| refused("auth_unavailable", "the model source is unknown"))?;
             if source_row.state != durable::SOURCE_ACTIVE
@@ -1093,78 +1106,95 @@ impl NativeModelBroker {
             return receipt(&current);
         }
 
-        let commitment = commitment_digest(
-            input_digest,
-            source,
-            configuration,
-            parsed.max_output_tokens,
-            parsed.tool_choice.as_str(),
-            evidence,
-        )?;
-        let messages = {
-            let mut out = Vec::with_capacity(parsed.messages.len());
-            for message in &parsed.messages {
-                out.push(message.to_pi_json());
+        let active = dto::active_tools(&parsed.messages)?;
+        let outcome = match &route.backend {
+            RouteBackend::AgenticOs { tls, workspace_id } => {
+                agenticos_gateway::invoke(agenticos_gateway::GatewayTurn {
+                    origin: &configuration.origin,
+                    tls,
+                    workspace_id,
+                    configured_model: &configuration.model,
+                    model_id: &configuration.model_uid,
+                    request_id: &parsed.request_id,
+                    max_output_tokens: parsed.max_output_tokens,
+                    tool_choice: parsed.tool_choice.as_str(),
+                    messages: &parsed.messages,
+                    tools: &active,
+                    bearer: &secret,
+                    deadline: EXECUTION_DEADLINE,
+                })
             }
-            Value::Array(out)
+            RouteBackend::Devin(pins) => {
+                let commitment = commitment_digest(
+                    input_digest,
+                    source,
+                    configuration,
+                    parsed.max_output_tokens,
+                    parsed.tool_choice.as_str(),
+                    evidence,
+                )?;
+                let messages = Value::Array(
+                    parsed
+                        .messages
+                        .iter()
+                        .map(NativeMessageV1::to_pi_json)
+                        .collect(),
+                );
+                let tools = Value::Array(active.iter().map(NativeToolV1::to_json).collect());
+                let plan = sdk::child_plan(
+                    pins,
+                    &route.provider,
+                    &configuration.origin,
+                    &configuration.model,
+                    &resolved.model_id,
+                    &configuration.model_uid,
+                    resolved.reasoning,
+                    &configuration.effort,
+                    &resolved.thinking_level_map,
+                    parsed.max_output_tokens,
+                    parsed.tool_choice.as_str(),
+                    &messages,
+                    &tools,
+                    &commitment,
+                    input_digest,
+                    &evidence.sdk_graph_digest,
+                    &source.source_id,
+                    &source.account,
+                    u64::try_from(source.revision).unwrap_or(0),
+                    &configuration.configuration_id,
+                    u64::try_from(configuration.revision).unwrap_or(0),
+                    &configuration.snapshot_id,
+                    &configuration.loaded_receipt_id,
+                    evidence.runtime_generation,
+                    evidence.owner_epoch,
+                );
+                sdk::run_child(sdk::ChildRequest {
+                    pins,
+                    plan: &plan,
+                    api_key: &secret,
+                    deadline: EXECUTION_DEADLINE,
+                })
+            }
         };
-        let tools = {
-            let active = dto::active_tools(&parsed.messages)?;
-            Value::Array(active.iter().map(NativeToolV1::to_json).collect())
-        };
-        let plan = sdk::child_plan(
-            &route.sdk,
-            &route.provider,
-            &configuration.origin,
-            &configuration.model,
-            &resolved.model_id,
-            &configuration.model_uid,
-            resolved.reasoning,
-            &configuration.effort,
-            &resolved.thinking_level_map,
-            parsed.max_output_tokens,
-            parsed.tool_choice.as_str(),
-            &messages,
-            &tools,
-            &commitment,
-            input_digest,
-            &evidence.sdk_graph_digest,
-            &source.source_id,
-            &source.account,
-            u64::try_from(source.revision).unwrap_or(0),
-            &configuration.configuration_id,
-            u64::try_from(configuration.revision).unwrap_or(0),
-            &configuration.snapshot_id,
-            &configuration.loaded_receipt_id,
-            evidence.runtime_generation,
-            evidence.owner_epoch,
-        );
-        let child = match sdk::run_child(sdk::ChildRequest {
-            pins: &route.sdk,
-            plan: &plan,
-            api_key: &secret,
-            deadline: EXECUTION_DEADLINE,
-        }) {
+        let child = match outcome {
             Ok(child) => child,
-            Err(error) if matches!(error.code(), Some("route_unavailable")) => {
-                return self
-                    .settle_refused(
-                        shared,
-                        &parsed.request_id,
-                        ClosedModelTurnErrorV1::route_unavailable(),
-                    )
-                    .and_then(|row| receipt(&row));
-            }
-            Err(error) if matches!(error.code(), Some("payload_too_large")) => {
-                return self
-                    .settle_refused(
-                        shared,
-                        &parsed.request_id,
-                        ClosedModelTurnErrorV1::payload_too_large(),
-                    )
-                    .and_then(|row| receipt(&row));
-            }
-            Err(_) => {
+            Err(error) => {
+                let refusal = match error.code() {
+                    Some("route_unavailable") => Some(ClosedModelTurnErrorV1::route_unavailable()),
+                    Some("payload_too_large") => Some(ClosedModelTurnErrorV1::payload_too_large()),
+                    Some("unsupported_content") if route.provider == AGENTICOS => {
+                        Some(ClosedModelTurnErrorV1::unsupported_content())
+                    }
+                    Some("auth_unavailable") if route.provider == AGENTICOS => {
+                        Some(ClosedModelTurnErrorV1::auth_unavailable())
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    return self
+                        .settle_refused(shared, &parsed.request_id, refusal)
+                        .and_then(|row| receipt(&row));
+                }
                 let current = self.mark_unknown(shared, &parsed.request_id, 0, 0, 0)?;
                 return receipt(&current);
             }
@@ -1201,6 +1231,7 @@ impl NativeModelBroker {
             sdk::ChildOutcome::Done {
                 assistant, usage, ..
             } => {
+                let usage_json = usage.as_ref().map(|usage| usage.to_json().to_string());
                 let leaks = crate::platform::refuse_leak(
                     "native model result",
                     &assistant.to_json().to_string(),
@@ -1218,9 +1249,8 @@ impl NativeModelBroker {
                     )
                     .is_err()
                 {
-                    // The upstream turn completed and consumed real usage: a
-                    // result refusal retains it. The unsafe assistant stays
-                    // private and is never projected to the guest.
+                    // The upstream turn completed; a result refusal retains
+                    // the usage observation if the provider supplied one.
                     let row = shared.store.write_tx(|tx| {
                         let row = durable::request_in(tx, &request_id)?
                             .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
@@ -1232,7 +1262,7 @@ impl NativeModelBroker {
                             // persisted: the credential echo must not reach
                             // core SQLite or WAL.
                             None,
-                            Some(usage.to_json().to_string().as_str()),
+                            usage_json.as_deref(),
                             Some(
                                 ClosedModelTurnErrorV1::result_refused()
                                     .to_json()
@@ -1257,7 +1287,7 @@ impl NativeModelBroker {
                         &row,
                         durable::STATE_DONE,
                         Some(assistant.to_json().to_string().as_str()),
-                        Some(usage.to_json().to_string().as_str()),
+                        usage_json.as_deref(),
                         None,
                         &billing.to_json().to_string(),
                         auth_requests,
@@ -1555,7 +1585,8 @@ impl NativeModelBroker {
         attempt: &VerifiedHumanAttemptV1,
         input: &BoundedSecretInputV1,
     ) -> Result<Value> {
-        if attempt.provider() != PROVIDER || attempt.connection_id().is_some() {
+        let route = self.route()?;
+        if attempt.provider() != route.provider || attempt.connection_id().is_some() {
             return Err(refused(
                 "unsupported_transport",
                 "the native model source request is not a supported provider link",
@@ -1573,10 +1604,9 @@ impl NativeModelBroker {
                     "the daemon has no protected encrypted custody",
                 )
             })?;
-        let route = self.route(PROVIDER)?.clone();
         let kind = match attempt.shape() {
             Some("native-model-api-key") => "api_key",
-            Some("native-model-devin-credentials") => "credentials",
+            Some("native-model-devin-credentials") if route.provider == DEVIN => "credentials",
             _ => {
                 return Err(refused(
                     "unsupported_content",
@@ -1666,7 +1696,7 @@ impl NativeModelBroker {
             if rotated {
                 Some(shared.store.native_model_rotation_source(
                     attempt.target_id(),
-                    PROVIDER,
+                    &route.provider,
                     attempt.expected_credential_revision().ok_or_else(|| {
                         refused("invalid_request", "the source revision is required")
                     })?,
@@ -1674,10 +1704,14 @@ impl NativeModelBroker {
             } else {
                 None
             };
-        let account = existing
-            .as_ref()
-            .map(|source| source.account.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let account = match existing.as_ref() {
+            Some(source) => source.account.clone(),
+            None => route
+                .backend
+                .agenticos_workspace()
+                .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned),
+        };
+        require_source_account(route, &account)?;
         let origin = match &origin_hint {
             Some(origin) => route.require_origin(origin)?,
             None => existing
@@ -1695,7 +1729,7 @@ impl NativeModelBroker {
             .unwrap_or(1);
         let catalog_revision = i64::try_from(route.catalog_revision)
             .map_err(|_| Error::internal("catalog revision out of range"))?;
-        let model_uid_map = model_uid_map(&route)?;
+        let model_uid_map = model_uid_map(route)?;
         crate::platform::refuse_leak(
             "native model source",
             &format!(
@@ -1726,7 +1760,7 @@ impl NativeModelBroker {
         let identity = ExpectedIdentity {
             workspace_id: workspace.clone(),
             connection_id: source_id.clone(),
-            provider: PROVIDER.to_string(),
+            provider: route.provider.clone(),
             account: account.clone(),
             credential_revision: u64::try_from(revision)
                 .map_err(|_| Error::internal("the source revision is out of range"))?,
@@ -1750,7 +1784,7 @@ impl NativeModelBroker {
         let next = durable::SourceRow {
             source_id: source_id.clone(),
             workspace_id: workspace.clone(),
-            provider: PROVIDER.to_string(),
+            provider: route.provider.clone(),
             account: account.clone(),
             revision,
             origin: origin.clone(),
@@ -1976,8 +2010,26 @@ fn is_canonical_uuid(value: &str) -> bool {
         })
 }
 
-fn destination(origin: &str) -> String {
-    format!("{origin}/exa.api_server_pb.ApiServerService/GetChatMessage")
+fn destination(route: &catalog::RouteFacts, origin: &str) -> String {
+    let path = match route.backend {
+        RouteBackend::Devin(_) => "/exa.api_server_pb.ApiServerService/GetChatMessage",
+        RouteBackend::AgenticOs { .. } => agenticos_gateway::CHAT_PATH,
+    };
+    format!("{origin}{path}")
+}
+
+fn require_source_account(route: &catalog::RouteFacts, account: &str) -> Result<()> {
+    if route
+        .backend
+        .agenticos_workspace()
+        .is_some_and(|workspace_id| workspace_id != account)
+    {
+        return Err(refused(
+            "auth_unavailable",
+            "the linked source does not belong to the pinned AgenticOS workspace",
+        ));
+    }
+    Ok(())
 }
 
 fn approved_tool_bindings(route: &catalog::RouteFacts) -> Result<String> {
@@ -2195,8 +2247,8 @@ fn authorize_result(
     route: &catalog::RouteFacts,
     parsed: &InvokeArgsV1,
 ) -> Result<()> {
-    if assistant.api != PROVIDER
-        || assistant.provider != PROVIDER
+    if assistant.api != route.provider
+        || assistant.provider != route.provider
         || assistant.model != configuration.model
     {
         return Err(refused(
@@ -2426,5 +2478,71 @@ impl Shared {
                 "the native model broker is not installed on this daemon",
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod agenticos_authorization_acceptance {
+    use super::*;
+    use cadence_core::connection_dispatch::RoleModelPolicyV1;
+
+    #[test]
+    fn agenticos_route_refuses_allowlisted_worker_but_allows_master() {
+        let model = ModelId::try_from("agenticos/example/model".to_string()).unwrap();
+        let policy = RoleModelPolicyV1 {
+            allow: vec![],
+            master_allow: Some(vec![model.clone()]),
+            worker_allow: Some(vec![model.clone()]),
+            agentic_providers: vec![],
+        };
+        let limit = catalog::ScopeLimit {
+            requests_per_minute: 1,
+            unresolved: 1,
+        };
+        let origin = "https://api-v2.agenticos.hk".to_string();
+        let route = catalog::RouteFacts {
+            provider: AGENTICOS.to_string(),
+            origins: vec![origin.clone()],
+            default_origin: origin,
+            catalog_revision: 1,
+            families: vec![catalog::FamilyFacts {
+                family_uid: "example/model".to_string(),
+                family_label: "Example model".to_string(),
+                variants: vec![catalog::VariantFacts {
+                    model_uid: "example/model".to_string(),
+                    max_context_tokens: Some(131_072),
+                    max_output_tokens: Some(8192),
+                }],
+                model_id: "example/model".to_string(),
+                thinking_level_map: vec![],
+                reasoning: false,
+            }],
+            max_output_tokens: 8192,
+            limits: catalog::OwnerLimits {
+                agent: limit,
+                account: limit,
+                workspace: limit,
+            },
+            backend: RouteBackend::AgenticOs {
+                tls: agenticos_gateway::GatewayTls::Production,
+                workspace_id: "ws_example".to_string(),
+            },
+            approved_tools: vec![],
+            approved_tools_digest: format!("sha256:{}", "0".repeat(64)),
+        };
+
+        assert!(pi_model_decision(RoleV1::Worker, &model, Some(&policy)).is_ok());
+        assert!(!native_model_allowed(
+            RoleV1::Worker,
+            &model,
+            Some(&policy),
+            &route,
+        ));
+        assert!(native_model_allowed(
+            RoleV1::Master,
+            &model,
+            Some(&policy),
+            &route,
+        ));
     }
 }

@@ -55,8 +55,8 @@ pub(crate) enum ConnectionAction {
         #[arg(long = "scope")]
         scopes: Vec<String>,
         /// `token` (default), `smtp`, or a native-model source shape
-        /// (`native-model-api-key`, `native-model-devin-credentials` for
-        /// provider `devin`).
+        /// (`native-model-api-key` for `agenticos` or `devin`;
+        /// `native-model-devin-credentials` for `devin`).
         #[arg(long)]
         shape: Option<String>,
         /// Bind the request to this existing agent (the daemon resolves its
