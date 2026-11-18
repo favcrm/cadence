@@ -30,6 +30,7 @@ import {
 } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
+import { fileKind } from "./fileKind";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -622,6 +623,20 @@ function turnFailure(entry: ThreadEntry, t: (english: string) => string): string
   return error ? `${t("Assistant could not finish this turn")}: ${error}` : t("Assistant could not finish this turn.");
 }
 
+/** CAD-2436: the failure's lead ("Assistant could not finish this turn:")
+ *  as the alert's title line and the reason under it. The text content is
+ *  unchanged: the split keeps every character, separator included. */
+function FailureText({ text }: { text: string }) {
+  const at = text.indexOf(": ");
+  if (at <= 0) return <span className="answer-fail-title">{text}</span>;
+  return (
+    <>
+      <span className="answer-fail-title">{text.slice(0, at + 1)}</span>
+      <span className="answer-fail-body">{text.slice(at + 1)}</span>
+    </>
+  );
+}
+
 /** CAD-1168: `payload.attachments` as typed rows — a malformed value
  *  reads as none. The stored row carries only daemon-resolved metadata
  *  ({id,name,size,mime,sha256}); the UI never makes a path or URL of it. */
@@ -689,13 +704,17 @@ function AttachmentRows({ files }: { files: EntryAttachment[] }) {
       <div className="sentchips" data-entry-attachments>
         {shown.map((f) => {
           const title = `${f.name} · ${f.size} B · ${f.mime}`;
+          // CAD-2436: a file tile — a type badge coloured by kind, the full
+          // name, and its size and type on a quiet second line.
           const body = (
             <>
-              <span className="sentchip-ext num" aria-hidden>
+              <span className="sentchip-ext" aria-hidden>
                 {sentExt(f.name)}
               </span>
-              <span className="sentchip-name">{f.name}</span>
-              <span className="sentchip-meta num">{attachMeta(f.name, f.size, t)}</span>
+              <span className="sentchip-text">
+                <span className="sentchip-name">{f.name}</span>
+                <span className="sentchip-meta">{attachMeta(f.name, f.size, t)}</span>
+              </span>
             </>
           );
           return f.mime === "application/pdf" && hosted && conversation !== null ? (
@@ -703,13 +722,14 @@ function AttachmentRows({ files }: { files: EntryAttachment[] }) {
               key={f.id}
               type="button"
               className="sentchip"
+              data-kind={fileKind(f.mime)}
               title={`${title} — ${t("(opens in a new tab)")}`}
               onClick={() => openAttachmentInTab(f.id, conversation)}
             >
               {body}
             </button>
           ) : (
-            <span key={f.id} className="sentchip" title={title}>
+            <span key={f.id} className="sentchip" data-kind={fileKind(f.mime)} title={title}>
               {body}
             </span>
           );
@@ -968,7 +988,8 @@ function TurnTrace({
                     {item.type === "thinking" ? t("Reasoning") : t("Worker note")}
                   </div>
                   <p className="turntrace-text">
-                    {withheld ? t("Reasoning withheld — it contained a request token.") : item.entry.text}
+                    {/* CAD-2436: a note's inline Markdown is rendered, as in the operator's bubble. */}
+                    {withheld ? t("Reasoning withheld — it contained a request token.") : <OperatorInline text={item.entry.text} />}
                   </p>
                 </li>
               );
@@ -1055,7 +1076,7 @@ function AnswerSurface({
           role="alert"
           data-kind="turn-failure"
         >
-          {failure}
+          <FailureText text={failure} />
         </div>
       )}
       {entry.text.trim() !== "" && (

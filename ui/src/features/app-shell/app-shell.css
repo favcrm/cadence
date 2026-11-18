@@ -1504,3 +1504,61 @@ button.sentchip:focus-visible {
   font-size: var(--text-label);
   padding: 0 0.5rem;
 }
+
+/* CAD-2436: a sent file is a tile, not a pill — a type badge coloured by
+   kind, the full name, and its size and type on a quiet second line, in the
+   chat font. The tile wraps inside the bubble like the pills did. */
+.sentchip {
+  display: inline-grid;
+  grid-template-columns: 1.875rem minmax(0, 1fr);
+  align-items: center;
+  column-gap: .5625rem;
+  height: auto;
+  min-width: min(11rem, 100%);
+  max-width: min(19rem, 100%);
+  padding: .375rem .625rem .375rem .375rem;
+  border-radius: .625rem;
+  border-color: color-mix(in srgb, var(--color-ink-100) 10%, transparent);
+  background: color-mix(in srgb, var(--color-ink-950) 20%, transparent);
+  font-family: var(--font-chat);
+  text-align: left;
+}
+/* The badge colour comes from the board's status tokens, tinted like a
+   status pill, so it follows the theme: no palette of its own. The text
+   leans toward the ink so every kind clears 4.5:1 on its tint in both
+   themes (the raw light tokens were 3.2-4.4:1). */
+.sentchip-ext {
+  --kind: var(--color-ink-400);
+  display: grid;
+  place-items: center;
+  width: 1.875rem;
+  height: 2.125rem;
+  border-radius: .375rem;
+  background: color-mix(in srgb, var(--kind) 14%, transparent);
+  color: color-mix(in srgb, var(--kind) 60%, var(--color-ink-100));
+  font: 600 .5625rem/1 var(--font-chat);
+  letter-spacing: .04em;
+}
+.sentchip[data-kind="pdf"] .sentchip-ext { --kind: var(--color-fail); }
+.sentchip[data-kind="image"] .sentchip-ext { --kind: var(--color-info); }
+.sentchip[data-kind="video"] .sentchip-ext { --kind: var(--color-warn); }
+.sentchip[data-kind="text"] .sentchip-ext { --kind: var(--color-accent); }
+.sentchip-text {
+  display: grid;
+  min-width: 0;
+}
+.sentchip-name {
+  overflow: hidden;
+  color: var(--color-ink-100);
+  font-size: .8125rem;
+  font-weight: 500;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sentchip-meta {
+  color: var(--color-ink-400);
+  font-size: .6875rem;
+  line-height: 1.3;
+}
+

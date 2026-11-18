@@ -288,3 +288,12 @@
   .canvas-drawer[data-mode="sheet"] .bz-addr { display: none; }
   .canvas-drawer[data-mode="sheet"] .bz-title { margin-right: auto; }
 }
+
+/* CAD-2436: the artifact card gives its title two lines, its meta line the
+   chat font, and Open the shape of a button. */
+.artcard { padding: 10px 12px; border-radius: 12px; }
+.arttype { width: 40px; height: 46px; border-radius: 8px; border: 0; background: color-mix(in srgb, var(--color-accent) 16%, var(--color-ink-875)); font: 600 10px/1 var(--font-chat); }
+.arttext b { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: .875rem; line-height: 1.35; }
+.artmeta { font-family: var(--font-chat); font-size: .75rem; color: var(--color-ink-400); }
+.artopen { padding: 5px 12px; border: 1px solid var(--color-ink-700); border-radius: 8px; color: var(--color-ink-100); font-weight: 500; }
+.artcard:hover .artopen { background: var(--color-ink-800); }
