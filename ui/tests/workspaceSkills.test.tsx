@@ -267,6 +267,8 @@ async function main() {
   assert(W.readUsedBy(undefined) === undefined && W.readUsedBy("x") === undefined, "a missing or non-list used_by is absent");
   assert(JSON.stringify(W.readUsedBy([user])) === JSON.stringify([user]) && W.readUsedBy([])?.length === 0, "a well-formed list is kept, an empty one too");
   assert(W.readUsedBy([user, { ...user, status: "gone" }]) === undefined, "an unknown status makes the whole field absent");
+  assert(W.approvedWhen(Date.UTC(2026, 10, 18, 6, 27)) === "18 Nov 06:27", "an approval time (epoch ms) reads as the board's time");
+  assert(W.approvedWhen(undefined) === null && W.approvedWhen(0) === null && W.approvedWhen(Number.NaN) === null, "a missing or invalid approval time shows nothing");
   assert(W.readUsedBy([user, { name: "b", status: "active" }]) === undefined && W.readUsedBy([user, null]) === undefined, "an entry without an id, or not an object, makes it absent");
   assert(W.withUsedBy({ ...summary("x", 1, 1), used_by: [{ nope: 1 }] as never }).used_by === undefined, "a malformed used_by is dropped from the skill");
   assert(W.usedByNote(summary("x", 1, 1)) === null, "no note when the board did not say");
@@ -334,7 +336,7 @@ async function main() {
   assert(["Overview", "Instructions", "Used by (8)", "Files (2)"].every((label, i) => document.body.querySelectorAll("[role=tab]")[i]?.textContent === label), "the panel has four tabs with counts");
   const summaryBox = document.body.querySelector("[data-work-panel=used-by-summary]");
   assert(/Used by · 8 active/.test(summaryBox?.textContent ?? "") && /and 3 more/.test(summaryBox?.textContent ?? "") && /See all 9/.test(summaryBox?.textContent ?? ""), "the Overview shows five names, how many more and See all");
-  assert(!document.body.querySelector("[role=switch]") && /Details/.test(all()) && /Approved revision1 · weekly-repor/.test(all()) && /Approved byusr_owner/.test(all()), "a member has On/Off text and sees the details");
+  assert(!document.body.querySelector("[role=switch]") && /Details/.test(all()) && /Approved revision1 · weekly-repor/.test(all()) && !/usr_owner/.test(all()) && /Approved\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}/.test(all()), "a member has On/Off text and sees the details");
   assert(/Only the workspace owner can approve, revoke or delete skills\./.test(drawer()?.querySelector("footer")?.textContent ?? "") && !drawer()?.querySelector("footer button"), "a member's footer says who can act and has no buttons");
   await click(button("See all 9"), "See all");
   assert(tabButton(/Used by/)?.getAttribute("aria-selected") === "true", "See all opens the Used by tab");

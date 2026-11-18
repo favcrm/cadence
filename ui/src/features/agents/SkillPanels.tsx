@@ -8,6 +8,7 @@ import Switch from "../../ui/Switch";
 import { navigate } from "../../lib/useLocation";
 import type { WorkspaceSkillRead, WorkspaceSkillUser } from "../../lib/types";
 import {
+  approvedWhen,
   filterUsedBy,
   referenceFiles,
   stripFrontmatter,
@@ -127,7 +128,8 @@ export function OverviewPanel({
           <Detail label="Approved revision" value={approved ? `${approved.revision} · ${approved.digest.slice(0, 12)}` : t("None")} />
           <Detail label="Latest revision" value={String(skill.latest_revision)} />
           <Detail label="Author" value={revision.author ?? t("Not recorded")} />
-          <Detail label="Approved by" value={approved ? approved.by : null} />
+          {/* The approver is shown as a date, not a raw member id; `at` is epoch milliseconds. */}
+          <Detail label="Approved" value={approvedWhen(approved?.at)} />
         </dl>
       </section>
       <p className="rc-note">{t("An agent reads this as guidance from the workspace. Only an approved revision reaches an agent.")}</p>

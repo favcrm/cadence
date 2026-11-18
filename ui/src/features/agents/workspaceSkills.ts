@@ -1,4 +1,5 @@
 import { api } from "../../lib/api";
+import { fmtTime } from "../../lib/fmt";
 import { ApiError } from "../../lib/apiError";
 import type { WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
 import { BUNDLED_SKILLS } from "./agentTabModel";
@@ -199,4 +200,10 @@ export function refusal(error: unknown): { text: string; unconfirmed: boolean; c
 /** SKILL.md first, then the other files by path. */
 export function skillFiles(files: Record<string, string>): [string, string][] {
   return Object.entries(files).sort(([a], [b]) => (a === "SKILL.md" ? -1 : b === "SKILL.md" ? 1 : a.localeCompare(b)));
+}
+
+/** When a revision was approved (`at` is epoch milliseconds), as the board shows times; null when unknown. */
+export function approvedWhen(at: number | undefined): string | null {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return null;
+  return fmtTime(new Date(at).toISOString());
 }
