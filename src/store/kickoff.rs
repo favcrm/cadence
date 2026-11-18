@@ -130,6 +130,9 @@ const SHA_TRAILER: &str = " Report when done: end your final answer with a one-l
 followed by a last line `SHA: <40-hex>` naming the commit you produced — the daemon reads \
 that line as the reported revision. Do not report a SHA you have not committed.";
 
+const REMOTE_TASK_GUIDANCE: &str = " Read required SOPs from the supplied brief or an \
+    authorized source you can open. Report a missing SOP before the step that needs it.";
+
 /// Cloud sessions cannot read the host spec path or run `cadence self`.
 /// The spec text is inlined and the `SHA:` trailer stays the report contract.
 /// The operator exit for a held Devin cloud turn. The held message
@@ -181,7 +184,7 @@ pub(super) fn cloud_kickoff_body(
         .unwrap_or_default();
     let head = format!(
         "Cadence task {} (job {}, revision {}). You are a cloud session and cannot \
-         read host paths or invoke the cadence CLI. For company questions, use wiki/guide \
+         read host paths or invoke the cadence CLI.{REMOTE_TASK_GUIDANCE} For company questions, use wiki/guide \
          access only if this session has it; otherwise report knowledge not consulted and \
          ask for authorized source material, inventing no policy. Spec text follows. ",
         task.id, job.id, revision
@@ -314,7 +317,8 @@ pub fn job_kickoff(
     endpoint_kind: &str,
     contract_in_context: bool,
 ) -> Result<String> {
-    if !contract_in_context && cloud_session(provider, endpoint_kind) {
+    let cloud = cloud_session(provider, endpoint_kind);
+    if !contract_in_context && cloud {
         let ceiling = if provider == "sandbox" && endpoint_kind == "sandbox" {
             crate::adapter::sandbox::SANDBOX_SPEC_BYTES
         } else {
@@ -410,7 +414,11 @@ pub fn job_kickoff(
     // in both envelopes, so the managed full form still ends on the
     // reminder, the managed compact form on the report contract, and
     // the explicit form on the correlation tail.
-    let discovery = crate::briefing::TASK_GUIDANCE;
+    let discovery = if cloud {
+        REMOTE_TASK_GUIDANCE
+    } else {
+        crate::briefing::TASK_GUIDANCE
+    };
     let full = format!(
         "{head}{scope}{acceptance}{discovery}{issue}{report} Do not report a SHA you have not \
          committed.{correlation}"
@@ -523,6 +531,11 @@ mod cad1373_kickoff_pointer_tests {
             "{body}"
         );
         assert!(body.contains("report knowledge not consulted"), "{body}");
+        assert!(
+            body.contains("Report a missing SOP before the step"),
+            "{body}"
+        );
+        assert!(!body.contains(".agents/skills"), "{body}");
         assert!(body.contains(" Acceptance: the task is done."), "{body}");
         assert!(body.contains("`SHA: <40-hex>`"), "{body}");
     }
