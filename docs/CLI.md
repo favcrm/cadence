@@ -680,8 +680,8 @@ ordinary same-UID sandbox is not eligible.
 - Omit the Devin `sdk` section. The frozen catalog has one explicit
   `author/model` variant per family. Configure the protected guest for
   `agenticos`, that model and `off` effort. In Settings > Agents, grant that
-  model to the master only. The protected workspace id must match the
-  workspace that issued the device credential.
+  model to the master only. Set the route's `workspace_id` to the AgenticOS
+  workspace that issues the device credential; this is not the native board id.
 - In AgenticOS, approve a device credential for `model.infer` only. In the
   local Cadence operator session, run
   `cadence connection enroll agenticos --shape native-model-api-key --no-open`.

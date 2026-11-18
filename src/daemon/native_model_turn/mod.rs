@@ -504,6 +504,7 @@ impl NativeModelBroker {
                         "no positive-human native model source is linked",
                     )
                 })?;
+            require_source_account(&route, &source.account)?;
             let resolved = route
                 .resolve(model, agent.effort.as_deref(), Some(source.origin.as_str()))
                 .map_err(|_| {
@@ -538,7 +539,7 @@ impl NativeModelBroker {
                 destination: destination(&route, &resolved.origin),
                 billing_route: match route.backend {
                     RouteBackend::Devin(_) => "subscription",
-                    RouteBackend::AgenticOs(_) => "gateway",
+                    RouteBackend::AgenticOs { .. } => "gateway",
                 }
                 .to_string(),
                 sdk_graph_digest: evidence.sdk_graph_digest.clone(),
@@ -771,6 +772,7 @@ impl NativeModelBroker {
                 "the model source changed or is not active",
             ));
         }
+        require_source_account(route, &configuration.account)?;
         if configuration.approved_tools_json != approved_tool_bindings(&route)? {
             return Err(refused(
                 "stale_configuration",
@@ -992,6 +994,7 @@ impl NativeModelBroker {
                     "the effective model route changed before commitment",
                 ));
             }
+            require_source_account(route, &current.account)?;
             let source_row = durable::source_in(tx, &workspace, &source_id)?
                 .ok_or_else(|| refused("auth_unavailable", "the model source is unknown"))?;
             if source_row.state != durable::SOURCE_ACTIVE
@@ -1105,11 +1108,11 @@ impl NativeModelBroker {
 
         let active = dto::active_tools(&parsed.messages)?;
         let outcome = match &route.backend {
-            RouteBackend::AgenticOs(tls) => {
+            RouteBackend::AgenticOs { tls, workspace_id } => {
                 agenticos_gateway::invoke(agenticos_gateway::GatewayTurn {
                     origin: &configuration.origin,
                     tls,
-                    workspace_id: &evidence.workspace_id,
+                    workspace_id,
                     configured_model: &configuration.model,
                     model_id: &configuration.model_uid,
                     request_id: &parsed.request_id,
@@ -1703,10 +1706,14 @@ impl NativeModelBroker {
             } else {
                 None
             };
-        let account = existing
-            .as_ref()
-            .map(|source| source.account.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let account = match existing.as_ref() {
+            Some(source) => source.account.clone(),
+            None => route
+                .backend
+                .agenticos_workspace()
+                .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned),
+        };
+        require_source_account(route, &account)?;
         let origin = match &origin_hint {
             Some(origin) => route.require_origin(origin)?,
             None => existing
@@ -2008,9 +2015,23 @@ fn is_canonical_uuid(value: &str) -> bool {
 fn destination(route: &catalog::RouteFacts, origin: &str) -> String {
     let path = match route.backend {
         RouteBackend::Devin(_) => "/exa.api_server_pb.ApiServerService/GetChatMessage",
-        RouteBackend::AgenticOs(_) => agenticos_gateway::CHAT_PATH,
+        RouteBackend::AgenticOs { .. } => agenticos_gateway::CHAT_PATH,
     };
     format!("{origin}{path}")
+}
+
+fn require_source_account(route: &catalog::RouteFacts, account: &str) -> Result<()> {
+    if route
+        .backend
+        .agenticos_workspace()
+        .is_some_and(|workspace_id| workspace_id != account)
+    {
+        return Err(refused(
+            "auth_unavailable",
+            "the linked source does not belong to the pinned AgenticOS workspace",
+        ));
+    }
+    Ok(())
 }
 
 fn approved_tool_bindings(route: &catalog::RouteFacts) -> Result<String> {

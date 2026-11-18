@@ -44,16 +44,26 @@ pub(super) const AGENTICOS: &str = "agenticos";
 #[derive(Clone, Debug)]
 pub(super) enum RouteBackend {
     Devin(SdkPins),
-    AgenticOs(ureq::tls::TlsConfig),
+    AgenticOs {
+        tls: ureq::tls::TlsConfig,
+        workspace_id: String,
+    },
 }
 
 impl RouteBackend {
     fn origin(&self, value: &str) -> Result<String> {
         match self {
             Self::Devin(_) => canonical_origin(value),
-            Self::AgenticOs(_) => {
+            Self::AgenticOs { .. } => {
                 super::agenticos_gateway::canonical_origin(value).map(str::to_owned)
             }
+        }
+    }
+
+    pub(super) fn agenticos_workspace(&self) -> Option<&str> {
+        match self {
+            Self::AgenticOs { workspace_id, .. } => Some(workspace_id),
+            Self::Devin(_) => None,
         }
     }
 }
@@ -206,12 +216,25 @@ impl RouteFacts {
                 "approved_tools_path",
                 "approved_tools_digest",
             ],
-            &["sdk", "tls_root_pem"],
+            &["sdk", "tls_root_pem", "workspace_id"],
         )?;
-        let backend = match (provider, m.get("sdk"), m.get("tls_root_pem")) {
-            (DEVIN, Some(sdk), None) => RouteBackend::Devin(SdkPins::parse(sdk)?),
-            (AGENTICOS, None, Some(Value::String(pem))) => {
-                RouteBackend::AgenticOs(super::agenticos_gateway::pinned_tls(pem)?)
+        let backend = match (
+            provider,
+            m.get("sdk"),
+            m.get("tls_root_pem"),
+            m.get("workspace_id"),
+        ) {
+            (DEVIN, Some(sdk), None, None) => RouteBackend::Devin(SdkPins::parse(sdk)?),
+            (AGENTICOS, None, Some(Value::String(pem)), Some(Value::String(workspace_id)))
+                if (1..=128).contains(&workspace_id.len())
+                    && workspace_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                    }) =>
+            {
+                RouteBackend::AgenticOs {
+                    tls: super::agenticos_gateway::pinned_tls(pem)?,
+                    workspace_id: workspace_id.clone(),
+                }
             }
             _ => {
                 return Err(refused(
