@@ -51,6 +51,22 @@ const result = (text: string): ThreadEntry => ({ seq: ++seq, role: "agent", kind
   check(!oddHtml.includes("href="), "a record id the app screen would refuse is not a link");
 }
 
+// Trust boundary: a web chip is an anchor only through SafeLink's policy.
+{
+  const web = (url: string) => sourcesHtml({ sources: [{ kind: "web", key: `web:${url}`, label: "x", target: url }], artifacts: [] });
+  const ok = web("https://example.com/a?b=1");
+  check(/<a [^>]*href="https:\/\/example\.com\/a\?b=1"[^>]*target="_blank"[^>]*rel="noreferrer"/.test(ok), `an https source is an external anchor: ${ok}`);
+  for (const url of ["http://localhost:3010/api", "http://127.0.0.1:9451/", "http://[::1]/x"]) {
+    const html = web(url);
+    check(!/<a [^>]*href=/.test(html) && html.includes("text-warn"), `a link to this machine is a warning, never an anchor: ${url}`);
+  }
+  for (const url of ["javascript:alert(1)", "data:text/html,x", "/wiki/x"]) {
+    check(!/<a [^>]*href=/.test(web(url)), `a non-http source is never an anchor: ${url}`);
+  }
+  // Derivation already drops non-http schemes before render.
+  check(turnSources([call('web_read {"url":"javascript:alert(1)"}'), call('web_read {"url":"file:///etc/passwd"}')]).length === 0, "non-http reads are not sources");
+}
+
 // The staged card reads the decisions list the surface holds.
 const ID = "7d2e4c1a9b3f40e8a6c5d2b1f0e9a873";
 const row = (status: string, result: Record<string, unknown> | undefined = undefined): StagedWrite =>
