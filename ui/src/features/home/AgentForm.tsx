@@ -23,6 +23,7 @@ import {
   type Comp,
   type Data,
 } from "./formModel";
+import { TurnCard, type CardDensity, type CardTone } from "../../ui/TurnCard";
 
 /**
  * CAD-2285: the master's A2UI form, drawn from the pilot catalog only.
@@ -57,7 +58,16 @@ function writeDraft(seq: number, data: Data | null): void {
   }
 }
 
-export default function AgentForm({ entry, status }: { entry: ThreadEntry; status: FormStatus }) {
+export default function AgentForm({
+  entry,
+  status,
+  density = "full",
+}: {
+  entry: ThreadEntry;
+  status: FormStatus;
+  /** CAD-2440: the thread's density; the assistant panel is compact. */
+  density?: CardDensity;
+}) {
   const t = useTranslate();
   const block = useWriteBlock(false);
   const surface = useMemo(() => parse(entry), [entry]);
@@ -289,42 +299,41 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     }
   };
 
-  const chip =
+  const chip: { tone: CardTone; text: string } =
     status.state === "sent"
-      ? { cls: "bg-ok/15 text-ok", text: `✓ ${t("Sent")}${clock(status.at) ? ` · ${clock(status.at)}` : ""}` }
+      ? { tone: "ok", text: `✓ ${t("Sent")}${clock(status.at) ? ` · ${clock(status.at)}` : ""}` }
       : status.state === "closed"
-        ? { cls: "bg-ink-800 text-ink-400", text: t("Closed") }
+        ? { tone: "muted", text: t("Closed") }
         : status.state === "failed"
-          ? { cls: "bg-fail/15 text-fail", text: t("Not sent") }
+          ? { tone: "fail", text: t("Not sent") }
           : status.state === "sending"
-            ? { cls: "bg-ink-800 text-ink-300", text: t("Sending…") }
-            : { cls: "bg-accent/15 text-accent", text: t("Waiting for you") };
+            ? { tone: "muted", text: t("Sending…") }
+            : { tone: "accent", text: t("Waiting for you") };
 
+  // CAD-2440: the card system's region shape. Header, fields, notes and
+  // every hook are the form's own; only the frame is shared.
   return (
-    <section
+    <TurnCard
       ref={root}
+      kind="form"
+      density={density}
       className="card agentform"
+      bodyClassName="agentform-body"
       data-kind="form"
       data-form-state={status.state}
-      aria-label={`${t("Form from the assistant")}: ${title ? asText(title.text) : ""}`}
+      label={`${t("Form from the assistant")}: ${title ? asText(title.text) : ""}`}
+      icon={
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+          <rect x="2.75" y="2" width="10.5" height="12" rx="2" />
+          <path d="M5.25 5.5h5.5M5.25 8h5.5M5.25 10.5h3" />
+        </svg>
+      }
+      kindLabel={t("Form")}
+      status={{ text: chip.text, tone: chip.tone, attrs: { "data-form-status": status.state } }}
     >
-      <div className="agentform-body">
-        <div className="agentform-head">
-          <span className="agentform-kind">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
-              <rect x="2.75" y="2" width="10.5" height="12" rx="2" />
-              <path d="M5.25 5.5h5.5M5.25 8h5.5M5.25 10.5h3" />
-            </svg>
-            {t("Form")}
-          </span>
-          <span className={`chip chip-sans ${chip.cls}`} data-form-status={status.state}>
-            {chip.text}
-          </span>
-        </div>
-        {render(surface.comps.get("root"))}
-        {status.state === "closed" && <p className="text-micro text-ink-500">{t("A newer message closed this form.")}</p>}
-        {answered && !answered.known && <p className="text-micro text-ink-500">{t("Sent. Your answer is the message below.")}</p>}
-      </div>
-    </section>
+      {render(surface.comps.get("root"))}
+      {status.state === "closed" && <p className="text-micro text-ink-500">{t("A newer message closed this form.")}</p>}
+      {answered && !answered.known && <p className="text-micro text-ink-500">{t("Sent. Your answer is the message below.")}</p>}
+    </TurnCard>
   );
 }

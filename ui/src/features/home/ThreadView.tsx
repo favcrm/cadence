@@ -437,7 +437,7 @@ export function ThreadItemView({
     case "tools":
       return <StepsGroup entries={item.entries} density={density} />;
     case "artifact":
-      return <ArtifactCard entry={item.entry} />;
+      return <ArtifactCard entry={item.entry} density={density} />;
     case "image":
       return <ImageBlock entry={item.entry} />;
     case "video":
@@ -447,7 +447,7 @@ export function ThreadItemView({
     case "ticket":
       return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} readOnly={readOnly} />;
     case "form":
-      return <AgentForm entry={item.entry} status={item.status} />;
+      return <AgentForm entry={item.entry} status={item.status} density={density} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -1296,11 +1296,11 @@ export function ThreadTurn({
           {artifacts.map((item) =>
             item.type === "form" ? (
               <div key={item.key} data-item-key={item.key}>
-                <AgentForm entry={item.entry} status={item.status} />
+                <AgentForm entry={item.entry} status={item.status} density={density} />
               </div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
               <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
-                {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
+                {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} density={density} />}
               </div>
             ) : null,
           )}
