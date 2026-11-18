@@ -4,6 +4,63 @@ import { sessionHeaders } from "../../lib/sessionKey";
 import { workspaceApps, type AccessDiff, type Installation } from "./workspaceApps";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const ZIP_LIMIT = 8 * 1024 * 1024;
+const GITHUB_SOURCE = "/api/app-installations/private/github";
+
+/** Discovery is deliberately optional: older hosts keep the upload-only flow. */
+export async function githubPrivateAppAvailable(signal?: AbortSignal): Promise<boolean> {
+  try {
+    return await withPrivateOperation(async (operation) => {
+      const response = await privateFetch(GITHUB_SOURCE, {
+        credentials: "same-origin", cache: "no-store",
+        headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+      }, operation);
+      if (!response.ok) return false;
+      const body: unknown = await response.json().catch(() => null);
+      operation.assertCurrent();
+      return object(body) && body.schema === 1 && body.enabled === true;
+    }, signal);
+  } catch {
+    return false;
+  }
+}
+
+/** Read at most the supported ZIP size before passing the same File to check and apply. */
+export async function fetchGithubPrivateApp(url: string): Promise<{ file: File; digest: string; sessionGeneration: number }> {
+  return withPrivateOperation(async (operation) => {
+    const response = await privateFetch(GITHUB_SOURCE, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify({ url }),
+    }, operation);
+    if (!response.ok) {
+      const body: unknown = await response.json().catch(() => null);
+      operation.assertCurrent();
+      throw new ApiError(errorMessage(body, "The GitHub package could not be fetched."), response.status, { code: refusalCode(body) });
+    }
+    const digest = response.headers.get("X-Cadence-App-Zip-Sha256");
+    if (response.status !== 200 || !/^application\/zip(?:\s*;|$)/i.test(response.headers.get("Content-Type") ?? "") ||
+        !digest || !DIGEST.test(digest) || !response.body) throw invalid();
+    const reader = response.body.getReader();
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        operation.assertCurrent();
+        if (done) break;
+        size += value.byteLength;
+        if (size > ZIP_LIMIT) throw invalid();
+        chunks.push(value as Uint8Array<ArrayBuffer>);
+      }
+    } finally {
+      if (size > ZIP_LIMIT) void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    if (!size) throw invalid();
+    return { file: new File(chunks, "github-release.zip", { type: "application/zip" }), digest, sessionGeneration: operation.generation };
+  });
+}
 
 export type PrivateTarget = { installId: string; name: string; digest: string; generation: string };
 type ScreenAccess = {
