@@ -403,19 +403,21 @@ mod tests {
     }
 
     #[test]
-    fn native_done_requires_a_real_referenced_artifact_and_no_declared_repo() {
+    fn native_done_requires_named_real_evidence_on_a_repo_free_task() {
         use std::os::unix::fs::symlink;
 
-        for case in ["staged", "missing", "symlink", "repo"] {
+        for scenario in ["missing", "symlink", "unreferenced", "repo", "attached"] {
             let (tmp, pm) = tracker();
-            let ticket = pm.dir.join("cadence/CAD-1");
+            let issue = pm.dir.join("cadence/CAD-1");
+            let attachment = issue.join("artifacts/brief.txt");
             let source = tmp.path().join("brief.txt");
-            std::fs::write(&source, b"synthetic brief").unwrap();
-            if case == "symlink" {
-                std::fs::create_dir_all(ticket.join("artifacts")).unwrap();
-                symlink(&source, ticket.join("artifacts/brief.txt")).unwrap();
+            std::fs::write(&source, b"the actual deliverable").unwrap();
+
+            if scenario == "symlink" {
+                std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+                symlink(&source, &attachment).unwrap();
             }
-            if case == "repo" {
+            if scenario == "repo" {
                 let path = pm.dir.join("cadence/project.yaml");
                 let mut project = project::load(&path).unwrap();
                 project.repos.push(project::Repo {
@@ -425,11 +427,16 @@ mod tests {
                 });
                 std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
             }
-            let before = std::fs::read(ticket.join("issue.md")).unwrap();
+
+            let before = std::fs::read(issue.join("issue.md")).unwrap();
             let spec = crate::issue::edit::EditSpec {
                 set: vec!["status=done".into()],
-                refs: vec!["artifact:brief.txt".into()],
-                attach: if case == "staged" || case == "repo" {
+                refs: if scenario == "unreferenced" {
+                    vec![]
+                } else {
+                    vec!["artifact:brief.txt".into()]
+                },
+                attach: if matches!(scenario, "attached" | "unreferenced" | "repo") {
                     vec![source]
                 } else {
                     vec![]
@@ -437,27 +444,27 @@ mod tests {
                 ..Default::default()
             };
             let result = crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None);
-            if case == "staged" {
+            if scenario == "attached" {
                 result.unwrap();
-                assert_eq!(load_front(&ticket).unwrap().0.status, "done");
-                assert_eq!(
-                    std::fs::read(ticket.join("artifacts/brief.txt")).unwrap(),
-                    b"synthetic brief"
-                );
+                let (front, _) = load_front(&issue).unwrap();
+                assert_eq!(front.status, "done");
+                assert!(front.refs.iter().any(|r| {
+                    r.kind == "artifact" && r.path.as_deref() == Some("brief.txt")
+                }));
+                assert_eq!(std::fs::read(&attachment).unwrap(), b"the actual deliverable");
             } else {
                 let error = result.unwrap_err().to_string();
-                assert!(
-                    error.contains("status=done needs evidence"),
-                    "{case}: {error}"
-                );
-                assert_eq!(
-                    std::fs::read(ticket.join("issue.md")).unwrap(),
-                    before,
-                    "{case}"
-                );
-                if case == "repo" {
-                    assert!(!ticket.join("artifacts/brief.txt").exists());
+                assert!(error.contains("status=done needs evidence"), "{scenario}: {error}");
+                assert_eq!(std::fs::read(issue.join("issue.md")).unwrap(), before, "{scenario}");
+                if scenario == "symlink" {
+                    assert!(attachment.symlink_metadata().unwrap().file_type().is_symlink());
+                } else {
+                    assert!(!attachment.exists(), "{scenario}: attachment survived refusal");
                 }
+                assert!(
+                    crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok(),
+                    "{scenario}: refusal left staged changes"
+                );
             }
         }
     }
