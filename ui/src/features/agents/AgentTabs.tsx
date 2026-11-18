@@ -541,7 +541,6 @@ function Instructions({ c }: { c: TabContext }) {
 }
 
 function ManageSkillsTab({ c }: { c: TabContext }) {
-  const t = useTranslate();
   // CAD-2419: a hosted profile also has the workspace's own skill library.
   const workspace = c.doc.kind === "hosted";
   return (
