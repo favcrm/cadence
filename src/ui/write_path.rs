@@ -1515,7 +1515,10 @@ pub(crate) fn write_route(
         // every other template write (WRITE_ROUTES); the daemon reads it only.
         if *method != Method::Post
             || !(business_templates::is_write(&route)
-                || matches!(route, business_templates::Route::Intake))
+                || matches!(
+                    route,
+                    business_templates::Route::Intake | business_templates::Route::DocumentExport
+                ))
         {
             send(request, err_response(405, "method not allowed"));
             return;

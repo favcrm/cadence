@@ -49,6 +49,7 @@ import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
+import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
 import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
@@ -944,6 +945,10 @@ function MasterHome({
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
   const canAttach = !readOnly && attachDestination !== undefined;
+  // Native public boards can report hosted metadata but do not publish the
+  // hosted master projection or serve the PDF renderer's assets.
+  const canCapturePdfPages = hosted === true && master.data !== null && Object.hasOwn(master.data, "actor_identity") &&
+    canAttach && !effectiveReadOnly && homeConversation !== undefined;
 
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const handoff = useSendHandoff(thread.data?.entries ?? [], thread.data?.pending ?? [], master);
@@ -1528,6 +1533,9 @@ function MasterHome({
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    <PdfPageTarget.Provider value={canCapturePdfPages && attachDestination
+      ? { key: "home", destination: attachDestination }
+      : null}>
     {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main
@@ -1778,6 +1786,7 @@ function MasterHome({
       </section>
     </main>
     </StagedSourceContext.Provider>
+    </PdfPageTarget.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

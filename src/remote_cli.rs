@@ -257,6 +257,19 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_designations_project",
     "audit_digest_project",
     "audit_approve_delegated_project",
+    // CAD-2316 / AOS-481: hosted HTML templates and document drafts. Source
+    // bytes ride `POST /__platform/templates/upload`; reads/writes ride `/__platform/cli/call`.
+    "template_list",
+    "template_show",
+    "template_blob_read",
+    "template_create",
+    "template_revise",
+    "template_sample",
+    "template_intake",
+    "template_approve",
+    "document_create",
+    "document_show",
+    "document_export",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -289,9 +302,16 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_roles"
         | "project_ls"
         | "project_timeline"
-        | "document_types" => &["cli.read"],
+        | "document_types"
+        | "template_list"
+        | "template_show"
+        | "template_blob_read"
+        | "document_show" => &["cli.read"],
         // CAD-2286: the tenant admits `document_submit` with cli.write alone.
-        "document_submit" => &["cli.write"],
+        "document_submit" | "template_create" | "template_revise" | "template_sample"
+        | "template_intake" | "template_approve" | "document_create" | "document_export" => {
+            &["cli.write"]
+        }
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         // A delegated approval is the designated agent's own act (`cli.write`),
@@ -416,6 +436,11 @@ const RECONCILE_AUDIT_APPROVE_DELEGATED: &str = "the delegated approval may or m
 const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
 const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — repeat `artifact submit <id>`, which answers the document's current stage and does not submit it twice";
 const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
+const RECONCILE_TEMPLATE_WRITE: &str = "the template version may or may not have been created — read `template show` for the same template name before repeating it";
+const RECONCILE_TEMPLATE_APPROVE: &str = "the template approval may or may not have been recorded — read `template show` for the same template and version before repeating it";
+const RECONCILE_TEMPLATE_PREVIEW: &str = "the template preview/intake request did not return a usable answer — nothing was approved or issued";
+const RECONCILE_DOCUMENT_CREATE: &str = "the document draft may or may not have been created — check `artifact find` (if --save-artifact was set) before repeating it";
+const RECONCILE_DOCUMENT_EXPORT: &str = "the document export may or may not have been recorded — read `document show` for the same id before repeating it";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
 
@@ -472,7 +497,16 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_designations_project"
         | "audit_digest_project"
         | "project_ls"
-        | "project_timeline" => Effect::Read,
+        | "project_timeline"
+        | "template_list"
+        | "template_show"
+        | "template_blob_read"
+        | "document_show" => Effect::Read,
+        "template_create" | "template_revise" => mutation(RECONCILE_TEMPLATE_WRITE),
+        "template_approve" => mutation(RECONCILE_TEMPLATE_APPROVE),
+        "template_sample" | "template_intake" => mutation(RECONCILE_TEMPLATE_PREVIEW),
+        "document_create" => mutation(RECONCILE_DOCUMENT_CREATE),
+        "document_export" => mutation(RECONCILE_DOCUMENT_EXPORT),
         // cli.write: every one of these can change durable state.
         "issue_new" => mutation(RECONCILE_ISSUE_NEW),
         "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),
@@ -4057,6 +4091,273 @@ pub fn artifact_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String
     )
 }
 
+/// CAD-2316 / AOS-481: what one `POST /__platform/templates/upload` sends.
+pub struct TemplateUpload<'a> {
+    pub media_type: &'a str,
+    pub file_name: &'a str,
+    pub bytes: &'a [u8],
+}
+
+fn template_upload_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    upload: &TemplateUpload,
+    req_id: &str,
+    dl: Instant,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let to = request_timeout(dl, AUTH_TIMEOUT)?;
+    let env = authorize(target, cred, Surface::Cli, "", &["cli.write"], to)?;
+    let mut rand = [0u8; 16];
+    getrandom::fill(&mut rand).map_err(|_| reject("unable to create upload boundary"))?;
+    let bnd = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand);
+    let flds = [
+        ("version", CLI_VERSION),
+        ("media_type", upload.media_type),
+        ("request_id", req_id),
+    ];
+    let body = crate::wiki::upload::build_multipart(&bnd, &flds, upload.file_name, upload.bytes);
+    let cfg = ureq::Agent::config_builder()
+        .timeout_global(Some(request_timeout(dl, CALL_TIMEOUT)?))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let resp = crate::issuer_transport::agent(cfg)
+        .post(format!("{}/__platform/templates/upload", target.endpoint))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-Cadence-Cli-Envelope", env.as_str())
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={bnd}"),
+        )
+        .send(&body[..])
+        .map_err(|_| template_upload_outcome_unknown())?;
+    let status = resp.status().as_u16();
+    let ra = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| template_upload_outcome_unknown())?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(template_upload_outcome_unknown());
+    }
+    Ok((status, ra, serde_json::from_slice(&bytes).ok()))
+}
+
+/// CAD-2316 / AOS-481: upload a local HTML template or intake DOCX to a hosted workspace.
+pub fn upload_template(
+    target: &RemoteTarget,
+    upload: &TemplateUpload,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let agent = agent_credential::bound_session();
+    upload_template_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
+}
+
+fn upload_template_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &TemplateUpload,
+    wake_timeout: u64,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let waking = || {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
+    let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let mut on_agent = agent_credential::applies(agent, target, Surface::Cli, "template_upload");
+    let mut reissued = false;
+    loop {
+        request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
+        let agent_pair = match on_agent {
+            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note, true)?,
+            None => None,
+        };
+        let using_agent = agent_pair.is_some();
+        let from_cache = agent_pair
+            .as_ref()
+            .is_some_and(|(_, src)| matches!(src, agent_credential::Source::Cached));
+        let cred = match agent_pair {
+            Some((c, _)) => c,
+            None => renewed_credential(dir, target, deadline)?,
+        };
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
+            return Err(reject("template upload needs the cli.write capability, which this remote login lacks — nothing was sent"));
+        }
+        if Instant::now() >= deadline {
+            return Err(waking());
+        }
+        let answered = template_upload_once(target, &cred, upload, &request_id, deadline);
+        let hr = agent_credential::HUMAN_SESSION_REQUIRED;
+        let refused_agent = using_agent
+            && on_agent.is_some()
+            && match &answered {
+                Err(e) => e.code() == Some(hr),
+                Ok((403, _, b)) => refusal_fields(b.as_ref()).0 == Some(hr),
+                _ => false,
+            };
+        if refused_agent {
+            if let Some(slot) = on_agent.take() {
+                slot.keep_login(&note, "this workspace has not been updated to accept it");
+            }
+            continue;
+        }
+        let rej_cache = using_agent
+            && from_cache
+            && !reissued
+            && match &answered {
+                Ok((401, ..)) => true,
+                Err(e) => e.code() == Some(CREDENTIAL_REJECTED),
+                _ => false,
+            };
+        if rej_cache {
+            if let Some(slot) = on_agent {
+                slot.invalidate();
+            }
+            reissued = true;
+            continue;
+        }
+        let (status, retry_after, body) = answered?;
+        if explicit_mutation_uncertainty(body.as_ref()).is_some() {
+            return Err(template_upload_outcome_unknown());
+        }
+        if status == 501 || (status == 404 && body.is_none()) {
+            let msg = template_tenant_too_old("template upload", status, "stored");
+            return Err(Error::invalid("not_implemented", msg));
+        }
+        if let Some(err) = template_store_refusal("template_upload", status, body.as_ref()) {
+            return Err(err);
+        }
+        let pre_fwd = board_gate_refused(body.as_ref()) || worker_waking(status, body.as_ref());
+        if status >= 500 && !pre_fwd {
+            return Err(template_upload_outcome_unknown());
+        }
+        if !(200..300).contains(&status) && status != 503 {
+            return Err(refusal_error(status, body.as_ref()));
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(Ok(ans)) => {
+                return template_upload_receipt(ans, &request_id, upload.bytes)
+            }
+            Verdict::Done(Err(_)) if (200..300).contains(&status) => {
+                return Err(template_upload_outcome_unknown())
+            }
+            Verdict::Done(Err(e)) => return Err(e),
+            Verdict::Conflict(_) => return Err(reject("remote template upload conflicted")),
+            Verdict::Waking(wait) => {
+                let rem = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|r| !r.is_zero())
+                    .ok_or_else(waking)?;
+                if wait >= rem {
+                    return Err(waking());
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
+fn template_upload_outcome_unknown() -> Error {
+    Error::unknown("the template source upload may or may not have been recorded — retry the command only after checking `template list` or `template show`")
+}
+
+fn template_upload_receipt(answer: Value, req_id: &str, bytes: &[u8]) -> Result<Value> {
+    let blob = &answer["blob"];
+    let dig = blob["sha256"].as_str().unwrap_or("");
+    let ok = answer.get("request_id").and_then(Value::as_str) == Some(req_id)
+        && blob["blob_key"].as_str().is_some_and(|k| !k.is_empty())
+        && blob["byte_length"].as_u64() == Some(bytes.len() as u64)
+        && dig.len() == 64
+        && crate::business_templates::sha256_hex(bytes).eq_ignore_ascii_case(dig);
+    if !ok {
+        return Err(template_upload_outcome_unknown());
+    }
+    Ok(answer)
+}
+
+pub fn template_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String {
+    format!("this workspace's server does not serve `{verb}` yet (HTTP {status}; requires AOS-481): update the tenant server first, then use this Cadence client. Nothing was {nothing}")
+}
+
+fn is_template_or_document_verb(verb: &str) -> bool {
+    const VERBS: &str = "template_upload template_list template_show template_blob_read template_create template_revise template_sample template_intake template_approve document_create document_show document_export";
+    VERBS.split_ascii_whitespace().any(|v| v == verb)
+}
+
+fn template_store_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    const CODES: &str = "invalid_request not_found conflict docx_executable_unsupported owner_required template_not_approved already_approved digest_mismatch export_required payload_too_large pdf_too_large pdf_renderer_unavailable pdf_render_failed";
+    if !is_template_or_document_verb(verb) {
+        return None;
+    }
+    let err = body?.get("error")?;
+    let (raw_code, msg) = (err.get("code")?.as_str()?, err.get("message")?.as_str()?);
+    let code = CODES.split_ascii_whitespace().find(|&c| c == raw_code)?;
+    let pdf_err = matches!(code, "pdf_renderer_unavailable" | "pdf_render_failed")
+        && matches!(verb, "template_sample" | "document_export")
+        && (500..=599).contains(&status);
+    if !(400..=422).contains(&status) && !pdf_err {
+        return None;
+    }
+    let bounded: String = msg.chars().take(300).collect();
+    Some(Error::invalid(
+        code,
+        format!("{verb} refused ({code}): {}", bounded.trim_end_matches('.')),
+    ))
+}
+
+fn jstr<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+    v.get(k).and_then(Value::as_str)
+}
+
+fn template_receipt_correlates(verb: &str, reply: &Value, args: &Map<String, Value>) -> bool {
+    let name_arg = args.get("name").and_then(Value::as_str);
+    match verb {
+        "template_create" | "template_revise" => {
+            reply.pointer("/template/name").and_then(Value::as_str) == name_arg
+                && reply
+                    .pointer("/template/version")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| v > 0)
+        }
+        "template_approve" => {
+            reply.pointer("/template/name").and_then(Value::as_str) == name_arg
+                && reply.pointer("/template/version").and_then(Value::as_u64)
+                    == args.get("version").and_then(Value::as_u64)
+                && reply.pointer("/template/status").and_then(Value::as_str) == Some("approved")
+        }
+        "document_create" => {
+            jstr(reply, "id").is_some_and(|id| !id.is_empty())
+                && jstr(reply, "template_name").or_else(|| jstr(reply, "template"))
+                    == args.get("template").and_then(Value::as_str)
+        }
+        "document_export" => jstr(reply, "id") == args.get("id").and_then(Value::as_str),
+        _ => true,
+    }
+}
+
 /// CAD-913 `wiki upload`: send one local file (already read and size-checked
 /// by `wiki::upload::read_local_file`) to the remote wiki at `logical_path`.
 /// Without `overwrite`, the parent is listed first and an existing name is
@@ -6633,6 +6934,8 @@ fn call_verb_until_retry(
                 "write" if matches!(surface, Surface::Wiki) && arguments.contains_key("text") => {
                     !wiki_write_receipt_correlates(reply, &arguments)
                 }
+                "template_create" | "template_revise" | "template_approve" | "document_create"
+                | "document_export" => !template_receipt_correlates(verb, reply, &arguments),
                 _ => false,
             });
         if receipt_missing {
@@ -6732,6 +7035,24 @@ fn call_verb_until_retry(
         if let Some(error) = document_lifecycle_unavailable(verb, status, body.as_ref())
             .or_else(|| document_submit_refusal(verb, status, body.as_ref()))
         {
+            return Err(error);
+        }
+        if status == 501 && is_template_or_document_verb(verb) {
+            let nothing = if matches!(
+                verb,
+                "template_list" | "template_show" | "template_blob_read" | "document_show"
+            ) {
+                "read"
+            } else {
+                "changed"
+            };
+            let command = verb.replacen('_', " ", 1);
+            return Err(Error::invalid(
+                "not_implemented",
+                template_tenant_too_old(&command, status, nothing),
+            ));
+        }
+        if let Some(error) = template_store_refusal(verb, status, body.as_ref()) {
             return Err(error);
         }
         // CAD-2150: a board that predates `include_body` refuses the field as an

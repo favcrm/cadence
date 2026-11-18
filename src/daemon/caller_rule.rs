@@ -606,6 +606,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection_on_agent (CAD-918)"),
     ),
     (
+        "business_template_list",
+        Rule::Handler("connection_caller: proven operator or registered agent lists workspace templates (CAD-2316)"),
+    ),
+    (
         "business_template_create",
         Rule::Handler("connection_caller: operator or registered agent drafts a version; unproven refused (CAD-1393)"),
     ),

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useContext, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
@@ -14,6 +14,7 @@ import VideoBlock from "../canvas/VideoBlock";
 import { useImageConversation } from "../canvas/imageConversation";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
+import PdfPageAction, { PdfPageTarget } from "./PdfPageAction";
 import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ACTION_MARK } from "./formModel";
@@ -358,7 +359,7 @@ export function ThreadItemView({
         <Bubble who={t("You")} at={time(item.entry.created)} me>
           <div className={`chat-bubble ${bodyText} text-ink-100`}>
             <OperatorText text={formAnswerText(item.entry.text, refs)} />
-            <AttachmentRows files={files} />
+            <AttachmentRows files={files} sent />
           </div>
           {isFormAnswer(refs) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
           <RefChips refs={refs} onOpenIssue={onOpenIssue} />
@@ -688,9 +689,10 @@ const SENT_CHIP_LIMIT = 3;
  *  PDF chip opens the board's own inline read in a new tab. A file that
  *  the board cannot serve keeps the plain chip; no remove or retry
  *  affordance — these already sent. */
-function AttachmentRows({ files }: { files: EntryAttachment[] }) {
+function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sent?: boolean }) {
   const t = useTranslate();
   const conversation = useImageConversation();
+  const pageTarget = useContext(PdfPageTarget);
   // The attachment read exists on the hosted board only; a local board keeps
   // the chips exactly as they were.
   const hosted = hostedOrigin(typeof window === "undefined" ? null : window.location.hostname);
@@ -717,17 +719,22 @@ function AttachmentRows({ files }: { files: EntryAttachment[] }) {
               </span>
             </>
           );
-          return f.mime === "application/pdf" && hosted && conversation !== null ? (
-            <button
-              key={f.id}
-              type="button"
-              className="sentchip"
-              data-kind={fileKind(f.mime)}
-              title={`${title} — ${t("(opens in a new tab)")}`}
-              onClick={() => openAttachmentInTab(f.id, conversation)}
-            >
-              {body}
-            </button>
+          const canCapturePages = sent && pageTarget?.destination.conversation === conversation && pageTarget !== null;
+          return f.mime === "application/pdf" && conversation !== null && (hosted || canCapturePages) ? (
+            <span key={f.id} className="inline-flex min-w-0 flex-wrap items-center gap-1">
+              <button
+                type="button"
+                className="sentchip"
+                data-kind={fileKind(f.mime)}
+                title={`${title} — ${t("(opens in a new tab)")}`}
+                onClick={() => openAttachmentInTab(f.id, conversation)}
+              >
+                {body}
+              </button>
+              {canCapturePages && (
+                <PdfPageAction key={`${pageTarget.key}:${conversation}`} source={{ kind: "retained", file: f, conversation }} target={pageTarget} />
+              )}
+            </span>
           ) : (
             <span key={f.id} className="sentchip" data-kind={fileKind(f.mime)} title={title}>
               {body}

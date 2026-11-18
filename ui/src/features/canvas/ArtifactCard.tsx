@@ -1,4 +1,7 @@
+import { useContext } from "react";
 import { useTranslate } from "../../lib/locale";
+import { WriteGate } from "../auth/WriteGate";
+import { requestSaveAsTemplateForArtifact } from "../templates/canvasTemplateDraft";
 import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
 import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
@@ -27,14 +30,15 @@ export default function ArtifactCard({
   const t = useTranslate();
   const canvas = useCanvas();
   const browser = useBrowserTab();
+  const writeGate = useContext(WriteGate);
   const ref: ArtifactRef | null = artifactRef(entry.payload);
   if (!ref) return <p className="text-micro text-ink-500">· {t("Artifact unavailable")}</p>;
   const tab = canvas.open ? canvas.tabs.find((x) => x.id === canvas.active) : undefined;
   // The Browser tab, when in front, is what the canvas shows.
   const inCanvas = !isBrowserPanelShown(canvas, browser) && tab?.id === ref.id && tab.selected === ref.version;
-  // CAD-2440: the card system's summary shape; the markup, roles, labels
+  // CAD-2440: the card system's button shape; the markup, roles, labels
   // and hooks are the ones this card always had.
-  return (
+  const card = (
     <TurnCard
       shape="button"
       element="div"
@@ -62,5 +66,25 @@ export default function ArtifactCard({
       }
       trailing={inCanvas ? <span className="artbadge">{t("in canvas")}</span> : <span className="artopen">{t("Open")}</span>}
     />
+  );
+  if (ref.kind !== "html") return card;
+  return (
+    <div className="grid gap-1" data-artifact-card-wrap={ref.id}>
+      {card}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          className="btn btn-ghost text-micro"
+          data-artifact-save-template={ref.id}
+          disabled={writeGate !== null}
+          onClick={() => {
+            requestSaveAsTemplateForArtifact(ref.id);
+            openArtifact(ref);
+          }}
+        >
+          {t("Save as Template")}
+        </button>
+      </div>
+    </div>
   );
 }

@@ -9,15 +9,15 @@
 //! reaches none of these routes; it uses the daemon RPC or the CLI, which
 //! run the same backend rules.
 //!
-//! - `POST /api/templates/create`   `{name, docx_base64, spec}`
-//! - `POST /api/templates/revise`   `{name, base, docx_base64, spec}`
+//! - `POST /api/templates/create`   `{name, html | html_base64 | docx_base64, spec}`
+//! - `POST /api/templates/revise`   `{name, base, html | html_base64 | docx_base64, spec}`
 //! - `POST /api/templates/approve`  `{name, version, digest, source}`
 //! - `GET  /api/templates/show?name=&version=` (version optional)
-//! - `POST /api/documents/create`   `{template, version, data}`
+//! - `POST /api/documents/create`   `{template, version, data, allow_partial?}`
 //! - `GET  /api/documents/show?id=`
-//! - `GET  /api/documents/export?id=` (DOCX and PDF as base64; a preview)
-//! - `GET  /api/templates/sample?name=&version=` (draft or approved version,
-//!   labelled sample DOCX and PDF as base64; stores nothing)
+//! - `GET|POST /api/documents/export` (`?id=&format=` or `{id, format?}`)
+//! - `GET  /api/templates/sample?name=&version=&format=` (draft or approved version,
+//!   labelled sample HTML, DOCX, or PDF; stores nothing)
 //! - `POST /api/templates/intake`   `{file, source}` (reference extraction;
 //!   read-only, DOCX or readable PDF as base64)
 //!
@@ -37,6 +37,7 @@ use crate::client;
 const BODY_CAP: u64 = 14 * 1024 * 1024;
 
 pub(super) enum Route {
+    List,
     Create,
     Revise,
     Approve,
@@ -58,6 +59,7 @@ pub(super) fn is_write(route: &Route) -> bool {
 
 pub(super) fn route(path: &str) -> Option<Route> {
     match path {
+        "/api/templates/list" => Some(Route::List),
         "/api/templates/create" => Some(Route::Create),
         "/api/templates/revise" => Some(Route::Revise),
         "/api/templates/approve" => Some(Route::Approve),
@@ -73,18 +75,16 @@ pub(super) fn route(path: &str) -> Option<Route> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateReq {
+struct TemplateWriteReq {
     name: String,
-    docx_base64: String,
-    spec: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviseReq {
-    name: String,
-    base: i64,
-    docx_base64: String,
+    #[serde(default)]
+    base: Option<i64>,
+    #[serde(default)]
+    docx_base64: Option<String>,
+    #[serde(default)]
+    html: Option<String>,
+    #[serde(default)]
+    html_base64: Option<String>,
     spec: Value,
 }
 
@@ -108,12 +108,48 @@ struct IntakeReq {
 #[serde(deny_unknown_fields)]
 struct DocumentReq {
     template: String,
-    version: i64,
+    #[serde(default)]
+    version: Option<i64>,
     data: Value,
+    #[serde(default)]
+    allow_partial: bool,
 }
 
-/// Write handlers (create, revise, approve, document create). Each is
-/// reached only after `admit` proved the operator on the HTTP peer.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentExportReq {
+    id: String,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn attach_template_source(
+    params: &mut Value,
+    spec: &Value,
+    docx_base64: Option<String>,
+    html: Option<String>,
+    html_base64: Option<String>,
+) -> std::result::Result<(), HttpResp> {
+    let authoring = spec.get("kind").and_then(Value::as_str) == Some("authoring");
+    if !authoring && docx_base64.is_none() && html.is_none() && html_base64.is_none() {
+        return Err(err_response(
+            400,
+            "template source (html or docx_base64) is required",
+        ));
+    }
+    if let Some(docx) = docx_base64 {
+        params["source"] = json!(docx);
+    }
+    if let Some(html) = html {
+        params["html"] = json!(html);
+    }
+    if let Some(html_b64) = html_base64 {
+        params["html_base64"] = json!(html_b64);
+    }
+    Ok(())
+}
+
+/// Write handlers (create, revise, approve, document create/export, intake).
 pub(super) fn handle_write(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -128,24 +164,37 @@ pub(super) fn handle_write(
         Err(resp) => return resp,
     };
     let (method, params) = match route {
-        Route::Create => {
-            let req: CreateReq = match parse_json(&bytes) {
+        Route::Create | Route::Revise => {
+            let req: TemplateWriteReq = match parse_json(&bytes) {
                 Ok(req) => req,
                 Err(resp) => return resp,
             };
+            let is_rev = matches!(route, Route::Revise);
+            let mut params = json!({"name": req.name, "spec": req.spec});
+            if is_rev {
+                let Some(b) = req.base else {
+                    return err_response(400, "base is required");
+                };
+                params["base"] = json!(b);
+            } else if req.base.is_some() {
+                return err_response(400, "unknown field `base`");
+            }
+            if let Err(resp) = attach_template_source(
+                &mut params,
+                &req.spec,
+                req.docx_base64,
+                req.html,
+                req.html_base64,
+            ) {
+                return resp;
+            }
             (
-                "business_template_create",
-                json!({"name": req.name, "source": req.docx_base64, "spec": req.spec}),
-            )
-        }
-        Route::Revise => {
-            let req: ReviseReq = match parse_json(&bytes) {
-                Ok(req) => req,
-                Err(resp) => return resp,
-            };
-            (
-                "business_template_revise",
-                json!({"name": req.name, "base": req.base, "source": req.docx_base64, "spec": req.spec}),
+                if is_rev {
+                    "business_template_revise"
+                } else {
+                    "business_template_create"
+                },
+                params,
             )
         }
         Route::Approve => {
@@ -163,10 +212,22 @@ pub(super) fn handle_write(
                 Ok(req) => req,
                 Err(resp) => return resp,
             };
-            (
-                "business_document_create",
-                json!({"template": req.template, "version": req.version, "data": req.data}),
-            )
+            let mut params = json!({"template": req.template, "data": req.data, "allow_partial": req.allow_partial});
+            if let Some(version) = req.version {
+                params["version"] = json!(version);
+            }
+            ("business_document_create", params)
+        }
+        Route::DocumentExport => {
+            let req: DocumentExportReq = match parse_json(&bytes) {
+                Ok(req) => req,
+                Err(resp) => return resp,
+            };
+            let mut params = json!({"id": req.id});
+            if let Some(format) = req.format {
+                params["format"] = json!(format);
+            }
+            ("business_document_export", params)
         }
         Route::Intake => {
             let req: IntakeReq = match parse_json(&bytes) {
@@ -178,7 +239,7 @@ pub(super) fn handle_write(
                 json!({"file": req.file, "source": req.source}),
             )
         }
-        Route::Show | Route::DocumentShow | Route::DocumentExport | Route::Sample => {
+        Route::List | Route::Show | Route::DocumentShow | Route::Sample => {
             return err_response(405, "method not allowed");
         }
     };
@@ -193,6 +254,7 @@ pub(super) fn handle_read(state_dir: &std::path::Path, route: Route, raw_query: 
     let mut name = None;
     let mut version = None;
     let mut id = None;
+    let mut format = None;
     for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let Some(value) = pct_decode(value) else {
@@ -202,6 +264,7 @@ pub(super) fn handle_read(state_dir: &std::path::Path, route: Route, raw_query: 
             "name" => &mut name,
             "version" => &mut version,
             "id" => &mut id,
+            "format" => &mut format,
             _ => return err_response(400, "unknown query key"),
         };
         if slot.is_some() {
@@ -210,6 +273,10 @@ pub(super) fn handle_read(state_dir: &std::path::Path, route: Route, raw_query: 
         *slot = Some(value);
     }
     match route {
+        Route::List => match client::rpc(state_dir, "business_template_list", json!({})) {
+            Ok(out) => json_response(out),
+            Err(e) => rpc_err(&e, "business_template_list"),
+        },
         Route::Show => {
             let Some(name) = name else {
                 return err_response(400, "name is required");
@@ -239,23 +306,30 @@ pub(super) fn handle_read(state_dir: &std::path::Path, route: Route, raw_query: 
             let Some(id) = id else {
                 return err_response(400, "id is required");
             };
-            match client::rpc(state_dir, "business_document_export", json!({"id": id})) {
+            let mut params = json!({"id": id});
+            if let Some(format) = format {
+                params["format"] = json!(format);
+            }
+            match client::rpc(state_dir, "business_document_export", params) {
                 Ok(out) => json_response(out),
                 Err(e) => rpc_err(&e, "business_document_export"),
             }
         }
         Route::Sample => {
-            let (Some(name), Some(version)) = (name, version) else {
-                return err_response(400, "name and version are required");
+            let Some(name) = name else {
+                return err_response(400, "name is required");
             };
-            let Some(version) = version.parse::<i64>().ok().filter(|v| *v > 0) else {
-                return err_response(400, "version must be a positive integer");
-            };
-            match client::rpc(
-                state_dir,
-                "business_template_sample",
-                json!({"name": name, "version": version}),
-            ) {
+            let mut params = json!({"name": name});
+            if let Some(version) = version.filter(|v| !v.is_empty()) {
+                let Some(version) = version.parse::<i64>().ok().filter(|v| *v > 0) else {
+                    return err_response(400, "version must be a positive integer");
+                };
+                params["version"] = json!(version);
+            }
+            if let Some(format) = format {
+                params["format"] = json!(format);
+            }
+            match client::rpc(state_dir, "business_template_sample", params) {
                 Ok(out) => json_response(out),
                 Err(e) => rpc_err(&e, "business_template_sample"),
             }

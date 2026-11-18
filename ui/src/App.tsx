@@ -1752,7 +1752,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
             )}
             {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
-            {route.section === "templates" && <Templates />}
+            {route.section === "templates" && (
+              <Templates viewer={{ operator: viewer.operator, hosted: Boolean(meta?.hosted || meta?.settings_sections) }} />
+            )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
             {route.section === "general" && <General />}
             {route.section === "account" && <PlatformAccount />}

@@ -18322,3 +18322,453 @@ mod cad2286_document_acceptance {
         }
     }
 }
+
+// CAD-2019 acceptance: HTML5 sanitizer/renderer, store/daemon lifecycle, and hosted CLI relay.
+mod cad2019_html_templates_acceptance {
+    use cadence_agent::{business_export::export_html, business_templates as bt, store::Store};
+    use serde_json::{json, Value};
+
+    const HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>@page{size:A4}</style></head><body><svg viewBox=\"0 0 80 20\"><defs><linearGradient id=\"grad\"><stop offset=\"0%\" stop-color=\"#111111\"/></linearGradient></defs><rect width=\"10\" height=\"10\" fill=\"url(#grad)\"/></svg>{{ customer }}{% for item in items %}{{ item.description }}:{{ item.line_total }}{% endfor %}{{ total }}</body></html>";
+    const SPEC: &str = r#"{"kind":"quotation","fields":[{"key":"customer","label":"Customer","kind":"text","required":true}],"fixed_text":{},"calculation":{"confirmed":true,"currency":"HKD","tax_rate_bps":1000,"discount_bps":0}}"#;
+
+    fn dv(c: &str, p: &str) -> Value {
+        json!({"fields":{"customer":c},"items":[{"description":"<","quantity":"2","unit_price":p}]})
+    }
+
+    #[test]
+    fn html_sanitizer_and_renderer_enforce_safety_and_determinism() {
+        let s = bt::parse_spec(serde_json::from_str(SPEC).unwrap()).unwrap();
+        let hd = "<!doctype html><html><head><meta charset=\"utf-8\">";
+        for (h, b) in [
+            ("", "<script>1</script>"),
+            ("<style></style x></style>", ""),
+            ("", r#"<img src="https://x.test/a">"#),
+            ("<style>@import url(x);</style>", ""),
+            ("", r#"<p style="background:url(https://x.test/b)">x</p>"#),
+            ("<style>p{background:url(https://x.test/b)}</style>", ""),
+            ("", r#"<a href="https://x.test/{{ customer }}">x</a>"#),
+            ("", r#"<p style="color:{{ customer }}">x</p>"#),
+            ("", r#"<p onclick="alert(1)">{{ customer }}</p>"#),
+            ("", "<p>{{ undeclared_var }}</p>"),
+            ("", "<!-- c -->"),
+        ] {
+            let d = format!("{hd}{h}</head><body>{b}<p>{{{{ customer }}}}</p></body></html>");
+            assert!(bt::html::validate_and_sanitize_html_template(d.as_bytes(), &s).is_err());
+        }
+        for frag in [
+            r#"<svg viewBox="0 0 10 10"><rect x="0" y="0" width="5" height="5" clip-path="\000075rl(https://x.test/a)" fill="\75 rl(https://x.test/b)"/></svg>"#,
+            r#"<svg viewBox="0 0 10 10"><rect x="0" y="0" width="5" height="5" fill="url/**/(https://x.test/c)"/></svg>"#,
+            "<!-- comment --><p>{{ customer }}</p>",
+            "<!-- {% if customer %} --><p>{{ customer }}</p><!-- {% endif %} -->",
+        ] {
+            assert!(
+                bt::html::validate_and_sanitize_html_template(frag.as_bytes(), &s).is_err(),
+                "{frag}"
+            );
+            assert!(
+                bt::html::validate_html_reference(frag.as_bytes()).is_err(),
+                "{frag}"
+            );
+        }
+        let cl = bt::validate_and_sanitize_html_template(HTML.as_bytes(), &s).unwrap();
+        assert!(
+            cl.contains("viewBox=\"0 0 80 20\"")
+                && cl.contains("<linearGradient")
+                && cl.contains("fill=\"url(#grad)\"")
+        );
+        let dd: bt::DocumentData =
+            serde_json::from_value(dv("<script>1</script> Acme Studio", "50.00")).unwrap();
+        let ctx = bt::build_draft(&s, &dd).unwrap().context();
+        let p = bt::render_html_template(&cl, &ctx, false).unwrap();
+        assert_eq!(p, bt::render_html_template(&cl, &ctx, false).unwrap());
+        assert!(
+            !p.contains("<script>") && p.contains("&lt;script&gt;1&lt;/script&gt; Acme Studio")
+        );
+        assert!(p.contains("&lt;:") && !p.contains("data-sample-banner"));
+        let sm = bt::render_html_template(&cl, &ctx, true).unwrap();
+        assert!(sm.contains("data-sample-banner=\"true\""));
+    }
+
+    #[test]
+    fn store_lifecycle_enforces_approval_revision_and_partial_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Store::open(&dir.path().join("c.sqlite3")).unwrap();
+        let s = bt::parse_spec(serde_json::from_str(SPEC).unwrap()).unwrap();
+        let def = bt::TemplateDefinition::Financial(s.clone());
+        let (h, fmt) = (HTML.as_bytes(), bt::SourceFormat::Html);
+        let add = |b| {
+            st.business_template_add_version_with_format("q", b, fmt, h, &def)
+                .unwrap()
+        };
+        let ap = |v, d: &str| st.business_template_approve("q", v, d, "o");
+        let doc = |v, d: Value, p| {
+            let dd = serde_json::from_value(d).unwrap();
+            st.business_document_create_with_options("q", v, &dd, p)
+        };
+        let v1 = add(None);
+        assert!(v1.version == 1 && v1.status == "draft");
+        let (_, sn) = st
+            .business_template_snapshot_source("q", 1)
+            .unwrap()
+            .unwrap();
+        let sd = bt::build_draft(&s, &bt::sample_data(&s)).unwrap().context();
+        assert!(export_html(&sn, &sd, true)
+            .unwrap()
+            .contains("data-sample-banner=\"true\""));
+        assert!(!export_html(&sn, &sd, false)
+            .unwrap()
+            .contains("data-sample-banner"));
+        let ok = dv("Acme Studio", "50.00");
+        assert!(doc(1, ok.clone(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("not approved"));
+        assert!(ap(1, &"0".repeat(64)).is_err());
+        assert_eq!(ap(1, &v1.content_sha256).unwrap().status, "approved");
+        let miss =
+            json!({"fields":{},"items":[{"description":"x","quantity":"1","unit_price":"10.00"}]});
+        assert!(doc(1, miss.clone(), false).is_err() && doc(1, miss, true).is_err());
+        assert!(doc(1, dv("Acme Studio", ""), false).is_err());
+        let pt = doc(1, dv("Acme Studio", ""), true).unwrap();
+        assert!(pt.has_unresolved_pricing && pt.context["total"] == "UNRESOLVED");
+        let v2 = add(Some(1));
+        assert!(v2.version == 2 && v2.status == "draft" && doc(2, ok.clone(), false).is_err());
+        ap(2, &v2.content_sha256).unwrap();
+        assert_eq!(doc(2, ok, false).unwrap().template_version, 2);
+    }
+
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn daemon_rpc_lifecycle_enforces_gates_and_revision() {
+        use cadence_agent::{adapter::ProviderEnv, daemon::*, test_seam::*};
+        let d = tempfile::tempdir().unwrap();
+        let pm = d.path().join("pm");
+        cadence_agent::issue::Pm::init(&pm).unwrap();
+        let pe = ProviderEnv::refusing_providers();
+        pe.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        let o = ServeOptions {
+            test_seam: true,
+            provider_env: pe,
+            lease: Some(Default::default()),
+            ..Default::default()
+        };
+        let sh = Shared::new(d.path(), &o).unwrap();
+        let pid = std::process::id();
+        let op = |m: &str, p: Value| scoped(Asserted::Operator, || sh.dispatch(m, &p, pid));
+        let sp: Value = serde_json::from_str(SPEC).unwrap();
+        let v1 = op(
+            "business_template_create",
+            json!({"name":"qr","spec":sp,"html":HTML}),
+        )
+        .unwrap();
+        let s1 = v1["template"]["content_sha256"].as_str().unwrap();
+        let sm = op("business_template_sample", json!({"name":"qr","version":1})).unwrap();
+        assert_eq!(sm["sample"], json!(true));
+        assert!(sm["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-sample-banner=\"true\""));
+        let full = dv("Northwind", "25.00");
+        assert!(op(
+            "business_document_create",
+            json!({"template":"qr","data":full})
+        )
+        .is_err());
+        assert!(op(
+            "business_document_create",
+            json!({"template":"qr","version":1,"data":full})
+        )
+        .is_err());
+        let ap = json!({"name":"qr","version":1,"digest":s1,"source":"o"});
+        assert!(op(
+            "business_template_approve",
+            json!({"name":"qr","version":1,"digest":"0".repeat(64),"source":"o"})
+        )
+        .is_err());
+        assert!(scoped(Asserted::Agent("w".into()), || {
+            sh.dispatch("business_template_approve", &ap, pid)
+        })
+        .is_err());
+        assert_eq!(
+            op("business_template_approve", ap).unwrap()["template"]["status"],
+            "approved"
+        );
+        let miss =
+            json!({"fields":{},"items":[{"description":"x","quantity":"1","unit_price":"10.00"}]});
+        assert!(op(
+            "business_document_create",
+            json!({"template":"qr","data":miss})
+        )
+        .is_err());
+        assert!(op(
+            "business_document_create",
+            json!({"template":"qr","data":dv("Northwind","")})
+        )
+        .is_err());
+        let dc = json!({"template":"qr","allow_partial":true,"data":dv("Northwind","UNRESOLVED")});
+        let pt = op("business_document_create", dc).unwrap();
+        assert_eq!(pt["has_unresolved_pricing"], json!(true));
+        assert_eq!(pt["context"]["total"], "UNRESOLVED");
+        let v2 = op(
+            "business_template_revise",
+            json!({"name":"qr","base":1,"spec":sp,"html":HTML}),
+        )
+        .unwrap();
+        let s2 = v2["template"]["content_sha256"].as_str().unwrap();
+        assert_eq!(v2["template"]["status"], "draft");
+        let d2 = json!({"template":"qr","version":2,"data":full});
+        assert!(op("business_document_create", d2.clone()).is_err());
+        op(
+            "business_template_approve",
+            json!({"name":"qr","version":2,"digest":s2,"source":"o"}),
+        )
+        .unwrap();
+        assert_eq!(op("business_document_create", d2).unwrap()["version"], 2);
+    }
+
+    #[cfg(all(unix, feature = "test-seam"))]
+    #[test]
+    fn cad2019_hosted_relay_acceptance() {
+        use base64::Engine;
+        use std::os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        };
+        use std::sync::{atomic::*, Arc, Mutex};
+        use std::time::Duration;
+        use std::{collections::VecDeque, fs, io::*, net::*, path::Path, process::*, thread};
+
+        type CallLog = Arc<Mutex<Vec<(String, Option<u64>)>>>;
+
+        struct Relay {
+            home: tempfile::TempDir,
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            hits: Arc<AtomicUsize>,
+            calls: CallLog,
+            wk: Option<thread::JoinHandle<()>>,
+        }
+        impl Drop for Relay {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2));
+                if let Some(wk) = self.wk.take() {
+                    let res = wk.join();
+                    if !thread::panicking() {
+                        res.unwrap();
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let r = home.path();
+        let ossl = |args: &[&str]| {
+            let mut c = Command::new("openssl");
+            c.current_dir(r)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            assert!(cadence_agent::reaper::status(&mut c).unwrap().success());
+        };
+        ossl(&"req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 2 -subj /CN=CAD2019-CA -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign".split(' ').collect::<Vec<_>>());
+        ossl(&"req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key -out leaf.csr -subj /CN=lc.cadencecloud.app".split(' ').collect::<Vec<_>>());
+        fs::write(r.join("leaf.ext"), "subjectAltName=DNS:lc.cadencecloud.app\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n").unwrap();
+        ossl(&"x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile leaf.ext -out leaf.pem".split(' ').collect::<Vec<_>>());
+
+        let cb = fs::read(r.join("leaf.pem")).unwrap();
+        let kb = fs::read(r.join("leaf.key")).unwrap();
+        let (mut cs, mut ks) = (&cb[..], &kb[..]);
+        let ch: Vec<_> = rustls_pemfile::certs(&mut cs).map(Result::unwrap).collect();
+        let key = rustls_pemfile::private_key(&mut ks).unwrap().unwrap();
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let sb = rustls::ServerConfig::builder_with_provider(p)
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let tls = Arc::new(sb.with_no_client_auth().with_single_cert(ch, key).unwrap());
+
+        let ra = r.join(".config/cadence/remote-auth");
+        let ha = r.join("ds/hosted-assignments");
+        fs::create_dir_all(&ra).unwrap();
+        fs::create_dir_all(&ha).unwrap();
+        let cred = ra.join("cli-h.json");
+        let bind = ha.join("m.bind");
+        let ca = r.join("ca.pem");
+        let df = r.join("d.json");
+        fs::write(r.join(".config/cadence/orgs.json"), r#"{"selected":{"org":"h"},"connections":[{"selection":{"org":"h"},"destination":{"mode":"remote","endpoint":"https://lc.cadencecloud.app","org_id":"w"}}]}"#).unwrap();
+        fs::write(&cred, r#"{"version":"hosted-cadence-auth.v1","organization_id":"w","audience":"https://lc.cadencecloud.app","subject_id":"u","issuer":"https://i.t","access_token":"hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","expires_at":4102444800}"#).unwrap();
+        fs::write(&bind, r#"{"version":1,"message_id":"m","organization_id":"w","org":"h","endpoint":"https://lc.cadencecloud.app","assignment_id":"a","claim_id":"c","generation":1,"worktree":"/t","text":"k","subject_id":"u","issuer":"https://i.t"}"#).unwrap();
+        fs::write(&df, r#"{"fields":{"customer":"Northwind"},"items":[{"description":"Item","quantity":"1","unit_price":"10.00"}]}"#).unwrap();
+        let sp = |p: &Path, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        let _ = [&ra, &r.join("ds")].map(|p| sp(p, 0o700));
+        let _ = [&cred, &bind, &ca].map(|p| sp(p, 0o600));
+
+        let body = b"<p>Acme Studio</p>";
+        let sha = bt::sha256_hex(body);
+        let re = |c: &str| json!({"ok":false,"error":{"code":c,"message":c}});
+        let ex =
+            json!({"id":"doc-1","requires_blob_read":true,"html_blob_key":"b","html_sha256":sha});
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pg = |s: usize, d: &[u8]| json!({"blob_key":"b","sha256":sha,"range":{"start":s,"end":s+d.len(),"total":18},"data_base64":b64.encode(d)});
+        let (p0, p1) = (pg(0, &body[..9]), pg(9, &body[9..]));
+        let mut q = VecDeque::from([
+            (501, re("not_implemented")),
+            (409, re("template_not_approved")),
+            (409, re("docx_executable_unsupported")),
+            (403, re("owner_required")),
+            (200, ex.clone()),
+            (200, p0.clone()),
+            (200, p1),
+            (200, ex),
+            (200, p0),
+            (200, pg(9, b"<!tamper>")),
+        ]);
+
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (sf, hf, cf) = (stop.clone(), hits.clone(), calls.clone());
+        let au = json!({"version":"hosted-cadence-cli.v1","envelope":"synthetic.fixture.envelope"});
+        let wk = thread::spawn(move || {
+            for inc in ln.incoming() {
+                let s = inc.unwrap();
+                if sf.load(Ordering::SeqCst) {
+                    return;
+                }
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+                hf.fetch_add(1, Ordering::SeqCst);
+                let conn = rustls::ServerConnection::new(tls.clone()).unwrap();
+                let mut rd = BufReader::new(rustls::StreamOwned::new(conn, s));
+                let (mut ls, mut hd, mut n) = (String::new(), String::new(), 0usize);
+                rd.read_line(&mut ls).unwrap();
+                while rd.read_line(&mut hd).unwrap() > 2 {
+                    if hd.to_ascii_lowercase().starts_with("content-length:") {
+                        n = hd[15..].trim().parse().unwrap();
+                    }
+                    hd.clear();
+                }
+                let mut raw = vec![0; n];
+                rd.read_exact(&mut raw).unwrap();
+                let (code, ans) = if ls.contains("/authorize") {
+                    (200, au.clone())
+                } else {
+                    let rq: Value = serde_json::from_slice(&raw).unwrap();
+                    let v = rq["verb"].as_str().unwrap_or("").to_owned();
+                    let off = rq.pointer("/arguments/offset").and_then(Value::as_u64);
+                    cf.lock().unwrap().push((v, off));
+                    q.pop_front().unwrap_or((500, re("x")))
+                };
+                let b = serde_json::to_vec(&ans).unwrap();
+                let w = rd.get_mut();
+                write!(w, "HTTP/1.1 {code} X\r\ncontent-type:application/json\r\ncontent-length:{}\r\nconnection:close\r\n\r\n", b.len()).unwrap();
+                w.write_all(&b).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        let relay = Relay {
+            home,
+            addr,
+            stop,
+            hits,
+            calls,
+            wk: Some(wk),
+        };
+        let r = relay.home.path();
+        let pe = std::env::var_os("PATH").unwrap_or_default();
+        let tc = relay.addr.to_string();
+        let run = |args: &str, ex: &[(&str, &str)]| -> Output {
+            let mut c = Command::new("timeout");
+            c.args(["--kill-after=2s", "20s", env!("CARGO_BIN_EXE_cadence")]);
+            c.env_clear()
+                .current_dir(r)
+                .env("PATH", &pe)
+                .env("HOME", r)
+                .env("XDG_CONFIG_HOME", r.join(".config"))
+                .env("XDG_STATE_HOME", r.join(".local/state"))
+                .env("CADENCE_TEST_TLS_CA", r.join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", &tc);
+            c.envs(ex.iter().copied());
+            c.args(["--org", "h"]).args(args.split_whitespace());
+            cadence_agent::reaper::output(&mut c).unwrap()
+        };
+        let chk = |a: &str, ex: &[(&str, &str)], ws: &[&str]| {
+            let o = run(a, ex);
+            let e = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.code() == Some(3) && o.stdout.is_empty(), "{e}");
+            for w in ws {
+                assert!(e.contains(w), "{e}");
+            }
+        };
+
+        let ds = r.join("ds");
+        let sock = ds.join("cadence.sock");
+        let ul = UnixListener::bind(&sock).unwrap();
+        let us = Arc::new(AtomicBool::new(false));
+        let usf = us.clone();
+        let ut = thread::spawn(move || {
+            for inc in ul.incoming() {
+                if usf.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Ok(mut s) = inc {
+                    let _ = BufReader::new(&s).read_line(&mut String::new());
+                    let _ = s.write_all(b"{\"ok\":true,\"result\":{\"agent\":{\"alias\":\"worker-1\"},\"messages\":[{\"id\":\"m\",\"alias\":\"worker-1\",\"state\":\"running\"}]}}\n");
+                }
+            }
+        });
+        let ap = "template approve q --version 1 --sha256 0000000000000000000000000000000000000000000000000000000000000000 --source w";
+        let ds_s = ds.to_str().unwrap();
+        chk(
+            ap,
+            &[("CADENCE_ALIAS", "worker-1"), ("CADENCE_STATE_DIR", ds_s)],
+            &["managed caller"],
+        );
+        us.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&sock);
+        ut.join().unwrap();
+        assert_eq!(relay.hits.load(Ordering::SeqCst), 0);
+
+        let dx = "document export doc-1 --out";
+        chk(
+            "template list",
+            &[],
+            &["\"code\": \"not_implemented\"", "AOS-481"],
+        );
+        chk(
+            &format!("document create q --file {}", df.display()),
+            &[],
+            &["\"code\": \"template_not_approved\""],
+        );
+        chk(
+            &format!("{dx} u.html"),
+            &[],
+            &["\"code\": \"docx_executable_unsupported\""],
+        );
+        chk(ap, &[], &["\"code\": \"owner_required\""]);
+        assert!(run(&format!("{dx} ok.html"), &[]).status.success());
+        let okp = r.join("ok.html");
+        let md = fs::metadata(&okp).unwrap().permissions().mode() & 0o777;
+        assert!(fs::read(&okp).unwrap() == body && md == 0o600);
+        chk(&format!("{dx} bad.html"), &[], &["sha256"]);
+        assert!(!r.join("u.html").exists() && !r.join("bad.html").exists());
+        assert_eq!(
+            *relay.calls.lock().unwrap(),
+            vec![
+                ("template_list".into(), None),
+                ("document_create".into(), None),
+                ("document_export".into(), None),
+                ("template_approve".into(), None),
+                ("document_export".into(), None),
+                ("template_blob_read".into(), Some(0)),
+                ("template_blob_read".into(), Some(9)),
+                ("document_export".into(), None),
+                ("template_blob_read".into(), Some(0)),
+                ("template_blob_read".into(), Some(9)),
+            ]
+        );
+    }
+}
