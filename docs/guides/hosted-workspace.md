@@ -306,6 +306,8 @@ without an answer. `unconfirmed` means the runtime cannot prove an outcome
 answers). It is never permission to resend. The host must prove the reader
 is entitled to the conversation and bind the lookup to its own approved
 receipt. This RPC does not accept or deliver a handoff.
+Opting out at startup stops capture and hides existing receipts without
+deleting them. Re-enabling never backfills results completed while disabled.
 
 Inside a turn, the operation's scope reaches both the model and its tools. A
 run can hold more than one input — the engine appends each steering input to

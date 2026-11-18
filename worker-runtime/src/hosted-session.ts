@@ -39,9 +39,9 @@ import {
   type AppScopeResolver,
 } from "./engine.ts";
 import {
+  configureOperationReplyCapture,
   readCompactionFailure,
   readCompactionIdentity,
-  installOperationReplyCapture,
   readGenerationIdentity,
   readHeldSubmission,
   readOperationReply,
@@ -295,8 +295,10 @@ export class HostedSession<
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
-        if (options.captureOperationReplies === true)
-          installOperationReplyCapture(this.ctx.storage.sql as unknown as TaskSql);
+        configureOperationReplyCapture(
+          this.ctx.storage.sql as unknown as TaskSql,
+          options.captureOperationReplies === true,
+        );
         // The bundled skills are engine-owned, so they are wrapped here with
         // the same refusal and live authorization an application tool gets.
         // CAD-2395: a workspace's approved skills come last, so a bundled

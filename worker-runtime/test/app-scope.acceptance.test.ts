@@ -35,7 +35,7 @@ import {
 } from "../src/contract.ts";
 import { runtimeExtension, type AppScopeResolver } from "../src/engine.ts";
 import type { HostedSession } from "../src/hosted-session.ts";
-import { installOperationReplyCapture, readSubmissionEntry, type TaskSql } from "../src/identity.ts";
+import { configureOperationReplyCapture, readSubmissionEntry, type TaskSql } from "../src/identity.ts";
 import { threadEntries } from "../src/transcript.ts";
 import {
   guardOperationRequests,
@@ -2355,7 +2355,7 @@ describe("no-wake settlement acceptance", () => {
       await scripted.started;
       scripted.release();
       expect((await old.wait(BACKGROUND_CONTEXT)).status).toBe("done");
-      installOperationReplyCapture(sqlStore(database));
+      configureOperationReplyCapture(sqlStore(database), true);
       const firstStarted = scripted.hold();
       const first = await root.submit(
         { type: "input", requestId: "handoff:first", content: "January" }, BACKGROUND_CONTEXT,
@@ -2429,6 +2429,26 @@ describe("no-wake settlement acceptance", () => {
       expect(await session.operationReply("handoff:later")).toEqual(unconfirmed("handoff:later"));
       setAnswer.run(answer, first.id);
       setAnswer.run(otherAnswer, later.id);
+      expect(await session.operationReply("handoff:first")).toEqual(reply);
+
+      const setRequestBody = database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.requestId', ?) WHERE id=?");
+      for (const id of ["handoff:first", "handoff:withdrawn"]) {
+        setRequestBody.run(id, later.id);
+        expect(await session.operationReply(id)).toEqual(unconfirmed(id));
+      }
+      setRequestBody.run("handoff:later", later.id);
+      expect(await session.operationReply("handoff:first")).toEqual(reply);
+
+      configureOperationReplyCapture(sqlStore(database), false);
+      const disabledStarted = scripted.hold();
+      const disabled = await root.submit(
+        { type: "input", requestId: "handoff:disabled", content: "Disabled" }, BACKGROUND_CONTEXT,
+      );
+      await disabledStarted;
+      scripted.release();
+      expect((await disabled.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      configureOperationReplyCapture(sqlStore(database), true);
+      expect(await session.operationReply("handoff:disabled")).toEqual(unconfirmed("handoff:disabled"));
       expect(await session.operationReply("handoff:first")).toEqual(reply);
 
       // A second submission receiving the same answer in settlement disqualifies it.

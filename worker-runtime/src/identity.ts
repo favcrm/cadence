@@ -518,7 +518,16 @@ export function readSubmissionSettlement(
  * not when someone later reads the mutable submission. Set up only after
  * the engine has created its schema and before this harness accepts work.
  */
-export function installOperationReplyCapture(sql: TaskSql): void {
+export function configureOperationReplyCapture(sql: TaskSql, enabled: boolean): void {
+  if (!enabled) {
+    if (sql.exec(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0) return;
+    // An opt-out stops new capture without throwing away existing custody.
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
+    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
+    return;
+  }
   sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
     submission_id INTEGER PRIMARY KEY,
     conversation_id INTEGER NOT NULL,
@@ -529,6 +538,10 @@ export function installOperationReplyCapture(sql: TaskSql): void {
   ) STRICT`);
   sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
     ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
+  // The engine looks up request_id. Independently index the body so a
+  // disagreement on a different row cannot hide an ambiguous operation.
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
+    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
   for (const event of ["INSERT", "UPDATE"] as const) {
     const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
     sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
@@ -559,6 +572,10 @@ export function readOperationReply(
     ).toArray();
     const row = rows[0];
     if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
+    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=? LIMIT 2`,
+      conversationId, operationId).toArray();
+    if (bodies.length !== 1 || bodies[0]?.id !== row.id) return unconfirmed;
     const submission = parseRecord(row.record);
     const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
       FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
