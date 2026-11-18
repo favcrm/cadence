@@ -293,6 +293,60 @@ public-client authority. Publication, visibility, withdrawal, install
 and rollout stay separately gated operator actions; anonymous read opens
 none of them.
 
+### Linux protected runtime owner (CAD-2442)
+
+Protected Linux hosts need `cadence-runtime-owner` in addition to the
+operator-host `cadence` binary. New x86_64 candidates build both from the
+same locked checkout and publish `cadence-runtime-owner.tar.gz` as a
+separate asset under the **same exact-SHA operator-host release**. The
+regular archive, receipt format and `cadence update` path are unchanged.
+Historical releases do not acquire the new asset retroactively.
+
+**Before promotion:** After the reviewed commit reaches `main` and its
+`ci.yml` push run succeeds, use that commit and run ID to fetch the signed
+candidate pair as an unprivileged user. The output directory must not exist.
+
+```sh
+bash scripts/verify-runtime-owner-candidate.sh "$source_sha" "$ci_run_id" "$new_absolute_output_dir"
+```
+
+This requires read access to Actions artifacts, `gh`, Python 3, `jq` and GNU
+coreutils, not Cargo. It verifies the ordinary candidate first, then uses that
+candidate's run and attempt to verify the Linux owner. A failed run may leave
+downloaded files but does not write `verified-pair.json`. The command does not
+install, start, promote or publish anything.
+
+Use the verified pair to replay installation and qualify the full launch on a
+network-isolated VPS: the real installer and observer must bring the pinned
+guest to `ready`, using fresh state and no production credentials. For
+the first Tencent rollout, record the clean install and guest result for
+the exact signed source, CI run and attempt in
+[CAD-2454](https://fav-limited.cadencecloud.app/projects/cadence/issues/CAD-2454).
+Do not dispatch production promotion while either pre-promotion check is open;
+the release-store may publish immediately after an approved promotion.
+
+**After promotion:** Replay the download from the release catalogue to check
+the bytes actually served to operators.
+
+Download the companion named in the approved release's catalogue entry:
+`/v1/cadence/artifacts/cadence/operator-host/<source-sha>/cadence-runtime-owner.tar.gz`
+on the configured release origin. Check the archive against that entry's
+SHA-256, extract it as an unprivileged user into an empty directory, and run
+the verifier from the reviewed Cadence checkout on Linux:
+
+```sh
+bash scripts/verify-runtime-owner.sh "$owner_dir" "$source_sha" "$ci_run_id" "$ci_run_attempt"
+```
+
+Take the expected source, CI run and attempt from the independently verified
+ordinary release's production-candidate receipt, not from the owner download.
+The verifier needs `gh`, `jq` and GNU coreutils, not Cargo. It refuses absent
+members, modified bytes and provenance from a different build or attempt.
+Verification does not install the file or authorize a restart. Pin the
+verified owner digest in the live root-owned profile only after CAD-2454's
+isolated qualification and public-download checks pass. Obtain separate
+operator authorization for the live rollout.
+
 **Scheduled and `workflow_run` staging cannot promote.** Their successful
 runs may have `promote: skipped`; that means staged, not production-approved.
 The default updater selects the last successful approved manual promotion,

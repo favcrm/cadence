@@ -655,14 +655,16 @@ jobs:
       - run: bun run build
         working-directory: ui
       - run: cargo build --release --locked --features ui
-      - name: Pack the binary with its tree-hash manifest
+      - name: Pack the release pair with its tree-hash manifest
         id: pack
         env:
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          strip --strip-unneeded -o "$RUNNER_TEMP/cadence-runtime-owner" target/release/cadence-runtime-owner
           python3 scripts/release-reuse.py pack --binary target/release/cadence \
+            --owner "$RUNNER_TEMP/cadence-runtime-owner" \
             --sha "$SOURCE_SHA" --dest dist --run-id "$RUN_ID" \
             --rustc "$(rustc --version)" --cargo "$(cargo --version)"
           echo "tree=$(jq -r .tree dist/manifest.json)" >> "$GITHUB_OUTPUT"
@@ -673,6 +675,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 2
 
@@ -692,6 +696,7 @@ jobs:
     outputs:
       reused: ${{ steps.done.outputs.reused }}
       sha256: ${{ steps.reuse.outputs.sha256 }}
+      owner_sha256: ${{ steps.reuse.outputs.owner_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Refuse reduced-gate release artifact before reusing
@@ -726,6 +731,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -774,6 +781,7 @@ jobs:
     # vouch for itself.
     outputs:
       sha256: ${{ steps.assemble.outputs.sha256 }}
+      owner_sha256: ${{ steps.assemble.outputs.owner_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Refuse reduced-gate release artifact before building
@@ -819,6 +827,8 @@ jobs:
             *) echo "binary reports '$version', expected +$SOURCE_SHA" >&2; exit 1 ;;
           esac
           (cd dist && sha256sum cadence > cadence.sha256)
+          strip --strip-unneeded -o dist/cadence-runtime-owner target/release/cadence-runtime-owner
+          (cd dist && sha256sum cadence-runtime-owner > cadence-runtime-owner.sha256)
           jq -n \
             --arg source_sha "$SOURCE_SHA" \
             --argjson run_id "$RUN_ID" \
@@ -837,6 +847,7 @@ jobs:
               sha256: $sha256, built_at: $built_at}' > dist/manifest.json
           cat dist/manifest.json dist/cadence.sha256
           echo "sha256=$(cut -d' ' -f1 dist/cadence.sha256)" >> "$GITHUB_OUTPUT"
+          echo "owner_sha256=$(cut -d' ' -f1 dist/cadence-runtime-owner.sha256)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-build-${{ github.sha }}
@@ -844,6 +855,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -905,6 +918,37 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           # A re-run of this job re-attests the same sha in the same run.
+          overwrite: true
+      - name: Check the protected runtime owner against the build output
+        working-directory: dist
+        env:
+          BUILT_OWNER_SHA256: ${{ needs.release-reuse.outputs.owner_sha256 || needs.release-artifact.outputs.owner_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILT_OWNER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test -f cadence-runtime-owner && test ! -L cadence-runtime-owner
+          size=$(stat -c '%s' cadence-runtime-owner)
+          test "$size" -gt 0 && test "$size" -le 134217728
+          test "$(sha256sum cadence-runtime-owner)" = "$BUILT_OWNER_SHA256  cadence-runtime-owner"
+          test "$(cat cadence-runtime-owner.sha256)" = "$BUILT_OWNER_SHA256  cadence-runtime-owner"
+      - name: Attest the Linux protected runtime owner
+        id: owner-proof
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/cadence-runtime-owner
+      - name: Save the owner build attestation with the binary
+        env:
+          BUNDLE: ${{ steps.owner-proof.outputs.bundle-path }}
+        run: cp "$BUNDLE" dist/owner-attestation.jsonl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cadence-runtime-owner-${{ github.sha }}-x86_64-linux
+          path: |
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
+            dist/owner-attestation.jsonl
+          if-no-files-found: error
+          retention-days: 90
           overwrite: true
 
   # CAD-311: a `v*` tag publishes a GitHub Release that install.sh
