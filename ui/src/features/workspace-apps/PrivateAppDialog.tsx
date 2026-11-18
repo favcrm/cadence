@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "../../lib/apiError";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { AppGlyph } from "../explorer/shared";
 import { notifyAppsChanged, type Installation } from "./workspaceApps";
 import { WorkspaceDialog } from "./WorkspaceDialog";
-import { applyPrivateApp, checkPrivateApp, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
+import { applyPrivateApp, checkPrivateApp, fetchGithubPrivateApp, githubPrivateAppAvailable, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
 
 const ZIP_LIMIT = 8 * 1024 * 1024;
 
@@ -16,7 +17,13 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
   onInstalled: () => void;
 }) {
   const t = useTranslate();
+  const githubInputId = useId();
   const [file, setFile] = useState<File | null>(null);
+  const [source, setSource] = useState<"upload" | "github">("upload");
+  const [githubAvailable, setGithubAvailable] = useState(false);
+  const [githubUrl, setGithubUrl] = useState("");
+  const [checkedFile, setCheckedFile] = useState<File | null>(null);
+  const [provenance, setProvenance] = useState<{ url: string; digest: string } | null>(null);
   const [review, setReview] = useState<PrivateReview | null>(null);
   const [consent, setConsent] = useState(false);
   const [busy, setBusy] = useState<"check" | "apply" | null>(null);
@@ -25,6 +32,22 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
   const [installed, setInstalled] = useState<Installation | null>(null);
   const reviewHeading = useRef<HTMLHeadingElement>(null);
   const inFlight = useRef(false);
+  const epoch = useRef(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    const current = epoch.current;
+    void githubPrivateAppAvailable(controller.signal).then((available) => {
+      if (!controller.signal.aborted && epoch.current === current && privateReadsAllowed()) setGithubAvailable(available);
+    });
+    const invalidate = () => {
+      epoch.current++;
+      setGithubAvailable(false); setSource("upload"); setReview(null); setCheckedFile(null);
+      setProvenance(null); setConsent(false); setGithubUrl(""); setFile(null); setError(null);
+    };
+    const stopPause = onPrivateReadsPaused(invalidate);
+    const stopReset = onPrivateSessionReset(invalidate);
+    return () => { epoch.current++; controller.abort(); stopPause(); stopReset(); };
+  }, []);
   useEffect(() => { if (review) reviewHeading.current?.focus(); }, [review]);
   const target: PrivateTarget | null = installation ? {
     installId: installation.install_id,
@@ -36,7 +59,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
   const close = () => { if (!inFlight.current) onClose(); };
   const selectFile = (selected: File | null) => {
     if (inFlight.current) return;
-    setReview(null); setConsent(false); setError(null);
+    setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); setError(null);
     if (selected && (selected.size === 0 || selected.size > ZIP_LIMIT)) {
       setFile(null);
       setError(t("Choose a non-empty ZIP no larger than 8 MiB."));
@@ -45,31 +68,35 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
     setFile(selected);
   };
   const check = async () => {
-    if (!file || inFlight.current) return;
+    if ((source === "upload" ? !file : !githubUrl.trim()) || inFlight.current) return;
+    const current = epoch.current;
+    const generation = privateSessionGeneration();
     inFlight.current = true;
-    setBusy("check"); setError(null); setReview(null); setConsent(false);
+    setBusy("check"); setError(null); setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false);
     try {
-      setReview(await checkPrivateApp(file, target));
+      const fetched = source === "github" ? await fetchGithubPrivateApp(githubUrl.trim()) : null;
+      if (epoch.current !== current || !privateReadsAllowed() || privateSessionGeneration() !== generation ||
+          (fetched && fetched.sessionGeneration !== generation)) return;
+      const selected = fetched?.file ?? file;
+      if (!selected) return;
+      const checked = await checkPrivateApp(selected, target);
+      if (epoch.current !== current || !privateReadsAllowed() || privateSessionGeneration() !== generation) return;
+      setCheckedFile(selected);
+      setProvenance(fetched ? { url: githubUrl.trim(), digest: fetched.digest } : null);
+      setReview(checked);
     } catch (cause) {
-      setError(cause instanceof ApiError && cause.status === 404
-        ? t("Private app uploads are not available on this workspace yet.")
-        : cause instanceof ApiError && cause.status === 403
-          ? t("Only a current workspace owner can install private apps.")
-          : cause instanceof ApiError && cause.code === "host_incompatible"
-            ? t("This package requests features or platform tools this workspace does not support.")
-            : cause instanceof ApiError && cause.code === "app_exists"
-              ? t("An app with this name already exists in this workspace.")
-              : cause instanceof ApiError && cause.code === "installation_stale"
-                ? t("The app or package changed. Check it again before installing.")
-                : t("The package could not be checked. Check the ZIP and try again."));
+      if (epoch.current !== current || !privateReadsAllowed() || privateSessionGeneration() !== generation) return;
+      setError(t(packageCheckError(cause, source)));
     } finally { inFlight.current = false; setBusy(null); }
   };
   const apply = async () => {
-    if (!file || !review || !consent || inFlight.current || !review.compatible || review.warnings) return;
+    if (!checkedFile || !review || !consent || inFlight.current || !review.compatible || review.warnings) return;
+    const current = epoch.current;
     inFlight.current = true;
     setBusy("apply"); setError(null);
     try {
-      const result = await applyPrivateApp(file, review);
+      const result = await applyPrivateApp(checkedFile, review);
+      if (epoch.current !== current || !privateReadsAllowed()) { setUncertain(true); notifyAppsChanged(); return; }
       setInstalled(result);
       notifyAppsChanged();
       onInstalled();
@@ -106,14 +133,31 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
           {!review ? (
             <>
               <p>{t("Choose a ZIP built with the Cadence app kit. It stays in this workspace, not the public directory.")}</p>
-              <label className="block text-label text-ink-200">
-                <span className="block mb-2">{t("App package (.zip)")}</span>
-                <input type="file" accept=".zip,application/zip" disabled={busy !== null} onChange={(event) => selectFile(event.currentTarget.files?.[0] ?? null)} />
-              </label>
-              {file && <p className="text-label text-ink-400">{file.name} · {(file.size / 1024).toFixed(0)} KiB</p>}
+              {githubAvailable && (
+                <fieldset disabled={busy !== null} className="space-y-2 text-label">
+                  <legend className="mb-2 text-ink-200">{t("Package source")}</legend>
+                  <label className="flex items-center gap-2"><input type="radio" name="private-app-source" checked={source === "upload"} onChange={() => { setSource("upload"); setError(null); }} />{t("Upload a ZIP")}</label>
+                  <label className="flex items-center gap-2"><input type="radio" name="private-app-source" checked={source === "github"} onChange={() => { setSource("github"); setError(null); }} />{t("From GitHub")}</label>
+                </fieldset>
+              )}
+              {source === "upload" ? (
+                <>
+                  <label className="block text-label text-ink-200">
+                    <span className="block mb-2">{t("App package (.zip)")}</span>
+                    <input key={epoch.current} type="file" accept=".zip,application/zip" disabled={busy !== null} onChange={(event) => selectFile(event.currentTarget.files?.[0] ?? null)} />
+                  </label>
+                  {file && <p className="text-label text-ink-400">{file.name} · {(file.size / 1024).toFixed(0)} KiB</p>}
+                </>
+              ) : (
+                <div className="text-label text-ink-200">
+                  <label className="block mb-2" htmlFor={githubInputId}>{t("Public GitHub release ZIP URL")}</label>
+                  <input id={githubInputId} aria-describedby={`${githubInputId}-help`} className="field w-full" type="url" maxLength={512} value={githubUrl} disabled={busy !== null} onChange={(event) => { setGithubUrl(event.currentTarget.value); setError(null); }} placeholder="https://github.com/owner/repo/releases/download/tag/app.zip" />
+                  <p id={`${githubInputId}-help`} className="mt-2 text-ink-400">{t("Copy the app ZIP link under Releases. GitHub’s source code ZIP is not an app package.")}</p>
+                </div>
+              )}
               {error && <p className="alert fail" role="alert">{error}</p>}
               <div className="flex flex-wrap gap-2">
-                <Button className="btn-primary" disabled={!file || busy !== null} onClick={() => void check()}>{busy === "check" ? t("Checking…") : t("Check package")}</Button>
+                <Button className="btn-primary" disabled={(source === "upload" ? !file : !githubUrl.trim()) || busy !== null} onClick={() => void check()}>{busy === "check" ? t("Checking…") : t("Check package")}</Button>
                 <Button disabled={busy !== null} onClick={close}>{t("Cancel")}</Button>
               </div>
             </>
@@ -181,6 +225,10 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                 <div className="mt-3 space-y-2 break-words">
                   <p>{t("App")}: <code>{review.name}</code></p>
                   <p>{t("Package digest")}: <code className="break-all">{review.digest}</code></p>
+                  {provenance && <>
+                    <p>{t("GitHub release URL")}: <code className="break-all">{provenance.url}</code></p>
+                    <p>{t("Downloaded ZIP SHA-256")}: <code className="break-all">{provenance.digest}</code></p>
+                  </>}
                   {Object.entries(review.declared.capabilities).map(([name, value]) =>
                     <p key={name}><code>{name}</code>: {formatCapability(value)}</p>)}
                   {Object.entries(review.access.capabilities).map(([name, { before, after }]) => (
@@ -200,7 +248,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
               <label className="flex items-start gap-2 text-label"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.currentTarget.checked)} disabled={busy !== null} /><span>{t("I reviewed this version and its requested access.")}</span></label>
               {error && <p className="alert fail" role="alert">{error}</p>}
               <div className="flex flex-wrap gap-2">
-                <Button disabled={busy !== null} onClick={() => { setReview(null); setConsent(false); }}>{t("Back")}</Button>
+                <Button disabled={busy !== null} onClick={() => { setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); }}>{t("Back")}</Button>
                 <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void apply()}>{busy === "apply" ? t("Installing…") : installation ? t("Install update") : t("Install private app")}</Button>
               </div>
             </>
@@ -209,6 +257,26 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
       )}
     </WorkspaceDialog>
   );
+}
+
+function packageCheckError(cause: unknown, source: "upload" | "github"): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 403) return "Only a current workspace owner can install private apps.";
+    if (source === "upload" && cause.status === 404) return "Private app uploads are not available on this workspace yet.";
+    switch (cause.code) {
+      case "host_incompatible": return "This package requests features or platform tools this workspace does not support.";
+      case "app_exists": return "An app with this name already exists in this workspace.";
+      case "installation_stale": return "The app or package changed. Check it again before installing.";
+      case "github_release_url":
+      case "github_asset_not_found": return "Use a ZIP link from a tagged public GitHub release.";
+      case "github_asset_unpinned": return "This release has no ZIP checksum. Upload the ZIP instead.";
+      case "github_asset_changed": return "The ZIP no longer matches its release checksum. Check the release again.";
+      case "payload_too_large": return "Choose a non-empty ZIP no larger than 8 MiB.";
+    }
+  }
+  return source === "github"
+    ? "The GitHub package could not be fetched or checked. Check the release URL and try again."
+    : "The package could not be checked. Check the ZIP and try again.";
 }
 
 type Capability = PrivateReview["declared"]["capabilities"][string];

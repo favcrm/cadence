@@ -302,6 +302,11 @@ provides one), exact version and requested access, then explicitly install it.
 Expand **Technical details** to inspect the package
 digest, file list and precise screen operations. A check does not grant
 access or review the app's behavior.
+When GitHub release ZIPs are enabled, owners can instead enter a public GitHub
+release asset URL (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.zip`).
+The ZIP must be no larger than 8 MiB. The check downloads it once; installation
+uses the same checked bytes, not a new download. Technical details show the
+requested URL and downloaded ZIP SHA-256 as provenance, not a safety certification.
 If the install or update result is unconfirmed, it may already have committed.
 Refresh Apps and inspect the installed version before checking the ZIP again;
 do not blindly resubmit it.
