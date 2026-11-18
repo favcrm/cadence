@@ -2451,6 +2451,20 @@ describe("no-wake settlement acceptance", () => {
       expect(await session.operationReply("handoff:disabled")).toEqual(unconfirmed("handoff:disabled"));
       expect(await session.operationReply("handoff:first")).toEqual(reply);
 
+      const surrogateId = "handoff:unicode-\ud800";
+      const unicodeStarted = scripted.hold();
+      const unicode = await root.submit(
+        { type: "input", requestId: surrogateId, content: "Unicode identity" }, BACKGROUND_CONTEXT,
+      );
+      await unicodeStarted;
+      scripted.release();
+      expect((await unicode.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect(await session.operationReply(surrogateId)).toEqual({
+        state: "answered", operationId: surrogateId, text: "Reply to Unicode identity",
+      });
+      const replacement = "handoff:unicode-\ufffd";
+      expect(await session.operationReply(replacement)).toEqual(unconfirmed(replacement));
+
       // A second submission receiving the same answer in settlement disqualifies it.
       database.prepare(
         `INSERT INTO pi_submissions (id, conversation_id, request_id, status, record)

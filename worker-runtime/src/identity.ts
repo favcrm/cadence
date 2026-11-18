@@ -572,9 +572,11 @@ export function readOperationReply(
     ).toArray();
     const row = rows[0];
     if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
+    // Decode both values in SQLite. Binding the raw JavaScript string would
+    // replace a lone surrogate before SQLite could compare it to the body.
     const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
-      WHERE conversation_id=? AND json_extract(record, '$.requestId')=? LIMIT 2`,
-      conversationId, operationId).toArray();
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`,
+      conversationId, JSON.stringify(operationId)).toArray();
     if (bodies.length !== 1 || bodies[0]?.id !== row.id) return unconfirmed;
     const submission = parseRecord(row.record);
     const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
