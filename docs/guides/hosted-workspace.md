@@ -14,6 +14,20 @@ See [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
 [Delivery](delivery.md) for how work is reviewed and approved,
 and [Workspace app catalog](app-catalog.md) for local package rules.
 
+## Sign out of a workspace
+
+Sign out in the account menu to end this browser's session for this hosted
+workspace. Other workspaces and your central AgenticOS sign-in are unchanged.
+The signed-out page remains after a reload or opening another tab. Continue
+with AgenticOS to sign in again; it may select the same account. Choose **Use
+another account** to switch accounts instead.
+
+If sign-out cannot be confirmed, workspace content stays hidden in this tab and
+other tabs of the same workspace, including after a reload. Retry sign-out or
+explicitly verify your session to return. A fresh hosted sign-in also clears the
+unconfirmed state after the server accepts it; browser notices alone do not
+authorize a view.
+
 ## Check your connection
 
 `cadence --org <org> doctor` tells you whether this machine's connection to a

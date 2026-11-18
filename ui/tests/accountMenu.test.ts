@@ -14,7 +14,7 @@ Object.defineProperty(globalThis, "fetch", {
   configurable: true,
   value: async (url: string) => {
     calls.push(String(url));
-    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response('{"ok":true}', { status: 200, headers: { "Content-Type": "application/json" } });
   },
 });
 const moduleLoader = require("module");
