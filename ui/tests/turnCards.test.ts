@@ -34,20 +34,23 @@ check(parseToolCall('wiki_read {"path":') === null, "broken JSON is not a call")
     call('artifact_read {"id":"art-1"}'),
     call('web_read {"url":"https://example.com/pricing?x=1"}'),
     call('web_read {"url":"javascript:alert(1)"}'),
-    call('app_call {"app":"crm","operation":"records.show","args":"{\\"id\\":\\"c1\\"}"}'),
-    call('app_call {"app":"crm","operation":"records.update","args":"{}"}'),
+    call('app_call {"app":"crm","operation":"records.show","args":"{\\"record_id\\":\\"c1\\"}"}'),
+    call('app_call {"app":"crm","operation":"records.update","args":"{\\"record_id\\":\\"c2\\"}"}'),
     call('app_call {"app":"crm","operation":"records.list","args":"{}"}'),
+    call('app_call {"app":"crm","operation":"records.show","args":"{}"}'),
     call('wiki_search {"query":"refunds"}'),
     call('wiki_read {"path":"policies/refunds"}'),
     prose("I read [the refunds page](wiki:policies/refunds) and CAD-99."),
   ]);
   check(
     JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`)) ===
-      JSON.stringify(["wiki:policies/refunds", "issue:CAD-12", "attachment:chf-0123456789abcdef0123456789abcdef", "artifact:art-1", "web:example.com", "app:crm"]),
+      JSON.stringify(["wiki:policies/refunds", "issue:CAD-12", "attachment:chf-0123456789abcdef0123456789abcdef", "artifact:art-1", "web:example.com", "app:crm · c1"]),
     `sources in order, one per source: ${JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`))}`,
   );
   check(sources.find((s) => s.kind === "web")?.target === "https://example.com/pricing?x=1", "a web source keeps its full URL");
   check(!sources.some((s) => s.label === "CAD-99"), "an id only in the answer's prose is not a source");
+  const app = sources.find((s) => s.kind === "app");
+  check(app?.app === "crm" && app.target === "c1", "an app source is the record, by app and record id");
 }
 check(turnSources([prose("No tools here.")]).length === 0, "a turn that read nothing has no sources");
 check(SOURCES_SHOWN === 8, "the row shows at most 8 chips");
@@ -109,16 +112,18 @@ check(parsePreview({ kind: "fields", fields: Array.from({ length: 20 }, (_, i) =
     tool: "app_call",
     status: "pending",
     createdAt: 1,
-    input: {
-      app: "crm",
-      subject: "Update",
-      operation: "records.update",
-      args: JSON.stringify(Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`f${i}`, i === 2 ? "" : "x".repeat(400)]))),
-    },
+    app: "crm",
+    title: "Update customer",
+    changes: Array.from({ length: 9 }, (_, i) => ({ field: `f${i}`, label: `F${i}`, kind: "changed", before: "a", after: i === 2 ? "" : "x".repeat(400) })),
+    changes_complete: true,
+    input: { app: "crm", subject: "Update", operation: "records.update", args: "{}" },
   });
+  check(long !== null && long.changes.length === 9, "a summary row with nine changes parses");
   const view = stagedFields(long!);
-  check(view.fields.length <= STAGED_FIELDS_SHOWN, "at most 6 fields on the card");
+  check(view.fields.length === STAGED_FIELDS_SHOWN && view.more === 3, "6 fields on the card, 3 more on the review card");
   check(view.fields.every((f) => f.value.length <= STAGED_VALUE_CHARS), "values are capped");
+  check(view.fields[0]!.value.endsWith("…"), "a cut value says so");
+  check(view.fields[2]!.missing && !view.fields[1]!.missing, "only the empty value is flagged");
 }
 
 console.log("turnCards: ok");

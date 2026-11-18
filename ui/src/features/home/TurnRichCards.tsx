@@ -19,6 +19,9 @@ import { SOURCES_SHOWN, stagedFields, stagedInTurn, type TurnSource } from "./tu
  * from the turn's recorded tool calls and results; see `turnCards.ts`.
  */
 
+/** The record ids the app screen's `?record=` accepts (screenRoute.ts). */
+const APP_RECORD_ID = /^[a-z0-9_-]{1,64}$/;
+
 const KIND_LABEL: Record<TurnSource["kind"], string> = {
   wiki: "Wiki",
   issue: "Issue",
@@ -53,7 +56,12 @@ function SourceChip({
     case "wiki":
       return <Link {...attrs} href={`/wiki/${source.target.split("/").map(encodeURIComponent).join("/")}`}>{body}</Link>;
     case "app":
-      return <Link {...attrs} href={`/apps/${encodeURIComponent(source.target)}`}>{body}</Link>;
+      // The app screen opens a record from `?record=` when the id is one it accepts.
+      return source.app && APP_RECORD_ID.test(source.target) ? (
+        <Link {...attrs} href={`/apps/${encodeURIComponent(source.app)}?${new URLSearchParams({ record: source.target })}`}>{body}</Link>
+      ) : (
+        <span {...attrs}>{body}</span>
+      );
     case "web":
       return <SafeLink {...attrs} href={source.target}>{body}</SafeLink>;
     case "issue":
@@ -163,9 +171,13 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
       {fields.length > 0 && (
         <dl className="turncard-fields">
           {fields.map((field, i) => (
-            <div key={`${field.label}-${i}`} className="turncard-field" data-missing={field.missing || undefined}>
+            <div key={`${field.label}-${i}`} className="turncard-field" data-missing={field.missing || undefined} data-removed={field.removed || undefined}>
               <dt><bdi>{field.label}</bdi></dt>
-              <dd>{field.missing ? t("Not provided") : <bdi>{field.value}</bdi>}</dd>
+              <dd>
+                {field.missing ? t("Not provided") : field.removed ? (
+                  <><del><bdi>{field.value}</bdi></del> <span className="text-ink-500">({t("removed")})</span></>
+                ) : <bdi>{field.value}</bdi>}
+              </dd>
             </div>
           ))}
         </dl>

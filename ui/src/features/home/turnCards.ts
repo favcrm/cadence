@@ -15,8 +15,10 @@ export interface TurnSource {
   key: string;
   /** What the chip names: a path, an id, a host or an app. */
   label: string;
-  /** The board identity the chip opens. */
+  /** The board identity the chip opens (for an app record, the record id). */
   target: string;
+  /** An app record's app key. */
+  app?: string;
 }
 
 /** At most this many chips; the rest are "+N more". */
@@ -41,8 +43,20 @@ export function parseToolCall(text: string): { name: string; args: Record<string
 
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
 
-/** An app operation that reads records, not one that changes them. */
-const APP_READ = /^records\.(show|get|read|list|search|query|aggregate|find)$/;
+/** An app operation that reads one record by id. */
+const APP_RECORD_READ = /^records\.(show|get|read)$/;
+
+/** `app_call` args arrive as a JSON string or an object. */
+function callArgs(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
 
 function sourceOf(name: string, args: Record<string, unknown>): TurnSource | null {
   switch (name) {
@@ -76,10 +90,16 @@ function sourceOf(name: string, args: Record<string, unknown>): TurnSource | nul
       return { kind: "web", key: `web:${parsed.href}`, label: parsed.host, target: parsed.href };
     }
     case "app_call": {
+      // An app record, named by its board identity (app and record id).
+      // Lists, searches and writes name no single record, so they are not
+      // sources.
       const app = str(args.app);
       const operation = str(args.operation);
-      if (!app || !operation || !APP_READ.test(operation)) return null;
-      return { kind: "app", key: `app:${app}`, label: app, target: app };
+      if (!app || !operation || !APP_RECORD_READ.test(operation)) return null;
+      const inner = callArgs(args.args);
+      const record = str(inner.record_id) ?? str(inner.id);
+      if (!record) return null;
+      return { kind: "app", key: `app:${app}:${record}`, label: `${app} · ${record}`, target: record, app };
     }
     default:
       return null;
@@ -126,6 +146,8 @@ export interface StagedField {
   value: string;
   /** Empty or not provided: shown as flagged. */
   missing: boolean;
+  /** The write removes this field; `value` is what it removes. */
+  removed: boolean;
 }
 
 /** At most this many fields on the card; the review card has the rest. */
@@ -143,10 +165,11 @@ const cut = (s: string): string => (s.length > STAGED_VALUE_CHARS ? `${s.slice(0
 export function stagedFields(write: StagedWrite): { fields: StagedField[]; more: number } {
   const preview = write.connected?.preview;
   const all: StagedField[] = preview
-    ? preview.fields.map((field) => ({ label: field.label, value: cut(field.value), missing: field.value.trim() === "" }))
+    ? preview.fields.map((field) => ({ label: field.label, value: cut(field.value), missing: field.value.trim() === "", removed: false }))
     : write.changes.map((change) => {
+        if (change.kind === "removed") return { label: change.label, value: cut(change.before ?? ""), missing: false, removed: true };
         const value = change.after ?? "";
-        return { label: change.label, value: cut(value), missing: change.after == null || value.trim() === "" };
+        return { label: change.label, value: cut(value), missing: change.after == null || value.trim() === "", removed: false };
       });
   return { fields: all.slice(0, STAGED_FIELDS_SHOWN), more: Math.max(0, all.length - STAGED_FIELDS_SHOWN) };
 }
