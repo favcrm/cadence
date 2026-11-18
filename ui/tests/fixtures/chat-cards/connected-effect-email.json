@@ -1,0 +1,30 @@
+{
+  "slug": "synthetic_mail_send",
+  "toolkit": "synthetic_mail",
+  "effect": "send",
+  "connection_id": "con_synthetic_mail",
+  "account": "ops@example.test",
+  "args": "{\"recipient_email\":\"customer@example.test\",\"cc\":\"manager@example.test\",\"subject\":\"Your booking on Friday\",\"body\":\"Hello, this confirms your booking on Friday at 3pm.\"}",
+  "preview": {
+    "title": "Synthetic Mail: send email",
+    "toolkit_label": "Synthetic Mail",
+    "account": "ops@example.test",
+    "kind": "email",
+    "fields": [
+      { "role": "to", "label": "To", "value": "customer@example.test", "untrusted": true },
+      { "role": "cc", "label": "Cc", "value": "manager@example.test", "untrusted": true },
+      {
+        "role": "subject",
+        "label": "Subject",
+        "value": "Your booking on Friday",
+        "untrusted": true
+      },
+      {
+        "role": "body",
+        "label": "Body",
+        "value": "Hello, this confirms your booking on Friday at 3pm.",
+        "untrusted": true
+      }
+    ]
+  }
+}
