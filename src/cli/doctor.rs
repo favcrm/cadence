@@ -229,6 +229,21 @@ fn remote_guidance(
     i32::from(!ok)
 }
 
+/// Why this org, by the precedence `org::settle` applies: a running assignment
+/// binds a managed caller, then `--org`, then `CADENCE_ORG`, then the saved
+/// default.
+fn selected_by(target: &RemoteTarget, org_flag: bool) -> &'static str {
+    if target.identity.is_some() {
+        "this session's running assignment"
+    } else if org_flag {
+        "--org"
+    } else if std::env::var_os("CADENCE_ORG").is_some_and(|value| !value.is_empty()) {
+        "CADENCE_ORG"
+    } else {
+        "the saved default"
+    }
+}
+
 #[cfg(test)]
 mod guidance_tests {
     use super::*;
@@ -275,20 +290,5 @@ mod guidance_tests {
             hosted_guidance(&unknown_profile, &approved, "p", "cadence")["status"],
             "unknown"
         );
-    }
-}
-
-/// Why this org, by the precedence `org::settle` applies: a running assignment
-/// binds a managed caller, then `--org`, then `CADENCE_ORG`, then the saved
-/// default.
-fn selected_by(target: &RemoteTarget, org_flag: bool) -> &'static str {
-    if target.identity.is_some() {
-        "this session's running assignment"
-    } else if org_flag {
-        "--org"
-    } else if std::env::var_os("CADENCE_ORG").is_some_and(|value| !value.is_empty()) {
-        "CADENCE_ORG"
-    } else {
-        "the saved default"
     }
 }
