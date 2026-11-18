@@ -6,6 +6,7 @@ import { openArtifact, useCanvas, type ArtifactRef } from "./canvasStore";
 import { artifactRef } from "./feed";
 import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
 import type { ThreadEntry } from "../home/thread";
+import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 
 export const KIND_LABEL: Record<string, string> = { md: "MD", pdf: "PDF", html: "HTML", image: "IMG", csv: "CSV" };
 
@@ -18,7 +19,14 @@ export function sizeLabel(bytes: number): string {
 /** The thread's card for an artifact: kind tile, title, version and size. A
  *  click opens the drawer on that version; the card of the artifact on view
  *  reads "in canvas". The thread never holds the content. */
-export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
+export default function ArtifactCard({
+  entry,
+  density = "full",
+}: {
+  entry: ThreadEntry;
+  /** CAD-2440: the thread's density; the assistant panel is compact. */
+  density?: CardDensity;
+}) {
   const t = useTranslate();
   const canvas = useCanvas();
   const browser = useBrowserTab();
@@ -28,12 +36,17 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
   const tab = canvas.open ? canvas.tabs.find((x) => x.id === canvas.active) : undefined;
   // The Browser tab, when in front, is what the canvas shows.
   const inCanvas = !isBrowserPanelShown(canvas, browser) && tab?.id === ref.id && tab.selected === ref.version;
+  // CAD-2440: the card system's button shape; the markup, roles, labels
+  // and hooks are the ones this card always had.
   const card = (
-    <div
-      className="artcard"
+    <TurnCard
+      shape="button"
+      element="div"
+      kind="artifact"
+      density={density}
       data-kind="artifact"
       data-artifact={ref.id}
-      data-open={inCanvas || undefined}
+      open={inCanvas}
       role="button"
       tabIndex={0}
       aria-label={`${t("Open")} ${ref.title}`}
@@ -44,20 +57,15 @@ export default function ArtifactCard({ entry }: { entry: ThreadEntry }) {
           openArtifact(ref);
         }
       }}
-    >
-      <span className="arttype">{KIND_LABEL[ref.kind] ?? "FILE"}</span>
-      <span className="arttext">
-        <b>{ref.title}</b>
+      icon={KIND_LABEL[ref.kind] ?? "FILE"}
+      subject={ref.title}
+      meta={
         <span className="artmeta">
           v{ref.version}{ref.bytes === undefined ? "" : ` · ${sizeLabel(ref.bytes)}`}
         </span>
-      </span>
-      {inCanvas ? (
-        <span className="artbadge">{t("in canvas")}</span>
-      ) : (
-        <span className="artopen">{t("Open")}</span>
-      )}
-    </div>
+      }
+      trailing={inCanvas ? <span className="artbadge">{t("in canvas")}</span> : <span className="artopen">{t("Open")}</span>}
+    />
   );
   if (ref.kind !== "html") return card;
   return (

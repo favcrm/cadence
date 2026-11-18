@@ -2931,7 +2931,9 @@ The control endpoint is on the fixture proxy's port:
   and `/api/workspace-skills[/<name>[/approve|revoke|delete]]` from
   `fixtures/workspace-skills.json` and `fixtures/skills-profile.json`.
   Writes go to its own copy. The member is answered `403 owner_required`.
-  The QA board refuses an approval past `approved_max` (3) with
+  `weekly-report` is used by 12 active and 2 archived agents, each with a
+  profile of its own, and a profile save keeps every skill's `used_by` in step,
+  so "Turn off for this agent" can be exercised. The QA board refuses an approval past `approved_max` (3) with
   `approved_limit`. The same body takes:
   - `skills`: `available` (the default), `not-served` (every library route
     answers 404, so the section is hidden) or `failing` (the list answers

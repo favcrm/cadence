@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
+import Switch from "../../ui/Switch";
 import {
   appExplorer,
   workspaceApps,
@@ -448,14 +449,11 @@ export default function ManageApp({
               <p>{t("Automatic updates")}</p>
               {automatic && <p className="hint">{t("Updates that change what this app can reach still ask you.")}</p>}
             </div>
-            <button
-              className="switch"
-              type="button"
-              role="switch"
-              aria-checked={automatic}
-              aria-label={t("Automatic updates for {title}").replace("{title}", () => inst.title)}
+            <Switch
+              checked={automatic}
+              label={t("Automatic updates for {title}").replace("{title}", () => inst.title)}
               disabled={!automaticReady || removed || checking || applying || savingAutomatic}
-              onClick={toggleAutomatic}
+              onToggle={toggleAutomatic}
             />
           </div>
           <p className="mt-3">{home === null
@@ -540,12 +538,10 @@ export default function ManageApp({
               <p>{t("Let {title} work").replace("{title}", () => inst.title)}</p>
               <p className="hint">{removed ? t("Off — the app is removed.") : off ? t("Off — it can't run or use its connections. Its data is kept.") : t("On — it can run and use its connections.")}</p>
             </div>
-            <button
-              className="switch"
-              role="switch"
-              aria-checked={!off && !removed}
-              aria-label={`Let ${inst.title} work`}
-              onClick={() => setNotice(off ? "Turn on through the app's page — consent is recorded there." : "Turn off through the app's page — consent is revoked there.")}
+            <Switch
+              checked={!off && !removed}
+              label={`Let ${inst.title} work`}
+              onToggle={() => setNotice(off ? "Turn on through the app's page — consent is recorded there." : "Turn off through the app's page — consent is revoked there.")}
             />
           </div>
         </div>

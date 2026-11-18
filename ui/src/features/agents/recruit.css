@@ -274,9 +274,53 @@ textarea.ap-doc-text[hidden] { display: none; }
 .ap-doc-lines { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.35rem; font-size: var(--text-secondary); color: var(--color-ink-300); }
 .ap-doc-lines li { display: flex; justify-content: space-between; gap: 1rem; }
 .ap-doc-muted { color: var(--color-ink-500); text-align: right; }
-/* CAD-2419: a workspace skill row is its drawer button and, when approved, the Assigned state. */
-.ap-skill { display: flex; align-items: center; min-width: 0; }
-.ap-skill + .ap-skill { border-top: 1px solid var(--color-ink-700); }
-.ap-skill .ap-mrow { flex: 1; }
-.ap-skill-assign { display: flex; align-items: center; gap: 0.35rem; flex: none; padding: 0 0.75rem; color: var(--color-ink-300); font-size: var(--text-label); white-space: nowrap; }
-.ap-skill-assign[data-assigned="false"] { color: var(--color-ink-500); }
+/* CAD-2438: workspace skills as cards, and the skill panel. */
+.sk-list { display: grid; gap: 0.5rem; }
+.sk-card { display: flex; align-items: center; gap: 0.75rem; min-width: 0; padding: 0.15rem 0.75rem 0.15rem 0; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-850); }
+.sk-card .sk-open { flex: 1; display: grid; gap: 0.25rem; min-width: 0; padding: 0.65rem 0.75rem; text-align: left; background: none; border: 0; border-radius: 0.5rem; cursor: pointer; }
+.sk-card .sk-open:hover { background: var(--color-ink-800); }
+.sk-card .sk-open:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.sk-title { display: flex; align-items: center; flex-wrap: wrap; gap: 0.35rem 0.5rem; }
+.sk-title b { color: var(--color-ink-100); font-weight: 500; font-size: var(--text-secondary); overflow-wrap: anywhere; }
+.sk-desc { color: var(--color-ink-400); font-size: var(--text-label); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.sk-meta { color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-switch { display: flex; align-items: center; gap: 0.5rem; flex: none; color: var(--color-ink-300); font-size: var(--text-label); white-space: nowrap; }
+.sk-switch[data-state="off"] { color: var(--color-ink-500); }
+.sk-state { color: var(--color-ink-300); font-size: var(--text-label); white-space: nowrap; }
+.crm-drawer.crm-drawer-shell[data-drawer="skill"] { width: min(35rem, 100dvw); }
+.crm-drawer[data-drawer="skill"] .crm-drawer-pills { align-items: center; }
+.sk-rev { color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-assign { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.75rem 0.9rem; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-850); }
+.sk-assign b { color: var(--color-ink-100); font-weight: 500; font-size: var(--text-secondary); }
+.sk-assign p { margin: 0.15rem 0 0; color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-names { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.5rem; margin: 0; }
+.sk-more { color: var(--color-ink-400); font-size: var(--text-label); }
+.sk-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem 1rem; margin: 0; }
+.sk-details dt { color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-details dd { margin: 0; color: var(--color-ink-200); font-size: var(--text-secondary); overflow-wrap: anywhere; }
+@media (max-width: 480px) { .sk-details { grid-template-columns: minmax(0, 1fr); } }
+.sk-doc { border: 1px solid var(--color-ink-700); border-radius: 0.5rem; overflow: hidden; }
+.sk-doc-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--color-ink-700); background: var(--color-ink-850); }
+.sk-file { display: grid; }
+.sk-file b { color: var(--color-ink-100); font-weight: 500; font-size: var(--text-secondary); }
+.sk-file small { color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-doc .ap-code { border: 0; border-radius: 0; margin: 0; }
+.sk-md { padding: 0.75rem 0.9rem; min-width: 0; overflow-wrap: anywhere; font-size: var(--text-secondary); }
+.sk-seg { display: inline-flex; border: 1px solid var(--color-ink-700); border-radius: 0.4rem; overflow: hidden; }
+.sk-seg button { padding: 0.25rem 0.65rem; border: 0; background: none; color: var(--color-ink-400); font-size: var(--text-label); cursor: pointer; }
+.sk-seg button + button { border-left: 1px solid var(--color-ink-700); }
+.sk-seg button[aria-pressed="true"] { background: var(--color-ink-800); color: var(--color-ink-100); }
+.sk-seg button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.sk-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+.sk-search { flex: 1 1 10rem; min-width: 0; }
+.sk-users { list-style: none; margin: 0; padding: 0; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; }
+.sk-user { display: flex; align-items: center; gap: 0.65rem; padding: 0.4rem 0.75rem; font-size: var(--text-secondary); color: var(--color-ink-200); }
+.sk-user + .sk-user { border-top: 1px solid var(--color-ink-700); }
+.sk-user-name { min-width: 0; overflow-wrap: anywhere; }
+.sk-user small { flex: 1; color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-file-card { border: 1px solid var(--color-ink-700); border-radius: 0.5rem; overflow: hidden; }
+.sk-file-card summary { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.55rem 0.75rem; cursor: pointer; background: var(--color-ink-850); }
+.sk-file-card summary b { color: var(--color-ink-100); font-weight: 500; font-size: var(--text-secondary); overflow-wrap: anywhere; }
+.sk-file-card summary small { color: var(--color-ink-500); font-size: var(--text-label); }
+.sk-file-card summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.sk-file-card .ap-code { border: 0; border-radius: 0; margin: 0; }
