@@ -1,6 +1,5 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import type { WorkspaceSkillSummary } from '../src/lib/types';
 import { usedByCounts } from '../src/features/agents/workspaceSkills';
 
 describe('WorkspaceSkills - usedByCounts', () => {
