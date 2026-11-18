@@ -19,7 +19,39 @@ import {
  */
 
 /** Context budget handed to the engine; the resolved model's real window is not exposed. */
-const MODEL_CONTEXT_WINDOW = 128_000;
+export const MODEL_CONTEXT_WINDOW = 128_000;
+
+/**
+ * CAD-2414: Pi's compaction thresholds for hosted sessions. The binding limit
+ * is the gateway's 256 KiB request body, not the model's window. The engine
+ * counts tokens from the last reply's reported usage, and estimates the rest
+ * (the first request, the first request after a compaction, and the newest
+ * step's results) at 3.5 characters a token.
+ *
+ * - Measured on the hosted default model (deepseek-v4.1-flash, 2026-11-17)
+ *   with requests shaped like hosted traffic: English JSON, HTML and prose
+ *   at 3.45 bytes a reported token, Chinese JSON and prose at 3.85. So
+ *   256 KiB holds about 68–76k reported tokens, and the default reserve
+ *   (window − 16,384 ≈ 112k) never fired before the gateway refused.
+ * - Where the engine estimates instead, Chinese (3 bytes a character, about
+ *   2 characters a real token) costs about 10.5 bytes an estimated token.
+ *
+ * - Blocking compaction at 128,000 − 80,000 = 48k tokens (about 185 KB at
+ *   3.85 bytes a token), background 16,384 tokens earlier (about 31.6k,
+ *   about 122 KB).
+ * - The kept tail is 8,000 tokens, so the first request after a compaction
+ *   stays far under the budget even when the tail is estimated Chinese text
+ *   (8,000 × 10.5 ≈ 84 KB).
+ * - Estimated Chinese tool results in one operation are kept in budget by
+ *   `boundActiveToolResults`, not by these thresholds.
+ * - The summary's output stays capped by the model's 8,192 output tokens.
+ */
+export const HOSTED_COMPACTION_POLICY = {
+  reserveTokens: 80_000,
+  keepRecentTokens: 8_000,
+  backgroundTokens: 16_384,
+} as const;
+
 const MODEL_MAX_OUTPUT_TOKENS = 8192;
 
 /**
@@ -219,8 +251,10 @@ const HISTORICAL_TOOL_RESULT_NOTICE =
 /**
  * Bound old tool results only in the model request. A completed assistant
  * answer proves the preceding results belong to earlier work; everything
- * after the latest such answer stays whole, including all pages of a file the
- * active operation is editing. The durable transcript is never changed.
+ * after the latest such answer stays whole here, including all pages of a
+ * file the active operation is editing. Only a request over the gateway
+ * budget shortens more (`boundActiveToolResults`). The durable transcript is
+ * never changed.
  */
 function boundToolHistory(input: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(input.messages)) return input;
@@ -272,6 +306,82 @@ function boundToolHistory(input: Record<string, unknown>): Record<string, unknow
     };
   }
   return messages === undefined ? input : { ...input, messages };
+}
+
+/**
+ * CAD-2414: the gateway's text budget for one request (prompt, host context,
+ * tool schemas). Image data has its own headroom and is not counted here.
+ * The target leaves room for the gateway's own framing.
+ */
+const REQUEST_TEXT_BYTES = 256 * 1024;
+const REQUEST_TEXT_TARGET = REQUEST_TEXT_BYTES - 16 * 1024;
+/** At least this many newest tool results stay whole, and the newest round. */
+const ACTIVE_TOOL_RESULTS_KEPT = 2;
+/** Each pass shortens the oldest results first, to this many characters. */
+const ACTIVE_TOOL_RESULT_PASSES = [HISTORICAL_TOOL_RESULT_CHARS, 2_000] as const;
+
+const encoder = new TextEncoder();
+
+/** The request's bytes against the gateway's text budget, images excluded. */
+function textBytes(input: unknown): number {
+  return encoder.encode(
+    JSON.stringify(input, (key, value: unknown) => (key === "image_url" ? null : value)),
+  ).length;
+}
+
+/** `text` cut to at most `end` characters, never inside a surrogate pair. */
+function cutText(text: string, end: number): string {
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
+}
+
+/**
+ * Keep one long operation's request inside the gateway budget. The engine
+ * cannot compact the operation it is running (`hosted-preserve-active-
+ * operation`), so once its own tool results pass 256 KiB every request would
+ * be refused. Only then, and only in the model request, shorten tool results
+ * oldest first, earlier history included, keeping the newest round and at
+ * least `ACTIVE_TOOL_RESULTS_KEPT` results whole, until the request fits.
+ * The durable transcript is never changed. A request that still does not fit
+ * is sent as it is, and the gateway's refusal takes the existing
+ * context-limit path.
+ */
+function boundActiveToolResults(input: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(input.messages)) return input;
+  let bytes = textBytes(input);
+  if (bytes <= REQUEST_TEXT_TARGET) return input;
+  const messages: unknown[] = input.messages.slice();
+  const results: number[] = [];
+  let lastCall = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (typeof message !== "object" || message === null || Array.isArray(message) || !("role" in message))
+      continue;
+    if (message.role === "assistant") lastCall = index;
+    else if (message.role === "tool" && "content" in message && typeof message.content === "string")
+      results.push(index);
+  }
+  // The newest round's results (parallel calls answer one assistant turn)
+  // have not been seen whole by the model yet; never cut them.
+  const newestRound = results.findIndex((index) => index > lastCall);
+  const keepFrom = Math.min(
+    results.length - ACTIVE_TOOL_RESULTS_KEPT,
+    newestRound < 0 ? results.length : newestRound,
+  );
+  const shortenable = results.slice(0, Math.max(0, keepFrom));
+  for (const limit of ACTIVE_TOOL_RESULT_PASSES) {
+    for (const index of shortenable) {
+      const message = messages[index] as { content: string };
+      if (message.content.length <= limit) continue;
+      const content = cutText(message.content, limit) + HISTORICAL_TOOL_RESULT_NOTICE;
+      bytes -= textBytes(message.content) - textBytes(content);
+      messages[index] = { ...message, content };
+      if (bytes <= REQUEST_TEXT_TARGET) return { ...input, messages };
+    }
+  }
+  return { ...input, messages };
 }
 
 /**
@@ -502,7 +612,8 @@ export function meteredBinding(
       }
       const compacting = isCompaction?.(options?.signal) === true;
       const summary = compacting ? splitSummaryMessages(input) : input;
-      const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
         // A refused summary is terminal, and it must not leave an earlier
         // attempt's evidence behind: nothing was dispatched under it.
