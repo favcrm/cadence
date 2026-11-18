@@ -1,6 +1,7 @@
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import type { WorkspaceSkillRead, WorkspaceSkillSummary } from "../../lib/types";
+import type { WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
+import { BUNDLED_SKILLS } from "./agentTabModel";
 
 /**
  * CAD-2419: the hosted workspace skill library on an agent's Skills tab
@@ -17,9 +18,36 @@ export interface SkillDeps {
   remove: (name: string, expectedRevision: number) => Promise<void>;
 }
 
+/**
+ * CAD-2429: `used_by` is read strictly. A board that predates it omits it; a
+ * malformed one (not a list, or any entry without a string id and name and a
+ * known status) is treated as absent, never repaired into a count.
+ */
+export function readUsedBy(value: unknown): WorkspaceSkillUser[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const users: WorkspaceSkillUser[] = [];
+  for (const entry of value as unknown[]) {
+    if (!entry || typeof entry !== "object") return undefined;
+    const { profile_id, name, status } = entry as Record<string, unknown>;
+    if (typeof profile_id !== "string" || typeof name !== "string" || (status !== "active" && status !== "archived")) return undefined;
+    users.push({ profile_id, name, status });
+  }
+  return users;
+}
+
+/** A skill as the board answered it, with `used_by` kept only when it is well-formed. */
+export function withUsedBy(skill: WorkspaceSkillSummary): WorkspaceSkillSummary {
+  const { used_by, ...rest } = skill;
+  const users = readUsedBy(used_by);
+  return users === undefined ? rest : { ...rest, used_by: users };
+}
+
 export const liveSkillDeps: SkillDeps = {
-  list: async () => (await api.workspaceSkills()).skills,
-  read: (name, revision) => api.workspaceSkill(name, revision),
+  list: async () => (await api.workspaceSkills()).skills.map(withUsedBy),
+  read: async (name, revision) => {
+    const read = await api.workspaceSkill(name, revision);
+    return { ...read, skill: withUsedBy(read.skill) };
+  },
   approve: async (name, revision, digest) => (await api.approveWorkspaceSkill(name, revision, digest)).skill,
   revoke: async (name, digest) => (await api.revokeWorkspaceSkill(name, digest)).skill,
   remove: async (name, expectedRevision) => {
@@ -40,6 +68,23 @@ export function statusParts(skill: WorkspaceSkillSummary): { text: string; n: nu
     parts.push({ text: "Draft rev {n} awaiting approval", n: skill.latest_revision });
   }
   return parts;
+}
+
+/** A skill Cadence bundles with every agent; it needs no workspace approval. */
+export function isBuiltIn(name: string): boolean {
+  return BUNDLED_SKILLS.some((skill) => skill.name === name);
+}
+
+/** "N of M": approved workspace skills this profile lists, of all approved ones. */
+export function assignedCount(profileSkills: string[], library: WorkspaceSkillSummary[]): { assigned: number; approved: number } {
+  const approved = library.filter((skill) => skill.approved);
+  return { assigned: approved.filter((skill) => profileSkills.includes(skill.name)).length, approved: approved.length };
+}
+
+/** "Used by N agents" for a row, in English for `t`; null when the board did not say. */
+export function usedByNote(skill: WorkspaceSkillSummary): { text: string; n: number } | null {
+  if (skill.used_by === undefined) return null;
+  return { text: skill.used_by.length === 1 ? "Used by {n} agent" : "Used by {n} agents", n: skill.used_by.length };
 }
 
 /** Names the profile lists that no approved workspace skill answers. */

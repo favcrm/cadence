@@ -375,8 +375,9 @@ export function documentsResponder(fx: Fixtures, presets: () => BoardPresets) {
 
 /** CAD-2419: the workspace skill library presets. `not-served` is a board
  *  that predates it (every library route answers 404); `failing` answers its
- *  list with 503, so the read failure and its Retry can be seen. */
-export const SKILL_PROBES = ["available", "not-served", "failing"] as const;
+ *  list with 503, so the read failure and its Retry can be seen; `no-used-by`
+ *  is a board that serves the library but predates `used_by` (CAD-2429). */
+export const SKILL_PROBES = ["available", "not-served", "failing", "no-used-by"] as const;
 export type SkillProbe = (typeof SKILL_PROBES)[number];
 
 type SkillRevision = WorkspaceSkillRead["revision"];
@@ -409,6 +410,7 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
   const no = (route: string, status: number, code: string, message: string) => answer(route, status, { error: { code, message } });
   const latest = (skill: FixtureSkill) => skill.revisions[skill.revisions.length - 1]!;
   const summary = (skill: FixtureSkill): WorkspaceSkillSummary => {
+    const { used_by } = skill;
     const last = latest(skill);
     const approved = skill.approved && skill.revisions.find((r) => r.revision === skill.approved!.revision);
     return {
@@ -420,6 +422,7 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
       created_by: skill.created_by,
       created_at: skill.created_at,
       updated_at: last.created_at,
+      ...(probe === "no-used-by" || used_by === undefined ? {} : { used_by }),
     };
   };
   const exact = (body: unknown, keys: readonly string[]): Record<string, unknown> | null => {
@@ -618,6 +621,16 @@ async function validateSkills(fx: Fixtures, board: Board, fail: Fail) {
         if (!approved.approved || approved.revision.digest !== skill.approved.digest) fail("workspace-skills", `${skill.name}: the approved revision does not read back as approved`);
       }
     }
+    if (skills.some((s) => s.used_by === undefined) || !skills.some((s) => s.used_by?.some((u) => u.status === "archived"))) {
+      fail("workspace-skills", "every skill should carry used_by, with an archived agent on one");
+    }
+    const detail = await liveSkillDeps.read(skills[0]!.name);
+    if (detail.skill.used_by === undefined) fail("workspace-skills", "the detail read dropped used_by");
+    board.skills.setProbe("no-used-by");
+    if ((await liveSkillDeps.list()).some((s) => s.used_by !== undefined) || (await liveSkillDeps.read(skills[0]!.name)).skill.used_by !== undefined) {
+      fail("workspace-skills", "no-used-by still answers used_by");
+    }
+    board.skills.setProbe("available");
     const { profile } = await api.agentProfile(row.id);
     if (profile.id !== row.id) fail("skills-profile", "the stored profile is not the roster row's");
     if (unapprovedNames(profile.skills, skills).length === 0 || unapprovedNames(profile.skills, skills).length === profile.skills.length) {

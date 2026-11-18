@@ -706,6 +706,15 @@ export interface WorkspaceSkillSummary {
   created_by: string;
   created_at: number;
   updated_at: number;
+  /** CAD-2429: the agents whose profile lists this skill. A board that
+   *  predates it omits the field (agenticos-v2 #2193); absent is unknown, never none. */
+  used_by?: WorkspaceSkillUser[];
+}
+
+export interface WorkspaceSkillUser {
+  profile_id: string;
+  name: string;
+  status: "active" | "archived";
 }
 
 /** `GET /api/workspace-skills/<name>[?revision=N]`: one revision, its files as text. */

@@ -25,6 +25,23 @@
           "author": "agent:qa-writer",
           "created_at": 1794603600000
         }
+      ],
+      "used_by": [
+        {
+          "profile_id": "ap_qa_writer",
+          "name": "qa-writer",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_editor",
+          "name": "qa-editor",
+          "status": "active"
+        },
+        {
+          "profile_id": "ap_qa_archivist",
+          "name": "qa-archivist",
+          "status": "archived"
+        }
       ]
     },
     {
@@ -61,6 +78,13 @@
           "author": "agent:qa-writer",
           "created_at": 1794607200000
         }
+      ],
+      "used_by": [
+        {
+          "profile_id": "ap_qa_editor",
+          "name": "qa-editor",
+          "status": "active"
+        }
       ]
     },
     {
@@ -82,7 +106,8 @@
           "author": "mcp:qa-assistant",
           "created_at": 1794603600000
         }
-      ]
+      ],
+      "used_by": []
     },
     {
       "name": "meeting-notes",
@@ -101,6 +126,13 @@
           "created_by": "usr_qa_member",
           "author": null,
           "created_at": 1794603600000
+        }
+      ],
+      "used_by": [
+        {
+          "profile_id": "ap_qa_editor",
+          "name": "qa-editor",
+          "status": "active"
         }
       ]
     }
