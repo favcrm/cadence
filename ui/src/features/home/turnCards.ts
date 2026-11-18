@@ -24,9 +24,22 @@ export interface TurnSource {
 /** At most this many chips; the rest are "+N more". */
 export const SOURCES_SHOWN = 8;
 
-/** A recorded call as `name {json}`. Null when it is not one. */
-export function parseToolCall(text: string): { name: string; args: Record<string, unknown> } | null {
+/**
+ * A recorded call. Two forms exist: the v2 runtime records `name {json}`;
+ * the native runtime records `store::threads::tool_summary`'s one line,
+ * `name: <detail>`. The detail is the first of command, file_path, path,
+ * pattern, url, query, description and prompt, or `{sorted keys}`
+ * (CAD-2456). A summary's detail arrives as `summary`; a keys-only summary
+ * carries none. Null when the text is neither form.
+ */
+export function parseToolCall(text: string): { name: string; args: Record<string, unknown>; summary?: string } | null {
   const trimmed = text.trim();
+  const summary = /^([a-z][a-z0-9_]*): (.+)$/s.exec(trimmed);
+  if (summary) {
+    const detail = summary[2]!.trim();
+    // `{a, b}` names keys only, never values.
+    return { name: summary[1]!, args: {}, ...(detail.startsWith("{") ? {} : { summary: detail }) };
+  }
   const space = trimmed.indexOf(" ");
   const name = space < 0 ? trimmed : trimmed.slice(0, space);
   if (!/^[a-z][a-z0-9_]*$/.test(name)) return null;
@@ -65,10 +78,11 @@ function callArgs(value: unknown): Record<string, unknown> {
   }
 }
 
-function sourceOf(name: string, args: Record<string, unknown>): TurnSource | null {
+function sourceOf(name: string, args: Record<string, unknown>, summary?: string): TurnSource | null {
   switch (name) {
     case "wiki_read": {
-      const path = str(args.path);
+      // A summary's detail is the path (tool_summary's `path` field).
+      const path = str(args.path) ?? (summary !== undefined ? str(summary) : null);
       return path ? { kind: "wiki", key: `wiki:${path}`, label: path, target: path } : null;
     }
     case "board_read_issue": {
@@ -87,7 +101,8 @@ function sourceOf(name: string, args: Record<string, unknown>): TurnSource | nul
       return id ? { kind: "artifact", key: `artifact:${id}`, label: shortId(id), target: id } : null;
     }
     case "web_read": {
-      const url = str(args.url);
+      // A summary's detail is the url (tool_summary's `url` field).
+      const url = str(args.url) ?? (summary !== undefined ? str(summary) : null);
       if (!url) return null;
       let parsed: URL;
       try {
@@ -126,7 +141,7 @@ export function turnSources(entries: readonly ThreadEntry[]): TurnSource[] {
     if (entry.kind !== "tool_call") continue;
     const call = parseToolCall(entry.text ?? "");
     if (!call) continue;
-    const source = sourceOf(call.name, call.args);
+    const source = sourceOf(call.name, call.args, call.summary);
     if (!source || seen.has(source.key)) continue;
     seen.add(source.key);
     out.push(source);
