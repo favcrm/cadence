@@ -2334,10 +2334,9 @@ Object.assign(zhTW, {
   "A preview is not available yet. Open in a new tab or use Download.": "目前尚未提供內嵌預覽，請在新分頁開啟或下載。",
   // CAD-2433: operator-side PDF page images.
   "Attach pages as images": "將頁面附加為圖片",
+  "Open original PDF": "開啟原始 PDF",
   "Pages": "頁碼",
   "Add to draft": "加入草稿",
-  "Replace PDF with page images": "以頁面圖片取代 PDF",
-  "Replace in draft": "在草稿中取代",
   "Opening PDF…": "正在開啟 PDF…",
   "Update your browser to attach PDF pages as images.": "請更新瀏覽器，才可將 PDF 頁面附加為圖片。",
   "This PDF couldn’t be opened. It may be unavailable, damaged, or password-protected.": "無法開啟此 PDF。檔案可能無法存取、已損毀，或受密碼保護。",

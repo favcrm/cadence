@@ -1,14 +1,14 @@
-import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
+import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import Button from "../../ui/Button";
-import { ATTACH_MAX_BYTES, ATTACH_MAX_FILES, type AttachDestination, type AttachItem } from "../app-shell/chat/attach";
-import { activeComposerSlot, addFiles, attachItems, removeAttach, requestComposerFocus, subscribeAttach } from "../app-shell/chat/composerStore";
+import { ATTACH_MAX_BYTES, ATTACH_MAX_FILES, type AttachDestination } from "../app-shell/chat/attach";
+import { activeComposerSlot, addFiles, attachItems, subscribeAttach } from "../app-shell/chat/composerStore";
 import { WorkspaceDialog } from "../workspace-apps/WorkspaceDialog";
 import "../workspace-apps/workspace-apps.css";
-import { attachmentHref, type AttachmentFile } from "./AttachmentMedia";
+import { attachmentHref, openAttachmentInTab, type AttachmentFile } from "./AttachmentMedia";
 import type { LoadedPdfPages } from "./pdfPageImages";
 
 interface PageTarget {
@@ -17,9 +17,7 @@ interface PageTarget {
   isCurrent?: () => boolean;
 }
 
-type PageSource =
-  | { kind: "retained"; file: AttachmentFile; conversation: string }
-  | { kind: "draft"; file: File; itemKey: string };
+type PageSource = { file: AttachmentFile; conversation: string };
 
 export const PdfPageTarget = createContext<PageTarget | null>(null);
 const STEP_TIMEOUT = 30_000;
@@ -40,11 +38,9 @@ function selection(input: string, pageCount: number, slots: number): number[] | 
   return [...pages].sort((a, b) => a - b);
 }
 
-async function readPdf(source: PageSource, operation: PrivateOperation) {
-  const { file, kind } = source;
+async function readPdf({ file, conversation }: PageSource, operation: PrivateOperation) {
   if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > ATTACH_MAX_BYTES) throw new Error("PDF outside attachment limits");
-  if (kind === "draft") return new Uint8Array(await file.arrayBuffer());
-  const response = await operation.fetch(attachmentHref(file.id, source.conversation), {
+  const response = await operation.fetch(attachmentHref(file.id, conversation), {
     cache: "no-store",
     redirect: "error",
     headers: sessionHeaders(),
@@ -71,29 +67,31 @@ async function readPdf(source: PageSource, operation: PrivateOperation) {
   return bytes;
 }
 
-export default function PdfPageAction({ source, target }: { source: PageSource; target: PageTarget }) {
-  const t = useTranslate();
+export default function PdfPageAction({ source, target, tileTitle, children }: {
+  source: PageSource;
+  target: PageTarget;
+  tileTitle: string;
+  children: ReactNode;
+}) {
   const [open, setOpen] = useState(false);
-  const label = t(source.kind === "draft" ? "Replace PDF with page images" : "Attach pages as images");
   return (
     <>
-      <Button size="sm" variant="ghost" aria-label={`${label}: ${source.file.name}`} onClick={() => setOpen(true)}>
-        {label}
-      </Button>
-      {open && createPortal(<PdfPageDialog source={source} target={target} title={label} close={() => setOpen(false)} />, document.body)}
+      <button type="button" className="sentchip" data-kind="pdf" title={tileTitle}
+        aria-haspopup="dialog" onClick={() => setOpen(true)}>
+        {children}
+      </button>
+      {open && createPortal(<PdfPageDialog source={source} target={target} close={() => setOpen(false)} />, document.body)}
     </>
   );
 }
 
-function PdfPageDialog({ source, target, title, close }: {
+function PdfPageDialog({ source, target, close }: {
   source: PageSource;
   target: PageTarget;
-  title: string;
   close: () => void;
 }) {
   const t = useTranslate();
   const [original] = useState(source);
-  const replaceKey = original.kind === "draft" ? original.itemKey : null;
   const [slot] = useState(() => activeComposerSlot(target.key));
   const subscribe = useCallback((listener: () => void) => subscribeAttach(target.key, listener), [target.key]);
   const [pdf, setPdf] = useState<LoadedPdfPages | null>(null);
@@ -103,9 +101,7 @@ function PdfPageDialog({ source, target, title, close }: {
   const id = useId();
   const operation = useRef<PrivateOperation | null>(null);
   const mount = useRef<AbortSignal | null>(null);
-  const items = useSyncExternalStore(subscribe, () => attachItems(target.key));
-  const occupied = (queue: readonly AttachItem[]) => queue.length - Number(replaceKey !== null && queue.some((item) => item.key === replaceKey));
-  const slots = Math.max(0, ATTACH_MAX_FILES - occupied(items));
+  const slots = useSyncExternalStore(subscribe, () => Math.max(0, ATTACH_MAX_FILES - attachItems(target.key).length));
   const limit = pdf ? Math.min(pdf.count, slots) : slots;
   const full = slots === 0;
 
@@ -156,14 +152,12 @@ function PdfPageDialog({ source, target, title, close }: {
     const op = operation.current;
     const scope = mount.current;
     if (!pdf || busy || !op || !scope || scope.aborted) return;
-    const current = () => slot !== undefined && activeComposerSlot(target.key) === slot &&
-      (target.isCurrent?.() ?? true) && (replaceKey === null || attachItems(target.key)
-        .some((item) => item.key === replaceKey && item.file === original.file));
+    const current = () => slot !== undefined && activeComposerSlot(target.key) === slot && (target.isCurrent?.() ?? true);
     if (!current()) {
       setError("The draft changed. Reopen the PDF to add pages to the current draft.");
       return;
     }
-    const pages = selection(range, pdf.count, ATTACH_MAX_FILES - occupied(attachItems(target.key)));
+    const pages = selection(range, pdf.count, ATTACH_MAX_FILES - attachItems(target.key).length);
     if (pages === "range" || pages === "slots") {
       setError(pages === "range" ? "Enter page numbers or ranges within this PDF." : "The selected pages don’t fit in this draft.");
       return;
@@ -179,13 +173,11 @@ function PdfPageDialog({ source, target, title, close }: {
         setError("The draft changed. Reopen the PDF to add pages to the current draft.");
         return;
       }
-      if (occupied(attachItems(target.key)) + images.length > ATTACH_MAX_FILES) {
+      if (attachItems(target.key).length + images.length > ATTACH_MAX_FILES) {
         setError("The selected pages don’t fit in this draft.");
         return;
       }
-      if (replaceKey !== null) removeAttach(target.key, replaceKey);
       addFiles(target.key, images, target.destination);
-      if (replaceKey !== null) requestComposerFocus(target.key);
       close();
     } catch {
       if (!scope.aborted) {
@@ -200,9 +192,14 @@ function PdfPageDialog({ source, target, title, close }: {
   }
 
   return (
-    <WorkspaceDialog title={title} onClose={close}>
+    <WorkspaceDialog title={t("Attach pages as images")} onClose={close}>
       <form className="grid gap-3" onSubmit={(event) => void submit(event)}>
-        <p className="m-0 min-w-0 truncate" title={original.file.name}>{original.file.name}</p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="m-0 min-w-0 truncate" title={original.file.name}>{original.file.name}</p>
+          <Button size="sm" onClick={() => openAttachmentInTab(original.file.id, original.conversation)}>
+            {t("Open original PDF")}
+          </Button>
+        </div>
         {!pdf && !error && <p className="m-0" role="status">{t("Opening PDF…")}</p>}
         {pdf && <>
           <label className="grid gap-1" htmlFor={id}>
@@ -218,7 +215,7 @@ function PdfPageDialog({ source, target, title, close }: {
         {error && <p className="m-0 text-fail" role="alert">{t(error)}</p>}
         {pdf && <div className="flex justify-end">
           <Button type="submit" variant="primary" disabled={full || range.trim() === ""} loading={busy}>
-            {busy ? t("Converting pages…") : replaceKey === null ? t("Add to draft") : t("Replace in draft")}
+            {busy ? t("Converting pages…") : t("Add to draft")}
           </Button>
         </div>}
       </form>
