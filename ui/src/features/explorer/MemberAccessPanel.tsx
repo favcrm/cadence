@@ -547,7 +547,7 @@ export default function MemberAccessPanel({
             {t("Each grant is one member and one conversation. Projects and private jobs are not affected.")}
           </p>
         </div>
-        {operator && (
+        {operator && phase.kind !== "unsupported" && (
           <div className="ma-head-actions">
             <button
               type="button"

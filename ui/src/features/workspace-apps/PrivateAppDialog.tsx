@@ -139,7 +139,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                   ? <p className="text-label">{t("No separate access grants requested.")}</p> : (
                   <ul className="list-disc pl-5 text-label">
                     {Object.entries(review.declared.capabilities).map(([name, value]) =>
-                      <li key={name} className="break-words">{t(capabilityCopy(value))} <span className="text-ink-400">({name})</span></li>)}
+                      <li key={name} className="break-words">{describeCapability(value, t)} <span className="text-ink-400">({name})</span></li>)}
                   </ul>
                 )}
                 {review.screens.map((screen) => (
@@ -159,8 +159,8 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                       {review.access.connections.removed.map((name) => <li key={`remove-${name}`}>{t("Removed connection")}: <code>{name}</code></li>)}
                       {Object.entries(review.access.capabilities).map(([name, change]) => (
                         <li key={name} className="break-words">
-                          {name}: {change.before && <>{t(capabilityCopy(change.before))} → </>}
-                          {change.after ? t(capabilityCopy(change.after)) : t("Removed")}
+                          {name}: {change.before && <>{describeCapability(change.before, t)} → </>}
+                          {change.after ? describeCapability(change.after, t) : t("Removed")}
                         </li>
                       ))}
                     </ul>}
@@ -206,12 +206,13 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
 
 type Capability = PrivateReview["declared"]["capabilities"][string];
 
-function capabilityCopy(value: Capability): string {
-  if (value.capability === "file.upload") return "Attach files to this app";
-  if (value.effect === "send") return "Publish through a connected account";
-  if (value.capability === "catalog.tool")
-    return value.effect === "read" ? "Read with an approved tool" : "Prepare drafts with an approved tool";
-  return value.effect === "read" ? "Read from a connected account" : "Prepare drafts with a connected account";
+function describeCapability(value: Capability, t: (english: string) => string): string {
+  if (value.capability === "file.upload") return t("Attach files to this app");
+  if (value.effect === "send") return t("Publish through a connected account");
+  if (value.capability === "catalog.tool" && value.action === "invoke")
+    return t(value.effect === "read" ? "Read with an approved tool" : "Prepare drafts with an approved tool");
+  const effect = t(value.effect === "read" ? "Read from a connected account" : "Prepare drafts with a connected account");
+  return `${effect} · ${value.capability.replace(/[.-]/g, " ")} / ${value.action.replace(/_/g, " ")}`;
 }
 
 function formatCapability(value: Capability): string {
@@ -222,8 +223,8 @@ function ScreenList({ label, entries }: { label: string; entries: PrivateReview[
   const t = useTranslate();
   return <div className="text-label"><p className="text-ink-400">{label}</p>{entries.map((screen) => <div key={screen.tag}>
     <p><code>{screen.tag}</code> · {screen.host_contract ?? t("No host contract")}</p>
-    <p>{t("Operations")}: {(screen.operations ?? []).join(", ") || t("None")}</p>
-    <p>{t("Platform tools")}: {(screen.tools ?? []).join(", ") || t("None")}</p>
+    <p>{t("Operations")}: {screen.operations === null ? t("Not declared") : screen.operations.join(", ") || t("None")}</p>
+    <p>{t("Platform tools")}: {screen.tools === null ? t("Not declared") : screen.tools.join(", ") || t("None")}</p>
     <p>{t("Remote image origins")}: {screen.remote_image_origins.join(", ") || t("None")}</p>
   </div>)}</div>;
 }
