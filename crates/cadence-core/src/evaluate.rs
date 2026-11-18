@@ -268,6 +268,15 @@ pub struct DeliveryRequirementsInput {
     /// unreadable and fails closed. `true` with either text present refuses.
     #[serde(default)]
     pub lists_absent: bool,
+    /// CAD-2417: the host vouches that `policy` is owner-approved as sent (on
+    /// hosted Cadence only a live owner can save a project's delivery policy).
+    /// A policy that parses is then resolved as approved at its own digest,
+    /// exactly as an `approval` of it would be; an absent or malformed text
+    /// changes nothing. Absent or `false` keeps today's answers; `true` with an
+    /// `approval` refuses as contradictory. Set it only for an owner-written
+    /// host record, never for text read from a repository or a PR head.
+    #[serde(default)]
+    pub policy_owner_approved: bool,
 }
 
 /// The delivery half of a project work approval: the digest it recorded and
@@ -694,10 +703,27 @@ fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Valu
         None => Ok(None),
         Some(text) => parse(text).map_err(|error| error.to_string()),
     };
-    let approved = input.approval.as_ref().map(|approval| Approved {
-        digest: approval.digest.clone(),
-        policy: approval.policy.clone(),
-    });
+    if input.policy_owner_approved && input.approval.is_some() {
+        return Err(refuse(
+            Code::InvalidCommand,
+            "policy_owner_approved contradicts a supplied approval".to_string(),
+        ));
+    }
+    let approved = if input.policy_owner_approved {
+        // CAD-2417: the policy text itself is the owner's approval.
+        match &file {
+            Ok(Some(policy)) => Some(Approved {
+                digest: crate::delivery::digest(policy),
+                policy: Some(policy.clone()),
+            }),
+            _ => None,
+        }
+    } else {
+        input.approval.as_ref().map(|approval| Approved {
+            digest: approval.digest.clone(),
+            policy: approval.policy.clone(),
+        })
+    };
     let resolved = effective("project", file, approved.as_ref());
     let requirements = if input.lists_absent {
         if input.risk_paths.is_some() || input.one_review_paths.is_some() {

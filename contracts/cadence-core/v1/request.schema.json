@@ -356,6 +356,11 @@
             "null"
           ]
         },
+        "policy_owner_approved": {
+          "description": "CAD-2417: the host vouches that `policy` is owner-approved as sent (on\nhosted Cadence only a live owner can save a project's delivery policy).\nA policy that parses is then resolved as approved at its own digest,\nexactly as an `approval` of it would be; an absent or malformed text\nchanges nothing. Absent or `false` keeps today's answers; `true` with an\n`approval` refuses as contradictory. Set it only for an owner-written\nhost record, never for text read from a repository or a PR head.",
+          "type": "boolean",
+          "default": false
+        },
         "risk_paths": {
           "description": "The trusted base's `docs/roles/risk-paths.toml` text.",
           "type": [
