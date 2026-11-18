@@ -12,6 +12,8 @@ import type * as ReactDomClient from "react-dom/client";
 import type { ApiError as ApiErrorType } from "../src/lib/apiError";
 import type { StoredAgentProfile, WorkspaceSkillRead, WorkspaceSkillSummary } from "../src/lib/types";
 import type { DocDeps } from "../src/features/agents/instructionsDoc";
+import type * as NavModule from "../screen-ui/src/navigation";
+import type * as SkillsModule from "../src/features/agents/workspaceSkills";
 import type { SkillDeps } from "../src/features/agents/workspaceSkills";
 import type * as TabsModule from "../src/features/agents/AgentTabs";
 import type { TabContext } from "../src/features/agents/AgentTabs";
@@ -46,6 +48,7 @@ async function main() {
   const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
   const { ApiError } = require("../src/lib/apiError") as { ApiError: typeof ApiErrorType };
   const { WorkspaceSkills, default: AgentTabBody } = require("../src/features/agents/AgentTabs") as typeof TabsModule;
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof NavModule;
   const { allowPrivateReads } = require("../src/lib/privateSession") as { allowPrivateReads: () => void };
   const { useInstructionsDoc } = require("../src/features/agents/useInstructionsDoc") as typeof HookModule;
 
@@ -77,6 +80,13 @@ async function main() {
   let library: WorkspaceSkillSummary[] = [];
   const reset = () => {
     library = [summary("weekly-report", 1, 1), summary("tone-guide", 2, 1), summary("pricing-check", 1, null)];
+    // pricing-check has no `used_by`: a board that predates the field.
+    library[0]!.used_by = [
+      { profile_id: "ap_1", name: "ads-agent", status: "active" },
+      { profile_id: "ap_2", name: "copy-agent", status: "active" },
+      { profile_id: "ap_3", name: "old-agent", status: "archived" },
+    ];
+    library[1]!.used_by = [{ profile_id: "ap_2", name: "copy-agent", status: "active" }];
   };
   reset();
   let listFails: (() => Error) | null = null;
@@ -129,7 +139,13 @@ async function main() {
     const doc = useInstructionsDoc({
       alias: "ads-agent", kind: "hosted", profileId: "ap_1", nativeServed: null, writable, onSaved: () => {}, toast: toast as never, deps: docDeps,
     });
-    return React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps });
+    return React.createElement(
+      NavigationProvider,
+      {
+        adapter: { navigate: () => {}, href: (h: string) => h, modifiedClicks: "browser" },
+        children: React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps }),
+      },
+    );
   }
 
   const host = document.createElement("div");
@@ -206,7 +222,53 @@ async function main() {
   assert(/No workspace skills yet\. Agents draft them; an owner approves them\./.test(all()), "the empty library explains itself");
   reset();
 
+  // ---- CAD-2429: pure reads of used_by and the counts ----
+  const W = require("../src/features/agents/workspaceSkills") as typeof SkillsModule;
+  const user = { profile_id: "ap_1", name: "a", status: "active" };
+  assert(W.readUsedBy(undefined) === undefined && W.readUsedBy("x") === undefined, "a missing or non-list used_by is absent");
+  assert(JSON.stringify(W.readUsedBy([user])) === JSON.stringify([user]) && W.readUsedBy([])?.length === 0, "a well-formed list is kept, an empty one too");
+  assert(W.readUsedBy([user, { ...user, status: "gone" }]) === undefined, "an unknown status makes the whole field absent");
+  assert(W.readUsedBy([user, { name: "b", status: "active" }]) === undefined && W.readUsedBy([user, null]) === undefined, "an entry without an id, or not an object, makes it absent");
+  assert(W.withUsedBy({ ...summary("x", 1, 1), used_by: [{ nope: 1 }] as never }).used_by === undefined, "a malformed used_by is dropped from the skill");
+  assert(W.usedByNote(summary("x", 1, 1)) === null, "no note when the board did not say");
+  assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [] })?.n === 0, "zero agents is still said");
+  assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [user as never] })?.text === "Used by {n} agent", "one agent is singular");
+  assert(W.usedByNote({ ...summary("x", 1, 1), used_by: [user as never, user as never] })?.text === "Used by {n} agents", "two agents are plural");
+  assert(W.isBuiltIn("cadence") && !W.isBuiltIn("weekly-report"), "a bundled skill is built in, a workspace one is not");
+  const counted = W.assignedCount(["weekly-report", "copywriting", "pricing-check"], library);
+  assert(counted.assigned === 1 && counted.approved === 2, "N counts approved assigned skills, M approved ones in the workspace");
+
   // ---- member: everything visible, nothing changeable ----
+  await mount(false);
+  assert(/1 of 2 assigned/.test(host.querySelector("h3")?.parentElement?.textContent ?? ""), "the header counts assigned of approved");
+  assert(/Used by 3 agents/.test(row("weekly-report")?.textContent ?? "") && /Used by 1 agent(?!s)/.test(row("tone-guide")?.textContent ?? ""), "rows say how many agents use them");
+  assert(!/Used by/.test(row("pricing-check")?.textContent ?? ""), "a skill without used_by has no note");
+  await click(row("weekly-report"), "the weekly-report row");
+  const usedBy = document.body.querySelector("[data-work-panel=used-by]");
+  assert(/Used by · 3/.test(usedBy?.textContent ?? ""), "the drawer counts who uses the skill");
+  assert(/ads-agentthis agent/.test(usedBy?.textContent ?? "") && !usedBy?.querySelector("a[href*=ads-agent]"), "this agent is marked, not linked");
+  assert(usedBy?.querySelector("a[href='/agents/copy-agent?tab=skills']"), "another agent links to its Skills tab");
+  assert(/old-agentarchived/.test(usedBy?.textContent ?? "") && !usedBy?.querySelector("a[href*=old-agent]"), "an archived agent is noted, not linked");
+  assert(!button("Approve revision 1") && !button("Revoke") && !button("Delete"), "a member sees used_by with no owner action");
+  assert(usedBy!.compareDocumentPosition(document.body.querySelector("pre.ap-code")!) & 4, "Used by comes before the file contents");
+  await closeDrawer();
+  await click(row("pricing-check"), "the pricing-check row, no used_by");
+  assert(!document.body.querySelector("[data-work-panel=used-by]"), "the section is hidden when the board omits used_by");
+  await closeDrawer();
+  // An empty list is said, not hidden.
+  library = library.map((s) => (s.name === "tone-guide" ? { ...s, used_by: [] } : s));
+  await mount(false);
+  await click(row("tone-guide"), "the tone-guide row, empty used_by");
+  assert(/Used by · 0/.test(document.body.textContent ?? "") && /No agent lists this skill yet/.test(document.body.textContent ?? ""), "an empty used_by says so");
+  await closeDrawer();
+  reset();
+  // A bundled name on the profile reads Built-in; an unknown one keeps its words.
+  const keep = stored;
+  stored = { ...stored, skills: [...stored.skills, "cadence"] };
+  await mount(false);
+  assert(/cadence\s*Built-in/.test(all()) && /copywriting\s*Not approved in this workspace/.test(all()), "a bundled name is Built-in, an unknown one is not approved");
+  assert(/1 of 2 assigned/.test(all()), "a built-in name does not count as an assigned workspace skill");
+  stored = keep;
   await mount(false);
   assert(/Approved rev 1/.test(row("weekly-report")?.textContent ?? ""), "an approved skill says so");
   assert(/Approved rev 1 · Draft rev 2 awaiting approval/.test(row("tone-guide")?.textContent ?? ""), "a newer draft of an approved skill says both");
