@@ -444,6 +444,9 @@
 .status-chip-doing {
   color: color-mix(in srgb, var(--color-info) 80%, var(--color-ink-100));
 }
+.status-chip-review {
+  color: color-mix(in srgb, var(--color-warn) 80%, var(--color-ink-100));
+}
 .status-chip-done {
   color: color-mix(in srgb, var(--color-ok) 80%, var(--color-ink-100));
 }
