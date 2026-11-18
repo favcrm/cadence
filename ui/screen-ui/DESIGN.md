@@ -34,11 +34,13 @@ validation, unsaved work, loading failures and the meaning of partial counts.
 
 ## Theme and typography
 
-Use semantic CSS variables from `src/theme.css`: ink levels for surfaces and
-text, `--color-edge` for boundaries, `--color-accent` for active/focus states,
-`--color-on-accent` for text on accent, and the status tokens for meaning.
-Use the scrim token for overlays. Do not hardcode a light-only background or
-use a status color as decorative branding. Theme selection supports explicit
+Use `src/theme.css` for neutral white/graphite in light mode and charcoal/slate
+in dark mode. Use ink levels for surfaces, text and neutral primary button
+fills; `--color-edge` for boundaries; `--color-accent` for focus and active
+states; and `--color-on-accent` for text on accent. Use the scrim token for
+overlays. Reserve blue for ongoing work and green for completion in status
+badges; retain text labels so color is not the only cue. The brand mark does not
+set the control palette. Theme selection supports explicit
 `data-theme="light"` / `"dark"` and a system fallback.
 
 Use `--font-sans` (IBM Plex Sans with system fallbacks), and `.num` /

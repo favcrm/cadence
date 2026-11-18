@@ -6,32 +6,28 @@
 
 /* Board-only presentation; the embedded app theme remains independently owned. */
 :root {
-  --board-nav-current-bg: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
-  --board-nav-current-fg: var(--color-accent);
-  --board-composer-shadow: 0 8px 24px rgb(0 0 0 / .28);
+  --board-nav-current-bg: #3a3f4b;
+  --board-nav-current-fg: var(--color-ink-100);
+  --board-composer-shadow: 0 4px 16px rgb(17 20 26 / .2);
   --board-reading-width: 52rem;
   --board-project-width: none;
-  --board-project-surface: var(--color-ink-875);
+  --board-project-surface: var(--color-ink-850);
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --board-nav-current-bg: #eaeaea;
-    --board-nav-current-fg: var(--color-ink-100);
-    --board-composer-shadow: 0 4px 16px rgb(0 0 0 / .08);
+    --board-nav-current-bg: #ededed;
+    --board-composer-shadow: 0 4px 16px rgb(0 0 0 / .05);
     --board-reading-width: 48rem;
     --board-project-width: 76rem;
-    --board-project-surface: var(--color-ink-850);
     --cadence-logo-start: #126b60;
     --cadence-logo-end: #197987;
   }
 }
 :root[data-theme="light"] {
-  --board-nav-current-bg: #eaeaea;
-  --board-nav-current-fg: var(--color-ink-100);
-  --board-composer-shadow: 0 4px 16px rgb(0 0 0 / .08);
+  --board-nav-current-bg: #ededed;
+  --board-composer-shadow: 0 4px 16px rgb(0 0 0 / .05);
   --board-reading-width: 48rem;
   --board-project-width: 76rem;
-  --board-project-surface: var(--color-ink-850);
   --cadence-logo-start: #126b60;
   --cadence-logo-end: #197987;
 }
@@ -444,6 +440,33 @@
     padding: .05rem .4rem;
     font: 500 .6875rem "IBM Plex Mono", monospace;
   }
+}
+.status-chip-doing {
+  color: color-mix(in srgb, var(--color-info) 80%, var(--color-ink-100));
+}
+.status-chip-review {
+  color: color-mix(in srgb, var(--color-warn) 80%, var(--color-ink-100));
+}
+.status-chip-done {
+  color: color-mix(in srgb, var(--color-ok) 80%, var(--color-ink-100));
+}
+.status-chip-doing::before,
+.status-chip-done::before {
+  content: "";
+  flex: none;
+}
+.status-chip-doing::before {
+  width: .3rem;
+  height: .3rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.status-chip-done::before {
+  width: .42rem;
+  height: .25rem;
+  border: solid currentColor;
+  border-width: 0 0 1.5px 1.5px;
+  transform: translateY(-.05rem) rotate(-45deg);
 }
 .reveal {
   animation: reveal .45s cubic-bezier(.2, .8, .2, 1) both;
@@ -2437,7 +2460,11 @@ button.refchip:hover {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 .chatdock > [data-composer] {
+  border-color: var(--color-edge);
   box-shadow: var(--board-composer-shadow);
+}
+.chatdock > [data-composer]:focus-within {
+  border-color: var(--color-accent);
 }
 .chatdock > [data-composer][data-blocked] {
   border-style: dashed;

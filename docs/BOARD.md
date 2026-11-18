@@ -2674,9 +2674,9 @@ case, so adding never replaces a type. A confirmed approver who is no longer a
 member is flagged to the owner, because nobody can approve that type until it
 is edited.
 
-`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests. Design tokens
-per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
-Sans/Mono, teal `#2dd4bf` on interactive elements only.
+`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests.
+See the [Screen UI design guidance](../ui/screen-ui/DESIGN.md) for the shared
+palette, IBM Plex Sans/Mono typography and control styles.
 
 ```bash
 cd ui

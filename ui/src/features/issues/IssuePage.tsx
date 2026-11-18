@@ -22,6 +22,7 @@ import { Activity } from "./Activity";
 import { PrPanel } from "./PrPanel";
 import { Evidence } from "./Evidence";
 import { Fields } from "./Fields";
+import { STATUS_CHIP } from "./chips";
 import { WorkResult } from "./WorkResult";
 import { Links } from "./Links";
 import { type IssuePageProps as Props } from "./issuePageProps";
@@ -47,15 +48,6 @@ const TABS: { id: IssueTab; label: string }[] = [
   { id: "pr", label: "Pull request" },
   { id: "evidence", label: "Evidence" },
 ];
-
-const STATUS_CHIP: Record<string, string> = {
-  backlog: "bg-ink-800 text-ink-400",
-  ready: "bg-ink-800 text-ink-200",
-  doing: "bg-info/15 text-info",
-  review: "bg-warn/15 text-warn",
-  done: "bg-ok/15 text-ok",
-  dropped: "bg-ink-800 text-ink-500",
-};
 
 export default function IssuePage(props: Props) {
   // All drafts and dialogs belong to one issue, including cached-to-cached navigation.

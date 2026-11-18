@@ -961,18 +961,6 @@ function PersonalIdentityEditor({
       <p className="assistant-about-note">
         {t("Private to you in this workspace. Ask in chat anytime to adjust how I communicate.")}
       </p>
-      <label className="assistant-field">
-        <span>{t("Display name")}</span>
-        <input
-          className="field"
-          value={name}
-          maxLength={80}
-          disabled={pending}
-          autoComplete="off"
-          onChange={(event) => setName(event.target.value)}
-          placeholder={t("Not named yet")}
-        />
-      </label>
       <fieldset className="assistant-looks" disabled={pending}>
         <legend className="text-label text-ink-300">{t("Avatar")}</legend>
         <div className="assistant-look-grid">
@@ -1025,9 +1013,23 @@ function PersonalIdentityEditor({
           {notice}
         </p>
       )}
-      <Button type="submit" size="sm" variant="primary" loading={pending} disabled={pending || !dirty || stale}>
-        {pending ? t("Saving…") : t("Save identity")}
-      </Button>
+      <div className="assistant-name-row">
+        <label className="assistant-field">
+          <span>{t("Display name")}</span>
+          <input
+            className="field"
+            value={name}
+            maxLength={80}
+            disabled={pending}
+            autoComplete="off"
+            onChange={(event) => setName(event.target.value)}
+            placeholder={t("Not named yet")}
+          />
+        </label>
+        <Button type="submit" variant="primary" loading={pending} disabled={pending || !dirty || stale}>
+          {pending ? t("Saving…") : t("Save identity")}
+        </Button>
+      </div>
     </form>
   );
 }
@@ -1103,18 +1105,6 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
         {t("Operator-only edit. Your personal assistant keeps its own name and preferences.")}
       </p>
       <label className="assistant-field">
-        <span>{t("Display name")}</span>
-        <input
-          className="field"
-          value={name}
-          maxLength={80}
-          disabled={pending}
-          autoComplete="off"
-          onChange={(event) => setName(event.target.value)}
-          placeholder={t("Not named yet")}
-        />
-      </label>
-      <label className="assistant-field">
         <span>{t("Personality")}</span>
         <textarea
           className="field"
@@ -1174,9 +1164,23 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
           {notice}
         </p>
       )}
-      <Button type="submit" size="sm" variant="primary" loading={pending} disabled={pending || !dirty}>
-        {pending ? t("Saving…") : t("Save identity")}
-      </Button>
+      <div className="assistant-name-row">
+        <label className="assistant-field">
+          <span>{t("Display name")}</span>
+          <input
+            className="field"
+            value={name}
+            maxLength={80}
+            disabled={pending}
+            autoComplete="off"
+            onChange={(event) => setName(event.target.value)}
+            placeholder={t("Not named yet")}
+          />
+        </label>
+        <Button type="submit" variant="primary" loading={pending} disabled={pending || !dirty}>
+          {pending ? t("Saving…") : t("Save identity")}
+        </Button>
+      </div>
     </form>
   );
 }
