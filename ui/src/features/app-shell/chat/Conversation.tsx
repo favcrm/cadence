@@ -185,6 +185,7 @@ const COMPOSER_ID = "app-shell-chat-box";
 
 export interface HomeListProps {
   mode: { kind: "home" };
+  highlightSkillCommand?: boolean;
   items: ThreadItem[];
   /** The Home conversation this list shows; its live preview text (CAD-2228)
    *  is painted on the turn that is generating. */
@@ -260,6 +261,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  */
 function HomeList({
   items,
+  highlightSkillCommand,
   conversation = null,
   readOnly,
   liveAfter,
@@ -390,7 +392,7 @@ function HomeList({
     return (
       <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
         {act?.kind === "row" && act.position === "before" && !hoist ? act.node : null}
-        <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+        <ThreadItemView item={item} readOnly={readOnly} highlightSkillCommand={highlightSkillCommand} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
         {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}
         {after?.(item)}

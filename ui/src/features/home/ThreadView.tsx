@@ -248,10 +248,11 @@ function InlineToken({ token }: { token: Inline }) {
 }
 
 /** Operator prose with its inline marks, line breaks as typed. */
-function OperatorInline({ text }: { text: string }) {
-  const tokens = useMemo(() => inlineTokens(text), [text]);
+function OperatorInline({ text, command }: { text: string; command?: string }) {
+  const tokens = useMemo(() => inlineTokens(command ? text.slice(command.length) : text), [text, command]);
   return (
     <span className="whitespace-pre-wrap">
+      {command && <code className="op-code" data-skill-command="">{command}</code>}
       {tokens.map((tok, i) => (
         <InlineToken key={i} token={tok} />
       ))}
@@ -265,19 +266,21 @@ function OperatorInline({ text }: { text: string }) {
  * message folded after `FOLD_LINES` lines with its line count, Show all and
  * Copy. Copy takes the text as written (a form answer's readable lines).
  */
-export function OperatorText({ text }: { text: string }) {
+export function OperatorText({ text, highlightSkillCommand = false }: { text: string; highlightSkillCommand?: boolean }) {
   const t = useTranslate();
   const parts = useMemo(() => segments(text), [text]);
   const fold = useMemo(() => foldable(parts), [parts]);
   const [open, setOpen] = useState(false);
   const bodyId = useId();
+  // Match the leading workspace skill tag only; this is syntax, not a receipt.
+  const command = highlightSkillCommand ? /^\/skill:[a-z0-9][a-z0-9-]{0,31}(?=\s|$)/.exec(text)?.[0] : undefined;
   const body = parts.map((s, i) =>
     s.kind === "code" ? (
       <pre key={i} className="op-pre num" data-lang={s.lang ?? undefined}>
         {s.text}
       </pre>
     ) : (
-      <OperatorInline key={i} text={s.text} />
+      <OperatorInline key={i} text={s.text} command={i === 0 ? command : undefined} />
     ),
   );
   if (!fold) return <>{body}</>;
@@ -309,6 +312,7 @@ export function ThreadItemView({
   item,
   readOnly,
   density = "full",
+  highlightSkillCommand,
   onOpenIssue,
   onRetry,
   onDiscard,
@@ -316,6 +320,7 @@ export function ThreadItemView({
 }: {
   item: ThreadItem;
   density?: Density;
+  highlightSkillCommand?: boolean;
   readOnly: boolean;
   onOpenIssue?: (id: string) => void;
   onRetry: (
@@ -362,7 +367,7 @@ export function ThreadItemView({
       return (
         <Bubble who={t("You")} at={time(item.entry.created)} me>
           <div className={`chat-bubble ${bodyText} text-ink-100`}>
-            <OperatorText text={formAnswerText(item.entry.text, refs)} />
+            <OperatorText text={formAnswerText(item.entry.text, refs)} highlightSkillCommand={highlightSkillCommand} />
             <AttachmentRows files={files} sent />
           </div>
           {isFormAnswer(refs) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
