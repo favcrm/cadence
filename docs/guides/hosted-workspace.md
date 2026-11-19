@@ -324,11 +324,11 @@ host-authorized dedicated conversation. The runtime records the input and
 answer IDs when the engine commits terminal settlement, in the same
 transaction; it never copies reply text into the receipt or backfills old
 operations. The lookup uses that receipt to verify the exact assistant entry
-even if unrelated work is active. `unanswered` proves the input finished
-without an answer. `unconfirmed` means the runtime cannot prove an outcome
-(including active work, missing receipts, conflicting links, shared answers,
-or output cut short by a token limit or an unfinished tool call). It is never
-permission to resend. The host must prove the reader
+even if unrelated work is active. `answered` requires a complete model reply
+ending in a normal stop. `unanswered` proves the input finished without an
+answer. `unconfirmed` includes active work, missing or conflicting receipts,
+shared answers, and output cut short by a token limit or a tool call. It is
+never permission to resend. The host must prove the reader
 is entitled to the conversation and bind the lookup to its own approved
 receipt. This RPC does not accept or deliver a handoff.
 Opting out at startup stops capture and hides existing receipts without
