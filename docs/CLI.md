@@ -719,9 +719,11 @@ same-UID sandbox is not eligible.
   queries refuse. Plain HTTP, proxies and redirects are not used.
 - Omit the Devin `sdk` section. The frozen catalog has one explicit
   `author/model` variant per family. Configure the protected guest for
-  `agenticos`, that model and `off` effort. In Settings > Agents, grant that
-  model to the master only. Set the route's `workspace_id` to the AgenticOS
-  workspace that issues the device credential; this is not the native board id.
+  `agenticos` and that model. Effort defaults to `off`; the exact model
+  `agenticos/tencent/hy4` also accepts explicit `high`. Other AgenticOS models
+  accept only `off`. In Settings > Agents, grant that model to the master only.
+  Set the route's `workspace_id` to the AgenticOS workspace that issues the
+  device credential; this is not the native board id.
 - In AgenticOS, approve a device credential for `model.infer` only. In the
   local Cadence operator session, run
   `cadence connection enroll agenticos --shape native-model-api-key --no-open`.
@@ -732,6 +734,9 @@ Cadence sends one bounded gateway request for the admitted model turn. It
 uses the broker's durable request id for idempotency. The protected guest
 receives the terminal model receipt, not upstream connection headers or a
 live token stream. The gateway owns provider and billing authorization.
+For Hy4 with `high`, the admitted gateway request includes
+`"reasoning":{"effort":"high"}`; with `off` the field is omitted. Deploy the
+compatible AgenticOS ingress and adapter before using `high`.
 
 ### Managing-agent authorization
 

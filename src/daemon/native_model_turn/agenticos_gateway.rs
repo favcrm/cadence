@@ -87,6 +87,7 @@ pub(super) struct GatewayTurn<'a> {
     pub tls: &'a GatewayTls,
     pub configured_model: &'a str,
     pub model_id: &'a str,
+    pub effort: &'a str,
     pub request_id: &'a str,
     pub workspace_id: &'a str,
     pub max_output_tokens: u32,
@@ -180,6 +181,11 @@ fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
         }));
     }
     #[derive(serde::Serialize)]
+    struct Reasoning {
+        effort: &'static str,
+    }
+
+    #[derive(serde::Serialize)]
     struct ChatRequest<'a> {
         model: &'a str,
         messages: Vec<Value>,
@@ -187,6 +193,8 @@ fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
         tools: Vec<Value>,
         max_tokens: u32,
         stream: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Reasoning>,
     }
     let body = serde_json::to_vec(&ChatRequest {
         model: turn.model_id,
@@ -194,6 +202,11 @@ fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
         tools,
         max_tokens: turn.max_output_tokens,
         stream: false,
+        reasoning: match (turn.model_id, turn.effort) {
+            (_, "off") => None,
+            ("tencent/hy4", "high") => Some(Reasoning { effort: "high" }),
+            _ => return Err(unsupported()),
+        },
     })
     .map_err(|_| unsupported())?;
     if body.len() > MAX_GATEWAY_REQUEST {
@@ -409,6 +422,7 @@ mod tests {
             tls,
             configured_model: "agenticos/example/model",
             model_id: "example/model",
+            effort: "off",
             request_id: "synthetic-request",
             workspace_id: "ws_synthetic",
             max_output_tokens: 64,
@@ -437,6 +451,12 @@ mod tests {
         let wire: Value = serde_json::from_slice(&request(&turn).unwrap()).unwrap();
         assert_eq!(wire["messages"][0]["content"], "Reply plainly");
         assert!(wire.get("tools").is_none());
+        assert!(wire.get("reasoning").is_none());
+        let mut high = fixture_turn(&GatewayTls::Production, &small);
+        high.model_id = "tencent/hy4";
+        high.effort = "high";
+        let wire: Value = serde_json::from_slice(&request(&high).unwrap()).unwrap();
+        assert_eq!(wire["reasoning"], json!({"effort": "high"}));
 
         let large: Vec<_> = (0..5).map(|_| user_message("x".repeat(60_000))).collect();
         let error = request(&fixture_turn(&GatewayTls::Production, &large)).unwrap_err();
@@ -502,6 +522,7 @@ mod tests {
                 tls,
                 configured_model: "agenticos/example/model",
                 model_id: "example/model",
+                effort: "off",
                 request_id: "synthetic-request",
                 workspace_id: "ws_synthetic",
                 max_output_tokens: 64,
@@ -550,6 +571,7 @@ mod tests {
             ),
             configured_model: "agenticos/example/model",
             model_id: "example/model",
+            effort: "off",
             request_id: "synthetic-request",
             workspace_id: "ws_synthetic",
             max_output_tokens: 64,
