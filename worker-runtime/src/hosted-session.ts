@@ -6,6 +6,7 @@ import {
   type LiveState,
   type Cursor,
   CompactionTask,
+  GenerationTask,
   createRegistry,
   Harness,
   hook,
@@ -61,7 +62,7 @@ import {
   type IdentitySnapshotSql,
 } from "./identity-snapshots.ts";
 import { masterState, operationStatus } from "./master.ts";
-import { defaultModel, HOSTED_COMPACTION_POLICY, meteredBinding, withDefaultModel } from "./model.ts";
+import { defaultModel, HOSTED_COMPACTION_POLICY, meteredBinding, RequestSizes, withDefaultModel } from "./model.ts";
 import { ModelTaskContext } from "./model-task-context.ts";
 import {
   guardOperationRequests,
@@ -199,6 +200,7 @@ export class HostedSession<
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name),
     };
+    const requestSizes = new RequestSizes();
     const ai = createAI({
       binding: meteredBinding(
         options,
@@ -207,9 +209,19 @@ export class HostedSession<
         options.maxImagesPerRequest,
         this.contextBudgetProofs,
         (signal) => this.modelTaskContext.read(signal)?.kind === "compaction",
+        requestSizes,
       ) as unknown as Ai,
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
+    // CAD-2480: blocking compaction also starts on the request's bytes.
+    this.registry.install({
+      name: "hosted-request-bytes",
+      hooks: [
+        hook(GenerationTask, {
+          afterResponse: (message, api) => requestSizes.withByteFloor(String(api.taskId), message),
+        }),
+      ],
+    });
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
     // Pi's token-based cut may fall inside the current operation, including
