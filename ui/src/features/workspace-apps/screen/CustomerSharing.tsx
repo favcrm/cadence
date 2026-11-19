@@ -17,6 +17,8 @@ const handle = (value: unknown): value is string =>
   typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 
 type Permission = "read" | "write";
+type Visibility = "private" | "workspace";
+const visibilityLabel = (visibility: Visibility) => visibility === "private" ? "Private customer" : "Workspace-visible";
 type Recipient = {
   kind: keyof typeof grantKinds;
   subject_id: string;
@@ -25,16 +27,17 @@ type Recipient = {
 type Grant = Recipient & { id: string };
 type Change =
   | { kind: "revoke"; recipient: Grant }
-  | { kind: "grant"; recipient: Recipient; label: string };
+  | { kind: "grant"; recipient: Recipient; label: string }
+  | { kind: "visibility"; to: Visibility };
 type SharingPage = {
   name: string | null;
-  policy: { id: string; revision: number; visibility: "private" | "workspace" };
+  policy: { id: string; revision: number; visibility: Visibility };
   grants: Grant[];
   next: string | null;
 };
 type Continuation = { policy_id: string; revision: number; cursor: string };
 type State = { kind: "loading" | "unavailable" | "changed" | "error" | "outcome-unknown" } | { kind: "ready"; page: SharingPage };
-type Review = { token: string; page: SharingPage; change: Change };
+type Review = { token: string; page: SharingPage; change: Change; ownerId?: string };
 
 function sharingPage(value: unknown, recordId: string, after?: Continuation): SharingPage | null {
   if (!object(value) || !exact(value, ["record", "policy", "grants", "next_cursor"])) return null;
@@ -97,13 +100,19 @@ async function inspect(actionToken: string, recordId: string, page: Continuation
 }
 
 function checkedReview(body: unknown, recordId: string, page: SharingPage, change: Change): Review | null {
-  if (!object(body) || !exact(body, ["confirmation_token", "record", "policy", "grant"]) ||
+  if (!object(body) || !exact(body, ["confirmation_token", "record", "policy", change.kind === "visibility" ? "visibility" : "grant"]) ||
       typeof body.confirmation_token !== "string" || !/^[a-f0-9]{64}$/.test(body.confirmation_token)) return null;
-  if (!object(body.grant) || !exact(body.grant, change.kind === "revoke"
-    ? ["id", "kind", "subject_id", "permission"] : ["kind", "subject_id", "permission"])) return null;
   const shown = sharingPage({ record: body.record, policy: body.policy, grants: [], next_cursor: null }, recordId);
   if (!shown || shown.policy.id !== page.policy.id || shown.policy.revision !== page.policy.revision ||
       shown.policy.visibility !== page.policy.visibility) return null;
+  if (change.kind === "visibility") {
+    const choice = body.visibility;
+    if (!object(choice) || !exact(choice, ["to", "owner_id"]) || choice.to !== change.to ||
+        typeof choice.owner_id !== "string" || !choice.owner_id || choice.owner_id.length > 200) return null;
+    return { token: body.confirmation_token, page: shown, change, ownerId: choice.owner_id };
+  }
+  if (!object(body.grant) || !exact(body.grant, change.kind === "revoke"
+    ? ["id", "kind", "subject_id", "permission"] : ["kind", "subject_id", "permission"])) return null;
   const grant = body.grant;
   if ((change.kind === "revoke" && grant.id !== change.recipient.id) ||
       grant.kind !== change.recipient.kind || grant.subject_id !== change.recipient.subject_id ||
@@ -191,6 +200,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
   const [review, setReview] = useState<Review | null>(null);
   const [busy, setBusy] = useState(false);
   const [revokeUnavailable, setRevokeUnavailable] = useState(false);
+  const [visibilityUnavailable, setVisibilityUnavailable] = useState(false);
   const [editing, setEditing] = useState(false);
   const [grantError, setGrantError] = useState<"target" | "unsupported" | null>(null);
   const addTrigger = useRef<HTMLButtonElement>(null);
@@ -238,10 +248,12 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
     setGrantError(null);
     const result = await sharingRequest(`${change.kind}-prepare`, actionToken, recordId, {
       policy_id: page.policy.id, revision: page.policy.revision,
-      ...(change.kind === "revoke" ? { grant_id: change.recipient.id } : {
-        target: { kind: change.recipient.kind, id: change.recipient.subject_id },
-        permission: change.recipient.permission,
-      }),
+      ...(change.kind === "revoke" ? { grant_id: change.recipient.id }
+        : change.kind === "visibility" ? { visibility: change.to }
+        : {
+          target: { kind: change.recipient.kind, id: change.recipient.subject_id },
+          permission: change.recipient.permission,
+        }),
     }, signal).catch(() => null);
     if (signal.aborted) return;
     const card = result?.ok ? checkedReview(result.body, recordId, page, change) : null;
@@ -255,6 +267,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
       setState({ kind: "unavailable" });
     } else {
       if (change.kind === "revoke") setRevokeUnavailable(true);
+      else if (change.kind === "visibility") setVisibilityUnavailable(true);
       else setGrantError(result?.status === 409 && object(result.body) && result.body.code === "sharing_target_unavailable"
         ? "target" : "unsupported");
     }
@@ -283,7 +296,8 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
   });
   const content = state.kind === "ready" ? state.page : null;
   const next = content?.next;
-  const reviewTitle = t(review?.change.kind === "grant" ? "Review access change" : "Review access removal");
+  const reviewTitle = t(review?.change.kind === "visibility" ? "Review visibility change"
+    : review?.change.kind === "grant" ? "Review access change" : "Review access removal");
   const closeEditor = () => {
     setEditing(false);
     setGrantError(null);
@@ -306,25 +320,39 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
       {review && <section aria-label={reviewTitle}>
         <h3>{reviewTitle}</h3>
         {review.change.kind === "revoke" && <p>{t("Other grants or workspace visibility may still allow access.")}</p>}
+        {review.change.kind === "visibility" && <p>{t(review.change.to === "workspace"
+          ? "Workspace members and authorized workspace tools can read this customer. This does not grant editing access."
+          : "Workspace-wide read access will be removed. The owner and explicit grants are kept.")}</p>}
         <dl className="wa-customer-sharing-summary">
           <div><dt>{t("Customer")}</dt><dd>{review.page.name || recordId}</dd></div>
-          <div><dt>{t("Access recipient")}</dt><dd>{t(grantKinds[review.change.recipient.kind])} · {review.change.kind === "grant" && <>{review.change.label} · </>}<bdi>{review.change.recipient.subject_id}</bdi></dd></div>
-          <div><dt>{t(review.change.kind === "grant" ? "Permission" : "Permission to remove")}</dt><dd>{t(review.change.recipient.permission === "read" ? "Can view" : "Can edit")}</dd></div>
+          {review.change.kind === "visibility" ? <>
+            <div><dt>{t("Current visibility")}</dt><dd>{t(visibilityLabel(review.page.policy.visibility))}</dd></div>
+            <div><dt>{t("New visibility")}</dt><dd>{t(visibilityLabel(review.change.to))}</dd></div>
+            <div><dt>{t("Customer owner")}</dt><dd><bdi>{review.ownerId}</bdi></dd></div>
+          </> : <>
+            <div><dt>{t("Access recipient")}</dt><dd>{t(grantKinds[review.change.recipient.kind])} · {review.change.kind === "grant" && <>{review.change.label} · </>}<bdi>{review.change.recipient.subject_id}</bdi></dd></div>
+            <div><dt>{t(review.change.kind === "grant" ? "Permission" : "Permission to remove")}</dt><dd>{t(review.change.recipient.permission === "read" ? "Can view" : "Can edit")}</dd></div>
+          </>}
           <div><dt>{t("Revision")}</dt><dd>{review.page.policy.revision}</dd></div>
         </dl>
         <div className="wa-customer-sharing-state" ref={reviewActions}>
           <Button disabled={busy} onClick={() => void decide(review, false)}>{t("Cancel")}</Button>
           <Button variant={review.change.kind === "grant" ? "primary" : "danger"} loading={busy} onClick={() => void decide(review, true)}>
-            {t(review.change.kind === "grant" ? "Confirm access change" : "Confirm removal")}
+            {t(review.change.kind === "visibility" ? "Confirm visibility change"
+              : review.change.kind === "grant" ? "Confirm access change" : "Confirm removal")}
           </Button>
         </div>
       </section>}
       {content && <div hidden={review !== null}>
         <dl className="wa-customer-sharing-summary">
           <div><dt>{t("Customer")}</dt><dd>{content.name || recordId}</dd></div>
-          <div><dt>{t("Visibility")}</dt><dd>{t(content.policy.visibility === "private" ? "Private customer" : "Workspace-visible")}</dd></div>
+          <div><dt>{t("Visibility")}</dt><dd>{t(visibilityLabel(content.policy.visibility))}</dd></div>
           <div><dt>{t("Revision")}</dt><dd>{content.policy.revision}</dd></div>
         </dl>
+        {visibilityUnavailable ? <p role="status">{t("Visibility changes are unavailable for this customer.")}</p>
+          : <Button disabled={busy || editing} onClick={(event) => void prepare(content, {
+            kind: "visibility", to: content.policy.visibility === "private" ? "workspace" : "private",
+          }, event.currentTarget)}>{t(content.policy.visibility === "private" ? "Make workspace-visible" : "Make private")}</Button>}
         {grantError !== null && <p role="status">{t(grantError === "target"
           ? "This recipient could not be verified. Check the member list and try again."
           : "Adding or editing access is unavailable on this host.")}</p>}
