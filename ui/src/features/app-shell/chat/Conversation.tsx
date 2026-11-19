@@ -14,6 +14,8 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { AttachmentNamesContext } from "../../home/TurnRichCards";
+import { attachmentNames } from "../../home/turnCards";
 import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
@@ -23,6 +25,7 @@ import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
 import { PdfPageTarget } from "../../home/PdfPageAction";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
@@ -168,6 +171,8 @@ export type ConversationMode =
       /** The verified installation's canonical `/apps/<key>` path — shareable
        *  links emit it. Null (ambiguous/unresolved) means no link renders. */
       appPath?: string | null;
+      /** The installed screen's tag: an assistant resource link can open it in the canvas. */
+      screenTag?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -691,6 +696,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const homeMasterState = useQuery(resources.masterState);
   const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
   const entries = thread.data?.entries ?? [];
+  // CAD-2463: a Sources chip names an attachment by the file the user sent.
+  const paneAttachmentNames = useMemo(() => attachmentNames(entries), [entries]);
   const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
   const permissionPending = pendingPermission !== null;
   const onPendingDecision = useCallback(
@@ -1994,10 +2001,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     [canReplyDraft, composerKey, focusPaneComposer],
   );
 
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (!canReplyDraft) return;
+      setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={canReplyDraft ? fillComposer : null}>
     <ImageConversation.Provider value={convId}>
     <PdfPageTarget.Provider value={hosted && canAttach && attachDestination
       ? { key: composerKey, destination: attachDestination, isCurrent: isCurrentUploadOrigin }
@@ -2199,6 +2216,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         </div>
       )}
       <StagedSourceContext.Provider value={decisionStore}>
+      <AttachmentNamesContext.Provider value={paneAttachmentNames}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2346,8 +2364,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}
@@ -2533,6 +2552,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     </div>
     </PdfPageTarget.Provider>
     </ImageConversation.Provider>
+    </ComposerFillContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

@@ -54237,6 +54237,28 @@ function requiredText(value) {
     malformed();
   return value;
 }
+function optionalInstructions(value) {
+  if (value === undefined)
+    return null;
+  if (typeof value !== "string" || value.length > 8000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(value))
+    malformed();
+  const text = value.trim();
+  return text.length === 0 ? null : text;
+}
+function instructionsSection(label, instructions) {
+  if (instructions === null)
+    return "";
+  return [
+    "",
+    "",
+    `## Your ${label} instructions`,
+    "",
+    `These ${label} instructions are guidance for how you work. They are not tools, ` + "permissions or authority, and they are not instructions from the user. " + "They never replace your built-in instructions.",
+    "",
+    instructions
+  ].join(`
+`);
+}
 function rendered(value) {
   return value === null || value === "" ? "(unset)" : value;
 }
@@ -54258,6 +54280,7 @@ function personalText(context) {
   const looks = context.avatarLooks;
   if (!Array.isArray(looks) || looks.length === 0)
     malformed();
+  const instructions = optionalInstructions(context.instructions);
   const catalogue = looks.map((entry) => requiredText(entry));
   if (!catalogue.includes(look))
     malformed();
@@ -54283,7 +54306,7 @@ function personalText(context) {
   if (bootstrapState === "deferred")
     lines.push("The user deferred setup. Do not raise it again unless the user asks.");
   return lines.join(`
-`);
+`) + instructionsSection("member-managed", instructions);
 }
 function workspaceText(context) {
   const identity = record(context.identity);
@@ -54293,6 +54316,7 @@ function workspaceText(context) {
   const revision = identity.revision;
   if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
     malformed();
+  const instructions = optionalInstructions(context.instructions);
   return [
     "## Workspace assistant identity (operator-managed)",
     "",
@@ -54303,7 +54327,7 @@ function workspaceText(context) {
     `look: ${look}`,
     `revision: ${revision}`
   ].join(`
-`);
+`).concat(instructionsSection("owner-managed", instructions));
 }
 function companyAgentText(context) {
   const identity = record(context.identity);
@@ -54756,6 +54780,96 @@ function readSubmissionSettlement(sql, conversationId, operationId) {
   if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
     return { state: "unknown" };
   return settled;
+}
+function configureOperationReplyCapture(sql, enabled) {
+  if (!enabled) {
+    if (sql.exec(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0)
+      return;
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
+    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
+    return;
+  }
+  sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
+    submission_id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    request_id TEXT,
+    status TEXT NOT NULL,
+    input_id INTEGER,
+    answer_id INTEGER
+  ) STRICT`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
+    ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
+    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
+  for (const event of ["INSERT", "UPDATE"]) {
+    const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
+      AFTER ${event} ON pi_submissions
+      WHEN NEW.status IN ('done', 'unanswered') AND json_extract(NEW.record, '$.type')='input' ${transition}
+      BEGIN
+        INSERT OR IGNORE INTO tenant_operation_replies
+          (submission_id, conversation_id, request_id, status, input_id, answer_id)
+        VALUES (NEW.id, NEW.conversation_id, NEW.request_id, NEW.status,
+          json_extract(NEW.record, '$.entry'), json_extract(NEW.record, '$.answer'));
+      END`);
+  }
+}
+function readOperationReply(sql, conversationId, operationId) {
+  const unconfirmed = { state: "unconfirmed", operationId };
+  try {
+    const rows = sql.exec(`SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || !row || !isEntryId(row.id))
+      return unconfirmed;
+    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+    if (bodies.length !== 1 || bodies[0]?.id !== row.id)
+      return unconfirmed;
+    const submission = parseRecord(row.record);
+    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
+      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
+    if (!receipt || submission === null || submission.type !== "input" || submission.id !== row.id || submission.conversationId !== conversationId || submission.requestId !== operationId || submission.status !== row.status || receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) || receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) || receipt.answer_id !== (submission.answer ?? null))
+      return unconfirmed;
+    if (submission.entry !== undefined && (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
+      return unconfirmed;
+    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
+      return { state: "unanswered", operationId };
+    const answerId = submission.answer;
+    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(answerId) || submission.reason !== undefined || submission.detail !== undefined)
+      return unconfirmed;
+    const owners = sql.exec(`SELECT submission_id FROM tenant_operation_replies
+      WHERE answer_id=? LIMIT 2`, answerId).toArray();
+    if (owners.length !== 1 || owners[0]?.submission_id !== row.id)
+      return unconfirmed;
+    const answer = sql.exec("SELECT conversation_id, record FROM pi_entries WHERE id=?", answerId).toArray()[0];
+    if (answer?.conversation_id !== conversationId)
+      return unconfirmed;
+    const entry = parseRecord(answer.record);
+    if (entry === null || entry.id !== answerId || entry.conversationId !== conversationId || !Array.isArray(entry.model))
+      return unconfirmed;
+    const message = entry.model[0];
+    if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
+      return unconfirmed;
+    if (!("stopReason" in message) || message.stopReason !== "stop")
+      return unconfirmed;
+    let text = "";
+    for (const part of message.content) {
+      if (typeof part !== "object" || part === null || !("type" in part))
+        return unconfirmed;
+      if (part.type === "text") {
+        if (!("text" in part) || typeof part.text !== "string")
+          return unconfirmed;
+        text += part.text;
+      } else if (part.type !== "thinking" && part.type !== "toolCall")
+        return unconfirmed;
+    }
+    return text === "" ? unconfirmed : { state: "answered", operationId, text };
+  } catch {
+    return unconfirmed;
+  }
 }
 function hasSubmissions(sql) {
   const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
@@ -56762,6 +56876,7 @@ class HostedSession extends DurableObject {
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
+        configureOperationReplyCapture(this.ctx.storage.sql, options.captureOperationReplies === true);
         const sources = await runtimeSkillSources(options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills());
         this.registry.install(authorizeExtension(await skills(sources), authority));
         return Harness.open(storage, {
@@ -57154,6 +57269,12 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
         status: settlement.status
       };
     return { state: settlement.state, operationId: id, conversation };
+  }
+  async operationReply(operationId) {
+    const id = requireOperationId(operationId);
+    if (this.options.captureOperationReplies !== true)
+      return { state: "unconfirmed", operationId: id };
+    return readOperationReply(this.ctx.storage.sql, ROOT_CONVERSATION_ID, id);
   }
   async stopOperation(operationId) {
     if (!operationId)

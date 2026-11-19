@@ -1,5 +1,7 @@
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AttachmentNamesContext } from "./TurnRichCards";
+import { attachmentNames } from "./turnCards";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -49,6 +51,7 @@ import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "./composerFill";
 import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
@@ -959,6 +962,8 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
+  // CAD-2463: a Sources chip names an attachment by the file the user sent.
+  const homeAttachmentNames = useMemo(() => attachmentNames(threadEntries), [threadEntries]);
   const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false);
   const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
@@ -1529,15 +1534,26 @@ function MasterHome({
     [effectiveReadOnly, focusHomeComposer],
   );
 
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (effectiveReadOnly) return;
+      setComposerDraft("home", appendComposerDraft(composerDraftState("home").text, text));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={!effectiveReadOnly ? fillComposer : null}>
     <PdfPageTarget.Provider value={canCapturePdfPages && attachDestination
       ? { key: "home", destination: attachDestination }
       : null}>
     {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
+    <AttachmentNamesContext.Provider value={homeAttachmentNames}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1785,8 +1801,10 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </AttachmentNamesContext.Provider>
     </StagedSourceContext.Provider>
     </PdfPageTarget.Provider>
+    </ComposerFillContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>

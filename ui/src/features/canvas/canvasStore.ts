@@ -13,10 +13,15 @@
  * - opening an artifact already open focuses its tab; closing the active
  *   tab selects a neighbour; closing the last collapses the drawer, unless the
  *   Browser tab (browserStore.ts, not modelled here) has a live session or was
- *   opened on its own, and then the drawer stays on it.
+ *   opened on its own, and then the drawer stays on it;
+ * - an app view (appView.ts, CAD-2471) is a tab that holds a reference to an
+ *   installed app's screen. It is only ever opened by a tap, never by the
+ *   feed, and follows the same focus, close and conversation-change rules.
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
+import { appViewId, appViewRef, applyRoutePatch, type AppViewRef } from "./appView";
+import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
 export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
@@ -43,7 +48,10 @@ export interface VersionInfo {
 
 export interface CanvasTab {
   id: string;
-  kind: ArtifactKind;
+  /** `app` is an app view (appView.ts): a reference, with none of the version fields in use. */
+  kind: ArtifactKind | "app";
+  /** Set exactly for an app view. */
+  app?: AppViewRef;
   title: string;
   /** Absent when the version that opened the tab had no known size. */
   bytes?: number;
@@ -59,6 +67,9 @@ export interface CanvasTab {
   /** The turn that put the newest version, if known. */
   turn: string | null;
 }
+
+export type ArtifactTab = CanvasTab & { kind: ArtifactKind };
+export const isArtifactTab = (tab: CanvasTab): tab is ArtifactTab => tab.kind !== "app";
 
 /** The turn running in the thread, and what it is changing in the canvas. */
 export interface Working {
@@ -222,7 +233,7 @@ export function feedCanvas(input: FeedInput): void {
     // A card only ever updates a tab that is already open. A tab is added by
     // opening a card, or by the one auto-open per operator turn (CAD-651).
     if (tabs.some((t) => t.id === ref.id)) {
-      tabs = tabs.map((t) => (t.id === ref.id ? withVersion(t, ref, card.turn) : t));
+      tabs = tabs.map((t) => (t.id === ref.id && !t.app ? withVersion(t, ref, card.turn) : t));
     }
     if (input.autoOpen !== false && card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
@@ -253,7 +264,7 @@ export function openArtifact(ref: ArtifactRef): void {
   const existing = state.tabs.find((t) => t.id === ref.id);
   const tabs = existing
     ? state.tabs.map((t) =>
-        t.id !== ref.id
+        t.id !== ref.id || t.app
           ? t
           : {
               ...withVersion(t, ref, t.turn),
@@ -264,6 +275,29 @@ export function openArtifact(ref: ArtifactRef): void {
     : [...state.tabs, newTab(ref, null)];
   set({ ...state, tabs, active: ref.id, open: true });
   artifactFocused("user");
+}
+
+/** Open (or focus) an installed app's screen from a resource link. A
+ *  malformed reference opens nothing and says so. */
+export function openAppView(input: unknown): boolean {
+  const ref = appViewRef(input);
+  if (!ref) return false;
+  const id = appViewId(ref);
+  const tabs = state.tabs.some((t) => t.id === id)
+    ? state.tabs
+    : [...state.tabs, { id, kind: "app" as const, title: ref.title, app: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null }];
+  set({ ...state, tabs, active: id, open: true });
+  artifactFocused("user");
+  return true;
+}
+
+/** The frame navigated inside its tab. The route stays on the tab: the
+ *  board URL is the full-page app's, and is never written from here. */
+export function patchAppViewRoute(id: string, patch: RoutePatch): void {
+  set({
+    ...state,
+    tabs: state.tabs.map((t) => (t.app && t.id === id ? { ...t, app: { ...t.app, route: applyRoutePatch(t.app.route, patch) } } : t)),
+  });
 }
 
 export function focusTab(id: string): void {
@@ -310,7 +344,7 @@ onPrivateSessionReset(() => resetCanvas());
 export function selectVersion(id: string, version: number): void {
   set({
     ...state,
-    tabs: state.tabs.map((t) => (t.id !== id ? t : { ...t, selected: version, follow: version >= t.latest })),
+    tabs: state.tabs.map((t) => (t.id !== id || t.app ? t : { ...t, selected: version, follow: version >= t.latest })),
   });
 }
 
@@ -328,18 +362,18 @@ export function clampWidth(px: number, viewport: number, floor = MIN_WIDTH): num
 
 /** The width when the operator has not dragged one: it scales with the
  *  viewport, wider for kinds that are read as a page. */
-export function defaultWidth(kind: ArtifactKind, viewport: number): number {
+export function defaultWidth(kind: ArtifactKind | "app", viewport: number): number {
   const [share, lo, hi] = defaultRange(kind);
   return Math.min(hi, Math.max(lo, Math.round(viewport * share)));
 }
 
-function defaultRange(kind: ArtifactKind): [number, number, number] {
-  return kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
+function defaultRange(kind: ArtifactKind | "app"): [number, number, number] {
+  return kind === "app" || kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
 }
 
 /** The default width, held to its kind's floor even where 60% of the
  *  viewport is smaller (a 900px window keeps a document at 560px). */
-export function defaultWidthFor(kind: ArtifactKind, viewport: number): number {
+export function defaultWidthFor(kind: ArtifactKind | "app", viewport: number): number {
   return clampWidth(defaultWidth(kind, viewport), viewport, defaultRange(kind)[1]);
 }
 

@@ -21,8 +21,9 @@ import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
 import { recordServices, object, exact, type HostCommand } from "./screenServices";
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
-import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
+import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
+import { readOnlyReceipt } from "./screenReadOnly";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 
@@ -46,7 +47,7 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
@@ -67,6 +68,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown) => void;
   /** CAD-1615 — which surface this frame is presented in (legacy). */
   presentation?: ScreenPresentationMode;
+  /** CAD-2471 — the canvas's app view: the frame may only read (see
+   *  screenReadOnly.ts) and runs none of the screen's tools. */
+  readOnly?: boolean;
+  /** CAD-2471 — where this frame opens, held by its owner. Absent, the route
+   *  comes from the board URL (the full-page app); present, the board URL is
+   *  never consulted. */
+  route?: ScreenRoute;
   /** CAD-1777 — the host-derived role of THIS outlet. */
   surfaceRole?: ScreenSurfaceRole;
   /** CAD-1777 — the closed surface idiom this drawer child draws. */
@@ -101,10 +109,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const presentationLocale = useRef(locale);
   presentationLocale.current = locale;
   const href = useHref();
-  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href });
-  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href };
+  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route });
+  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : { ...p, presentation_locale: presentationLocale.current };
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : { ...p, presentation_locale: presentationLocale.current };
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -320,7 +328,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           pending = { kind: "refused", status: response.status, code: mountRefusalCode(await response.json().catch(() => null)) };
           throw new Error("Screen mount refused");
         }
-        const receipt = parseMount(await response.json(), current.tag);
+        const mountReceipt = parseMount(await response.json(), current.tag);
+        const receipt = mountReceipt && readOnly ? readOnlyReceipt(mountReceipt) : mountReceipt;
         if (!receipt) { pending = { kind: "invalid_receipt" }; throw new Error("Invalid screen mount receipt"); }
         session.assertCurrent();
         if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) { pending = { kind: "invalid_receipt" }; throw new Error("Screen receipt scope changed"); }
@@ -365,7 +374,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
         actionTokenRef.current = actionToken;
-        if (actionToken) {
+        if (actionToken && !readOnly) {
           inlineAudio = createScreenAudioSession({
             actionToken,
             signal: session.signal,
@@ -390,7 +399,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             }
             return loader.current ? loader.current(ref) : null;
           },
-          services || acting.current ? {
+          services || (!readOnly && acting.current) ? {
             call: (verb, args, ui) => {
               if (services) return (RECORD_CALL_VERBS as readonly string[]).includes(verb)
                 ? services.call(verb as RecordCallVerb, args)
@@ -425,12 +434,12 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                   navigationCallbacks.current.onScreenDrawer?.(mode, surface, false);
                 }
               : undefined,
-            ...(actionToken ? { invoke: async (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) => {
+            ...(actionToken && !readOnly ? { invoke: async (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) => {
               const result = await invokeTool(actionToken!, alias, input, requestId, scope);
               if (result.ok && isCurrent()) await toolInvoked.current?.();
               return result;
             } } : {}),
-            ...(actionToken ? { captureAudio: (mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }) =>
+            ...(actionToken && !readOnly ? { captureAudio: (mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }) =>
               new Promise<ActionResult>(resolve => {
                 if (!isCurrent() || ui.signal.aborted) {
                   resolve({ ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } });
@@ -521,7 +530,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     const frame = container.current?.querySelector("iframe");
     frame?.contentWindow?.postMessage({ type: "cadence-theme", theme: frameTheme ?? "system" }, "*");
   }, [frameTheme]);
-  useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
+  useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale, route]);
   // The child portal exists only for a live primary with a real private
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;

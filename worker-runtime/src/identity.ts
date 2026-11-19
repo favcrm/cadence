@@ -1,4 +1,4 @@
-import type { GenerationIdentity } from "./contract.ts";
+import type { GenerationIdentity, OperationReply } from "./contract.ts";
 
 /**
  * The one place that knows the engine's durable SQLite layout.
@@ -510,6 +510,120 @@ export function readSubmissionSettlement(
   if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
     return { state: "unknown" };
   return settled;
+}
+
+/**
+ * Pi 1.5.2 flushes answer entries before settling input submissions in the
+ * same SQLite transaction. Capture the first terminal link in that commit,
+ * not when someone later reads the mutable submission. Set up only after
+ * the engine has created its schema and before this harness accepts work.
+ */
+export function configureOperationReplyCapture(sql: TaskSql, enabled: boolean): void {
+  if (!enabled) {
+    if (sql.exec(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0) return;
+    // An opt-out stops new capture without throwing away existing custody.
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
+    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
+    return;
+  }
+  sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
+    submission_id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    request_id TEXT,
+    status TEXT NOT NULL,
+    input_id INTEGER,
+    answer_id INTEGER
+  ) STRICT`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
+    ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
+  // The engine looks up request_id. Independently index the body so a
+  // disagreement on a different row cannot hide an ambiguous operation.
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
+    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
+  for (const event of ["INSERT", "UPDATE"] as const) {
+    const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
+      AFTER ${event} ON pi_submissions
+      WHEN NEW.status IN ('done', 'unanswered') AND json_extract(NEW.record, '$.type')='input' ${transition}
+      BEGIN
+        INSERT OR IGNORE INTO tenant_operation_replies
+          (submission_id, conversation_id, request_id, status, input_id, answer_id)
+        VALUES (NEW.id, NEW.conversation_id, NEW.request_id, NEW.status,
+          json_extract(NEW.record, '$.entry'), json_extract(NEW.record, '$.answer'));
+      END`);
+  }
+}
+
+/** Read from indexed, committed custody; never open the engine or scan other work. */
+export function readOperationReply(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): OperationReply {
+  const unconfirmed = { state: "unconfirmed", operationId } as const;
+  try {
+    const rows = sql.exec(
+      `SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    ).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
+    // Decode both values in SQLite. Binding the raw JavaScript string would
+    // replace a lone surrogate before SQLite could compare it to the body.
+    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`,
+      conversationId, JSON.stringify(operationId)).toArray();
+    if (bodies.length !== 1 || bodies[0]?.id !== row.id) return unconfirmed;
+    const submission = parseRecord(row.record);
+    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
+      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
+    if (!receipt || submission === null || submission.type !== "input" ||
+        submission.id !== row.id || submission.conversationId !== conversationId ||
+        submission.requestId !== operationId || submission.status !== row.status ||
+        receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) ||
+        receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) ||
+        receipt.answer_id !== (submission.answer ?? null)) return unconfirmed;
+    if (submission.entry !== undefined &&
+        (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
+      return unconfirmed;
+    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
+      return { state: "unanswered", operationId };
+    const answerId = submission.answer;
+    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(answerId) ||
+        submission.reason !== undefined || submission.detail !== undefined) return unconfirmed;
+    const owners = sql.exec(`SELECT submission_id FROM tenant_operation_replies
+      WHERE answer_id=? LIMIT 2`, answerId).toArray();
+    if (owners.length !== 1 || owners[0]?.submission_id !== row.id) return unconfirmed;
+    const answer = sql.exec(
+      "SELECT conversation_id, record FROM pi_entries WHERE id=?",
+      answerId,
+    ).toArray()[0];
+    if (answer?.conversation_id !== conversationId) return unconfirmed;
+    const entry = parseRecord(answer.record);
+    if (entry === null || entry.id !== answerId || entry.conversationId !== conversationId ||
+        !Array.isArray(entry.model)) return unconfirmed;
+    const message: unknown = entry.model[0];
+    if (typeof message !== "object" || message === null || !("role" in message) ||
+        message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
+      return unconfirmed;
+    // Settlement alone does not prove that the model supplied a complete answer.
+    if (!("stopReason" in message) || message.stopReason !== "stop") return unconfirmed;
+    let text = "";
+    for (const part of message.content as unknown[]) {
+      if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
+      if (part.type === "text") {
+        if (!("text" in part) || typeof part.text !== "string") return unconfirmed;
+        text += part.text;
+      } else if (part.type !== "thinking" && part.type !== "toolCall") return unconfirmed;
+    }
+    return text === "" ? unconfirmed : { state: "answered", operationId, text };
+  } catch {
+    return unconfirmed;
+  }
 }
 
 /** Whether the engine's submissions table exists; without it, none is held. */

@@ -1,0 +1,134 @@
+name: CI cache warming
+
+# Cache health is not release evidence. Run beside ci.yml so completed main CI
+# can trigger staging as soon as its own gates and attestation are green.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # CAD-904 / CI-SEC-2: the ONLY job that holds the read-write R2 key. It
+  # runs on push to main alone, under the `sccache-writer` environment
+  # (deployment branch: main only), and compiles merged code. No gate job,
+  # no pull_request and no merge_group job sees the key: a queued PR's build
+  # scripts and tests run in the gates, which only ever read the cache.
+  # Nothing `needs` it and it never fails the run.
+  # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
+  # per profile, each with its own target dir and the shared key the gates
+  # restore (gate-test-ld2: test; gate-release: build + ui;
+  # gc2: clippy). The rust-cache step precedes `ci-sccache enable`
+  # exactly as in the gates, because the cache key hashes RUST* env vars and
+  # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
+  # target dir is the point), but are skipped when the exact cache key already
+  # exists (rust-cache would not save) and sccache has nothing to warm.
+  cache-warm:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: instabox-medium
+    timeout-minutes: 30
+    continue-on-error: true
+    environment: sccache-writer
+    strategy:
+      fail-fast: false
+      matrix:
+        # CAD-1970: no `test` leg — its cache fed the PR test job, which is gone;
+        # the nightly has no wall-time budget worth a compile per merge.
+        profile: [release, release-full, clippy]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-rust-toolchain --profile minimal --component clippy
+      - id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # CAD-1493: test and clippy carry fingerprint epochs; release stays
+          # unversioned. Keep these keys aligned with the gate consumers.
+          shared-key: ${{ matrix.profile == 'clippy' && 'gc2' || format('gate-{0}', matrix.profile) }}${{ matrix.profile == 'test' && '-ld2' || '' }}
+          # A lint or test failure on main must not freeze the refresh.
+          cache-on-failure: true
+      # The clippy leg has no sccache: clippy-driver calls are not cacheable
+      # and no gate reads clippy objects from it.
+      # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
+      # the release leg warms the cache with the same flag the gates use.
+      # CAD-1487: the suite enables the fast linker too (its link is
+      # the shard bottleneck), so the test leg must warm with it as well.
+      - name: Enable fast linker (test and release legs; same flags as the gates)
+        if: matrix.profile == 'release'
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
+      - name: Enable shared sccache (read-write; no-op without credentials)
+        id: sccache
+        if: matrix.profile == 'release'
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      # CAD-1103: gates build the `ci` profile, so that is what this leg
+      # warms (dependencies are shared with the `ui` feature build). release-artifact keeps its own cache.
+      - name: Warm the ci profile
+        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
+        run: cargo build --profile ci --locked
+      # CAD-1131: the shipping profile, so the queue's release-queue-build
+      # restores warm dependencies (no fast linker or sccache: the same
+      # build as release-artifact).
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          bun-version-file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          node-version: 22
+      - name: Warm the release profile (queue release build)
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          (cd ui && bun install --frozen-lockfile && bun run build)
+          cargo build --release --locked --features ui
+      - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
+        if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --features test-seam -- -D warnings
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-1551: warm both cross-build dependency profiles on merged code only.
+  # The test profile optimizes dependencies differently from dev, so test
+  # artifacts alone do not warm the gate's default production-feature build.
+  # Bump the shared epoch in producer and consumer when warm inputs change:
+  # an existing immutable cache entry would otherwise skip the new work.
+  cache-warm-cross:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+          - target: aarch64-macos
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cross-dual2-${{ matrix.target }}
+      - name: Warm the cross-build test and dev profiles
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          # CAD-1970: the CAD-1425 acceptance target was retired with the test
+          # reset; the dev-profile build is what the cross gates now restore.
+          cargo build --locked

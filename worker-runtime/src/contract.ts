@@ -180,6 +180,12 @@ export type AssistantIdentityContext =
       };
       /** The host's avatar catalogue, in its own established order. */
       readonly avatarLooks: readonly string[];
+      /**
+       * The member's own managed instructions for their assistant: guidance
+       * rendered after the identity, not tools, permissions or authority.
+       * At most 8000 characters; whitespace-only is absent.
+       */
+      readonly instructions?: string;
     }
   | {
       readonly scope: "workspace";
@@ -189,6 +195,12 @@ export type AssistantIdentityContext =
         readonly look: string;
         readonly revision: string;
       };
+      /**
+       * The owner-managed instructions for the company Master only: guidance
+       * rendered after the identity, not tools, permissions or authority.
+       * At most 8000 characters; whitespace-only is absent.
+       */
+      readonly instructions?: string;
     }
   | {
       readonly scope: "company_agent";
@@ -272,6 +284,8 @@ export interface HostedSessionOptions {
   readonly projectThread?: ThreadProjection;
   /** The platform default alias this deployment sends. */
   readonly modelAlias: string;
+  /** Retain settlement evidence in a host-authorized dedicated conversation. */
+  readonly captureOperationReplies?: boolean;
   /**
    * The model transport accepts image input. Default false: image tool results
    * become an explicit error. A host opting in must validate the resolved
@@ -354,6 +368,11 @@ export interface AskResult {
   readonly text: string | undefined;
   readonly operationId: string | undefined;
 }
+
+/** A read-only reply from an exact input. Unconfirmed is never proof it did not run. */
+export type OperationReply =
+  | { readonly state: "answered"; readonly operationId: string; readonly text: string }
+  | { readonly state: "unanswered" | "unconfirmed"; readonly operationId: string };
 
 /** One submission the runtime has not settled yet. */
 export interface PendingOperation {

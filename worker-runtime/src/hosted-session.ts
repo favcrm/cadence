@@ -23,6 +23,7 @@ import type {
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
+  OperationReply,
   OperationSettlement,
   PendingOperation,
   ThreadContext,
@@ -39,10 +40,12 @@ import {
   type AppScopeResolver,
 } from "./engine.ts";
 import {
+  configureOperationReplyCapture,
   readCompactionFailure,
   readCompactionIdentity,
   readGenerationIdentity,
   readHeldSubmission,
+  readOperationReply,
   readSubmissionEntry,
   readSubmissionRequestId,
   readSubmissionSettlement,
@@ -298,6 +301,10 @@ export class HostedSession<
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
+        configureOperationReplyCapture(
+          this.ctx.storage.sql as unknown as TaskSql,
+          options.captureOperationReplies === true,
+        );
         // The bundled skills are engine-owned, so they are wrapped here with
         // the same refusal and live authorization an application tool gets.
         // CAD-2395: a workspace's approved skills come last, so a bundled
@@ -1001,6 +1008,18 @@ export class HostedSession<
         status: settlement.status,
       };
     return { state: settlement.state, operationId: id, conversation };
+  }
+
+  /** Inspect one reply without resending, waking the engine, or reading a transcript. */
+  async operationReply(operationId: string): Promise<OperationReply> {
+    const id = requireOperationId(operationId);
+    if (this.options.captureOperationReplies !== true)
+      return { state: "unconfirmed", operationId: id };
+    return readOperationReply(
+      this.ctx.storage.sql as unknown as TaskSql,
+      ROOT_CONVERSATION_ID,
+      id,
+    );
   }
 
   /**

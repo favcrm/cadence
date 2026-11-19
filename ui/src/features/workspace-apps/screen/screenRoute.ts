@@ -15,3 +15,10 @@ export function routeFromHref(nav: ScreenNavigation | null | undefined, tag: str
   const section = nav?.sections.find(s => s.id === q.get(nav.section_query))?.id ?? nav?.default_section ?? tag;
   return { section, view: q.get("appview") === "new" ? "new" : "list", record_id: id(q.get("record")) ? q.get("record") : null, segment_id: id(q.get("segment")) ? q.get("segment") : null };
 }
+/** The route a frame is pushed: its owner's, when it has one (the canvas's app
+ *  view), else the board URL's. A held route never consults the URL. */
+export function frameRoute(nav: ScreenNavigation | null | undefined, tag: string, current: { route?: ScreenRoute; href: string }): ScreenRoute {
+  const { route } = current;
+  if (!route) return routeFromHref(nav, tag, current.href);
+  return nav?.sections.some(s => s.id === route.section) ? route : { ...route, section: nav?.default_section ?? tag };
+}

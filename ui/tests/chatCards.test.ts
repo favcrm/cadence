@@ -1,5 +1,5 @@
 /** CAD-2443: connect_ref / record_ref parsing and layout, against the shared agenticos-v2 fixtures. */
-import { CELL_MAX_CHARS, cellText, parseConnectRef, parseInstant, parseRecordRef, plainText, recordLayout } from "../src/features/home/chatCards";
+import { CELL_MAX_CHARS, cellText, dayKey, parseConnectRef, stripToolkitPrefix, parseInstant, parseRecordRef, plainText, recordLayout, splitAddress } from "../src/features/home/chatCards";
 import { asEntry, mergePage, threadItems, threadRuns } from "../src/features/home/thread";
 
 export {};
@@ -46,19 +46,20 @@ equal(parseRecordRef(entryOf(connect)), null, "a connect entry is not a record")
 const list = parseRecordRef(entryOf(fixture("record-ref-list")));
 assert(list, "list parses");
 equal([list.view, list.truncated, list.tool, list.items.length], ["list", true, "synthetic_crm_list_contacts", 2], "list model");
+equal([list.toolLabel, list.toolkitLabel, list.account, list.total], ["List contacts", "Synthetic CRM", "Main CRM", 120], "header data");
 equal(recordLayout(list), {
   view: "role-list",
   rows: [
-    { title: "Alex Example", subtitle: "c_1001", snippet: "", time: null, chips: ["vip"], amount: "" },
-    { title: "Sam Sample", subtitle: "c_1002", snippet: "", time: null, chips: [], amount: "" },
+    { title: "Alex Example", name: "Alex Example", address: "", subtitle: "c_1001", snippet: "", time: null, chips: [{ text: "VIP", muted: false }], star: false, unread: false, amount: "" },
+    { title: "Sam Sample", name: "Sam Sample", address: "", subtitle: "c_1002", snippet: "", time: null, chips: [{ text: "New", muted: false }], star: false, unread: true, amount: "" },
   ],
-}, "list layout from roles");
+}, "list layout from roles: labels map, null hides, unread matches an array element");
 const generic = { ...list, roles: null };
 equal(recordLayout(generic), {
   view: "list",
   rows: [
     [{ label: "ID", value: "c_1001" }, { label: "Name", value: "Alex Example" }, { label: "Visits", value: "4" }, { label: "Tags", value: "vip" }],
-    [{ label: "ID", value: "c_1002" }, { label: "Name", value: "Sam Sample" }, { label: "Visits", value: "1" }],
+    [{ label: "ID", value: "c_1002" }, { label: "Name", value: "Sam Sample" }, { label: "Visits", value: "1" }, { label: "Tags", value: "new, internal" }],
   ],
 }, "list without roles is the generic typed rows");
 
@@ -68,9 +69,10 @@ assert(thread, "thread parses");
 equal(recordLayout(thread), {
   view: "role-thread",
   messages: [
-    { actor: "", time: { text: "2026-11-18T01:00:00Z", instant: Date.parse("2026-11-18T01:00:00Z") }, text: "Is my order ready?", own: false },
-    { actor: "", time: { text: "2026-11-18T01:02:00Z", instant: Date.parse("2026-11-18T01:02:00Z") }, text: "Yes, ready for pickup.", own: true },
+    { actor: "", time: { text: "2026-11-18T01:00:00Z", instant: Date.parse("2026-11-18T01:00:00Z") }, day: dayKey(Date.parse("2026-11-18T01:00:00Z")), text: "Is my order ready?", own: false, approved: false },
+    { actor: "", time: { text: "2026-11-18T01:02:00Z", instant: Date.parse("2026-11-18T01:02:00Z") }, day: dayKey(Date.parse("2026-11-18T01:02:00Z")), text: "Yes, ready for pickup.", own: true, approved: false },
   ],
+  contact: "",
 }, "thread bubbles: side.self is the own side");
 equal(recordLayout({ ...thread, roles: null }), {
   view: "thread",
@@ -102,7 +104,7 @@ rich.items[0] = { ...rich.items[0], state: "open", due: "next week", price: "HK$
 rich.roles = { title: "name", snippet: "tags", time: "due", status: "state", amount: "price" };
 const richLayout = recordLayout(rich);
 assert(richLayout && richLayout.view === "role-list", "rich list");
-equal(richLayout.rows[0], { title: "Alex Example", subtitle: "", snippet: "vip", time: { text: "next week", instant: null }, chips: ["open"], amount: "HK$12" }, "all list roles; time as given");
+equal(richLayout.rows[0], { title: "Alex Example", name: "Alex Example", address: "", subtitle: "", snippet: "vip", time: { text: "next week", instant: null }, chips: [{ text: "open", muted: true }], star: false, unread: false, amount: "HK$12" }, "all list roles; time as given; an unmapped value shows muted");
 const hostile = "[x](https://e.test) **b** " + "A".repeat(2000);
 const hostileModel = clone(list) as any;
 hostileModel.items[0].name = hostile;
@@ -120,6 +122,79 @@ for (const [what, roles] of [
   ["roles not an object", "name"],
 ] as const) equal(rolesOf(roles), null, `record rejects roles: ${what}`);
 equal(rolesOf({})?.roles, {}, "empty roles parse");
+for (const [what, roles] of [
+  ["labels not an object", { labels: [] }],
+  ["label display not a string", { labels: { a: 1 } }],
+  ["label display too long", { labels: { a: "x".repeat(101) } }],
+  ["empty label key", { labels: { "": "x" } }],
+  ["unread without values", { unread: { key: "tags", values: [] } }],
+  ["unread naming no field", { unread: { key: "zzz", values: ["a"] } }],
+  ["unread extra key", { unread: { key: "tags", values: ["a"], more: 1 } }],
+] as const) equal(rolesOf(roles), null, `record rejects roles: ${what}`);
+const tooMany = Object.fromEntries(Array.from({ length: 41 }, (_, i) => [`k${i}`, "x"]));
+equal(rolesOf({ labels: tooMany }), null, "record rejects more than 40 labels");
+for (const [what, mutate] of [
+  ["blank tool_label", (p: any) => { p.tool_label = " "; }],
+  ["long account", (p: any) => { p.account = "x".repeat(201); }],
+  ["non-string toolkit_label", (p: any) => { p.toolkit_label = 3; }],
+  ["fractional total", (p: any) => { p.total = 1.5; }],
+  ["negative total", (p: any) => { p.total = -1; }],
+  ["string total", (p: any) => { p.total = "3"; }],
+] as const) {
+  const bad = clone(fixture("record-ref-list")) as any;
+  mutate(bad.payload);
+  equal(parseRecordRef(entryOf(bad)), null, `record rejects ${what}`);
+}
+const bare = clone(fixture("record-ref-list")) as any;
+for (const k of ["tool_label", "toolkit_label", "account", "total"]) delete bare.payload[k];
+equal(parseRecordRef(entryOf(bare))!.account, null, "header data is optional");
+equal(parseRecordRef(entryOf(bare))!.total, null, "total is optional");
+
+// CAD-2469: header redundancy
+const gm = clone(fixture("record-ref-list")) as any;
+Object.assign(gm.payload, { toolkit_label: "Gmail", tool_label: "Gmail: fetch emails", account: "gmail" });
+const gmm = parseRecordRef(entryOf(gm))!;
+equal([gmm.toolLabel, gmm.account], ["Fetch emails", null], "toolkit prefix dropped and account equal to the toolkit omitted");
+equal(stripToolkitPrefix("GMAIL fetch emails", "Gmail"), "Fetch emails", "space prefix, case-insensitive");
+equal(stripToolkitPrefix("List contacts", "Synthetic CRM"), "List contacts", "no prefix, unchanged");
+equal(stripToolkitPrefix("Gmailer: send", "Gmail"), "Gmailer: send", "a longer word is not a prefix");
+equal(stripToolkitPrefix("Gmail:", "Gmail"), "Gmail:", "nothing left, unchanged");
+equal(stripToolkitPrefix("Gmail: fetch", null), "Gmail: fetch", "no toolkit label, unchanged");
+equal(parseRecordRef(entryOf(fixture("record-ref-list")))!.account, "Main CRM", "a different account is kept");
+
+// labels: null hides, a star label is the star, unmapped shows muted; a hostile key is plain data
+const mail = clone(fixture("record-ref-list")) as any;
+mail.payload.items = [
+  { id: "1", name: "Dev Ops <ops@x.example>", tags: ["UNREAD", "IMPORTANT", "CATEGORY_UPDATES", "INBOX", "__proto__", "Odd"] },
+];
+mail.payload.roles = {
+  title: "name", subtitle: "id", badge: "tags",
+  labels: JSON.parse('{"UNREAD":null,"IMPORTANT":"★","CATEGORY_UPDATES":"Updates","INBOX":null,"__proto__":"Poison"}'),
+  unread: { key: "tags", values: ["UNREAD"] },
+};
+const mailLayout = recordLayout(parseRecordRef(entryOf(mail))!) as any;
+equal(mailLayout.rows[0].chips, [{ text: "Updates", muted: false }, { text: "Poison", muted: false }, { text: "Odd", muted: true }], "labels: hidden, star and mapped; the constructor-like key is just a key");
+equal([mailLayout.rows[0].star, mailLayout.rows[0].unread, mailLayout.rows[0].name, mailLayout.rows[0].address], [true, true, "Dev Ops", "ops@x.example"], "star, unread and the sender split");
+
+// "Name <address>" split: only a trailing angle address; anything else stays a name
+equal(splitAddress('"Dev Ops" <a@b.example>'), { name: "Dev Ops", address: "a@b.example" }, "quoted name");
+equal(splitAddress("<a@b.example>"), { name: "a@b.example", address: "" }, "address only");
+equal(splitAddress("Mei Chan"), { name: "Mei Chan", address: "" }, "no address");
+equal(splitAddress("Sam <https://e.test/x>"), { name: "Sam <https://e.test/x>", address: "" }, "a URL is not an address");
+equal(splitAddress("A <b> <c@d.example>"), { name: "A <b>", address: "c@d.example" }, "only the last address splits");
+const longName = "N".repeat(CELL_MAX_CHARS);
+equal(splitAddress(`${longName} <a@b.example>`).name, longName, "a long name is kept whole for CSS to truncate");
+
+// thread: actor "api" is the approved tag, a contact comes from the other side, days come from the time role
+const wa = clone(fixture("record-ref-thread")) as any;
+wa.payload.fields.push({ key: "by", label: "By", type: "string", untrusted: true });
+wa.payload.roles.actor = "by";
+wa.payload.items[0].by = "Mr Lee <+85255550123>";
+wa.payload.items[1].by = "api";
+wa.payload.items.push({ direction: "in", text: "YES", sent_at: "2026-11-19T09:00:00Z", by: "Mr Lee" });
+const waLayout = recordLayout(parseRecordRef(entryOf(wa))!) as any;
+equal([waLayout.contact, waLayout.messages.map((m: any) => [m.actor, m.approved])], ["Mr Lee", [["Mr Lee", false], ["", true], ["Mr Lee", false]]], "thread contact and approved tag");
+equal(waLayout.messages[0].day === waLayout.messages[2].day, false, "a later day gets its own key");
 equal(recordLayout(rolesOf({ side: { key: "name", self: ["x"] } })!)?.view, "list", "roles with no layout role fall back to the generic rows");
 
 // strict narrowing: any malformed payload is null, never partial

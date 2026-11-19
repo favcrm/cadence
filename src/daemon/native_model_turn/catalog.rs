@@ -421,6 +421,9 @@ impl RouteFacts {
         };
         let reasoning = family.reasoning && !family.thinking_level_map.is_empty();
         let (model_uid, effort_name) = match (reasoning, effort) {
+            (true, None | Some("off")) if self.provider == AGENTICOS => {
+                (model_id.to_string(), "off".to_string())
+            }
             (true, Some(effort)) => {
                 let uid = family
                     .thinking_level_map
@@ -635,7 +638,11 @@ fn parse_catalog(provider: &str, value: &Value) -> Result<Vec<FamilyFacts>> {
                     "gateway catalog entries require one explicit author/model id",
                 ));
             }
-            (id.clone(), Vec::new(), false)
+            if id == "tencent/hy4" {
+                (id.clone(), vec![("high".to_string(), id.clone())], true)
+            } else {
+                (id.clone(), Vec::new(), false)
+            }
         } else {
             family_models(&family_uid, &variants)
         };
@@ -1039,5 +1046,53 @@ mod gateway_profile_tests {
         ] {
             assert!(parse_backend(AGENTICOS, invalid.as_object().unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn explicit_high_is_admitted_only_for_standard_hy4() {
+        let origin = "https://api-v2.agenticos.hk";
+        let limit = ScopeLimit {
+            requests_per_minute: 1,
+            unresolved: 1,
+        };
+        let route = RouteFacts {
+            provider: AGENTICOS.to_string(),
+            origins: vec![origin.to_string()],
+            default_origin: origin.to_string(),
+            catalog_revision: 1,
+            families: parse_catalog(
+                AGENTICOS,
+                &json!({"v": 1, "families": [
+                    {"family": "Hy4", "variants": [{"model_uid": "tencent/hy4"}]},
+                    {"family": "Hy4 Flash", "variants": [{"model_uid": "tencent/hy4-flash"}]}
+                ]}),
+            )
+            .unwrap(),
+            max_output_tokens: 8192,
+            limits: OwnerLimits {
+                agent: limit,
+                account: limit,
+                workspace: limit,
+            },
+            backend: parse_backend(
+                AGENTICOS,
+                json!({"tls_mode": "webpki", "workspace_id": "ws_example"})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap(),
+            approved_tools: vec![],
+            approved_tools_digest: String::new(),
+        };
+
+        let hy4 = "agenticos/tencent/hy4";
+        let high = route.resolve(hy4, Some("high"), None).unwrap();
+        assert_eq!(high.model_uid, "tencent/hy4");
+        assert_eq!(high.effort, "high");
+        assert_eq!(route.resolve(hy4, None, None).unwrap().effort, "off");
+        assert!(route.resolve(hy4, Some("low"), None).is_err());
+        assert!(route
+            .resolve("agenticos/tencent/hy4-flash", Some("high"), None)
+            .is_err());
     }
 }

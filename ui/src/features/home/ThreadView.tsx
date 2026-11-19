@@ -34,7 +34,7 @@ import {
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 import { fileKind } from "./fileKind";
-import { TurnSources, TurnStagedCards } from "./TurnRichCards";
+import { AttachmentNamesContext, TurnSources, TurnStagedCards } from "./TurnRichCards";
 import { turnSources } from "./turnCards";
 
 /**
@@ -1237,6 +1237,7 @@ export function ThreadTurn({
   const interimText =
     interim && !carriesSecret(interim.entry.text) ? interimLine(interim.entry.text) : null;
   const toolEntries = trace.flatMap((item) => (item.type === "tools" ? item.entries : []));
+  const attachmentNames = useContext(AttachmentNamesContext);
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -1307,7 +1308,7 @@ export function ThreadTurn({
           come from its recorded tool calls and results, never its prose. */}
       {shown && !streaming && (
         <TurnSources
-          sources={turnSources(toolEntries)}
+          sources={turnSources(toolEntries, attachmentNames)}
           onOpenIssue={onOpenIssue}
           artifacts={artifacts.flatMap((item) => (item.type === "artifact" ? [item.entry] : []))}
         />
