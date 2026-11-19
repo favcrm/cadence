@@ -2404,6 +2404,7 @@ Object.assign(zhTW, {
   "Draft a reply to {name}": "草擬回覆給 {name}",
   "Draft a reply": "草擬回覆",
   "from {account}": "寄自 {account}",
+  "sent by assistant · approved": "由助理傳送 · 已核准",
   "{n} of {total}": "{n} / {total}",
   "{n} messages": "{n} 則訊息",
   "Content from {toolkit} is shown as plain text": "來自 {toolkit} 的內容以純文字顯示",

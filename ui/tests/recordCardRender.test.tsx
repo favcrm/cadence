@@ -2,14 +2,14 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { LocaleProvider } from "../src/lib/locale";
-import { RecordCard } from "../src/features/home/RecordCard";
-import { CELL_MAX_CHARS } from "../src/features/home/chatCards";
+import { RecordCard, dayLabel } from "../src/features/home/RecordCard";
+import { CELL_MAX_CHARS, dayKey } from "../src/features/home/chatCards";
 import { ComposerFillContext } from "../src/features/home/composerFill";
 import { mergePage, threadItems } from "../src/features/home/thread";
 
 export {};
 declare function require(name: string): any;
-declare const process: { cwd(): string };
+declare const process: { cwd(): string; env: { TZ?: string } };
 
 const fixture = (name: string): any =>
   JSON.parse(require("fs").readFileSync(`${process.cwd()}/tests/fixtures/chat-cards/${name}.json`, "utf8"));
@@ -75,5 +75,35 @@ check(plain.includes("data-unread"), "the unread row is marked");
 check(plain.includes("data-record-truncated") && !plain.includes("Ask for more") && acted.includes("Ask for more"), "truncated footer; ask-for-more fills the composer");
 check(!plain.includes("<script") && !acted.includes("<script"), "hostile markup in any role is escaped");
 check(!plain.includes("N".repeat(CELL_MAX_CHARS + 1)) && !plain.includes("P".repeat(CELL_MAX_CHARS + 1)) && !plain.includes("T".repeat(61)), "every role is capped");
+
+// CAD-2469: the approved bubble says who sent it; the header note is a button for touch.
+const wa = fixture("record-ref-thread");
+wa.payload.fields.push({ key: "by", label: "By", type: "string", untrusted: true });
+wa.payload.roles.actor = "by";
+wa.payload.items[0].by = `Mr Lee <+85255550123> ${"L".repeat(2000)}`;
+wa.payload.items[1].by = "api";
+const waState = mergePage(null, { thread: { id: "t" }, entries: [{ seq: 1, role: "agent", kind: "record_ref", message: "m", ...wa }] });
+const waItem: any = threadItems(waState).find((i) => i.type === "record");
+const waHtml = renderToStaticMarkup(createElement(LocaleProvider, null, createElement(RecordCard, { entry: waItem.entry })));
+check(/<button[^>]*class="recordcard-info"[^>]*aria-expanded="false"/.test(waHtml) || /<button[^>]*aria-expanded="false"[^>]*class="recordcard-info"/.test(waHtml), "the note control is a button");
+check(waHtml.includes("sent by assistant · approved"), "the approved bubble says it was sent by the assistant");
+check(waHtml.includes("recordcard-headline") && !waHtml.includes("recordcard-headsub"), "a thread with a contact puts the account on its own line");
+check(!waHtml.includes("recordcard-note"), "the note is closed until tapped");
+
+// CAD-2469: day labels reuse dayKey across a midnight boundary and the viewer's timezone.
+const t = (k: string) => k;
+const fmt = (v: number) => `D${v}`;
+const prevTz = process.env.TZ;
+for (const tz of ["Pacific/Kiritimati", "America/Los_Angeles", "UTC"]) {
+  process.env.TZ = tz;
+  const now = new Date(2026, 10, 18, 0, 1).getTime();
+  const lateYesterday = new Date(2026, 10, 17, 23, 59).getTime();
+  const earlyToday = new Date(2026, 10, 18, 0, 0).getTime();
+  const older = new Date(2026, 10, 10, 12, 0).getTime();
+  check(dayLabel(dayKey(lateYesterday), lateYesterday, t, fmt, now) === "Yesterday", `23:59 the day before reads Yesterday in ${tz}`);
+  check(dayLabel(dayKey(earlyToday), earlyToday, t, fmt, now) === "Today", `00:00 reads Today in ${tz}`);
+  check(dayLabel(dayKey(older), older, t, fmt, now) === `D${older}`, `an older day uses the date in ${tz}`);
+}
+process.env.TZ = prevTz;
 
 console.log("record card render checks passed");

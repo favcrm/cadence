@@ -1,7 +1,8 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import {
+  dayKey,
   parseRecordRef,
   plainText,
   recordLayout,
@@ -111,19 +112,15 @@ function RowItem({ row, replyable }: { row: RoleRow; replyable: boolean }) {
   );
 }
 
-function dayLabel(
+export function dayLabel(
   day: string,
   instant: number,
   t: (key: string) => string,
   formatDate: (v: number, o?: Intl.DateTimeFormatOptions) => string,
+  now: number = Date.now(),
 ): string {
-  const key = (ms: number) => {
-    const d = new Date(ms);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  };
-  const now = Date.now();
-  if (day === key(now)) return t("Today");
-  if (day === key(now - 86_400_000)) return t("Yesterday");
+  if (day === dayKey(now)) return t("Today");
+  if (day === dayKey(now - 86_400_000)) return t("Yesterday");
   const sameYear = new Date(instant).getFullYear() === new Date(now).getFullYear();
   return formatDate(instant, sameYear ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
 }
@@ -149,7 +146,7 @@ function Bubbles({ messages }: { messages: RoleMessage[] }) {
                   {m.actor}
                   {m.actor && m.time ? " · " : ""}
                   {m.time && <Clock value={m.time} />}
-                  {m.approved && <span className="recordcard-tag">{t("approved")}</span>}
+                  {m.approved && <span className="recordcard-tag">{t("sent by assistant · approved")}</span>}
                 </span>
               )}
             </span>
@@ -181,20 +178,50 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
           : formatNumber(count);
   const note = t("Content from {toolkit} is shown as plain text").replace("{toolkit}", () => name);
   const replyTo = contact ? t("Draft a reply to {name}").replace("{name}", () => inPrompt(contact)) : t("Draft a reply");
+  const [noteOpen, setNoteOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!noteOpen) return;
+    const outside = (e: Event) => {
+      if (!wrap.current?.contains(e.target as Node)) setNoteOpen(false);
+    };
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNoteOpen(false);
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [noteOpen]);
   return (
-    <div className="recordcard-head">
-      <span className="recordcard-ic" aria-hidden>{[...name][0]?.toUpperCase() ?? "·"}</span>
-      <span className="recordcard-headname">{name}</span>
-      {sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
-      {model.view === "thread" && fill && (
-        <span className="recordcard-hact">
-          <button type="button" className="recordcard-act" onClick={() => fill(replyTo)}>
-            <span aria-hidden>↩</span> {t("Reply")}
-          </button>
-        </span>
-      )}
-      {pill !== null && <span className="recordcard-count" data-record-count>{pill}</span>}
-      <span className="recordcard-info" role="img" tabIndex={0} aria-label={note} title={note}>i</span>
+    <div className="recordcard-headwrap" ref={wrap}>
+      <div className="recordcard-head">
+        <span className="recordcard-ic" aria-hidden>{[...name][0]?.toUpperCase() ?? "·"}</span>
+        <span className="recordcard-headname">{name}</span>
+        {!contact && sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
+        {model.view === "thread" && fill && (
+          <span className="recordcard-hact">
+            <button type="button" className="recordcard-act" onClick={() => fill(replyTo)}>
+              <span aria-hidden>↩</span> {t("Reply")}
+            </button>
+          </span>
+        )}
+        {pill !== null && <span className="recordcard-count" data-record-count>{pill}</span>}
+        <button
+          type="button"
+          className="recordcard-info"
+          aria-label={note}
+          aria-expanded={noteOpen}
+          title={note}
+          onClick={() => setNoteOpen((o) => !o)}
+        >
+          i
+        </button>
+      </div>
+      {contact && sub.length > 0 && <p className="recordcard-headline">{sub.join(" · ")}</p>}
+      {noteOpen && <p className="recordcard-note" role="note">{note}</p>}
     </div>
   );
 }
