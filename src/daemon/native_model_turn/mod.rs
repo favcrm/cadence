@@ -1115,6 +1115,7 @@ impl NativeModelBroker {
                     workspace_id,
                     configured_model: &configuration.model,
                     model_id: &configuration.model_uid,
+                    effort: &configuration.effort,
                     request_id: &parsed.request_id,
                     max_output_tokens: parsed.max_output_tokens,
                     tool_choice: parsed.tool_choice.as_str(),

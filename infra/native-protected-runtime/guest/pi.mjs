@@ -89,7 +89,8 @@ const readConfig = () => {
   if (value.effort !== null && (typeof value.effort !== 'string' || !THINKING_LEVELS.has(value.effort))) {
     throw new Error('effort');
   }
-  if (value.provider === 'agenticos' && value.effort !== 'off') throw new Error('effort');
+  if (value.provider === 'agenticos' && value.effort !== 'off'
+      && !(value.model_uid === 'tencent/hy4' && value.effort === 'high')) throw new Error('effort');
   if (!Array.isArray(value.tools) || value.tools.length === 0 || value.tools.length > 16) {
     throw new Error('tools');
   }
@@ -176,7 +177,9 @@ const buildModel = (config) => ({
   baseUrl: 'https://protected.invalid',
   input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  reasoning: config.effort !== null && config.provider !== 'agenticos',
+  reasoning: config.provider === 'agenticos'
+    ? config.model_uid === 'tencent/hy4'
+    : config.effort !== null,
   contextWindow: config.max_context_tokens,
   maxTokens: config.max_output_tokens,
 });

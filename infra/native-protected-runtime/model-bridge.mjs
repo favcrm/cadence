@@ -513,7 +513,8 @@ export function createNativeModelProvider({
   if ((provider !== NATIVE_MODEL_PROVIDER && provider !== 'agenticos')
       || !model || model.provider !== provider
       || typeof model.id !== 'string' || !model.id || typeof model.api !== 'string'
-      || (provider === 'agenticos' && (model.api !== provider || effort !== 'off'))) {
+      || (provider === 'agenticos' && (model.api !== provider
+        || (effort !== 'off' && !(model.id === 'tencent/hy4' && effort === 'high'))))) {
     throw closed('unsupported_transport', 'the native model provider is not qualified');
   }
   // The bootstrap passes its own public Pi 1.4 module namespace; the bridge
