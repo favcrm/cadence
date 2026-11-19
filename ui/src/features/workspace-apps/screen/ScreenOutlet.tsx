@@ -535,10 +535,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;
   const liveReceipt = mounted.current;
-  const sharingRoute = primary && state === "ready" && overlay === null &&
+  const sharingRoute = primary && !readOnly && state === "ready" && overlay === null &&
     projection.installation.name === "crm" && liveReceipt?.host_contract === "screen-records.v1" &&
     liveReceipt.operations?.includes("records.show")
-    ? routeFromHref(liveReceipt.navigation, liveReceipt.tag, href)
+    ? frameRoute(liveReceipt.navigation, liveReceipt.tag, { href, route })
     : null;
   return <>
     {drawerToken && sharingRoute?.section === "customers" && sharingRoute.view === "list" && sharingRoute.record_id &&

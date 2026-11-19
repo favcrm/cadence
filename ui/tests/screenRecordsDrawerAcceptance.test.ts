@@ -1,7 +1,7 @@
 /** CAD-1777: independently authored from the ticket, not the implementation.
  * Exercise the mounted records frame, real parser and local action dispatch.
  */
-import type { ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import type { ScreenPush, ScreenRoute } from "../src/features/workspace-apps/screen/screenProtocol";
 import type * as ReactModule from "react";
 import type * as ReactDomModule from "react-dom/client";
 import type * as LocaleModule from "../src/lib/locale";
@@ -36,7 +36,8 @@ const ScreenOutlet = require("../src/features/workspace-apps/screen/ScreenOutlet
 const digest = "sha256:" + "c".repeat(64);
 const receipt = {
   mount: `/api/app-screen/${"b".repeat(64)}`, bridge_nonce: "a".repeat(64), generation: 1, tag: "main",
-  action_token: "d".repeat(64), tools: [], host_contract: "screen-records.v1", operations: ["records.list"], navigation: null,
+  action_token: "d".repeat(64), tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show"],
+  navigation: { section_query: "crm", default_section: "customers", sections: [{ id: "customers", label: "Customers" }, { id: "segments", label: "Segments" }] },
   install_id: "records-drawer-acceptance", context_id: "context-a", digest,
   display_scope_key: "e".repeat(64), display_session_key: "f".repeat(64), remote_images: [],
 };
@@ -68,13 +69,15 @@ class Port {
 const host = document.createElement("section");
 document.body.append(host);
 const flush = () => React.act(async () => { await Promise.resolve(); });
-async function mount(shell: boolean, optedIn = true) {
+async function mount(shell: boolean, optedIn = true, customer?: { route: ScreenRoute; readOnly: boolean }) {
   const root = createRoot(host);
   const effects: string[] = [];
   function Harness() {
     const [mode, setMode] = React.useState<"outlet" | "drawer">("outlet");
     return React.createElement(LocaleProvider, null, React.createElement(ScreenOutlet, {
-      projection, fallback: React.createElement("p", null, "Frame refused"), presentation: mode,
+      projection: customer ? { ...projection, installation: { ...projection.installation, name: "crm" } } : projection,
+      fallback: React.createElement("p", null, "Frame refused"), presentation: mode,
+      route: customer?.route, readOnly: customer?.readOnly,
       onScreenDrawer: shell ? (next, surface) => { effects.push(`${next}:${surface ?? ""}`); setMode(next); } : undefined,
     }));
   }
@@ -127,6 +130,17 @@ async function main() {
   await retired.close();
   await retired.send("retired", "screen.drawer.open", { surface: "segment" });
   assert(retired.port.closed && retired.effects.length === 0, "a retired records frame cannot reopen host presentation");
+  const selected = { section: "customers", view: "list", record_id: "selected", segment_id: null } as const;
+  win.history.replaceState(null, "", "/apps/records-drawer-acceptance?crm=segments&record=elsewhere");
+  const sharingVisible = () => Array.from(host.querySelectorAll("button")).some(button => button.textContent === "Customer sharing");
+  for (const readOnly of [false, true]) {
+    const recordView = await mount(true, true, { route: selected, readOnly });
+    try {
+      assert(sharingVisible() === !readOnly, readOnly
+        ? "a read-only outlet cannot open customer sharing"
+        : "a normal outlet follows its selected customer, not the unrelated board URL");
+    } finally { await recordView.close(); }
+  }
   assert(requests.every(path => path === `/api/app-installations/${receipt.install_id}/screens/main/mount` || path === "/api/app-screen-tools/revoke"), `no presentation path used a records backend endpoint: ${JSON.stringify(requests)}`);
   await win.happyDOM.close();
   console.log("CAD-1777 independent records drawer guard acceptance passed");
