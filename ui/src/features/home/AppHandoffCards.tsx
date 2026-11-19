@@ -19,6 +19,25 @@ const summary: Record<AppHandoffState, string> = {
   answered: "Confirmed specialist reply",
 };
 
+const stage: Record<AppHandoffState, number> = {
+  pending: 0, approved: 1, running: 2, unconfirmed: 2,
+  denied: 3, refused: 3, unanswered: 3, answered: 3,
+};
+
+// Only opaque action ids, never questions, recipients or answers. Cache in
+// this tab as well as memory so a pending Run survives navigating or reloading.
+const sent = new Set<string>();
+function submitted(key: string): boolean {
+  if (sent.has(key)) return true;
+  try { return window.sessionStorage.getItem(key) === "1"; } catch { return false; }
+}
+function rememberSubmitted(key: string, value: boolean): void {
+  if (value) sent.add(key); else sent.delete(key);
+  try {
+    if (value) window.sessionStorage.setItem(key, "1"); else window.sessionStorage.removeItem(key);
+  } catch { /* the in-memory fence still covers this tab */ }
+}
+
 function HandoffCard({ conversation, row }: { conversation: string; row: AppHandoffDecision }) {
   const t = useTranslate();
   const id = useId();
@@ -27,17 +46,24 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
   const [receipt, setReceipt] = useState<AppHandoffDecision | null>(null);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
-  // A lost Run response is not permission to resend, even if a concurrent GET
-  // was answered just before the server recorded its claim.
-  const [runUncertain, setRunUncertain] = useState(false);
+  const key = `cadence.appHandoff.submitted.${row.id}`;
+  const [runUncertain, setRunUncertain] = useState(() => submitted(key));
   useEffect(() => () => active.current?.abort(), []);
-  const decision = receipt ?? row;
+  const decision = receipt && stage[receipt.state] >= stage[row.state] ? receipt : row;
+  useEffect(() => {
+    if (stage[decision.state] === 3) rememberSubmitted(key, false);
+  }, [decision.state, key]);
   const state = runUncertain && (decision.state === "pending" || decision.state === "approved")
     ? "unconfirmed"
     : decision.state;
 
   const act = async (button: HTMLButtonElement, mutation?: AppHandoffMutation) => {
-    if (active.current) return;
+    if (active.current || (mutation === "run" && submitted(key))) return;
+    // Fence before sending: navigation can abort the response, not the server.
+    if (mutation === "run") {
+      rememberSubmitted(key, true);
+      setRunUncertain(true);
+    }
     const abort = new AbortController();
     active.current = abort;
     setBusy(true);
@@ -52,7 +78,6 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
       setReceipt(result);
     } catch {
       if (abort.signal.aborted) return;
-      if (mutation === "run") setRunUncertain(true);
       setFailed(true);
     } finally {
       active.current = null;

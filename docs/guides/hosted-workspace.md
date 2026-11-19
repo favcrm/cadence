@@ -326,15 +326,17 @@ transaction; it never copies reply text into the receipt or backfills old
 operations. The lookup uses that receipt to verify the exact assistant entry
 even if unrelated work is active. `unanswered` proves the input finished
 without an answer. `unconfirmed` means the runtime cannot prove an outcome
-(including active work, missing receipts, conflicting links, or shared
-answers). It is never permission to resend. The host must prove the reader
+(including active work, missing receipts, conflicting links, shared answers,
+or output cut short by a token limit or an unfinished tool call). It is never
+permission to resend. The host must prove the reader
 is entitled to the conversation and bind the lookup to its own approved
 receipt. This RPC does not accept or deliver a handoff.
 Opting out at startup stops capture and hides existing receipts without
 deleting them. Re-enabling never backfills results completed while disabled.
 
 On a compatible hosted board, a private Home conversation can show a
-read-only app handoff. Check the specialist and the exact question first.
+read-only app handoff. Type the exact question you want shared, then check
+the recipient and text in its decision card.
 **Approve** records consent but does not run anything; **Run handoff** sends
 only the reviewed question to the app specialist. **Check reply** reads that
 same run from Home. If the status is unconfirmed, check again without starting

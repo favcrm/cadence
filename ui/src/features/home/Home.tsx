@@ -1751,8 +1751,10 @@ function MasterHome({
                         });
                         const conversation =
                           typeof payload.conversation === "string" ? payload.conversation : undefined;
-                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined,
-                          conversation !== undefined && conversation === appHandoffConversation);
+                        const handoff = payload.app_handoff_v === 1 && appHandoffConversation !== undefined &&
+                          (conversation === undefined || conversation === appHandoffConversation);
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined,
+                          handoff ? appHandoffConversation : conversation, undefined, mediaRefs.length ? mediaRefs : undefined, handoff);
                       }
                     : undefined,
                 onView: turnBar.kind === "queued" && aheadHref !== null
