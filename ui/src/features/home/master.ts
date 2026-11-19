@@ -63,10 +63,9 @@ export function composerBlock(block: string | null, status: MasterStatus, hosted
 
 // ---- CAD-551: the composer's `/` verbs and the working row ----
 
-/** One `/` verb (CAD-551). `help` is composer-local — it never crosses
- * the board; the rest post to `/api/master/command`, whose own
- * allowlist is the daemon's set. `arg` is the autocomplete hint's
- * placeholder, `kind` splits reads from mutations for styling. */
+/** One `/` verb (CAD-551). `help` and `skills` stay in the UI; the other
+ * verbs post to `/api/master/command`. `arg` is the autocomplete hint's
+ * placeholder; `kind` splits reads from mutations for styling. */
 export interface SlashCommand {
   name: string;
   arg?: string;
@@ -88,18 +87,26 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "permissions", blurb: "Pending permission requests and saved rules", kind: "read" },
 ];
 
-/** The verbs a board can run. `/permissions` is native-only (`hosted === false`):
- *  unknown boards keep all other verbs while `/api/meta` resolves, and a
- *  hosted board offers only `help` plus advertised non-`permissions` verbs. */
+export const WORKSPACE_SKILLS_COMMAND: SlashCommand = {
+  name: "skills",
+  blurb: "Browse approved workspace skills",
+  kind: "read",
+};
+
+/** Native boards offer `/permissions`; hosted Home has its local `/skills`
+ *  command, `/help` and the other verbs the board advertises. */
 export function offeredCommands(
   hosted: boolean | null | undefined,
   advertised: readonly string[] | null | undefined,
 ): SlashCommand[] {
   if (hosted === false) return SLASH_COMMANDS;
   if (hosted !== true) return SLASH_COMMANDS.filter((c) => c.name !== "permissions");
-  return SLASH_COMMANDS.filter(
-    (c) => c.name !== "permissions" && (c.name === "help" || (advertised ?? []).includes(c.name)),
-  );
+  return [
+    ...SLASH_COMMANDS.filter(
+      (c) => c.name !== "permissions" && (c.name === "help" || (advertised ?? []).includes(c.name)),
+    ),
+    WORKSPACE_SKILLS_COMMAND,
+  ];
 }
 
 /** `/name` or `/name arg…` — null when the draft is not a command. */

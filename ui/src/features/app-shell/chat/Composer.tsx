@@ -11,8 +11,9 @@ import {
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
-import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
+import { parseSlash, SLASH_COMMANDS, slashMatches, WORKSPACE_SKILLS_COMMAND, type SlashCommand } from "../../home/master";
 import type { PendingAttachment } from "../../home/thread";
+import WorkspaceSkillPicker from "../../home/WorkspaceSkillPicker";
 import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
@@ -463,6 +464,7 @@ export default function Composer({
   // Esc dismisses the menu for THIS verb text — the next keystroke
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
+  const [skillsFor, setSkillsFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
   const revealRef = useRef(onReveal);
   revealRef.current = onReveal;
@@ -516,11 +518,14 @@ export default function Composer({
   // Slash completion is a full-density extra (Home's commands); compact
   // mode routes slash verbs through onCommand without sending them
   // as ordinary chat.
-  const menu = !compact && onCommand !== undefined;
+  const skillsEnabled = !compact && commands?.includes(WORKSPACE_SKILLS_COMMAND);
+  const browse = skillsEnabled ? /^\/skills(?:\n([\s\S]*))?$/i.exec(draft.trim()) : null;
+  const skillPickerOpen = !block && browse !== null && draft === skillsFor;
+  const menu = !compact && (onCommand !== undefined || skillsEnabled);
   const slash = menu ? parseSlash(draft) : null;
   const verbDraft = menu && draft.startsWith("/") && !draft.includes(" ") ? draft.slice(1) : null;
   const matches =
-    verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase(), commands) : [];
+    !skillPickerOpen && verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase(), commands) : [];
   useEffect(() => setHi(0), [verbDraft]);
   const hiClamped = Math.min(hi, Math.max(0, matches.length - 1));
 
@@ -547,6 +552,11 @@ export default function Composer({
     // `block` is also "not an operator" in an app pane — the box and
     // Send are disabled and no submission leaves the composer.
     if (!body || block) return;
+    if (browse) {
+      setSkillsFor(draft);
+      setMenuOffFor(draft);
+      return;
+    }
     // An unresolved original submission owns this key: a new ordinary
     // submission is refused until the operator retries or discards it,
     // so the earlier intent can never be silently replaced. The newer
@@ -603,14 +613,8 @@ export default function Composer({
     // effect scrolls the working indicator into view.
     onSubmitted?.();
     const cmd = parseSlash(body);
-    if (cmd && !menu && onCommand !== undefined) {
-      // A compact pane with its own commands (`/new`): exact verb.
-      if (onCommand(cmd.name, cmd.arg) !== false) finishCommand();
-      else keepRefused(cmd.arg);
-    } else if (cmd && !menu) {
-      // An unsupported slash verb is never forwarded as chat — the
-      // composer refuses it in place. Full-density menus cannot reach
-      // this: an exact verb already submitted above.
+    if (cmd && onCommand === undefined) {
+      // A verb that the host does not handle is not ordinary chat.
       onNotice?.({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name: cmd.name } });
       return;
     } else if (cmd) {
@@ -706,7 +710,7 @@ export default function Composer({
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         // An exact verb submits; a prefix completes to the highlighted row.
-        if (slash && SLASH_COMMANDS.some((c) => c.name === slash.name)) submit();
+        if (browse || (slash && SLASH_COMMANDS.some((c) => c.name === slash.name))) submit();
         else complete(matches[hiClamped]);
         return;
       }
@@ -761,7 +765,7 @@ export default function Composer({
       ref={box}
       id={textareaId}
       value={draft}
-      onChange={(e) => setDraft(e.target.value)}
+      onChange={(e) => { setSkillsFor(null); setDraft(e.target.value); }}
       onKeyDown={onKey}
       rows={1}
       disabled={!!block}
@@ -817,8 +821,8 @@ export default function Composer({
   // Retry or Discard.
   const reserved = cell.reserved;
   const imagePending = libraryImage?.state === "pending";
-  const sendBlocked = !!block || !draft.trim() || sendHeld !== null || reserved || originalUnresolved || imagePending;
-  const sendTitle = imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
+  const sendBlocked = !!block || !draft.trim() || (!browse && (sendHeld !== null || reserved || originalUnresolved || imagePending));
+  const sendTitle = browse ? "Run command" : imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
 
   // Drop handling is scoped to the composer surface itself — the same
   // selection path and limits as the picker; a drag that only crosses
@@ -910,6 +914,19 @@ export default function Composer({
       }}
     >
       {block && <div className="text-label text-ink-300 mb-2 font-medium">{t("Read-only conversation")}</div>}
+      {skillPickerOpen && (
+        <WorkspaceSkillPicker
+          onSelect={(name) => {
+            setDraft(`/skill:${name} ${browse[1] ?? ""}`);
+            setSkillsFor(null);
+            box.current?.focus();
+          }}
+          onClose={(restoreFocus) => {
+            setSkillsFor(null);
+            if (restoreFocus) box.current?.focus();
+          }}
+        />
+      )}
       {matches.length > 0 && (
         <ul className="slashmenu" role="listbox" aria-label={t("slash commands")}>
           {matches.map((c, i) => (

@@ -16,6 +16,7 @@ import { templatesApi } from "../templates/templatesApi";
 import ArtifactView, { downloadName, htmlFrameDocument, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
+import AppViewBody from "./AppViewBody";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
@@ -29,7 +30,8 @@ import {
   selectVersion,
   useCanvas,
   writeWidth,
-  type CanvasTab,
+  isArtifactTab,
+  type ArtifactTab,
   type DrawerLayout,
   type Surface,
   type Working,
@@ -100,7 +102,7 @@ function focusFallback(fallbackArtifactId?: string | null): void {
 
 function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
-  tab: CanvasTab;
+  tab: ArtifactTab;
   composerKey: string | null;
   working: Working | null;
   sheet: boolean;
@@ -633,20 +635,33 @@ export default function CanvasDrawer() {
         // Kept mounted while the Browser tab is in front, so an artifact's
         // scroll position and frame survive the switch.
         <div className="cv-pane" hidden={showBrowser}>
-          <Body
-            key={`${tab.id}@${tab.selected}`}
-            conversation={canvas.conversation ?? conversation}
-            tab={tab}
-            composerKey={canvas.composerKey}
-            working={working}
-            sheet={sheet}
-            expanded={expanded}
-            canExpand={canExpand}
-            onExpand={() => setExpanded((x) => !x)}
-            onClose={closeAll}
-            htmlView={htmlViews[tab.id] ?? "rendered"}
-            onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
-          />
+          {isArtifactTab(tab) ? (
+            <Body
+              key={`${tab.id}@${tab.selected}`}
+              conversation={canvas.conversation ?? conversation}
+              tab={tab}
+              composerKey={canvas.composerKey}
+              working={working}
+              sheet={sheet}
+              expanded={expanded}
+              canExpand={canExpand}
+              onExpand={() => setExpanded((x) => !x)}
+              onClose={closeAll}
+              htmlView={htmlViews[tab.id] ?? "rendered"}
+              onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
+            />
+          ) : tab.app ? (
+            <AppViewBody
+              key={tab.id}
+              tab={tab}
+              app={tab.app}
+              sheet={sheet}
+              expanded={expanded}
+              canExpand={canExpand}
+              onExpand={() => setExpanded((x) => !x)}
+              onClose={closeAll}
+            />
+          ) : null}
         </div>
       ) : null}
       {hasBrowser ? (

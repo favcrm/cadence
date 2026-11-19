@@ -1,0 +1,19 @@
+{
+  "operations": [
+    {
+      "id": "op_qa_customers",
+      "action_id": "customer.search",
+      "status": "succeeded",
+      "revision": 1,
+      "summary": "Found 3 customers matching Harbour",
+      "result": null,
+      "resource_refs": [
+        { "kind": "customer", "id": "cus_8f21", "label": "Harbour Trading Ltd" },
+        { "kind": "customer", "id": "cus_hostile", "label": "Harbour Trading and Wholesale Distribution Holdings (Hong Kong) Limited, Kwun Tong Industrial Centre Branch Office Number Twelve" },
+        { "kind": "segment", "id": "wholesale", "label": "Wholesale" }
+      ],
+      "permission_request": null,
+      "error": null
+    }
+  ]
+}

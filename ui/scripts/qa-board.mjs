@@ -338,6 +338,8 @@ function serve(opts) {
   const context = fx["app-contexts"].contexts[0].id;
   const mount = fx["app-screen-mount"];
   let views = 0;
+  // CAD-2471: `none` refuses the app's detail, contexts and mount, as for a viewer without access.
+  let access = "member";
   // CAD-2286: the viewer, the Settings list and the document lifecycle, as
   // the hosted board answers them. A `documents` preset starts the rows and
   // types again from the fixtures and clears the refusals.
@@ -398,12 +400,18 @@ function serve(opts) {
     "GET /api/app-home": () => fx["app-home"],
     // CAD-2314: the sidebar's app menu reads the operator's installed-app list.
     "GET /api/app-installations": () => appInstallations(fx),
-    [`GET ${app}`]: () => fx["app-installation"],
-    [`GET ${app}/contexts`]: () => fx["app-contexts"],
+    [`GET ${app}`]: (_b, res) => access === "none" ? send(res, 403, { error: "forbidden" }) : fx["app-installation"],
+    [`GET ${app}/contexts`]: (_b, res) => access === "none" ? send(res, 403, { error: "forbidden" }) : fx["app-contexts"],
+    // CAD-2471: the app assistant's one finished operation, with resource links.
+    [`GET ${app}/conversations`]: () => fx["app-conversations"],
+    "GET /api/threads/master": () => fx["app-thread"],
+    [`GET ${app}/assistant/actions`]: () => fx["app-assistant-actions"],
+    [`GET ${app}/assistant/operations`]: () => fx["app-assistant-operations"],
+    [`GET ${app}/assistant/permissions`]: () => fx["app-assistant-permissions"],
     [`GET ${app}/effects`]: () => fx["app-effects"],
     [`GET ${app}/contexts/${context}/effects`]: () => fx["app-effects"],
     "GET /api/app-runs": () => fx["app-runs"],
-    [`POST ${app}/screens/${mount.tag}/mount`]: () => mount,
+    [`POST ${app}/screens/${mount.tag}/mount`]: (_b, res) => access === "none" ? send(res, 403, { error: "forbidden" }) : mount,
     [`GET ${mount.mount}`]: (_b, res) => send(res, 200, fs.readFileSync(path.join(root, "frame", "frame.html")), "text/html; charset=utf-8"),
     "GET /api/browser": () => browser,
     "POST /api/browser/view": (_b, res) => {
@@ -454,8 +462,10 @@ function serve(opts) {
         return send(res, 400, { error: `document_refusals must be a list of ${DOCUMENT_WRITES.join(", ")}` });
       }
       if (b.skills !== undefined && !SKILL_PROBES.includes(b.skills)) return send(res, 400, { error: `skills preset must be one of ${SKILL_PROBES.join(", ")}` });
+      if (b.app_access !== undefined && b.app_access !== "member" && b.app_access !== "none") return send(res, 400, { error: "app_access must be member or none" });
       if (b.profile_changed !== undefined && b.profile_changed !== true) return send(res, 400, { error: "profile_changed must be true" });
       browser = next;
+      if (b.app_access !== undefined) access = b.app_access;
       if ("locale" in b) locale.user_locale = b.locale;
       if (b.viewer !== undefined) presets = { ...presets, viewer: b.viewer };
       if (b.settings !== undefined) presets = { ...presets, settings: b.settings };
@@ -472,7 +482,7 @@ function serve(opts) {
     } else if (req.method !== "GET") return send(res, 405, { error: "GET or POST" });
     const { viewer, settings, probe, refusals } = presets;
     const { revision, skills: assigned } = skills.profile();
-    return send(res, 200, { browser, locale, views, viewer, settings, documents: { probe, refusals, changed: documents.changes() }, skills: { probe: skills.probe(), profile: { revision, skills: assigned } } });
+    return send(res, 200, { browser, locale, views, app_access: access, viewer, settings, documents: { probe, refusals, changed: documents.changes() }, skills: { probe: skills.probe(), profile: { revision, skills: assigned } } });
   }
 
   http.createServer(async (req, res) => {

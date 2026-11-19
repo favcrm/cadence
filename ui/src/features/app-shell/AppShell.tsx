@@ -1428,6 +1428,8 @@ export default function AppShell({
               // shell only mounts after the route proved the key unique for
               // this install, so the verified receipt's name is its path.
               appPath: verified && installation ? installedAppHref(installation.name) : null,
+              screenTag: verified && installation ? screenTag(installation) : null,
+              appLabel: verified && installation ? title : null,
               fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
               fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
             }}

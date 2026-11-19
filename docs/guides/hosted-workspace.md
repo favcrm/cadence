@@ -94,6 +94,12 @@ AgenticOS supplies the authenticated model proxy and domain capabilities.
 Provider credentials, model routing, financial authorization, current tenant
 membership and human approval decisions remain with that platform.
 
+In hosted Home, type `/skills` and press Enter to browse approved workspace
+skills without sending a message. Selecting a skill inserts `/skill:<name>`
+in the draft. Send it with your request, or type the command directly. The
+sent prompt highlights the command; the highlight does not confirm that the
+skill loaded or that any action ran.
+
 An owner can review a write staged in an installed app's assistant conversation
 beside that conversation. **Review** shows the stored changes and declared
 effects; **Not now** leaves it pending. Approval may still fail to apply, so

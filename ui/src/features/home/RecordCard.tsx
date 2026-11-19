@@ -1,7 +1,8 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import {
+  dayKey,
   parseRecordRef,
   plainText,
   recordLayout,
@@ -111,19 +112,15 @@ function RowItem({ row, replyable }: { row: RoleRow; replyable: boolean }) {
   );
 }
 
-function dayLabel(
+export function dayLabel(
   day: string,
   instant: number,
   t: (key: string) => string,
   formatDate: (v: number, o?: Intl.DateTimeFormatOptions) => string,
+  now: number = Date.now(),
 ): string {
-  const key = (ms: number) => {
-    const d = new Date(ms);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  };
-  const now = Date.now();
-  if (day === key(now)) return t("Today");
-  if (day === key(now - 86_400_000)) return t("Yesterday");
+  if (day === dayKey(now)) return t("Today");
+  if (day === dayKey(now - 86_400_000)) return t("Yesterday");
   const sameYear = new Date(instant).getFullYear() === new Date(now).getFullYear();
   return formatDate(instant, sameYear ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
 }
@@ -135,13 +132,12 @@ function Bubbles({ messages }: { messages: RoleMessage[] }) {
   return (
     <ul className="recordcard-thread recordcard-bubbles">
       {messages.map((m, i) => {
-        const separator = m.day !== null && m.day !== lastDay && m.time?.instant != null;
+        const label =
+          m.day !== null && m.day !== lastDay && m.time?.instant != null ? dayLabel(m.day, m.time.instant, t, formatDate) : null;
         if (m.day !== null) lastDay = m.day;
         return (
-          <li key={i} className="recordcard-msg" data-own={m.own || undefined} data-day-break={separator || undefined}>
-            {separator && m.day !== null && m.time?.instant != null && (
-              <span className="recordcard-day" data-day={m.day}>{dayLabel(m.day, m.time.instant, t, formatDate)}</span>
-            )}
+          <li key={i} className="recordcard-msg" data-own={m.own || undefined} data-day-break={label !== null || undefined}>
+            {label !== null && <span className="recordcard-day" data-day={m.day}>{label}</span>}
             <span className="recordcard-bubble">
               <span className="recordcard-text">{m.text}</span>
               {(m.actor || m.time || m.approved) && (
@@ -149,7 +145,7 @@ function Bubbles({ messages }: { messages: RoleMessage[] }) {
                   {m.actor}
                   {m.actor && m.time ? " · " : ""}
                   {m.time && <Clock value={m.time} />}
-                  {m.approved && <span className="recordcard-tag">{t("approved")}</span>}
+                  {m.approved && <span className="recordcard-tag">{t("sent by assistant · approved")}</span>}
                 </span>
               )}
             </span>
@@ -167,34 +163,63 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
   const fill = useContext(ComposerFillContext);
   const name = model.toolkitLabel ?? model.toolkit;
   const account = model.account;
-  const sub = [
-    ...(contact !== null ? [contact] : model.toolLabel ? [model.toolLabel] : []),
-    ...(account ? [contact !== null ? t("from {account}").replace("{account}", () => account) : account] : []),
-  ];
+  const sub = [...(model.toolLabel ? [model.toolLabel] : []), ...(account ? [account] : [])];
+  const fromAccount = account ? t("from {account}").replace("{account}", () => account) : null;
   const pill =
     count === null
       ? null
-      : model.total !== null
+      : model.total !== null && model.total > count
         ? t("{n} of {total}").replace("{n}", formatNumber(count)).replace("{total}", formatNumber(model.total))
         : model.view === "thread"
           ? t("{n} messages").replace("{n}", formatNumber(count))
           : formatNumber(count);
   const note = t("Content from {toolkit} is shown as plain text").replace("{toolkit}", () => name);
   const replyTo = contact ? t("Draft a reply to {name}").replace("{name}", () => inPrompt(contact)) : t("Draft a reply");
+  const [noteOpen, setNoteOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!noteOpen) return;
+    const outside = (e: Event) => {
+      if (!wrap.current?.contains(e.target as Node)) setNoteOpen(false);
+    };
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNoteOpen(false);
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [noteOpen]);
   return (
-    <div className="recordcard-head">
-      <span className="recordcard-ic" aria-hidden>{[...name][0]?.toUpperCase() ?? "·"}</span>
-      <span className="recordcard-headname">{name}</span>
-      {sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
-      {model.view === "thread" && fill && (
-        <span className="recordcard-hact">
-          <button type="button" className="recordcard-act" onClick={() => fill(replyTo)}>
-            <span aria-hidden>↩</span> {t("Reply")}
-          </button>
-        </span>
-      )}
-      {pill !== null && <span className="recordcard-count" data-record-count>{pill}</span>}
-      <span className="recordcard-info" role="img" tabIndex={0} aria-label={note} title={note}>i</span>
+    <div className="recordcard-headwrap" ref={wrap}>
+      <div className="recordcard-head">
+        <span className="recordcard-ic" aria-hidden>{[...name][0]?.toUpperCase() ?? "·"}</span>
+        <span className="recordcard-headname">{name}</span>
+        {contact === null && sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
+        {model.view === "thread" && fill && (
+          <span className="recordcard-hact">
+            <button type="button" className="recordcard-act" onClick={() => fill(replyTo)}>
+              <span aria-hidden>↩</span> {t("Reply")}
+            </button>
+          </span>
+        )}
+        {pill !== null && <span className="recordcard-count" data-record-count>{pill}</span>}
+        <button
+          type="button"
+          className="recordcard-info"
+          aria-label={note}
+          aria-expanded={noteOpen}
+          title={note}
+          onClick={() => setNoteOpen((o) => !o)}
+        >
+          i
+        </button>
+      </div>
+      {contact !== null && <p className="recordcard-contact" title={contact}>{contact}</p>}
+      {contact !== null && fromAccount !== null && <p className="recordcard-account" title={account ?? undefined}>{fromAccount}</p>}
+      {noteOpen && <p className="recordcard-note" role="note">{note}</p>}
     </div>
   );
 }
@@ -204,7 +229,7 @@ function MoreFooter({ model, shown }: { model: RecordCardModel; shown: number })
   const fill = useContext(ComposerFillContext);
   const tool = inPrompt(model.toolLabel ?? model.toolkitLabel ?? model.toolkit);
   const text =
-    model.total !== null
+    model.total !== null && model.total > shown
       ? t("Showing {n} of {total}").replace("{n}", String(shown)).replace("{total}", String(model.total))
       : t("Showing {n}").replace("{n}", String(shown));
   return (

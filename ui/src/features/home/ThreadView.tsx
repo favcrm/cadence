@@ -19,6 +19,7 @@ import { ThreadPermission } from "./PermissionCard";
 import AgentForm from "./AgentForm";
 import { ConnectCard } from "./ConnectCard";
 import { RecordCard } from "./RecordCard";
+import { ViewCard } from "./ViewCard";
 import { ACTION_MARK } from "./formModel";
 import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
 import { elapsedSecs, errorReason, formatElapsed, resultCount, toolKey, toolLabel, toolSubject } from "./turnText";
@@ -248,10 +249,11 @@ function InlineToken({ token }: { token: Inline }) {
 }
 
 /** Operator prose with its inline marks, line breaks as typed. */
-function OperatorInline({ text }: { text: string }) {
-  const tokens = useMemo(() => inlineTokens(text), [text]);
+function OperatorInline({ text, command }: { text: string; command?: string }) {
+  const tokens = useMemo(() => inlineTokens(command ? text.slice(command.length) : text), [text, command]);
   return (
     <span className="whitespace-pre-wrap">
+      {command && <code className="op-code" data-skill-command="">{command}</code>}
       {tokens.map((tok, i) => (
         <InlineToken key={i} token={tok} />
       ))}
@@ -265,19 +267,21 @@ function OperatorInline({ text }: { text: string }) {
  * message folded after `FOLD_LINES` lines with its line count, Show all and
  * Copy. Copy takes the text as written (a form answer's readable lines).
  */
-export function OperatorText({ text }: { text: string }) {
+export function OperatorText({ text, highlightSkillCommand = false }: { text: string; highlightSkillCommand?: boolean }) {
   const t = useTranslate();
   const parts = useMemo(() => segments(text), [text]);
   const fold = useMemo(() => foldable(parts), [parts]);
   const [open, setOpen] = useState(false);
   const bodyId = useId();
+  // Match the leading workspace skill tag only; this is syntax, not a receipt.
+  const command = highlightSkillCommand ? /^\/skill:[a-z0-9][a-z0-9-]{0,31}(?=\s|$)/.exec(text)?.[0] : undefined;
   const body = parts.map((s, i) =>
     s.kind === "code" ? (
       <pre key={i} className="op-pre num" data-lang={s.lang ?? undefined}>
         {s.text}
       </pre>
     ) : (
-      <OperatorInline key={i} text={s.text} />
+      <OperatorInline key={i} text={s.text} command={i === 0 ? command : undefined} />
     ),
   );
   if (!fold) return <>{body}</>;
@@ -309,6 +313,7 @@ export function ThreadItemView({
   item,
   readOnly,
   density = "full",
+  highlightSkillCommand,
   onOpenIssue,
   onRetry,
   onDiscard,
@@ -316,6 +321,7 @@ export function ThreadItemView({
 }: {
   item: ThreadItem;
   density?: Density;
+  highlightSkillCommand?: boolean;
   readOnly: boolean;
   onOpenIssue?: (id: string) => void;
   onRetry: (
@@ -362,7 +368,7 @@ export function ThreadItemView({
       return (
         <Bubble who={t("You")} at={time(item.entry.created)} me>
           <div className={`chat-bubble ${bodyText} text-ink-100`}>
-            <OperatorText text={formAnswerText(item.entry.text, refs)} />
+            <OperatorText text={formAnswerText(item.entry.text, refs)} highlightSkillCommand={highlightSkillCommand} />
             <AttachmentRows files={files} sent />
           </div>
           {isFormAnswer(refs) && <div className="text-micro text-ink-500 mt-1">{t("Answered with the form")}</div>}
@@ -397,7 +403,10 @@ export function ThreadItemView({
             }`}
             data-pending={item.pending.state}
           >
-            <OperatorText text={formAnswerText(item.pending.text, item.pending.refs ?? [])} />
+            <OperatorText
+              text={formAnswerText(item.pending.text, item.pending.refs ?? [])}
+              highlightSkillCommand={highlightSkillCommand && item.pending.state === "sent"}
+            />
             <AttachmentRows files={pendingAttachments(item.pending.attachments)} />
           </div>
           <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
@@ -456,6 +465,8 @@ export function ThreadItemView({
       return <ConnectCard entry={item.entry} density={density} />;
     case "record":
       return <RecordCard entry={item.entry} density={density} />;
+    case "view":
+      return <ViewCard entry={item.entry} density={density} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -1325,6 +1336,8 @@ export function ThreadTurn({
               <div key={item.key} data-item-key={item.key}><ConnectCard entry={item.entry} density={density} /></div>
             ) : item.type === "record" ? (
               <div key={item.key} data-item-key={item.key}><RecordCard entry={item.entry} density={density} /></div>
+            ) : item.type === "view" ? (
+              <div key={item.key} data-item-key={item.key}><ViewCard entry={item.entry} density={density} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
               <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
                 {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} density={density} />}

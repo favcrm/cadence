@@ -7,6 +7,7 @@ import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
+import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import { useDockHeight } from "./useDockHeight";
 import {
   applyMemberEarlier,
@@ -477,6 +478,7 @@ export default function MemberChat({
             <ImageConversation.Provider value={surface?.conversation ?? null}>
             <Conversation
               mode={{ kind: "home" }}
+              highlightSkillCommand
               items={shown}
               legacyTranscript={!items.some((item) => item.type === "answer")}
               readOnly={readOnly}
@@ -499,14 +501,8 @@ export default function MemberChat({
               density="full"
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
-              // A `/` command is not sent here, and Enter must not look dead.
-              onNotice={(notice) =>
-                setSendNote(
-                  typeof notice !== "string" && notice.key.startsWith("Unsupported command")
-                    ? t("Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.")
-                    : displayUiNotice(notice, t),
-                )
-              }
+              commands={[WORKSPACE_SKILLS_COMMAND]}
+              onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-

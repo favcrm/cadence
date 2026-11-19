@@ -1,5 +1,6 @@
 import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
+import { ViewScopeContext } from "../../home/ViewCard";
 import { ImageConversation } from "../../canvas/imageConversation";
 import {
   Fragment,
@@ -171,6 +172,10 @@ export type ConversationMode =
       /** The verified installation's canonical `/apps/<key>` path — shareable
        *  links emit it. Null (ambiguous/unresolved) means no link renders. */
       appPath?: string | null;
+      /** The installed screen's tag: an assistant resource link can open it in the canvas. */
+      screenTag?: string | null;
+      /** The installed app's display name: a canvas tab names the app from it when the install cannot be read. */
+      appLabel?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -185,6 +190,7 @@ const COMPOSER_ID = "app-shell-chat-box";
 
 export interface HomeListProps {
   mode: { kind: "home" };
+  highlightSkillCommand?: boolean;
   items: ThreadItem[];
   /** The Home conversation this list shows; its live preview text (CAD-2228)
    *  is painted on the turn that is generating. */
@@ -260,6 +266,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  */
 function HomeList({
   items,
+  highlightSkillCommand,
   conversation = null,
   readOnly,
   liveAfter,
@@ -390,7 +397,7 @@ function HomeList({
     return (
       <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
         {act?.kind === "row" && act.position === "before" && !hoist ? act.node : null}
-        <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+        <ThreadItemView item={item} readOnly={readOnly} highlightSkillCommand={highlightSkillCommand} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
         {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}
         {after?.(item)}
@@ -1293,9 +1300,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     },
     convId,
   );
+  const viewScope = useMemo(() => ({ installId, contextId: mode.contextId }), [installId, mode.contextId]);
   useCanvasFeed({
     conversation: convId,
     surface: "app",
+    viewScope,
     composerKey,
     items,
     loaded: loaded && thread.data?.missing !== true,
@@ -2215,6 +2224,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       <StagedSourceContext.Provider value={decisionStore}>
       <AttachmentNamesContext.Provider value={paneAttachmentNames}>
+      <ViewScopeContext.Provider value={viewScope}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2362,9 +2372,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </ViewScopeContext.Provider>
       </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}

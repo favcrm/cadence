@@ -4,7 +4,8 @@ import { subscribeMasterChanged } from "../../../lib/masterChanged";
 import { useTranslate } from "../../../lib/locale";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
-import { resourceHref, type ResourceRef } from "../assistantResourceNavigation";
+import { resourceAppView, resourceHref, type ResourceRef } from "../assistantResourceNavigation";
+import { openAppView, useCanvas } from "../../canvas/canvasStore";
 
 interface Action {
   id: string;
@@ -337,7 +338,7 @@ function standingLabel(request: PermissionRequest, actionId: string): string {
   return STANDING_LABELS[actionId];
 }
 
-function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
+function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath, screenTag, appLabel }: {
   operation: Operation;
   installId: string;
   contextId: string;
@@ -345,8 +346,13 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   decide: (operation: Operation, decision: "allow_once" | "allow_always" | "deny") => void;
   /** The verified canonical `/apps/<key>` path for resource links; null means no link. */
   appPath: string | null;
+  /** The installed screen's tag; with it a resource link can open in the canvas. */
+  screenTag: string | null;
+  appLabel: string | null;
 }) {
   const t = useTranslate();
+  // The canvas shows once the conversation is fed to it; before that there is nothing to open into.
+  const canvasReady = useCanvas().conversation !== null;
   const request = operation.permission_request;
   const requestMatches = request !== null && request.scope.install_id === installId &&
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
@@ -446,7 +452,13 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
         <ul className="app-assistant-resources" aria-label={t("Result resources")}>
           {operation.resource_refs.map((ref, index) => {
             const href = resourceHref(appPath, installId, contextId, ref);
-            return <li key={`${ref.kind}:${ref.id}:${index}`}>{href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}</li>;
+            const view = resourceAppView(appPath, installId, contextId, screenTag, ref, appLabel);
+            return (
+              <li key={`${ref.kind}:${ref.id}:${index}`}>
+                {href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}
+                {view && canvasReady ? <button type="button" className="lnk text-label app-assistant-canvas-open" onClick={() => openAppView(view)}>{t("Open in canvas")}</button> : null}
+              </li>
+            );
           })}
         </ul>
       )}
@@ -486,12 +498,15 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, connectionRevision, onPendingChange }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
   /** The verified canonical `/apps/<key>` path; resource links emit it. Null means no links. */
   appPath: string | null;
+  /** The installed screen's tag, for Open in canvas. Null means no such action. */
+  screenTag: string | null;
+  appLabel: string | null;
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
@@ -664,12 +679,12 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       </div>
       {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
-      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {completedOperations.length > 0 && (
         <details className="app-assistant-history">
           <summary className="text-micro">{t("Completed activity")} ({completedOperations.length})</summary>
           <div className="app-assistant-history-list">
-            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
+            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
           </div>
         </details>
       )}

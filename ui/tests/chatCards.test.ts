@@ -1,5 +1,5 @@
 /** CAD-2443: connect_ref / record_ref parsing and layout, against the shared agenticos-v2 fixtures. */
-import { CELL_MAX_CHARS, cellText, dayKey, parseConnectRef, parseInstant, parseRecordRef, plainText, recordLayout, splitAddress } from "../src/features/home/chatCards";
+import { CELL_MAX_CHARS, cellText, dayKey, parseConnectRef, stripToolkitPrefix, parseInstant, parseRecordRef, plainText, recordLayout, splitAddress } from "../src/features/home/chatCards";
 import { asEntry, mergePage, threadItems, threadRuns } from "../src/features/home/thread";
 
 export {};
@@ -149,6 +149,18 @@ const bare = clone(fixture("record-ref-list")) as any;
 for (const k of ["tool_label", "toolkit_label", "account", "total"]) delete bare.payload[k];
 equal(parseRecordRef(entryOf(bare))!.account, null, "header data is optional");
 equal(parseRecordRef(entryOf(bare))!.total, null, "total is optional");
+
+// CAD-2469: header redundancy
+const gm = clone(fixture("record-ref-list")) as any;
+Object.assign(gm.payload, { toolkit_label: "Gmail", tool_label: "Gmail: fetch emails", account: "gmail" });
+const gmm = parseRecordRef(entryOf(gm))!;
+equal([gmm.toolLabel, gmm.account], ["Fetch emails", null], "toolkit prefix dropped and account equal to the toolkit omitted");
+equal(stripToolkitPrefix("GMAIL fetch emails", "Gmail"), "Fetch emails", "space prefix, case-insensitive");
+equal(stripToolkitPrefix("List contacts", "Synthetic CRM"), "List contacts", "no prefix, unchanged");
+equal(stripToolkitPrefix("Gmailer: send", "Gmail"), "Gmailer: send", "a longer word is not a prefix");
+equal(stripToolkitPrefix("Gmail:", "Gmail"), "Gmail:", "nothing left, unchanged");
+equal(stripToolkitPrefix("Gmail: fetch", null), "Gmail: fetch", "no toolkit label, unchanged");
+equal(parseRecordRef(entryOf(fixture("record-ref-list")))!.account, "Main CRM", "a different account is kept");
 
 // labels: null hides, a star label is the star, unmapped shows muted; a hostile key is plain data
 const mail = clone(fixture("record-ref-list")) as any;

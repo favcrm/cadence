@@ -1,3 +1,4 @@
+import { appViewRef, type AppViewRef } from "../canvas/appView";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -11,6 +12,9 @@ import type { ThreadEntry } from "./thread";
  * as a system line, never a half-rendered card. Every value in a record card
  * is plain text (React escapes it; there is no Markdown and no link), capped.
  * A card never carries a URL: the Connect button uses the board's own flow.
+ *
+ * CAD-2475 adds `view_ref` (agenticos-v2 AOS-654): a reference to an installed
+ * app's screen, opened as a canvas app tab. Same strictness; never content.
  */
 
 export const RECORD_MAX_ITEMS = 50;
@@ -171,10 +175,12 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     const v = p[key];
     return typeof v === "string" && v.trim() !== "" && v.length <= 200 ? plainText(v, 200) : undefined;
   };
-  const toolLabel = header("tool_label");
+  const rawToolLabel = header("tool_label");
   const toolkitLabel = header("toolkit_label");
-  const account = header("account");
-  if (toolLabel === undefined || toolkitLabel === undefined || account === undefined) return null;
+  const rawAccount = header("account");
+  if (rawToolLabel === undefined || toolkitLabel === undefined || rawAccount === undefined) return null;
+  const toolLabel = stripToolkitPrefix(rawToolLabel, toolkitLabel);
+  const account = rawAccount !== null && rawAccount.trim().toLowerCase() === toolkitLabel?.trim().toLowerCase() ? null : rawAccount;
   if (present.includes("total") && !(Number.isInteger(p.total) && (p.total as number) >= 0)) return null;
   const { toolkit, tool, items, fields, view, truncated } = p;
   if (typeof toolkit !== "string" || !TOOLKIT.test(toolkit)) return null;
@@ -210,6 +216,19 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     account,
     total: present.includes("total") ? (p.total as number) : null,
   };
+}
+
+/** "Gmail: fetch emails" under toolkit "Gmail" reads "Fetch emails"; unchanged when there is no such prefix. */
+export function stripToolkitPrefix(tool: string | null, toolkit: string | null): string | null {
+  if (tool === null || toolkit === null || toolkit.trim() === "") return tool;
+  const t = tool.trim();
+  const k = toolkit.trim();
+  if (!t.toLowerCase().startsWith(k.toLowerCase())) return tool;
+  const rest = t.slice(k.length);
+  const m = /^(?::\s*|\s+)(\S[\s\S]*)$/.exec(rest);
+  if (!m) return tool;
+  const r = m[1].trim();
+  return r === "" ? tool : r[0].toUpperCase() + r.slice(1);
 }
 
 /** Plain text for display: control characters out, capped with an ellipsis. */
@@ -377,7 +396,7 @@ function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLab
       .map((item) => {
         const own = side !== undefined && item[side.key] != null && side.self.includes(String(item[side.key]));
         const rawActor = text(item, roles.actor);
-        const approved = rawActor.toLowerCase() === "api";
+        const approved = rawActor === "api";
         const when = time(item);
         return {
           actor: approved ? "" : splitAddress(rawActor).name,
@@ -456,4 +475,65 @@ export function recordLayout(model: RecordCardModel, labels?: CellLabels): Recor
   }
   const columns = model.fields.slice(0, LIST_COLUMNS_MAX);
   return { view: "list", rows: model.items.map((item) => pairs(item, columns)) };
+}
+
+// ---- view_ref (CAD-2475; agenticos-v2 AOS-654 `viewRefPayloadSchema`) ----
+
+const VIEW_APP = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const VIEW_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const VIEW_TAG = /^[A-Za-z0-9_-]{1,64}$/;
+const VIEW_SECTION = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const NO_CONTROLS = /^[^\u0000-\u001f\u007f-\u009f]*$/;
+
+export interface ViewCardModel {
+  app: string;
+  appLabel: string;
+  installId: string;
+  screenTag: string;
+  section: string;
+  recordId: string | null;
+  title: string;
+}
+
+const plainField = (v: unknown, max: number): v is string =>
+  typeof v === "string" && v.length >= 1 && v.length <= max && NO_CONTROLS.test(v);
+
+/** Strict like the contract: unknown keys, bad grammar or a missing key yield null (the text line shows). */
+export function parseViewRef(entry: ThreadEntry): ViewCardModel | null {
+  const p = payloadOf(entry, "view_ref");
+  if (!p) return null;
+  const hasRecord = Object.prototype.hasOwnProperty.call(p, "record_id");
+  if (!exactKeys(p, ["v", "app", "app_label", "install_id", "screen_tag", "section", "title", ...(hasRecord ? ["record_id"] : [])])) return null;
+  const { app, app_label, install_id, screen_tag, section, record_id, title } = p;
+  if (typeof app !== "string" || !VIEW_APP.test(app)) return null;
+  if (!plainField(app_label, 60) || !plainField(title, 120)) return null;
+  if (typeof install_id !== "string" || !VIEW_ID.test(install_id)) return null;
+  if (typeof screen_tag !== "string" || !VIEW_TAG.test(screen_tag)) return null;
+  if (typeof section !== "string" || !VIEW_SECTION.test(section)) return null;
+  if (hasRecord && record_id !== null && (typeof record_id !== "string" || !VIEW_ID.test(record_id))) return null;
+  return { app, appLabel: app_label, installId: install_id, screenTag: screen_tag, section, recordId: typeof record_id === "string" ? record_id : null, title };
+}
+
+/** Where a card opens its tab: the app pane's own context when the card is for that install, else the install's default. */
+export interface ViewScope {
+  installId: string | null;
+  contextId: string;
+}
+export const HOME_VIEW_SCOPE: ViewScope = { installId: null, contextId: "default" };
+
+/** The canvas reference of a card, or null when the frame would refuse it (grammar the tab is stricter about). */
+export function viewCardAppView(model: ViewCardModel, scope: ViewScope = HOME_VIEW_SCOPE): AppViewRef | null {
+  const contextId = scope.installId === model.installId ? scope.contextId : "default";
+  const ref = appViewRef({
+    installId: model.installId,
+    tag: model.screenTag,
+    contextId,
+    route: { section: model.section, view: "list", record_id: model.recordId, segment_id: null },
+    title: model.title,
+    appLabel: model.appLabel,
+    // A placeholder: the tab builds the real link from the installation it reads.
+    fromCard: true,
+    href: `/apps/${model.app}`,
+  });
+  return ref;
 }
