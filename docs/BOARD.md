@@ -2630,6 +2630,23 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
+On a hosted board advertising `wiki_managed_files` (CAD-2477), **Wiki** is
+the shared library for durable files and knowledge. An assigned approver
+opens **Home → To do → Review** to read the submitted version in Wiki.
+Opening a file does not clear the follow-up; approval does. Recent recorded
+approval and delivery outcomes appear in **Updates** for the people involved
+who still have access. The private-assistant Home shows these document
+follow-ups without mounting the Master's queues or activity. On the owner's
+workspace Home they appear alongside the existing actions. The two kinds
+of Home keep their existing access rules.
+
+The file's Wiki link and linked ticket Evidence point to the exact version.
+Approval and archive/restore are file actions; approval does not deliver the
+file. The owner edits **Document policy** in **Settings → Workspace → General**.
+Old Documents links open Wiki (Archived links keep that view); the old policy
+link opens General or a permitted Settings default. Hosted boards that do
+not advertise the capability still use the two older destinations below.
+
 Documents (`/documents`, CAD-2286) is hosted only: the review side of the
 document lifecycle that `artifact submit` starts
 (`docs/guides/hosted-workspace.md`). One shared probe,

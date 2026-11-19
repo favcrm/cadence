@@ -43,7 +43,7 @@ import { displayName, readConversationIdentity, scopeDescriptor } from "../assis
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
-import NeedsRail from "./NeedsRail";
+import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
@@ -759,6 +759,7 @@ export default function Home({
   viewerIsMember = false,
   sessionId = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
   decisions = false,
@@ -790,6 +791,7 @@ export default function Home({
    *  re-login as another member never reads the previous chat. */
   sessionId?: string | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   /** Open a reading item in the shared work-item detail (App owns the mount). */
   onOpenDecision: (open: HomeDecisionOpen) => void;
@@ -822,6 +824,7 @@ export default function Home({
         scope={scope}
         readOnly={readOnly}
         onOpenIssue={onOpenIssue}
+        documentFollowUps={documentFollowUps}
       />
     );
   }
@@ -830,6 +833,7 @@ export default function Home({
       readOnly={readOnly}
       hosted={hosted}
       overview={overview}
+      documentFollowUps={documentFollowUps}
       onOpenIssue={onOpenIssue}
       onOpenDecision={onOpenDecision}
       decisions={decisions}
@@ -849,6 +853,7 @@ function MasterHome({
   readOnly,
   hosted = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
   decisions = false,
@@ -864,6 +869,7 @@ function MasterHome({
   credentialRequestsEnabled?: boolean;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
@@ -1570,6 +1576,7 @@ function MasterHome({
       <aside className="absolute rail:static min-w-0 rail:order-2 rail:h-full rail:min-h-0">
         <NeedsRail
           overview={overview}
+          documentFollowUps={documentFollowUps}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}

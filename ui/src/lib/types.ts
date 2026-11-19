@@ -549,9 +549,28 @@ export interface Monitoring {
   alerts: MonitorAlert[];
 }
 
+export interface DocumentFollowUp {
+  id: string;
+  version: number;
+  title: string;
+  project: string | null;
+  href: string;
+  /** Server-recorded time in epoch milliseconds. */
+  at: number;
+}
+
+export type DocumentFollowUps =
+  | {
+      status: "ready";
+      pending: DocumentFollowUp[];
+      recent: (DocumentFollowUp & { outcome: "approved" | "delivered" })[];
+    }
+  | { status: "unavailable" };
+
 /** `GET /api/overview` — everything derived, nothing stored. */
 export interface Overview {
   needs_me: NeedsMe[];
+  document_follow_ups?: DocumentFollowUps;
   drift: Drift;
   projects: OverviewProject[];
   github: {
@@ -957,6 +976,7 @@ export interface AgentDetail {
 export type Meta = Api.MetaResponse & {
   /** A hosted board sets this when its Worker serves /api/wiki. */
   wiki?: boolean;
+  wiki_managed_files?: true;
   /** Optional capability flags advertised by a hosted board's /api/meta. */
   my_work?: boolean;
   milestones?: boolean;

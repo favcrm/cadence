@@ -1176,6 +1176,10 @@ cadence --org acme artifact submit <art-id>
   `stage`, `type`, `typeConfirmed` and, for an unconfirmed type, `baseline`.
   The lifecycle is in [Delivery](delivery.md#document-review-for-non-code-work);
   the board side is in `docs/BOARD.md`.
+- On a Wiki-managed hosted board, a readable submitted version appears under
+  **Home → To do** for its effective approver. **Review** opens that exact Wiki
+  version. The owner sets the type's rule under **Settings → Workspace → General**.
+  Older hosted boards keep the original **Documents** workflow.
 - Submitting again answers the current stage and does not submit twice, so
   after a lost answer (exit 1) repeat the same command.
 - `document_lifecycle_unavailable` (exit 3) means the workspace has no document

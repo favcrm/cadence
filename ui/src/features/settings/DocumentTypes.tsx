@@ -202,12 +202,15 @@ export default function DocumentTypes({
   hosted,
   viewer,
   viewerSub,
+  modalDrawer = false,
 }: {
   /** The lifecycle is hosted only: a native board never reads the probe. */
   hosted: boolean;
   viewer: Viewer;
   /** The board session's subject (`meta.session.user.sub`). */
   viewerSub: string | null;
+  /** The policy page is inside a modal drawer rather than the legacy settings page. */
+  modalDrawer?: boolean;
 }) {
   const t = useTranslate();
   const probeState = useMaybeResource(hosted ? documentsProbe : null);
@@ -550,6 +553,7 @@ export default function DocumentTypes({
           baseline={answer.baseline}
           existing={types.map((row) => row.label)}
           roster={roster}
+          modal={modalDrawer}
           onClose={() => setOpen(null)}
           onSaved={(type) => {
             settleDrawer(open.token, type.label);
@@ -612,6 +616,7 @@ function TypeDrawer({
   existing,
   roster,
   onClose,
+  modal,
   onSaved,
   onUnsettled,
   onRosterChanged,
@@ -622,6 +627,7 @@ function TypeDrawer({
   baseline: DocumentBaseline;
   existing: string[];
   roster: Roster;
+  modal: boolean;
   onClose: () => void;
   onSaved: (type: DocumentType) => void;
   /** The write may have applied but its answer proves nothing; `quiet` for an
@@ -879,6 +885,8 @@ function TypeDrawer({
       kind="document-type"
       label={title}
       title={title}
+      modal={modal}
+      trapFocus={modal}
       tabs={[{ id: "details", label: title, panel: body }]}
       foot={foot}
       onClose={onClose}

@@ -41,6 +41,8 @@ export interface DrawerShellProps {
   scrim?: "outlet" | "board";
   /** The host traps focus inside the drawer (CAD-2186); announce it as modal. */
   modal?: boolean;
+  /** Own keyboard containment and dismissal for this modal, including nested drawers. */
+  trapFocus?: boolean;
   title: ReactNode;
   subtitle?: ReactNode;
   avatar?: ReactNode;
@@ -164,6 +166,7 @@ export default function DrawerShell(props: DrawerShellProps) {
     headRef.current?.focus();
   }, []);
   useEffect(() => {
+    if (props.trapFocus) return;
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
       // An Escape another control inside already handled (cancelled) is not
       // the drawer's. An open Select's Escape stops at the Select and never
@@ -175,7 +178,46 @@ export default function DrawerShell(props: DrawerShellProps) {
     };
     addEventListener("keydown", onKeyDown);
     return () => removeEventListener("keydown", onKeyDown);
-  }, [menuOpen, edit, requestClose]);
+  }, [menuOpen, edit, requestClose, props.trapFocus]);
+
+  const onModalKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!props.trapFocus || event.defaultPrevented) return;
+    const root = event.currentTarget;
+    const target = event.target as HTMLElement;
+    // A nested dialog owns its own keys. Portaled Select content still bubbles
+    // through React, but has no DOM ancestor dialog.
+    const dialog = target.closest('[role="dialog"]');
+    if (dialog && dialog !== root) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (menuOpen) setMenuOpen(false);
+      else if (edit != null) edit.onCancel();
+      else requestClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    event.stopPropagation();
+    const items = Array.from(root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    )).filter((element) => element.closest('[role="dialog"]') === root && element.getClientRects().length > 0);
+    const active = document.activeElement;
+    // A searchable Select moves focus to a portaled input. Continue from its
+    // combobox in the drawer rather than allowing Tab to escape to the page.
+    const controls = target.getAttribute("aria-controls");
+    const index = items.findIndex((element) => element === active ||
+      (controls !== null && element.getAttribute("role") === "combobox" && element.getAttribute("aria-controls") === controls));
+    if (items.length === 0) {
+      event.preventDefault();
+      headRef.current?.focus();
+    } else if (index === -1 || !root.contains(target) || (event.shiftKey ? index === 0 : index === items.length - 1)) {
+      event.preventDefault();
+      const next = index === -1
+        ? (event.shiftKey ? items.length - 1 : 0)
+        : (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
+      items[next]?.focus();
+    }
+  };
 
   const active = tabs.find((t) => t.id === tab) ?? tabs[0];
   const onTabKey = (e: KeyboardEvent, index: number) => {
@@ -207,6 +249,7 @@ export default function DrawerShell(props: DrawerShellProps) {
         data-mode={editing ? "edit" : "view"}
         data-closing={closing || undefined}
         onTransitionEnd={onTransitionEnd}
+        onKeyDown={props.trapFocus ? onModalKeyDown : undefined}
       >
         <header className="crm-drawer-top">
           <div className="crm-drawer-id">

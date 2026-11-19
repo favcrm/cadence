@@ -164,6 +164,7 @@ function PageBody({
   onOpen,
   setKickoff,
   hosted,
+  managedFiles,
   projectRepos,
   stagedActions,
 }: Props & {
@@ -387,6 +388,7 @@ function PageBody({
               images={images}
               files={files}
               readOnly={readOnly}
+              managedFiles={managedFiles}
               onWrite={onWrite}
               onError={onError}
             />

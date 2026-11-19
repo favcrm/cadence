@@ -3,13 +3,18 @@ import { useLocale } from "../../lib/locale";
 import Select from "../../ui/Select";
 import { setCompanyTimeZone, useTimeZones } from "../../lib/timeZone";
 import TimeZoneRow from "./TimeZoneRow";
+import Button from "../../ui/Button";
+import DrawerShell from "../app-shell/shared/DrawerShell";
+import DocumentTypes from "./DocumentTypes";
+import type { Viewer } from "../projects/work";
 
 /** Settings that apply to everyone in the workspace. */
-export default function General() {
+export default function General({ documentPolicy }: { documentPolicy?: { hosted: boolean; viewer: Viewer; viewerSub: string | null } } = {}) {
   const id = useId();
   const { organizationLocale, canSetOrganizationLocale, t, setPreference } = useLocale();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
+  const [policyOpen, setPolicyOpen] = useState(false);
   const zones = useTimeZones();
 
   const save = async (value: "en" | "zh-TW") => {
@@ -60,7 +65,14 @@ export default function General() {
             onSave={(zone) => (zone ? setCompanyTimeZone(zone) : Promise.resolve())}
           />
         )}
+        {documentPolicy && (
+          <div className="grid gap-3 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+            <div><h2 className="text-secondary font-medium text-ink-100">{t("Document policy")}</h2><p className="mt-0.5 text-label text-ink-500">{t("Manage approval and retention rules for document types.")}</p></div>
+            <Button onClick={() => setPolicyOpen(true)}>{t("Manage document types")}</Button>
+          </div>
+        )}
       </section>
+      {documentPolicy && policyOpen && <DrawerShell kind="document-policy" label={t("Document policy")} title={t("Manage document types")} scrim="board" modal trapFocus tabs={[{ id: "types", label: t("Document types"), panel: <DocumentTypes {...documentPolicy} modalDrawer /> }]} onClose={() => setPolicyOpen(false)} />}
     </main>
   );
 }
