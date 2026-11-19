@@ -3197,6 +3197,13 @@ chips above the composer (one status/remove icon slot each, +N more
 past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
 
+Below 640px, Home uses a one-row toolbar without a breadcrumb. The
+assistant header shows Latest when new activity arrives while a reader is
+away from the end, without covering or fading the thread.
+The floating dock puts attach, draft and send in one row. Longer drafts
+expand, and the thread keeps enough room below its last message to clear
+the dock and the Needs-you button.
+
 The shared turn bar (CAD-1700) names the conversation actually ahead of a
 queued message, including Home's server-issued thread id. The master queue
 projection includes every queued message, so a position beyond twenty still
