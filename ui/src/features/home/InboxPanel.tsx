@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { api } from "../../lib/api";
+import { inboxApi } from "./inboxApi";
 import { useTranslate } from "../../lib/locale";
 import type { AgentInboxFeed, AgentInboxMessage } from "../../lib/types";
 import Button from "../../ui/Button";
@@ -80,7 +80,7 @@ export default function InboxPanel({
     setActionError(null);
     setActionNotice(null);
     try {
-      await api.inboxAck({ alias: feed?.alias, through });
+      await inboxApi.ack({ alias: feed?.alias, through });
       await onRefresh();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : t("Could not update inbox cursor."));
@@ -101,14 +101,14 @@ export default function InboxPanel({
     setActionError(null);
     setActionNotice(null);
     try {
-      await api.inboxSend({
+      await inboxApi.send({
         to: target,
         text,
         kind: "reply",
         reply_to: feed?.alias,
       });
       if (msg.unread) {
-        await api.inboxAck({ alias: feed?.alias, through: msg.seq });
+        await inboxApi.ack({ alias: feed?.alias, through: msg.seq });
       }
       setReplyText("");
       setActionNotice(t("Reply sent to {target}.").replace("{target}", target));
@@ -126,7 +126,7 @@ export default function InboxPanel({
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await api.inboxPromote({ alias: feed?.alias, message: msg.id });
+      const res = await inboxApi.promote({ alias: feed?.alias, message: msg.id });
       setActionNotice(
         res.already_promoted
           ? t("Already tracked as {id}.").replace("{id}", res.issue)
@@ -148,7 +148,7 @@ export default function InboxPanel({
     setActionError(null);
     setActionNotice(null);
     try {
-      await api.inboxSend({
+      await inboxApi.send({
         to: effectiveTarget,
         text,
         kind: sendKind,

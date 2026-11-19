@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
-import { api } from "../../lib/api";
+import { inboxApi } from "./inboxApi";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, AgentInboxFeed, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
@@ -72,7 +72,7 @@ export default function NeedsRail({
   const refreshInbox = useCallback(async () => {
     setInboxLoading(true);
     try {
-      const next = await api.inbox({ limit: 50 });
+      const next = await inboxApi.feed({ limit: 50 });
       setInboxFeed(next);
       setInboxError(null);
     } catch (e) {
