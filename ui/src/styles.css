@@ -2575,10 +2575,9 @@ button.refchip:hover {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
   .header-breadcrumb { order: 1; flex: 0 0 100%; }
   .app-header[data-home-header] { min-height: 3rem; padding-block: 0; }
-  .app-header[data-home-header] .header-breadcrumb { display: none; }
+  .app-header[data-home-header] :is(.header-breadcrumb, .header-local-preferences) { display: none; }
   .app-header[data-home-header] .header-menu { margin-inline-end: auto; }
-  .app-header[data-home-header] .app-header-utilities { flex-wrap: wrap; max-width: 100%; }
-  .app-header[data-home-header="signed-in"] .app-header-utilities { margin-inline-start: 0; }
+  .app-header[data-home-header] .app-header-utilities { flex-wrap: wrap; max-width: 100%; margin-inline-start: 0; }
   .app-header[data-home-header] .header-icon { width: 2.75rem; height: 2.75rem; }
 }
 @media (width < 420px) {

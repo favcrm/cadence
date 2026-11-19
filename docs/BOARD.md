@@ -3197,9 +3197,10 @@ chips above the composer (one status/remove icon slot each, +N more
 past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
 
-Below 640px, Home hides its breadcrumb. The signed-in toolbar fits on
-one row; sign-in and language controls can wrap when needed. The master
-assistant header shows Latest when activity arrives while a reader is
+Below 640px, Home uses a one-row toolbar without a breadcrumb. A
+signed-out reader can still sign in from the toolbar and find language
+and theme choices in the navigation drawer. The master assistant header
+shows Latest when activity arrives while a reader is
 away from the end, without covering or fading the thread.
 The floating dock puts attach, draft and send in one row. Longer drafts
 expand, and the thread keeps enough room below its last message to clear
