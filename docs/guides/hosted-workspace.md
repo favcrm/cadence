@@ -741,7 +741,7 @@ app's records before retrying; do not blindly repeat an uncertain write. For
 Social Content draft create/update, the same request and material replay the
 first answer, while changed material is refused.
 
-### Review and revoke CRM customer sharing
+### Review and change CRM customer sharing
 
 Open a customer in the CRM workspace and choose **Customer sharing** in the
 Cadence shell. The installed app cannot open this panel or read its contents.
@@ -751,6 +751,13 @@ one grant, choose **Revoke access**, check the exact customer, recipient,
 permission and revision, then choose **Confirm removal**. Cancel leaves the
 policy unchanged. Revoking one grant does not remove access from other grants
 or workspace visibility.
+
+On a host that supports grants, choose **Add or edit access** and select a
+current workspace member and **Can view** or **Can edit**. Review the exact
+customer, recipient, permission and revision before confirming. The host
+checks the recipient again at confirmation; rejoining the workspace does not
+carry a pending grant forward. The picker does not offer teams, agents or
+integrations.
 
 A changed revision requires a new review. If the outcome is unknown, reload
 sharing before trying again. Older hosts can show read-only sharing when
