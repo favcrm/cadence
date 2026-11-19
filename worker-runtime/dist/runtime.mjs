@@ -54829,7 +54829,7 @@ function readOperationReply(sql, conversationId, operationId) {
     const message = entry.model[0];
     if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
       return unconfirmed;
-    if (!("stopReason" in message) || message.stopReason !== "stop" && message.stopReason !== "length" && message.stopReason !== "toolUse")
+    if (!("stopReason" in message) || message.stopReason !== "stop")
       return unconfirmed;
     let text = "";
     for (const part of message.content) {

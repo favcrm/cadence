@@ -2406,9 +2406,12 @@ describe("no-wake settlement acceptance", () => {
       database.prepare("UPDATE pi_entries SET record=json_set(record, '$.conversationId', 2) WHERE id=?").run(answer);
       expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
       database.prepare("UPDATE pi_entries SET record=json_set(record, '$.conversationId', 1) WHERE id=?").run(answer);
-      database.prepare("UPDATE pi_entries SET record=json_set(record, '$.model[0].stopReason', 'error') WHERE id=?").run(answer);
-      expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
-      database.prepare("UPDATE pi_entries SET record=json_set(record, '$.model[0].stopReason', 'stop') WHERE id=?").run(answer);
+      const setStopReason = database.prepare("UPDATE pi_entries SET record=json_set(record, '$.model[0].stopReason', ?) WHERE id=?");
+      for (const reason of ["error", "length", "toolUse"]) {
+        setStopReason.run(reason, answer);
+        expect(await session.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
+      }
+      setStopReason.run("stop", answer);
 
       const setInput = database.prepare("UPDATE pi_submissions SET record=json_set(record, '$.entry', ?) WHERE id=?");
       setInput.run(answer, first.id);
