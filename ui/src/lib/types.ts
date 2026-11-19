@@ -2027,6 +2027,9 @@ export interface AgentInboxMessage {
   state: string;
   unread: boolean;
   auto_answered: boolean;
+  decision_state?: "pending" | "approved" | "declined" | null;
+  decided_by?: string | null;
+  decision_reason?: string | null;
   issue: string | null;
   task_id: string | null;
   created: number;
@@ -2038,6 +2041,7 @@ export interface AgentInboxDirectoryEntry {
   provider: string;
   endpoint_kind: string;
   state: string;
+  checkin_auto_reply?: boolean;
   kind: "colleague" | "specialist" | string;
 }
 

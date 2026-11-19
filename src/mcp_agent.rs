@@ -190,6 +190,40 @@ pub fn run(state_dir: &Path) -> Result<i32> {
     Ok(0)
 }
 
+fn inbox_updated_notification(alias: &str, feed: &Value) -> Value {
+    let uri = inbox_resource_uri(alias);
+    let mut params = json!({
+        "uri": uri,
+        "seq": feed["tail_seq"].as_i64().unwrap_or(0),
+        "unread": feed["unread"].as_i64().unwrap_or(0),
+    });
+    if let Some(latest) = feed["messages"].as_array().and_then(|rows| rows.first()) {
+        if let Some(seq) = latest["seq"].as_i64() {
+            params["seq"] = json!(seq);
+        }
+        if let Some(id) = latest["id"].as_str() {
+            params["msgId"] = json!(id);
+        }
+        if let Some(kind) = latest["kind"].as_str() {
+            params["kind"] = json!(kind);
+        }
+        if let Some(from) = latest["sender"].as_str() {
+            params["from"] = json!(from);
+        }
+        if let Some(reply_to) = latest["reply_to"].as_str() {
+            params["replyTo"] = json!(reply_to);
+        }
+        if latest["auto_answered"].as_bool() == Some(true) {
+            params["autoAnswered"] = json!(true);
+        }
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/resources/updated",
+        "params": params
+    })
+}
+
 fn spawn_inbox_watcher(
     state_dir: PathBuf,
     alias: String,
@@ -198,7 +232,6 @@ fn spawn_inbox_watcher(
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let uri = inbox_resource_uri(&alias);
         let mut last_tail: Option<i64> = None;
         while !shutdown.load(Ordering::SeqCst) {
             if subscribed.load(Ordering::SeqCst) {
@@ -211,11 +244,7 @@ fn spawn_inbox_watcher(
                     let tail = feed["tail_seq"].as_i64().unwrap_or(0);
                     if let Some(prev) = last_tail {
                         if tail > prev {
-                            let notification = json!({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/resources/updated",
-                                "params": {"uri": uri}
-                            });
+                            let notification = inbox_updated_notification(&alias, &feed);
                             if !write_json_line(&stdout, &notification) {
                                 break;
                             }
@@ -270,13 +299,13 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
              "through":{"type":"integer","minimum":0,"description":"Watermark seq to acknowledge through."},
              "reader":{"type":"string","description":"Optional reader cursor name (default 'default')."}},
              "required":["through"],"additionalProperties":false}},
-        {"name":"message_send","description":"Send a durable Agent Inbox message (checkin, handoff, or reply) to a colleague's assistant or a specialist agent without creating a board ticket. Does not grant operator, steering, or approval authority.",
+        {"name":"message_send","description":"Send a durable Agent Inbox message (checkin, handoff, decision proposal, or reply) to a colleague's assistant or a specialist agent without creating a board ticket. Does not grant operator, steering, or approval authority; decision proposals require explicit human approval.",
          "inputSchema":{"type":"object","properties":{
              "to":{"type":"string","description":"Target assistant or specialist agent alias."},
              "text":{"type":"string","description":"Message body."},
-             "kind":{"type":"string","enum":["checkin","handoff","reply"],"description":"Lightweight message kind (default 'handoff' when artifact is set, otherwise 'checkin' or plain message)."},
+             "kind":{"type":"string","enum":["checkin","handoff","decision","reply"],"description":"Lightweight message kind (default 'handoff' when artifact is set, otherwise 'checkin' or plain message)."},
              "reply_to":{"type":"string","description":"Optional alias to route the reply back to."},
-             "artifact":{"type":"string","description":"Optional artifact or path reference attached to a handoff."}},
+             "artifact":{"type":"string","description":"Optional artifact or path reference attached to a handoff or decision proposal."}},
              "required":["to","text"],"additionalProperties":false}},
         {"name":"agent_directory","description":"List reachable colleagues' assistants and specialist agents in your workspace directory.",
          "inputSchema":{"type":"object","properties":{},"additionalProperties":false}}
@@ -795,10 +824,11 @@ fn message_send_params(args: &Value) -> Result<Value> {
         Some(raw) => match crate::inbox::InboxKind::parse(raw)? {
             crate::inbox::InboxKind::Checkin
             | crate::inbox::InboxKind::Handoff
+            | crate::inbox::InboxKind::Decision
             | crate::inbox::InboxKind::Reply => Some(raw.trim().to_ascii_lowercase()),
             other => {
                 return Err(Error::rejected(format!(
-                    "MCP message_send kind '{}' is not permitted — use checkin, handoff, or reply",
+                    "MCP message_send kind '{}' is not permitted — use checkin, handoff, decision, or reply",
                     other.as_str()
                 )))
             }
@@ -1073,9 +1103,43 @@ mod tests {
             message_send_params(&json!({"to": "fin", "text": "hi", "priority": "urgent"})).is_err()
         );
         assert!(
-            message_send_params(&json!({"to": "fin", "text": "hi", "kind": "decision"})).is_err()
+            message_send_params(&json!({"to": "fin", "text": "hi", "kind": "message"})).is_err()
         );
         assert!(message_send_params(&json!({"to": "--flag", "text": "hi"})).is_err());
+
+        // Specialist decision proposals are allowed as proposal-only envelopes (no write authority).
+        let decision_req = message_send_params(&json!({
+            "to": "master",
+            "text": "Book supplier invoice #4821 ($2,400)?",
+            "kind": "decision",
+            "reply_to": "finance-agent"
+        }))
+        .unwrap();
+        assert_eq!(decision_req["kind"], "decision");
+
+        // MCP resource update notification includes seq, msgId, kind, from, replyTo.
+        let notif = inbox_updated_notification(
+            "assistant-a",
+            &json!({
+                "tail_seq": 9,
+                "unread": 2,
+                "messages": [{
+                    "seq": 9,
+                    "id": "msg-9",
+                    "kind": "handoff",
+                    "sender": "assistant-b",
+                    "reply_to": "assistant-b",
+                    "auto_answered": false
+                }]
+            }),
+        );
+        assert_eq!(notif["method"], "notifications/resources/updated");
+        assert_eq!(notif["params"]["uri"], "cadence://inbox/assistant-a");
+        assert_eq!(notif["params"]["seq"], 9);
+        assert_eq!(notif["params"]["msgId"], "msg-9");
+        assert_eq!(notif["params"]["kind"], "handoff");
+        assert_eq!(notif["params"]["from"], "assistant-b");
+        assert_eq!(notif["params"]["replyTo"], "assistant-b");
 
         // Valid calls produce exact daemon RPC payloads.
         let feed_req = inbox_list_params(

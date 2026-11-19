@@ -442,6 +442,35 @@ impl Store {
         })
     }
 
+    /// CAD-2476: record an operator's explicit decision (`approved` or
+    /// `declined`) on a specialist `decision` proposal in the inbox.
+    pub fn record_inbox_decision(
+        &self,
+        alias: &str,
+        message_id: &str,
+        decision: &str,
+        reason: Option<&str>,
+        by: &str,
+    ) -> Result<()> {
+        if !matches!(decision, "approved" | "declined") {
+            return Err(Error::rejected(
+                "inbox decision must be 'approved' or 'declined'",
+            ));
+        }
+        self.write_tx(|conn| {
+            let mut payload = json!({
+                "message": message_id,
+                "decision": decision,
+                "by": by,
+            });
+            if let Some(r) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+                payload["reason"] = json!(r);
+            }
+            Self::event(&conn, alias, "inbox_decision", payload)?;
+            Ok(())
+        })
+    }
+
     /// CAD-2476: durable Agent Inbox feed for ANY registered agent or
     /// assistant (active or passive). Returns newest-first bounded messages
     /// enriched with lightweight `kind` (`checkin`, `handoff`, `decision`,
@@ -465,14 +494,16 @@ impl Store {
             let cursor = readers[reader]["through"].as_i64().unwrap_or(0);
             let parked = self.inbox_parked_in(&conn, alias, reader)?;
 
-            // Load lightweight envelope metadata and optional ticket promotions.
+            // Load lightweight envelope metadata, optional ticket promotions, and decisions.
             let mut envelopes: std::collections::HashMap<String, Value> =
                 std::collections::HashMap::new();
             let mut promoted: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut decisions: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
             let meta_rows = conn.query_vec(
                 "SELECT kind, payload FROM events WHERE alias=?
-                 AND kind IN ('inbox_envelope','inbox_promoted') ORDER BY seq",
+                 AND kind IN ('inbox_envelope','inbox_promoted','inbox_decision') ORDER BY seq",
                 [alias],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?;
@@ -489,6 +520,8 @@ impl Store {
                     if let Some(issue) = v["issue"].as_str() {
                         promoted.insert(mid.to_string(), issue.to_string());
                     }
+                } else if kind == "inbox_decision" {
+                    decisions.insert(mid.to_string(), v);
                 }
             }
 
@@ -575,6 +608,20 @@ impl Store {
                 } else {
                     m.body.clone()
                 };
+                let decision_ev = decisions.get(&m.id);
+                let decision_state = if let Some(ev) = decision_ev {
+                    ev["decision"].as_str().map(str::to_string)
+                } else if kind == "decision" {
+                    Some("pending".to_string())
+                } else {
+                    None
+                };
+                let decided_by = decision_ev
+                    .and_then(|ev| ev["by"].as_str())
+                    .map(str::to_string);
+                let decision_reason = decision_ev
+                    .and_then(|ev| ev["reason"].as_str())
+                    .map(str::to_string);
                 items.push(json!({
                     "seq": m.seq,
                     "id": m.id,
@@ -591,6 +638,9 @@ impl Store {
                     "state": m.state,
                     "unread": is_unread,
                     "auto_answered": auto_answered,
+                    "decision_state": decision_state,
+                    "decided_by": decided_by,
+                    "decision_reason": decision_reason,
                     "issue": promoted_issue,
                     "task_id": m.task_id,
                     "created": m.created,
@@ -620,7 +670,7 @@ impl Store {
         colleague_aliases: &std::collections::HashSet<String>,
     ) -> Result<Value> {
         let rows = conn.query_vec(
-            "SELECT alias, role, team_role, provider, endpoint_kind, state
+            "SELECT alias, role, team_role, provider, endpoint_kind, state, params
              FROM agents ORDER BY alias",
             [],
             |row| {
@@ -631,15 +681,24 @@ impl Store {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )?;
         let mut colleagues = Vec::new();
         let mut specialists = Vec::new();
-        for (alias, role, team_role, provider, endpoint_kind, state) in rows {
+        for (alias, role, team_role, provider, endpoint_kind, state, raw_params) in rows {
             if alias == self_alias {
                 continue;
             }
+            let checkin_auto_reply = raw_params
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .and_then(|v| {
+                    v.pointer("/inbox/checkin_auto_reply")
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false);
             let is_colleague = colleague_aliases.contains(&alias)
                 || alias.starts_with("assist-")
                 || alias.starts_with("assist_");
@@ -649,6 +708,7 @@ impl Store {
                 "provider": provider,
                 "endpoint_kind": endpoint_kind,
                 "state": state,
+                "checkin_auto_reply": checkin_auto_reply,
                 "kind": if is_colleague {
                     "colleague"
                 } else {

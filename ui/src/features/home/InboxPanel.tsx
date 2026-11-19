@@ -140,6 +140,29 @@ export default function InboxPanel({
     }
   };
 
+  const handleDecide = async (msg: AgentInboxMessage, decision: "approved" | "declined") => {
+    if (readOnly || busyId) return;
+    setBusyId(`decide:${msg.id}:${decision}`);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      await inboxApi.decide({ alias: feed?.alias, message: msg.id, decision });
+      if (msg.unread) {
+        await inboxApi.ack({ alias: feed?.alias, through: msg.seq });
+      }
+      setActionNotice(
+        decision === "approved"
+          ? t("Approved proposal from {sender}.").replace("{sender}", msg.sender)
+          : t("Declined proposal from {sender}.").replace("{sender}", msg.sender),
+      );
+      await onRefresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : t("Could not record decision."));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     const text = sendText.trim();
@@ -371,6 +394,15 @@ export default function InboxPanel({
                     {msg.auto_answered && (
                       <span className="chip bg-ok/10 text-ok">{t("auto-replied")}</span>
                     )}
+                    {msg.decision_state === "pending" && (
+                      <span className="chip bg-warn/15 text-warn">{t("needs approval")}</span>
+                    )}
+                    {msg.decision_state === "approved" && (
+                      <span className="chip bg-ok/15 text-ok">{t("approved")}</span>
+                    )}
+                    {msg.decision_state === "declined" && (
+                      <span className="chip bg-fail/15 text-fail">{t("declined")}</span>
+                    )}
                     {msg.issue ? (
                       <span className="chip bg-accent/15 text-accent num">{msg.issue}</span>
                     ) : (
@@ -398,6 +430,31 @@ export default function InboxPanel({
                     )}
                     {!readOnly && (
                       <>
+                        {msg.kind === "decision" && msg.decision_state === "pending" && (
+                          <div className="flex flex-wrap items-center gap-1.5" data-inbox-decision>
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              loading={busyId === `decide:${msg.id}:approved`}
+                              disabled={busyId !== null}
+                              onClick={() => void handleDecide(msg, "approved")}
+                            >
+                              {t("Approve")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              loading={busyId === `decide:${msg.id}:declined`}
+                              disabled={busyId !== null}
+                              onClick={() => void handleDecide(msg, "declined")}
+                            >
+                              {t("Decline")}
+                            </Button>
+                            <span className="text-micro text-ink-500">
+                              {t("Approval required before write")}
+                            </span>
+                          </div>
+                        )}
                         <div className="flex items-center gap-1.5">
                           <input
                             type="text"

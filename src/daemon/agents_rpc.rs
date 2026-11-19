@@ -1553,6 +1553,78 @@ impl Shared {
         }))
     }
 
+    /// CAD-2476: record the operator's explicit decision (`approved` or
+    /// `declined`) on a specialist `decision` proposal in the inbox.
+    /// Strictly operator-only: peer messages and agent callers NEVER hold
+    /// approval authority.
+    pub(super) fn rpc_inbox_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_decide")?;
+        if !matches!(who, crate::peer::AgentCaller::Operator) {
+            return Err(Error::rejected(
+                "agent_inbox_decide is an operator action — agents cannot approve or decline inbox decisions",
+            ));
+        }
+        let message_id = required_str(params, "message")?;
+        let decision = required_str(params, "decision")?;
+        let reason = optional_str(params, "reason");
+        let existing = self
+            .store
+            .message(message_id)?
+            .ok_or_else(|| Error::rejected(format!("no such inbox message '{message_id}'")))?;
+        if existing.alias != alias {
+            return Err(Error::rejected(format!(
+                "message '{message_id}' does not belong to '{alias}'"
+            )));
+        }
+        self.store
+            .record_inbox_decision(&alias, message_id, decision, reason, "operator")?;
+        // Notify the proposing specialist via a correlated reply when `reply_to`
+        // names a registered agent (still without granting any write authority).
+        let mut routed_reply: Option<String> = None;
+        if let Some(target) = existing
+            .reply_to
+            .as_deref()
+            .filter(|t| *t != alias && self.store.agent_opt(t).ok().flatten().is_some())
+        {
+            let reply_id = format!("decision-{decision}-{message_id}");
+            let reply_body = match reason.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(r) => format!("Operator {decision} proposal {message_id}: {r}"),
+                None => format!("Operator {decision} proposal {message_id}."),
+            };
+            let _ = self.store.enqueue_sent(
+                target,
+                &reply_body,
+                Some(&alias),
+                &reply_id,
+                "inbox_decision",
+                None,
+                &crate::store::Sender::Operator,
+            )?;
+            self.store.record_inbox_envelope(
+                target,
+                &reply_id,
+                crate::inbox::InboxKind::Reply,
+                None,
+                false,
+            )?;
+            self.notify_agent(target);
+            routed_reply = Some(reply_id);
+        }
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "message": message_id,
+            "decision": decision,
+            "reason": reason,
+            "by": "operator",
+            "reply_message": routed_reply,
+        }))
+    }
+
     /// The resume path shared by `agent_resume` and `agent_unfence`:
     /// inbox guard, ownership/fence checks, then start the actor.
     /// Returns whether the actor started — a failed start records

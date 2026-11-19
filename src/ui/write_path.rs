@@ -1367,6 +1367,7 @@ pub(crate) fn write_route(
                 Some(caller) => super::inbox::promote(&mut request, state_dir, pm_dir, caller),
                 None => err_response(500, "unadmitted write"),
             },
+            RouteId::InboxDecide => super::inbox::decide(&mut request, state_dir),
         };
         send(request, resp);
         return;

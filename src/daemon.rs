@@ -4656,6 +4656,7 @@ impl Shared {
             "agent_inbox_feed" => self.rpc_inbox_feed(params, peer_pid),
             "agent_inbox_mark" => self.rpc_inbox_mark(params, peer_pid),
             "agent_inbox_promote" => self.rpc_inbox_promote(params, peer_pid),
+            "agent_inbox_decide" => self.rpc_inbox_decide(params, peer_pid),
             "message_read" => self.rpc_message_read(params, peer_pid),
             "message_list" => self.rpc_message_list(params, peer_pid),
             "message_report" => self.rpc_message_report(params, peer_pid),

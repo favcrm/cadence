@@ -85,7 +85,7 @@ async function main() {
         seq: 2,
         id: "msg-fin-2",
         alias: "master",
-        kind: "checkin",
+        kind: "decision",
         sender: "finance-agent",
         sender_uid: null,
         sender_kind: "specialist",
@@ -97,6 +97,9 @@ async function main() {
         state: "done",
         unread: true,
         auto_answered: false,
+        decision_state: "pending",
+        decided_by: null,
+        decision_reason: null,
         issue: null,
         task_id: null,
         created: now - 60,
@@ -178,6 +181,17 @@ async function main() {
         messages: state.messages.map((m) => (m.id === msgId ? { ...m, issue: "CAD-901" } : m)),
       };
       return okJson({ ok: true, alias: "master", message: msgId, issue: "CAD-901" });
+    }
+    if (url === "/api/inbox/decide" && method === "POST") {
+      const msgId = String((body as { message?: string }).message ?? "");
+      const decision = (body as { decision?: "approved" | "declined" }).decision ?? "approved";
+      state = {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === msgId ? { ...m, decision_state: decision, decided_by: "operator" } : m,
+        ),
+      };
+      return okJson({ alias: "master", message: msgId, decision, by: "operator" });
     }
     if (url === "/api/inbox/send" && method === "POST") {
       return okJson({ ok: true, id: "msg-sent-3", seq: 3 });
@@ -299,6 +313,108 @@ async function main() {
       issueLink.click();
     });
     assert(openedIssues[0] === "CAD-901", "Clicking promoted issue link should open CAD-901");
+
+    // Switch to Specialists filter and approve finance-agent decision proposal
+    const specialistsBtn = Array.from(host.querySelectorAll("[data-agent-inbox] button")).find(
+      (b) => b.textContent?.trim() === "Specialists",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      specialistsBtn.click();
+    });
+    const finRow = host.querySelector("[data-inbox-list] > li") as HTMLLIElement;
+    assert(finRow && finRow.textContent?.includes("needs approval"), "Pending specialist decision should show needs approval");
+    await act(async () => {
+      (finRow.querySelector("button") as HTMLButtonElement).click();
+    });
+    const approveBtn = Array.from(finRow.querySelectorAll("[data-inbox-decision] button")).find(
+      (b) => b.textContent?.trim() === "Approve",
+    ) as HTMLButtonElement;
+    assert(approveBtn, "Approve button should appear on pending decision proposal");
+    await act(async () => {
+      approveBtn.click();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    assert(
+      calls.some(
+        (c) =>
+          c.url === "/api/inbox/decide" &&
+          (c.body as { message?: string; decision?: string })?.message === "msg-fin-2" &&
+          (c.body as { decision?: string })?.decision === "approved",
+      ),
+      "Approve should POST /api/inbox/decide with decision=approved",
+    );
+    assert(finRow.textContent?.includes("approved"), "Decision chip should update to approved");
+
+    // Switch back to To do tab, simulate a new unread arrival, and confirm foreground toast appears
+    const todoTab = Array.from(host.querySelectorAll(".todo-tabs button")).find((b) =>
+      b.textContent?.includes("To do"),
+    ) as HTMLButtonElement;
+    await act(async () => {
+      todoTab.click();
+    });
+    state = {
+      ...state,
+      tail_seq: 3,
+      unread: 1,
+      messages: [
+        {
+          seq: 3,
+          id: "msg-maya-3",
+          alias: "master",
+          kind: "checkin",
+          sender: "assist-maya",
+          sender_uid: null,
+          sender_kind: "colleague",
+          recipient: "master",
+          reply_to: "assist-maya",
+          origin: null,
+          body: "Quick check-in: ready for 4pm sync?",
+          artifact: null,
+          state: "done",
+          unread: true,
+          auto_answered: false,
+          issue: null,
+          task_id: null,
+          created: now,
+        },
+        ...state.messages,
+      ],
+    };
+    const refreshedOverview: ResourceState<Overview> = {
+      ...overview,
+      data: { ...(overview.data as Overview), generated_at: now + 5 } as unknown as Overview,
+    };
+    await act(async () => {
+      root.render(
+        React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(NeedsRail, {
+            overview: refreshedOverview,
+            readOnly: false,
+            onOpenIssue: (id: string) => openedIssues.push(id),
+            overviewHref: "/overview",
+            permissionsHref: "/settings",
+            onAsk: () => {},
+            onOpenDecision: () => {},
+            collapsed: false,
+            onToggleCollapse: () => {},
+            onAskAgent: () => {},
+          }),
+        ),
+      );
+      await new Promise((r) => setTimeout(r, 25));
+    });
+    const toast = host.querySelector("[data-inbox-toast]");
+    assert(toast && toast.textContent?.includes("assist-maya"), "Foreground toast should appear when unattended");
+    const openInboxBtn = Array.from(toast.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Open Inbox",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      openInboxBtn.click();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    assert(!host.querySelector("[data-inbox-toast]"), "Toast should clear once Inbox is opened");
 
     console.log("agentInbox: passed");
   } finally {

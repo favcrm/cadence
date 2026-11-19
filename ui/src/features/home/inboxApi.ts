@@ -73,4 +73,10 @@ export const inboxApi = {
     write<Record<string, unknown>>("/api/inbox/ack", body),
   promote: (body: { alias?: string; message: string; project?: string; title?: string }) =>
     write<AgentInboxPromoteResult>("/api/inbox/promote", body),
+  decide: (body: {
+    alias?: string;
+    message: string;
+    decision: "approved" | "declined";
+    reason?: string;
+  }) => write<Record<string, unknown>>("/api/inbox/decide", body),
 };

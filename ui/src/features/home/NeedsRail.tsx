@@ -69,10 +69,23 @@ export default function NeedsRail({
   const [inboxFeed, setInboxFeed] = useState<AgentInboxFeed | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
   const [inboxError, setInboxError] = useState<string | null>(null);
+  const [inboxToast, setInboxToast] = useState<{ sender: string; kind: string; body: string } | null>(null);
+  const lastSeenInboxTail = useRef<number | null>(null);
+  const tabRef = useRef<"todo" | "inbox" | "updates">("todo");
+  tabRef.current = tab;
   const refreshInbox = useCallback(async () => {
     setInboxLoading(true);
     try {
       const next = await inboxApi.feed({ limit: 50 });
+      const prevTail = lastSeenInboxTail.current;
+      if (prevTail !== null && next.tail_seq > prevTail && next.unread > 0) {
+        const newest = next.messages.find((m) => m.seq > prevTail && m.unread);
+        // Foreground toast only when the Inbox tab is not actively attended.
+        if (newest && tabRef.current !== "inbox") {
+          setInboxToast({ sender: newest.sender, kind: newest.kind, body: newest.body });
+        }
+      }
+      lastSeenInboxTail.current = next.tail_seq;
       setInboxFeed(next);
       setInboxError(null);
     } catch (e) {
@@ -178,7 +191,10 @@ export default function NeedsRail({
   const showTab = (next: "todo" | "inbox" | "updates") => {
     setTab(next);
     if (next === "updates") homeDecisions.clearNotice();
-    if (next === "inbox") void refreshInbox();
+    if (next === "inbox") {
+      setInboxToast(null);
+      void refreshInbox();
+    }
   };
   // Updates on screen is Updates viewed: a failed write stops asking for attention.
   useEffect(() => {
@@ -639,6 +655,41 @@ export default function NeedsRail({
         </>
       )}
 
+      {inboxToast && tab !== "inbox" && (
+        <div
+          role="status"
+          data-inbox-toast
+          className="fixed bottom-4 right-4 z-40 max-w-sm rounded-lg border border-ink-700 bg-ink-900 px-3 py-2.5 shadow-lg flex items-start gap-2.5"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 text-micro text-ink-300">
+              <span className="font-medium text-ink-100 truncate">{inboxToast.sender}</span>
+              <span className="chip bg-accent/15 text-accent">{inboxToast.kind}</span>
+            </div>
+            <p className="text-label text-ink-200 line-clamp-2 break-words mt-0.5">{inboxToast.body}</p>
+            <div className="mt-1.5 flex items-center gap-2">
+              <button
+                type="button"
+                className="lnk text-micro"
+                onClick={() => {
+                  setInboxToast(null);
+                  if (collapsed) onToggleCollapse();
+                  showTab("inbox");
+                }}
+              >
+                {t("Open Inbox")}
+              </button>
+              <button
+                type="button"
+                className="lnk text-micro text-ink-400"
+                onClick={() => setInboxToast(null)}
+              >
+                {t("Dismiss")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

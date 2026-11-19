@@ -7,6 +7,8 @@
 //! - `POST /api/inbox/ack` — advance the read watermark (`through` seq)
 //! - `POST /api/inbox/promote` — opt-in promotion of an inbox message to a
 //!   tracked board issue
+//! - `POST /api/inbox/decide` — operator approval or decline of a specialist
+//!   `decision` proposal in the inbox
 //!
 //! Every route is `OperatorOnly` in [`super::endpoints`]; request bodies use
 //! `#[serde(deny_unknown_fields)]` so no forged sender, actor, or steering
@@ -51,6 +53,15 @@ struct InboxPromoteReq {
     message: String,
     project: Option<String>,
     title: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxDecideReq {
+    alias: Option<String>,
+    message: String,
+    decision: String,
+    reason: Option<String>,
 }
 
 fn valid_alias(value: &str) -> bool {
@@ -379,5 +390,52 @@ fn default_promote_title(msg: &Value, body: &str) -> String {
         )
     } else {
         cleaned
+    }
+}
+
+/// `POST /api/inbox/decide` — operator approval or decline of a specialist
+/// `decision` proposal in the inbox.
+pub(super) fn decide(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: InboxDecideReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let alias = req
+        .alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::master::ALIAS);
+    if !valid_alias(alias) {
+        return err_response(400, "bad agent alias");
+    }
+    let message_id = req.message.trim();
+    if message_id.is_empty() {
+        return err_response(400, "message id is required");
+    }
+    let decision = req.decision.trim();
+    if !matches!(decision, "approved" | "declined") {
+        return err_response(400, "decision must be 'approved' or 'declined'");
+    }
+    let mut rpc_req = json!({
+        "alias": alias,
+        "message": message_id,
+        "decision": decision,
+    });
+    if let Some(r) = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        rpc_req["reason"] = json!(r);
+    }
+    match client::rpc(state_dir, "agent_inbox_decide", rpc_req) {
+        Ok(reply) => json_response(reply),
+        Err(error) => home::rpc_err(&error, "agent_inbox_decide"),
     }
 }
