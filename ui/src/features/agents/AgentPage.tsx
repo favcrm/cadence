@@ -263,6 +263,13 @@ export default function AgentPage({
     hired,
     operator: operator === true,
     writable: operator === true && boardBlock === null && !rosterStale,
+    // Why the page is read-only, from what it already knows; null when it isn't.
+    readOnlyReason:
+      operator === false
+        ? "Only the operator can edit instructions."
+        : operator === null
+          ? "We couldn’t confirm your access"
+          : (boardBlock ?? (rosterStale ? "The board isn’t answering, so instructions are read-only for now." : null)),
     toast: onToast,
     stats,
     // Without a roster row nothing is known about the agent, so this reads as

@@ -2,7 +2,7 @@
  * CAD-2091: the Instructions editor on a hosted profile, through the real hook
  * and component against a fake board. The things a person feels: Save only on a
  * change, a stale revision keeps the draft and asks, a dropped connection never
- * says saved, the caret survives Preview, and the document cannot inject HTML.
+ * says saved, the caret survives, and the document cannot inject HTML.
  */
 import type * as HappyDom from "happy-dom";
 import type * as ReactNs from "react";
@@ -118,7 +118,7 @@ async function main() {
   await type(stored.responsibilities);
   assert(!button("Save"), "typing back to the stored text removes Save");
 
-  // Caret and draft survive a re-render and Preview; Preview cannot inject HTML.
+  // Caret and draft survive a re-render; the document is plain text, never HTML.
   const hostile = "# Hi\n\n<img src=x onerror=alert(1)> <script>boom()</script>\n\n**bold** line";
   await type(hostile);
   const before = area();
@@ -126,14 +126,9 @@ async function main() {
   before.dispatchEvent(new Event("select", { bubbles: true }));
   await render(true, 1);
   assert(area() === before && area().selectionStart === 5, "a re-render keeps the same textarea and caret");
-  await click("Preview");
-  const preview = host.querySelector(".ap-doc-preview")!;
-  assert(preview, "Preview shows");
-  assert(!preview.querySelector("img") && !preview.querySelector("script"), "Preview renders no raw HTML element");
-  assert(preview.querySelector("strong"), "Preview renders the Markdown");
-  assert(area() === before && area().hidden, "the textarea stays mounted, hidden");
-  await click("Edit");
-  assert(area().value === hostile && area().selectionStart === 5, "the draft and caret are back on Edit");
+  assert(!button("Preview") && !button("Edit"), "there is no Edit or Preview toggle");
+  assert(!host.querySelector("img") && !host.querySelector("script"), "the text is never rendered as HTML");
+  assert(area().value === hostile && !area().hidden, "the draft is in the textarea");
 
   // A stale revision keeps the draft and asks; nothing is overwritten.
   await type("# Ads\n\nMine.");
@@ -221,20 +216,11 @@ async function main() {
   assert(!button("Save")?.disabled, "and comes back when the board does");
   await click("Discard");
 
-  // Preview drops a javascript: link; a reader gets no inert Edit.
-  await type("[click](javascript:alert(1)) and [ok](https://example.com)");
-  await click("Preview");
-  assert(![...host.querySelectorAll(".ap-doc-preview a")].some((a) => (a.getAttribute("href") ?? "").startsWith("javascript:")), "a javascript: link is not a link");
-  await click("Discard");
-
   // A viewer reads it and cannot change it.
-  await click("Edit");
   await render(false);
   assert(area().readOnly && !button("Save") && !button("Discard"), "a viewer reads, and has no write action");
-  assert(!button("Edit"), "a reader has no inert Edit toggle");
-  assert(button("Preview") && !button("Preview")!.hidden && area().value.length > 0 && !area().hidden, "a reader still reads the text by default, and can preview it");
-  await click("Preview");
-  assert(host.querySelector(".ap-doc-preview"), "a reader gets Preview");
+  assert(!button("Edit") && !button("Preview"), "a reader has no toggle");
+  assert(!area().hidden && area().value.length > 0, "a reader reads the same textarea");
 
   // Native has no revision: a 409 there is a refusal, not use-theirs or save-mine.
   nativeMode = true;
