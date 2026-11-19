@@ -3468,12 +3468,15 @@ button.turnsource:hover {
   line-clamp: 6;
   overflow: hidden;
 }
-.turncard-message[data-message-kind="email"] .turncard-message-text {
+.turncard-message-box {
+  max-width: 100%;
+}
+.turncard-message[data-message-kind="email"] .turncard-message-box {
   padding: .5rem .625rem;
   border-left: 2px solid var(--color-ink-700);
 }
 /* A message reads as the bubble the recipient will see. */
-.turncard-message[data-message-kind="message"] .turncard-message-text {
+.turncard-message[data-message-kind="message"] .turncard-message-box {
   max-width: 85%;
   padding: .45rem .625rem;
   border-radius: .5rem .5rem .5rem .125rem;

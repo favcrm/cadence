@@ -171,6 +171,18 @@ check(
     createElement(StagedSourceContext.Provider, { value: sourceWith([sent]) }, createElement(TurnStagedCards, { toolEntries: [result(`{"staged":true,"actionId":"${ID}"}`)], density: "full" })),
   );
   check(sentHtml.includes(">Sent<") && !sentHtml.includes("data-outside-domain"), `an applied send reads Sent: ${sentHtml}`);
+  check(!sentHtml.includes("data-staged-body-toggle") && !sentHtml.includes("data-clamped"), "a short body has no toggle and no clamp");
+  check(html.includes('class="turncard-message-box"'), "the padding sits on the box, not the clamped text");
+}
+
+// CAD-2463 QA: an attachment chip's tooltip is the full id, named or not.
+{
+  const id = "chf-121800f2fb54c8d375f53e115e0a4909";
+  const sources = turnSources([call(`chat_attachment_read {"id":"${id}"}`)], new Map([[id, "Quote Q-0140.pdf"]]));
+  const named = sourcesHtml({ sources, artifacts: [] });
+  check(named.includes("<bdi>Quote Q-0140.pdf</bdi>") && named.includes(`title="${id}"`), `the named chip keeps the full id in its tooltip: ${named}`);
+  const bare = sourcesHtml({ sources: turnSources([call(`chat_attachment_read {"id":"${id}"}`)]), artifacts: [] });
+  check(bare.includes("<bdi>chf-121800f2…</bdi>") && bare.includes(`title="${id}"`), "the short-id chip keeps the full id in its tooltip");
 }
 
 console.log("turnRichCards: ok");

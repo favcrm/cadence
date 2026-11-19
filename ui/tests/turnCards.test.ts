@@ -1,7 +1,7 @@
 import { parsePreview, parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
 import type { ThreadEntry } from "../src/features/home/thread";
 declare function require(name: string): any;
-import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, attachmentNames, outsideDomainRecipients, parseToolCall, shortId, stagedAccount, stagedFields, stagedInTurn, stagedStatus, turnSources } from "../src/features/home/turnCards";
+import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, attachmentNames, bodyNeedsClamp, outsideDomainRecipients, parseToolCall, shortId, stagedAccount, stagedFields, stagedInTurn, stagedStatus, turnSources } from "../src/features/home/turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): a turn's sources and staged
@@ -231,5 +231,10 @@ check(parsePreview({ kind: "fields", fields: Array.from({ length: 20 }, (_, i) =
   check(stagedStatus(effect("send", "pending"), "pending", "Waiting") === "Waiting", "pending keeps the rail's word");
   check(stagedStatus(appRow(ACTION)!, "applied", "Applied") === "Applied", "an app write keeps the rail's word");
 }
+
+// CAD-2463 QA: "Show full message" only when the body is long enough to clamp.
+check(!bodyNeedsClamp("Hi Mr Lee,\nsee you at 3pm."), "a short body does not clamp");
+check(bodyNeedsClamp("x\n".repeat(7)), "seven lines clamp");
+check(bodyNeedsClamp("x".repeat(401)), "a long single paragraph clamps");
 
 console.log("turnCards: ok");

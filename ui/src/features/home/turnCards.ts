@@ -271,6 +271,18 @@ export function stagedFields(write: StagedWrite): { fields: StagedField[]; more:
   return { fields: all.slice(0, STAGED_FIELDS_SHOWN), more: Math.max(0, all.length - STAGED_FIELDS_SHOWN), body };
 }
 
+/** The body clamps at this many lines; about this many characters fill them. */
+export const BODY_CLAMP_LINES = 6;
+const BODY_CLAMP_CHARS = 400;
+
+/**
+ * Whether a body is long enough to clamp, so "Show full message" only
+ * appears when it would reveal something (CAD-2463 QA).
+ */
+export function bodyNeedsClamp(body: string): boolean {
+  return body.split("\n").length > BODY_CLAMP_LINES || body.length > BODY_CLAMP_CHARS;
+}
+
 /** The sending account a connected effect names, if any. */
 export function stagedAccount(write: StagedWrite): string | null {
   const account = write.connected?.preview?.account ?? write.connected?.account ?? null;

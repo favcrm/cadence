@@ -11,7 +11,7 @@ import { stagedChipView } from "../decisions/stagedRef";
 import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
 import { openAttachmentInTab } from "./AttachmentMedia";
 import type { ThreadEntry } from "./thread";
-import { SOURCES_SHOWN, outsideDomainRecipients, stagedAccount, stagedFields, stagedInTurn, stagedStatus, type TurnSource } from "./turnCards";
+import { SOURCES_SHOWN, bodyNeedsClamp, outsideDomainRecipients, stagedAccount, stagedFields, stagedInTurn, stagedStatus, type TurnSource } from "./turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): under a finished answer, what
@@ -65,7 +65,7 @@ function SourceChip({
     </>
   );
   // The tooltip carries the full identity a shortened label leaves out.
-  const tip = source.kind === "web" || source.kind === "artifact" ? source.target : label;
+  const tip = source.kind === "web" || source.kind === "artifact" || source.kind === "attachment" ? source.target : label;
   const attrs = { className: "turnsource", "data-source-kind": source.kind, title: tip };
   switch (source.kind) {
     case "wiki":
@@ -154,6 +154,7 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
   const account = stagedAccount(write);
   const outside = outsideDomainRecipients(write);
   const status = stagedStatus(write, view.outcome, view.status);
+  const clampable = body !== null && bodyNeedsClamp(body);
   return (
     <TurnCard
       kind="staged"
@@ -208,12 +209,18 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
       )}
       {body !== null && (
         <div className="turncard-message" data-message-kind={preview?.kind ?? "fields"}>
-          <p className="turncard-message-text" data-clamped={fullBody ? undefined : ""}>
-            <bdi>{body}</bdi>
-          </p>
-          <button type="button" className="lnk text-label" data-staged-body-toggle aria-expanded={fullBody} onClick={() => setFullBody((v) => !v)}>
-            {fullBody ? t("Show less") : t("Show full message")}
-          </button>
+          {/* The box carries the padding and the bubble; the text inside is what clamps,
+              so a clipped line never shows in the padding. */}
+          <div className="turncard-message-box">
+            <p className="turncard-message-text" data-clamped={clampable && !fullBody ? "" : undefined}>
+              <bdi>{body}</bdi>
+            </p>
+          </div>
+          {clampable && (
+            <button type="button" className="lnk text-label" data-staged-body-toggle aria-expanded={fullBody} onClick={() => setFullBody((v) => !v)}>
+              {fullBody ? t("Show less") : t("Show full message")}
+            </button>
+          )}
         </div>
       )}
       {outside > 0 && (
