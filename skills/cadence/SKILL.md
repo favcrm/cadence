@@ -1,6 +1,6 @@
 ---
 name: cadence
-description: Work on a Cadence project as a hosted or native agent, including direct coding or review sessions. Use for assignments, reporting, project delivery, or when CADENCE_ALIAS is set.
+description: Work on a Cadence project as a hosted or native agent. Use for assignments, PR handoffs, artifact or task delivery, and reporting, or when CADENCE_ALIAS is set.
 ---
 
 # Cadence agent protocol
@@ -31,12 +31,30 @@ describes a command; it does not authorize it. Listers answer to both
 Everything else stays callable: `cadence help operator` lists the operator
 and advanced verbs, `cadence help all` lists every verb with its
 subcommands, and `cadence help <verb>` is one verb's own help.
+If search or schema omits a command, check `cadence <verb> --help` before
+assuming the installed client lacks it.
 
 `issue` is the one public unit of work. A plan is an epic in the
 `proposed` stage; the operator approves it before its tickets dispatch.
 `job` and `monitor` are PM-internal, and `delivery`'s write verbs are the operator's;
 `delivery requirements` and `delivery check` are read-only and any agent may
 run them.
+
+## Choose the delivery path
+
+Read the named ticket first (`cadence --org <org> issue show <ID>` for a
+hosted workspace). Decide from the requested outcome, not the job title:
+
+- **Repository change:** follow the owning repo's rules for code,
+  configuration or docs. If it requires a PR, use Git and the repo's CI
+  tools, then follow [Review and delivery](#review-and-delivery).
+- **No repository change:** a design mockup, campaign brief, quotation,
+  or research note needs a checked [deliverable](#deliverables-and-review-handoff),
+  not a Git lane, commit SHA or PR. Implementing the mockup in a repo uses
+  the repo path; handing over the mockup alone does not.
+- **External action:** if the ticket asks you to publish, send, spend or
+  deploy, use the applicable approval and effect receipt. A draft or an
+  approval alone is not proof that the action happened.
 
 ## Hosted profile session
 
@@ -99,7 +117,7 @@ connection itself:
 cadence message result --text "summary of outcome"
 # or the `done` alias, which reports the same way:
 cadence done --text "summary of outcome"
-# a job kickoff additionally wants the commit you produced:
+# only for a job kickoff that needs the commit you produced:
 cadence message result --text "summary" --sha "$(git rev-parse HEAD)"
 # a long result reads from a file (`-` reads stdin):
 cadence message result --file <path>
@@ -110,17 +128,15 @@ Holding several running turns is refused — name the one to report, with
 chars also works): `cadence message result <msg-id> --token <turn_id>
 --text "summary"`. Report every running message — an unreported message
 stays `running` forever and blocks review.
-Never report a SHA you have not committed — a `job verdict` binds QA to
-exactly that commit. Managed endpoints (codex/claude) never run
-`message result`: their kickoff instead asks the final answer to end with
-a last line `SHA: <40-hex>` — the daemon reads the last such line as the
-reported revision.
-
-A ticket the master dispatched goes to fresh-session review when you file
-its `done` report with the head and the PR (`sha: <40-hex>` and
-`pr: https://github.com/<owner>/<repo>/pull/<n>` in the frontmatter).
-A REVISE comes back to you as a message: fix it on the same branch, push,
-and file a new `done` with the new head.
+Report a SHA only for work that produced that commit. Managed endpoints
+(codex/claude) report through the final answer, not `message result`. If
+the kickoff requests `SHA: <40-hex>`, put the real revision on the last
+line. For a PR-bound ticket the master dispatched, file the `done` report
+with the head and PR to start fresh-session review (`sha:` and `pr:` in the
+frontmatter). Fix a REVISE on the same branch and report the new head.
+For non-PR work, report the result and its evidence through the assigned
+route. If the route demands Git evidence for repo-free work, report the
+refusal and use an authorized report or attachment route, not a fake SHA.
 
 If you are sent a `[review]` kickoff, judge exactly the head it names and
 file your verdict as a report: `cadence report file --task <ID> --kind
@@ -274,6 +290,10 @@ incident reports to external preview hosts:
   client/incident-specific facts out of the template and treat unapproved drafts
   as `SAMPLE`.
 
+Link the named ticket attachment or exact artifact version and state what
+you verified. A hosted session with a `ticket_result` tool can report
+there; that receipt does not approve, publish or change ticket status.
+
 Choose the ticket handoff state deliberately:
 
 - **`status=review`:** use whenever a human owner or reviewer must inspect a
@@ -281,13 +301,21 @@ Choose the ticket handoff state deliberately:
   or spend, or review/merge/deploy a change. Attach the deliverable(s) first,
   then transition to `review` with a comment stating what was verified and what
   decision is needed.
-- **`status=done`:** use only when the work is complete within already-granted
-  authority and requires no pending human sign-off, external release or merge
-  gate.
-  On a repo-free native project, use `issue edit --attach <file> --ref
-  artifact:<basename> --set status=done --comment-file <verification>` for a
-  checked attachment. A run result, a draft, an approval and an external
-  receipt establish different outcomes. Report only the one you verified.
+- **`status=done`:** close when the ticket's requested outcome is verified
+  and its required decisions or effects are complete. A checked internal draft
+  can be done if the draft is the requested outcome and no sign-off is pending.
+  On a native repo-free project with no branch/worktree refs, use
+  `issue edit <ID> --attach <file> --ref artifact:<basename> --set status=done
+  --comment-file <verification>` if the installed version supports named
+  attachment evidence. If the atomic edit refuses, attach the evidence
+  separately and record the refusal and next owner. A draft, approval and
+  external receipt prove different things; read back an uncertain effect
+  before considering a retry.
+
+For hosted CLI updates, read the revision with `issue show <ID> --json`,
+then use `issue set <ID> status=review --if-rev <rev>` or the same command
+with `status=done` as appropriate. Pass `--org <org>` on both and read back
+the resulting status and linked evidence.
 
 ## Errors and exit codes
 
@@ -698,19 +726,18 @@ Before dispatch or resuming changed scope:
   versions before using accepted lessons. Proposed, stale or contradicted
   lessons are hypotheses, not instructions. Record missing or conflicting
   evidence without borrowing another project's memory implicitly.
-- **Plan:** record the feature's acceptance end to end as one increment (one
-  ticket, one PR; split only per repository or independently usable
-  outcome), dependencies, touched areas,
-  one writer per area, reviewer/result route and proportionate validation.
+- **Plan:** record acceptance end to end as one increment: one ticket and,
+  where a PR is needed, one per affected repository. Split only for an
+  independently usable outcome or a necessary rollout boundary. Name
+  dependencies, touched areas, writers, the result route and validation.
   Include rollout/recovery and cleanup ownership when they are in scope. Link
   existing plans instead of copying them; revise the brief when scope changes.
-- **Kickoff:** state the project's actual integration base at dispatch, its CI
-  status, known flaky tests and PRs about to land; require a fetch right
-  before push. Give each rule's intent, not only its mechanics, so edge cases
-  resolve without guessing. For each acceptance item name the component that
-  produces the output, mark every number measured or aspirational, and list
-  the existing tests and neighbouring verbs that consume the changed output —
-  found by searching for callers of what changed, not for tests named after it.
+- **Kickoff:** name the inputs, checks and expected evidence. For repo work,
+  include the actual integration base, CI status, known flaky tests and PRs
+  about to land; require a fetch before push. Explain why each rule matters.
+  For each acceptance item name what produces the output, distinguish
+  measured from target values, and identify existing checks by tracing
+  callers of what changed.
 
 During implementation and handoff:
 
@@ -727,7 +754,7 @@ During implementation and handoff:
 - Self-check before handoff, including a simplification pass over your own
   diff (dead code, duplication, abstractions the change does not need; your
   changed lines only, no behaviour change). List checks run, skipped and
-  limitations. Reviews and delivery follow "Review and delivery" below.
+  limitations. For a PR, follow "Review and delivery" below.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
@@ -751,13 +778,12 @@ During implementation and handoff:
   met, with evidence, or not yet and who owns the next step. Merged, approved
   or drafted is not in effect, and `done` on a ticket does not say that it is.
 
-After the increment merges, follow the selected workspace's supported ticket
-reconciliation and the project's completion rules; report an unavailable
-hosted operation rather than switching trackers or claiming completion. Delete
-your scratch, stop the processes you started and close abandoned PRs with a
-link. Release a merged lane with `issue finish <ID>` (on a hosted org:
-`cadence --org <name> issue finish <ID>`, which has no `--force`); leave other
-worktrees to their authorized sweep and never force `issue finish`.
+Reconcile the ticket against the verified outcome and the project's rules.
+Delete your scratch and stop the processes you started. Close an abandoned
+PR with a link to its replacement. If a Cadence lane was created, release
+it after merge with `issue finish <ID> --worktree <path>` (pass `--org <org>`
+for hosted). If the release guard refuses, record the exact reason and next
+owner; do not force it or work around it with manual removal.
 
 At a completed increment, QA revision, incident or repeated blocker, append a
 compact reflection to the existing task: **expected outcome; observed evidence;
@@ -769,13 +795,14 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 ## Review and delivery
 
-Each project owns its delivery policy. Read what it requires for your change:
-natively `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`;
-on a hosted org read the gate itself, read-only, before handing over:
+Use this path only for tickets with a PR. Each repo owns its checks, review
+and merge route. For a native Cadence gate, inspect
+`cadence delivery requirements --issue <ID> --pr <url> --head <full-sha>`.
+If the project uses hosted Cadence delivery, preflight the live PR head with
 `cadence --org <org> delivery check --project <p> --issue <ID> --repo
-<owner/name> --pr <n> --head <sha>` (exit 0 only when every rule passes). The
-hosted gate counts the `standards` and `spec-security` review axes itself, so a
-policy that needs no review may still need both review workflows. Then:
+<owner/name> --pr <n> --head <full-sha>`. The hosted gate counts
+`standards` and `spec-security` itself; CI or an advisory review can be
+green while the gate refuses.
 
 1. **Do the agent reviews the policy requires.** A reviewer is a fresh
    session: not the author, inheriting no conversation or context from the work
@@ -787,23 +814,32 @@ policy that needs no review may still need both review workflows. Then:
 2. **Post the reports.** Whoever dispatched the reviewer posts each report on
    the PR or ticket, naming the head, the checks run and the limitations. For
    Browser QA, the `deliverable-qa` skill has the comment format and routes.
-3. **Move the issue to `review`.** Attach the evidence, then set
-   `status=review` with a comment saying what was verified and what decision
-   is needed.
-4. **Hand over for approval.** A human approves at review; delivery follows
-   the approval. Never record or simulate the human's approval, and never act
-   under another identity or switch credentials. Approval, `delivery
-   enqueue`/`delivery merge` and `audit accept-revise` are the approver's;
-   Cadence refuses them from an agent. If a gate refuses, report the exact
-   refusal.
+3. **Clear agent-owned blockers.** Read `delivery check` reasons, even on a
+   nonzero exit: approval may be the only pending requirement. For a
+   workflow REVISE, use hosted `audit verdicts --body` with the same
+   selectors; fix valid findings in the existing PR and recheck the new head.
+   Ask the operator to accept a REVISE only when the finding is wrong and say
+   why. Missing or stale review, CI or Browser QA is not an approval request.
+4. **Hand off through the CLI.** Once only the operator step remains, put the
+   ticket in Review and post one comment: PR, full head, CI and review links,
+   Browser QA report when required, and the exact decision or approval ID.
+   For a hosted Cadence merge, give paste-ready operator commands with all
+   selectors and the actual approval source: `audit approve`, then
+   `delivery enqueue`. If the gate says a matching author-posted QA pass
+   needs exact-head approval, ask the operator to read the report first.
+   If approval is already in force or not required, give only enqueue; if
+   already queued, give neither. Use the UI if requested or if the CLI
+   route is unavailable; it authenticates the human, not bypasses a refusal.
+   Approval, `delivery enqueue`/`delivery merge` and `audit accept-revise`
+   are operator actions. Agents don't run them or switch identities.
+5. **Verify the outcome.** After enqueue, read the queue and merged PR from
+   GitHub. Close the ticket only after the merge commit is on the target
+   branch and the ticket's finish line is met. If the reply was lost, inspect
+   the existing queue entry or merge before anyone retries. Merged is not
+   deployed.
 
-When a review says revise, fix the finding on the same branch, push, and let
-the new head be reviewed. Ask the approver to accept a revise only when the
-finding is wrong, and say why. A passing check or review does not itself
-authorize a merge, deployment or send. Never restart the daemon: `cadence
-update` refuses an agent session, so an update is the operator's to run. An
-existing session does not reload guidance; reread this skill at a task
-boundary.
+Do not restart the daemon. `cadence update` is operator-only. Reread this
+skill at a task boundary; an existing session does not reload guidance.
 
 ## Improve memory and this skill
 
