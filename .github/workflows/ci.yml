@@ -369,17 +369,28 @@ jobs:
       # it to a suite.
       - name: Verify the platform-minted board assertion fixture
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
-        # A filter that matches nothing exits 0, so count first and fail
-        # unless exactly one test matches: a rename or move must not go green.
+        # List and run the same binary so Cargo does not rebuild the harness.
+        # libtest succeeds with zero matches, so require exactly one first.
         run: |
           set -euo pipefail
-          filter=board_identity::tests::the_platform_minted_fixture
-          count=$(cargo test --profile ci --locked --lib "$filter" -- --list | grep -c ': test$' || true)
+          fixture=board_identity::tests::the_platform_minted_fixture_verifies_and_a_tampered_copy_is_refused
+          test_bin=$(cargo test --profile ci --locked --lib --no-run --message-format=json-render-diagnostics |
+            jq -ers '
+              [.[] | select(.reason == "compiler-artifact" and
+                            .target.name == "cadence_agent" and
+                            (.target.kind | index("lib")) and
+                            .profile.test == true and
+                            (.executable | type == "string")) | .executable]
+              | if length == 1 then .[0]
+                else error("expected one Cadence library test executable, found \(length)")
+                end')
+          listed=$("$test_bin" --list --exact "$fixture")
+          count=$(grep -Fxc -- "$fixture: test" <<< "$listed" || true)
           if [ "$count" != 1 ]; then
-            echo "expected exactly one test matching $filter, found $count" >&2
+            echo "expected exactly one test matching $fixture, found $count" >&2
             exit 1
           fi
-          cargo test --profile ci --locked --lib "$filter" -- --test-threads 2
+          "$test_bin" --exact "$fixture" --test-threads 2
       - name: Package and clean-consumer check for the app toolchain
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"

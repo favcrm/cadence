@@ -32,6 +32,14 @@ deadline and 200ms receive bound remain. Maintenance of this protected check
 was explicitly operator-authorized and still needs independent review.
 This is test runtime evidence, not a measured whole-CI saving.
 
+The `build` job compiles the platform-minted board assertion fixture once
+(CAD-2460). It lists the exact test in Cargo's emitted library test binary
+before running it from the same binary. Missing or ambiguous matches fail the
+job. Separate list and run invocations of Cargo recompiled the test harness on
+the [PR](https://github.com/favcrm/cadence/actions/runs/44391227760/job/135109286360)
+and [merge queue](https://github.com/favcrm/cadence/actions/runs/44390270802/job/135105839920)
+baselines, adding 108s and 94s respectively.
+
 ## 2. The rust-cache staleness trap (the real bug)
 
 `Swatinem/rust-cache` **never overwrites an existing key**. The post-action
