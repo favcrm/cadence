@@ -22,9 +22,10 @@ import type { ScreenPush } from "./screenProtocol";
  * host but keep the mounted frame and its handshake; only a context
  * switch, a new bundle or another screen rebuilds it.
  */
-export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit">) {
+export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit" | "readOnly" | "route">) {
   const href = useHref();
-  const native = new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
+  // A canvas frame (it owns its route) never follows the board URL's back door.
+  const native = !callbacks.route && new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
   return native ? fallback : <ScreenOutlet projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} {...callbacks} />;
 }
 
@@ -33,7 +34,7 @@ export default function ScreenHost({ projection, fallback, loadAsset, actions, .
  * a files entry or URL by itself never authorizes execution. */
 export function InstalledScreenOutlet({ installation, contexts, contextId, admitted, fallback, ...callbacks }: {
   installation: Installation; contexts: AppContext[]; contextId: string; admitted: boolean; fallback: ReactNode;
-} & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget">) {
+} & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "readOnly" | "route">) {
   const declarations = installation.files.filter(f => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f));
   const tag = declarations.length === 1 ? declarations[0].split("/")[1] : null;
   const liveContext = contexts.some(c => c.id === contextId && c.install_id === installation.install_id && c.state === "active");
@@ -131,5 +132,5 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };
   }, [installation, contextId, snapshot]);
   return admitted && liveContext && tag && installation.executable && installation.approval.state === "approved" && installation.removed == null
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} onToolInvoked={reloadTools} {...callbacks} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={callbacks.readOnly ? undefined : actions} onToolInvoked={reloadTools} {...callbacks} /> : fallback;
 }

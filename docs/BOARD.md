@@ -2924,6 +2924,12 @@ The control endpoint is on the fixture proxy's port:
     `{"documents":"available","document_refusals":[],"settings":"native","viewer":"member"}`,
     or as the owner with
     `{"viewer":"owner","settings":"hosted","documents":"available"}`.
+- CAD-2471, the canvas app view. The proxy answers the app's assistant routes
+  (`assistant/actions|operations|permissions`) with one finished operation
+  whose resource links include customers, so "Open in canvas" can be driven.
+  The control body takes `app_access`: `member` (the default) or `none`, which
+  answers the app's detail, contexts and mount `403`, as for a viewer without
+  access to the app.
 - CAD-2419, the workspace skill library on the Skills tab of the hosted
   profile `qa-writer` (`/agents/qa-writer?tab=skills`). The proxy adds that
   profile to the sandbox's `GET /api/agents` roster. It answers

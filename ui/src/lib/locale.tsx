@@ -2358,6 +2358,16 @@ Object.assign(zhTW, {
   // CAD-2103: the Browser tab. Written Chinese, as a product reads it.
   "Ask to change": "要求修改",
   "Back to chat": "返回對話",
+  // CAD-2471: an app view in the canvas.
+  "App": "應用程式",
+  "read-only": "唯讀",
+  "Open in {app}": "在 {app} 開啟",
+  "Open in canvas": "在畫布開啟",
+  "No access": "沒有存取權限",
+  "Live": "即時",
+  "Shown as you": "以你的身分顯示",
+  "This screen could not be opened.": "無法開啟此畫面。",
+  "Retry": "重試",
   "Browser session actions": "瀏覽器工作階段操作",
   "Browser": "瀏覽器",
   "Can't load": "無法載入",
