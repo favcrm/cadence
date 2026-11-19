@@ -318,6 +318,21 @@ same durable record. The board's operator entry projects that stored binding as
 stored scope that does not validate fails that read or stream instead of being
 presented as Home.
 
+**Recovering an exact reply.** `HostedSession.operationReply(operationId)` is a
+read-only host RPC. Opt in with `captureOperationReplies` only for a
+host-authorized dedicated conversation. The runtime records the input and
+answer IDs when the engine commits terminal settlement, in the same
+transaction; it never copies reply text into the receipt or backfills old
+operations. The lookup uses that receipt to verify the exact assistant entry
+even if unrelated work is active. `unanswered` proves the input finished
+without an answer. `unconfirmed` means the runtime cannot prove an outcome
+(including active work, missing receipts, conflicting links, or shared
+answers). It is never permission to resend. The host must prove the reader
+is entitled to the conversation and bind the lookup to its own approved
+receipt. This RPC does not accept or deliver a handoff.
+Opting out at startup stops capture and hides existing receipts without
+deleting them. Re-enabling never backfills results completed while disabled.
+
 Inside a turn, the operation's scope reaches both the model and its tools. A
 run can hold more than one input — the engine appends each steering input to
 the live run — so the runtime attributes a run only when every one of its
