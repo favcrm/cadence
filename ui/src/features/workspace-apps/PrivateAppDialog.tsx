@@ -42,14 +42,14 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     if (reviewId === undefined) void githubPrivateAppAvailable(controller.signal).then((available) => {
       if (!controller.signal.aborted && epoch.current === current && privateReadsAllowed()) setGithubAvailable(available);
     });
-    else if (!/^par_[A-Za-z0-9_-]+$/.test(reviewId)) {
-      setHostedLoading(false);
-      setError("This review is missing or unavailable.");
-    } else {
+    else {
+      setHostedLoading(true);
+      setError(null);
       void getHostedPrivateReview(reviewId, controller.signal).then((request) => {
         if (controller.signal.aborted || epoch.current !== current || !privateReadsAllowed()) return;
         setHostedReview(request);
-        if (request.state === "pending") setReview(request.review);
+        setReview(request.state === "pending" ? request.review : null);
+        setUncertain(false);
       }).catch(() => {
         if (!controller.signal.aborted && epoch.current === current) setError("This review is missing or unavailable.");
       }).finally(() => { if (!controller.signal.aborted && epoch.current === current) setHostedLoading(false); });
@@ -131,15 +131,16 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     setBusy(decision === "install" ? "apply" : "reject"); setError(null);
     try {
       const result = await decideHostedPrivateReview(hostedReview, decision);
-      if (epoch.current !== current || !privateReadsAllowed()) {
-        setUncertain(true); notifyAppsChanged(); return;
-      }
+      if (epoch.current !== current || !privateReadsAllowed()) return;
       setHostedReview(result); setReview(null);
-      if (decision === "install") { notifyAppsChanged(); onInstalled(); }
+      if (result.state === "installed") { notifyAppsChanged(); onInstalled(); }
     } catch (cause) {
+      if (epoch.current !== current || !privateReadsAllowed()) return;
       setReview(null);
-      if (cause instanceof ApiError && cause.status === 409) {
-        setError("This review is stale or already closed. Open the review link again to see its current status.");
+      if (cause instanceof ApiError && cause.status === 409 && (cause.code === "installation_stale" || cause.code === "app_exists" || cause.code === "package_changed")) {
+        setError("This review no longer matches the workspace. Ask for a new review before installing.");
+      } else if (cause instanceof ApiError && cause.status === 403) {
+        setError("Only a current workspace owner can review this request.");
       } else {
         setUncertain(true);
         if (decision === "install") notifyAppsChanged();

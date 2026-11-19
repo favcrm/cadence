@@ -6,6 +6,7 @@ import { workspaceApps, type AccessDiff, type Installation } from "./workspaceAp
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const ZIP_LIMIT = 8 * 1024 * 1024;
 const GITHUB_SOURCE = "/api/app-installations/private/github";
+const HOSTED_REVIEW_ID = /^par_[0-9a-f]{32}$/;
 
 /** Discovery is deliberately optional: older hosts keep the upload-only flow. */
 export async function githubPrivateAppAvailable(signal?: AbortSignal): Promise<boolean> {
@@ -195,10 +196,11 @@ export type HostedPrivateReview = {
 function parseHostedReview(body: unknown, id: string, generation: number): HostedPrivateReview {
   if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
   const data = body.data;
-  if (data.id !== id || !["pending", "installed", "rejected", "expired"].includes(String(data.state)) ||
+  if (data.id !== id || typeof data.state !== "string" ||
+      !["pending", "installed", "rejected", "expired"].includes(data.state) ||
       typeof data.expires_at !== "number" || !Number.isFinite(data.expires_at) ||
       typeof data.source !== "string" || typeof data.zip_sha256 !== "string" ||
-      !/^(?:sha256:)?[0-9a-f]{64}$/.test(data.zip_sha256) || !object(data.review)) throw invalid();
+      !DIGEST.test(data.zip_sha256) || !object(data.review)) throw invalid();
   const raw = data.review;
   let target: PrivateTarget | null = null;
   if (data.install_id != null) {
@@ -213,18 +215,20 @@ function parseHostedReview(body: unknown, id: string, generation: number): Hoste
 }
 
 export async function getHostedPrivateReview(id: string, signal?: AbortSignal): Promise<HostedPrivateReview> {
+  if (!HOSTED_REVIEW_ID.test(id)) throw invalid();
   return withPrivateOperation(async (operation) => {
     const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(id)}`, {
       credentials: "same-origin", cache: "no-store", headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new ApiError(errorMessage(body, "The review is unavailable."), response.status);
+    if (!response.ok) throw new ApiError(errorMessage(body, "The review is unavailable."), response.status, { code: refusalCode(body) });
     return parseHostedReview(body, id, operation.generation);
   }, signal);
 }
 
 export async function decideHostedPrivateReview(request: HostedPrivateReview, decision: "install" | "reject"): Promise<HostedPrivateReview> {
+  if (!HOSTED_REVIEW_ID.test(request.id)) throw invalid();
   return withPrivateOperation(async (operation) => {
     if (operation.generation !== request.review.sessionGeneration || request.state !== "pending") throw invalid();
     const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(request.id)}/${decision}`, {
@@ -234,7 +238,10 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new ApiError(errorMessage(body, "The decision did not finish."), response.status);
+    const code = refusalCode(body);
+    const closed = response.status === 409 && code === "review_closed";
+    if (!response.ok && !closed)
+      throw new ApiError(errorMessage(body, "The decision did not finish."), response.status, { code });
     if (decision === "install" && response.status === 201) {
       if (!object(body) || body.committed !== true || body.source_kind !== "private" ||
           body.digest !== request.review.digest || body.name !== request.review.name ||
@@ -242,8 +249,11 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
           (request.review.target && body.install_id !== request.review.target.installId)) throw invalid();
       return { ...request, state: "installed" };
     }
-    const receipt = parseHostedReview(body, request.id, operation.generation);
-    if (receipt.state !== (decision === "install" ? "installed" : "rejected") ||
+    // A closed request was not applied by this call. Read its terminal state
+    // without replaying the decision or replacing the reviewed fingerprints.
+    const receipt = closed ? await getHostedPrivateReview(request.id) : parseHostedReview(body, request.id, operation.generation);
+    operation.assertCurrent();
+    if (receipt.state === "pending" || (!closed && decision === "install" && receipt.state !== "installed") ||
         receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
     return receipt;
   });
