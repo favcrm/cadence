@@ -106,6 +106,12 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
   const trashHref = operator === true && !scope
     ? navHref({ screen: "wiki", mode: "trash", path: null, query: null })
     : null;
+  const restricted = !!managedFiles && !!route.protectedFiles && !scope;
+  const fileHref = (target: Route) => navHref(
+    restricted && target.screen === "wiki"
+      ? { ...target, protectedFiles: true, archived: route.archived }
+      : target,
+  );
   const [children, setChildren] = useState<Record<string, WikiEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set([""]));
   const [dirError, setDirError] = useState<Record<string, string>>({});
@@ -316,10 +322,10 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
         <div className="wk-pane" data-mode={route.mode}>
           {managedFiles && route.file !== undefined ? (
             route.file && route.version
-              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={navHref} onChange={onManagedChange} />
+              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={fileHref} onChange={onManagedChange} />
               : <PageState title={t("This file version is unavailable")}>{t("A valid file and version are required.")}</PageState>
-          ) : managedFiles && route.archived ? (
-            <section className="p-4 grid gap-4"><div className="flex gap-2"><Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>{t("Files")}</Button><strong>{t("Archived")}</strong></div><ManagedList path={root} archived navHref={navHref} /></section>
+          ) : restricted || (managedFiles && route.archived) ? (
+            <ManagedLibraryPane key={`${restricted}:${!!route.archived}`} root={root} restricted={restricted} archived={!!route.archived} navHref={navHref} fileHref={fileHref} />
           ) : route.mode === "trash" ? (
             <TrashPane
               operator={operator}
@@ -386,6 +392,48 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
       </div>
     </div>
     </WikiScopeContext>
+  );
+}
+
+function ManagedLibraryPane({ root, restricted, archived, navHref, fileHref }: {
+  root: string;
+  restricted: boolean;
+  archived: boolean;
+  navHref: (route: Route) => string;
+  fileHref: (route: Route) => string;
+}) {
+  const t = useTranslate();
+  const [query, setQuery] = useState("");
+  const route = { screen: "wiki", mode: "browse", path: null, query: null } as const;
+  return (
+    <section className="grid gap-4 p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button href={navHref(route)}>{t("Files")}</Button>
+        <strong>{t(restricted ? "Restricted files" : "Archived")}</strong>
+        {restricted
+          ? <Button href={navHref({ ...route, protectedFiles: true, archived: !archived })}>{t(archived ? "Active" : "Archived")}</Button>
+          : root === "" && <Button href={navHref({ ...route, protectedFiles: true, archived: true })}>{t("Restricted files")}</Button>}
+      </div>
+      {restricted && (
+        <form className="wk-sinput" onSubmit={(event) => {
+          event.preventDefault();
+          const value = new FormData(event.currentTarget).get("q");
+          setQuery(typeof value === "string" ? value.trim() : "");
+        }}>
+          <input className="field" type="search" name="q" maxLength={200} aria-label={t("Search restricted files")} />
+          <Button type="submit">{t("Search")}</Button>
+        </form>
+      )}
+      <ManagedList
+        key={query}
+        path={root}
+        archived={archived}
+        query={query}
+        protectedFiles={restricted}
+        empty={restricted ? <p className="text-secondary text-ink-400">{t("No restricted files match.")}</p> : undefined}
+        navHref={fileHref}
+      />
+    </section>
   );
 }
 
@@ -570,6 +618,7 @@ function BrowsePane({
             <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
             {trashHref && <Button href={trashHref} icon={<IconTrash />}>{t("Trash")}</Button>}
             {managedFiles && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, archived: true })}>{t("Archived")}</Button>}
+            {managedFiles && rootHere && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, protectedFiles: true })}>{t("Restricted files")}</Button>}
         </>} />
         {missingRoot && scope && (
           <EmptyCard title={t("No project context yet")} action={

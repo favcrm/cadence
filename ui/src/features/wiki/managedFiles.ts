@@ -26,11 +26,15 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   }, signal);
 }
 
-export async function listManagedFiles(filter: { path: string; archived?: boolean; q?: string } | { issue: string }, signal?: AbortSignal): Promise<WikiManagedFile[]> {
+export async function listManagedFiles(
+  filter: (({ path: string } | { scope: "protected" }) & { archived?: boolean; q?: string }) | { issue: string },
+  signal?: AbortSignal,
+): Promise<WikiManagedFile[]> {
   const q = new URLSearchParams();
   if ("issue" in filter) q.set("issue", filter.issue);
   else {
-    q.set("path", filter.path);
+    if ("scope" in filter) q.set("scope", filter.scope);
+    else q.set("path", filter.path);
     if (filter.archived) q.set("archived", "1");
     if (filter.q) q.set("q", filter.q);
   }

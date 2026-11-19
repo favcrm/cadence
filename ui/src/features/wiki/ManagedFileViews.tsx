@@ -14,9 +14,9 @@ export function managedRoute(row: WikiManagedFile): Route {
   return { screen: "wiki", mode: "browse", path: null, query: null, file: row.file.id, version: row.file.version };
 }
 
-type ManagedListFilter = { path?: string; archived?: boolean; query?: string; issue?: string };
+type ManagedListFilter = { path?: string; archived?: boolean; query?: string; issue?: string; protectedFiles?: boolean };
 
-export function useManagedFiles({ path, archived, query, issue }: ManagedListFilter, enabled = true) {
+export function useManagedFiles({ path, archived, query, issue, protectedFiles }: ManagedListFilter, enabled = true) {
   const [rows, setRows] = useState<WikiManagedFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -24,11 +24,14 @@ export function useManagedFiles({ path, archived, query, issue }: ManagedListFil
     setError(null);
     if (!enabled) return;
     const controller = new AbortController();
-    void listManagedFiles(issue !== undefined ? { issue } : { path: path ?? "", archived, q: query }, controller.signal)
+    void listManagedFiles(issue !== undefined
+      ? { issue }
+      : { ...(protectedFiles ? { scope: "protected" as const } : { path: path ?? "" }), archived, q: query },
+    controller.signal)
       .then((files) => { if (!controller.signal.aborted) setRows(files); })
       .catch((e) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)); });
     return () => controller.abort();
-  }, [path, archived, query, issue, enabled]);
+  }, [path, archived, query, issue, enabled, protectedFiles]);
   useEffect(() => onPrivateReadsPaused(() => { setRows(null); setError(null); }), []);
   return { rows, error };
 }
@@ -38,15 +41,15 @@ export function ManagedList({ navHref, empty, ...filter }: ManagedListFilter & {
   const { rows, error } = useManagedFiles(filter);
   if (error) return <p role="alert" className="text-fail">{error}</p>;
   if (!rows) return <p role="status" className="text-label text-ink-500">{t("Loading files…")}</p>;
-  if (!rows.length) return filter.archived ? <p className="text-secondary text-ink-400">{t("No archived files.")}</p> : empty ?? null;
-  return <ManagedFileResults rows={rows} linked={filter.issue !== undefined} navHref={navHref} />;
+  if (!rows.length) return empty ?? (filter.archived ? <p className="text-secondary text-ink-400">{t("No archived files.")}</p> : null);
+  return <ManagedFileResults rows={rows} linked={filter.issue !== undefined} protectedFiles={filter.protectedFiles} navHref={navHref} />;
 }
 
-export function ManagedFileResults({ rows, linked = false, navHref }: { rows: WikiManagedFile[]; linked?: boolean; navHref: (route: Route) => string }) {
+export function ManagedFileResults({ rows, linked = false, protectedFiles = false, navHref }: { rows: WikiManagedFile[]; linked?: boolean; protectedFiles?: boolean; navHref: (route: Route) => string }) {
   const t = useTranslate();
   return (
     <section className="card min-w-0 p-3">
-      <h2 className="text-cardtitle font-semibold text-ink-100">{t(linked ? "Linked files" : "Workspace files")}</h2>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{t(linked ? "Linked files" : protectedFiles ? "Restricted files" : "Workspace files")}</h2>
       <ul className="list-none m-0 p-0">
         {rows.map((row) => (
           <li key={`${row.file.id}:${row.file.version}`} className="border-b border-ink-800 py-2">
