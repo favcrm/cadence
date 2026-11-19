@@ -239,9 +239,10 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
     const code = refusalCode(body);
-    const closed = response.status === 409 && code === "review_closed";
-    if (!response.ok && !closed)
-      throw new ApiError(errorMessage(body, "The decision did not finish."), response.status, { code });
+    const reconcile = response.status === 409 &&
+      (code === "review_closed" || code === "installation_stale" || code === "app_exists");
+    const refusal = () => new ApiError(errorMessage(body, "The decision did not finish."), response.status, { code });
+    if (!response.ok && !reconcile) throw refusal();
     if (decision === "install" && response.status === 201) {
       if (!object(body) || body.committed !== true || body.source_kind !== "private" ||
           body.digest !== request.review.digest || body.name !== request.review.name ||
@@ -249,12 +250,13 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
           (request.review.target && body.install_id !== request.review.target.installId)) throw invalid();
       return { ...request, state: "installed" };
     }
-    // A closed request was not applied by this call. Read its terminal state
-    // without replaying the decision or replacing the reviewed fingerprints.
-    const receipt = closed ? await getHostedPrivateReview(request.id) : parseHostedReview(body, request.id, operation.generation);
+    // A competing decision can close this review after the initial check
+    // but before activation. Read its receipt once, never replay the POST.
+    const receipt = reconcile ? await getHostedPrivateReview(request.id) : parseHostedReview(body, request.id, operation.generation);
     operation.assertCurrent();
-    if (receipt.state === "pending" || (!closed && decision === "install" && receipt.state !== "installed") ||
-        receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
+    if (receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
+    if (receipt.state === "pending" && reconcile && code !== "review_closed") throw refusal();
+    if (receipt.state === "pending" || (!reconcile && decision === "install" && receipt.state !== "installed")) throw invalid();
     return receipt;
   });
 }

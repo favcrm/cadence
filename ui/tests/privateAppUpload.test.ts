@@ -95,10 +95,17 @@ async function main() {
   equal(calls.length, beforeClosed + 2);
   equal(calls[beforeClosed]?.init.method, "POST");
   equal(calls[beforeClosed + 1]?.init.method, undefined, "a closed review is reconciled without replaying approval");
-  responses = [{ status: 409, body: { error: { code: "installation_stale", message: "Catalog generation changed." } } }];
+  const staleResponse = { status: 409, body: { error: { code: "installation_stale", message: "Catalog generation changed." } } };
+  responses = [staleResponse, { status: 200, body: receipt }];
+  const beforeStale = calls.length;
   await rejected(decideHostedPrivateReview(hosted, "install"),
     (error: unknown) => error instanceof ApiError && error.code === "installation_stale",
-    "an installation change requires a fresh review, not a repeat GET of the stale preview");
+    "a still-pending stale package requires a fresh review");
+  equal(calls.length, beforeStale + 2);
+  equal(calls[beforeStale + 1]?.init.method, undefined);
+  responses = [staleResponse, { status: 200, body: { ...receipt, data: { ...receipt.data, state: "installed" } } }];
+  equal((await decideHostedPrivateReview(hosted, "install")).state, "installed",
+    "an owner who won the activation race leaves a verified installed receipt");
   responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, digest: `sha256:${"b".repeat(64)}` } } }];
   await rejected(getHostedPrivateReview(reviewId), (error) => error instanceof ApiError && error.status === 502,
     "a mismatched review fingerprint cannot be presented for approval");
