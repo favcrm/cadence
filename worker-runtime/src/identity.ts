@@ -610,8 +610,8 @@ export function readOperationReply(
     if (typeof message !== "object" || message === null || !("role" in message) ||
         message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
       return unconfirmed;
-    if (!("stopReason" in message) || (message.stopReason !== "stop" &&
-        message.stopReason !== "length" && message.stopReason !== "toolUse")) return unconfirmed;
+    // Settlement alone does not prove that the model supplied a complete answer.
+    if (!("stopReason" in message) || message.stopReason !== "stop") return unconfirmed;
     let text = "";
     for (const part of message.content as unknown[]) {
       if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
