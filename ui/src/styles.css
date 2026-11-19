@@ -4,6 +4,13 @@
 @import "../screen-ui/src/controls.css";
 @import "../screen-ui/src/base.css";
 
+/* The host board owns the outer page canvas; embedded app screens keep
+   `html, body { background: transparent }` from `@cadence/screen-ui/src/base.css`. */
+html,
+body {
+  background: var(--color-ink-950);
+}
+
 /* Board-only presentation; the embedded app theme remains independently owned. */
 :root {
   --board-nav-current-bg: #3a3f4b;

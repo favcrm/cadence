@@ -4,6 +4,7 @@ import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, priva
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { AppGlyph } from "../explorer/shared";
+import { installedAppHref } from "../apps/appViewModel";
 import { notifyAppsChanged, type Installation } from "./workspaceApps";
 import { WorkspaceDialog } from "./WorkspaceDialog";
 import { applyPrivateApp, checkPrivateApp, decideHostedPrivateReview, fetchGithubPrivateApp, getHostedPrivateReview, githubPrivateAppAvailable, type HostedPrivateReview, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
@@ -19,7 +20,9 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
 }) {
   const t = useTranslate();
   const githubInputId = useId();
+  const fileInputId = useId();
   const [file, setFile] = useState<File | null>(null);
+  const [dragging, setDragging] = useState(false);
   const [source, setSource] = useState<"upload" | "github">("upload");
   const [githubAvailable, setGithubAvailable] = useState(false);
   const [githubUrl, setGithubUrl] = useState("");
@@ -73,6 +76,9 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     generation: installation.catalog_generation,
   } : null;
   const title = reviewId !== undefined ? t("Review private app request") : installation ? t("Update private app") : t("Add a private app");
+  const subtitle = reviewId !== undefined
+    ? t("Inspect the requested package and its workspace access before approving.")
+    : t("Private apps stay in this workspace and never appear in the public directory.");
   const close = () => { if (!inFlight.current) onClose(); };
   const selectFile = (selected: File | null) => {
     if (inFlight.current) return;
@@ -147,133 +153,346 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       }
     } finally { inFlight.current = false; setBusy(null); }
   };
+
+  const installedHref = installed ? installedAppHref(installed.name) : null;
+
+  const footer = hostedLoading ? null : reviewId !== undefined && !review && !uncertain ? (
+    <div className="pa-foot-row">
+      <span />
+      <Button onClick={close}>{t("Back to apps")}</Button>
+    </div>
+  ) : installed ? (
+    <div className="pa-foot-row">
+      <Button className="btn-ghost" onClick={close}>{t("Back to apps")}</Button>
+      <div className="flex flex-wrap gap-2">
+        <Button href={`/apps/manage/${encodeURIComponent(installed.install_id)}`}>{t("Manage app")}</Button>
+        {installedHref && <Button className="btn-primary" href={installedHref}>{t("Open app")}</Button>}
+      </div>
+    </div>
+  ) : uncertain ? (
+    <div className="pa-foot-row">
+      <span />
+      <Button onClick={close}>{t("Back to apps")}</Button>
+    </div>
+  ) : !review ? (
+    <div className="pa-foot-row">
+      <Button className="btn-ghost" disabled={busy !== null} onClick={close}>{t("Cancel")}</Button>
+      <Button
+        className="btn-primary"
+        disabled={(source === "upload" ? !file : !githubUrl.trim()) || busy !== null}
+        onClick={() => void check()}
+      >
+        {busy === "check" ? t("Checking…") : t("Check package")}
+      </Button>
+    </div>
+  ) : (
+    <>
+      <label className="pa-consent-row">
+        <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.currentTarget.checked)} disabled={busy !== null} />
+        <span>{t("I reviewed this version and its requested access.")}</span>
+      </label>
+      <div className="pa-foot-row">
+        {hostedReview ? (
+          <>
+            <Button disabled={busy !== null} onClick={() => void decide("reject")}>
+              {busy === "reject" ? t("Rejecting…") : t("Reject request")}
+            </Button>
+            <Button
+              className="btn-primary"
+              disabled={!consent || !review.compatible || review.warnings || busy !== null}
+              onClick={() => void decide("install")}
+            >
+              {busy === "apply" ? t("Installing…") : t("Approve and install")}
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button disabled={busy !== null} onClick={() => { setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); }}>
+              {t("Back")}
+            </Button>
+            <Button
+              className="btn-primary"
+              disabled={!consent || !review.compatible || review.warnings || busy !== null}
+              onClick={() => void apply()}
+            >
+              {busy === "apply" ? t("Installing…") : installation ? t("Install update") : t("Install private app")}
+            </Button>
+          </>
+        )}
+      </div>
+    </>
+  );
+
   return (
-    <WorkspaceDialog title={title} onClose={close}>
+    <WorkspaceDialog
+      title={title}
+      subtitle={subtitle}
+      badge={t("This workspace only")}
+      footer={footer}
+      className="wa-private-dialog"
+      onClose={close}
+    >
       {hostedLoading ? (
-        <p role="status">{t("Loading review…")}</p>
+        <p className="text-label text-ink-400" role="status">{t("Loading review…")}</p>
       ) : reviewId !== undefined && !review && !uncertain ? (
         <div className="space-y-3" role={error ? "alert" : "status"}>
-          <p>{error ? t(error) : hostedReview?.state === "installed" ? t("This request has been installed.") : hostedReview?.state === "rejected" ? t("This request was rejected.") : hostedReview?.state === "expired" ? t("This request has expired.") : t("This review is missing or unavailable.")}</p>
-          <Button onClick={close}>{t("Back to apps")}</Button>
+          <p className="text-secondary text-ink-200">{error ? t(error) : hostedReview?.state === "installed" ? t("This request has been installed.") : hostedReview?.state === "rejected" ? t("This request was rejected.") : hostedReview?.state === "expired" ? t("This request has expired.") : t("This review is missing or unavailable.")}</p>
         </div>
       ) : installed ? (
-        <div className="space-y-3" role="status">
+        <div className="pa-installed" role="status">
+          <div className="pa-installed-badge" aria-hidden>✓</div>
           <h3 className="text-cardtitle font-semibold text-ink-100">{installation ? t("Private app updated") : t("Private app installed")}</h3>
-          <p>{t("The checked version is installed in this workspace.")}</p>
-          <p><b>{installed.title}</b> · {installed.version}</p>
-          <div className="flex flex-wrap gap-2">
-            <Button className="btn-primary" href={`/apps/manage/${encodeURIComponent(installed.install_id)}`}>{t("Manage app")}</Button>
-            <Button onClick={close}>{t("Back to apps")}</Button>
+          <p className="text-label text-ink-400">{t("The checked version is installed in this workspace.")}</p>
+          <div className="pa-installed-pkg">
+            <AppGlyph name={installed.name} title={installed.title} size="sm" />
+            <div className="text-left min-w-0">
+              <div className="text-secondary font-semibold text-ink-100 truncate">{installed.title}</div>
+              <div className="text-micro text-ink-400 num">v{installed.version}</div>
+            </div>
           </div>
         </div>
       ) : uncertain ? (
-        <div className="space-y-3" role="alert">
+        <div className="space-y-2" role="alert">
           <h3 className="text-cardtitle font-semibold text-ink-100">{t(reviewId !== undefined ? "Decision outcome unknown" : "Installation outcome unknown")}</h3>
-          <p>{t(reviewId !== undefined ? "The workspace did not confirm the decision. Open the review link again to see its current status." : "The workspace did not confirm the result. Refresh your apps before trying again.")}</p>
-          <Button onClick={close}>{t("Back to apps")}</Button>
+          <p className="text-label text-ink-400">{t(reviewId !== undefined ? "The workspace did not confirm the decision. Open the review link again to see its current status." : "The workspace did not confirm the result. Refresh your apps before trying again.")}</p>
         </div>
       ) : (
         <div className="space-y-4">
-          {reviewId === undefined && <ol className="flex flex-wrap gap-4 text-label text-ink-400" aria-label={t("Installation progress")}>
-            <li aria-current={!review ? "step" : undefined}>1 · {t("Choose package")}</li>
-            <li aria-current={review ? "step" : undefined}>2 · {t("Review access")}</li>
-          </ol>}
+          {reviewId === undefined && (
+            <ol className="pa-stepper" aria-label={t("Installation progress")}>
+              <li className="pa-step" aria-current={!review ? "step" : undefined} data-done={review ? "true" : undefined}>
+                <span className="pa-step-num" aria-hidden>{review ? "✓" : "1"}</span>
+                <span>{t("Choose package")}</span>
+              </li>
+              <li className="pa-step-sep" aria-hidden />
+              <li className="pa-step" aria-current={review ? "step" : undefined}>
+                <span className="pa-step-num" aria-hidden>2</span>
+                <span>{t("Review access")}</span>
+              </li>
+            </ol>
+          )}
           {!review ? (
             <>
-              <p>{t("Choose a ZIP built with the Cadence app kit. It stays in this workspace, not the public directory.")}</p>
               {githubAvailable && (
-                <fieldset disabled={busy !== null} className="space-y-2 text-label">
-                  <legend className="mb-2 text-ink-200">{t("Package source")}</legend>
-                  <label className="flex items-center gap-2"><input type="radio" name="private-app-source" checked={source === "upload"} onChange={() => { setSource("upload"); setError(null); }} />{t("Upload a ZIP")}</label>
-                  <label className="flex items-center gap-2"><input type="radio" name="private-app-source" checked={source === "github"} onChange={() => { setSource("github"); setError(null); }} />{t("From GitHub")}</label>
+                <fieldset disabled={busy !== null} className="pa-source-fieldset">
+                  <legend className="pa-legend">{t("Package source")}</legend>
+                  <div className="pa-source-grid">
+                    <label className={`pa-source-card ${source === "upload" ? "is-selected" : ""}`}>
+                      <input
+                        className="sr-only"
+                        type="radio"
+                        name="private-app-source"
+                        checked={source === "upload"}
+                        onChange={() => { setSource("upload"); setError(null); }}
+                      />
+                      <span className="pa-source-ic" aria-hidden>
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M12 16V4m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                        </svg>
+                      </span>
+                      <span className="min-w-0">
+                        <span className="pa-source-title">{t("Upload a ZIP")}</span>
+                        <span className="pa-source-desc">{t("Local Cadence app kit bundle, up to 8 MiB.")}</span>
+                      </span>
+                    </label>
+                    <label className={`pa-source-card ${source === "github" ? "is-selected" : ""}`}>
+                      <input
+                        className="sr-only"
+                        type="radio"
+                        name="private-app-source"
+                        checked={source === "github"}
+                        onChange={() => { setSource("github"); setError(null); }}
+                      />
+                      <span className="pa-source-ic" aria-hidden>
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M9 19c-4.5 1.4-4.5-2.5-6-3m12 6v-3.8c0-1 .1-1.5-.5-2.1 2.4-.3 5-1.2 5-5.4 0-1.2-.4-2.2-1.1-3 .1-.3.5-1.4-.1-2.9 0 0-.9-.3-3 1.1a10.4 10.4 0 0 0-5.4 0C6.8 4.4 5.9 4.7 5.9 4.7c-.6 1.5-.2 2.6-.1 2.9-.7.8-1.1 1.8-1.1 3 0 4.2 2.6 5.1 5 5.4-.4.4-.6 1-.6 2V22" />
+                        </svg>
+                      </span>
+                      <span className="min-w-0">
+                        <span className="pa-source-title">{t("From GitHub")}</span>
+                        <span className="pa-source-desc">{t("Tagged public release .zip with SHA-256 checksum.")}</span>
+                      </span>
+                    </label>
+                  </div>
                 </fieldset>
               )}
               {source === "upload" ? (
-                <>
-                  <label className="block text-label text-ink-200">
-                    <span className="block mb-2">{t("App package (.zip)")}</span>
-                    <input key={epoch.current} type="file" accept=".zip,application/zip" disabled={busy !== null} onChange={(event) => selectFile(event.currentTarget.files?.[0] ?? null)} />
-                  </label>
-                  {file && <p className="text-label text-ink-400">{file.name} · {(file.size / 1024).toFixed(0)} KiB</p>}
-                </>
+                <div className="space-y-2">
+                  <input
+                    id={fileInputId}
+                    key={epoch.current}
+                    className="sr-only"
+                    type="file"
+                    accept=".zip,application/zip"
+                    disabled={busy !== null}
+                    onChange={(event) => selectFile(event.currentTarget.files?.[0] ?? null)}
+                  />
+                  {file ? (
+                    <div className="pa-file-pill">
+                      <AppGlyph name={file.name} title={file.name} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-secondary font-medium text-ink-100 truncate">{file.name}</div>
+                        <div className="text-micro text-ink-400 num">{Math.max(1, Math.round(file.size / 1024))} KiB · .zip</div>
+                      </div>
+                      <Button className="btn-sm btn-ghost" disabled={busy !== null} onClick={() => selectFile(null)}>
+                        {t("Remove")}
+                      </Button>
+                    </div>
+                  ) : (
+                    <label
+                      htmlFor={fileInputId}
+                      className={`pa-dropzone ${dragging ? "is-drag" : ""}`}
+                      onDragOver={(event) => { event.preventDefault(); if (busy === null) setDragging(true); }}
+                      onDragLeave={() => setDragging(false)}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        setDragging(false);
+                        if (busy !== null) return;
+                        selectFile(event.dataTransfer.files?.[0] ?? null);
+                      }}
+                    >
+                      <span className="pa-drop-ic" aria-hidden>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M12 15V3m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                        </svg>
+                      </span>
+                      <span className="pa-drop-title">{t("Drop your .zip package here, or click to browse")}</span>
+                      <span className="pa-drop-sub">{t("App package (.zip)")} · {t("Max 8 MiB")}</span>
+                    </label>
+                  )}
+                </div>
               ) : (
-                <div className="text-label text-ink-200">
-                  <label className="block mb-2" htmlFor={githubInputId}>{t("Public GitHub release ZIP URL")}</label>
-                  <input id={githubInputId} aria-describedby={`${githubInputId}-help`} className="field w-full" type="url" maxLength={512} value={githubUrl} disabled={busy !== null} onChange={(event) => { setGithubUrl(event.currentTarget.value); setError(null); }} placeholder="https://github.com/owner/repo/releases/download/tag/app.zip" />
-                  <p id={`${githubInputId}-help`} className="mt-2 text-ink-400">{t("Copy the app ZIP link under Releases. GitHub’s source code ZIP is not an app package.")}</p>
+                <div className="text-label text-ink-200 space-y-2">
+                  <label className="block font-medium" htmlFor={githubInputId}>{t("Public GitHub release ZIP URL")}</label>
+                  <input
+                    id={githubInputId}
+                    aria-describedby={`${githubInputId}-help`}
+                    className="field w-full num"
+                    type="url"
+                    maxLength={512}
+                    value={githubUrl}
+                    disabled={busy !== null}
+                    onChange={(event) => { setGithubUrl(event.currentTarget.value); setError(null); }}
+                    placeholder="https://github.com/owner/repo/releases/download/tag/app.zip"
+                  />
+                  <p id={`${githubInputId}-help`} className="text-micro text-ink-400 leading-relaxed">
+                    {t("Copy the app ZIP link under Releases. GitHub’s source code ZIP is not an app package.")}
+                  </p>
                 </div>
               )}
               {error && <p className="alert fail" role="alert">{error}</p>}
-              <div className="flex flex-wrap gap-2">
-                <Button className="btn-primary" disabled={(source === "upload" ? !file : !githubUrl.trim()) || busy !== null} onClick={() => void check()}>{busy === "check" ? t("Checking…") : t("Check package")}</Button>
-                <Button disabled={busy !== null} onClick={close}>{t("Cancel")}</Button>
-              </div>
             </>
           ) : (
             <>
-              <h3 ref={reviewHeading} tabIndex={-1} className="text-cardtitle font-semibold text-ink-100">{t("Review your private app")}</h3>
-              <div className="flex items-start gap-3 rounded-lg border border-ink-700 bg-ink-875 p-3">
-                <AppGlyph name={review.title} size="sm" />
-                <div className="min-w-0">
-                  <p className="text-cardtitle font-semibold text-ink-100 break-words">{review.title}</p>
-                  {review.summary && <p className="text-label wrap-anywhere">{review.summary}</p>}
-                  <p className="text-label text-ink-400 break-words">
-                    {installation ? `${installation.version} → ${review.version}` : `${t("Version")} ${review.version}`} · {t("This workspace only")}
-                  </p>
+              <h3 ref={reviewHeading} tabIndex={-1} className="sr-only">{t("Review your private app")}</h3>
+              <div className="pa-pkg-head">
+                <AppGlyph name={review.name} title={review.title} size="sm" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-cardtitle font-semibold text-ink-100 break-words">{review.title}</p>
+                    <span className="chip num">
+                      {installation ? `${installation.version} → ${review.version}` : `v${review.version}`}
+                    </span>
+                    <span className={`chip ${review.compatible ? "ok" : "fail"}`} role="status">
+                      {review.compatible ? t("Compatible") : t("Incompatible")}
+                    </span>
+                  </div>
+                  {review.summary && <p className="text-label text-ink-400 mt-0.5 wrap-anywhere">{review.summary}</p>}
+                  {hostedReview && (
+                    <p className="text-micro text-ink-500 mt-1">
+                      {t("Expires")}: {new Date(hostedReview.expiresAt).toLocaleString()}
+                    </p>
+                  )}
                 </div>
               </div>
-              {hostedReview && <p className="text-label text-ink-400">
-                {t("Expires")}: {new Date(hostedReview.expiresAt).toLocaleString()}
-              </p>}
-              <div className={review.compatible ? "alert info" : "alert fail"} role="status">{review.compatible ? t("Compatible with this workspace") : t("This package is not compatible with this workspace.")}</div>
+
+              {!review.compatible && (
+                <div className="alert fail" role="alert">{t("This package is not compatible with this workspace.")}</div>
+              )}
+
               <section aria-label={t("Requested access")} className="space-y-2">
-                <h4 className="font-medium text-ink-100">{t("Requested access")}</h4>
-                <p className="text-label break-words">{review.declared.connections.length
-                  ? <>{t("Accounts this app asks to connect")}: {review.declared.connections.join(", ")}</>
-                  : t("No named connections requested.")}</p>
-                {Object.keys(review.declared.capabilities).length === 0
-                  ? <p className="text-label">{t("No separate access grants requested.")}</p> : (
-                  <ul className="list-disc pl-5 text-label">
-                    {Object.entries(review.declared.capabilities).map(([name, value]) =>
-                      <li key={name} className="break-words">{describeCapability(value, t)} <span className="text-ink-400">({name})</span></li>)}
-                  </ul>
-                )}
-                {review.screens.map((screen) => (
-                  <div key={screen.tag} className="space-y-1 text-label">
-                    <p>{t("Screen operations")}: {screen.operations === null ? t("Not declared") : screen.operations.length === 0 ? t("None") : null}</p>
-                    {screen.operations && screen.operations.length > 0 && (
-                      <ul className="list-disc break-words pl-5">
-                        {screen.operations.map((operation) => <li key={operation}>{screenOperationLabel(operation, t)}</li>)}
-                      </ul>
-                    )}
-                    <p className="break-words">{t("Screen tools")}: {screen.tools === null ? t("Not declared") : screen.tools.join(", ") || t("None")}</p>
+                <h4 className="pa-legend">{t("Requested access")}</h4>
+                <div className="pa-perm-card">
+                  <div className="pa-perm-row">
+                    <span className="pa-perm-k">{t("Connections")}</span>
+                    <span className="pa-perm-v break-words">
+                      {review.declared.connections.length
+                        ? review.declared.connections.join(", ")
+                        : <span className="text-ink-400">{t("No named connections requested.")}</span>}
+                    </span>
                   </div>
-                ))}
-                {review.screens.some((screen) => screen.remote_image_origins.length > 0) && (
-                  <p className="text-label break-all">{t("Loads images from")}: {review.screens.flatMap((screen) => screen.remote_image_origins).join(", ")}</p>
-                )}
-                {(installation || review.target) && <div className="text-label">
-                  <p className="text-ink-400">{t("Changes since installed version")}</p>
-                  {review.access.connections.added.length === 0 && review.access.connections.removed.length === 0 && Object.keys(review.access.capabilities).length === 0
-                    ? <p>{t("No declared access changes.")}</p>
-                    : <ul className="list-disc pl-5">
-                      {review.access.connections.added.map((name) => <li key={`add-${name}`}>{t("Added connection")}: <code>{name}</code></li>)}
-                      {review.access.connections.removed.map((name) => <li key={`remove-${name}`}>{t("Removed connection")}: <code>{name}</code></li>)}
-                      {Object.entries(review.access.capabilities).map(([name, change]) => (
-                        <li key={name} className="break-words">
-                          {name}: {change.before && <>{describeCapability(change.before, t)} → </>}
-                          {change.after ? describeCapability(change.after, t) : t("Removed")}
-                        </li>
-                      ))}
-                    </ul>}
-                </div>}
+                  <div className="pa-perm-row">
+                    <span className="pa-perm-k">{t("Capabilities")}</span>
+                    <div className="pa-perm-v">
+                      {Object.keys(review.declared.capabilities).length === 0 ? (
+                        <span className="text-ink-400">{t("No separate access grants requested.")}</span>
+                      ) : (
+                        <ul className="list-disc pl-4 space-y-1">
+                          {Object.entries(review.declared.capabilities).map(([name, value]) => (
+                            <li key={name} className="break-words">
+                              {describeCapability(value, t)} <span className="text-ink-400 num">({name})</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                  {review.screens.length > 0 && (
+                    <div className="pa-perm-row">
+                      <span className="pa-perm-k">{t("Screens")}</span>
+                      <div className="pa-perm-v space-y-1.5">
+                        {review.screens.map((screen) => (
+                          <div key={screen.tag} className="space-y-0.5">
+                            <p>{t("Screen operations")}: {screen.operations === null ? t("Not declared") : screen.operations.length === 0 ? t("None") : null}</p>
+                            {screen.operations && screen.operations.length > 0 && (
+                              <ul className="list-disc break-words pl-4">
+                                {screen.operations.map((operation) => <li key={operation}>{screenOperationLabel(operation, t)}</li>)}
+                              </ul>
+                            )}
+                            <p className="break-words text-ink-400">{t("Screen tools")}: {screen.tools === null ? t("Not declared") : screen.tools.join(", ") || t("None")}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {review.screens.some((screen) => screen.remote_image_origins.length > 0) && (
+                    <div className="pa-perm-row">
+                      <span className="pa-perm-k">{t("Loads images from")}</span>
+                      <span className="pa-perm-v break-all">
+                        {review.screens.flatMap((screen) => screen.remote_image_origins).join(", ")}
+                      </span>
+                    </div>
+                  )}
+                  {(installation || review.target) && (
+                    <div className="pa-perm-row">
+                      <span className="pa-perm-k">{t("Changes since installed version")}</span>
+                      <div className="pa-perm-v">
+                        {review.access.connections.added.length === 0 && review.access.connections.removed.length === 0 && Object.keys(review.access.capabilities).length === 0 ? (
+                          <span className="text-ink-400">{t("No declared access changes.")}</span>
+                        ) : (
+                          <ul className="list-disc pl-4 space-y-1">
+                            {review.access.connections.added.map((name) => <li key={`add-${name}`}>{t("Added connection")}: <code>{name}</code></li>)}
+                            {review.access.connections.removed.map((name) => <li key={`remove-${name}`}>{t("Removed connection")}: <code>{name}</code></li>)}
+                            {Object.entries(review.access.capabilities).map(([name, change]) => (
+                              <li key={name} className="break-words">
+                                {name}: {change.before && <>{describeCapability(change.before, t)} → </>}
+                                {change.after ? describeCapability(change.after, t) : t("Removed")}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
                 {review.previousScreens && JSON.stringify(review.previousScreens) !== JSON.stringify(review.screens) && (
-                  <p className="text-label">{t("Screen access changed. Review the details below.")}</p>
+                  <p className="text-label text-warn">{t("Screen access changed. Review the details below.")}</p>
                 )}
               </section>
-              <details className="rounded-lg border border-ink-700 p-3 text-label">
-                <summary className="cursor-pointer font-medium text-ink-100">{t("Technical details")}</summary>
-                <div className="mt-3 space-y-2 break-words">
+
+              <details className="pa-tech-details">
+                <summary>{t("Technical details")}</summary>
+                <div className="mt-3 space-y-2 break-words text-micro text-ink-300">
                   <p>{t("App")}: <code>{review.name}</code></p>
                   <p>{t("Package digest")}: <code className="break-all">{review.digest}</code></p>
                   {(provenance || hostedReview) && <>
@@ -293,20 +512,13 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                     : <p>{t("Package files")}: {review.files.join(", ")}</p>}
                 </div>
               </details>
-              {((installation && review.digest !== installation.digest) || (review.target && review.digest !== review.target.digest)) && <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>}
+
+              {((installation && review.digest !== installation.digest) || (review.target && review.digest !== review.target.digest)) && (
+                <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>
+              )}
               <p className="alert warn">{t("This check does not scan for secrets or review app behavior.")}</p>
               {review.warnings && <p className="alert fail" role="alert">{t("The package reported warnings. Resolve them before installing.")}</p>}
-              <label className="flex items-start gap-2 text-label"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.currentTarget.checked)} disabled={busy !== null} /><span>{t("I reviewed this version and its requested access.")}</span></label>
               {error && <p className="alert fail" role="alert">{error}</p>}
-              <div className="flex flex-wrap gap-2">
-                {hostedReview ? <>
-                  <Button disabled={busy !== null} onClick={() => void decide("reject")}>{busy === "reject" ? t("Rejecting…") : t("Reject request")}</Button>
-                  <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void decide("install")}>{busy === "apply" ? t("Installing…") : t("Approve and install")}</Button>
-                </> : <>
-                  <Button disabled={busy !== null} onClick={() => { setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); }}>{t("Back")}</Button>
-                  <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void apply()}>{busy === "apply" ? t("Installing…") : installation ? t("Install update") : t("Install private app")}</Button>
-                </>}
-              </div>
             </>
           )}
         </div>

@@ -130,6 +130,18 @@ execution rather than pretending to run the tool.
 
 ## Presentation and the board-wide drawer
 
+### Transparent canvas (avoid page and tab-bar background colors)
+
+Keep the app screen's document (`html`, `body`), root page wrapper, and top tab
+bars transparent (`background: transparent`). The host board owns the page
+backdrop and `cadence-kit` sets `html, body { background: transparent; }`. Do
+not paint an opaque page background color (such as `--color-ink-950` or a
+hardcoded dark/light hex) or a solid-filled top tab bar strip — doing so
+creates a mismatched inset box whenever the host theme changes. Reserve surface
+background tokens (`--color-ink-850`, `--color-ink-875`, `--color-ink-800`) for
+discrete elevated components such as cards, tables, inputs, popovers, and
+drawers.
+
 A screen opts into the host's `screen-presentation.v1` contract by naming it in
 `accepts` (with `screen.v2`). The host then tells the frame which surface it is
 presented in — the app outlet (`"outlet"`) or the board-wide drawer

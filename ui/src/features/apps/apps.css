@@ -58,9 +58,7 @@
   }
 }
 
-/* CAD-1312: the Apps home's states — sign-in refusal, load failure and
-   the empty workspace — share one restrained left-aligned panel instead
-   of a wide banner or a centred hero card. */
+/* CAD-1312: restrained left-aligned state panel for sign-in, load failure, and empty workspace. */
 .apps-state {
   display: flex;
   align-items: center;
@@ -121,130 +119,413 @@
   }
 }
 
-/* CAD-1312: the unified zero-content state uses the shared .page-state
-   (ui/PageState.tsx); the host screen only has to flex so it can centre
-   in the pane below the header. */
 .apps-home.flex {
   min-height: calc(100dvh - 2.25rem);
 }
 
-/* The Installed gallery (CAD catalogue directory): the card opens the
-   app; the operator's settings action sits in the card's top-right
-   corner. Artwork comes from the shared AppCover, text from the real
-   app_home row. The card's own border motion is the shared `.card`
-   transition; nothing here adds animation, so reduced-motion needs no
-   extra rule. */
+/* =========================================================================
+   macOS Applications Launcher (`/apps`)
+   ========================================================================= */
+.apps-home .apps-hero {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.875rem;
+  margin-bottom: 1.25rem;
+}
+.apps-home .apps-hero-copy {
+  min-width: 0;
+}
+.apps-home .apps-hero-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+.apps-home .apps-page-title {
+  margin: 0;
+  font-size: 1.375rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+  color: var(--color-ink-100);
+}
+.apps-home .apps-hero-sub {
+  margin: 0.25rem 0 0;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-400);
+}
+.apps-home .apps-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.apps-home .apps-count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.375rem;
+  border-radius: 999px;
+  background: var(--color-ink-800);
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  font-weight: 500;
+}
+
+/* Spotlight-style Launcher Bar */
+.apps-home .apps-launcher-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.625rem 0.75rem;
+  margin-bottom: 1.25rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+}
+.apps-home .apps-search-wrap {
+  position: relative;
+  flex: 1 1 15rem;
+  min-width: min(12rem, 100%);
+  display: flex;
+  align-items: center;
+}
+.apps-home .apps-search-ic {
+  position: absolute;
+  left: 0.625rem;
+  display: inline-flex;
+  color: var(--color-ink-500);
+  pointer-events: none;
+}
+.apps-home .apps-search-input {
+  width: 100%;
+  height: 2.125rem;
+  padding-left: 2rem;
+  border-radius: 0.5rem;
+  background: var(--color-ink-900);
+}
+.apps-home .apps-filter-pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+.apps-home .apps-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  height: 1.875rem;
+  padding: 0 0.625rem;
+  border-radius: 0.4375rem;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  font-weight: 500;
+  text-transform: capitalize;
+  cursor: pointer;
+  transition: background-color 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+.apps-home .apps-filter-pill:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.apps-home .apps-filter-pill[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent) 16%, var(--color-ink-850));
+  border-color: color-mix(in srgb, var(--color-accent) 36%, var(--color-ink-700));
+  color: var(--color-accent);
+}
+.apps-home .apps-filter-pill:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.apps-home .apps-pill-n {
+  font-size: 0.625rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--color-ink-800);
+  color: var(--color-ink-400);
+}
+.apps-home .apps-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+.apps-home .apps-sort {
+  height: 2.125rem;
+  width: auto;
+  border-radius: 0.5rem;
+  background: var(--color-ink-900);
+}
+.apps-home .apps-view-switch {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 0.4375rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+}
+.apps-home .apps-view-btn {
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.625rem;
+  border: 0;
+  border-radius: 0.3125rem;
+  background: transparent;
+  color: var(--color-ink-500);
+  cursor: pointer;
+}
+.apps-home .apps-view-btn:hover {
+  color: var(--color-ink-200);
+}
+.apps-home .apps-view-btn[aria-pressed="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.apps-home .apps-view-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Subordinate Section Kickers */
+.apps-home .apps-kicker-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.apps-home .apps-kicker {
+  margin: 0;
+  font: 600 0.6875rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-ink-500);
+}
+
+/* Compact Pinned Dock */
+.apps-home .apps-fav-sec {
+  margin-top: 0;
+}
+.apps-home .apps-pinned-dock {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625rem;
+}
+.apps-home .apps-pinned-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.625rem 0.375rem 0.4375rem;
+  border-radius: 0.6875rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.apps-home .apps-pinned-chip:hover {
+  border-color: var(--color-ink-500);
+  background: var(--color-ink-800);
+}
+.apps-home .apps-pinned-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--color-ink-100);
+  text-decoration: none;
+}
+.apps-home .apps-pinned-name {
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.apps-home .apps-pinned-star {
+  border: 0;
+  background: transparent;
+  color: var(--color-warn);
+  cursor: pointer;
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.25rem;
+  font-size: 0.8125rem;
+  line-height: 1;
+}
+.apps-home .apps-pinned-star:hover {
+  background: var(--color-ink-700);
+}
+.apps-home .apps-fav-inline-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}
+
+/* macOS Applications Icon Grid & Compact List */
 .apps-home .apps-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr));
-  gap: 1.25rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(184px, 100%), 1fr));
+  gap: 0.875rem;
+}
+.apps-home .apps-grid.is-list {
+  grid-template-columns: 1fr;
+  gap: 0.5rem;
 }
 .apps-home .app-card {
   position: relative;
   min-width: 0;
   overflow: hidden;
+  border-radius: 0.875rem;
+  transition: border-color 0.15s ease, background-color 0.15s ease, transform 0.15s ease;
 }
 .apps-home .app-card:has(> a):hover {
   border-color: var(--color-ink-500);
+  background: color-mix(in srgb, var(--color-ink-800) 60%, var(--color-ink-850));
+  transform: translateY(-1px);
 }
 .apps-home .app-card:has(> .app-card-link:focus-visible) {
   outline: 2px solid var(--color-accent);
-  outline-offset: 3px;
+  outline-offset: 2px;
 }
-.apps-home .app-card-settings {
+.apps-home .app-card-actions {
   position: absolute;
-  top: 0.625rem;
-  right: 0.625rem;
+  top: 0.5rem;
+  right: 0.5rem;
   z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.apps-home .app-card:hover .app-card-actions,
+.apps-home .app-card:focus-within .app-card-actions,
+.apps-home .app-card.is-pinned .app-card-actions {
+  opacity: 1;
+}
+@media (pointer: coarse) {
+  .apps-home .app-card-actions {
+    opacity: 1;
+  }
+}
+.apps-home .app-card-action-btn,
+.apps-home .app-card-settings {
   display: grid;
   place-items: center;
-  width: 2rem;
-  height: 2rem;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--color-ink-500) 45%, transparent);
-  background: color-mix(in srgb, var(--color-ink-950) 62%, transparent);
-  color: var(--color-ink-200);
-  backdrop-filter: blur(6px);
-  transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 0.4375rem;
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--color-ink-900) 76%, transparent);
+  color: var(--color-ink-400);
+  font-size: 0.8125rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
 }
+.apps-home .app-card-action-btn:hover,
 .apps-home .app-card-settings:hover {
-  border-color: var(--color-ink-300);
-  background: var(--color-ink-850);
+  border-color: var(--color-ink-600);
+  background: var(--color-ink-800);
   color: var(--color-ink-100);
 }
+.apps-home .app-card-action-btn.is-pinned {
+  color: var(--color-warn);
+}
+.apps-home .app-card-action-btn:focus-visible,
 .apps-home .app-card-settings:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
+
 .apps-home .app-card-link,
 .apps-home .app-card-link:hover {
   display: flex;
   flex-direction: column;
+  align-items: center;
+  text-align: center;
   height: 100%;
+  padding: 1.25rem 0.875rem 1rem;
   color: var(--color-ink-300);
   text-decoration: none;
 }
 .apps-home .app-card-link:focus-visible {
   outline: none;
 }
+.apps-home .app-tile-icon {
+  margin-bottom: 0.75rem;
+  filter: drop-shadow(0 6px 14px rgb(0 0 0 / 0.22));
+  transition: transform 0.16s ease;
+}
+.apps-home .app-card:hover .app-tile-icon {
+  transform: scale(1.04);
+}
 .apps-home .app-card-copy {
   display: flex;
   flex: 1;
+  width: 100%;
   min-width: 0;
   flex-direction: column;
-  padding: 1.125rem;
+  align-items: center;
+}
+.apps-home .app-card-title-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1875rem;
+  max-width: 100%;
+}
+.apps-home .app-card-name {
+  margin: 0;
+  font-size: var(--text-body);
+  font-weight: 600;
+  color: var(--color-ink-100);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
 }
 .apps-home .card-category {
   color: var(--color-ink-500);
   font-size: var(--text-micro);
-  margin-bottom: 0.375rem;
-}
-.apps-home .app-card-name {
-  margin: 0;
-  font-size: var(--text-cardtitle);
-  font-weight: 600;
-  color: var(--color-ink-100);
+  text-transform: capitalize;
 }
 .apps-home .app-card-summary {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
-  min-height: 2.9em;
-  margin: 0.5rem 0 0;
+  min-height: 2.8em;
+  margin: 0.35rem 0 0;
   color: var(--color-ink-400);
-  font-size: var(--text-secondary);
-  line-height: 1.45;
+  font-size: var(--text-label);
+  line-height: 1.4;
 }
 .apps-home .card-publisher {
   color: var(--color-ink-500);
   font-size: var(--text-micro);
-  margin-top: 0.875rem;
-}
-.apps-home .card-publisher + .card-publisher {
-  margin-top: 0.125rem;
+  margin-top: 0.375rem;
 }
 .apps-home .card-footer {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
-  justify-content: space-between;
+  justify-content: center;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
   margin-top: auto;
-  padding-top: 1.25rem;
+  padding-top: 0.75rem;
   font-size: var(--text-micro);
-  color: var(--color-ink-400);
-}
-.apps-home .card-footer b {
-  font-weight: 500;
-  color: var(--color-ink-200);
+  color: var(--color-ink-500);
 }
 .apps-home .app-status {
   display: inline-flex;
   align-items: center;
-  gap: 0.375rem;
+  gap: 0.325rem;
   font-size: var(--text-micro);
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
 }
 .apps-home .app-status[data-state="info"] {
   color: var(--color-info);
@@ -258,17 +539,58 @@
   height: 5px;
   flex: none;
   border-radius: 50%;
+  background: var(--color-ok);
+}
+.apps-home .app-status[data-state="info"]::before,
+.apps-home .app-status[data-state="warn"]::before {
   background: currentColor;
 }
 .apps-home .app-card-copy-note {
-  padding: 0 1.125rem 1.125rem;
+  margin-top: 0.375rem;
   font-size: var(--text-micro);
   color: var(--color-ink-500);
 }
 
-/* Choose favorites: the pin picker for every installed app, kept
-   outside the gallery cards so they stay single-link. Native
-   <details>/<summary>; disabled rows wait on the favorites read. */
+/* Compact List Mode Overrides */
+.apps-home .apps-grid.is-list .app-card:hover {
+  transform: none;
+}
+.apps-home .apps-grid.is-list .app-card-link {
+  flex-direction: row;
+  align-items: center;
+  text-align: left;
+  gap: 0.875rem;
+  padding: 0.75rem 4.5rem 0.75rem 0.875rem;
+}
+.apps-home .apps-grid.is-list .app-tile-icon {
+  margin-bottom: 0;
+  filter: none;
+}
+.apps-home .apps-grid.is-list .app-card-copy {
+  align-items: flex-start;
+  gap: 0.125rem;
+}
+.apps-home .apps-grid.is-list .app-card-title-group {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.apps-home .apps-grid.is-list .app-card-summary {
+  -webkit-line-clamp: 1;
+  min-height: 0;
+  margin-top: 0.125rem;
+}
+.apps-home .apps-grid.is-list .card-footer {
+  padding-top: 0.25rem;
+  justify-content: flex-start;
+}
+.apps-home .apps-grid.is-list .app-card-actions {
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 1;
+}
+
+/* Choose favorites dropdown (kept accessible for keyboard & contract parity) */
 .apps-home .favpick {
   position: relative;
 }
@@ -342,4 +664,25 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@media (max-width: 639px) {
+  .apps-home .apps-bar-right {
+    margin-left: 0;
+    width: 100%;
+    justify-content: space-between;
+  }
+  .apps-home .apps-sort {
+    flex: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .apps-home .app-card,
+  .apps-home .app-tile-icon {
+    transition: none;
+  }
+  .apps-home .app-card:has(> a):hover,
+  .apps-home .app-card:hover .app-tile-icon {
+    transform: none;
+  }
 }
