@@ -6,13 +6,14 @@ import Button from "../../ui/Button";
 import { AppGlyph } from "../explorer/shared";
 import { notifyAppsChanged, type Installation } from "./workspaceApps";
 import { WorkspaceDialog } from "./WorkspaceDialog";
-import { applyPrivateApp, checkPrivateApp, fetchGithubPrivateApp, githubPrivateAppAvailable, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
+import { applyPrivateApp, checkPrivateApp, decideHostedPrivateReview, fetchGithubPrivateApp, getHostedPrivateReview, githubPrivateAppAvailable, type HostedPrivateReview, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
 
 const ZIP_LIMIT = 8 * 1024 * 1024;
 
 /** The owner reviews a host-checked package before explicitly committing the same File. */
-export function PrivateAppDialog({ installation, onClose, onInstalled }: {
+export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled }: {
   installation?: Installation;
+  reviewId?: string;
   onClose: () => void;
   onInstalled: () => void;
 }) {
@@ -26,7 +27,9 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
   const [provenance, setProvenance] = useState<{ url: string; digest: string } | null>(null);
   const [review, setReview] = useState<PrivateReview | null>(null);
   const [consent, setConsent] = useState(false);
-  const [busy, setBusy] = useState<"check" | "apply" | null>(null);
+  const [hostedReview, setHostedReview] = useState<HostedPrivateReview | null>(null);
+  const [hostedLoading, setHostedLoading] = useState(Boolean(reviewId !== undefined));
+  const [busy, setBusy] = useState<"check" | "apply" | "reject" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [uncertain, setUncertain] = useState(false);
   const [installed, setInstalled] = useState<Installation | null>(null);
@@ -36,18 +39,32 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
   useEffect(() => {
     const controller = new AbortController();
     const current = epoch.current;
-    void githubPrivateAppAvailable(controller.signal).then((available) => {
+    if (reviewId === undefined) void githubPrivateAppAvailable(controller.signal).then((available) => {
       if (!controller.signal.aborted && epoch.current === current && privateReadsAllowed()) setGithubAvailable(available);
     });
+    else {
+      setHostedLoading(true);
+      setError(null);
+      void getHostedPrivateReview(reviewId, controller.signal).then((request) => {
+        if (controller.signal.aborted || epoch.current !== current || !privateReadsAllowed()) return;
+        setHostedReview(request);
+        setReview(request.state === "pending" ? request.review : null);
+        setUncertain(false);
+      }).catch(() => {
+        if (!controller.signal.aborted && epoch.current === current) setError("This review is missing or unavailable.");
+      }).finally(() => { if (!controller.signal.aborted && epoch.current === current) setHostedLoading(false); });
+    }
     const invalidate = () => {
       epoch.current++;
       setGithubAvailable(false); setSource("upload"); setReview(null); setCheckedFile(null);
       setProvenance(null); setConsent(false); setGithubUrl(""); setFile(null); setError(null);
+      setHostedReview(null); setHostedLoading(false);
+      if (reviewId !== undefined) setError("This review is missing or unavailable.");
     };
     const stopPause = onPrivateReadsPaused(invalidate);
     const stopReset = onPrivateSessionReset(invalidate);
     return () => { epoch.current++; controller.abort(); stopPause(); stopReset(); };
-  }, []);
+  }, [reviewId]);
   useEffect(() => { if (review) reviewHeading.current?.focus(); }, [review]);
   const target: PrivateTarget | null = installation ? {
     installId: installation.install_id,
@@ -55,7 +72,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
     digest: installation.digest,
     generation: installation.catalog_generation,
   } : null;
-  const title = installation ? t("Update private app") : t("Add a private app");
+  const title = reviewId !== undefined ? t("Review private app request") : installation ? t("Update private app") : t("Add a private app");
   const close = () => { if (!inFlight.current) onClose(); };
   const selectFile = (selected: File | null) => {
     if (inFlight.current) return;
@@ -106,9 +123,40 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
       setReview(null); setUncertain(true); notifyAppsChanged();
     } finally { inFlight.current = false; setBusy(null); }
   };
+  const decide = async (decision: "install" | "reject") => {
+    if (!hostedReview || hostedReview.state !== "pending" || inFlight.current ||
+        (decision === "install" && (!consent || !hostedReview.review.compatible || hostedReview.review.warnings))) return;
+    const current = epoch.current;
+    inFlight.current = true;
+    setBusy(decision === "install" ? "apply" : "reject"); setError(null);
+    try {
+      const result = await decideHostedPrivateReview(hostedReview, decision);
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      setHostedReview(result); setReview(null);
+      if (result.state === "installed") { notifyAppsChanged(); onInstalled(); }
+    } catch (cause) {
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      setReview(null);
+      if (cause instanceof ApiError && cause.status === 409 && (cause.code === "installation_stale" || cause.code === "app_exists" || cause.code === "package_changed")) {
+        setError("This review no longer matches the workspace. Ask for a new review before installing.");
+      } else if (cause instanceof ApiError && cause.status === 403) {
+        setError("Only a current workspace owner can review this request.");
+      } else {
+        setUncertain(true);
+        if (decision === "install") notifyAppsChanged();
+      }
+    } finally { inFlight.current = false; setBusy(null); }
+  };
   return (
     <WorkspaceDialog title={title} onClose={close}>
-      {installed ? (
+      {hostedLoading ? (
+        <p role="status">{t("Loading review…")}</p>
+      ) : reviewId !== undefined && !review && !uncertain ? (
+        <div className="space-y-3" role={error ? "alert" : "status"}>
+          <p>{error ? t(error) : hostedReview?.state === "installed" ? t("This request has been installed.") : hostedReview?.state === "rejected" ? t("This request was rejected.") : hostedReview?.state === "expired" ? t("This request has expired.") : t("This review is missing or unavailable.")}</p>
+          <Button onClick={close}>{t("Back to apps")}</Button>
+        </div>
+      ) : installed ? (
         <div className="space-y-3" role="status">
           <h3 className="text-cardtitle font-semibold text-ink-100">{installation ? t("Private app updated") : t("Private app installed")}</h3>
           <p>{t("The checked version is installed in this workspace.")}</p>
@@ -120,16 +168,16 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
         </div>
       ) : uncertain ? (
         <div className="space-y-3" role="alert">
-          <h3 className="text-cardtitle font-semibold text-ink-100">{t("Installation outcome unknown")}</h3>
-          <p>{t("The workspace did not confirm the result. Refresh your apps before trying again.")}</p>
+          <h3 className="text-cardtitle font-semibold text-ink-100">{t(reviewId !== undefined ? "Decision outcome unknown" : "Installation outcome unknown")}</h3>
+          <p>{t(reviewId !== undefined ? "The workspace did not confirm the decision. Open the review link again to see its current status." : "The workspace did not confirm the result. Refresh your apps before trying again.")}</p>
           <Button onClick={close}>{t("Back to apps")}</Button>
         </div>
       ) : (
         <div className="space-y-4">
-          <ol className="flex flex-wrap gap-4 text-label text-ink-400" aria-label={t("Installation progress")}>
+          {reviewId === undefined && <ol className="flex flex-wrap gap-4 text-label text-ink-400" aria-label={t("Installation progress")}>
             <li aria-current={!review ? "step" : undefined}>1 · {t("Choose package")}</li>
             <li aria-current={review ? "step" : undefined}>2 · {t("Review access")}</li>
-          </ol>
+          </ol>}
           {!review ? (
             <>
               <p>{t("Choose a ZIP built with the Cadence app kit. It stays in this workspace, not the public directory.")}</p>
@@ -174,6 +222,9 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                   </p>
                 </div>
               </div>
+              {hostedReview && <p className="text-label text-ink-400">
+                {t("Expires")}: {new Date(hostedReview.expiresAt).toLocaleString()}
+              </p>}
               <div className={review.compatible ? "alert info" : "alert fail"} role="status">{review.compatible ? t("Compatible with this workspace") : t("This package is not compatible with this workspace.")}</div>
               <section aria-label={t("Requested access")} className="space-y-2">
                 <h4 className="font-medium text-ink-100">{t("Requested access")}</h4>
@@ -201,7 +252,7 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                 {review.screens.some((screen) => screen.remote_image_origins.length > 0) && (
                   <p className="text-label break-all">{t("Loads images from")}: {review.screens.flatMap((screen) => screen.remote_image_origins).join(", ")}</p>
                 )}
-                {installation && <div className="text-label">
+                {(installation || review.target) && <div className="text-label">
                   <p className="text-ink-400">{t("Changes since installed version")}</p>
                   {review.access.connections.added.length === 0 && review.access.connections.removed.length === 0 && Object.keys(review.access.capabilities).length === 0
                     ? <p>{t("No declared access changes.")}</p>
@@ -225,9 +276,9 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                 <div className="mt-3 space-y-2 break-words">
                   <p>{t("App")}: <code>{review.name}</code></p>
                   <p>{t("Package digest")}: <code className="break-all">{review.digest}</code></p>
-                  {provenance && <>
-                    <p>{t("GitHub release URL")}: <code className="break-all">{provenance.url}</code></p>
-                    <p>{t("Downloaded ZIP SHA-256")}: <code className="break-all">{provenance.digest}</code></p>
+                  {(provenance || hostedReview) && <>
+                    <p>{t("GitHub release URL")}: <code className="break-all">{hostedReview?.source ?? provenance?.url}</code></p>
+                    <p>{t("Downloaded ZIP SHA-256")}: <code className="break-all">{hostedReview?.zipSha256 ?? provenance?.digest}</code></p>
                   </>}
                   {Object.entries(review.declared.capabilities).map(([name, value]) =>
                     <p key={name}><code>{name}</code>: {formatCapability(value)}</p>)}
@@ -242,14 +293,19 @@ export function PrivateAppDialog({ installation, onClose, onInstalled }: {
                     : <p>{t("Package files")}: {review.files.join(", ")}</p>}
                 </div>
               </details>
-              {installation && review.digest !== installation.digest && <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>}
+              {((installation && review.digest !== installation.digest) || (review.target && review.digest !== review.target.digest)) && <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>}
               <p className="alert warn">{t("This check does not scan for secrets or review app behavior.")}</p>
               {review.warnings && <p className="alert fail" role="alert">{t("The package reported warnings. Resolve them before installing.")}</p>}
               <label className="flex items-start gap-2 text-label"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.currentTarget.checked)} disabled={busy !== null} /><span>{t("I reviewed this version and its requested access.")}</span></label>
               {error && <p className="alert fail" role="alert">{error}</p>}
               <div className="flex flex-wrap gap-2">
-                <Button disabled={busy !== null} onClick={() => { setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); }}>{t("Back")}</Button>
-                <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void apply()}>{busy === "apply" ? t("Installing…") : installation ? t("Install update") : t("Install private app")}</Button>
+                {hostedReview ? <>
+                  <Button disabled={busy !== null} onClick={() => void decide("reject")}>{busy === "reject" ? t("Rejecting…") : t("Reject request")}</Button>
+                  <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void decide("install")}>{busy === "apply" ? t("Installing…") : t("Approve and install")}</Button>
+                </> : <>
+                  <Button disabled={busy !== null} onClick={() => { setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); }}>{t("Back")}</Button>
+                  <Button className="btn-primary" disabled={!consent || !review.compatible || review.warnings || busy !== null} onClick={() => void apply()}>{busy === "apply" ? t("Installing…") : installation ? t("Install update") : t("Install private app")}</Button>
+                </>}
               </div>
             </>
           )}

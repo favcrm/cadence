@@ -1,6 +1,7 @@
 import { canOpenInstall } from "../explorer/installAccess";
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
+import { navigate, useHref } from "../../lib/useLocation";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
@@ -57,6 +58,13 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [privateOpen, setPrivateOpen] = useState(false);
+  const href = useHref();
+  const reviewId = new URLSearchParams(href.split("?")[1] ?? "").get("review");
+  const closeReview = () => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("review");
+    navigate(url.pathname + url.search + url.hash, { replace: true });
+  };
 
   const isOp = viewer.operator === true && !viewer.readOnly;
 
@@ -443,7 +451,9 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
       )}
         </>
       )}
-      {privateOpen && <PrivateAppDialog onClose={() => setPrivateOpen(false)} onInstalled={() => setRevision((r) => r + 1)} />}
+      {reviewId !== null && !isOp && <div className="alert warn" role="status">{t("Only a current workspace owner can review this request.")}</div>}
+      {reviewId !== null && isOp && <PrivateAppDialog key={reviewId} reviewId={reviewId} onClose={closeReview} onInstalled={() => setRevision((r) => r + 1)} />}
+      {privateOpen && reviewId === null && <PrivateAppDialog onClose={() => setPrivateOpen(false)} onInstalled={() => setRevision((r) => r + 1)} />}
     </main>
   );
 }
