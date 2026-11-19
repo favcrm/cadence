@@ -31,8 +31,6 @@
 //!   A `home` row is never relabeled as an app row, and a stored label
 //!   that is neither `home` nor a well-formed app scope refuses.
 
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
@@ -1375,7 +1373,35 @@ fn read_workspace_blob(workspace_dir: &Path, file: &ChatFile) -> Result<Vec<u8>>
 /// workspace blob operation is relative to this handle, never its pathname.
 struct PinnedBlobDir {
     #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
+    dir: crate::fd_fs::DirFd,
+}
+
+#[cfg(unix)]
+fn open_or_create_child_dir(
+    parent: &crate::fd_fs::DirFd,
+    name: &std::ffi::CStr,
+    create: bool,
+    create_err: &str,
+    unavailable_err: &str,
+) -> Result<Option<crate::fd_fs::DirFd>> {
+    match parent.open_child_dir(name) {
+        Ok(child) => Ok(Some(child)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            if !create {
+                return Ok(None);
+            }
+            if let Err(mk_err) = parent.mkdir(name, 0o700) {
+                if mk_err.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(Error::rejected(create_err));
+                }
+            }
+            parent
+                .open_child_dir(name)
+                .map(Some)
+                .map_err(|_| Error::rejected(unavailable_err))
+        }
+        Err(_) => Err(Error::rejected(unavailable_err)),
+    }
 }
 
 /// Open the workspace and custody suffix without following any component.
@@ -1386,24 +1412,12 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         if !workspace.is_absolute() {
             return Err(Error::rejected("workspace custody path must be absolute"));
         }
-        let root = std::ffi::CString::new("/").unwrap();
-        let root_fd = unsafe {
-            libc::open(
-                root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if root_fd < 0 {
-            return Err(Error::rejected(
-                "cannot open filesystem root for workspace custody",
-            ));
-        }
-        let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        let mut current = crate::fd_fs::DirFd::open_root()
+            .map_err(|_| Error::rejected("cannot open filesystem root for workspace custody"))?;
         let mut parts = Vec::new();
         for component in workspace.components() {
             match component {
@@ -1418,74 +1432,39 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
         for part in parts {
             let name = CString::new(part.as_bytes())
                 .map_err(|_| Error::rejected("workspace path is invalid"))?;
-            let fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(Error::rejected(
-                    "workspace directory is missing, aliased, or unavailable",
-                ));
-            }
-            current = unsafe { OwnedFd::from_raw_fd(fd) };
+            current = current.open_child_dir(&name).map_err(|_| {
+                Error::rejected("workspace directory is missing, aliased, or unavailable")
+            })?;
         }
         for child_name in [".cadence", CHAT_FILES_DIR] {
-            let child = CString::new(child_name).unwrap();
-            let mut fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    child.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
+            let child = CString::new(child_name)
+                .map_err(|_| Error::rejected("workspace custody directory is invalid"))?;
+            let Some(next) = open_or_create_child_dir(
+                &current,
+                &child,
+                create,
+                "cannot create workspace chat custody directory",
+                "workspace chat custody directory is aliased or unavailable",
+            )?
+            else {
+                return Ok(None);
             };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENOENT) && !create {
-                    return Ok(None);
-                }
-                if error.raw_os_error() == Some(libc::ENOENT) && create {
-                    if unsafe { libc::mkdirat(current.as_raw_fd(), child.as_ptr(), 0o700) } != 0
-                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
-                    {
-                        return Err(Error::rejected(
-                            "cannot create workspace chat custody directory",
-                        ));
-                    }
-                    fd = unsafe {
-                        libc::openat(
-                            current.as_raw_fd(),
-                            child.as_ptr(),
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                    };
-                }
-            }
-            if fd < 0 {
-                return Err(Error::rejected(
-                    "workspace chat custody directory is aliased or unavailable",
-                ));
-            }
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut stat) } != 0
-                || stat.st_uid != unsafe { libc::geteuid() }
-                || stat.st_mode & 0o022 != 0
-            {
-                unsafe {
-                    libc::close(fd);
-                }
+            let stat = next.stat().map_err(|_| {
+                Error::rejected(
+                    "workspace custody directories must be owned by the daemon uid and not group/world writable",
+                )
+            })?;
+            if stat.st_uid != crate::fd_fs::geteuid() || stat.st_mode & 0o022 != 0 {
                 return Err(Error::rejected(
                     "workspace custody directories must be owned by the daemon uid and not group/world writable",
                 ));
             }
-            current = unsafe { OwnedFd::from_raw_fd(fd) };
+            current = next;
         }
         if create {
-            ensure_custody_gitignore(current.as_raw_fd())?;
+            ensure_custody_gitignore(&current)?;
         }
-        Ok(Some(PinnedBlobDir { fd: current }))
+        Ok(Some(PinnedBlobDir { dir: current }))
     }
     #[cfg(not(unix))]
     {
@@ -1503,33 +1482,26 @@ fn workspace_users_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBl
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         if !workspace.is_absolute() {
             return Err(Error::rejected("operational workspace must be absolute"));
         }
-        let root_fd = unsafe {
-            libc::open(
-                c"/".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if root_fd < 0 {
-            return Err(Error::rejected(
-                "cannot open filesystem root for operational workspace",
-            ));
-        }
-        let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        let mut current = crate::fd_fs::DirFd::open_root().map_err(|_| {
+            Error::rejected("cannot open filesystem root for operational workspace")
+        })?;
+        let daemon_uid = crate::fd_fs::geteuid();
         for component in workspace.components() {
             let part = match component {
                 std::path::Component::RootDir => continue,
                 std::path::Component::Normal(part) => part,
                 _ => return Err(Error::rejected("operational workspace is not normalized")),
             };
-            let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
-            let daemon_uid = unsafe { libc::geteuid() };
-            if unsafe { libc::fstat(current.as_raw_fd(), &mut parent_stat) } != 0
-                || (parent_stat.st_uid != 0 && parent_stat.st_uid != daemon_uid)
+            let parent_stat = current.stat().map_err(|_| {
+                Error::rejected(
+                    "operational workspace parent has unsafe ownership or writable mode",
+                )
+            })?;
+            if (parent_stat.st_uid != 0 && parent_stat.st_uid != daemon_uid)
                 || (parent_stat.st_mode & 0o022 != 0 && parent_stat.st_mode & libc::S_ISVTX == 0)
             {
                 return Err(Error::rejected(
@@ -1538,92 +1510,50 @@ fn workspace_users_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBl
             }
             let name = CString::new(part.as_bytes())
                 .map_err(|_| Error::rejected("operational workspace path is invalid"))?;
-            let mut fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
+            let Some(next) = open_or_create_child_dir(
+                &current,
+                &name,
+                create,
+                "cannot create operational workspace root",
+                "operational workspace is aliased or unavailable",
+            )?
+            else {
+                return Ok(None);
             };
-            if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-                if !create {
-                    return Ok(None);
-                }
-                if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
-                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
-                {
-                    return Err(Error::rejected("cannot create operational workspace root"));
-                }
-                fd = unsafe {
-                    libc::openat(
-                        current.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-            }
-            if fd < 0 {
-                return Err(Error::rejected(
-                    "operational workspace is aliased or unavailable",
-                ));
-            }
-            current = unsafe { OwnedFd::from_raw_fd(fd) };
+            current = next;
         }
-        let mut workspace_stat: libc::stat = unsafe { std::mem::zeroed() };
-        let daemon_uid = unsafe { libc::geteuid() };
-        if unsafe { libc::fstat(current.as_raw_fd(), &mut workspace_stat) } != 0
-            || workspace_stat.st_uid != daemon_uid
-            || workspace_stat.st_mode & 0o022 != 0
-        {
+        let workspace_stat = current.stat().map_err(|_| {
+            Error::rejected(
+                "operational workspace must be daemon-owned and not group/other writable",
+            )
+        })?;
+        if workspace_stat.st_uid != daemon_uid || workspace_stat.st_mode & 0o022 != 0 {
             return Err(Error::rejected(
                 "operational workspace must be daemon-owned and not group/other writable",
             ));
         }
-        let name = c"users";
-        let mut fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        let Some(users) = open_or_create_child_dir(
+            &current,
+            c"users",
+            create,
+            "cannot create operational users directory",
+            "operational users directory is aliased or unavailable",
+        )?
+        else {
+            return Ok(None);
         };
-        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-            if !create {
-                return Ok(None);
-            }
-            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
-                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
-            {
-                return Err(Error::rejected("cannot create operational users directory"));
-            }
-            fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-        }
-        if fd < 0 {
-            return Err(Error::rejected(
-                "operational users directory is aliased or unavailable",
-            ));
-        }
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } != 0
-            || stat.st_uid != unsafe { libc::geteuid() }
-            || stat.st_mode & 0o077 != 0
-        {
-            unsafe { libc::close(fd) };
+        let stat = users.stat().map_err(|_| {
+            Error::rejected("operational users directory must be daemon-owned and private")
+        })?;
+        if stat.st_uid != daemon_uid || stat.st_mode & 0o077 != 0 {
             return Err(Error::rejected(
                 "operational users directory must be daemon-owned and private",
             ));
         }
-        let users = unsafe { OwnedFd::from_raw_fd(fd) };
         if create {
-            ensure_custody_gitignore(users.as_raw_fd())?;
+            ensure_custody_gitignore(&users)?;
         }
-        Ok(Some(PinnedBlobDir { fd: users }))
+        Ok(Some(PinnedBlobDir { dir: users }))
     }
     #[cfg(not(unix))]
     {
@@ -1642,7 +1572,6 @@ fn open_user_attachment_dir(
     attachment_id: &str,
     create: bool,
 ) -> Result<Option<PinnedBlobDir>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     if !valid_upload_account_id(user_id)
         || !valid_native_thread_id(thread_id)
         || !valid_id(attachment_id)
@@ -1652,58 +1581,35 @@ fn open_user_attachment_dir(
         ));
     }
     let components = [user_id, "threads", thread_id, "uploads", attachment_id];
-    let duplicate = unsafe { libc::fcntl(users.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(Error::rejected(
-            "cannot duplicate operational users directory",
-        ));
-    }
-    let mut current = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let mut current = users
+        .dir
+        .try_clone()
+        .map_err(|_| Error::rejected("cannot duplicate operational users directory"))?;
+    let daemon_uid = crate::fd_fs::geteuid();
     for part in components {
         let name = std::ffi::CString::new(part)
             .map_err(|_| Error::rejected("stored upload path is malformed"))?;
-        let mut fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        let Some(next) = open_or_create_child_dir(
+            &current,
+            &name,
+            create,
+            "cannot create private upload directory",
+            "private upload path is aliased or unavailable",
+        )?
+        else {
+            return Ok(None);
         };
-        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-            if !create {
-                return Ok(None);
-            }
-            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
-                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
-            {
-                return Err(Error::rejected("cannot create private upload directory"));
-            }
-            fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-        }
-        if fd < 0 {
-            return Err(Error::rejected(
-                "private upload path is aliased or unavailable",
-            ));
-        }
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } != 0
-            || stat.st_uid != unsafe { libc::geteuid() }
-            || stat.st_mode & 0o077 != 0
-        {
-            unsafe { libc::close(fd) };
+        let stat = next
+            .stat()
+            .map_err(|_| Error::rejected("private upload path has unsafe ownership or mode"))?;
+        if stat.st_uid != daemon_uid || stat.st_mode & 0o077 != 0 {
             return Err(Error::rejected(
                 "private upload path has unsafe ownership or mode",
             ));
         }
-        current = unsafe { OwnedFd::from_raw_fd(fd) };
+        current = next;
     }
-    Ok(Some(PinnedBlobDir { fd: current }))
+    Ok(Some(PinnedBlobDir { dir: current }))
 }
 
 #[cfg(not(unix))]
@@ -1721,46 +1627,16 @@ fn open_user_attachment_dir(
 
 #[cfg(target_os = "linux")]
 fn publish_attachment_at(stage: &PinnedStage, target: &PinnedBlobDir, name: &str) -> Result<()> {
-    use std::os::fd::AsRawFd;
     if sanitize_name(name)? != name {
         return Err(Error::rejected("host-validated upload filename changed"));
     }
     let name = std::ffi::CString::new(name)
         .map_err(|_| Error::rejected("host-validated upload filename is invalid"))?;
-    let mut rc = unsafe {
-        libc::linkat(
-            stage.file.as_raw_fd(),
-            c"".as_ptr(),
-            target.fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    if rc != 0
-        && matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EPERM) | Some(libc::EINVAL)
-        )
-    {
-        let procfd = std::ffi::CString::new(format!("/proc/self/fd/{}", stage.file.as_raw_fd()))
-            .expect("formatted procfd contains no NUL");
-        rc = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                procfd.as_ptr(),
-                target.fd.as_raw_fd(),
-                name.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-    }
-    if rc != 0 {
-        return Err(Error::rejected(format!(
-            "cannot publish immutable upload without replacing an existing file: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    target.dir.link_fd(&stage.file, &name).map_err(|err| {
+        Error::rejected(format!(
+            "cannot publish immutable upload without replacing an existing file: {err}"
+        ))
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1789,19 +1665,10 @@ fn read_user_attachment(workspace: &Path, file: &ChatFile) -> Result<Vec<u8>> {
     }
     let name = std::ffi::CString::new(file.name.as_str())
         .map_err(|_| Error::rejected("stored upload filename is malformed"))?;
-    let fd = unsafe {
-        libc::openat(
-            dir.fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(
-            "operational attachment is missing or aliased",
-        ));
-    }
-    let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+    let opened = dir
+        .dir
+        .open_readonly_nofollow(&name)
+        .map_err(|_| Error::rejected("operational attachment is missing or aliased"))?;
     let bytes = read_bounded_file(&opened, CHAT_FILE_MAX_BYTES)?;
     if bytes.is_empty() || bytes.len() as u64 != file.size || sha256_hex(&bytes) != file.sha256 {
         return Err(Error::rejected(
@@ -1824,26 +1691,13 @@ fn read_user_attachment(_workspace: &Path, _file: &ChatFile) -> Result<Vec<u8>> 
 /// rule is created exclusively; an existing entry that is not exactly
 /// `*` is replaced by an atomic rename of a fresh file in the same dir.
 #[cfg(unix)]
-fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
+fn ensure_custody_gitignore(dir: &crate::fd_fs::DirFd) -> Result<()> {
     use std::io::{Read, Write};
-    use std::os::fd::{FromRawFd, OwnedFd};
     let err =
         |e: std::io::Error| Error::rejected(format!("cannot write the custody ignore rule: {e}"));
-    let open = |name: &std::ffi::CStr, flags: libc::c_int| unsafe {
-        libc::openat(
-            dir,
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
     // True when `.gitignore` is already exactly the `*` rule.
-    let has_rule = || {
-        let fd = open(c".gitignore", libc::O_RDONLY | libc::O_NONBLOCK);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let has_rule = || -> std::io::Result<bool> {
+        let mut file = dir.open_readonly_nofollow(c".gitignore")?;
         let mut buf = Vec::new();
         // Bounded: the rule is two bytes; anything longer is rewritten.
         let ok = Read::take(&mut file, 16).read_to_end(&mut buf).is_ok();
@@ -1866,21 +1720,16 @@ fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
     .expect("no NUL in a formatted name");
-    let written = (|| {
-        let fd = open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let written = (|| -> std::io::Result<()> {
+        let mut file =
+            dir.open_file_nofollow(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
         file.write_all(b"*\n")?;
         file.sync_all()?;
-        if unsafe { libc::renameat(dir, tmp.as_ptr(), dir, c".gitignore".as_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        dir.rename_child(&tmp, c".gitignore")?;
         Ok(())
     })();
     if let Err(e) = written {
-        unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+        let _ = dir.unlink_child(&tmp);
         // A concurrent first upload may have installed the rule already.
         return if has_rule().unwrap_or(false) {
             Ok(())
@@ -1893,28 +1742,15 @@ fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
 
 #[cfg(unix)]
 fn open_blob_at(root: &PinnedBlobDir, digest: &str) -> Result<Option<std::fs::File>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let name =
         std::ffi::CString::new(digest).map_err(|_| Error::rejected("invalid retained digest"))?;
-    let fd = unsafe {
-        libc::openat(
-            root.fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(None);
-        }
-        return Err(Error::rejected(format!(
+    match root.dir.open_readonly_nofollow(&name) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) => Err(Error::rejected(format!(
             "workspace retained entry is invalid: {e}"
-        )));
+        ))),
     }
-    Ok(Some(std::fs::File::from(unsafe {
-        OwnedFd::from_raw_fd(fd)
-    })))
 }
 
 #[cfg(unix)]
@@ -1940,41 +1776,28 @@ fn read_verified_at(_root: &PinnedBlobDir, _digest: &str, _size: u64) -> Result<
 
 #[cfg(unix)]
 fn acquire_workspace_quota_lock(root: &PinnedBlobDir) -> Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
     let name = c".quota.lock";
-    let mut fd = unsafe {
-        libc::openat(
-            root.fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
-        fd = unsafe {
-            libc::openat(
-                root.fd.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+    let lock =
+        match root
+            .dir
+            .open_file_nofollow(name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600)
+        {
+            Ok(file) => file,
+            Err(err) if err.raw_os_error() == Some(libc::EEXIST) => root
+                .dir
+                .open_file_nofollow(name, libc::O_RDWR, 0)
+                .map_err(|e| Error::rejected(format!("workspace quota lock unavailable: {e}")))?,
+            Err(err) => {
+                return Err(Error::rejected(format!(
+                    "workspace quota lock unavailable: {err}"
+                )));
+            }
         };
-    }
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "workspace quota lock unavailable: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let lock = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(lock.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(Error::rejected(
-            "workspace quota lock could not be verified",
-        ));
-    }
-    let stat = unsafe { stat.assume_init() };
+    let stat = crate::fd_fs::fstat(lock.as_fd())
+        .map_err(|_| Error::rejected("workspace quota lock could not be verified"))?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-        || stat.st_uid != unsafe { libc::getuid() }
+        || stat.st_uid != crate::fd_fs::getuid()
         || stat.st_nlink != 1
         || stat.st_mode & 0o777 != 0o600
     {
@@ -1982,11 +1805,8 @@ fn acquire_workspace_quota_lock(root: &PinnedBlobDir) -> Result<std::fs::File> {
             "workspace quota lock has unsafe ownership or mode",
         ));
     }
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(Error::busy(
-            "workspace quota admission is busy; retry shortly",
-        ));
-    }
+    crate::fd_fs::flock_exclusive_nonblocking(&lock)
+        .map_err(|_| Error::busy("workspace quota admission is busy; retry shortly"))?;
     Ok(lock)
 }
 
@@ -2005,67 +1825,18 @@ struct QuotaFile {
     size: u64,
 }
 
-/// Reset the thread's `errno` so a `readdir` end-of-directory can be told
-/// from a read error.
 #[cfg(unix)]
-fn clear_errno() {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
-
-#[cfg(unix)]
-struct QuotaDir(*mut libc::DIR);
-
-#[cfg(unix)]
-impl Drop for QuotaDir {
-    fn drop(&mut self) {
-        unsafe {
-            libc::closedir(self.0);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
-    let scan_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if scan_fd < 0 {
-        return Err(Error::rejected(
-            "quota accounting could not duplicate a pinned directory",
-        ));
-    }
-    let dir = unsafe { libc::fdopendir(scan_fd) };
-    if dir.is_null() {
-        unsafe { libc::close(scan_fd) };
-        return Err(Error::rejected(
-            "quota accounting could not enumerate a pinned directory",
-        ));
-    }
-    let dir = QuotaDir(dir);
+fn quota_scan_dir(dir: &crate::fd_fs::DirFd) -> Result<Vec<QuotaFile>> {
+    use std::os::fd::AsFd;
+    let iter = dir
+        .read_dir()
+        .map_err(|_| Error::rejected("quota accounting could not enumerate a pinned directory"))?;
     let mut files = Vec::new();
     let mut entries = 0u64;
-    loop {
-        clear_errno();
-        let entry = unsafe { libc::readdir(dir.0) };
-        if entry.is_null() {
-            let read_error = std::io::Error::last_os_error();
-            if read_error.raw_os_error().is_some_and(|code| code != 0) {
-                return Err(Error::rejected(
-                    "quota accounting directory scan was incomplete",
-                ));
-            }
-            break;
-        }
-        let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if raw.to_bytes() == b"." || raw.to_bytes() == b".." {
-            continue;
-        }
-        if matches!(raw.to_bytes(), b".quota.lock" | b".gitignore") {
+    for entry in iter {
+        let name =
+            entry.map_err(|_| Error::rejected("quota accounting directory scan was incomplete"))?;
+        if matches!(name.as_bytes(), b".quota.lock" | b".gitignore") {
             continue;
         }
         entries = entries
@@ -2076,40 +1847,18 @@ fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
                 "quota accounting refuses more than 1,000 entries in a residue directory",
             ));
         }
-        let name = raw.to_owned();
-        let child = unsafe {
-            libc::openat(
-                fd,
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if child < 0 {
-            return Err(Error::rejected(
-                "quota accounting found an unreadable or aliased entry",
-            ));
-        }
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let rc = unsafe { libc::fstat(child, stat.as_mut_ptr()) };
-        if rc != 0 {
-            unsafe {
-                libc::close(child);
-            }
-            return Err(Error::rejected(
-                "quota accounting could not inspect an entry",
-            ));
-        }
-        let stat = unsafe { stat.assume_init() };
-        unsafe {
-            libc::close(child);
-        }
+        let child = dir.open_nofollow_fd(&name).map_err(|_| {
+            Error::rejected("quota accounting found an unreadable or aliased entry")
+        })?;
+        let stat = crate::fd_fs::fstat(child.as_fd())
+            .map_err(|_| Error::rejected("quota accounting could not inspect an entry"))?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size < 0 {
             return Err(Error::rejected(
                 "quota accounting refuses non-regular or ambiguous entries",
             ));
         }
         files.push(QuotaFile {
-            path: raw.to_bytes().to_vec(),
+            path: name.into_bytes(),
             device: stat.st_dev,
             inode: stat.st_ino,
             size: stat.st_size as u64,
@@ -2120,52 +1869,26 @@ fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
 
 #[cfg(unix)]
 fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
     fn walk(
-        fd: std::os::fd::RawFd,
+        dir: &crate::fd_fs::DirFd,
         prefix: &[u8],
         depth: usize,
         entries: &mut u64,
         files: &mut Vec<QuotaFile>,
     ) -> Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         if depth > 8 {
             return Err(Error::rejected(
                 "quota accounting found excessive upload-directory depth",
             ));
         }
-        let scan_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if scan_fd < 0 {
-            return Err(Error::rejected(
-                "quota accounting could not duplicate a users directory",
-            ));
-        }
-        let dir = unsafe { libc::fdopendir(scan_fd) };
-        if dir.is_null() {
-            unsafe { libc::close(scan_fd) };
-            return Err(Error::rejected(
-                "quota accounting could not enumerate a users directory",
-            ));
-        }
-        let dir = QuotaDir(dir);
-        loop {
-            clear_errno();
-            let entry = unsafe { libc::readdir(dir.0) };
-            if entry.is_null() {
-                if std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .is_some_and(|code| code != 0)
-                {
-                    return Err(Error::rejected(
-                        "quota accounting users scan was incomplete",
-                    ));
-                }
-                break;
-            }
-            let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if matches!(raw.to_bytes(), b"." | b"..")
-                || (depth == 0 && raw.to_bytes() == b".gitignore")
-            {
+        let iter = dir.read_dir().map_err(|_| {
+            Error::rejected("quota accounting could not enumerate a users directory")
+        })?;
+        for entry in iter {
+            let name =
+                entry.map_err(|_| Error::rejected("quota accounting users scan was incomplete"))?;
+            if depth == 0 && name.as_bytes() == b".gitignore" {
                 continue;
             }
             *entries = entries
@@ -2176,40 +1899,27 @@ fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
                     "quota accounting refuses an excessive users tree",
                 ));
             }
-            let name = raw.to_owned();
-            let child = unsafe {
-                libc::openat(
-                    fd,
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            if child < 0 {
-                return Err(Error::rejected(
-                    "quota accounting found an unreadable or aliased upload entry",
-                ));
-            }
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe { libc::fstat(child, stat.as_mut_ptr()) } != 0 {
-                unsafe { libc::close(child) };
-                return Err(Error::rejected(
-                    "quota accounting could not inspect an upload entry",
-                ));
-            }
-            let stat = unsafe { stat.assume_init() };
+            let child = dir.open_nofollow_fd(&name).map_err(|_| {
+                Error::rejected("quota accounting found an unreadable or aliased upload entry")
+            })?;
+            let stat = crate::fd_fs::fstat(child.as_fd()).map_err(|_| {
+                Error::rejected("quota accounting could not inspect an upload entry")
+            })?;
             match stat.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     let mut nested = prefix.to_vec();
                     nested.push(b'/');
-                    nested.extend_from_slice(raw.to_bytes());
-                    let nested_fd = unsafe { OwnedFd::from_raw_fd(child) };
-                    walk(nested_fd.as_raw_fd(), &nested, depth + 1, entries, files)?;
+                    nested.extend_from_slice(name.as_bytes());
+                    let nested_dir = crate::fd_fs::DirFd::from_verified_dir(child, &stat)
+                        .ok_or_else(|| {
+                            Error::rejected("quota accounting could not inspect an upload entry")
+                        })?;
+                    walk(&nested_dir, &nested, depth + 1, entries, files)?;
                 }
                 libc::S_IFREG if stat.st_size >= 0 => {
-                    unsafe { libc::close(child) };
                     let mut path = prefix.to_vec();
                     path.push(b'/');
-                    path.extend_from_slice(raw.to_bytes());
+                    path.extend_from_slice(name.as_bytes());
                     files.push(QuotaFile {
                         path,
                         device: stat.st_dev,
@@ -2218,7 +1928,6 @@ fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
                     });
                 }
                 _ => {
-                    unsafe { libc::close(child) };
                     return Err(Error::rejected(
                         "quota accounting refuses non-regular or ambiguous upload entries",
                     ));
@@ -2228,7 +1937,7 @@ fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
         Ok(())
     }
     let mut files = Vec::new();
-    walk(root.fd.as_raw_fd(), b"users", 0, &mut 0, &mut files)?;
+    walk(&root.dir, b"users", 0, &mut 0, &mut files)?;
     Ok(files)
 }
 
@@ -2359,7 +2068,7 @@ fn enforce_workspace_quota(
     const BUCKET_OBJECTS: u64 = 250;
     #[cfg(unix)]
     {
-        let mut observed = quota_scan_dir(root.fd.as_raw_fd())?;
+        let mut observed = quota_scan_dir(&root.dir)?;
         if let Some(users) = workspace_users_dir(workspace_dir, false)? {
             observed.extend(quota_scan_user_tree(&users)?);
         }
@@ -2519,63 +2228,41 @@ fn open_upload_source(state_dir: &Path, tmp: &Path) -> Result<Option<std::fs::Fi
     }
     #[cfg(unix)]
     {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
-        let dir_c = std::ffi::CString::new(uploads.as_os_str().as_bytes())
-            .map_err(|_| Error::rejected("chat_file_upload refused: staging path is not usable"))?;
-        let dirfd = unsafe {
-            libc::open(
-                dir_c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if dirfd < 0 {
-            let e = std::io::Error::last_os_error();
-            // `O_DIRECTORY|O_NOFOLLOW` on a symlink is `ENOTDIR` on
-            // Linux, not `ELOOP`: name the refusal from lstat.
-            if e.raw_os_error() == Some(libc::ELOOP)
-                || std::fs::symlink_metadata(&uploads)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
+        let dirfd = match crate::fd_fs::DirFd::open_nofollow(&uploads) {
+            Ok(dir) => dir,
+            Err(e) => {
+                // `O_DIRECTORY|O_NOFOLLOW` on a symlink is `ENOTDIR` on
+                // Linux, not `ELOOP`: name the refusal from lstat.
+                if e.raw_os_error() == Some(libc::ELOOP)
+                    || std::fs::symlink_metadata(&uploads)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                {
+                    return Err(Error::rejected(format!(
+                        "chat_file_upload refused: the staging dir {} is a symlink — refusing to follow it",
+                        uploads.display()
+                    )));
+                }
                 return Err(Error::rejected(format!(
-                    "chat_file_upload refused: the staging dir {} is a symlink — refusing to follow it",
+                    "chat_file_upload refused: cannot open the staging dir {}: {e}",
                     uploads.display()
                 )));
             }
-            return Err(Error::rejected(format!(
-                "chat_file_upload refused: cannot open the staging dir {}: {e}",
-                uploads.display()
-            )));
-        }
-        let dirfd = unsafe { OwnedFd::from_raw_fd(dirfd) };
+        };
         let leaf = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| Error::rejected("chat_file_upload refused: tmp name is not usable"))?;
-        let fd = unsafe {
-            libc::openat(
-                dirfd.as_raw_fd(),
-                leaf.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ENOENT) {
-                return Ok(None);
-            }
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                return Err(Error::rejected(
-                    "chat_file_upload refused: tmp is a symlink — refusing to follow it",
-                ));
-            }
-            return Err(Error::rejected(format!(
+        match dirfd.open_readonly_nofollow(&leaf) {
+            Ok(file) => Ok(Some(file)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(Error::rejected(
+                "chat_file_upload refused: tmp is a symlink — refusing to follow it",
+            )),
+            Err(e) => Err(Error::rejected(format!(
                 "chat_file_upload tmp {}: {e}",
                 tmp.display()
-            )));
+            ))),
         }
-        Ok(Some(std::fs::File::from(unsafe {
-            OwnedFd::from_raw_fd(fd)
-        })))
     }
     #[cfg(not(unix))]
     {
@@ -2595,7 +2282,7 @@ fn open_upload_source(state_dir: &Path, tmp: &Path) -> Result<Option<std::fs::Fi
 /// checked bytes and no named stage can be raced or left behind.
 #[cfg(target_os = "linux")]
 struct PinnedStage {
-    root_fd: std::os::fd::OwnedFd,
+    root_dir: crate::fd_fs::DirFd,
     file: std::fs::File,
 }
 
@@ -2612,31 +2299,21 @@ impl PinnedStage {
 #[cfg(target_os = "linux")]
 fn write_stage_at(root: &PinnedBlobDir, bytes: &[u8]) -> Result<PinnedStage> {
     use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let fd = unsafe {
-        libc::openat(
-            root.fd.as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "workspace filesystem does not support anonymous O_TMPFILE custody; refusing named-stage fallback: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let file = root.dir.open_tmpfile(0o600).map_err(|err| {
+        Error::rejected(format!(
+            "workspace filesystem does not support anonymous O_TMPFILE custody; refusing named-stage fallback: {err}"
+        ))
+    })?;
     if !file.metadata()?.is_file() {
         return Err(Error::rejected(
             "anonymous workspace stage is not a regular file",
         ));
     }
-    let stage = PinnedStage {
-        root_fd: duplicate_fd(root.fd.as_raw_fd())?,
-        file,
-    };
+    let root_dir = root
+        .dir
+        .try_clone()
+        .map_err(|_| Error::rejected("cannot retain workspace custody descriptor"))?;
+    let stage = PinnedStage { root_dir, file };
     let mut writer = stage.file.try_clone()?;
     writer.write_all(bytes)?;
     writer.sync_all()?;
@@ -2678,69 +2355,29 @@ fn publish_blob_at(stage: &PinnedStage, _digest: &str, _size: u64) -> Result<()>
 
 #[cfg(target_os = "linux")]
 fn publish_blob_at(stage: &PinnedStage, digest: &str, size: u64) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    let dest = std::ffi::CString::new(digest).unwrap();
-    let mut rc = unsafe {
-        libc::linkat(
-            stage.file.as_raw_fd(),
-            c"".as_ptr(),
-            stage.root_fd.as_raw_fd(),
-            dest.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    let mut error = std::io::Error::last_os_error();
-    if rc != 0 && matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EINVAL)) {
-        // AT_EMPTY_PATH can require CAP_DAC_READ_SEARCH. The procfd link
-        // still names the opened inode, never a re-resolved stage leaf.
-        let procfd =
-            std::ffi::CString::new(format!("/proc/self/fd/{}", stage.file.as_raw_fd())).unwrap();
-        rc = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                procfd.as_ptr(),
-                stage.root_fd.as_raw_fd(),
-                dest.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-        error = std::io::Error::last_os_error();
-    }
-    if rc == 0 {
-        return Ok(());
-    }
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        if matches!(
-            read_verified_at(
-                &PinnedBlobDir {
-                    fd: duplicate_fd(stage.root_fd.as_raw_fd())?,
-                },
-                digest,
-                size
-            ),
-            Ok(Some(_))
-        ) {
-            return Ok(());
+    let dest =
+        std::ffi::CString::new(digest).map_err(|_| Error::rejected("invalid retained digest"))?;
+    match stage.root_dir.link_fd(&stage.file, &dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let root_copy = stage
+                .root_dir
+                .try_clone()
+                .map_err(|_| Error::rejected("cannot retain workspace custody descriptor"))?;
+            if matches!(
+                read_verified_at(&PinnedBlobDir { dir: root_copy }, digest, size),
+                Ok(Some(_))
+            ) {
+                return Ok(());
+            }
+            Err(Error::rejected(
+                "existing workspace blob failed digest verification; refusing overwrite",
+            ))
         }
-        return Err(Error::rejected(
-            "existing workspace blob failed digest verification; refusing overwrite",
-        ));
+        Err(error) => Err(Error::rejected(format!(
+            "could not publish workspace blob from its owned inode: {error}"
+        ))),
     }
-    Err(Error::rejected(format!(
-        "could not publish workspace blob from its owned inode: {error}"
-    )))
-}
-
-#[cfg(target_os = "linux")]
-fn duplicate_fd(fd: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if copy < 0 {
-        return Err(Error::rejected(
-            "cannot retain workspace custody descriptor",
-        ));
-    }
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2758,13 +2395,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_first_gitignore_writes_all_succeed() {
-        use std::os::fd::AsRawFd;
         let dir = TempDir::new().unwrap();
-        let handle = std::fs::File::open(dir.path()).unwrap();
-        let fd = handle.as_raw_fd();
+        let dir_fd = crate::fd_fs::DirFd::open_nofollow(dir.path()).unwrap();
         std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| ensure_custody_gitignore(fd)))
+                .map(|_| scope.spawn(|| ensure_custody_gitignore(&dir_fd)))
                 .collect();
             for worker in workers {
                 worker.join().unwrap().unwrap();
