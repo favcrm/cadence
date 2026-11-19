@@ -101,6 +101,6 @@ equal(resourceAppView("/apps/crm", "inst_crm", "ctx_1", "crm", { kind: "invoice"
 equal(resourceAppView("/apps/crm", "inst_crm", "ctx_1", "crm", { kind: "customer", id: "Cus_UPPER", label: "x" }), null, "an id the frame would refuse: no canvas action");
 
 // Read-only: the mount keeps only read operations; a write the app declared is closed.
-const receipt = { mount: "/api/app-screen/n", bridge_nonce: "b", generation: 1, tag: "crm", action_token: "t", tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show", "records.update", "records.create", "sends.approve", "screen.route.patch", "records.csv.import"] } as unknown as MountReceipt;
+const receipt = { mount: "/api/app-screen/n", bridge_nonce: "b", generation: 1, tag: "crm", action_token: "t", tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show", "records.update", "records.create", "sends.approve", "screen.route.patch", "records.csv.import", "works.get"] } as unknown as MountReceipt;
 equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch"], "only reads and route patches survive");
-equal(receipt.operations?.length, 7, "the original receipt is not mutated");
+equal(receipt.operations?.length, 8, "the original receipt is not mutated");

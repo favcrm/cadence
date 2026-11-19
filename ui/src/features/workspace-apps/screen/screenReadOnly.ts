@@ -7,21 +7,24 @@
  * has no path to the server.
  *
  * An allowlist, never a denylist: an operation added later is closed until it
- * is listed here. The list follows the daemon's own read set for a member
- * mount (`ScreenOperation::is_screen_read`), narrowed to what a record view
- * needs.
+ * is listed here. The list is the daemon's own read set for a member mount
+ * (`ScreenOperation::is_screen_read`), so a screen that already runs for a
+ * read-only member sees the operations it expects.
  */
 import type { MountReceipt } from "./screenLifecycle";
 
 export const READ_ONLY_OPERATIONS: readonly string[] = [
-  "records.list", "records.show", "records.aggregate",
+  "records.list", "records.show", "catalog.status",
   "segments.list", "segments.show", "exclusions.list", "exclusions.show", "suppressions.list",
+  "audience.preview",
   "content.list", "content.show", "content.render",
   "proposals.list", "proposals.show", "proposals.render",
-  "sends.list", "sends.show", "campaign-work.show",
+  "sends.list", "sends.show", "smtp.show", "origin.show",
+  "screen.route.patch", "screen.preview.show", "screen.preview.clear",
   "whatsapp.status", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages",
-  "works.query", "works.get", "calendar.query",
-  "screen.route.patch",
+  "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
+  "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results",
+  "whatsapp.draft.show", "campaign-work.show", "calendar.query",
 ];
 
 /** The receipt a read-only mount is held to: operations narrowed to reads. */
