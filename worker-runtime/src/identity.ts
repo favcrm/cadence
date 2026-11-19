@@ -610,9 +610,8 @@ export function readOperationReply(
     if (typeof message !== "object" || message === null || !("role" in message) ||
         message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
       return unconfirmed;
-    // A terminal input can still point at output cut off by a token limit
-    // or stopped at a tool call. Neither is a complete specialist reply.
-    if (!("stopReason" in message) || message.stopReason !== "stop") return unconfirmed;
+    if (!("stopReason" in message) || (message.stopReason !== "stop" &&
+        message.stopReason !== "length" && message.stopReason !== "toolUse")) return unconfirmed;
     let text = "";
     for (const part of message.content as unknown[]) {
       if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
