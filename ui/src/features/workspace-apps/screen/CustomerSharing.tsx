@@ -275,8 +275,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
     } else {
       if (change.kind === "revoke") setRevokeUnavailable(true);
       else if (change.kind === "visibility") {
-        const unsupported = result?.status === 404 ||
-          (result?.status === 501 && object(result.body) && result.body.code === "not_implemented");
+        const unsupported = result?.status === 404 || result?.status === 501;
         setVisibilityIssue(unsupported ? "unsupported" : "retry");
       } else setGrantError(result?.status === 409 && object(result.body) && result.body.code === "sharing_target_unavailable"
         ? "target" : "unsupported");
