@@ -5,7 +5,17 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": "cust-0001", "title": "Ada Example", "url": "https://example.test/x" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": "cust-0001",
+        "title": "Ada Example",
+        "url": "https://example.test/x"
+      }
     }
   },
   {
@@ -14,7 +24,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 2, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": "cust-0001", "title": "Ada Example" }
+      "payload": {
+        "v": 2,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": "cust-0001",
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -23,7 +42,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install/crm", "screen_tag": "crm", "section": "customers", "record_id": "cust-0001", "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install/crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": "cust-0001",
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -32,7 +60,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": "cust 0001?x=1", "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": "cust 0001?x=1",
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -41,7 +78,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "../customers", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "../customers",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -50,7 +96,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm/mount", "section": "customers", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm/mount",
+        "section": "customers",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -59,7 +114,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened a record in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": null, "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": null,
+        "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
     }
   },
   {
@@ -68,7 +132,16 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -77,7 +150,15 @@
       "role": "agent",
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -86,7 +167,16 @@
       "role": "agent",
       "kind": "record_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   },
   {
@@ -96,7 +186,16 @@
       "kind": "view_ref",
       "text": "Opened Ada Example in the canvas (CRM · customers)",
       "html": "<b>x</b>",
-      "payload": { "v": 1, "app": "crm", "app_label": "CRM", "install_id": "install_crm", "screen_tag": "crm", "section": "customers", "record_id": null, "title": "Ada Example" }
+      "payload": {
+        "v": 1,
+        "app": "crm",
+        "app_label": "CRM",
+        "install_id": "install_crm",
+        "screen_tag": "crm",
+        "section": "customers",
+        "record_id": null,
+        "title": "Ada Example"
+      }
     }
   }
 ]
