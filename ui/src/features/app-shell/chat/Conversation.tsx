@@ -171,6 +171,8 @@ export type ConversationMode =
       /** The verified installation's canonical `/apps/<key>` path — shareable
        *  links emit it. Null (ambiguous/unresolved) means no link renders. */
       appPath?: string | null;
+      /** The installed screen's tag: an assistant resource link can open it in the canvas. */
+      screenTag?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -2364,7 +2366,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </ol>
       </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}

@@ -1460,6 +1460,8 @@ button.sentchip:focus-visible {
   margin: 0;
   padding: 0;
 }
+.app-assistant-resources > li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.1rem 0.75rem; min-width: 0; overflow-wrap: anywhere; }
+.app-assistant-canvas-open { background: none; border: 0; padding: 0; cursor: pointer; }
 .app-assistant-settings { display: grid; gap: 0.45rem; }
 .app-assistant-settings > ul > li {
   display: flex;
