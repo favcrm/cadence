@@ -741,6 +741,15 @@ app's records before retrying; do not blindly repeat an uncertain write. For
 Social Content draft create/update, the same request and material replay the
 first answer, while changed material is refused.
 
+### Inspect CRM customer sharing
+
+Open a customer in the CRM workspace and choose **Customer sharing** in the
+Cadence shell. The installed app cannot open this panel or read its contents.
+With a supported host, the customer owner or a workspace owner can review
+the customer's visibility, sharing revision and existing grants. The panel
+is read-only. If sharing changed while paging, reload the panel. Older hosts
+and customers without an active sharing policy show an unavailable state.
+
 ## A teammate's own-agent collaboration flow
 
 Use a plain signed-in human shell, or an eligible managed agent's existing
