@@ -9,7 +9,7 @@ import { EmptyCard, Failure, Loading, Note, useWikiScope, WikiToolbar } from "./
 import type { WikiRoute } from "./Wiki";
 import { withinScope } from "./scope";
 import { useTranslate } from "../../lib/locale";
-import { ManagedList } from "./ManagedFileViews";
+import { ManagedFileResults, useManagedFiles } from "./ManagedFileViews";
 
 const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", images: "Images", video: "Video", pdf: "PDF" };
 
@@ -36,6 +36,11 @@ export default function SearchPane({
   const [partial, setPartial] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<TypeFilter>("all");
+  const includeFiles = !!managedFiles && !!query && filter !== "pages" && filter !== "video";
+  const files = useManagedFiles({ path: scope?.root ?? "", query }, !!managedFiles && !!query);
+  const shownFiles = !includeFiles ? [] : files.rows?.filter(({ file }) =>
+    filter === "all" || (filter === "images" && file.kind === "image") || (filter === "pdf" && file.kind === "pdf"),
+  );
 
   useEffect(() => setValue(query), [query]);
 
@@ -102,7 +107,8 @@ export default function SearchPane({
           <Button type="submit">{t("Search")}</Button>
         </form>
       </WikiToolbar>
-      {managedFiles && query && filter === "all" && <ManagedList path={scope?.root ?? ""} query={query} navHref={navHref} />}
+      {files.error !== null && includeFiles && <Failure what="file search failed" error={files.error} />}
+      {!!shownFiles?.length && <ManagedFileResults rows={shownFiles} navHref={navHref} />}
 
       {error !== null ? (
         <Failure what="search failed" error={error} />
@@ -112,11 +118,15 @@ export default function SearchPane({
         </EmptyCard>
       ) : shown === null ? (
         <Loading what={`searching for “${query}”…`} />
+      ) : includeFiles && !shownFiles && files.error === null && shown.length === 0 ? (
+        <Loading what={`searching files for “${query}”…`} />
       ) : shown.length === 0 ? (
-        <EmptyCard title={t("No matches")}>
-          {t("No page matches")} <span className="num">{query}</span>
-          {filter !== "all" ? ` ${t("among")} ${filter}` : ""}.
-        </EmptyCard>
+        !shownFiles?.length && (!includeFiles || files.error === null) && (
+          <EmptyCard title={t("No matches")}>
+            {t("No matches for")} <span className="num">{query}</span>
+            {filter !== "all" ? ` ${t("among")} ${filter}` : ""}.
+          </EmptyCard>
+        )
       ) : (
         <>
           {partial && (
