@@ -79,6 +79,7 @@ fn kickoff_body(
     provider: &str,
     endpoint_kind: &str,
 ) -> String {
+    let guidance = crate::briefing::TASK_GUIDANCE;
     let sha7: String = base_sha.chars().take(7).collect();
     let explicit = crate::adapter::registry::report_hint(provider, endpoint_kind)
         == crate::adapter::registry::Reporting::Explicit;
@@ -103,10 +104,8 @@ fn kickoff_body(
     };
     format!(
         "read {} — {issue}: {title}. Your worktree exists: {} (branch \
-         {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
-         main; reply to {reply_to}. Company questions: read the \
-         \"Business knowledge\" section of \
-         $HOME/.agents/skills/cadence/SKILL.md.{report}{completion}",
+         {branch}, base {sha7}). Commit trailer: Issue: {issue}. Follow the repo's \
+         integration and review rules; reply to {reply_to}.{guidance}{report}{completion}",
         note.display(),
         wt_dir.display()
     )

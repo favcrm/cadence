@@ -7,6 +7,117 @@ fn an_identifier_is_validated_before_anything_uses_it() {
     assert!(cadence_agent::proto::identifier("cad1234", "issue id").is_ok());
     assert!(cadence_agent::proto::identifier("not a valid id", "issue id").is_err());
 }
+mod cad2457_close_acceptance {
+    #[test]
+    fn native_done_requires_named_real_evidence_on_a_repo_free_task() {
+        use cadence_agent::issue::edit::{edit, EditSpec};
+        use cadence_agent::issue::write::{new_issue, project_add};
+        use cadence_agent::issue::{parse, project, Pm};
+        use std::os::unix::fs::symlink;
+
+        for scenario in ["missing", "symlink", "unreferenced", "repo", "attached"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+            project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+            new_issue(
+                &pm,
+                tmp.path(),
+                Some("cadence"),
+                "ticket",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                &[],
+                None,
+                None,
+                "t",
+            )
+            .unwrap();
+            let issue = pm.dir.join("cadence/CAD-1");
+            let attachment = issue.join("artifacts/brief.txt");
+            let source = tmp.path().join("brief.txt");
+            std::fs::write(&source, b"the actual deliverable").unwrap();
+
+            if scenario == "symlink" {
+                std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+                symlink(&source, &attachment).unwrap();
+            }
+            if scenario == "repo" {
+                let path = pm.dir.join("cadence/project.yaml");
+                let mut project = project::load(&path).unwrap();
+                project.repos.push(project::Repo {
+                    path: None,
+                    remote: Some("https://example.invalid/example/repo".into()),
+                    base: None,
+                });
+                std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+            }
+
+            let before = std::fs::read(issue.join("issue.md")).unwrap();
+            let spec = EditSpec {
+                set: vec!["status=done".into()],
+                refs: if scenario == "unreferenced" {
+                    vec![]
+                } else {
+                    vec!["artifact:brief.txt".into()]
+                },
+                attach: if matches!(scenario, "attached" | "unreferenced" | "repo") {
+                    vec![source]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let result = edit(&pm, "CAD-1", &spec, "t", None);
+            if scenario == "attached" {
+                result.unwrap();
+                let text = std::fs::read_to_string(issue.join("issue.md")).unwrap();
+                let (front, _) = parse::parse_issue(&text).unwrap();
+                assert_eq!(front.status, "done");
+                assert!(front
+                    .refs
+                    .iter()
+                    .any(|r| { r.kind == "artifact" && r.path.as_deref() == Some("brief.txt") }));
+                assert_eq!(
+                    std::fs::read(&attachment).unwrap(),
+                    b"the actual deliverable"
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("status=done needs evidence"),
+                    "{scenario}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read(issue.join("issue.md")).unwrap(),
+                    before,
+                    "{scenario}"
+                );
+                if scenario == "symlink" {
+                    assert!(attachment
+                        .symlink_metadata()
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                } else {
+                    assert!(
+                        !attachment.exists(),
+                        "{scenario}: attachment survived refusal"
+                    );
+                }
+                let mut command = std::process::Command::new("git");
+                command
+                    .arg("-C")
+                    .arg(&pm.dir)
+                    .args(["diff", "--cached", "--quiet"]);
+                let status = cadence_agent::reaper::status(&mut command).unwrap();
+                assert!(status.success(), "{scenario}: refusal left staged changes");
+            }
+        }
+    }
+}
 
 // CAD-2162 security acceptance, authored independently of the implementation.
 #[test]
@@ -18770,5 +18881,127 @@ mod cad2019_html_templates_acceptance {
                 ("template_blob_read".into(), Some(9)),
             ]
         );
+    }
+}
+#[cfg(feature = "test-seam")]
+mod cad2457_doctor_acceptance {
+    use cadence_agent::store::{NewAgent, Store};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::process::{Child, Command, Stdio};
+
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn named_native_doctor_checks_copies_only_in_the_verified_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let pm = root.path().join("pm");
+        let workspace = root.path().join("work");
+        let home = root.path().join("runner-home");
+        let daemon_home = root.path().join("daemon-home");
+        let copy = workspace.join(".agents/skills/cadence/SKILL.md");
+        for path in [
+            state.as_path(),
+            home.as_path(),
+            daemon_home.as_path(),
+            copy.parent().unwrap(),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        cadence_agent::issue::Pm::init(&pm).unwrap();
+        fs::write(copy, cadence_agent::skill::SKILL_MD).unwrap();
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        for provider in ["codex", "pi"] {
+            store
+                .register_agent(&NewAgent {
+                    alias: provider,
+                    provider,
+                    endpoint_kind: "managed",
+                    role: "worker",
+                    cwd: workspace.to_str().unwrap(),
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let cli = || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TMPDIR", root.path().parent().unwrap())
+                .env("CADENCE_STATE_DIR", &state)
+                .env("CADENCE_PM_DIR", &pm)
+                .current_dir(&workspace);
+            command
+        };
+        let log = fs::File::create(root.path().join("daemon.log")).unwrap();
+        let daemon = Daemon(
+            cadence_agent::reaper::spawn(
+                cli()
+                    .env("HOME", &daemon_home)
+                    .env("CADENCE_TEST_SEAM", "1")
+                    .args(["daemon", "run"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log)),
+            )
+            .unwrap(),
+        );
+        let health =
+            cadence_agent::client::rpc_relay(&state, "health", json!({})).unwrap_or_else(|error| {
+                panic!(
+                    "{error}: {}",
+                    fs::read_to_string(root.path().join("daemon.log")).unwrap()
+                )
+            });
+        assert_eq!(health["pid"], daemon.0.id());
+
+        let report = |target, actor, code| -> Value {
+            let out = cadence_agent::reaper::output(
+                cli()
+                    .env("HOME", &home)
+                    .env("CADENCE_TEST_AS", actor)
+                    .env("CADENCE_ALIAS", target)
+                    .args(["doctor", "--agent", target]),
+            )
+            .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let own = report("codex", "agent:codex", 0);
+        assert_eq!(own["status"], "installed");
+        assert_eq!(
+            own["copies"],
+            json!({"home": "missing", "working_directory": "current"})
+        );
+        assert_eq!(own["discovery"], "unknown");
+
+        let outside = report("codex", "operator", 1);
+        assert_eq!(outside["status"], "unknown");
+        assert!(outside["copies"].is_null());
+
+        let disabled = report("pi", "agent:pi", 1);
+        assert_eq!(disabled["status"], "disabled");
+        assert_eq!(disabled["copies"]["working_directory"], "current");
+        assert_eq!(disabled["discovery"], "disabled");
     }
 }

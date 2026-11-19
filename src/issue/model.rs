@@ -17,7 +17,7 @@ pub use cadence_core::issue::{
 /// Link fields stored on one side only; inverses are computed.
 pub const LINK_KINDS: &[&str] = &["blocked_by", "relates", "parent", "duplicate_of"];
 pub const REF_KINDS: &[&str] = &[
-    "pr", "commit", "note", "preview", "message", "url", "branch", "worktree",
+    "pr", "commit", "note", "preview", "message", "url", "branch", "worktree", "artifact",
 ];
 /// Fields `issue set` may write.
 pub const SETTABLE: &[&str] = &[

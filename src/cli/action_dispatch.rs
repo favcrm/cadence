@@ -367,6 +367,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         host: false,
         json,
         offline,
+        agent,
+        skill,
         ..
     } = &cli.command
     {
@@ -379,6 +381,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 *offline,
                 cli.org.is_some(),
                 client_only,
+                agent.as_deref().map(|agent| (agent, skill.as_deref())),
+                cli.wake_timeout,
             ));
         }
     }

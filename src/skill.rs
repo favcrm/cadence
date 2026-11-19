@@ -11,7 +11,8 @@
 //! Sandbox startup never writes to the shared home. File match and provider
 //! links are not evidence that a running agent session has reloaded them.
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Read;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -224,6 +225,61 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             SKILL_NAMES.join(", ")
         ))),
     }
+}
+/// Compare the fixed bundle under `root/.agents/skills`, without returning files.
+pub fn guidance_copy(root: Option<&Path>, name: &str) -> Result<&'static str> {
+    let bundle = selected(Some(name))?
+        .iter()
+        .find(|skill| skill.name == name)
+        .expect("selected skill includes its requested bundle");
+    let Some(root) = root else {
+        return Ok("unknown");
+    };
+    let root = canonical_root(root).join(name);
+    let mut state = "current";
+    for (relative, expected) in bundle.files {
+        let actual = (|| -> std::io::Result<bool> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(root.join(relative))?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            if metadata.len() != expected.len() as u64 {
+                return Ok(false);
+            }
+            let mut buffer = [0; 4096];
+            for bytes in expected.as_bytes().chunks(buffer.len()) {
+                let chunk = &mut buffer[..bytes.len()];
+                file.read_exact(chunk)?;
+                if bytes != &*chunk {
+                    return Ok(false);
+                }
+            }
+            Ok(file.read(&mut buffer[..1])? == 0)
+        })();
+        match actual {
+            Ok(false) if state == "current" => state = "stale",
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state = "missing",
+            Err(_) => return Ok("unknown"),
+            _ => {}
+        }
+    }
+    Ok(state)
+}
+
+/// Compare one bundled skill in this caller's home, without exposing its contents.
+pub fn guidance(home: Option<&Path>, name: &str) -> Result<Value> {
+    let state = guidance_copy(home, name)?;
+    Ok(json!({
+        "skill": name,
+        "status": state,
+        "scope": "caller HOME",
+        "remedy": (state != "current").then(|| format!("cadence skill install {name} (review local changes first)")),
+        "live_session": "not checked"
+    }))
 }
 
 /// Refresh selected public guidance, including company-outputs' guidance
@@ -697,6 +753,31 @@ fn apply_staged_bundle(staged_home: &Path, home: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guidance_checks_only_the_requested_bundle_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        sync(home.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "missing"
+        );
+        sync(home.path(), false, Some("cadence")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "current"
+        );
+        std::fs::write(
+            canonical_root(home.path()).join("cadence/SKILL.md"),
+            b"different",
+        )
+        .unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "stale"
+        );
+        assert_eq!(guidance(None, "cadence").unwrap()["status"], "unknown");
+    }
 
     #[test]
     fn already_current_update_uses_this_process_and_rollback_uses_the_restored_sha() {

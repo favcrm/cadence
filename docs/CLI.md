@@ -373,6 +373,39 @@ assignment default in place.
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
 
+## Guidance diagnostics
+
+Plain local `cadence doctor` includes `checks.guidance`, comparing only the
+bundled `cadence` files with the copy in the caller's `$HOME/.agents/skills`.
+It reports `missing`, `stale`, `current`, or `unknown`; the storage check still
+determines its exit code. This does not establish provider discovery or what a
+running session read. `cadence skill sync` refreshes bundled guidance;
+`cadence skill install <name>` replaces the selected bundle after you review
+local changes.
+
+`cadence doctor --agent <alias> [--skill <bundled-name>]` checks the named
+native agent, defaulting to `cadence`. Run it **inside that runner** to check
+the bundled copies in `$HOME/.agents/skills` and `./.agents/skills` for the
+invocation. The daemon verifies that the caller is the named runner before
+the CLI checks either directory. An outside invocation reads no target files
+and leaves `copies` null; run inside the runner or supply the guidance
+through an authorized task route.
+
+`installed` (exit 0) means a copy matches this CLI's bundle, not that the
+provider discovers or has read it. Managed Pi/omp reports `disabled` (exit 1)
+even with a matching copy. If neither can be established, the report is
+`unknown` (exit 1). The `copies` and `discovery` fields keep these facts separate.
+
+`cadence --org <org> doctor --agent <profile-id> [--skill <name>]` instead
+checks profile assignment and the workspace catalog's approved revision and
+digest, using the selected caller. It reports `not_assigned`, `missing`,
+`unapproved`, `available`, or `unknown`; `available` concerns the profile's
+board dispatch only, not an actual run or SOP compliance. Older boards,
+refusals and malformed metadata are unknown. Targeted hosted diagnostics
+require an explicit `--org`; `--offline` sends no requests and reports unknown.
+Targeted reports exit 0 only for available. These options do not change
+ordinary hosted connection checks or `doctor --host`.
+
 ## Cadence home, overrides and isolation (CAD-1922)
 
 One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor
