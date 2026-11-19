@@ -171,7 +171,7 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
   const pill =
     count === null
       ? null
-      : model.total !== null
+      : model.total !== null && model.total > count
         ? t("{n} of {total}").replace("{n}", formatNumber(count)).replace("{total}", formatNumber(model.total))
         : model.view === "thread"
           ? t("{n} messages").replace("{n}", formatNumber(count))
@@ -231,7 +231,7 @@ function MoreFooter({ model, shown }: { model: RecordCardModel; shown: number })
   const fill = useContext(ComposerFillContext);
   const tool = inPrompt(model.toolLabel ?? model.toolkitLabel ?? model.toolkit);
   const text =
-    model.total !== null
+    model.total !== null && model.total > shown
       ? t("Showing {n} of {total}").replace("{n}", String(shown)).replace("{total}", String(model.total))
       : t("Showing {n}").replace("{n}", String(shown));
   return (

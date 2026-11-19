@@ -171,10 +171,12 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     const v = p[key];
     return typeof v === "string" && v.trim() !== "" && v.length <= 200 ? plainText(v, 200) : undefined;
   };
-  const toolLabel = header("tool_label");
+  const rawToolLabel = header("tool_label");
   const toolkitLabel = header("toolkit_label");
-  const account = header("account");
-  if (toolLabel === undefined || toolkitLabel === undefined || account === undefined) return null;
+  const rawAccount = header("account");
+  if (rawToolLabel === undefined || toolkitLabel === undefined || rawAccount === undefined) return null;
+  const toolLabel = stripToolkitPrefix(rawToolLabel, toolkitLabel);
+  const account = rawAccount !== null && rawAccount.trim().toLowerCase() === toolkitLabel?.trim().toLowerCase() ? null : rawAccount;
   if (present.includes("total") && !(Number.isInteger(p.total) && (p.total as number) >= 0)) return null;
   const { toolkit, tool, items, fields, view, truncated } = p;
   if (typeof toolkit !== "string" || !TOOLKIT.test(toolkit)) return null;
@@ -210,6 +212,19 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     account,
     total: present.includes("total") ? (p.total as number) : null,
   };
+}
+
+/** "Gmail: fetch emails" under toolkit "Gmail" reads "Fetch emails"; unchanged when there is no such prefix. */
+export function stripToolkitPrefix(tool: string | null, toolkit: string | null): string | null {
+  if (tool === null || toolkit === null || toolkit.trim() === "") return tool;
+  const t = tool.trim();
+  const k = toolkit.trim();
+  if (!t.toLowerCase().startsWith(k.toLowerCase())) return tool;
+  const rest = t.slice(k.length);
+  const m = /^(?::\s*|\s+)(\S[\s\S]*)$/.exec(rest);
+  if (!m) return tool;
+  const r = m[1].trim();
+  return r === "" ? tool : r[0].toUpperCase() + r.slice(1);
 }
 
 /** Plain text for display: control characters out, capped with an ellipsis. */

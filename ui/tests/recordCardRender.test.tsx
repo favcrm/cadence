@@ -76,6 +76,19 @@ check(plain.includes("data-record-truncated") && !plain.includes("Ask for more")
 check(!plain.includes("<script") && !acted.includes("<script"), "hostile markup in any role is escaped");
 check(!plain.includes("N".repeat(CELL_MAX_CHARS + 1)) && !plain.includes("P".repeat(CELL_MAX_CHARS + 1)) && !plain.includes("T".repeat(61)), "every role is capped");
 
+// CAD-2469: no "of N" when the total is not larger than what is shown.
+const same: any = fixture("record-ref-list");
+same.payload.total = same.payload.items.length;
+same.payload.truncated = true;
+const sameState = mergePage(null, { thread: { id: "t" }, entries: [{ seq: 1, role: "agent", kind: "record_ref", message: "m", ...same }] });
+const sameItem: any = threadItems(sameState).find((i) => i.type === "record");
+const sameHtml = renderToStaticMarkup(
+  createElement(LocaleProvider, null, createElement(ComposerFillContext.Provider, { value: () => {} }, createElement(RecordCard, { entry: sameItem.entry }))),
+);
+check(!/ of \d+/.test(sameHtml) && sameHtml.includes("Showing " + same.payload.items.length) && sameHtml.includes("Ask for more"), "truncated with total == shown reads Showing N, no of");
+check(sameHtml.includes(`data-record-count="true">${same.payload.items.length}<`), "the pill is N when total == N");
+check(plain.includes("Showing 1 of 120"), "total above shown keeps Showing N of TOTAL");
+
 // CAD-2469: the approved bubble says who sent it; the header note is a button for touch.
 const wa = fixture("record-ref-thread");
 wa.payload.fields.push({ key: "by", label: "By", type: "string", untrusted: true });
