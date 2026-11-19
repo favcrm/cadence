@@ -183,6 +183,72 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
   };
 }
 
+export type HostedPrivateReview = {
+  id: string;
+  state: "pending" | "installed" | "rejected" | "expired";
+  expiresAt: number;
+  source: string;
+  zipSha256: string;
+  review: PrivateReview;
+};
+
+function parseHostedReview(body: unknown, id: string, generation: number): HostedPrivateReview {
+  if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
+  const data = body.data;
+  if (data.id !== id || !["pending", "installed", "rejected", "expired"].includes(String(data.state)) ||
+      typeof data.expires_at !== "number" || !Number.isFinite(data.expires_at) ||
+      typeof data.source !== "string" || typeof data.zip_sha256 !== "string" ||
+      !/^(?:sha256:)?[0-9a-f]{64}$/.test(data.zip_sha256) || !object(data.review)) throw invalid();
+  const raw = data.review;
+  let target: PrivateTarget | null = null;
+  if (data.install_id != null) {
+    if (typeof data.install_id !== "string" || typeof data.expected_digest !== "string" ||
+        typeof raw.expected_generation !== "string" || typeof data.name !== "string") throw invalid();
+    target = { installId: data.install_id, name: data.name, digest: data.expected_digest, generation: raw.expected_generation };
+  }
+  const review = parseReview(raw, target, generation);
+  if (data.name !== review.name || data.digest !== review.digest || data.generation !== review.generation) throw invalid();
+  return { id, state: data.state as HostedPrivateReview["state"], expiresAt: data.expires_at,
+    source: data.source, zipSha256: data.zip_sha256, review };
+}
+
+export async function getHostedPrivateReview(id: string, signal?: AbortSignal): Promise<HostedPrivateReview> {
+  return withPrivateOperation(async (operation) => {
+    const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(id)}`, {
+      credentials: "same-origin", cache: "no-store", headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) throw new ApiError(errorMessage(body, "The review is unavailable."), response.status);
+    return parseHostedReview(body, id, operation.generation);
+  }, signal);
+}
+
+export async function decideHostedPrivateReview(request: HostedPrivateReview, decision: "install" | "reject"): Promise<HostedPrivateReview> {
+  return withPrivateOperation(async (operation) => {
+    if (operation.generation !== request.review.sessionGeneration || request.state !== "pending") throw invalid();
+    const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(request.id)}/${decision}`, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify(decision === "install" ? { digest: request.review.digest, zip_sha256: request.zipSha256 } : {}),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) throw new ApiError(errorMessage(body, "The decision did not finish."), response.status);
+    if (decision === "install" && response.status === 201) {
+      if (!object(body) || body.committed !== true || body.source_kind !== "private" ||
+          body.digest !== request.review.digest || body.name !== request.review.name ||
+          body.version !== request.review.version || typeof body.install_id !== "string" || !body.install_id ||
+          (request.review.target && body.install_id !== request.review.target.installId)) throw invalid();
+      return { ...request, state: "installed" };
+    }
+    const receipt = parseHostedReview(body, request.id, operation.generation);
+    if (receipt.state !== (decision === "install" ? "installed" : "rejected") ||
+        receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
+    return receipt;
+  });
+}
+
 /** The selected File is immutable; the same bytes are sent at review and apply. */
 export async function checkPrivateApp(file: File, target: PrivateTarget | null): Promise<PrivateReview> {
   if (target && (!target.installId || !target.name || !DIGEST.test(target.digest) || !target.generation)) throw invalid();
