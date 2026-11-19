@@ -9,6 +9,7 @@ import { EmptyCard, Failure, Loading, Note, useWikiScope, WikiToolbar } from "./
 import type { WikiRoute } from "./Wiki";
 import { withinScope } from "./scope";
 import { useTranslate } from "../../lib/locale";
+import { ManagedList } from "./ManagedFileViews";
 
 const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", images: "Images", video: "Video", pdf: "PDF" };
 
@@ -21,9 +22,11 @@ const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", 
 export default function SearchPane({
   route,
   navHref,
+  managedFiles,
 }: {
   route: WikiRoute;
   navHref: (route: Route) => string;
+  managedFiles?: boolean;
 }) {
   const t = useTranslate();
   const scope = useWikiScope();
@@ -99,6 +102,7 @@ export default function SearchPane({
           <Button type="submit">{t("Search")}</Button>
         </form>
       </WikiToolbar>
+      {managedFiles && query && filter === "all" && <ManagedList path={scope?.root ?? ""} query={query} navHref={navHref} />}
 
       {error !== null ? (
         <Failure what="search failed" error={error} />

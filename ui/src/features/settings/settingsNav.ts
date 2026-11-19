@@ -31,6 +31,7 @@ const ENTRIES = {
 export type SettingsMeta = {
   settings_sections?: readonly string[];
   platform_account_configured?: boolean;
+  wiki_managed_files?: boolean;
 } | null | undefined;
 
 /**
@@ -57,7 +58,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
-    { label: "Workspace", items: pick("members", "documents", "connections", "email", "templates", "general") },
+    { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", "email", "templates", "general") },
     { label: "System", items: [...pick("status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }
@@ -78,6 +79,7 @@ const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents"];
  */
 export function settingsRedirect(section: SettingsSection, meta: SettingsMeta): SettingsSection | null {
   if (!meta || section === "templates") return null;
+  if (section === "documents" && meta.wiki_managed_files && meta.settings_sections?.includes("general")) return "general";
   const groups = settingsNavGroups(meta);
   if (groups.some((group) => group.items.some((item) => item.section === section))) return null;
   // No list at all: a native board. Only a hosted-only page is refused there;

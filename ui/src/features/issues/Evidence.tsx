@@ -19,6 +19,7 @@ import ArtifactView, {
 import type { ArtifactKind } from "../canvas/canvasStore";
 import { Attach } from "./Attach";
 import { type IssuePageProps as Props } from "./issuePageProps";
+import { ManagedList } from "../wiki/ManagedFileViews";
 
 export type DeliverablePreviewKind = Exclude<ArtifactKind, "image">;
 
@@ -490,6 +491,7 @@ export function Evidence({
   readOnly,
   onWrite,
   onError,
+  managedFiles,
 }: {
   id: string;
   images: { name: string; size: number }[];
@@ -497,12 +499,14 @@ export function Evidence({
   /** Read-only hosts (the shared work-item detail) omit the write callbacks. */
   readOnly: boolean;
   onWrite?: Props["onWrite"];
+  managedFiles?: boolean;
   onError?: Props["onError"];
 }) {
   const t = useTranslate();
   const empty = images.length === 0 && files.length === 0;
   return (
     <section className="grid min-w-0 gap-4">
+      {managedFiles && <ManagedList key={id} issue={id} navHref={(route) => route.screen === "wiki" && route.file && route.version ? `/wiki?file=${encodeURIComponent(route.file)}&version=${route.version}` : "/wiki"} />}
       {empty && (
         <div className="card min-w-0 px-4 py-8 text-center">
           <div className="text-cardtitle font-semibold text-ink-100">

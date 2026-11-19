@@ -89,7 +89,7 @@ export type Route =
   | { screen: "threads" }
   /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
   | { screen: "myWork"; view?: MyWorkView }
-  | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number }
+  | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number; file?: string; version?: number; archived?: boolean }
   | { screen: "outbox" }
   /** CAD-2286: hosted only. The tab and the Active tab's stage filter, from
    *  the query (`?archived=1`, `?stage=in_review`). */
@@ -457,12 +457,18 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
     const section = q.get("section");
     const page = q.get("page");
     const parsedPage = page !== null && /^[1-9][0-9]{0,5}$/.test(page) ? Number(page) : undefined;
-    if (at !== null || section || parsedPage !== undefined) {
+    const file = q.get("file");
+    const rawVersion = q.get("version");
+    const version = rawVersion && /^[1-9][0-9]*$/.test(rawVersion) ? Number(rawVersion) : undefined;
+    const archived = q.get("archived") === "1";
+    if (at !== null || section || parsedPage !== undefined || file !== null || archived) {
       route = {
         ...route,
         ...(at !== null ? { at } : {}),
         ...(section ? { section } : {}),
         ...(parsedPage !== undefined ? { page: parsedPage } : {}),
+        ...(file !== null ? { file, ...(version && Number.isSafeInteger(version) ? { version } : {}) } : {}),
+        ...(archived ? { archived: true } : {}),
       };
     }
   }
@@ -605,7 +611,7 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // must carry it across the delete below. Only a Threads → Threads move
   // keeps it: another screen's `?project=` is that screen's filter.
   const threadsProject = from?.screen === "threads" && loc.route.screen === "threads" ? q.get("project") : null;
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "file", "version"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
@@ -654,6 +660,11 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
     if (route.at !== undefined) q.set("at", route.at);
     if (route.section) q.set("section", route.section);
     if (route.page !== undefined) q.set("page", String(route.page));
+    if (route.file && route.version) {
+      q.set("file", route.file);
+      q.set("version", String(route.version));
+    }
+    if (route.archived) q.set("archived", "1");
   }
   const s = q.toString();
   return routePath(route) + (s ? `?${s}` : "");

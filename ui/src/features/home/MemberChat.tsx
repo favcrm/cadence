@@ -8,6 +8,8 @@ import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
 import { WORKSPACE_SKILLS_COMMAND } from "./master";
+import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
+import { readRailCollapsed, writeRailCollapsed } from "./needs";
 import { useDockHeight } from "./useDockHeight";
 import {
   applyMemberEarlier,
@@ -87,13 +89,16 @@ export default function MemberChat({
   scope,
   readOnly,
   onOpenIssue,
+  documentFollowUps,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
+  documentFollowUps?: DocumentFollowUpState;
 }) {
   const t = useTranslate();
+  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
   const store = memberThreadStore(scope);
   const thread = useResource(store);
   // The member scope is never named in stream-resource invalidations
@@ -401,7 +406,11 @@ export default function MemberChat({
 
   return (
     <AssistantActorProvider actor={actor}>
-    <main className="home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)]">
+    <main className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)] ${
+      !documentFollowUps ? "" : railCollapsed
+        ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
+        : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
+    }`}>
       <section className="min-w-0 flex flex-col min-h-0 gap-4" aria-label={t("assistant thread")}>
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
           <div
@@ -525,6 +534,19 @@ export default function MemberChat({
           </div>
         </div>
       </section>
+      {documentFollowUps && (
+        <aside className="absolute rail:static min-w-0 rail:h-full rail:min-h-0">
+          <NeedsRail
+            documentFollowUps={documentFollowUps}
+            readOnly={readOnly}
+            collapsed={railCollapsed}
+            onToggleCollapse={() => {
+              writeRailCollapsed(!railCollapsed);
+              setRailCollapsed(!railCollapsed);
+            }}
+          />
+        </aside>
+      )}
     </main>
     </AssistantActorProvider>
   );

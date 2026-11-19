@@ -43,6 +43,7 @@ import UploadPane from "./UploadPane";
 import SearchPane from "./SearchPane";
 import HistoryPane from "./HistoryPane";
 import TrashPane from "./TrashPane";
+import { ManagedFilePane, ManagedList } from "./ManagedFileViews";
 import "./wiki.css";
 
 /**
@@ -75,6 +76,8 @@ export interface WikiProps {
    *  unknown (`null`/absent). Trash discovery is operator-only; `false`
    *  never probes it and never guesses a host capability. */
   operator?: boolean | null;
+  managedFiles?: boolean;
+  onManagedChange?: () => void;
 }
 
 type Open =
@@ -92,7 +95,7 @@ function unavailableRevision(error: unknown): boolean {
   );
 }
 
-export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator, managedFiles, onManagedChange }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
@@ -311,7 +314,13 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
         />
 
         <div className="wk-pane" data-mode={route.mode}>
-          {route.mode === "trash" ? (
+          {managedFiles && route.file !== undefined ? (
+            route.file && route.version
+              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={navHref} onChange={onManagedChange} />
+              : <PageState title={t("This file version is unavailable")}>{t("A valid file and version are required.")}</PageState>
+          ) : managedFiles && route.archived ? (
+            <section className="p-4 grid gap-4"><div className="flex gap-2"><Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>{t("Files")}</Button><strong>{t("Archived")}</strong></div><ManagedList path={root} archived navHref={navHref} /></section>
+          ) : route.mode === "trash" ? (
             <TrashPane
               operator={operator}
               navHref={navHref}
@@ -321,7 +330,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               onRefresh={refresh}
             />
           ) : route.mode === "search" ? (
-            <SearchPane route={route} navHref={navHref} />
+            <SearchPane route={route} navHref={navHref} managedFiles={managedFiles} />
           ) : route.mode === "history" && route.path ? (
             <HistoryPane
               path={route.path}
@@ -367,6 +376,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               trashHref={trashHref}
               section={route.section}
               page={route.page}
+              managedFiles={managedFiles}
               onToast={onToast}
               onRefresh={refresh}
               onFail={fail}
@@ -394,6 +404,7 @@ function BrowsePane({
   trashHref,
   section,
   page: citedPage,
+  managedFiles,
   onToast,
   onRefresh,
   onFail,
@@ -413,6 +424,7 @@ function BrowsePane({
   trashHref: string | null;
   section?: string;
   page?: number;
+  managedFiles?: boolean;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onRefresh: () => void;
   onFail: (error: unknown, verb: string) => void;
@@ -557,6 +569,7 @@ function BrowsePane({
             </Button>
             <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
             {trashHref && <Button href={trashHref} icon={<IconTrash />}>{t("Trash")}</Button>}
+            {managedFiles && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, archived: true })}>{t("Archived")}</Button>}
         </>} />
         {missingRoot && scope && (
           <EmptyCard title={t("No project context yet")} action={
@@ -588,6 +601,7 @@ function BrowsePane({
           onToast={onToast}
           onFail={onFail}
         />}
+        {managedFiles && !missingRoot && <ManagedList path={path} navHref={navHref} />}
       </>
     );
   }

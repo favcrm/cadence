@@ -58,6 +58,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
+import type { DocumentFollowUpState } from "./features/home/NeedsRail";
 import { ownerDecisionsOn, useDecisions } from "./features/decisions/useDecisions";
 import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
@@ -284,7 +285,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // is never queried.
   const decisionsOn = ownerDecisionsOn(meta);
   const decisions = useDecisions(decisionsOn);
-  const homeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
+  const otherHomeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
@@ -318,11 +319,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
   // probed; the nav shows Documents once the probe answers `available`.
   const documentsHosted = meta?.hosted === true;
+  const managedFiles = documentsHosted && meta?.wiki_managed_files === true && wikiAvailable(meta);
   const documentsProbeState = useMaybeResource(documentsHosted ? documentsProbe : null);
   const hiddenScreens: Screen[] = [
     ...(!myWorkOn ? ["myWork" as const] : []),
     ...(!workConversationsOn && !humanThreadsOn ? ["threads" as const] : []),
-    ...(documentsNavHidden(documentsHosted, documentsProbeState?.data) ? ["documents" as const] : []),
+    ...(managedFiles || documentsNavHidden(documentsHosted, documentsProbeState?.data) ? ["documents" as const] : []),
   ];
 
   const personalState = useMaybeResource(screen === "myWork" && myWorkOn ? resources.myWork : null);
@@ -368,6 +370,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const boardReadOnly = meta?.read_only ?? false;
   const block = writeBlock(meta);
   const readOnly = block !== null;
+  const documentFollowUps: DocumentFollowUpState | undefined = managedFiles && meta?.signed_in === true
+    ? overviewState.status === "failed"
+      ? { status: "unavailable" }
+      : overviewState.data?.document_follow_ups ??
+        (overviewState.data ? { status: "unavailable" } : { status: "loading" })
+    : undefined;
+  const homeCount = otherHomeCount + (!readOnly && documentFollowUps?.status === "ready" ? documentFollowUps.pending.length : 0);
   const actor = meta?.actor ?? "operator (ui)";
   // Hosted boards upload with one multipart POST to the tenant Worker's wiki (AOS-418, which
   // also produces `Meta.wiki`); local boards use transfer jobs.
@@ -394,6 +403,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
     }
   }, [settingsTarget]);
+  const legacyDocumentsHref = managedFiles && route.screen === "documents"
+    ? route.archived ? "/wiki?archived=1" : "/wiki"
+    : null;
+  useEffect(() => {
+    if (legacyDocumentsHref) navigate(legacyDocumentsHref, { replace: true });
+  }, [legacyDocumentsHref]);
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
   // projected server-side). Local and tailnet boards have no configured
@@ -1356,6 +1371,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             sessionId={meta?.session?.id ?? null}
             operator={meta?.operator === true}
             overview={overviewState}
+            documentFollowUps={documentFollowUps}
             onOpenIssue={openHomeWork}
             onOpenDecision={openDecision}
             decisions={decisionsOn}
@@ -1503,6 +1519,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             writeBlock={block}
             kickoffBlock={operatorKickoffBlock(meta)}
             hosted={meta?.hosted === true}
+            managedFiles={managedFiles}
             projectRepos={projects.find((p) => p.key === route.project)?.repos ?? null}
             stagedActions={decisions.rows}
             onWrite={applyWrite}
@@ -1677,6 +1694,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               readOnly={readOnly || meta === null}
               readOnlyReason={block}
               actor={actor}
+              managedFiles={managedFiles}
+              onManagedChange={() => void resources.overview.refresh()}
               onToast={say}
             />
           )
@@ -1705,7 +1724,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {/* CAD-2286: hosted only. A native board, or a hosted one whose probe is
             not available, gets the screen's unavailable state, never a blank body. */}
-        {route.screen === "documents" && (
+        {route.screen === "documents" && !managedFiles && (
           <DocumentsScreen
             hosted={documentsHosted}
             viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
@@ -1756,7 +1775,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Templates viewer={{ operator: viewer.operator, hosted: Boolean(meta?.hosted || meta?.settings_sections) }} />
             )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
-            {route.section === "general" && <General />}
+            {route.section === "general" && <General documentPolicy={
+              managedFiles && viewer.operator === true && !readOnly && viewerSub && !viewerSub.startsWith("operator-token:")
+                ? { hosted: documentsHosted, viewer, viewerSub }
+                : undefined
+            } />}
             {route.section === "account" && <PlatformAccount />}
             {route.section === "update" && (meta?.settings_sections
               ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} partialUpdates={partialUpdates} />
@@ -1784,6 +1807,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           key={`${openId}:${decision?.need.key ?? ""}`}
           id={openId}
           origin={effectiveOrigin}
+          managedFiles={managedFiles}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => {

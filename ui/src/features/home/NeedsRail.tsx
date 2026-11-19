@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
-import type { Agent, Overview } from "../../lib/types";
+import type { Agent, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
@@ -20,11 +20,52 @@ import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
 
+export type DocumentFollowUpState = DocumentFollowUps | { status: "loading" };
+
+function DocumentFollowUpRows({
+  rows,
+  onOpen,
+  recent = false,
+}: {
+  rows: readonly (DocumentFollowUp & { outcome?: "approved" | "delivered" })[];
+  onOpen: () => void;
+  recent?: boolean;
+}) {
+  const t = useTranslate();
+  const heading = t(recent ? "Document activity" : "Document follow-ups");
+  return (
+    <section className="border-b border-ink-700" aria-label={heading}>
+      <h3 className="px-3 pt-2 text-label font-medium text-ink-400">{heading}</h3>
+      <ul className="todo-list">
+        {rows.map((row) => {
+          const href = `/wiki?file=${encodeURIComponent(row.id)}&version=${row.version}`;
+          const version = `v${row.version}`;
+          const meta = recent ? t(row.outcome === "delivered" ? "Delivered" : "Approved") : t("Approval requested");
+          const action = t(recent ? "Open" : "Review");
+          return (
+            <li key={`${row.id}:${row.version}`} className="flex min-w-0 items-center justify-between gap-2 border-b border-ink-800 px-3 py-2.5">
+              <div className="min-w-0">
+                <span className="block break-words text-label font-medium text-ink-100">{row.title}</span>
+                <span className="block break-words text-micro text-ink-400">
+                  {row.project ? `${row.project} · ` : ""}{version} · {meta}
+                </span>
+              </div>
+              <Link href={href} className={recent ? "lnk text-label shrink-0" : "btn btn-sm btn-secondary shrink-0"} onClick={onOpen} aria-label={`${action}: ${row.title}, ${version}`}>
+                {action}
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 /**
- * The Home rail (CAD-574, CAD-1216): "To do" holds only work for the
- * operator, one line per card with one control; "Updates" holds the
- * informational rows and the team's recent work. It collapses to a slim
- * rail with the count (persisted per viewer) and, under ~1100px, is a
+ * The Home rail shows actions for the viewer in "To do" and informational
+ * rows and recent work in "Updates". Private Home supplies only documents;
+ * it does not mount Master activity. Desktop can collapse the rail to
+ * its count; under ~1100px it is a
  * slide-over opened from the floating button. Reading items (plans,
  * ideas, merge decisions) open inside the one shared work-item detail,
  * mounted by App (CAD-1811); the rail hands it the reading queue as it
@@ -33,6 +74,7 @@ export { NeedMenu } from "./NeedMenu";
  */
 export default function NeedsRail({
   overview,
+  documentFollowUps,
   readOnly,
   onOpenIssue,
   overviewHref,
@@ -45,18 +87,20 @@ export default function NeedsRail({
   onSent,
   decisions: decisionsOn = false,
 }: {
-  overview: ResourceState<Overview>;
+  /** Only Master Home supplies the existing operator overview. */
+  overview?: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   readOnly: boolean;
-  onOpenIssue: (id: string) => void;
-  overviewHref: string;
+  onOpenIssue?: (id: string) => void;
+  overviewHref?: string;
   /** Settings → Master permissions, where the standing "Always" rules live. */
-  permissionsHref: string;
-  onAsk: (need: HomeNeed, lead?: string) => void;
+  permissionsHref?: string;
+  onAsk?: (need: HomeNeed, lead?: string) => void;
   /** Open a reading item in the shared detail (App owns the one mount). */
-  onOpenDecision: (open: HomeDecisionOpen) => void;
+  onOpenDecision?: (open: HomeDecisionOpen) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
-  onAskAgent: (agent: Agent, update?: AgentUpdate) => void;
+  onAskAgent?: (agent: Agent, update?: AgentUpdate) => void;
   /** A "Fix it" reached Master: Home pins the chat to the sent message. */
   onSent?: () => void;
   /** CAD-2186: also read the owner's staged decisions (`/api/assist/actions`) and
@@ -66,19 +110,23 @@ export default function NeedsRail({
   const [tab, setTab] = useState<"todo" | "updates">("todo");
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
-  const split = todoSplit(overview.data?.needs_me);
+  const privateHome = overview === undefined;
+  const overviewData = overview?.data;
+  const pendingDocuments = documentFollowUps?.status === "ready" && !readOnly ? documentFollowUps.pending : [];
+  const recentDocuments = documentFollowUps?.status === "ready" ? documentFollowUps.recent : [];
+  const split = todoSplit(overviewData?.needs_me);
   const { updates, decided } = split;
   const staged = useDecisions(decisionsOn);
   const [decidedRoutineIds, setDecidedRoutineIds] = useState<Record<string, boolean>>({});
   const [decidingRoutineId, setDecidingRoutineId] = useState<string | null>(null);
   const [routineActionErr, setRoutineActionErr] = useState<string | null>(null);
-  const waitingRoutines = (overview.data?.routine_needs ?? []).filter(
+  const waitingRoutines = (overviewData?.routine_needs ?? []).filter(
     (r) => !decidedRoutineIds[r.id],
   );
-  const routineProposals = (overview.data?.routine_proposals ?? []).filter(
+  const routineProposals = (overviewData?.routine_proposals ?? []).filter(
     (p) => !decidedRoutineIds[p.id],
   );
-  const routineStepHolds = (overview.data?.routine_step_holds ?? []).filter(
+  const routineStepHolds = (overviewData?.routine_step_holds ?? []).filter(
     (run) => !decidedRoutineIds[run.id],
   );
 
@@ -118,7 +166,7 @@ export default function NeedsRail({
   const [drawer, setDrawer] = useState(false);
   const local = useTodoLocal();
   // A new visit to Home: earlier decided and sent marks stop applying.
-  useLayoutEffect(() => beginTodoVisit(), []);
+  useLayoutEffect(() => { if (!privateHome) beginTodoVisit(); }, [privateHome]);
   // The floating button that owns the slide-over's focus on the way out.
   const needBtn = useRef<HTMLButtonElement | null>(null);
   const drawerEl = useRef<HTMLElement | null>(null);
@@ -148,17 +196,17 @@ export default function NeedsRail({
   // a stale overlay never hangs over the navigation.
   const openIssue = (id: string) => {
     setDrawer(false);
-    onOpenIssue(id);
+    onOpenIssue?.(id);
   };
   const [showDecided, setShowDecided] = useState(false);
   const showTab = (next: "todo" | "updates") => {
     setTab(next);
-    if (next === "updates") homeDecisions.clearNotice();
+    if (decisionsOn && next === "updates") homeDecisions.clearNotice();
   };
   // Updates on screen is Updates viewed: a failed write stops asking for attention.
   useEffect(() => {
-    if (tab === "updates" && !collapsed) homeDecisions.markFailedSeen();
-  }, [tab, collapsed, staged.decided]);
+    if (decisionsOn && tab === "updates" && !collapsed) homeDecisions.markFailedSeen();
+  }, [decisionsOn, tab, collapsed, staged.decided]);
   const stagedOpener = useRef<Element | null>(null);
   /** The detail closed: the opener if it is still there, else the rail. */
   const closeStaged = () => {
@@ -182,12 +230,14 @@ export default function NeedsRail({
     cards.filter((n) => !isDone(n)).length +
     waitingRoutines.length +
     routineProposals.length +
-    routineStepHolds.length;
+    routineStepHolds.length +
+    pendingDocuments.length;
+  const countKnown = Boolean(overviewData) || (privateHome && documentFollowUps?.status === "ready");
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
     setDrawer(false);
-    onAsk(need, lead);
+    onAsk?.(need, lead);
   };
   /** One reading item, with the queue as it stood when the detail opened:
    *  "n of m" does not recount when the overview refreshes mid-run. */
@@ -220,7 +270,9 @@ export default function NeedsRail({
     const at = queue.indexOf(id);
     if (at >= 0) reviewStaged(queue, at, opener);
   };
-  useEffect(() => homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener)), []);
+  useEffect(() => {
+    if (decisionsOn) return homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener));
+  }, [decisionsOn]);
   const openDecision = (key: string) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
     if (stagedCard) {
@@ -231,7 +283,7 @@ export default function NeedsRail({
     }
     const need = readers.find((n) => n.key === key);
     if (!need) return;
-    onOpenDecision(decisionFor(need, readers.filter((n) => n.key === key || !isDone(n))));
+    onOpenDecision?.(decisionFor(need, readers.filter((n) => n.key === key || !isDone(n))));
   };
   const todoBody = (
     <>
@@ -246,22 +298,32 @@ export default function NeedsRail({
           )}
         </p>
       )}
-      {!overview.data && overview.status === "failed" && (
+      {overview && !overviewData && overview.status === "failed" && (
         <p className="px-3 py-2.5 text-label text-fail break-words">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
-      {!overview.data && overview.status !== "failed" && (
+      {overview && !overviewData && overview.status !== "failed" && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
       {/* An unread or failed decision list is not an empty list. */}
-      {overview.data && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
+      {overviewData && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {overview.data && cards.length === 0 && decisionsOn && staged.phase === "error" && (
+      {overviewData && cards.length === 0 && decisionsOn && staged.phase === "error" && (
         <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
-      {overview.data && cards.length === 0 && waitingRoutines.length === 0 && routineProposals.length === 0 && routineStepHolds.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
-        <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
+      {countKnown && count === 0 && cards.length === 0 && documentFollowUps?.status !== "unavailable" && documentFollowUps?.status !== "loading" && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
+        <p className="px-3 py-3 text-label text-ink-400">{t(privateHome ? "Nothing needs your review." : "Nothing needs you. The team is working.")}</p>
       )}
+      {documentFollowUps?.status === "loading" && (
+        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading document follow-ups…")}</p>
+      )}
+      {documentFollowUps?.status === "unavailable" && (
+        <p className="px-3 py-2.5 text-label text-warn">
+          {t("Document follow-ups could not be loaded.")}{" "}
+          <button type="button" className="lnk" onClick={() => void resources.overview.refresh()}>{t("Retry")}</button>
+        </p>
+      )}
+      {pendingDocuments.length > 0 && <DocumentFollowUpRows rows={pendingDocuments} onOpen={() => setDrawer(false)} />}
       {routineActionErr && (
         <p className="px-3 py-2 text-micro text-fail break-words" role="alert">
           {routineActionErr}
@@ -438,9 +500,9 @@ export default function NeedsRail({
                   </li>
                 ))}
               </ul>
-              <Link href={permissionsHref} className="lnk text-label" onClick={() => setDrawer(false)}>
+              {permissionsHref && <Link href={permissionsHref} className="lnk text-label" onClick={() => setDrawer(false)}>
                 {t("Standing rules are in Settings")}
-              </Link>
+              </Link>}
             </>
           )}
         </section>
@@ -450,6 +512,10 @@ export default function NeedsRail({
 
   const updatesBody = (
     <>
+      {recentDocuments.length > 0 && <DocumentFollowUpRows rows={recentDocuments} onOpen={() => setDrawer(false)} recent />}
+      {privateHome && recentDocuments.length === 0 && (
+        <p className="px-3 py-2.5 text-label text-ink-400">{t(documentFollowUps?.status === "loading" ? "Reading document follow-ups…" : documentFollowUps?.status === "unavailable" ? "Document follow-ups could not be loaded." : "No recent document activity.")}</p>
+      )}
       {staged.decided.length > 0 && (
         <ul className="todo-fyi" data-todo-decisions>
           {staged.decided.slice(0, 8).map((w) => (
@@ -477,20 +543,20 @@ export default function NeedsRail({
           ))}
         </ul>
       )}
-      <AgentUpdates
+      {onAskAgent && <AgentUpdates
         onAsk={(agent, update) => {
           setDrawer(false);
           onAskAgent(agent, update);
         }}
         onOpenIssue={openIssue}
-      />
+      />}
     </>
   );
 
   const tabs = (drawerMode: boolean) => (
     <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
       <button aria-pressed={tab === "todo"} onClick={() => showTab("todo")}>
-        {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{overview.data ? count : "…"}</span>
+        {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{countKnown ? count : "…"}</span>
       </button>
       <button aria-pressed={tab === "updates"} onClick={() => showTab("updates")}>
         {t("Updates")}
@@ -499,9 +565,9 @@ export default function NeedsRail({
         )}
       </button>
       <span className="todo-tools">
-        <Link href={overviewHref} className="lnk text-label" onClick={() => setDrawer(false)}>
+        {overviewHref && <Link href={overviewHref} className="lnk text-label" onClick={() => setDrawer(false)}>
           {t("Team overview")}
-        </Link>
+        </Link>}
         {drawerMode ? (
           <button type="button" className="lnk text-label" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
             ✕
@@ -535,7 +601,7 @@ export default function NeedsRail({
             onClick={onToggleCollapse}
           >
             <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
-              {overview.data ? count : "…"}
+              {countKnown ? count : "…"}
             </span>
             <span className="vert text-label text-ink-400">{t("To do")}</span>
             <span className="text-ink-500" aria-hidden>
@@ -560,7 +626,7 @@ export default function NeedsRail({
       >
         {t("To do")}
         <span className={`chip ${count ? "bg-warn/15 text-warn" : "bg-ok/15 text-ok"}`}>
-          {overview.data ? count : "…"}
+          {countKnown ? count : "…"}
         </span>
       </button>
       {review !== null && (

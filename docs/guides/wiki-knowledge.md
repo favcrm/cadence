@@ -53,6 +53,12 @@ personal folder. Native boards identify that folder by handle; hosted boards
 use the verified member subject. A read-only message on one folder does not
 mean every folder is read-only.
 
+On a Wiki-managed hosted board, Wiki browse and filename search also show
+durable workspace files that the viewer may read. A linked Evidence item
+opens the recorded version, not the latest version. Private drafts do not
+become shared by moving their bytes to Wiki. Personal review reminders live
+in **Home → To do**, not in the shared Wiki browser.
+
 An empty project Context offers to create its wiki folder. Search filters use
 the available file type, and a hosted result that matched only some search
 terms says so. Hosted attachment filenames remain searchable even when their
