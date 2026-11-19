@@ -524,6 +524,10 @@ impl ScreenOperation {
                 | Self::CampaignWorkShow
                 // CAD-2379: dated summary read; titles, times and states.
                 | Self::CalendarQuery
+                // CAD-2481: report totals are a read; the hosted board
+                // applies the same member row visibility as records.list.
+                // Native still refuses to execute it.
+                | Self::RecordsAggregate
         )
     }
     pub fn args_limit(self) -> usize {
@@ -1949,6 +1953,9 @@ mod tests {
         assert!(checked.operations().iter().all(|op| !op.is_slot()));
         assert_eq!(ScreenOperation::RecordsBatch.args_limit(), 49_152);
         assert_eq!(ScreenOperation::RecordsAggregate.args_limit(), 16_384);
+        // CAD-2481: aggregate is a read-only-screen read; batch is a write.
+        assert!(ScreenOperation::RecordsAggregate.is_screen_read());
+        assert!(!ScreenOperation::RecordsBatch.is_screen_read());
         assert!(validate_facts(&call, &facts(BODY)).is_ok());
 
         let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &operations);
