@@ -180,6 +180,12 @@ export type AssistantIdentityContext =
       };
       /** The host's avatar catalogue, in its own established order. */
       readonly avatarLooks: readonly string[];
+      /**
+       * The member's own managed instructions for their assistant: guidance
+       * rendered after the identity, not tools, permissions or authority.
+       * At most 8000 characters; whitespace-only is absent.
+       */
+      readonly instructions?: string;
     }
   | {
       readonly scope: "workspace";
@@ -189,6 +195,12 @@ export type AssistantIdentityContext =
         readonly look: string;
         readonly revision: string;
       };
+      /**
+       * The owner-managed instructions for the company Master only: guidance
+       * rendered after the identity, not tools, permissions or authority.
+       * At most 8000 characters; whitespace-only is absent.
+       */
+      readonly instructions?: string;
     }
   | {
       readonly scope: "company_agent";
