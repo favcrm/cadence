@@ -59,10 +59,9 @@ env:
 # CAD-1967: the Linux gates run on instabox-medium. Its kernel 6.18.54 is
 # listed in supported_kernel_abi and both host acceptances (cad1196, cad1377)
 # pass there; the test profile compiles in 3:20 against 5:44 on ubuntu-latest.
-# `cache-warm` moves with them: Actions cache versions include the cached
-# paths, so a writer on a different runner cannot warm these jobs, and a
-# consumer moved alone compiles cold. Release, ARM and macOS jobs stay on
-# their current labels.
+# The Linux cache writer in ci-cache-warm.yml uses the same runner. Actions
+# cache versions include the cached paths, so moving one without the other
+# can leave the gate compiling cold.
 jobs:
   native-fixture-release-exclusion:
     # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
@@ -95,19 +94,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
-  # profiles' caches, under the shared keys gate-test-ld2, gate-release,
-  # gc2 and gate-release-full (CAD-1493: bump fingerprint epochs when flags
-  # change; rust-cache never overwrites an existing key). CAD-1684 updated
-  # the test and clippy epochs for the dependency debuginfo change.
-  # Every pull_request / merge_group gate job
-  # restores the same key and passes `save-if: false`: a queue ref saved
-  # ~1.4 GB per run that no other ref could read, and the repo sat at 12.7 GB
-  # against a 10 GB limit.
-  # release-artifact and release-build keep their own default-keyed caches
-  # (they run on main pushes and tags only). cross-build restores the
-  # per-target cross-* keys its own cache-warm legs write — restore-only
-  # in the gates, like every other shared key.
+  # The main-push jobs in ci-cache-warm.yml populate the shared gate cache
+  # keys. Gate jobs restore with `save-if: false`: a queue ref used to save
+  # ~1.4 GB per run that no other ref could read. release-artifact and
+  # release-build keep their own default-keyed caches. Keep shared key epochs
+  # aligned with the writers when compiler flags or profiles change.
   # The legacy cache-scope fixture was retired in CAD-1073.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
@@ -512,125 +503,6 @@ jobs:
         if: ${{ !cancelled() && needs.change-scope.outputs.ui != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
-  # CAD-904 / CI-SEC-2: the ONLY job that holds the read-write R2 key. It
-  # runs on push to main alone, under the `sccache-writer` environment
-  # (deployment branch: main only), and compiles merged code. No gate job,
-  # no pull_request and no merge_group job sees the key: a queued PR's build
-  # scripts and tests run in the gates, which only ever read the cache.
-  # Nothing `needs` it and it never fails the run.
-  # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
-  # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test-ld2: test; gate-release: build + ui;
-  # gc2: clippy). The rust-cache step precedes `ci-sccache enable`
-  # exactly as in the gates, because the cache key hashes RUST* env vars and
-  # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
-  # target dir is the point), but are skipped when the exact cache key already
-  # exists (rust-cache would not save) and sccache has nothing to warm.
-  cache-warm:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: instabox-medium
-    timeout-minutes: 30
-    continue-on-error: true
-    environment: sccache-writer
-    strategy:
-      fail-fast: false
-      matrix:
-        # CAD-1970: no `test` leg — its cache fed the PR test job, which is gone;
-        # the nightly has no wall-time budget worth a compile per merge.
-        profile: [release, release-full, clippy]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal --component clippy
-      - id: cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # CAD-1493: test and clippy carry fingerprint epochs; release stays
-          # unversioned. Keep these keys aligned with the gate consumers.
-          shared-key: ${{ matrix.profile == 'clippy' && 'gc2' || format('gate-{0}', matrix.profile) }}${{ matrix.profile == 'test' && '-ld2' || '' }}
-          # A lint or test failure on main must not freeze the refresh.
-          cache-on-failure: true
-      # The clippy leg has no sccache: clippy-driver calls are not cacheable
-      # and no gate reads clippy objects from it.
-      # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
-      # the release leg warms the cache with the same flag the gates use.
-      # CAD-1487: the suite enables the fast linker too (its link is
-      # the shard bottleneck), so the test leg must warm with it as well.
-      - name: Enable fast linker (test and release legs; same flags as the gates)
-        if: matrix.profile == 'release'
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      - name: Enable shared sccache (read-write; no-op without credentials)
-        id: sccache
-        if: matrix.profile == 'release'
-        env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
-          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      # CAD-1103: gates build the `ci` profile, so that is what this leg
-      # warms (dependencies are shared with the `ui` feature build). release-artifact keeps its own cache.
-      - name: Warm the ci profile
-        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
-        run: cargo build --profile ci --locked
-      # CAD-1131: the shipping profile, so the queue's release-queue-build
-      # restores warm dependencies (no fast linker or sccache: the same
-      # build as release-artifact).
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          bun-version-file: ui/package.json
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          node-version: 22
-      - name: Warm the release profile (queue release build)
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          (cd ui && bun install --frozen-lockfile && bun run build)
-          cargo build --release --locked --features ui
-      - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
-        if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo clippy --all-targets --locked --features test-seam -- -D warnings
-      - name: sccache statistics
-        if: ${{ !cancelled() }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
-
-  # CAD-1551: warm both cross-build dependency profiles on merged code only.
-  # The test profile optimizes dependencies differently from dev, so test
-  # artifacts alone do not warm the gate's default production-feature build.
-  # Bump the shared epoch in producer and consumer when warm inputs change:
-  # an existing immutable cache entry would otherwise skip the new work.
-  cache-warm-cross:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-linux
-            runner: ubuntu-22.04-arm
-          - target: aarch64-macos
-            runner: macos-15
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal
-      - id: cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: cross-dual2-${{ matrix.target }}
-      - name: Warm the cross-build test and dev profiles
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: |
-          # CAD-1970: the CAD-1425 acceptance target was retired with the test
-          # reset; the dev-profile build is what the cross gates now restore.
-          cargo build --locked
-
   # CAD-1131: build the release binary once per git TREE. A queue entry's
   # merge_group run builds the shipping binary in parallel with the gates
   # (`contents: read` only, like release-artifact; not a required check) and
@@ -656,7 +528,7 @@ jobs:
         with:
           node-version: 22
       - run: scripts/ci-rust-toolchain --profile minimal
-      # Restore-only, from the key `cache-warm` (release-full) saves on main.
+      # Restore-only, from the release-full leg of ci-cache-warm.yml.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-release-full
@@ -1668,7 +1540,7 @@ jobs:
       - run: rustup target add ${{ matrix.rust_target }}
         if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name == 'pull_request' }}
       # Restore-only cache with both test-seam/test and default/dev dependencies.
-      # Keep the epoch aligned with cache-warm-cross; only main saves it.
+      # Keep the epoch aligned with cache-warm-cross in ci-cache-warm.yml.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.change-scope.outputs.cross != 'false' }}
         with:

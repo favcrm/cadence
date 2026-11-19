@@ -102,18 +102,25 @@ after credentials resolve (download, checksum mismatch, unreachable bucket, bad
 token) also fails open to the same state. `release-artifact` (the attested build)
 never uses the cache.
 
+The [CI cache warming workflow](../.github/workflows/ci-cache-warm.yml) runs
+independently on the same main push as `ci.yml`. Automatic staging still waits
+for a completed, successful `ci.yml` run and verifies the exact release
+artifact. Cache completion or failure is no longer part of that wait. In
+seven of eight sampled main runs, warming finished 7–87s after attestation
+(for example, [run 44444184776](https://github.com/favcrm/cadence/actions/runs/44444184776)).
+That is the historical wait, not a post-change measurement.
+
 Who may write: **only the `cache-warm` job, on `push` to `refs/heads/main`, holds
 the read-write key.** A queued PR's build scripts and tests run in the
 merge_group gate jobs, so a read-write key there would let that code poison the
 cache or exfiltrate the key. Therefore:
 
-- `cache-warm` has `if: push && ref == refs/heads/main`, the static
-  `environment: sccache-writer`, `continue-on-error: true`, and nothing `needs`
-  it. It builds the profiles the gates use so main fills the cache, and skips
-  the builds when sccache did not enable.
+- `cache-warm` checks for a main push, uses the static `sccache-writer`
+  environment, and warms the same profiles with the same cache keys. A hit
+  skips work unless the `release` leg has shared sccache enabled.
 - `cache-warm-cross` is the same pattern for the cross-build gates: `push` to
   `refs/heads/main` only, one leg per cross target, writing only the
-  `cross-<target>` rust-cache keys the cross-build matrix restores with
+  `cross-dual2-<target>` rust-cache keys the cross-build matrix restores with
   `save-if: false`. It holds no secrets and no environment.
 - Every other job, including all gate jobs on `pull_request` and `merge_group`
   and on main pushes, gets only the read-only pair and no `environment:`.
@@ -168,10 +175,8 @@ How it works:
    queue runs show cache hits. To turn the feature off, delete the five
    values (four secrets and the variable); CI returns to today's behaviour with no workflow change.
 
-`cache-warm` is the only job that references the environment, and only on
-main pushes, so the environment never affects which jobs run on which event.
-Because the job is skipped (not failed) on every other event, a missing or
-misconfigured environment cannot block a PR or the merge queue.
+`cache-warm` is the only job that references the environment. Its workflow
+does not run for pull requests, merge groups, tags or manual dispatch.
 
 
 ## Mutation experiments
