@@ -106,7 +106,7 @@ The [CI cache warming workflow](../.github/workflows/ci-cache-warm.yml) runs
 independently on the same main push as `ci.yml`. Automatic staging still waits
 for a completed, successful `ci.yml` run and verifies the exact release
 artifact. Cache completion or failure is no longer part of that wait. In
-seven of eight sampled main runs, warming finished 7–87s after attestation
+seven of eight sampled main runs, warming finished 7–88s after attestation
 (for example, [run 44444184776](https://github.com/favcrm/cadence/actions/runs/44444184776)).
 That is the historical wait, not a post-change measurement.
 
