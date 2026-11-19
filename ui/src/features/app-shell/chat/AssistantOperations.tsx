@@ -338,7 +338,7 @@ function standingLabel(request: PermissionRequest, actionId: string): string {
   return STANDING_LABELS[actionId];
 }
 
-function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath, screenTag }: {
+function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath, screenTag, appLabel }: {
   operation: Operation;
   installId: string;
   contextId: string;
@@ -348,6 +348,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   appPath: string | null;
   /** The installed screen's tag; with it a resource link can open in the canvas. */
   screenTag: string | null;
+  appLabel: string | null;
 }) {
   const t = useTranslate();
   // The canvas shows once the conversation is fed to it; before that there is nothing to open into.
@@ -451,7 +452,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
         <ul className="app-assistant-resources" aria-label={t("Result resources")}>
           {operation.resource_refs.map((ref, index) => {
             const href = resourceHref(appPath, installId, contextId, ref);
-            const view = resourceAppView(appPath, installId, contextId, screenTag, ref);
+            const view = resourceAppView(appPath, installId, contextId, screenTag, ref, appLabel);
             return (
               <li key={`${ref.kind}:${ref.id}:${index}`}>
                 {href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}
@@ -497,7 +498,7 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, connectionRevision, onPendingChange }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
@@ -505,6 +506,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   appPath: string | null;
   /** The installed screen's tag, for Open in canvas. Null means no such action. */
   screenTag: string | null;
+  appLabel: string | null;
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
@@ -677,12 +679,12 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       </div>
       {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
-      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {completedOperations.length > 0 && (
         <details className="app-assistant-history">
           <summary className="text-micro">{t("Completed activity")} ({completedOperations.length})</summary>
           <div className="app-assistant-history-list">
-            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} busy={busy === operation.id || !canDecide} decide={decide} />)}
+            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
           </div>
         </details>
       )}

@@ -15,12 +15,14 @@
  *   Browser tab (browserStore.ts, not modelled here) has a live session or was
  *   opened on its own, and then the drawer stays on it;
  * - an app view (appView.ts, CAD-2471) is a tab that holds a reference to an
- *   installed app's screen. It is only ever opened by a tap, never by the
- *   feed, and follows the same focus, close and conversation-change rules.
+ *   installed app's screen. A tap opens it; the feed opens one only for a
+ *   live `view_ref` card (CAD-2475) under the same once-per-operator-turn rule
+ *   as artifacts, and never adds or moves a tab otherwise. It follows the same
+ *   focus, close and conversation-change rules.
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
-import { appViewId, appViewRef, applyRoutePatch, type AppViewRef } from "./appView";
+import { appViewId, appViewRef, appViewTitle, applyRoutePatch, type AppViewRef } from "./appView";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
@@ -105,11 +107,23 @@ export interface FeedCard {
   turn: string | null;
 }
 
+/** A `view_ref` card in the conversation: a reference to an app screen. */
+export interface FeedView {
+  /** Stable per entry. */
+  key: string;
+  ref: AppViewRef;
+  live: boolean;
+  operatorTurn: boolean;
+  turn: string | null;
+}
+
 export interface FeedInput {
   conversation: string | null;
   surface: Surface;
   composerKey: string | null;
   cards: FeedCard[];
+  /** `view_ref` cards (CAD-2475); absent: none. */
+  views?: FeedView[];
   working: Working | null;
   /** The turn in flight, if any — a close is remembered against it. */
   turn: string | null;
@@ -243,6 +257,17 @@ export function feedCanvas(input: FeedInput): void {
       focused = true;
     }
   }
+  for (const view of input.views ?? []) {
+    if (seen.has(view.key)) continue;
+    seen.add(view.key);
+    if (input.autoOpen === false || !view.live || !view.operatorTurn || !view.turn || autoOpened.has(view.turn) || closedTurns.has(view.turn)) continue;
+    autoOpened.add(view.turn);
+    const id = appViewId(view.ref);
+    if (!tabs.some((t) => t.id === id)) tabs = [...tabs, appTab(id, view.ref)];
+    open = true;
+    active = id;
+    focused = true;
+  }
   if (tabs.length === 0) {
     open = false;
     active = null;
@@ -277,6 +302,10 @@ export function openArtifact(ref: ArtifactRef): void {
   artifactFocused("user");
 }
 
+function appTab(id: string, ref: AppViewRef): CanvasTab {
+  return { id, kind: "app", title: ref.title, app: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null };
+}
+
 /** Open (or focus) an installed app's screen from a resource link. A
  *  malformed reference opens nothing and says so. */
 export function openAppView(input: unknown): boolean {
@@ -285,7 +314,7 @@ export function openAppView(input: unknown): boolean {
   const id = appViewId(ref);
   const tabs = state.tabs.some((t) => t.id === id)
     ? state.tabs
-    : [...state.tabs, { id, kind: "app" as const, title: ref.title, app: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null }];
+    : [...state.tabs, appTab(id, ref)];
   set({ ...state, tabs, active: id, open: true });
   artifactFocused("user");
   return true;
@@ -296,7 +325,11 @@ export function openAppView(input: unknown): boolean {
 export function patchAppViewRoute(id: string, patch: RoutePatch): void {
   set({
     ...state,
-    tabs: state.tabs.map((t) => (t.app && t.id === id ? { ...t, app: { ...t.app, route: applyRoutePatch(t.app.route, patch) } } : t)),
+    tabs: state.tabs.map((t) => {
+      if (!t.app || t.id !== id) return t;
+      const route = applyRoutePatch(t.app.route, patch);
+      return { ...t, title: appViewTitle(t.id, t.app.title, route), app: { ...t.app, route } };
+    }),
   });
 }
 
