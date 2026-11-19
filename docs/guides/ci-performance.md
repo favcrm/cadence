@@ -40,6 +40,13 @@ the [PR](https://github.com/favcrm/cadence/actions/runs/44391227760/job/13510928
 and [merge queue](https://github.com/favcrm/cadence/actions/runs/44390270802/job/135105839920)
 baselines, adding 108s and 94s respectively.
 
+In the [first PR run with this change](https://github.com/favcrm/cadence/actions/runs/44429061380/job/135241524025),
+the fixture step took 129s, the build job took 365s, and the workflow took 388s.
+The two earlier PR runs took 217–246s for the fixture step, 424–476s for the
+build job, and 462–502s for the workflow. The hosted run executed the same
+single fixture, including the tamper refusals. These are observed PR timings,
+not a measured merge-queue saving.
+
 ## 2. The rust-cache staleness trap (the real bug)
 
 `Swatinem/rust-cache` **never overwrites an existing key**. The post-action
