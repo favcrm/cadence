@@ -2373,6 +2373,9 @@ Object.assign(zhTW, {
   "Shown as you": "以你的身分顯示",
   "This screen could not be opened.": "無法開啟此畫面。",
   "Retry": "重試",
+  // CAD-2475: the canvas view card.
+  "Canvas view card": "畫布檢視卡片",
+  "Not found": "找不到",
   "Browser session actions": "瀏覽器工作階段操作",
   "Browser": "瀏覽器",
   "Can't load": "無法載入",
