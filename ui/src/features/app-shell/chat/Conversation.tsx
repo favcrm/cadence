@@ -23,7 +23,6 @@ import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
-import { PdfPageTarget } from "../../home/PdfPageAction";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -1999,9 +1998,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
     <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
     <ImageConversation.Provider value={convId}>
-    <PdfPageTarget.Provider value={hosted && canAttach && attachDestination
-      ? { key: composerKey, destination: attachDestination, isCurrent: isCurrentUploadOrigin }
-      : null}>
     <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <div className="app-chat-head">
         <div
@@ -2531,7 +2527,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         className="app-chat-form"
       />
     </div>
-    </PdfPageTarget.Provider>
     </ImageConversation.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
