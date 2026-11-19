@@ -579,6 +579,7 @@ const ThreadList = memo(function ThreadList({
   loadingEarlier,
   onEarlier,
   readOnly,
+  hosted,
   onOpenIssue,
   liveAfter,
   onRetry,
@@ -595,6 +596,7 @@ const ThreadList = memo(function ThreadList({
   loadingEarlier: boolean;
   onEarlier: () => void;
   readOnly: boolean;
+  hosted: boolean;
   onOpenIssue: (id: string) => void;
   liveAfter: number;
   onRetry: (
@@ -674,6 +676,7 @@ const ThreadList = memo(function ThreadList({
       )}
       <Conversation
         mode={{ kind: "home" }}
+        highlightSkillCommand={hosted}
         items={shown}
         conversation={conversation}
         readOnly={readOnly}
@@ -1677,6 +1680,7 @@ function MasterHome({
               loadingEarlier={loadingEarlier}
               onEarlier={onEarlier}
               readOnly={effectiveReadOnly}
+              hosted={hosted === true}
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
