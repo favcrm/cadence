@@ -996,6 +996,8 @@ fn verb_for(
             file,
             message,
             reply_to,
+            kind,
+            artifact,
             task,
             ready,
             force,
@@ -1008,6 +1010,17 @@ fn verb_for(
                     "send",
                     "--wait",
                     "a remote send is a durable enqueue; read the outcome with `message read`",
+                ));
+            }
+            if kind.is_some() || artifact.is_some() {
+                return Err(unsupported(
+                    "send",
+                    if kind.is_some() {
+                        "--kind"
+                    } else {
+                        "--artifact"
+                    },
+                    "remote send only accepts durable text + --message",
                 ));
             }
             let recipient = alias.as_deref().or(to.as_deref()).unwrap_or_default();
@@ -1024,6 +1037,8 @@ fn verb_for(
                     file,
                     message,
                     reply_to,
+                    kind,
+                    artifact,
                     task,
                     ready,
                     force,
@@ -1031,6 +1046,17 @@ fn verb_for(
                     steer,
                 },
         } => {
+            if kind.is_some() || artifact.is_some() {
+                return Err(unsupported(
+                    "message send",
+                    if kind.is_some() {
+                        "--kind"
+                    } else {
+                        "--artifact"
+                    },
+                    "remote send only accepts durable text + --message",
+                ));
+            }
             return remote_send_args(
                 alias, text, file, message, reply_to, task, *ready, *force, *nudge, steer,
             )
@@ -7047,6 +7073,8 @@ mod read_contract_tests {
             file: None,
             message: Some("cad1568-proof-1".into()),
             reply_to: None,
+            kind: None,
+            artifact: None,
             task: None,
             ready: false,
             force: false,

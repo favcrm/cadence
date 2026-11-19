@@ -1490,6 +1490,141 @@ impl Shared {
         Ok(result)
     }
 
+    /// CAD-2476: caller-scoped durable Agent Inbox feed for ANY registered
+    /// agent or assistant (active or passive), plus workspace directory.
+    /// Agents may read ONLY their own inbox (`inbox_caller`).
+    pub(super) fn rpc_inbox_feed(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (alias, _caller) = self.inbox_caller(params, peer_pid, "agent_inbox_feed")?;
+        let reader = inbox_reader(params)?;
+        let after = optional_i64(params, "after");
+        let limit = optional_u64(params, "limit").unwrap_or(50).clamp(1, 100) as usize;
+        let unread_only = params.get("unread_only").and_then(Value::as_bool) == Some(true);
+        self.store
+            .agent_inbox_feed(&alias, after, limit, unread_only, reader)
+    }
+
+    /// CAD-2476: mark Agent Inbox messages read/acknowledged through `through`
+    /// for ANY registered agent or assistant. Agents may ack ONLY their own inbox.
+    pub(super) fn rpc_inbox_mark(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_mark")?;
+        let by = match &who {
+            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
+            crate::peer::AgentCaller::Operator => "operator".to_string(),
+        };
+        let reader = inbox_reader(params)?;
+        let through = optional_i64(params, "through")
+            .ok_or_else(|| Error::rejected("agent_inbox_mark needs a `through` seq watermark"))?;
+        let result = self.store.agent_inbox_mark(&alias, through, reader, &by)?;
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-2476: record an optional promotion of an inbox message to a tracked
+    /// board issue (operator or owning agent only).
+    pub(super) fn rpc_inbox_promote(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_promote")?;
+        let by = match &who {
+            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
+            crate::peer::AgentCaller::Operator => "operator".to_string(),
+        };
+        let message_id = required_str(params, "message")?;
+        let issue_id = required_str(params, "issue")?;
+        let existing = self
+            .store
+            .message(message_id)?
+            .ok_or_else(|| Error::rejected(format!("no such inbox message '{message_id}'")))?;
+        if existing.alias != alias {
+            return Err(Error::rejected(format!(
+                "message '{message_id}' does not belong to '{alias}'"
+            )));
+        }
+        self.store
+            .record_inbox_promotion(&alias, message_id, issue_id, &by)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "message": message_id,
+            "issue": issue_id,
+            "by": by,
+        }))
+    }
+
+    /// CAD-2476: record the operator's explicit decision (`approved` or
+    /// `declined`) on a specialist `decision` proposal in the inbox.
+    /// Strictly operator-only: peer messages and agent callers NEVER hold
+    /// approval authority.
+    pub(super) fn rpc_inbox_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_decide")?;
+        if !matches!(who, crate::peer::AgentCaller::Operator) {
+            return Err(Error::rejected(
+                "agent_inbox_decide is an operator action — agents cannot approve or decline inbox decisions",
+            ));
+        }
+        let message_id = required_str(params, "message")?;
+        let decision = required_str(params, "decision")?;
+        let reason = optional_str(params, "reason");
+        let existing = self
+            .store
+            .message(message_id)?
+            .ok_or_else(|| Error::rejected(format!("no such inbox message '{message_id}'")))?;
+        if existing.alias != alias {
+            return Err(Error::rejected(format!(
+                "message '{message_id}' does not belong to '{alias}'"
+            )));
+        }
+        self.store
+            .record_inbox_decision(&alias, message_id, decision, reason, "operator")?;
+        // Notify the proposing specialist via a correlated reply when `reply_to`
+        // names a registered agent (still without granting any write authority).
+        let mut routed_reply: Option<String> = None;
+        if let Some(target) = existing
+            .reply_to
+            .as_deref()
+            .filter(|t| *t != alias && self.store.agent_opt(t).ok().flatten().is_some())
+        {
+            let reply_id = format!("decision-{decision}-{message_id}");
+            let reply_body = match reason.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(r) => format!("Operator {decision} proposal {message_id}: {r}"),
+                None => format!("Operator {decision} proposal {message_id}."),
+            };
+            let _ = self.store.enqueue_sent(
+                target,
+                &reply_body,
+                Some(&alias),
+                &reply_id,
+                "inbox_decision",
+                None,
+                &crate::store::Sender::Operator,
+            )?;
+            self.store.record_inbox_envelope(
+                target,
+                &reply_id,
+                crate::inbox::InboxKind::Reply,
+                None,
+                false,
+            )?;
+            self.notify_agent(target);
+            routed_reply = Some(reply_id);
+        }
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "message": message_id,
+            "decision": decision,
+            "reason": reason,
+            "by": "operator",
+            "reply_message": routed_reply,
+        }))
+    }
+
     /// The resume path shared by `agent_resume` and `agent_unfence`:
     /// inbox guard, ownership/fence checks, then start the actor.
     /// Returns whether the actor started — a failed start records

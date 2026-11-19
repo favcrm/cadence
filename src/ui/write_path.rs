@@ -1152,9 +1152,8 @@ pub(crate) fn write_route(
             | RouteId::AgentDetail
             | RouteId::AgentRoles
             | RouteId::AutomaticUpdatesGet
-            | RouteId::MemberAccessGet => {
-                err_response(500, "a read row reached the write dispatcher")
-            }
+            | RouteId::MemberAccessGet
+            | RouteId::InboxFeed => err_response(500, "a read row reached the write dispatcher"),
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
@@ -1362,6 +1361,13 @@ pub(crate) fn write_route(
                 app_explorer::WriteAction::RequestDismiss,
                 None,
             ),
+            RouteId::InboxSend => super::inbox::send_message(&mut request, state_dir),
+            RouteId::InboxAck => super::inbox::ack(&mut request, state_dir),
+            RouteId::InboxPromote => match caller.as_ref() {
+                Some(caller) => super::inbox::promote(&mut request, state_dir, pm_dir, caller),
+                None => err_response(500, "unadmitted write"),
+            },
+            RouteId::InboxDecide => super::inbox::decide(&mut request, state_dir),
         };
         send(request, resp);
         return;

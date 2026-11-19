@@ -76,6 +76,11 @@ pub(super) enum RouteId {
     ArtifactRead,
     ArtifactVersions,
     ProjectPolicy,
+    InboxFeed,
+    InboxSend,
+    InboxAck,
+    InboxPromote,
+    InboxDecide,
 }
 
 /// How one bound parameter is validated, and what a failure answers.
@@ -490,6 +495,12 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         OperatorOnly,
         &[]
     ),
+    // CAD-2476: Agent Inbox & assistant-to-assistant relay routes.
+    get!(InboxFeed, "/api/inbox", OperatorOnly, &[]),
+    row!(InboxSend, "/api/inbox/send", OperatorOnly, &[]),
+    row!(InboxAck, "/api/inbox/ack", OperatorOnly, &[]),
+    row!(InboxPromote, "/api/inbox/promote", OperatorOnly, &[]),
+    row!(InboxDecide, "/api/inbox/decide", OperatorOnly, &[]),
 ];
 
 impl Endpoint {
@@ -807,6 +818,29 @@ mod tests {
         );
         // The show pattern has no write row: a bare POST is not a row.
         assert!(resolve("POST", "/api/app-installations/i").is_none());
+        // CAD-2476: Agent Inbox routes are operator-only and method-exact.
+        assert_eq!(
+            resolve("GET", "/api/inbox").map(|b| (b.endpoint.id, b.endpoint.class)),
+            Some((RouteId::InboxFeed, RouteClass::OperatorOnly))
+        );
+        assert_eq!(
+            resolve("POST", "/api/inbox/send").map(|b| (b.endpoint.id, b.endpoint.class)),
+            Some((RouteId::InboxSend, RouteClass::OperatorOnly))
+        );
+        assert_eq!(
+            resolve("POST", "/api/inbox/ack").map(|b| (b.endpoint.id, b.endpoint.class)),
+            Some((RouteId::InboxAck, RouteClass::OperatorOnly))
+        );
+        assert_eq!(
+            resolve("POST", "/api/inbox/promote").map(|b| (b.endpoint.id, b.endpoint.class)),
+            Some((RouteId::InboxPromote, RouteClass::OperatorOnly))
+        );
+        assert_eq!(
+            resolve("POST", "/api/inbox/decide").map(|b| (b.endpoint.id, b.endpoint.class)),
+            Some((RouteId::InboxDecide, RouteClass::OperatorOnly))
+        );
+        assert!(resolve("POST", "/api/inbox").is_none());
+        assert!(resolve("GET", "/api/inbox/send").is_none());
     }
 
     #[test]

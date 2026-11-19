@@ -740,6 +740,17 @@ impl Shared {
         let reply_to = optional_str(params, "reply_to")
             .map(str::to_string)
             .or_else(|| (!nudge).then(|| self.upstream_of(&alias)).flatten());
+        let inbox_kind = optional_text(params, "kind")?
+            .map(crate::inbox::InboxKind::parse)
+            .transpose()?;
+        let inbox_artifact = optional_text(params, "artifact")?
+            .map(crate::inbox::validate_artifact)
+            .transpose()?;
+        if nudge && (inbox_kind.is_some() || inbox_artifact.is_some()) {
+            return Err(Error::rejected(
+                "--nudge is steering, not an inbox message — it takes no kind or artifact",
+            ));
+        }
         let message = optional_str(params, "message")
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -1000,9 +1011,105 @@ impl Shared {
                 }
             }
         }
+        let mut auto_answered = false;
+        let mut auto_reply_message: Option<String> = None;
+        if !duplicate && (inbox_kind.is_some() || inbox_artifact.is_some()) {
+            let effective_kind = inbox_kind.unwrap_or(if reply_to.is_some() {
+                crate::inbox::InboxKind::Reply
+            } else if inbox_artifact.is_some() {
+                crate::inbox::InboxKind::Handoff
+            } else {
+                crate::inbox::InboxKind::Message
+            });
+            // CAD-2476: read-only check-in auto-reply policy. Opt-in per agent
+            // via `params.inbox.checkin_auto_reply = true` (default false).
+            // Never grants write or steering authority; leaves a quiet
+            // `auto_answered: true` audit row in the recipient's inbox and
+            // sends a correlated `reply` ONLY back to the daemon-derived
+            // authenticated asking agent (`Sender::Agent(caller)`), never to an
+            // arbitrary sender-supplied `reply_to` or upstream target.
+            if effective_kind == crate::inbox::InboxKind::Checkin {
+                let explicit_reply_to = optional_str(params, "reply_to");
+                if let (crate::store::Sender::Agent(caller_alias), Ok(Some(target_agent))) =
+                    (&sender, self.store.agent_opt(&alias))
+                {
+                    let policy_enabled = target_agent
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.pointer("/inbox/checkin_auto_reply"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    let reply_matches_asker =
+                        explicit_reply_to.is_none_or(|r| r == caller_alias.as_str());
+                    if policy_enabled
+                        && reply_matches_asker
+                        && caller_alias.as_str() != alias.as_str()
+                        && self.store.agent_opt(caller_alias)?.is_some()
+                    {
+                        let reply_body = target_agent
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.pointer("/inbox/auto_reply_text"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "[auto-reply from {alias} ({})] Check-in received; current state: {}.",
+                                    target_agent
+                                        .team_role
+                                        .as_deref()
+                                        .unwrap_or(&target_agent.role),
+                                    target_agent.state
+                                )
+                            });
+                        let reply_id = format!("auto-reply-{message}");
+                        let _ = self.store.enqueue_sent(
+                            caller_alias,
+                            &reply_body,
+                            Some(&alias),
+                            &reply_id,
+                            "inbox_auto_reply",
+                            None,
+                            &crate::store::Sender::Agent(alias.clone()),
+                        )?;
+                        self.store.record_inbox_envelope(
+                            caller_alias,
+                            &reply_id,
+                            crate::inbox::InboxKind::Reply,
+                            None,
+                            false,
+                        )?;
+                        self.notify_agent(caller_alias);
+                        auto_answered = true;
+                        auto_reply_message = Some(reply_id);
+                    }
+                }
+            }
+            self.store.record_inbox_envelope(
+                &alias,
+                &message,
+                effective_kind,
+                inbox_artifact.as_deref(),
+                auto_answered,
+            )?;
+        }
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": message, "state": state, "duplicate": duplicate});
+        if let Some(kind) = inbox_kind {
+            receipt["kind"] = json!(kind.as_str());
+        }
+        if let Some(artifact) = inbox_artifact {
+            receipt["artifact"] = json!(artifact);
+        }
+        if auto_answered {
+            receipt["auto_answered"] = json!(true);
+            if let Some(reply_id) = auto_reply_message {
+                receipt["auto_reply_message"] = json!(reply_id);
+            }
+        }
         // CAD-251: an undrained mailbox warns the sender — never refuses.
         if let Some(warning) = self.inbox_warning(&alias) {
             receipt["warning"] = json!(warning);

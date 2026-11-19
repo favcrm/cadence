@@ -1844,6 +1844,7 @@ fn read_dispatch(
                 (key == "install").then(|| install.to_string())
             })
         }
+        endpoints::RouteId::InboxFeed => super::inbox::feed(request, state_dir),
         _ => err_response(500, "a write row reached the read dispatcher"),
     }
 }
