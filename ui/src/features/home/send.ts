@@ -1,4 +1,5 @@
 import { api } from "../../lib/api";
+import { sendHandoffCompatibleMaster } from "../../lib/appHandoffs";
 import { resources } from "../../lib/resources";
 import { usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { ThreadRef } from "../../lib/types";
@@ -28,8 +29,10 @@ export function sendToMaster(
   return usingPrivateOperation(operation, async (op) => {
     try {
       op.assertCurrent();
-      store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation, appHandoff));
-      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op, mediaRefs, undefined, appHandoff);
+      const handoff = appHandoff && conversation !== undefined;
+      store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation, handoff));
+      if (handoff) await sendHandoffCompatibleMaster({ conversation, message, text: body, refs, attachments, mediaRefs }, op);
+      else await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op, mediaRefs);
       op.assertCurrent();
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.

@@ -1,6 +1,7 @@
 import { ApiError, errorMessage } from "./apiError";
-import { usingPrivateOperation } from "./privateSession";
+import { usingPrivateOperation, type PrivateOperation } from "./privateSession";
 import { sessionHeaders } from "./sessionKey";
+import type { ThreadRef } from "./types";
 
 /** AgenticOS host contract DEMOCOMPANY-26. Not an authorization credential. */
 export const APP_HANDOFF_HEADERS = { "X-Cadence-App-Handoff": "app-handoff-decision-v1" };
@@ -91,4 +92,39 @@ export async function appHandoffDecision(
   const row = parseDecision(body?.decision);
   if (row.id !== id) throw new Error("The response belongs to a different handoff.");
   return row;
+}
+
+/** This opt-in is HTTP-only; the shared socket path stays unchanged. */
+export async function sendHandoffCompatibleMaster(
+  input: {
+    conversation: string;
+    message: string;
+    text: string;
+    refs?: ThreadRef[];
+    attachments?: { id: string }[];
+    mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
+  },
+  operation: PrivateOperation,
+): Promise<void> {
+  const { conversation, message, text, refs, attachments, mediaRefs } = input;
+  const response = await operation.fetch("/api/threads/master/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Cadence-Board": "1",
+      ...sessionHeaders(),
+      ...APP_HANDOFF_HEADERS,
+    },
+    body: JSON.stringify({
+      conversation,
+      message,
+      text,
+      ...(refs?.length ? { refs } : {}),
+      ...(attachments?.length ? { attachments: attachments.map(({ id }) => ({ id })) } : {}),
+      ...(mediaRefs?.length ? { media_refs: mediaRefs } : {}),
+    }),
+  });
+  const body: unknown = await response.json().catch(() => null);
+  operation.assertCurrent();
+  if (!response.ok) throw new ApiError(errorMessage(body, response.statusText), response.status);
 }
