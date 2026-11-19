@@ -8,6 +8,7 @@ import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import ScreenAudioModal from "./ScreenAudioModal";
+import CustomerSharing from "./CustomerSharing";
 import { createScreenAudioSession, type ScreenAudioSessionController } from "./screenAudioSession";
 import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type AudioSessionRequest, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
 import { DrawerRestorer } from "./drawerRestore";
@@ -533,7 +534,15 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // The child portal exists only for a live primary with a real private
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;
+  const liveReceipt = mounted.current;
+  const sharingRoute = primary && !readOnly && state === "ready" && overlay === null &&
+    projection.installation.name === "crm" && liveReceipt?.host_contract === "screen-records.v1" &&
+    liveReceipt.operations?.includes("records.show")
+    ? frameRoute(liveReceipt.navigation, liveReceipt.tag, { href, route })
+    : null;
   return <>
+    {drawerToken && sharingRoute?.section === "customers" && sharingRoute.view === "list" && sharingRoute.record_id &&
+      <CustomerSharing key={`${scope}:${attempt}:${sharingRoute.record_id}`} actionToken={drawerToken} recordId={sharingRoute.record_id} />}
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
