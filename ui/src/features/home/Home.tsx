@@ -51,6 +51,7 @@ import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import PermissionsSlashCard from "./PermissionsSlashCard";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "./composerFill";
 import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
@@ -1533,10 +1534,20 @@ function MasterHome({
     [effectiveReadOnly, focusHomeComposer],
   );
 
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (effectiveReadOnly) return;
+      setComposerDraft("home", appendComposerDraft(composerDraftState("home").text, text));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
     <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={!effectiveReadOnly ? fillComposer : null}>
     <PdfPageTarget.Provider value={canCapturePdfPages && attachDestination
       ? { key: "home", destination: attachDestination }
       : null}>
@@ -1793,6 +1804,7 @@ function MasterHome({
     </AttachmentNamesContext.Provider>
     </StagedSourceContext.Provider>
     </PdfPageTarget.Provider>
+    </ComposerFillContext.Provider>
     </PermissionReplyContext.Provider>
     </PermissionEnabledContext.Provider>
     </AssistantActorProvider>
