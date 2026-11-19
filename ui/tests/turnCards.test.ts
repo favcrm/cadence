@@ -1,7 +1,7 @@
 import { parsePreview, parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
 import type { ThreadEntry } from "../src/features/home/thread";
 declare function require(name: string): any;
-import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, parseToolCall, shortId, stagedFields, stagedInTurn, turnSources } from "../src/features/home/turnCards";
+import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, attachmentNames, outsideDomainRecipients, parseToolCall, shortId, stagedAccount, stagedFields, stagedInTurn, stagedStatus, turnSources } from "../src/features/home/turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): a turn's sources and staged
@@ -44,7 +44,7 @@ check(parseToolCall('wiki_read {"path":') === null, "broken JSON is not a call")
   ]);
   check(
     JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`)) ===
-      JSON.stringify(["wiki:policies/refunds", "issue:CAD-12", "attachment:chf-0123456789abcdef0123456789abcdef", "artifact:art-1", "web:example.com", "app:crm · c1"]),
+      JSON.stringify(["wiki:policies/refunds", "issue:CAD-12", "attachment:chf-01234567…", "artifact:art-1", "web:example.com", "app:crm · c1"]),
     `sources in order, one per source: ${JSON.stringify(sources.map((s) => `${s.kind}:${s.label}`))}`,
   );
   check(sources.find((s) => s.kind === "web")?.target === "https://example.com/pricing?x=1", "a web source keeps its full URL");
@@ -131,9 +131,12 @@ const appRow = (id: string, status = "pending") =>
   check(preview?.kind === "email" && preview.toolkitLabel === "Synthetic Mail", "the preview is read");
   const view = stagedFields(row!);
   check(
-    JSON.stringify(view.fields.map((f) => f.label)) === JSON.stringify(["To", "Cc", "Subject", "Body"]),
-    `preview fields in order: ${JSON.stringify(view.fields.map((f) => f.label))}`,
+    JSON.stringify(view.fields.map((f) => f.label)) === JSON.stringify(["To", "Cc", "Subject"]),
+    `preview fields in order, body apart: ${JSON.stringify(view.fields.map((f) => f.label))}`,
   );
+  check(view.body === "Hello, this confirms your booking on Friday at 3pm.", "the body is the preview's message, whole");
+  check(preview?.account === "ops@example.test" && stagedAccount(row!) === "ops@example.test", "the sending account is read");
+  check(outsideDomainRecipients(row!) === 0, "recipients on the account's own domain are inside");
   check(view.fields[0]!.value === "customer@example.test", "values are the preview's plain text");
   // Without a preview, the stored call's own keys are shown.
   const bare = parseStagedRow({ id: OTHER, tool: "connected_effect", status: "pending", createdAt: 1, input: { ...input, preview: undefined } });
@@ -165,6 +168,68 @@ check(parsePreview({ kind: "fields", fields: Array.from({ length: 20 }, (_, i) =
   check(view.fields.every((f) => f.value.length <= STAGED_VALUE_CHARS), "values are capped");
   check(view.fields[0]!.value.endsWith("…"), "a cut value says so");
   check(view.fields[2]!.missing && !view.fields[1]!.missing, "only the empty value is flagged");
+}
+
+// CAD-2463: web chips that share a host add their path; others stay bare.
+{
+  const sources = turnSources([
+    call("web_read: https://www.hubspot.com/pricing/crm"),
+    call("web_read: https://www.hubspot.com/products/crm?utm=x"),
+    call("web_read: https://www.zoho.com/crm/zohobigin/pricing.html"),
+    call('web_read {"url":"https://www.hubspot.com/"}'),
+    call("web_read: https://docs.example.com/a/really/long/path/that/keeps/going/and/going/forever"),
+    call("web_read: https://docs.example.com/b"),
+  ]);
+  const labels = sources.map((s) => s.label);
+  check(
+    JSON.stringify(labels.slice(0, 4)) === JSON.stringify(["www.hubspot.com/pricing/crm", "www.hubspot.com/products/crm?…", "www.zoho.com", "www.hubspot.com/"]),
+    `shared hosts add their path: ${JSON.stringify(labels)}`,
+  );
+  check(labels[4]!.length === 40 && labels[4]!.endsWith("…"), `a long path is cut: ${labels[4]}`);
+  check(sources.every((s) => s.kind !== "web" || s.target.startsWith("https://")), "targets stay the full URL");
+}
+
+// CAD-2463: an attachment is named by the file the thread's own message carried.
+{
+  const id = "chf-121800f2fb54c8d375f53e115e0a4909";
+  const message: ThreadEntry = { seq: ++seq, role: "operator", kind: "message", text: "see attached", message: "m0", payload: { attachments: [{ id, name: "Quote Q-0140.pdf", size: 10, mime: "application/pdf" }, { id: "bad" }, "junk"] } };
+  const names = attachmentNames([message, prose("x"), { ...message, payload: null }]);
+  check(names.get(id) === "Quote Q-0140.pdf" && names.size === 1, "names come from payload.attachments; malformed rows are skipped");
+  const read = call(`chat_attachment_read {"id":"${id}","offset":0}`);
+  check(turnSources([read], names)[0]!.label === "Quote Q-0140.pdf", "a held attachment shows its file name");
+  check(turnSources([read])[0]!.label === "chf-121800f2…", "an unknown attachment shows a short id");
+  check(turnSources([read], names)[0]!.target === id, "the chip still targets the id");
+}
+
+// CAD-2463: outside-domain recipients, only for an email with an address account.
+{
+  const email = (account: string | undefined, fields: { role: string; label: string; value: string }[], kind = "email") =>
+    parseStagedRow({
+      id: ACTION,
+      tool: "connected_effect",
+      status: "pending",
+      createdAt: 1,
+      input: { slug: "gmail_send", toolkit: "gmail", effect: "send", connection_id: "c", account: "ops@example.test", args: "{}", preview: { title: "Gmail: send", toolkit_label: "Gmail", ...(account === undefined ? {} : { account }), kind, fields } },
+    })!;
+  const to = (value: string) => ({ role: "to", label: "To", value });
+  check(outsideDomainRecipients(email("ops@example.test", [to("mei@harbourfans.example, a@example.test"), { role: "cc", label: "Cc", value: "Accounts <ACC@Example.Test>" }])) === 1, "one outside, case-insensitive, Name <addr> read");
+  check(outsideDomainRecipients(email("ops@example.test", [to("x@mail.example.test")])) === 0, "a subdomain is inside");
+  check(outsideDomainRecipients(email("ops@example.test", [to("a@b.example; c@d.example"), { role: "bcc", label: "Bcc", value: "e@f.example" }])) === 3, "to, cc and bcc all count");
+  check(outsideDomainRecipients(email("+852 5555 0100", [to("a@b.example")])) === 0, "a non-address account never guesses");
+  check(outsideDomainRecipients(email("ops@example.test", [to("+852 5555 0123")], "message")) === 0, "a message is not an email");
+  check(outsideDomainRecipients(email("ops@example.test", [{ role: "subject", label: "Subject", value: "x@y.example" }])) === 0, "only recipient roles count");
+}
+
+// CAD-2463: a connected effect's outcome in its own words, only once confirmed.
+{
+  const effect = (e: "send" | "draft", status: string, result?: Record<string, unknown>) =>
+    parseStagedRow({ id: ACTION, tool: "connected_effect", status, createdAt: 1, ...(result ? { result } : {}), input: { slug: "gmail_send", toolkit: "gmail", effect: e, connection_id: "c", account: "a@b.test", args: "{}" } })!;
+  check(stagedStatus(effect("send", "approved", { ok: true }), "applied", "Applied") === "Sent", "an applied send is Sent");
+  check(stagedStatus(effect("draft", "approved", { ok: true }), "applied", "Applied") === "Draft saved", "an applied draft is Draft saved");
+  check(stagedStatus(effect("send", "approved", { ok: false }), "failed", "Did not apply") === "Couldn't send", "a failed send says so");
+  check(stagedStatus(effect("send", "approved"), "unconfirmed", "Result not confirmed") === "Result not confirmed", "an unconfirmed send is never Sent");
+  check(stagedStatus(effect("send", "pending"), "pending", "Waiting") === "Waiting", "pending keeps the rail's word");
+  check(stagedStatus(appRow(ACTION)!, "applied", "Applied") === "Applied", "an app write keeps the rail's word");
 }
 
 console.log("turnCards: ok");

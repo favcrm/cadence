@@ -4,7 +4,7 @@
  * results — never from the model's prose, so an answer cannot invent a
  * source or a write. No React, so the UI tests load it directly.
  */
-import type { StagedWrite } from "../decisions/stagedWrite";
+import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
 import type { ThreadEntry } from "./thread";
 
 export type TurnSourceKind = "wiki" | "issue" | "attachment" | "artifact" | "web" | "app";
@@ -134,7 +134,7 @@ function sourceOf(name: string, args: Record<string, unknown>, summary?: string)
  * The sources a turn read, in the order it first read them, one chip per
  * source. Only recorded `tool_call` entries count.
  */
-export function turnSources(entries: readonly ThreadEntry[]): TurnSource[] {
+export function turnSources(entries: readonly ThreadEntry[], names: ReadonlyMap<string, string> = new Map()): TurnSource[] {
   const seen = new Set<string>();
   const out: TurnSource[] = [];
   for (const entry of entries) {
@@ -146,7 +146,51 @@ export function turnSources(entries: readonly ThreadEntry[]): TurnSource[] {
     seen.add(source.key);
     out.push(source);
   }
-  return out;
+  return nameSources(out, names);
+}
+
+/** A web chip's label when its host alone is ambiguous: host plus the path, cut. */
+const WEB_LABEL_CHARS = 40;
+
+/**
+ * CAD-2463: labels a person can tell apart. Web sources that share a host add
+ * their path; an attachment the thread holds is named by its file name.
+ */
+function nameSources(sources: TurnSource[], names: ReadonlyMap<string, string>): TurnSource[] {
+  const hosts = new Map<string, number>();
+  for (const source of sources) if (source.kind === "web") hosts.set(source.label, (hosts.get(source.label) ?? 0) + 1);
+  return sources.map((source) => {
+    if (source.kind === "web" && (hosts.get(source.label) ?? 0) > 1) {
+      const url = new URL(source.target);
+      const path = url.pathname.replace(/\/$/, "");
+      const label = `${url.host}${path || "/"}${url.search ? "?…" : ""}`;
+      return { ...source, label: label.length > WEB_LABEL_CHARS ? `${label.slice(0, WEB_LABEL_CHARS - 1)}…` : label };
+    }
+    if (source.kind === "attachment") {
+      const name = names.get(source.target);
+      return { ...source, label: name ?? shortId(source.target) };
+    }
+    return source;
+  });
+}
+
+/**
+ * The file names of the attachments a thread's own messages carry
+ * (`payload.attachments`, CAD-1168), by attachment id. A malformed row is
+ * skipped.
+ */
+export function attachmentNames(entries: readonly ThreadEntry[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const entry of entries) {
+    const list = (entry.payload as { attachments?: unknown } | null | undefined)?.attachments;
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const { id, name } = item as { id?: unknown; name?: unknown };
+      if (typeof id === "string" && typeof name === "string" && name.trim() !== "") names.set(id, name.trim());
+    }
+  }
+  return names;
 }
 
 const norm = (s: string): string => s.toLowerCase().replace(/-/g, "");
@@ -206,14 +250,76 @@ const cut = (s: string): string => (s.length > STAGED_VALUE_CHARS ? `${s.slice(0
  * the row carries one (display only — what runs is the stored call), else
  * the row's own changes. Every value is plain text.
  */
-export function stagedFields(write: StagedWrite): { fields: StagedField[]; more: number } {
+/** Preview roles that hold the message itself, shown as the card's body. */
+const BODY_ROLES = new Set(["body", "text", "message"]);
+
+export function stagedFields(write: StagedWrite): { fields: StagedField[]; more: number; body: string | null } {
   const preview = write.connected?.preview;
+  // CAD-2463: a connected effect's message is the body, in full (the preview
+  // already caps it at 2,000 characters); the card clamps it, not cuts it.
+  const bodyField = preview?.fields.find((field) => BODY_ROLES.has(field.role)) ?? null;
+  const body = bodyField && bodyField.value.trim() !== "" ? bodyField.value : null;
   const all: StagedField[] = preview
-    ? preview.fields.map((field) => ({ label: field.label, value: cut(field.value), missing: field.value.trim() === "", removed: false }))
+    ? preview.fields
+        .filter((field) => field !== bodyField || body === null)
+        .map((field) => ({ label: field.label, value: cut(field.value), missing: field.value.trim() === "", removed: false }))
     : write.changes.map((change) => {
         if (change.kind === "removed") return { label: change.label, value: cut(change.before ?? ""), missing: false, removed: true };
         const value = change.after ?? "";
         return { label: change.label, value: cut(value), missing: change.after == null || value.trim() === "", removed: false };
       });
-  return { fields: all.slice(0, STAGED_FIELDS_SHOWN), more: Math.max(0, all.length - STAGED_FIELDS_SHOWN) };
+  return { fields: all.slice(0, STAGED_FIELDS_SHOWN), more: Math.max(0, all.length - STAGED_FIELDS_SHOWN), body };
+}
+
+/** The sending account a connected effect names, if any. */
+export function stagedAccount(write: StagedWrite): string | null {
+  const account = write.connected?.preview?.account ?? write.connected?.account ?? null;
+  return account && account.trim() !== "" ? account.trim() : null;
+}
+
+const domainOf = (address: string): string | null => {
+  const at = address.lastIndexOf("@");
+  if (at < 1 || at === address.length - 1) return null;
+  const domain = address.slice(at + 1).toLowerCase().replace(/[>\s.]+$/, "");
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain) ? domain : null;
+};
+
+/** Recipient roles an outside-domain check reads. */
+const RECIPIENT_ROLES = new Set(["to", "cc", "bcc"]);
+
+/**
+ * CAD-2463: how many email recipients sit outside the sending account's
+ * domain (a subdomain counts as inside). Zero when the effect is not an email
+ * or the account is not an address, so the card never guesses.
+ */
+export function outsideDomainRecipients(write: StagedWrite): number {
+  const preview = write.connected?.preview;
+  if (!preview || preview.kind !== "email") return 0;
+  const account = stagedAccount(write);
+  const home = account ? domainOf(account) : null;
+  if (!home) return 0;
+  let outside = 0;
+  for (const field of preview.fields) {
+    if (!RECIPIENT_ROLES.has(field.role)) continue;
+    for (const part of field.value.split(/[,;]/)) {
+      const address = (/<([^>]+)>/.exec(part)?.[1] ?? part).trim();
+      const domain = domainOf(address);
+      if (domain && domain !== home && !domain.endsWith(`.${home}`)) outside++;
+    }
+  }
+  return outside;
+}
+
+/**
+ * CAD-2463: the outcome in a connected effect's own words, only once the row
+ * says so: an applied send is "Sent", an applied draft "Draft saved", a
+ * failed one "Couldn't send". Anything else keeps the rail's word, so an
+ * uncertain result never reads as success.
+ */
+export function stagedStatus(write: StagedWrite, outcome: StagedOutcome, railWord: string): string {
+  const effect = write.connected?.effect;
+  if (!effect) return railWord;
+  if (outcome === "applied") return effect === "send" ? "Sent" : "Draft saved";
+  if (outcome === "failed") return effect === "send" ? "Couldn't send" : "Couldn't save the draft";
+  return railWord;
 }

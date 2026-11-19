@@ -82,6 +82,8 @@ export interface StagedWrite {
 export interface ConnectedPreview {
   title: string | null;
   toolkitLabel: string | null;
+  /** The sending account the preview names (CAD-2463). */
+  account: string | null;
   kind: "email" | "message" | "fields";
   fields: { role: string; label: string; value: string }[];
 }
@@ -108,7 +110,7 @@ export function parsePreview(value: unknown): ConnectedPreview | undefined {
     });
   }
   const text = (v: unknown) => (typeof v === "string" && v.trim() !== "" ? v.slice(0, 200) : null);
-  return { title: text(p.title), toolkitLabel: text(p.toolkit_label), kind, fields };
+  return { title: text(p.title), toolkitLabel: text(p.toolkit_label), account: text(p.account), kind, fields };
 }
 
 const STATUSES: readonly string[] = ["pending", "approved", "denied"];

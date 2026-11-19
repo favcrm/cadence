@@ -1,4 +1,4 @@
-import { useContext, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useContext, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
 import SafeLink from "../../ui/SafeLink";
@@ -11,13 +11,20 @@ import { stagedChipView } from "../decisions/stagedRef";
 import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
 import { openAttachmentInTab } from "./AttachmentMedia";
 import type { ThreadEntry } from "./thread";
-import { SOURCES_SHOWN, stagedFields, stagedInTurn, type TurnSource } from "./turnCards";
+import { SOURCES_SHOWN, outsideDomainRecipients, stagedAccount, stagedFields, stagedInTurn, stagedStatus, type TurnSource } from "./turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): under a finished answer, what
  * the turn read (Sources) and what it staged (one card per write). Both come
  * from the turn's recorded tool calls and results; see `turnCards.ts`.
  */
+
+/**
+ * CAD-2463: the file names of the thread's own attachments, by id, so an
+ * attachment source reads as the file the user sent. Each surface that holds
+ * the whole thread (Home, the assistant panel) provides it.
+ */
+export const AttachmentNamesContext = createContext<ReadonlyMap<string, string>>(new Map());
 
 /** The record ids the app screen's `?record=` accepts (screenRoute.ts). */
 const APP_RECORD_ID = /^[a-z0-9_-]{1,64}$/;
@@ -137,11 +144,16 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
   const t = useTranslate();
   // "Not now" folds the card to its header for this view; it decides nothing.
   const [folded, setFolded] = useState(false);
+  // "Show full message" lifts the body's clamp; the body is already plain text.
+  const [fullBody, setFullBody] = useState(false);
   const view = stagedChipView(write);
-  const { fields, more } = stagedFields(write);
+  const { fields, more, body } = stagedFields(write);
   const preview = write.connected?.preview;
   const title = preview?.title ?? view.title;
-  const app = preview?.toolkitLabel ?? view.app;
+  const app = preview?.toolkitLabel ?? write.connected?.toolkit ?? view.app;
+  const account = stagedAccount(write);
+  const outside = outsideDomainRecipients(write);
+  const status = stagedStatus(write, view.outcome, view.status);
   return (
     <TurnCard
       kind="staged"
@@ -157,7 +169,7 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
         </svg>
       }
       kindLabel={[app, t(view.kind)].filter(Boolean).join(" · ")}
-      status={{ text: t(view.status), tone: TONE[view.outcome] }}
+      status={{ text: t(status), tone: TONE[view.outcome] }}
       data-folded={folded || undefined}
       footer={
         view.pending ? (
@@ -173,6 +185,11 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
       }
     >
       <p className="turncard-title"><bdi>{title}</bdi></p>
+      {account && (
+        <p className="turncard-from">
+          {t("from")} <bdi>{account}</bdi>
+        </p>
+      )}
       {!folded && (
         <>
       {fields.length > 0 && (
@@ -188,6 +205,21 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
             </div>
           ))}
         </dl>
+      )}
+      {body !== null && (
+        <div className="turncard-message" data-message-kind={preview?.kind ?? "fields"}>
+          <p className="turncard-message-text" data-clamped={fullBody ? undefined : ""}>
+            <bdi>{body}</bdi>
+          </p>
+          <button type="button" className="lnk text-label" data-staged-body-toggle aria-expanded={fullBody} onClick={() => setFullBody((v) => !v)}>
+            {fullBody ? t("Show less") : t("Show full message")}
+          </button>
+        </div>
+      )}
+      {outside > 0 && (
+        <p className="turncard-flag" role="note" data-outside-domain={outside}>
+          {outside === 1 ? t("1 recipient is outside your company domain") : `${outside} ${t("recipients are outside your company domain")}`}
+        </p>
       )}
       {more > 0 && <p className="text-micro text-ink-500">{t("More on the review card")} (+{more})</p>}
         </>
