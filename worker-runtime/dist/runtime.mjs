@@ -55125,6 +55125,7 @@ var HOSTED_COMPACTION_POLICY = {
   backgroundTokens: 16384
 };
 var MODEL_MAX_OUTPUT_TOKENS = 8192;
+var BYTE_COMPACTION_THRESHOLD = 160 * 1024;
 var SUMMARY_MAX_OUTPUT_TOKENS = 32768;
 function withSummaryBudget(input) {
   const field = "max_completion_tokens" in input ? "max_completion_tokens" : "max_tokens";
@@ -55210,21 +55211,16 @@ function captureResolvedModel(response, onModelResolved) {
   });
 }
 function splitSummaryMessages(input) {
-  if (!Array.isArray(input.messages) || input.messages.length !== 2)
+  const source = summarySource(input);
+  if (source === null)
     return input;
-  const [system, user] = input.messages;
-  if (typeof system !== "object" || system === null || system.role !== "system" || typeof user !== "object" || user === null || user.role !== "user")
-    return input;
-  let text;
-  if (typeof user.content === "string")
-    text = user.content;
-  else if (Array.isArray(user.content) && user.content.length === 1 && user.content[0]?.type === "text" && typeof user.content[0].text === "string")
-    text = user.content[0].text;
-  else
-    return input;
+  const { system, user } = source;
+  const text = shortenToolCallArguments(source.text);
   const limit = 64000;
-  if (text.length <= limit)
+  if (text === source.text && text.length <= limit)
     return input;
+  if (text.length <= limit)
+    return { ...input, messages: [system, { ...user, content: text }] };
   const messages = [system];
   for (let start = 0;start < text.length; ) {
     let end = Math.min(start + limit, text.length);
@@ -55236,6 +55232,47 @@ function splitSummaryMessages(input) {
     start = end;
   }
   return { ...input, messages };
+}
+function summarySource(input) {
+  if (!Array.isArray(input.messages) || input.messages.length !== 2)
+    return null;
+  const [system, user] = input.messages;
+  if (typeof system !== "object" || system === null || system.role !== "system" || typeof user !== "object" || user === null || user.role !== "user")
+    return null;
+  if (typeof user.content === "string")
+    return { system, user, text: user.content };
+  if (Array.isArray(user.content) && user.content.length === 1 && user.content[0]?.type === "text" && typeof user.content[0].text === "string")
+    return { system, user, text: user.content[0].text };
+  return null;
+}
+var TOOL_CALLS_PREFIX = "[Assistant tool calls]: ";
+var TOOL_CALL_STRING_KEPT = 1000;
+var JSON_STRING = /"(?:[^"\\]|\\[\s\S])*"/g;
+function shortenToolCallArguments(text) {
+  if (!text.includes(TOOL_CALLS_PREFIX))
+    return text;
+  return text.split(`
+
+`).map((part) => !part.startsWith(TOOL_CALLS_PREFIX) ? part : part.replace(JSON_STRING, (literal) => shortenJsonString(literal))).join(`
+
+`);
+}
+function shortenJsonString(literal) {
+  const body = literal.slice(1, -1);
+  if (body.length <= 2 * TOOL_CALL_STRING_KEPT + 200)
+    return literal;
+  let head = TOOL_CALL_STRING_KEPT;
+  const slashes = /\\*$/.exec(body.slice(0, head))[0].length;
+  if (slashes % 2 === 1)
+    head--;
+  head = cutText(body, head).length;
+  let tail = body.length - TOOL_CALL_STRING_KEPT;
+  if (body[tail - 1] === "\\" && /\\*$/.exec(body.slice(0, tail))[0].length % 2 === 1)
+    tail++;
+  const low = body.charCodeAt(tail);
+  if (low >= 56320 && low <= 57343)
+    tail++;
+  return `"${body.slice(0, head)}[... ${tail - head} more characters omitted]${body.slice(tail)}"`;
 }
 var SUMMARY_BODY_BYTES = 256 * 1024;
 function requestBytes(input) {
@@ -55420,7 +55457,42 @@ function imagesOnlyInHistory(input) {
   const messages = input.messages;
   return !hasImage(messages.at(-1)?.content) && messages.some((message) => hasImage(message?.content));
 }
-function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1, budgetProofs, isCompaction) {
+
+class RequestSizes {
+  bytes = new Map;
+  record(task, bytes) {
+    this.bytes.delete(task);
+    this.bytes.set(task, bytes);
+    if (this.bytes.size > 32)
+      this.bytes.delete(this.bytes.keys().next().value);
+  }
+  withByteFloor(task, message) {
+    const sent = this.bytes.get(task);
+    this.bytes.delete(task);
+    if (sent === undefined || message.stopReason === "error" || message.stopReason === "aborted")
+      return;
+    if (sent + replyBytes(message) <= BYTE_COMPACTION_THRESHOLD)
+      return;
+    const blocking = MODEL_CONTEXT_WINDOW - HOSTED_COMPACTION_POLICY.reserveTokens + 1;
+    const usage = message.usage;
+    usage.totalTokens = Math.max(usage.totalTokens, blocking);
+  }
+}
+function replyBytes(message) {
+  let text = "";
+  for (const part of message.content) {
+    if (part.type === "text")
+      text += part.text;
+    else if (part.type === "toolCall")
+      text += JSON.stringify({
+        id: part.id,
+        type: "function",
+        function: { name: part.name, arguments: JSON.stringify(part.arguments) }
+      });
+  }
+  return encoder2.encode(text).length;
+}
+function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1, budgetProofs, isCompaction, sizes) {
   if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
     throw new Error("Invalid model image limit.");
   return {
@@ -55450,6 +55522,8 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
       }
       const request = (value) => {
         budgetProofs?.clear(current);
+        if (!compacting)
+          sizes?.record(current.task, textBytes(value));
         return transport.requestModel(value, current, options?.signal);
       };
       let response = await request(bounded);
@@ -56820,10 +56894,19 @@ class HostedSession extends DurableObject {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name)
     };
+    const requestSizes = new RequestSizes;
     const ai = createAI({
-      binding: meteredBinding(options, (signal) => this.modelIdentity(signal), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest, this.contextBudgetProofs, (signal) => this.modelTaskContext.read(signal)?.kind === "compaction")
+      binding: meteredBinding(options, (signal) => this.modelIdentity(signal), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest, this.contextBudgetProofs, (signal) => this.modelTaskContext.read(signal)?.kind === "compaction", requestSizes)
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
+    this.registry.install({
+      name: "hosted-request-bytes",
+      hooks: [
+        hook(GenerationTask, {
+          afterResponse: (message, api) => requestSizes.withByteFloor(String(api.taskId), message)
+        })
+      ]
+    });
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
     this.registry.install({

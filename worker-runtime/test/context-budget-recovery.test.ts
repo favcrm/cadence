@@ -5,7 +5,7 @@ import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-work
 import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { BOARD_MESSAGE_KIND, compactionFailureText, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
-import { CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel, SUMMARY_MAX_OUTPUT_TOKENS } from "../src/model.ts";
+import { BYTE_COMPACTION_THRESHOLD, CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel, HOSTED_COMPACTION_POLICY, SUMMARY_MAX_OUTPUT_TOKENS } from "../src/model.ts";
 import type { ModelTaskContext } from "../src/model-task-context.ts";
 
 // The Workers module is absent in Bun; install its lifecycle stub before
@@ -68,6 +68,18 @@ function toolCall() {
     { headers: { "content-type": "text/event-stream" } },
   );
 }
+/** An assistant turn that writes an artifact: the HTML travels as a tool-call argument. */
+function putCall(html: string) {
+  return new Response(
+    chunk({ role: "assistant", content: "" }) +
+      chunk({ tool_calls: [{ index: 0, id: `put-${html.length}`, type: "function",
+        function: { name: "put_artifact", arguments: JSON.stringify({ html }) } }] }) +
+      chunk({}, "tool_calls") + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+const lastRole = (input: Record<string, unknown>) =>
+  (input.messages as Array<{ role?: string }>).at(-1)?.role;
 function cutOff(text: string) {
   return new Response(
     chunk({ role: "assistant", content: "" }) + chunk({ content: text }) +
@@ -97,7 +109,7 @@ afterEach(async () => {
 
 async function session(
   respond: (requests: readonly RequestRecord[]) => Response | Promise<Response>,
-  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number } = {},
+  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean } = {},
 ) {
   const { HostedSession } = await import("../src/hosted-session.ts");
   const database = new Database(":memory:");
@@ -133,8 +145,16 @@ async function session(
         } }, { status: 400 });
         return response;
       },
-      tools: options.artifact === undefined ? [] : [{
-        name: "artifacts", tools: [{
+      tools: options.artifact === undefined && !options.put ? [] : [{
+        name: "artifacts", tools: [...(options.put ? [{
+          name: "put_artifact", description: "Write the HTML artifact.",
+          parameters: {
+            type: "object", properties: { html: { type: "string" } },
+            required: ["html"], additionalProperties: false,
+          },
+          replay: "safe",
+          async execute() { return { output: [{ type: "text", text: "Saved." }] }; },
+        }] : []), ...(options.artifact === undefined ? [] : [{
           name: "read_artifact", description: "Read the HTML artifact.",
           parameters: { type: "object", properties: {}, additionalProperties: false },
           replay: "safe",
@@ -142,7 +162,7 @@ async function session(
             toolExecutions++;
             return { output: [{ type: "text", text: options.artifact! }] };
           },
-        }],
+        }])],
       }],
       authorizeTool: async () => {},
       toolRefusal: () => undefined,
@@ -187,6 +207,7 @@ async function session(
 }
 
 const LIMIT = 256 * 1024;
+const HTML_CHARS = 261_000;
 const failed = (thread: readonly ThreadEntry[]) =>
   thread.filter((entry) => entry.payload?.status === "failed");
 
@@ -397,4 +418,50 @@ describe("gateway byte-budget recovery", () => {
     expect(failed(thread).at(-1)?.payload?.error).toBe(CONTEXT_BUDGET_EXCEEDED_TEXT);
     expect(JSON.stringify(thread)).not.toContain("private summary failure");
   });
+
+  // CAD-2480: a thread of large HTML tool-call arguments is far over the
+  // gateway's bytes while the engine's token estimate is still under its
+  // threshold (JSON-in-JSON escaping quadruples every quote the estimate
+  // counts once). The hosted policy compacts it before the cap, with no refusal.
+  it("compacts before the byte threshold with the token estimate still under", async () => {
+    const html = '"'.repeat(11_000);
+    const run = await session((requests) => {
+      const input = requests.at(-1)!.input;
+      if (requests.at(-1)!.bytes > LIMIT) return refused();
+      if (isSummary(input)) return answer("Summary of earlier work.");
+      return lastRole(input) === "tool" ? answer("Saved the page.") : putCall(html);
+    }, { put: true, keepRecentTokens: 8_000, reserveTokens: HOSTED_COMPACTION_POLICY.reserveTokens });
+    for (let turn = 0; turn < 7; turn++)
+      await (await run.submit(`Rewrite the page, version ${turn}.`)).wait(BACKGROUND_CONTEXT);
+    const summaries = run.requests.filter((request) => isSummary(request.input));
+    expect(summaries.length).toBeGreaterThanOrEqual(1);
+    expect(run.requests.filter((request) => request.bytes > LIMIT)).toHaveLength(0);
+    const ordinary = run.requests.filter((request) => !isSummary(request.input));
+    expect(Math.max(...ordinary.map((request) => request.bytes))).toBeLessThanOrEqual(BYTE_COMPACTION_THRESHOLD);
+    expect(failed(await run.hosted.transcript(false))).toHaveLength(0);
+    expect((await run.hosted.transcript(false)).at(-1)?.text).toBe("Saved the page.");
+  }, 15_000);
+
+  // CAD-2480: the summary's source keeps every tool-call argument whole, so a
+  // backlog of large HTML could not be summarised in one request.
+  it("summarises a backlog of large HTML arguments in one request under the cap", async () => {
+    const run = await session((requests) => {
+      const input = requests.at(-1)!.input;
+      if (requests.at(-1)!.bytes > LIMIT) return refused();
+      if (isSummary(input)) return answer("Summary of earlier work.");
+      const messages = input.messages as Array<{ role?: string; content?: unknown }>;
+      const asked = JSON.stringify(messages.findLast((message) => message.role === "user")?.content);
+      return lastRole(input) !== "tool" && asked.includes("Write the page.")
+        ? putCall("<p>" + "x".repeat(HTML_CHARS))
+        : answer("Saved the page.");
+    }, { put: true, keepRecentTokens: 8_000, reserveTokens: 0 });
+    await (await run.submit("Write the page.")).wait(BACKGROUND_CONTEXT);
+    await (await run.submit("y".repeat(30_000))).wait(BACKGROUND_CONTEXT);
+    const summaries = run.requests.filter((request) => isSummary(request.input));
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.bytes).toBeLessThan(LIMIT);
+    expect(JSON.stringify(summaries[0]!.input)).toContain("more characters omitted");
+    expect(failed(await run.hosted.transcript(false))).toHaveLength(0);
+    expect((await run.hosted.transcript(false)).at(-1)?.text).toBe("Saved the page.");
+  }, 15_000);
 });
