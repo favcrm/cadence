@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused } from "../../lib/privateSession";
 import type { Route } from "../../lib/router";
@@ -33,12 +33,12 @@ export function useManagedFiles({ path, archived, query, issue }: ManagedListFil
   return { rows, error };
 }
 
-export function ManagedList({ navHref, ...filter }: ManagedListFilter & { navHref: (route: Route) => string }) {
+export function ManagedList({ navHref, empty, ...filter }: ManagedListFilter & { navHref: (route: Route) => string; empty?: ReactNode }) {
   const t = useTranslate();
   const { rows, error } = useManagedFiles(filter);
   if (error) return <p role="alert" className="text-fail">{error}</p>;
   if (!rows) return <p role="status" className="text-label text-ink-500">{t("Loading files…")}</p>;
-  if (!rows.length) return filter.archived ? <p className="text-secondary text-ink-400">{t("No archived files.")}</p> : null;
+  if (!rows.length) return filter.archived ? <p className="text-secondary text-ink-400">{t("No archived files.")}</p> : empty ?? null;
   return <ManagedFileResults rows={rows} linked={filter.issue !== undefined} navHref={navHref} />;
 }
 
