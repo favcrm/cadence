@@ -8,7 +8,7 @@
  * (`<section data-theme="light">`) without flipping the whole page.
  */
 
-:root {
+:root, html[data-cadence-kit] {
   color-scheme: dark;
 
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
@@ -46,7 +46,7 @@
 }
 
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
+  :root:not([data-theme="dark"]), html[data-cadence-kit]:not([data-theme="dark"]) {
     color-scheme: light;
     --color-ink-950: #ffffff;
     --color-ink-900: #ffffff;
@@ -72,7 +72,7 @@
   }
 }
 
-[data-theme="light"] {
+[data-theme="light"], html[data-cadence-kit][data-theme="light"] {
   color-scheme: light;
   --color-ink-950: #ffffff;
   --color-ink-900: #ffffff;
@@ -97,7 +97,7 @@
   --color-scrim: rgb(0 0 0 / .28);
 }
 
-[data-theme="dark"] {
+[data-theme="dark"], html[data-cadence-kit][data-theme="dark"] {
   color-scheme: dark;
   --color-ink-950: #282c34;
   --color-ink-900: #282c34;

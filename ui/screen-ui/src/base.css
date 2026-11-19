@@ -9,3 +9,10 @@ body {
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
+
+/* Inside a Cadence host frame, keep the document canvas transparent onto the
+   host app-shell rather than painting an opaque inset panel over it. */
+html[data-cadence-kit],
+html[data-cadence-kit] body {
+  background: transparent;
+}
