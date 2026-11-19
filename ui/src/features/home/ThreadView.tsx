@@ -402,7 +402,10 @@ export function ThreadItemView({
             }`}
             data-pending={item.pending.state}
           >
-            <OperatorText text={formAnswerText(item.pending.text, item.pending.refs ?? [])} />
+            <OperatorText
+              text={formAnswerText(item.pending.text, item.pending.refs ?? [])}
+              highlightSkillCommand={highlightSkillCommand && item.pending.state === "sent"}
+            />
             <AttachmentRows files={pendingAttachments(item.pending.attachments)} />
           </div>
           <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
