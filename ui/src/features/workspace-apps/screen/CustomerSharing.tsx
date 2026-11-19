@@ -108,7 +108,8 @@ function checkedReview(body: unknown, recordId: string, page: SharingPage, chang
   if (change.kind === "visibility") {
     const choice = body.visibility;
     if (!object(choice) || !exact(choice, ["to", "owner_id"]) || choice.to !== change.to ||
-        typeof choice.owner_id !== "string" || !choice.owner_id || choice.owner_id.length > 200) return null;
+        typeof choice.owner_id !== "string" || !choice.owner_id.trim() ||
+        choice.owner_id.length > 200 || /\p{Cc}/u.test(choice.owner_id)) return null;
     return { token: body.confirmation_token, page: shown, change, ownerId: choice.owner_id };
   }
   if (!object(body.grant) || !exact(body.grant, change.kind === "revoke"
@@ -200,14 +201,18 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
   const [review, setReview] = useState<Review | null>(null);
   const [busy, setBusy] = useState(false);
   const [revokeUnavailable, setRevokeUnavailable] = useState(false);
-  const [visibilityUnavailable, setVisibilityUnavailable] = useState(false);
+  const [visibilityIssue, setVisibilityIssue] = useState<"unsupported" | "retry" | null>(null);
   const [editing, setEditing] = useState(false);
   const [grantError, setGrantError] = useState<"target" | "unsupported" | null>(null);
   const addTrigger = useRef<HTMLButtonElement>(null);
+  const visibilityNotice = useRef<HTMLParagraphElement>(null);
   const pending = useRef<AbortController | null>(null);
   const opener = useRef<HTMLElement | null>(null);
   const reviewActions = useRef<HTMLDivElement>(null);
   useEffect(() => () => pending.current?.abort(), []);
+  useEffect(() => {
+    if (visibilityIssue) visibilityNotice.current?.focus();
+  }, [visibilityIssue]);
   useEffect(() => {
     if (review) reviewActions.current?.querySelector("button")?.focus();
     else if (opener.current) {
@@ -229,6 +234,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
     setRequest({ page });
     setEditing(false);
     setGrantError(null);
+    setVisibilityIssue(null);
   };
   const perform = async (run: (signal: AbortSignal) => Promise<void>) => {
     if (pending.current) return;
@@ -246,6 +252,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
   };
   const prepare = (page: SharingPage, change: Change, button: HTMLElement) => perform(async (signal) => {
     setGrantError(null);
+    if (change.kind === "visibility") setVisibilityIssue(null);
     const result = await sharingRequest(`${change.kind}-prepare`, actionToken, recordId, {
       policy_id: page.policy.id, revision: page.policy.revision,
       ...(change.kind === "revoke" ? { grant_id: change.recipient.id }
@@ -267,7 +274,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
       setState({ kind: "unavailable" });
     } else {
       if (change.kind === "revoke") setRevokeUnavailable(true);
-      else if (change.kind === "visibility") setVisibilityUnavailable(true);
+      else if (change.kind === "visibility") setVisibilityIssue(result?.status === 404 ? "unsupported" : "retry");
       else setGrantError(result?.status === 409 && object(result.body) && result.body.code === "sharing_target_unavailable"
         ? "target" : "unsupported");
     }
@@ -326,6 +333,7 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
         <dl className="wa-customer-sharing-summary">
           <div><dt>{t("Customer")}</dt><dd>{review.page.name || recordId}</dd></div>
           {review.change.kind === "visibility" ? <>
+            {review.page.name && <div><dt>{t("Customer ID")}</dt><dd><bdi>{recordId}</bdi></dd></div>}
             <div><dt>{t("Current visibility")}</dt><dd>{t(visibilityLabel(review.page.policy.visibility))}</dd></div>
             <div><dt>{t("New visibility")}</dt><dd>{t(visibilityLabel(review.change.to))}</dd></div>
             <div><dt>{t("Customer owner")}</dt><dd><bdi>{review.ownerId}</bdi></dd></div>
@@ -349,8 +357,10 @@ function SharingDialog({ actionToken, recordId, onClose }: { actionToken: string
           <div><dt>{t("Visibility")}</dt><dd>{t(visibilityLabel(content.policy.visibility))}</dd></div>
           <div><dt>{t("Revision")}</dt><dd>{content.policy.revision}</dd></div>
         </dl>
-        {visibilityUnavailable ? <p role="status">{t("Visibility changes are unavailable for this customer.")}</p>
-          : <Button disabled={busy || editing} onClick={(event) => void prepare(content, {
+        {visibilityIssue && <p ref={visibilityNotice} role="status" tabIndex={-1}>{t(visibilityIssue === "unsupported"
+          ? "Visibility changes are unavailable for this customer."
+          : "Could not prepare the visibility change. Try again.")}</p>}
+        {visibilityIssue !== "unsupported" && <Button disabled={busy || editing} onClick={(event) => void prepare(content, {
             kind: "visibility", to: content.policy.visibility === "private" ? "workspace" : "private",
           }, event.currentTarget)}>{t(content.policy.visibility === "private" ? "Make workspace-visible" : "Make private")}</Button>}
         {grantError !== null && <p role="status">{t(grantError === "target"

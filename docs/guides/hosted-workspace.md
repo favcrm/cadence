@@ -776,11 +776,13 @@ carry a pending grant forward. The picker does not offer teams, agents or
 integrations.
 
 Choose **Make workspace-visible** or **Make private** to change visibility.
-The review identifies the customer, owner, revision, and both visibility
-settings. Making a customer workspace-visible lets eligible workspace members
-and tools read the customer; it does not grant editing access. Making it
-private removes workspace-wide access but preserves the owner and explicit
-grants. A host that cannot verify the owner will not change the policy.
+The review shows the customer name and ID, owner, revision, and both
+visibility settings. Making a customer workspace-visible lets eligible
+workspace members and tools read the customer; it does not grant editing
+access. Making it private removes workspace-wide access but preserves the
+owner and explicit grants. A host that cannot verify the owner will not change
+the policy. If preparing the review fails temporarily, try the visibility
+action again.
 
 A changed revision requires a new review. If the outcome is unknown, reload
 sharing before trying again. Older hosts can show read-only sharing when
