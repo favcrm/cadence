@@ -898,6 +898,17 @@ function MasterHome({
   // Same-row growth while the reader is in history (no count to show).
   const [activity, setActivity] = useState(false);
   const [glideTick, setGlideTick] = useState(0);
+  // Latest moves in the tab order as well as visually; desktop leaves
+  // it after the transcript. Match the narrow Home layout in styles.css.
+  const [compactHome, setCompactHome] = useState(false);
+  useLayoutEffect(() => {
+    const media = window.matchMedia?.("(width < 640px)");
+    if (!media) return;
+    const update = () => setCompactHome(media.matches);
+    media.addEventListener("change", update);
+    update();
+    return () => media.removeEventListener("change", update);
+  }, []);
   const cmdSeq = useRef(0);
   const follow = useRef<Follow>(initialFollow());
   const prevItems = useRef(0);
@@ -1552,6 +1563,8 @@ function MasterHome({
     [effectiveReadOnly, focusHomeComposer],
   );
 
+  const latestLabel = showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : "";
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
@@ -1564,7 +1577,7 @@ function MasterHome({
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <AttachmentNamesContext.Provider value={homeAttachmentNames}>
     <main
-      className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
+      className={`home-workspace home-master px-4 lg:px-8 sm:pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
           ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
           : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
@@ -1623,6 +1636,23 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {compactHome && latestLabel && (
+                <button
+                  type="button"
+                  className="newpill"
+                  data-jump-to-latest
+                  aria-label={latestLabel}
+                  onClick={(event) => {
+                    if (document.activeElement === event.currentTarget) {
+                      scrollRef.current?.focus({ preventScroll: true });
+                    }
+                    jumpToLatest();
+                  }}
+                >
+                  <span aria-hidden="true">↓</span>{" "}
+                  {t("Latest")}{unseen > 0 ? ` · ${unseen}` : ""}
+                </button>
+              )}
               {!readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "deferred" && (
                 <button
                   type="button"
@@ -1655,8 +1685,9 @@ function MasterHome({
             className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3"
             ref={scrollRef}
             onScroll={onPanelScroll}
+            tabIndex={compactHome ? 0 : undefined}
             data-chat-scroll
-            data-jump-pill={showJumpPill(unseen, activity) ? "" : undefined}
+            data-jump-pill={latestLabel ? "" : undefined}
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
             {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
@@ -1710,14 +1741,13 @@ function MasterHome({
             ))}
           </div>
 
-          {/* The status node stays mounted so a screen reader announces the
-              pill's arrival (a live region added with its text is not). */}
+          {/* Keep the live region mounted so its updated text is announced. */}
           <span role="status" aria-live="polite" className="sr-only">
-            {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
+            {latestLabel}
           </span>
-          {showJumpPill(unseen, activity) && (
+          {!compactHome && latestLabel && (
             <button type="button" className="newpill" onClick={jumpToLatest} data-jump-to-latest>
-              <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
+              <span aria-hidden="true">↓</span> {latestLabel}
             </button>
           )}
 

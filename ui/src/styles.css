@@ -2574,6 +2574,11 @@ button.refchip:hover {
 @media (width < 640px) {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
   .header-breadcrumb { order: 1; flex: 0 0 100%; }
+  .app-header[data-home-header] { min-height: 3rem; padding-block: 0; }
+  .app-header[data-home-header] :is(.header-breadcrumb, .header-local-preferences) { display: none; }
+  .app-header[data-home-header] .header-menu { margin-inline-end: auto; }
+  .app-header[data-home-header] .app-header-utilities { flex-wrap: wrap; max-width: 100%; margin-inline-start: 0; }
+  .app-header[data-home-header] .header-icon { width: 2.75rem; height: 2.75rem; }
 }
 @media (width < 420px) {
   .app-header[data-installed-app] { flex-wrap: wrap; row-gap: .125rem; }
@@ -3074,6 +3079,75 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   .composer-foot .app-chat-attach-label,
   .app-chat-composer-tools .app-chat-attach-label {
     display: inline;
+  }
+}
+
+/* Narrow Home keeps the transcript unmasked and puts Latest in the header.
+   Only the dock's content catches input; the measured height still reserves
+   space for the last message, the safe area and the floating Needs-you. */
+@media (width < 640px) {
+  .home-master .newpill {
+    position: static;
+    transform: none;
+    animation: none;
+    min-height: 2.75rem;
+    padding-inline: .5rem;
+    border-color: transparent;
+    border-radius: .5rem;
+    background: transparent;
+    box-shadow: none;
+  }
+  .home-master .newpill:hover,
+  .home-master .newpill:focus-visible {
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  }
+  .home-master .assistant-heading-name h1 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .home-master .chat-scroll,
+  .home-master .chat-scroll[data-jump-pill] {
+    mask-image: none;
+    scroll-padding-bottom: calc(var(--dock-h, 3.25rem) + var(--need-clear, 0px) + 1.75rem);
+  }
+  .home-master .chat-scroll:focus-visible { outline-offset: -2px; }
+  .home-master .chatdock { pointer-events: none; }
+  .home-master .chatdock > [data-composer],
+  .home-master .chatdock :is(button, a, .turnbar[data-state="failed"] .tb-detail) {
+    pointer-events: auto;
+  }
+  .home-master [data-composer]:has(> .composer-foot) {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: end;
+    column-gap: .25rem;
+    padding: .1875rem;
+    border-radius: 1rem;
+  }
+  .home-master [data-composer]:not([data-blocked]) {
+    background: color-mix(in srgb, var(--color-ink-850) 92%, transparent);
+    backdrop-filter: blur(12px);
+  }
+  .home-master [data-composer] > :not(textarea, .composer-foot) { grid-column: 1 / -1; }
+  .home-master .composer-foot { display: contents; }
+  .home-master .composer-foot > .composer-hint,
+  .home-master .composer-foot > span { display: none; }
+  .home-master .composer-foot > .app-chat-attach,
+  .home-master .composer-foot > .app-chat-send { width: 2.75rem; height: 2.75rem; }
+  .home-master .composer-foot > .app-chat-attach { grid-column: 1; order: 1; }
+  .home-master [data-composer] > textarea {
+    grid-column: 2;
+    order: 2;
+    padding: .625rem .25rem;
+    max-height: 6.25rem;
+    scrollbar-gutter: auto;
+  }
+  .home-master .composer-foot > .app-chat-send { grid-column: 3; order: 3; }
+  .home-master [data-composer-block] {
+    grid-column: 1 / -1;
+    order: 4;
+    padding: .25rem .5rem;
   }
 }
 /* The assistant panel's compact composer follows the same card: 12px
