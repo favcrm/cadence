@@ -137,14 +137,14 @@ def render_css(dark: list[tuple[str, str]], light: list[tuple[str, str]]) -> str
 
     return (
         HEADER
-        + "\n:root {\n  color-scheme: dark;\n\n"
+        + "\n:root, html[data-cadence-kit] {\n  color-scheme: dark;\n\n"
         + decls(dark, "  ")
         + "\n}\n\n@media (prefers-color-scheme: light) {\n"
-        + "  :root:not([data-theme=\"dark\"]) {\n    color-scheme: light;\n"
+        + "  :root:not([data-theme=\"dark\"]), html[data-cadence-kit]:not([data-theme=\"dark\"]) {\n    color-scheme: light;\n"
         + decls(light_vars, "    ")
-        + "\n  }\n}\n\n[data-theme=\"light\"] {\n  color-scheme: light;\n"
+        + "\n  }\n}\n\n[data-theme=\"light\"], html[data-cadence-kit][data-theme=\"light\"] {\n  color-scheme: light;\n"
         + decls(light_vars, "  ")
-        + "\n}\n\n[data-theme=\"dark\"] {\n  color-scheme: dark;\n"
+        + "\n}\n\n[data-theme=\"dark\"], html[data-cadence-kit][data-theme=\"dark\"] {\n  color-scheme: dark;\n"
         + decls(dark_themed, "  ")
         + "\n}\n"
     )
