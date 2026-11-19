@@ -3426,8 +3426,9 @@ button.turnsource:hover {
 
 /* CAD-2452 / CAD-2458: record card roles layouts (header, list rows, thread bubbles). */
 .recordcard-headwrap { display: grid; gap: .25rem; min-width: 0; }
-.recordcard-headline, .recordcard-note { min-width: 0; margin: 0; padding-left: 1.875rem; color: var(--color-ink-400); font-size: var(--text-micro); overflow-wrap: anywhere; }
-.recordcard-headline { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.recordcard-contact, .recordcard-account, .recordcard-note { min-width: 0; margin: 0; padding-left: 1.875rem; color: var(--color-ink-400); font-size: var(--text-micro); }
+.recordcard-contact { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recordcard-account, .recordcard-note { overflow-wrap: anywhere; }
 .recordcard-note { color: var(--color-ink-300); }
 .recordcard-head { display: flex; align-items: center; gap: .5rem; min-width: 0; font-size: var(--text-label); }
 .recordcard-ic { display: grid; flex: none; width: 1.375rem; height: 1.375rem; place-items: center; border-radius: .375rem; background: color-mix(in srgb, var(--color-ink-400) 16%, transparent); color: var(--color-ink-200); font-size: var(--text-micro); font-weight: 600; }

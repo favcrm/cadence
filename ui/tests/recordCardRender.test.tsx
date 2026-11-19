@@ -95,12 +95,20 @@ wa.payload.fields.push({ key: "by", label: "By", type: "string", untrusted: true
 wa.payload.roles.actor = "by";
 wa.payload.items[0].by = `Mr Lee <+85255550123> ${"L".repeat(2000)}`;
 wa.payload.items[1].by = "api";
+const longAccount = "ACCT".repeat(45);
+wa.payload.account = longAccount;
+// an own-side message by another actor, and one whose actor is only similar to "api", are not approved
+wa.payload.items.push({ ...wa.payload.items[1], by: "Assistant", text: "Own, not approved" });
+wa.payload.items.push({ ...wa.payload.items[0], by: "API", text: "Upper case is not the marker" });
 const waState = mergePage(null, { thread: { id: "t" }, entries: [{ seq: 1, role: "agent", kind: "record_ref", message: "m", ...wa }] });
 const waItem: any = threadItems(waState).find((i) => i.type === "record");
 const waHtml = renderToStaticMarkup(createElement(LocaleProvider, null, createElement(RecordCard, { entry: waItem.entry })));
 check(/<button[^>]*class="recordcard-info"[^>]*aria-expanded="false"/.test(waHtml) || /<button[^>]*aria-expanded="false"[^>]*class="recordcard-info"/.test(waHtml), "the note control is a button");
 check(waHtml.includes("sent by assistant · approved"), "the approved bubble says it was sent by the assistant");
-check(waHtml.includes("recordcard-headline") && !waHtml.includes("recordcard-headsub"), "a thread with a contact puts the account on its own line");
+check(waHtml.split("sent by assistant · approved").length === 2, "only the message whose actor is api gets the approved meta");
+check(waHtml.includes("recordcard-account") && !waHtml.includes("recordcard-headsub"), "a thread with a contact puts the account on its own line");
+check(/class="recordcard-contact" title="Mr Lee/.test(waHtml), "the contact is one ellipsised line with the full value in its title");
+check(waHtml.includes(`title="${longAccount}"`) && waHtml.includes(`from ${longAccount}`), "the account line carries the whole account, never clamped away");
 check(!waHtml.includes("recordcard-note"), "the note is closed until tapped");
 
 // CAD-2469: day labels reuse dayKey across a midnight boundary and the viewer's timezone.

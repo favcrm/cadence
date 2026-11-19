@@ -392,7 +392,7 @@ function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLab
       .map((item) => {
         const own = side !== undefined && item[side.key] != null && side.self.includes(String(item[side.key]));
         const rawActor = text(item, roles.actor);
-        const approved = rawActor.toLowerCase() === "api";
+        const approved = rawActor === "api";
         const when = time(item);
         return {
           actor: approved ? "" : splitAddress(rawActor).name,

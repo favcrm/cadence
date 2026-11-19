@@ -132,13 +132,12 @@ function Bubbles({ messages }: { messages: RoleMessage[] }) {
   return (
     <ul className="recordcard-thread recordcard-bubbles">
       {messages.map((m, i) => {
-        const separator = m.day !== null && m.day !== lastDay && m.time?.instant != null;
+        const label =
+          m.day !== null && m.day !== lastDay && m.time?.instant != null ? dayLabel(m.day, m.time.instant, t, formatDate) : null;
         if (m.day !== null) lastDay = m.day;
         return (
-          <li key={i} className="recordcard-msg" data-own={m.own || undefined} data-day-break={separator || undefined}>
-            {separator && m.day !== null && m.time?.instant != null && (
-              <span className="recordcard-day" data-day={m.day}>{dayLabel(m.day, m.time.instant, t, formatDate)}</span>
-            )}
+          <li key={i} className="recordcard-msg" data-own={m.own || undefined} data-day-break={label !== null || undefined}>
+            {label !== null && <span className="recordcard-day" data-day={m.day}>{label}</span>}
             <span className="recordcard-bubble">
               <span className="recordcard-text">{m.text}</span>
               {(m.actor || m.time || m.approved) && (
@@ -164,10 +163,8 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
   const fill = useContext(ComposerFillContext);
   const name = model.toolkitLabel ?? model.toolkit;
   const account = model.account;
-  const sub = [
-    ...(contact !== null ? [contact] : model.toolLabel ? [model.toolLabel] : []),
-    ...(account ? [contact !== null ? t("from {account}").replace("{account}", () => account) : account] : []),
-  ];
+  const sub = [...(model.toolLabel ? [model.toolLabel] : []), ...(account ? [account] : [])];
+  const fromAccount = account ? t("from {account}").replace("{account}", () => account) : null;
   const pill =
     count === null
       ? null
@@ -200,7 +197,7 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
       <div className="recordcard-head">
         <span className="recordcard-ic" aria-hidden>{[...name][0]?.toUpperCase() ?? "·"}</span>
         <span className="recordcard-headname">{name}</span>
-        {!contact && sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
+        {contact === null && sub.length > 0 && <span className="recordcard-headsub">{sub.map((s) => ` · ${s}`).join("")}</span>}
         {model.view === "thread" && fill && (
           <span className="recordcard-hact">
             <button type="button" className="recordcard-act" onClick={() => fill(replyTo)}>
@@ -220,7 +217,8 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
           i
         </button>
       </div>
-      {contact && sub.length > 0 && <p className="recordcard-headline">{sub.join(" · ")}</p>}
+      {contact !== null && <p className="recordcard-contact" title={contact}>{contact}</p>}
+      {contact !== null && fromAccount !== null && <p className="recordcard-account" title={account ?? undefined}>{fromAccount}</p>}
       {noteOpen && <p className="recordcard-note" role="note">{note}</p>}
     </div>
   );
