@@ -81,6 +81,7 @@ import {
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
+import AppHandoffCards from "./AppHandoffCards";
 import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
@@ -554,13 +555,6 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (
-  message: string,
-  text: string,
-  refs?: ThreadRef[],
-  attachments?: PendingAttachment[],
-  conversation?: string,
-) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -934,6 +928,11 @@ function MasterHome({
       && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
       ? homeProjection.conversation_id
       : undefined);
+  const appHandoffConversation =
+    hosted === true && decisions && !effectiveReadOnly && thread.data?.cloudWithheld == null &&
+    homeProjection?.scope === "personal" && homeProjection.conversation_id === homeConversation
+      ? homeConversation
+      : undefined;
   useEffect(() => {
     if (homeConversation === undefined || thread.data === null
       || thread.data.conversation !== undefined
@@ -1210,7 +1209,8 @@ function MasterHome({
       conversation?: string,
     ) => {
       engage();
-      retry(message, text, refs, attachments, conversation);
+      const pending = resources.masterThread.get().data?.pending?.find((entry) => entry.message === message);
+      void sendToMaster(text, message, refs, attachments, conversation, undefined, undefined, pending?.appHandoff === true);
     },
     [engage],
   );
@@ -1685,6 +1685,9 @@ function MasterHome({
               stale={streamReconnecting && activeTurn}
             />
             </ImageConversation.Provider>
+            {appHandoffConversation !== undefined && (
+              <AppHandoffCards key={appHandoffConversation} conversation={appHandoffConversation} revision={lastSeq(thread.data) ?? 0} />
+            )}
             {cmds.map((c) => (
               <CmdCard
                 key={c.id}
@@ -1748,7 +1751,8 @@ function MasterHome({
                         });
                         const conversation =
                           typeof payload.conversation === "string" ? payload.conversation : undefined;
-                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined,
+                          conversation !== undefined && conversation === appHandoffConversation);
                       }
                     : undefined,
                 onView: turnBar.kind === "queued" && aheadHref !== null
@@ -1791,6 +1795,7 @@ function MasterHome({
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
+              appHandoffConversation={appHandoffConversation}
               attachReason={readOnly
                 ? "The board is read-only."
                 : missing

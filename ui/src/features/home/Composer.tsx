@@ -26,6 +26,7 @@ export default function Composer({
   onSent,
   attachEnabled = true,
   attachDestination,
+  appHandoffConversation,
   attachReason = "A writable Home conversation is required to attach files.",
   stop = null,
   textareaId,
@@ -39,6 +40,7 @@ export default function Composer({
   onSent: () => void;
   attachEnabled?: boolean;
   attachDestination?: AttachDestination;
+  appHandoffConversation?: string;
   attachReason?: string;
   /** CAD-1880: this pane's running turn — Stop takes the send slot. */
   stop?: { onStop: () => void } | null;
@@ -56,7 +58,8 @@ export default function Composer({
       commands={commands}
       onSubmitted={onSent}
       onSend={({ body, refs, attachments, mediaRefs }) => {
-        void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation, undefined, mediaRefs);
+        const conversation = appHandoffConversation ?? attachDestination?.conversation;
+        void sendToMaster(body, newMessageId(), refs, attachments, conversation, undefined, mediaRefs, appHandoffConversation !== undefined);
       }}
       refocusAfterSend
       stop={stop}

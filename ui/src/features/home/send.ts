@@ -20,6 +20,7 @@ export function sendToMaster(
   conversation?: string,
   operation?: PrivateOperation,
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
+  appHandoff = false,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
@@ -27,8 +28,8 @@ export function sendToMaster(
   return usingPrivateOperation(operation, async (op) => {
     try {
       op.assertCurrent();
-      store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation));
-      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op, mediaRefs);
+      store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation, appHandoff));
+      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op, mediaRefs, undefined, appHandoff);
       op.assertCurrent();
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.

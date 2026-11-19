@@ -333,6 +333,13 @@ receipt. This RPC does not accept or deliver a handoff.
 Opting out at startup stops capture and hides existing receipts without
 deleting them. Re-enabling never backfills results completed while disabled.
 
+On a compatible hosted board, a private Home conversation can show a
+read-only app handoff. Check the specialist and the exact question first.
+**Approve** records consent but does not run anything; **Run handoff** sends
+only the reviewed question to the app specialist. **Check reply** reads that
+same run from Home. If the status is unconfirmed, check again without starting
+another run. Direct app tools do not require this handoff.
+
 Inside a turn, the operation's scope reaches both the model and its tools. A
 run can hold more than one input — the engine appends each steering input to
 the live run — so the runtime attributes a run only when every one of its

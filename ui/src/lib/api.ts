@@ -2,6 +2,7 @@ import type { LanePayload } from "../features/issues/lane";
 import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
 import { ApiError, errorMessage } from "./apiError";
+import { APP_HANDOFF_HEADERS } from "./appHandoffs";
 import { sessionKey, sessionHeaders } from "./sessionKey";
 import {
   bindPrivateAbort,
@@ -501,7 +502,12 @@ function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unkn
 }
 
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
-async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+async function post<T>(
+  path: string,
+  body: object,
+  operation?: PrivateOperation,
+  headers?: Readonly<Record<string, string>>,
+): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
     const resp = await privateFetch(path, {
       method: "POST",
@@ -509,6 +515,7 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
         "Content-Type": "application/json",
         "X-Cadence-Board": "1",
         ...sessionHeaders(),
+        ...headers,
       },
       body: JSON.stringify(body),
     }, op);
@@ -929,6 +936,7 @@ export const api = {
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     expectedRecipientUid?: string,
+    appHandoff = false,
   ): Promise<Record<string, unknown>> => {
     const payload: Record<string, unknown> = {
       text,
@@ -949,7 +957,10 @@ export const api = {
       (refs !== undefined && refs.length > 0) ||
       (mediaRefs !== undefined && mediaRefs.length > 0) ||
       Boolean(expectedRecipientUid);
-    if (alias === "master" && !hasNativeOnlyContext) {
+    // The per-turn compatibility header is HTTP-only. Do not change the
+    // socket admission of ordinary, app-scoped or native messages.
+    const handoff = appHandoff && alias === "master" && Boolean(conversation) && !app;
+    if (alias === "master" && !hasNativeOnlyContext && !handoff) {
       const viaSocket = await sendMasterMessageViaSocket(alias, payload, operation);
       if (viaSocket !== null) {
         return unwrapPostJson<Record<string, unknown>>(viaSocket.status, `${viaSocket.status}`, viaSocket.body);
@@ -959,6 +970,7 @@ export const api = {
       `/api/threads/${encodeURIComponent(alias)}/messages`,
       payload,
       operation,
+      handoff ? APP_HANDOFF_HEADERS : undefined,
     );
   },
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
