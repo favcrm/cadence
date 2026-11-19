@@ -21,6 +21,8 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             file,
             message,
             reply_to,
+            kind,
+            artifact,
             task,
             ready,
             force,
@@ -46,8 +48,8 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
                     },
                 ),
                 None => send::run(
-                    state_dir, recipient, text, file, message, reply_to, task, ready, force,
-                    nudge, steer,
+                    state_dir, recipient, text, file, message, reply_to, kind, artifact, task,
+                    ready, force, nudge, steer,
                 ),
             }
         }

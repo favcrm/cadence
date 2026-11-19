@@ -38,6 +38,12 @@ pub(crate) enum MessageAction {
         /// Route the result to another agent when the turn finishes.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Lightweight Agent Inbox message kind (checkin, handoff, decision, reply).
+        #[arg(long, conflicts_with = "nudge")]
+        kind: Option<String>,
+        /// Optional artifact reference attached to a handoff or decision.
+        #[arg(long, conflicts_with = "nudge")]
+        artifact: Option<String>,
         /// Attach this delivery to a task — ad-hoc follow-up inside a
         /// job's delivery record.
         #[arg(long)]
@@ -308,13 +314,16 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             file,
             message,
             reply_to,
+            kind,
+            artifact,
             task,
             ready,
             force,
             nudge,
             steer,
         } => send_message(
-            &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge, steer,
+            &state_dir, &alias, text, file, message, reply_to, kind, artifact, ready, force, task,
+            nudge, steer,
         )?,
         MessageAction::List {
             alias,

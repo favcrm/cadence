@@ -1,12 +1,14 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
+import { api } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
-import type { Agent, Overview } from "../../lib/types";
+import type { Agent, AgentInboxFeed, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
+import InboxPanel from "./InboxPanel";
 import type { AgentUpdate } from "./agentUpdateModel";
 import { useTranslate } from "../../lib/locale";
 import { READ_ONLY_COPY } from "./AnswerForm";
@@ -63,7 +65,29 @@ export default function NeedsRail({
    *  list them in To do. Off for a board with no such route or a non-owner. */
   decisions?: boolean;
 }) {
-  const [tab, setTab] = useState<"todo" | "updates">("todo");
+  const [tab, setTab] = useState<"todo" | "inbox" | "updates">("todo");
+  const [inboxFeed, setInboxFeed] = useState<AgentInboxFeed | null>(null);
+  const [inboxLoading, setInboxLoading] = useState(false);
+  const [inboxError, setInboxError] = useState<string | null>(null);
+  const refreshInbox = useCallback(async () => {
+    setInboxLoading(true);
+    try {
+      const next = await api.inbox({ limit: 50 });
+      setInboxFeed(next);
+      setInboxError(null);
+    } catch (e) {
+      // Older daemons without /api/inbox keep the rail working without noise.
+      const msg = e instanceof Error ? e.message : "";
+      if (!msg.includes("404") && !msg.includes("501") && !msg.includes("Unknown method")) {
+        setInboxError(msg || "Could not load Agent Inbox.");
+      }
+    } finally {
+      setInboxLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshInbox();
+  }, [refreshInbox, overview.data]);
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
   const split = todoSplit(overview.data?.needs_me);
@@ -151,9 +175,10 @@ export default function NeedsRail({
     onOpenIssue(id);
   };
   const [showDecided, setShowDecided] = useState(false);
-  const showTab = (next: "todo" | "updates") => {
+  const showTab = (next: "todo" | "inbox" | "updates") => {
     setTab(next);
     if (next === "updates") homeDecisions.clearNotice();
+    if (next === "inbox") void refreshInbox();
   };
   // Updates on screen is Updates viewed: a failed write stops asking for attention.
   useEffect(() => {
@@ -487,10 +512,16 @@ export default function NeedsRail({
     </>
   );
 
+  const inboxUnread = inboxFeed?.unread ?? 0;
+
   const tabs = (drawerMode: boolean) => (
     <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
       <button aria-pressed={tab === "todo"} onClick={() => showTab("todo")}>
         {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{overview.data ? count : "…"}</span>
+      </button>
+      <button aria-pressed={tab === "inbox"} onClick={() => showTab("inbox")}>
+        {t("Inbox")}
+        {inboxUnread > 0 && <span className="todo-count on">{inboxUnread}</span>}
       </button>
       <button aria-pressed={tab === "updates"} onClick={() => showTab("updates")}>
         {t("Updates")}
@@ -520,7 +551,24 @@ export default function NeedsRail({
     </div>
   );
 
-  const panelBody = <div>{tab === "todo" ? todoBody : updatesBody}</div>;
+  const panelBody = (
+    <div>
+      {tab === "todo" ? (
+        todoBody
+      ) : tab === "inbox" ? (
+        <InboxPanel
+          feed={inboxFeed}
+          loading={inboxLoading}
+          error={inboxError}
+          readOnly={readOnly}
+          onRefresh={refreshInbox}
+          onOpenIssue={openIssue}
+        />
+      ) : (
+        updatesBody
+      )}
+    </div>
+  );
 
   return (
     <>

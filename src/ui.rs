@@ -70,6 +70,7 @@ pub mod delivery_sync;
 mod endpoints;
 mod home;
 mod human_threads;
+mod inbox;
 mod lane;
 mod lifecycle;
 mod locale;

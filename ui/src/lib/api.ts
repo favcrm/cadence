@@ -15,6 +15,8 @@ import {
 import type {
   AgentAccess,
   AgentDetail,
+  AgentInboxFeed,
+  AgentInboxPromoteResult,
   AgentRegisterBody,
   AgentProfileBody,
   HiredProfile,
@@ -1751,6 +1753,28 @@ export const api = {
   /** `GET /api/master/models` — the dropdowns' list (CAD-575's route,
    *  operator-gated; the chip shows the refusal until it lands). */
   masterModels: () => get<MasterModels>("/api/master/models"),
+
+  /** CAD-2476: Agent Inbox & assistant-to-assistant relay. */
+  inbox: (opts?: { alias?: string; unreadOnly?: boolean; after?: number; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (opts?.alias) qs.set("alias", opts.alias);
+    if (opts?.unreadOnly) qs.set("unread_only", "true");
+    if (opts?.after !== undefined) qs.set("after", String(opts.after));
+    if (opts?.limit !== undefined) qs.set("limit", String(opts.limit));
+    const q = qs.toString();
+    return get<AgentInboxFeed>(q ? `/api/inbox?${q}` : "/api/inbox");
+  },
+  inboxSend: (body: {
+    to: string;
+    text: string;
+    kind?: "checkin" | "handoff" | "decision" | "reply";
+    reply_to?: string;
+    artifact?: string;
+  }) => post<Record<string, unknown>>("/api/inbox/send", body),
+  inboxAck: (body: { alias?: string; through: number; reader?: string }) =>
+    post<Record<string, unknown>>("/api/inbox/ack", body),
+  inboxPromote: (body: { alias?: string; message: string; project?: string; title?: string }) =>
+    post<AgentInboxPromoteResult>("/api/inbox/promote", body),
 
   /** CAD-1548 — harnesses, profiles, providers and models. */
   agentSettings: () => get<AgentSettingsSnapshot>("/api/settings/agents"),

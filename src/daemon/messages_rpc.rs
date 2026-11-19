@@ -740,6 +740,17 @@ impl Shared {
         let reply_to = optional_str(params, "reply_to")
             .map(str::to_string)
             .or_else(|| (!nudge).then(|| self.upstream_of(&alias)).flatten());
+        let inbox_kind = optional_text(params, "kind")?
+            .map(crate::inbox::InboxKind::parse)
+            .transpose()?;
+        let inbox_artifact = optional_text(params, "artifact")?
+            .map(crate::inbox::validate_artifact)
+            .transpose()?;
+        if nudge && (inbox_kind.is_some() || inbox_artifact.is_some()) {
+            return Err(Error::rejected(
+                "--nudge is steering, not an inbox message — it takes no kind or artifact",
+            ));
+        }
         let message = optional_str(params, "message")
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -1000,9 +1011,31 @@ impl Shared {
                 }
             }
         }
+        if !duplicate && (inbox_kind.is_some() || inbox_artifact.is_some()) {
+            let effective_kind = inbox_kind.unwrap_or(if reply_to.is_some() {
+                crate::inbox::InboxKind::Reply
+            } else if inbox_artifact.is_some() {
+                crate::inbox::InboxKind::Handoff
+            } else {
+                crate::inbox::InboxKind::Message
+            });
+            self.store.record_inbox_envelope(
+                &alias,
+                &message,
+                effective_kind,
+                inbox_artifact.as_deref(),
+                false,
+            )?;
+        }
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": message, "state": state, "duplicate": duplicate});
+        if let Some(kind) = inbox_kind {
+            receipt["kind"] = json!(kind.as_str());
+        }
+        if let Some(artifact) = inbox_artifact {
+            receipt["artifact"] = json!(artifact);
+        }
         // CAD-251: an undrained mailbox warns the sender — never refuses.
         if let Some(warning) = self.inbox_warning(&alias) {
             receipt["warning"] = json!(warning);

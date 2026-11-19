@@ -10,6 +10,66 @@
 
 use serde_json::{json, Value};
 
+use crate::error::{Error, Result};
+
+/// CAD-2476: lightweight generic message kinds for the Agent Inbox.
+/// Not every daily business interaction is a board ticket — routine status
+/// check-ins and handoffs stay lightweight until explicitly promoted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InboxKind {
+    Checkin,
+    Handoff,
+    Decision,
+    Reply,
+    Message,
+}
+
+impl InboxKind {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "checkin" => Ok(Self::Checkin),
+            "handoff" => Ok(Self::Handoff),
+            "decision" => Ok(Self::Decision),
+            "reply" => Ok(Self::Reply),
+            "message" => Ok(Self::Message),
+            other => Err(Error::rejected(format!(
+                "invalid inbox message kind '{other}': expected checkin, handoff, decision, reply, or message"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkin => "checkin",
+            Self::Handoff => "handoff",
+            Self::Decision => "decision",
+            Self::Reply => "reply",
+            Self::Message => "message",
+        }
+    }
+}
+
+/// Bounded optional artifact reference attached to an inbox handoff/decision.
+pub const MAX_ARTIFACT_LEN: usize = 256;
+
+pub fn validate_artifact(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::rejected("artifact reference cannot be empty"));
+    }
+    if trimmed.chars().count() > MAX_ARTIFACT_LEN {
+        return Err(Error::rejected(format!(
+            "artifact reference exceeds {MAX_ARTIFACT_LEN} characters"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(Error::rejected(
+            "artifact reference cannot contain control characters",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Warn above this many unread messages (`inbox_warn_unread`).
 pub const WARN_UNREAD: u64 = 50;
 /// …when no `inbox_read` landed within this window (`inbox_warn_idle_secs`).

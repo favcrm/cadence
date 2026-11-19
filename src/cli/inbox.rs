@@ -28,6 +28,37 @@ pub(crate) enum InboxAction {
         #[arg(long)]
         reset: bool,
     },
+    /// CAD-2476: read the Agent Inbox feed (structured envelopes, read cursor,
+    /// and reachable colleagues/specialists directory) for any registered
+    /// assistant or specialist agent without draining passive mailboxes.
+    Feed {
+        /// Agent or assistant alias.
+        alias: String,
+        /// Return only messages strictly after this seq.
+        #[arg(long)]
+        after: Option<i64>,
+        /// Maximum messages to return (1..=100, default 50).
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Return only messages above the reader's read watermark.
+        #[arg(long)]
+        unread: bool,
+        /// Reader cursor name (default "default").
+        #[arg(long)]
+        reader: Option<String>,
+    },
+    /// CAD-2476: advance the read/acknowledged watermark through `--through <seq>`
+    /// for any registered assistant or specialist agent.
+    Mark {
+        /// Agent or assistant alias.
+        alias: String,
+        /// Advance the reader's watermark through this seq.
+        #[arg(long)]
+        through: i64,
+        /// Reader cursor name (default "default").
+        #[arg(long)]
+        reader: Option<String>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45,39 +76,76 @@ pub(super) fn run(
     exec_timeout_ms: u64,
     exec_max_failures: u32,
 ) -> Result<i32> {
-    if let Some(InboxAction::Ack {
-        alias,
-        seqs,
-        through,
-        reader,
-        reset,
-    }) = action
-    {
-        if reset && (through.is_some() || !seqs.is_empty()) {
-            return Err(Error::rejected(
-                "`cadence inbox ack --reset` takes no seqs — it drops \
-                 the reader's cursor instead of acking",
-            ));
+    if let Some(action) = action {
+        match action {
+            InboxAction::Ack {
+                alias,
+                seqs,
+                through,
+                reader,
+                reset,
+            } => {
+                if reset && (through.is_some() || !seqs.is_empty()) {
+                    return Err(Error::rejected(
+                        "`cadence inbox ack --reset` takes no seqs — it drops \
+                         the reader's cursor instead of acking",
+                    ));
+                }
+                if !reset && seqs.is_empty() && through.is_none() {
+                    return Err(Error::rejected(
+                        "`cadence inbox ack` needs at least one seq — \
+                         `inbox ack <alias> <seq>...` or `--through <seq>`",
+                    ));
+                }
+                let mut req = json!({"alias": alias, "seqs": seqs});
+                if reset {
+                    req["reset"] = json!(true);
+                }
+                if let Some(t) = through {
+                    req["through"] = json!(t);
+                }
+                if let Some(r) = reader {
+                    req["reader"] = json!(r);
+                }
+                let r = client::rpc_relay(&state_dir, "agent_inbox_ack", req)?;
+                print_json(&r);
+                return Ok(0);
+            }
+            InboxAction::Feed {
+                alias,
+                after,
+                limit,
+                unread,
+                reader,
+            } => {
+                let mut req = json!({"alias": alias, "unread_only": unread});
+                if let Some(a) = after {
+                    req["after"] = json!(a);
+                }
+                if let Some(l) = limit {
+                    req["limit"] = json!(l);
+                }
+                if let Some(r) = reader {
+                    req["reader"] = json!(r);
+                }
+                let r = client::rpc_relay(&state_dir, "agent_inbox_feed", req)?;
+                print_json(&r);
+                return Ok(0);
+            }
+            InboxAction::Mark {
+                alias,
+                through,
+                reader,
+            } => {
+                let mut req = json!({"alias": alias, "through": through});
+                if let Some(r) = reader {
+                    req["reader"] = json!(r);
+                }
+                let r = client::rpc_relay(&state_dir, "agent_inbox_mark", req)?;
+                print_json(&r);
+                return Ok(0);
+            }
         }
-        if !reset && seqs.is_empty() && through.is_none() {
-            return Err(Error::rejected(
-                "`cadence inbox ack` needs at least one seq — \
-                 `inbox ack <alias> <seq>...` or `--through <seq>`",
-            ));
-        }
-        let mut req = json!({"alias": alias, "seqs": seqs});
-        if reset {
-            req["reset"] = json!(true);
-        }
-        if let Some(t) = through {
-            req["through"] = json!(t);
-        }
-        if let Some(r) = reader {
-            req["reader"] = json!(r);
-        }
-        let r = client::rpc_relay(&state_dir, "agent_inbox_ack", req)?;
-        print_json(&r);
-        return Ok(0);
     }
     let Some(alias) = alias else {
         return Err(Error::rejected(

@@ -1490,6 +1490,69 @@ impl Shared {
         Ok(result)
     }
 
+    /// CAD-2476: caller-scoped durable Agent Inbox feed for ANY registered
+    /// agent or assistant (active or passive), plus workspace directory.
+    /// Agents may read ONLY their own inbox (`inbox_caller`).
+    pub(super) fn rpc_inbox_feed(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (alias, _caller) = self.inbox_caller(params, peer_pid, "agent_inbox_feed")?;
+        let reader = inbox_reader(params)?;
+        let after = optional_i64(params, "after");
+        let limit = optional_u64(params, "limit").unwrap_or(50).clamp(1, 100) as usize;
+        let unread_only = params.get("unread_only").and_then(Value::as_bool) == Some(true);
+        self.store
+            .agent_inbox_feed(&alias, after, limit, unread_only, reader)
+    }
+
+    /// CAD-2476: mark Agent Inbox messages read/acknowledged through `through`
+    /// for ANY registered agent or assistant. Agents may ack ONLY their own inbox.
+    pub(super) fn rpc_inbox_mark(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_mark")?;
+        let by = match &who {
+            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
+            crate::peer::AgentCaller::Operator => "operator".to_string(),
+        };
+        let reader = inbox_reader(params)?;
+        let through = optional_i64(params, "through")
+            .ok_or_else(|| Error::rejected("agent_inbox_mark needs a `through` seq watermark"))?;
+        let result = self.store.agent_inbox_mark(&alias, through, reader, &by)?;
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-2476: record an optional promotion of an inbox message to a tracked
+    /// board issue (operator or owning agent only).
+    pub(super) fn rpc_inbox_promote(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_promote")?;
+        let by = match &who {
+            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
+            crate::peer::AgentCaller::Operator => "operator".to_string(),
+        };
+        let message_id = required_str(params, "message")?;
+        let issue_id = required_str(params, "issue")?;
+        let existing = self
+            .store
+            .message(message_id)?
+            .ok_or_else(|| Error::rejected(format!("no such inbox message '{message_id}'")))?;
+        if existing.alias != alias {
+            return Err(Error::rejected(format!(
+                "message '{message_id}' does not belong to '{alias}'"
+            )));
+        }
+        self.store
+            .record_inbox_promotion(&alias, message_id, issue_id, &by)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "message": message_id,
+            "issue": issue_id,
+            "by": by,
+        }))
+    }
+
     /// The resume path shared by `agent_resume` and `agent_unfence`:
     /// inbox guard, ownership/fence checks, then start the actor.
     /// Returns whether the actor started — a failed start records

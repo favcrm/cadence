@@ -2007,3 +2007,59 @@ export interface RoutinesPayload {
 export interface RoutinePayload {
   routine: Routine;
 }
+
+/** CAD-2476: Agent Inbox & assistant-to-assistant relay. */
+export type AgentInboxKind = "checkin" | "handoff" | "decision" | "reply" | "message" | string;
+
+export interface AgentInboxMessage {
+  seq: number;
+  id: string;
+  alias: string;
+  kind: AgentInboxKind;
+  sender: string;
+  sender_uid: string | null;
+  sender_kind: "colleague" | "specialist" | "operator" | string;
+  recipient: string;
+  reply_to: string | null;
+  origin: string | null;
+  body: string;
+  artifact: string | null;
+  state: string;
+  unread: boolean;
+  auto_answered: boolean;
+  issue: string | null;
+  task_id: string | null;
+  created: number;
+}
+
+export interface AgentInboxDirectoryEntry {
+  alias: string;
+  role: string;
+  provider: string;
+  endpoint_kind: string;
+  state: string;
+  kind: "colleague" | "specialist" | string;
+}
+
+export interface AgentInboxFeed {
+  alias: string;
+  cursor: number;
+  tail_seq: number;
+  unread: number;
+  reader: string;
+  messages: AgentInboxMessage[];
+  directory: {
+    colleagues: AgentInboxDirectoryEntry[];
+    specialists: AgentInboxDirectoryEntry[];
+  };
+}
+
+export interface AgentInboxPromoteResult {
+  ok: boolean;
+  alias: string;
+  message: string;
+  issue: string;
+  project?: string;
+  title?: string;
+  already_promoted?: boolean;
+}
