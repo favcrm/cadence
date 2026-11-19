@@ -3440,3 +3440,57 @@ button.turnsource:hover {
 .recordcard-bubbles > li[data-own] .recordcard-meta { text-align: right; }
 .recordcard-bubbles { grid-template-columns: minmax(0, 1fr); }
 .recordcard-meta, .recordcard-time { min-width: 0; overflow-wrap: anywhere; }
+
+/* CAD-2463: a connected effect's sending account, its message body (clamped
+   until "Show full message") and the outside-domain flag. Tokens only. */
+.turncard-from {
+  margin: -.35rem 0 0;
+  color: var(--color-ink-400);
+  font: 400 var(--text-label) var(--font-chat);
+  overflow-wrap: anywhere;
+}
+.turncard-message {
+  display: grid;
+  justify-items: start;
+  gap: .3rem;
+}
+.turncard-message-text {
+  margin: 0;
+  color: var(--color-ink-100);
+  font: 400 var(--text-label)/1.55 var(--font-chat);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.turncard-message-text[data-clamped] {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  line-clamp: 6;
+  overflow: hidden;
+}
+.turncard-message-box {
+  max-width: 100%;
+}
+.turncard-message[data-message-kind="email"] .turncard-message-box {
+  padding: .5rem .625rem;
+  border-left: 2px solid var(--color-ink-700);
+}
+/* A message reads as the bubble the recipient will see. */
+.turncard-message[data-message-kind="message"] .turncard-message-box {
+  max-width: 85%;
+  padding: .45rem .625rem;
+  border-radius: .5rem .5rem .5rem .125rem;
+  background: var(--color-ink-800);
+}
+.turncard-flag {
+  margin: 0;
+  padding: .35rem .5rem;
+  border: 1px solid color-mix(in srgb, var(--color-warn) 25%, transparent);
+  border-radius: .375rem;
+  background: color-mix(in srgb, var(--color-warn) 10%, transparent);
+  color: color-mix(in srgb, var(--color-warn) 75%, var(--color-ink-100));
+  font: 500 var(--text-label) var(--font-chat);
+}
+.turncard-flag::before {
+  content: "⚠ ";
+}

@@ -14,6 +14,8 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { AttachmentNamesContext } from "../../home/TurnRichCards";
+import { attachmentNames } from "../../home/turnCards";
 import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
@@ -691,6 +693,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const homeMasterState = useQuery(resources.masterState);
   const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
   const entries = thread.data?.entries ?? [];
+  // CAD-2463: a Sources chip names an attachment by the file the user sent.
+  const paneAttachmentNames = useMemo(() => attachmentNames(entries), [entries]);
   const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
   const permissionPending = pendingPermission !== null;
   const onPendingDecision = useCallback(
@@ -2199,6 +2203,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         </div>
       )}
       <StagedSourceContext.Provider value={decisionStore}>
+      <AttachmentNamesContext.Provider value={paneAttachmentNames}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2346,6 +2351,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (

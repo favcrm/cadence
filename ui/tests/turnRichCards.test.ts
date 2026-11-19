@@ -1,3 +1,4 @@
+declare function require(name: string): any;
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
@@ -145,5 +146,43 @@ check(
   renderToStaticMarkup(createElement(TurnStagedCards, { toolEntries: [result(ID)], density: "full" })) === "",
   "without a decisions source, no card",
 );
+
+// CAD-2463: the connected-effect staged card (AOS-647 email preview fixture).
+{
+  const input = JSON.parse(require("fs").readFileSync(require("path").join(require("process").cwd(), "tests", "fixtures", "chat-cards", "connected-effect-email.json"), "utf8")) as Record<string, unknown>;
+  const preview = input.preview as { fields: { role: string; label: string; value: string; untrusted: boolean }[] };
+  const longBody = "Line one.\n".repeat(30) + "<b>not markup</b>";
+  const fields = preview.fields.map((f) => (f.role === "to" ? { ...f, value: "mei@harbourfans.example" } : f.role === "body" ? { ...f, value: longBody } : f));
+  const emailRow = parseStagedRow({ id: ID, tool: "connected_effect", status: "pending", createdAt: 1, input: { ...input, preview: { ...preview, fields } } })!;
+  const html = renderToStaticMarkup(
+    createElement(StagedSourceContext.Provider, { value: sourceWith([emailRow]) }, createElement(TurnStagedCards, { toolEntries: [result(`{"staged":true,"actionId":"${ID}"}`)], density: "full" })),
+  );
+  check(html.includes("Synthetic Mail · ") && html.includes('class="turncard-from">from <bdi>ops@example.test</bdi>'), `the header names the toolkit and the sending account: ${html}`);
+  check(html.includes('data-message-kind="email"') && html.includes("data-clamped"), "the email body is clamped");
+  check(html.includes("Show full message") && html.includes('aria-expanded="false"'), "the body offers Show full message");
+  check(html.includes("&lt;b&gt;not markup&lt;/b&gt;") && !html.includes("<b>not markup</b>"), "the body is plain text");
+  check(html.includes("Line one.") && (html.match(/Line one\./g) ?? []).length === 30, "the card carries the whole body, not the 280-character cut");
+  check(html.includes('data-outside-domain="1"') && html.includes("1 recipient is outside your company domain"), "one outside recipient is flagged");
+  check(!/<dt><bdi>Body<\/bdi><\/dt>/.test(html), "the body is not repeated as a field");
+  check(!/>\s*(Approve|Deny)\s*</.test(html), "still no approve or deny in chat");
+
+  const sent = parseStagedRow({ id: ID, tool: "connected_effect", status: "approved", createdAt: 1, decidedAt: 2, result: { ok: true }, input })!;
+  const sentHtml = renderToStaticMarkup(
+    createElement(StagedSourceContext.Provider, { value: sourceWith([sent]) }, createElement(TurnStagedCards, { toolEntries: [result(`{"staged":true,"actionId":"${ID}"}`)], density: "full" })),
+  );
+  check(sentHtml.includes(">Sent<") && !sentHtml.includes("data-outside-domain"), `an applied send reads Sent: ${sentHtml}`);
+  check(!sentHtml.includes("data-staged-body-toggle") && !sentHtml.includes("data-clamped"), "a short body has no toggle and no clamp");
+  check(html.includes('class="turncard-message-box"'), "the padding sits on the box, not the clamped text");
+}
+
+// CAD-2463 QA: an attachment chip's tooltip is the full id, named or not.
+{
+  const id = "chf-121800f2fb54c8d375f53e115e0a4909";
+  const sources = turnSources([call(`chat_attachment_read {"id":"${id}"}`)], new Map([[id, "Quote Q-0140.pdf"]]));
+  const named = sourcesHtml({ sources, artifacts: [] });
+  check(named.includes("<bdi>Quote Q-0140.pdf</bdi>") && named.includes(`title="${id}"`), `the named chip keeps the full id in its tooltip: ${named}`);
+  const bare = sourcesHtml({ sources: turnSources([call(`chat_attachment_read {"id":"${id}"}`)]), artifacts: [] });
+  check(bare.includes("<bdi>chf-121800f2…</bdi>") && bare.includes(`title="${id}"`), "the short-id chip keeps the full id in its tooltip");
+}
 
 console.log("turnRichCards: ok");
