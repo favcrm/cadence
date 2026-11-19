@@ -4,7 +4,7 @@
  * outlet, read-only, under the viewer's own session. A viewer who cannot read
  * the app sees "No access", never another member's data.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
@@ -12,8 +12,9 @@ import { IconClose } from "../../ui/icons";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenPaneState } from "../workspace-apps/screen/screenFailure";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
+import { installedAppHref } from "../apps/appViewModel";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { patchAppViewRoute, type CanvasTab } from "./canvasStore";
+import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
 
 type Load =
@@ -42,6 +43,26 @@ function useAppScope(installId: string, attempt: number): Load {
   return load;
 }
 
+const SECTION_QUERY = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/** A view card's full-page link, from the installation itself: its canonical
+ *  `/apps/<key>` path and declared section query, pinned to the install. Null
+ *  when the install declares no usable route. */
+function installationHref(installation: Installation, app: AppViewRef): string | null {
+  const path = installedAppHref(installation.name);
+  const sectionQuery = installation.navigation?.section_query;
+  if (path === null || sectionQuery === undefined || !SECTION_QUERY.test(sectionQuery)) return null;
+  const query = new URLSearchParams({ install: app.installId, ctx: app.contextId, [sectionQuery]: app.route.section });
+  if (app.route.record_id !== null) query.set("record", app.route.record_id);
+  return `${path}?${query.toString()}`;
+}
+
+/** Tells the tab its frame was refused for lack of access, so the header drops "Open in <App>". */
+function FrameDenied({ onDenied, children }: { onDenied: () => void; children: ReactNode }) {
+  useEffect(onDenied, [onDenied]);
+  return <>{children}</>;
+}
+
 export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onExpand, onClose }: {
   tab: CanvasTab;
   app: AppViewRef;
@@ -54,13 +75,17 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
   const t = useTranslate();
   const [attempt, setAttempt] = useState(0);
   const load = useAppScope(app.installId, attempt);
-  const appName = load.status === "ready" ? load.installation.title || load.installation.name : t("App");
+  // No access (the scope refused, or the frame's own mount did): the tab offers no way into the app.
+  const [frameDenied, setFrameDenied] = useState(false);
+  const noAccess = load.status === "denied" || frameDenied;
+  const appName = load.status === "ready" ? load.installation.title || load.installation.name : app.appLabel || t("App");
   // The frame's own navigation stays on this tab; it never reaches the board URL.
   const onRoute = useCallback((patch: RoutePatch) => patchAppViewRoute(tab.id, patch), [tab.id]);
+  const href = app.fromCard === true ? (load.status === "ready" ? installationHref(load.installation, app) : null) : app.href;
   const place = app.route.record_id ? `${app.route.section} / ${app.route.record_id}` : app.route.section;
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>
-    state.kind === "refused" && isNoAccess(state.status) ? denied : (
+    state.kind === "refused" && isNoAccess(state.status) ? <FrameDenied onDenied={() => setFrameDenied(true)}>{denied}</FrameDenied> : (
       <div className="cv-appview-note" role="alert">
         <p>{t("This screen could not be opened.")}</p>
         <button type="button" className="btn btn-ghost" onClick={retry}>{t("Retry")}</button>
@@ -80,9 +105,12 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
           <b title={tab.title}>{tab.title}</b>
           <span className="cv-appview-sub" title={`${appName} · ${place} · ${t("read-only")}`}>{appName} · {place} · {t("read-only")}</span>
         </span>
-        <Link className="btn btn-ghost cv-appview-open" href={app.href} onClick={sheet ? onClose : undefined}>
-          {t("Open in {app}").replace("{app}", appName)} ↗
-        </Link>
+        {noAccess || href === null ? null : (
+          // Navigating away leaves the tab behind: close it on the desktop too (the sheet closes the drawer).
+          <Link className="btn btn-ghost cv-appview-open" href={href} onClick={sheet ? onClose : () => closeTab(tab.id)}>
+            {t("Open in {app}").replace("{app}", appName)} ↗
+          </Link>
+        )}
         {!sheet ? (
           <>
             <button type="button" className="cv-iconbtn" onClick={onExpand} disabled={!canExpand} aria-pressed={expanded} aria-label={t("Expand canvas")} title={t("Expand canvas")}>

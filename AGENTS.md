@@ -203,23 +203,44 @@ approval rule for send, publish, spend or deploy.
    satisfies the gate. Fallback: where the approval route is not available, the
    operator posts the non-author pass personally as `favcrm-dev` after reading the
    report. An agent never switches credentials or impersonates the operator.
-4. **Check and hand off.** The agent runs
-   `cadence --org fav-limited delivery check --project cadence --issue <ID> --pr <n> --head <full-sha>`
-   (or `scripts/enqueue-reviewed <n> --head <full-sha> --org fav-limited --dry-run`),
-   posts one ticket comment for that head (the review reports, the green CI run
-   and, where required, the approval id) and hands the PR to the operator. A new
-   head voids every verdict on the old one.
-5. **Operator.** The operator records the per-head approval and enqueues:
-   `cadence --org fav-limited audit approve --project cadence --issue <ID> --repo favcrm/cadence --pr <n> --head <full-sha> --source "<who, where>"`,
-   then `cadence --org fav-limited delivery enqueue --project cadence --issue <ID> --repo favcrm/cadence --pr <n> --head <full-sha>`.
-   On `main` (effective from the next release), `delivery enqueue --approve
-   "<source>"` records the approval and enqueues in one call. The board's
-   Approve & merge panel does the same with an Email-OTP step-up. A workflow
-   REVISE the operator judges wrong is settled with `cadence --org fav-limited
-   audit accept-revise` and a stated reason. The queue's required
-   `delivery-gate` check holds a PR without the hosted signature, so a direct
-   `gh pr merge` never lands.
-6. **Agents never approve and never enqueue.** They check, report and hand off.
+4. **Check before requesting approval.** Resolve the owning ticket and current
+   full PR head. Run `cadence --org fav-limited delivery check --project cadence
+   --issue <ID> --repo favcrm/cadence --pr <n> --head <full-sha>` (or the
+   read-only `scripts/enqueue-reviewed <n> --head <full-sha> --org fav-limited
+   --dry-run`). Read `audit verdicts --body` with the same selectors on REVISE.
+   Clear missing CI, review and Browser QA evidence before requesting approval.
+   When a matching author-posted Browser QA pass waits on the operator's
+   approval, link the full report for that decision. Leave the issue in Review
+   and post one handoff comment with the full head, evidence links, exact
+   remaining refusal or approval ID, and the operator command(s). A new head
+   needs new evidence; do not reuse approval or request it for a stale head.
+5. **Operator: CLI first.** Supply a paste-ready command block with literal
+   issue, PR, full head and a truthful approval source (who decided and where).
+   The operator reviews the evidence, then runs the commands from their own
+   authorized terminal:
+
+   ```bash
+   cadence --org fav-limited audit approve --project cadence --issue "$issue" \
+     --repo favcrm/cadence --pr "$pr" --head "$head" --source "$source" &&
+   cadence --org fav-limited delivery enqueue --project cadence --issue "$issue" \
+     --repo favcrm/cadence --pr "$pr" --head "$head"
+   ```
+
+   If approval is already in force or not required, give only the enqueue
+   command. Check the actual GitHub merge-queue entry; a null
+   `autoMergeRequest` does not mean the PR is unqueued. If queued, observe
+   instead of enqueuing again. A supported
+   `delivery enqueue --approve "<source>"` can combine approval and enqueue.
+   Offer the board's **Approve & merge** if the operator prefers it or the
+   CLI route is unavailable. Email OTP authenticates the operator; it does not
+   clear a review or other refusal. A workflow REVISE the operator judges
+   wrong is settled with `cadence --org fav-limited audit accept-revise` and
+   a stated reason. A direct `gh pr merge` is not this repository's route.
+6. **Agent follows through.** Agents never approve or enqueue. After operator
+   enqueue, watch the queue and verify the merge on `main` before following
+   [Finish](#finish-one-procedure-as-soon-as-the-pr-merges). A queue receipt
+   is not a merge. If enqueue's outcome is uncertain, check the queue and PR
+   state before anyone retries.
 
 **What a workflow row proves.** The gate also requires the workflow file at the
 row's `workflow_sha` to be byte-identical to main's tip; a re-run keeps the
@@ -442,8 +463,11 @@ substitute a comment or another identity for the required proof.
 
 ### Merging
 
-If the hosted board cannot run, stop and report the limitation; do not change
-identities or bypass a gate.
+Use the [hosted CLI route](#review-what-a-merge-needs) when it is reachable,
+even if the Board UI is down. If the CLI is unavailable, the operator can
+use the Board route if it works. If neither authorized route works, report
+the exact limitation. A gate refusal is not a route outage: address the
+refusal instead of changing identities or bypassing the gate.
 
 - The queue re-tests on the newest main, so you do not have to rebase first.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the cause is
@@ -680,8 +704,11 @@ name. Never run `rm <scratchpad>/*`.
 
 ### Finish: one procedure, as soon as the PR merges
 
-1. Set the ticket's status from the merge evidence through the selected
-   workspace's supported ticket update. On a hosted org that is
+1. Read the merged PR's merge commit (`gh pr view <n> -R favcrm/cadence
+   --json state,mergeCommit`) and verify that commit is on fetched
+   `origin/main`. The reviewed head itself need not survive a squash. Then
+   set the ticket's status through the selected workspace's supported update.
+   On a hosted org that is
    `cadence --org fav-limited issue set <ID> status=done --if-rev <rev>` once the
    acceptance and completion rules are met; on a native tracker
    `cadence issue reconcile --project <key>` marks it from the merge evidence. If
@@ -693,11 +720,11 @@ name. Never run `rm <scratchpad>/*`.
    <path>]` on a hosted org (it takes no other option), or `cadence issue finish
    <ID> --worktree <path>` natively. Natively, `cadence issue finish --merged
    --dry-run` previews the sweep and removes nothing. Its activity, clean-tree and
-   commit-survival guards may refuse cleanup; never `--force` it. Leave other
-   worktrees to the authorized sweep: an unrecorded lane needs its owner's review,
-   and its directory name is not ownership proof. `git fetch --prune origin`
-   clears stale `origin/*` refs and does not prove a branch or worktree safe to
-   remove.
+   commit-survival guards may refuse cleanup. Report the exact refusal and
+   hand off to the lane's owner or operator when their connection is needed;
+   don't force or remove it by hand to get around the refusal. Leave other
+   worktrees to the authorized sweep. A path name or a pruned remote ref does
+   not prove a lane is safe to remove.
 3. Delete your own scratch files by name and stop the servers and processes you
    started. A PR you abandon or replace: close it with a link to what replaces it
    and say so on the ticket; do not leave a conflicted PR idle.

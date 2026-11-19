@@ -31,9 +31,9 @@ export function resourceHref(appPath: string | null, installId: string, contextI
  * the installed screen, never its content. `null` when there is no link, no
  * screen tag, or an id the frame would refuse; the plain link keeps working.
  */
-export function resourceAppView(appPath: string | null, installId: string, contextId: string, screenTag: string | null, ref: ResourceRef): AppViewRef | null {
+export function resourceAppView(appPath: string | null, installId: string, contextId: string, screenTag: string | null, ref: ResourceRef, appLabel: string | null = null): AppViewRef | null {
   const href = resourceHref(appPath, installId, contextId, ref);
   const section = RESOURCE_SECTIONS.get(ref.kind);
   if (href === null || section === undefined || screenTag === null) return null;
-  return appViewRef({ installId, tag: screenTag, contextId, route: { section, view: "list", record_id: ref.id, segment_id: null }, title: ref.label, href });
+  return appViewRef({ installId, tag: screenTag, contextId, route: { section, view: "list", record_id: ref.id, segment_id: null }, title: ref.label, href, ...(appLabel ? { appLabel } : {}) });
 }

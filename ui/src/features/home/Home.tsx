@@ -43,7 +43,7 @@ import { displayName, readConversationIdentity, scopeDescriptor } from "../assis
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
-import NeedsRail from "./NeedsRail";
+import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
@@ -81,6 +81,7 @@ import {
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
+import AppHandoffCards from "./AppHandoffCards";
 import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
@@ -554,13 +555,6 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (
-  message: string,
-  text: string,
-  refs?: ThreadRef[],
-  attachments?: PendingAttachment[],
-  conversation?: string,
-) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -765,6 +759,7 @@ export default function Home({
   viewerIsMember = false,
   sessionId = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
   decisions = false,
@@ -796,6 +791,7 @@ export default function Home({
    *  re-login as another member never reads the previous chat. */
   sessionId?: string | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   /** Open a reading item in the shared work-item detail (App owns the mount). */
   onOpenDecision: (open: HomeDecisionOpen) => void;
@@ -828,6 +824,7 @@ export default function Home({
         scope={scope}
         readOnly={readOnly}
         onOpenIssue={onOpenIssue}
+        documentFollowUps={documentFollowUps}
       />
     );
   }
@@ -836,6 +833,7 @@ export default function Home({
       readOnly={readOnly}
       hosted={hosted}
       overview={overview}
+      documentFollowUps={documentFollowUps}
       onOpenIssue={onOpenIssue}
       onOpenDecision={onOpenDecision}
       decisions={decisions}
@@ -855,6 +853,7 @@ function MasterHome({
   readOnly,
   hosted = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
   decisions = false,
@@ -870,6 +869,7 @@ function MasterHome({
   credentialRequestsEnabled?: boolean;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
@@ -898,6 +898,17 @@ function MasterHome({
   // Same-row growth while the reader is in history (no count to show).
   const [activity, setActivity] = useState(false);
   const [glideTick, setGlideTick] = useState(0);
+  // Latest moves in the tab order as well as visually; desktop leaves
+  // it after the transcript. Match the narrow Home layout in styles.css.
+  const [compactHome, setCompactHome] = useState(false);
+  useLayoutEffect(() => {
+    const media = window.matchMedia?.("(width < 640px)");
+    if (!media) return;
+    const update = () => setCompactHome(media.matches);
+    media.addEventListener("change", update);
+    update();
+    return () => media.removeEventListener("change", update);
+  }, []);
   const cmdSeq = useRef(0);
   const follow = useRef<Follow>(initialFollow());
   const prevItems = useRef(0);
@@ -937,6 +948,11 @@ function MasterHome({
       && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
       ? homeProjection.conversation_id
       : undefined);
+  const appHandoffConversation =
+    hosted === true && decisions && !effectiveReadOnly && thread.data?.cloudWithheld == null &&
+    homeProjection?.scope === "personal" && homeProjection.conversation_id === homeConversation
+      ? homeConversation
+      : undefined;
   useEffect(() => {
     if (homeConversation === undefined || thread.data === null
       || thread.data.conversation !== undefined
@@ -1213,7 +1229,8 @@ function MasterHome({
       conversation?: string,
     ) => {
       engage();
-      retry(message, text, refs, attachments, conversation);
+      const pending = resources.masterThread.get().data?.pending?.find((entry) => entry.message === message);
+      void sendToMaster(text, message, refs, attachments, conversation, undefined, undefined, pending?.appHandoff === true);
     },
     [engage],
   );
@@ -1546,6 +1563,8 @@ function MasterHome({
     [effectiveReadOnly, focusHomeComposer],
   );
 
+  const latestLabel = showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : "";
+
   return (
     <AssistantActorProvider actor={actor}>
     <PermissionEnabledContext.Provider value={hosted === false}>
@@ -1558,7 +1577,7 @@ function MasterHome({
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <AttachmentNamesContext.Provider value={homeAttachmentNames}>
     <main
-      className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
+      className={`home-workspace home-master px-4 lg:px-8 sm:pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
           ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
           : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
@@ -1570,6 +1589,7 @@ function MasterHome({
       <aside className="absolute rail:static min-w-0 rail:order-2 rail:h-full rail:min-h-0">
         <NeedsRail
           overview={overview}
+          documentFollowUps={documentFollowUps}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
@@ -1616,6 +1636,23 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {compactHome && latestLabel && (
+                <button
+                  type="button"
+                  className="newpill"
+                  data-jump-to-latest
+                  aria-label={latestLabel}
+                  onClick={(event) => {
+                    if (document.activeElement === event.currentTarget) {
+                      scrollRef.current?.focus({ preventScroll: true });
+                    }
+                    jumpToLatest();
+                  }}
+                >
+                  <span aria-hidden="true">↓</span>{" "}
+                  {t("Latest")}{unseen > 0 ? ` · ${unseen}` : ""}
+                </button>
+              )}
               {!readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "deferred" && (
                 <button
                   type="button"
@@ -1648,8 +1685,9 @@ function MasterHome({
             className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3"
             ref={scrollRef}
             onScroll={onPanelScroll}
+            tabIndex={compactHome ? 0 : undefined}
             data-chat-scroll
-            data-jump-pill={showJumpPill(unseen, activity) ? "" : undefined}
+            data-jump-pill={latestLabel ? "" : undefined}
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
             {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
@@ -1689,6 +1727,9 @@ function MasterHome({
               stale={streamReconnecting && activeTurn}
             />
             </ImageConversation.Provider>
+            {appHandoffConversation !== undefined && (
+              <AppHandoffCards key={appHandoffConversation} conversation={appHandoffConversation} revision={lastSeq(thread.data) ?? 0} />
+            )}
             {cmds.map((c) => (
               <CmdCard
                 key={c.id}
@@ -1700,14 +1741,13 @@ function MasterHome({
             ))}
           </div>
 
-          {/* The status node stays mounted so a screen reader announces the
-              pill's arrival (a live region added with its text is not). */}
+          {/* Keep the live region mounted so its updated text is announced. */}
           <span role="status" aria-live="polite" className="sr-only">
-            {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
+            {latestLabel}
           </span>
-          {showJumpPill(unseen, activity) && (
+          {!compactHome && latestLabel && (
             <button type="button" className="newpill" onClick={jumpToLatest} data-jump-to-latest>
-              <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
+              <span aria-hidden="true">↓</span> {latestLabel}
             </button>
           )}
 
@@ -1752,7 +1792,10 @@ function MasterHome({
                         });
                         const conversation =
                           typeof payload.conversation === "string" ? payload.conversation : undefined;
-                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
+                        const handoff = payload.app_handoff_v === 1 && appHandoffConversation !== undefined &&
+                          (conversation === undefined || conversation === appHandoffConversation);
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined,
+                          handoff ? appHandoffConversation : conversation, undefined, mediaRefs.length ? mediaRefs : undefined, handoff);
                       }
                     : undefined,
                 onView: turnBar.kind === "queued" && aheadHref !== null
@@ -1795,6 +1838,7 @@ function MasterHome({
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
+              appHandoffConversation={appHandoffConversation}
               attachReason={readOnly
                 ? "The board is read-only."
                 : missing

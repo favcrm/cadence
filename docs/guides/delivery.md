@@ -418,12 +418,14 @@ Use this gate when the requested deliverable needs approval before sharing:
 
 1. The creator saves the file with `artifact put --label <type>` and submits it
    with `artifact submit <art-id>`.
-2. The type's approver approves that exact version on the board's Documents
-   screen. There is no approve command. A member cannot approve a version they
-   wrote, and a later version needs its own approval.
+2. The type's assigned approver opens **Home → To do → Review** on a
+   Wiki-managed board, reads the submitted file version in Wiki and approves
+   it there. On older hosted boards, use **Documents**. There is no approve
+   command. A member cannot approve a version they wrote, and a later version
+   needs its own approval.
 3. The owner shares the approved version, which delivers it. Where a type needs
    approval, sharing any other version is refused (`document_not_approved`).
 
 Document review is hosted only. See "Submitting a document for review" in
 [Hosted workspace](hosted-workspace.md#submitting-a-document-for-review) for the
-commands and their refusals, and [BOARD.md](../BOARD.md) for the Documents screen.
+commands and their refusals, and [BOARD.md](../BOARD.md) for the board workflow.

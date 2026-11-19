@@ -11,8 +11,9 @@ import {
 import { appViewId, appViewRef } from "../src/features/canvas/appView";
 import { resourceAppView } from "../src/features/app-shell/assistantResourceNavigation";
 import { frameRoute } from "../src/features/workspace-apps/screen/screenRoute";
-import { readOnlyReceipt } from "../src/features/workspace-apps/screen/screenReadOnly";
+import { readOnlyReceipt, READ_ONLY_OPERATIONS } from "../src/features/workspace-apps/screen/screenReadOnly";
 import type { MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
+import { SCREEN_READ_VERBS } from "../src/features/workspace-apps/screen/screenServices";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -103,4 +104,7 @@ equal(resourceAppView("/apps/crm", "inst_crm", "ctx_1", "crm", { kind: "customer
 // Read-only: the mount keeps only read operations; a write the app declared is closed.
 const receipt = { mount: "/api/app-screen/n", bridge_nonce: "b", generation: 1, tag: "crm", action_token: "t", tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show", "records.update", "records.create", "sends.approve", "screen.route.patch", "records.csv.import", "works.get"] } as unknown as MountReceipt;
 equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch"], "only reads and route patches survive");
+const aggregateReceipt = { ...receipt, operations: ["records.aggregate", "records.batch", "records.update", "records.list"] } as unknown as MountReceipt;
+equal(readOnlyReceipt(aggregateReceipt).operations, ["records.aggregate", "records.list"], "records.aggregate is kept, writes still dropped");
+equal([...READ_ONLY_OPERATIONS].sort(), [...SCREEN_READ_VERBS].sort(), "canvas read-only set matches the screen read set");
 equal(receipt.operations?.length, 8, "the original receipt is not mutated");

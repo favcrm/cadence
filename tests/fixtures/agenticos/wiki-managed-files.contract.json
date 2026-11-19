@@ -1,0 +1,99 @@
+{
+  "description": "CAD-2477 hosted Wiki managed-file and document follow-up wire examples; synthetic data.",
+  "version": "hosted-wiki-managed-files.v1",
+  "capability": { "wiki": true, "wiki_managed_files": true },
+  "owner_overview": {
+    "document_follow_ups": {
+      "status": "ready",
+      "pending": [],
+      "recent": [
+        {
+          "id": "art-example",
+          "version": 1,
+          "title": "Project brief",
+          "project": "ALPHA",
+          "href": "/wiki?file=art-example&version=1",
+          "at": 1795000000000,
+          "outcome": "approved"
+        }
+      ]
+    }
+  },
+  "member_overview": {
+    "document_follow_ups": {
+      "status": "ready",
+      "pending": [
+        {
+          "id": "art-example",
+          "version": 2,
+          "title": "Project brief",
+          "project": "ALPHA",
+          "href": "/wiki?file=art-example&version=2",
+          "at": 1795100000000
+        }
+      ],
+      "recent": []
+    }
+  },
+  "unavailable_overview": { "document_follow_ups": { "status": "unavailable" } },
+  "managed_list": {
+    "files": [
+      {
+        "file": {
+          "id": "art-example",
+          "version": 2,
+          "kind": "pdf",
+          "title": "Project brief",
+          "label": "brief",
+          "customer": "",
+          "bytes": 123,
+          "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "created": "2026-11-19T00:00:00.000Z",
+          "issue": "ALPHA-1",
+          "shared": false
+        },
+        "document": {
+          "type": "brief",
+          "stage": "in_review",
+          "submittedVersion": 2,
+          "approvedVersion": null,
+          "selfApproved": false,
+          "deliveredVersion": null,
+          "deliveredAt": null,
+          "archivedAt": null,
+          "rev": 2
+        },
+        "actions": { "approve": true, "archive": false, "restore": false }
+      }
+    ]
+  },
+  "managed_detail": {
+    "file": {
+      "file": {
+        "id": "art-example",
+        "version": 2,
+        "kind": "pdf",
+        "title": "Project brief",
+        "label": "brief",
+        "customer": "",
+        "bytes": 123,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created": "2026-11-19T00:00:00.000Z",
+        "issue": "ALPHA-1",
+        "shared": false
+      },
+      "document": {
+        "type": "brief",
+        "stage": "in_review",
+        "submittedVersion": 2,
+        "approvedVersion": null,
+        "selfApproved": false,
+        "deliveredVersion": null,
+        "deliveredAt": null,
+        "archivedAt": null,
+        "rev": 2
+      },
+      "actions": { "approve": true, "archive": false, "restore": false }
+    }
+  }
+}

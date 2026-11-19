@@ -1075,15 +1075,9 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(argv, expected);
-        // The static tools stay reachable, and the listing grows by one.
-        assert_eq!(
-            tools(&[]).as_array().unwrap().len(),
-            STATIC_TOOL_NAMES.len()
-        );
-        assert_eq!(
-            tools(&generated).as_array().unwrap().len(),
-            STATIC_TOOL_NAMES.len() + 1
-        );
+        // The static nine tools stay reachable, and the listing grows by one.
+        assert_eq!(tools(&[]).as_array().unwrap().len(), 9);
+        assert_eq!(tools(&generated).as_array().unwrap().len(), 10);
         // A dotted tool slug survives as an MCP-safe name.
         assert_eq!(mcp_name_part("email.send"), "email_send");
         assert_eq!(mcp_name_part("account-images"), "account-images");

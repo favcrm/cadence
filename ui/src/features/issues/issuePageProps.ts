@@ -20,6 +20,7 @@ export interface IssuePageProps {
   onToast: (text: string) => void;
   /** True on hosted workspaces where local daemon `/lane` routes do not exist. */
   hosted?: boolean;
+  managedFiles?: boolean;
   /** Configured repositories for `project` (`[]` on non-repository projects). */
   projectRepos?: readonly unknown[] | null;
   /** Staged/decided assistant actions from the shared decisions store, when available. */

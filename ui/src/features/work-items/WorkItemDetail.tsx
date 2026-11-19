@@ -74,6 +74,7 @@ export interface WorkItemDetailProps {
   };
   /** True on hosted workspaces where non-repository items default to domain-neutral tabs. */
   hosted?: boolean;
+  managedFiles?: boolean;
   /** Configured repositories for the item's project (`[]` on non-repository projects). */
   projectRepos?: readonly unknown[] | null;
   /** Staged/decided assistant actions from the shared decisions store, when available. */
@@ -125,7 +126,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
       ) : tabId === "code" ? (
         <CodePanel detail={known ? detail : null} />
       ) : tabId === "evidence" ? (
-        <EvidencePanel detail={known ? detail : null} />
+        <EvidencePanel detail={known ? detail : null} managedFiles={props.managedFiles} />
       ) : tabId === "approvals" ? (
         <ApprovalsPanel detail={known ? detail : null} stagedActions={stagedActions} />
       ) : tabId === "activity" ? (
@@ -499,7 +500,7 @@ function CodePanel({ detail }: { detail: IssueDetail | null }) {
 }
 
 /** Recorded evidence only: artifact authoring stays on the canonical issue page. */
-function EvidencePanel({ detail }: { detail: IssueDetail | null }) {
+function EvidencePanel({ detail, managedFiles }: { detail: IssueDetail | null; managedFiles?: boolean }) {
   const { t } = useLocale();
   if (!detail) return <p className="issue-peek-note dim m-0">{t("Evidence is listed once the item loads.")}</p>;
   const artifacts = detail.artifacts ?? [];
@@ -510,6 +511,7 @@ function EvidencePanel({ detail }: { detail: IssueDetail | null }) {
         images={artifacts.filter((file) => IMG.test(file.name))}
         files={artifacts.filter((file) => !IMG.test(file.name))}
         readOnly
+        managedFiles={managedFiles}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { checkPrivateApp, applyPrivateApp } from "../src/features/workspace-apps/privateAppUpload";
+import { checkPrivateApp, applyPrivateApp, decideHostedPrivateReview, getHostedPrivateReview } from "../src/features/workspace-apps/privateAppUpload";
 import { ApiError } from "../src/lib/apiError";
 function equal(actual: unknown, expected: unknown, message = "values differ"): void {
   if (actual !== expected) throw new Error(message);
@@ -64,6 +64,51 @@ async function main() {
   equal(new Headers(calls[1]?.init.headers).get("x-cadence-app-digest"), digest);
   equal(new Headers(calls[1]?.init.headers).get("x-cadence-app-generation"), review.catalog_generation);
   equal(calls[2]?.path, "/api/app-installations/i1", "success requires an installation readback");
+  const reviewId = `par_${"1".repeat(32)}`;
+  const receipt = { ok: true, data: { id: reviewId, state: "pending", expires_at: 2000000000000,
+    source: "https://github.com/a/b/releases/download/v1/app.zip", zip_sha256: digest,
+    digest, name: review.name, generation: review.catalog_generation, install_id: null, expected_digest: null, review } };
+  calls = [];
+  await rejected(getHostedPrivateReview("par_123"), (error: unknown) => error instanceof ApiError,
+    "a malformed review link is refused before any fetch");
+  equal(calls.length, 0);
+  responses = [{ status: 200, body: receipt }];
+  const hosted = await getHostedPrivateReview(reviewId);
+  equal(calls.length, 1, "opening a review performs only a read");
+  equal(calls[0]?.init.method, undefined);
+  responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, state: "installed" } } }];
+  equal((await decideHostedPrivateReview(hosted, "install")).state, "installed");
+  equal(calls[1]?.path, `/api/app-installations/private/reviews/${reviewId}/install`);
+  equal(calls[1]?.init.body, JSON.stringify({ digest, zip_sha256: digest }), "approval binds both fingerprints");
+  responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, state: "rejected" } } }];
+  equal((await decideHostedPrivateReview(hosted, "reject")).state, "rejected");
+  equal(calls[2]?.path, `/api/app-installations/private/reviews/${reviewId}/reject`);
+  responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, state: "installed" } } }];
+  equal((await decideHostedPrivateReview(hosted, "reject")).state, "installed",
+    "a concurrent owner approval stays installed");
+  responses = [
+    { status: 409, body: { error: { code: "review_closed", message: "Review closed." } } },
+    { status: 200, body: { ...receipt, data: { ...receipt.data, state: "expired" } } },
+  ];
+  const beforeClosed = calls.length;
+  equal((await decideHostedPrivateReview(hosted, "install")).state, "expired");
+  equal(calls.length, beforeClosed + 2);
+  equal(calls[beforeClosed]?.init.method, "POST");
+  equal(calls[beforeClosed + 1]?.init.method, undefined, "a closed review is reconciled without replaying approval");
+  const staleResponse = { status: 409, body: { error: { code: "installation_stale", message: "Catalog generation changed." } } };
+  responses = [staleResponse, { status: 200, body: receipt }];
+  const beforeStale = calls.length;
+  await rejected(decideHostedPrivateReview(hosted, "install"),
+    (error: unknown) => error instanceof ApiError && error.code === "installation_stale",
+    "a still-pending stale package requires a fresh review");
+  equal(calls.length, beforeStale + 2);
+  equal(calls[beforeStale + 1]?.init.method, undefined);
+  responses = [staleResponse, { status: 200, body: { ...receipt, data: { ...receipt.data, state: "installed" } } }];
+  equal((await decideHostedPrivateReview(hosted, "install")).state, "installed",
+    "an owner who won the activation race leaves a verified installed receipt");
+  responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, digest: `sha256:${"b".repeat(64)}` } } }];
+  await rejected(getHostedPrivateReview(reviewId), (error) => error instanceof ApiError && error.status === 502,
+    "a mismatched review fingerprint cannot be presented for approval");
   console.log("private app upload receipt checks passed");
 }
 void main();

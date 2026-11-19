@@ -5,6 +5,7 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
+import { HOME_VIEW_SCOPE, parseViewRef, viewCardAppView, type ViewScope } from "../home/chatCards";
 import { isArtifactPutCall, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
@@ -12,6 +13,7 @@ import {
   type ArtifactKind,
   type ArtifactRef,
   type FeedCard,
+  type FeedView,
   type Surface,
   type Working,
 } from "./canvasStore";
@@ -44,6 +46,7 @@ function putTargets(text: string): string[] {
 
 export interface FeedParts {
   cards: FeedCard[];
+  views: FeedView[];
   working: Working | null;
   turn: string | null;
 }
@@ -55,7 +58,7 @@ export interface FeedParts {
  * strip and the chip follow that turn, not the newest operator message, which
  * may be a follow-up queued behind it.
  */
-export function feedParts(items: ThreadItem[], liveAfter: number, running: string | null): FeedParts {
+export function feedParts(items: ThreadItem[], liveAfter: number, running: string | null, viewScope: ViewScope = HOME_VIEW_SCOPE): FeedParts {
   const operatorTurns = new Set<string>();
   let turn: string | null = null;
   let lastOperator = -1;
@@ -67,7 +70,15 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
     }
   });
   const cards: FeedCard[] = [];
+  const views: FeedView[] = [];
   for (const item of items) {
+    if (item.type === "view") {
+      const model = parseViewRef(item.entry);
+      const ref = model && viewCardAppView(model, viewScope);
+      const message = item.entry.message ?? null;
+      if (ref) views.push({ key: `view:${item.key}`, ref, live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      continue;
+    }
     if (item.type !== "artifact") continue;
     const ref = artifactRef(item.entry.payload);
     if (!ref) continue;
@@ -97,7 +108,7 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
     }
     working = { turn, updating: [...updating] };
   }
-  return { cards, working, turn };
+  return { cards, views, working, turn };
 }
 
 /** The highest stored seq among the items — the mount watermark. */
@@ -125,13 +136,17 @@ export function useCanvasFeed(opts: {
   running: string | null;
   /** Default true. False keeps a card from opening the drawer by itself. */
   autoOpen?: boolean;
+  /** Where a `view_ref` card opens its tab (the app pane's install and context); default: Home's. */
+  viewScope?: ViewScope;
 }): void {
   const { conversation, surface, composerKey, items, loaded, running, autoOpen } = opts;
+  const scopeInstall = opts.viewScope?.installId ?? null;
+  const scopeContext = opts.viewScope?.contextId ?? HOME_VIEW_SCOPE.contextId;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;
     if (mark.current.seq === null) mark.current.seq = topSeq(items);
-    feedCanvas({ conversation, surface, composerKey, autoOpen, ...feedParts(items, mark.current.seq, running) });
-  }, [conversation, surface, composerKey, items, loaded, running, autoOpen]);
+    feedCanvas({ conversation, surface, composerKey, autoOpen, ...feedParts(items, mark.current.seq, running, { installId: scopeInstall, contextId: scopeContext }) });
+  }, [conversation, surface, composerKey, items, loaded, running, autoOpen, scopeInstall, scopeContext]);
 }

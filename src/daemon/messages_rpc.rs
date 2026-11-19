@@ -1025,10 +1025,13 @@ impl Shared {
             // via `params.inbox.checkin_auto_reply = true` (default false).
             // Never grants write or steering authority; leaves a quiet
             // `auto_answered: true` audit row in the recipient's inbox and
-            // sends a correlated `reply` back to `reply_to`.
+            // sends a correlated `reply` ONLY back to the daemon-derived
+            // authenticated asking agent (`Sender::Agent(caller)`), never to an
+            // arbitrary sender-supplied `reply_to` or upstream target.
             if effective_kind == crate::inbox::InboxKind::Checkin {
-                if let (Some(reply_target), Ok(Some(target_agent))) =
-                    (reply_to.as_deref(), self.store.agent_opt(&alias))
+                let explicit_reply_to = optional_str(params, "reply_to");
+                if let (crate::store::Sender::Agent(caller_alias), Ok(Some(target_agent))) =
+                    (&sender, self.store.agent_opt(&alias))
                 {
                     let policy_enabled = target_agent
                         .params
@@ -1036,9 +1039,12 @@ impl Shared {
                         .and_then(|p| p.pointer("/inbox/checkin_auto_reply"))
                         .and_then(Value::as_bool)
                         == Some(true);
+                    let reply_matches_asker =
+                        explicit_reply_to.is_none_or(|r| r == caller_alias.as_str());
                     if policy_enabled
-                        && reply_target != alias
-                        && self.store.agent_opt(reply_target)?.is_some()
+                        && reply_matches_asker
+                        && caller_alias.as_str() != alias.as_str()
+                        && self.store.agent_opt(caller_alias)?.is_some()
                     {
                         let reply_body = target_agent
                             .params
@@ -1060,7 +1066,7 @@ impl Shared {
                             });
                         let reply_id = format!("auto-reply-{message}");
                         let _ = self.store.enqueue_sent(
-                            reply_target,
+                            caller_alias,
                             &reply_body,
                             Some(&alias),
                             &reply_id,
@@ -1069,13 +1075,13 @@ impl Shared {
                             &crate::store::Sender::Agent(alias.clone()),
                         )?;
                         self.store.record_inbox_envelope(
-                            reply_target,
+                            caller_alias,
                             &reply_id,
                             crate::inbox::InboxKind::Reply,
                             None,
                             false,
                         )?;
-                        self.notify_agent(reply_target);
+                        self.notify_agent(caller_alias);
                         auto_answered = true;
                         auto_reply_message = Some(reply_id);
                     }

@@ -19,6 +19,7 @@ import ArtifactView, {
 import type { ArtifactKind } from "../canvas/canvasStore";
 import { Attach } from "./Attach";
 import { type IssuePageProps as Props } from "./issuePageProps";
+import { ManagedList } from "../wiki/ManagedFileViews";
 
 export type DeliverablePreviewKind = Exclude<ArtifactKind, "image">;
 
@@ -490,6 +491,7 @@ export function Evidence({
   readOnly,
   onWrite,
   onError,
+  managedFiles,
 }: {
   id: string;
   images: { name: string; size: number }[];
@@ -497,22 +499,28 @@ export function Evidence({
   /** Read-only hosts (the shared work-item detail) omit the write callbacks. */
   readOnly: boolean;
   onWrite?: Props["onWrite"];
+  managedFiles?: boolean;
   onError?: Props["onError"];
 }) {
   const t = useTranslate();
-  const empty = images.length === 0 && files.length === 0;
+  const empty = images.length === 0 && files.length === 0 ? (
+    <div className="card min-w-0 px-4 py-8 text-center">
+      <div className="text-cardtitle font-semibold text-ink-100">
+        {t("No evidence yet")}
+      </div>
+      <p className="text-secondary text-ink-400 mt-1">
+        {t("Add screenshots, test results, and other supporting files.")}
+      </p>
+    </div>
+  ) : null;
   return (
     <section className="grid min-w-0 gap-4">
-      {empty && (
-        <div className="card min-w-0 px-4 py-8 text-center">
-          <div className="text-cardtitle font-semibold text-ink-100">
-            {t("No evidence yet")}
-          </div>
-          <p className="text-secondary text-ink-400 mt-1">
-            {t("Add screenshots, test results, and other supporting files.")}
-          </p>
-        </div>
-      )}
+      {managedFiles ? <ManagedList
+        key={id}
+        issue={id}
+        empty={empty}
+        navHref={(route) => route.screen === "wiki" && route.file && route.version ? `/wiki?file=${encodeURIComponent(route.file)}&version=${route.version}` : "/wiki"}
+      /> : empty}
       {images.length > 0 && (
         <div className="grid min-w-0 gap-2">
           <h2 className="text-cardtitle font-semibold text-ink-100 m-0">

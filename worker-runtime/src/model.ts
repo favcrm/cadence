@@ -1,4 +1,4 @@
-import type { Api, Model, Provider } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model, Provider } from "@earendil-works/pi-ai";
 import { CLOUDFLARE_AI_API, CLOUDFLARE_PROVIDER_ID } from "agents/models/pi-ai";
 import type { GenerationIdentity } from "./contract.ts";
 import type { ContextBudgetProofs } from "./context-budget-proofs.ts";
@@ -54,6 +54,20 @@ export const HOSTED_COMPACTION_POLICY = {
 } as const;
 
 const MODEL_MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * CAD-2480: the request size at which hosted blocking compaction starts,
+ * whatever the token count says. The token rule reads the last reply's
+ * reported usage and estimates the newest step at 3.5 characters a token, so a
+ * thread of large HTML tool-call arguments (each quote is escaped twice in
+ * the request body, the estimate counts it once) reaches the gateway's 256 KiB
+ * cap while the estimate is still under its threshold. 160 KiB is the token
+ * rule's own design point: 48k tokens at 3.41 bytes a token, just under the
+ * 3.45 bytes a token measured for English JSON and HTML (see above). It leaves
+ * 96 KiB (37.5%) for the step in flight, the tool results the engine only
+ * estimates, and the summary's own prompt.
+ */
+export const BYTE_COMPACTION_THRESHOLD = 160 * 1024;
 
 /**
  * CAD-2430: the output budget of the engine's compaction summary, which the
@@ -226,21 +240,13 @@ export interface MeteredBinding {
  * for the engine's attested summarization request.
  */
 function splitSummaryMessages(input: Record<string, unknown>): Record<string, unknown> {
-  if (!Array.isArray(input.messages) || input.messages.length !== 2) return input;
-  const [system, user] = input.messages;
-  if (
-    typeof system !== "object" || system === null || system.role !== "system" ||
-    typeof user !== "object" || user === null || user.role !== "user"
-  ) return input;
-  let text: string;
-  if (typeof user.content === "string") text = user.content;
-  else if (
-    Array.isArray(user.content) && user.content.length === 1 &&
-    user.content[0]?.type === "text" && typeof user.content[0].text === "string"
-  ) text = user.content[0].text;
-  else return input;
+  const source = summarySource(input);
+  if (source === null) return input;
+  const { system, user } = source;
+  const text = shortenToolCallArguments(source.text);
   const limit = 64_000;
-  if (text.length <= limit) return input;
+  if (text === source.text && text.length <= limit) return input;
+  if (text.length <= limit) return { ...input, messages: [system, { ...user, content: text }] };
   const messages: unknown[] = [system];
   for (let start = 0; start < text.length;) {
     let end = Math.min(start + limit, text.length);
@@ -251,6 +257,64 @@ function splitSummaryMessages(input: Record<string, unknown>): Record<string, un
     start = end;
   }
   return { ...input, messages };
+}
+
+/** The engine's summarization request: its system prompt and one user message of text. */
+function summarySource(
+  input: Record<string, unknown>,
+): { system: unknown; user: Record<string, unknown>; text: string } | null {
+  if (!Array.isArray(input.messages) || input.messages.length !== 2) return null;
+  const [system, user] = input.messages;
+  if (
+    typeof system !== "object" || system === null || system.role !== "system" ||
+    typeof user !== "object" || user === null || user.role !== "user"
+  ) return null;
+  if (typeof user.content === "string") return { system, user, text: user.content };
+  if (
+    Array.isArray(user.content) && user.content.length === 1 &&
+    user.content[0]?.type === "text" && typeof user.content[0].text === "string"
+  ) return { system, user, text: user.content[0].text };
+  return null;
+}
+
+/**
+ * CAD-2480: the engine's serializer shortens tool results to 2,000 characters
+ * but writes every tool-call argument whole, as `name(key=<JSON>)` on one
+ * line (JSON escapes newlines). A backlog of large HTML arguments then cannot
+ * fit one summary request. Shorten each long string inside a tool-call line the
+ * way a tool result is shortened: keep the head and the tail, name what was
+ * left out. The summary needs what was done, not every byte of a page.
+ */
+const TOOL_CALLS_PREFIX = "[Assistant tool calls]: ";
+const TOOL_CALL_STRING_KEPT = 1_000;
+const JSON_STRING = /"(?:[^"\\]|\\[\s\S])*"/g;
+
+function shortenToolCallArguments(text: string): string {
+  if (!text.includes(TOOL_CALLS_PREFIX)) return text;
+  return text
+    .split("\n\n")
+    .map((part) =>
+      !part.startsWith(TOOL_CALLS_PREFIX)
+        ? part
+        : part.replace(JSON_STRING, (literal) => shortenJsonString(literal)),
+    )
+    .join("\n\n");
+}
+
+/** One JSON string literal (quotes included) cut to its head and tail, never inside an escape or a surrogate pair. */
+function shortenJsonString(literal: string): string {
+  const body = literal.slice(1, -1);
+  if (body.length <= 2 * TOOL_CALL_STRING_KEPT + 200) return literal;
+  let head = TOOL_CALL_STRING_KEPT;
+  // An odd run of backslashes before the cut means it falls inside an escape.
+  const slashes = /\\*$/.exec(body.slice(0, head))![0].length;
+  if (slashes % 2 === 1) head--;
+  head = cutText(body, head).length;
+  let tail = body.length - TOOL_CALL_STRING_KEPT;
+  if (body[tail - 1] === "\\" && /\\*$/.exec(body.slice(0, tail))![0].length % 2 === 1) tail++;
+  const low = body.charCodeAt(tail);
+  if (low >= 0xdc00 && low <= 0xdfff) tail++;
+  return `"${body.slice(0, head)}[... ${tail - head} more characters omitted]${body.slice(tail)}"`;
 }
 
 /**
@@ -594,6 +658,56 @@ function imagesOnlyInHistory(input: Record<string, unknown>): boolean {
 }
 
 /**
+ * CAD-2480: the text bytes of each generation's latest request, so the reply
+ * can carry them into the engine's context estimate (`withByteFloor`). The
+ * engine decides blocking compaction from tokens only; this is the one seam
+ * that gives it a byte rule without a second compaction path. In memory: a
+ * restart only skips one floor, and the token rule still applies.
+ */
+export class RequestSizes {
+  private readonly bytes = new Map<string, number>();
+
+  record(task: string, bytes: number): void {
+    this.bytes.delete(task);
+    this.bytes.set(task, bytes);
+    // A task that never answered (aborted) must not hold an entry forever.
+    if (this.bytes.size > 32) this.bytes.delete(this.bytes.keys().next().value!);
+  }
+
+  /**
+   * Raise a finished reply's reported context tokens to the engine's blocking
+   * threshold when the next request, this request plus the reply as it will be
+   * sent back, passes `BYTE_COMPACTION_THRESHOLD`. Only raises, and only a
+   * reply that answered.
+   */
+  withByteFloor(task: string, message: AssistantMessage): void {
+    const sent = this.bytes.get(task);
+    this.bytes.delete(task);
+    if (sent === undefined || message.stopReason === "error" || message.stopReason === "aborted")
+      return;
+    if (sent + replyBytes(message) <= BYTE_COMPACTION_THRESHOLD) return;
+    const blocking = MODEL_CONTEXT_WINDOW - HOSTED_COMPACTION_POLICY.reserveTokens + 1;
+    const usage = message.usage as { totalTokens: number };
+    usage.totalTokens = Math.max(usage.totalTokens, blocking);
+  }
+}
+
+/** The reply's bytes in the next request: text, and each call's arguments as the JSON string they are sent as. */
+function replyBytes(message: AssistantMessage): number {
+  let text = "";
+  for (const part of message.content) {
+    if (part.type === "text") text += part.text;
+    else if (part.type === "toolCall")
+      text += JSON.stringify({
+        id: part.id,
+        type: "function",
+        function: { name: part.name, arguments: JSON.stringify(part.arguments) },
+      });
+  }
+  return encoder.encode(text).length;
+}
+
+/**
  * The private model endpoint.
  *
  * `identity` resolves the calling engine task's durable checkpoint and must
@@ -610,6 +724,7 @@ export function meteredBinding(
   maxImagesPerRequest = 1,
   budgetProofs?: Pick<ContextBudgetProofs, "clear" | "issue">,
   isCompaction?: (signal: AbortSignal | undefined) => boolean,
+  sizes?: RequestSizes,
 ): MeteredBinding {
   if (
     !Number.isSafeInteger(maxImagesPerRequest) ||
@@ -654,6 +769,7 @@ export function meteredBinding(
         // Recovery can repeat this task after a crash before the error entry
         // was committed. Never let evidence from the earlier attempt survive.
         budgetProofs?.clear(current);
+        if (!compacting) sizes?.record(current.task, textBytes(value));
         return transport.requestModel(value, current, options?.signal);
       };
       let response = await request(bounded);

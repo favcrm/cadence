@@ -1,5 +1,6 @@
 import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
+import { ViewScopeContext } from "../../home/ViewCard";
 import { ImageConversation } from "../../canvas/imageConversation";
 import {
   Fragment,
@@ -173,6 +174,8 @@ export type ConversationMode =
       appPath?: string | null;
       /** The installed screen's tag: an assistant resource link can open it in the canvas. */
       screenTag?: string | null;
+      /** The installed app's display name: a canvas tab names the app from it when the install cannot be read. */
+      appLabel?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -1297,9 +1300,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     },
     convId,
   );
+  const viewScope = useMemo(() => ({ installId, contextId: mode.contextId }), [installId, mode.contextId]);
   useCanvasFeed({
     conversation: convId,
     surface: "app",
+    viewScope,
     composerKey,
     items,
     loaded: loaded && thread.data?.missing !== true,
@@ -2219,6 +2224,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       <StagedSourceContext.Provider value={decisionStore}>
       <AttachmentNamesContext.Provider value={paneAttachmentNames}>
+      <ViewScopeContext.Provider value={viewScope}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
           const rows: ReactNode[] = [];
@@ -2366,9 +2372,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           return rows;
         })()}
       </ol>
+      </ViewScopeContext.Provider>
       </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}

@@ -2630,6 +2630,23 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
+On a hosted board advertising `wiki_managed_files` (CAD-2477), **Wiki** is
+the shared library for durable files and knowledge. An assigned approver
+opens **Home → To do → Review** to read the submitted version in Wiki.
+Opening a file does not clear the follow-up; approval does. Recent recorded
+approval and delivery outcomes appear in **Updates** for the people involved
+who still have access. The private-assistant Home shows these document
+follow-ups without mounting the Master's queues or activity. On the owner's
+workspace Home they appear alongside the existing actions. The two kinds
+of Home keep their existing access rules.
+
+The file's Wiki link and linked ticket Evidence point to the exact version.
+Approval and archive/restore are file actions; approval does not deliver the
+file. The owner edits **Document policy** in **Settings → Workspace → General**.
+Old Documents links open Wiki (Archived links keep that view); the old policy
+link opens General or a permitted Settings default. Hosted boards that do
+not advertise the capability still use the two older destinations below.
+
 Documents (`/documents`, CAD-2286) is hosted only: the review side of the
 document lifecycle that `artifact submit` starts
 (`docs/guides/hosted-workspace.md`). One shared probe,
@@ -3196,6 +3213,15 @@ message rows. Attachments the operator picked show as compact wrapping
 chips above the composer (one status/remove icon slot each, +N more
 past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
+
+Below 640px, Home uses a one-row toolbar without a breadcrumb. A
+signed-out reader can still sign in from the toolbar and find language
+and theme choices in the navigation drawer. The master assistant header
+shows Latest when activity arrives while a reader is
+away from the end, without covering or fading the thread.
+The floating dock puts attach, draft and send in one row. Longer drafts
+expand, and the thread keeps enough room below its last message to clear
+the dock and the Needs-you button.
 
 The shared turn bar (CAD-1700) names the conversation actually ahead of a
 queued message, including Home's server-issued thread id. The master queue

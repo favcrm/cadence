@@ -1,0 +1,15 @@
+{
+  "role": "agent",
+  "kind": "view_ref",
+  "text": "Opened Ada Example in the canvas (CRM · customers)",
+  "payload": {
+    "v": 1,
+    "app": "crm",
+    "app_label": "CRM",
+    "install_id": "install_crm",
+    "screen_tag": "crm",
+    "section": "customers",
+    "record_id": "cust-0001",
+    "title": "Ada Example"
+  }
+}

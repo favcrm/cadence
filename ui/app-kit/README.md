@@ -62,6 +62,18 @@ export const bridge = createScreenBridge({
 
 ### Private apps and platform tools
 
+An authorized CLI or MCP caller can request a hosted private-app review using
+`private_app_review_request` with a public release ZIP URL and a request ID.
+The returned review URL opens Apps for a signed-in workspace owner. The owner
+reviews the package, requested access, source URL and ZIP fingerprint, then
+explicitly checks the acknowledgement and approves installation or rejects
+the request. Opening the link does not install anything. A closed, expired,
+missing or stale request cannot be approved; reopen the link to check its
+current status if a decision's outcome is uncertain. Callers can track the
+request with `private_app_review_status`. Approval does not grant platform
+tools; the separate owner grant described below is still required. Owners can
+also continue to upload a ZIP or choose a GitHub release in Apps directly.
+
 The hosted workspace can grant a private app a catalogue **read** or **draft**
 tool. Declare the slot in `app.md`:
 

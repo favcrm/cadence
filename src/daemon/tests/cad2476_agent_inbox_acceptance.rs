@@ -127,6 +127,35 @@ fn agent_inbox_guards_refuse_cross_agent_access_and_agent_decisions() {
         .unwrap_or_default()
         .contains("Supplier quote is ready"));
 
+    // 2b. A peer cannot redirect another assistant's auto-reply to a third party
+    //     by forging `reply_to`: finance-agent must receive nothing.
+    let bounce_receipt = scoped(Asserted::Agent("assist-alex".into()), || {
+        shared.dispatch(
+            "agent_send",
+            &json!({
+                "alias": "assist-peter",
+                "text": "Bounce test",
+                "kind": "checkin",
+                "reply_to": "finance-agent"
+            }),
+            pid,
+        )
+    })
+    .expect("send succeeds as ordinary unread checkin");
+    assert!(
+        bounce_receipt.get("auto_answered").is_none(),
+        "mismatched reply_to must not trigger auto-reply"
+    );
+    let fin_before = scoped(Asserted::Agent("finance-agent".into()), || {
+        shared.dispatch("agent_inbox_feed", &json!({"alias": "finance-agent"}), pid)
+    })
+    .unwrap();
+    assert_eq!(
+        fin_before["messages"].as_array().unwrap().len(),
+        0,
+        "third-party reply_to must never receive an auto-reply"
+    );
+
     // 3. Cross-agent access is refused on feed, mark, and promote.
     assert!(scoped(Asserted::Agent("assist-alex".into()), || {
         shared.dispatch("agent_inbox_feed", &json!({"alias": "assist-peter"}), pid)

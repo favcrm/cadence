@@ -340,6 +340,14 @@ receipt. This RPC does not accept or deliver a handoff.
 Opting out at startup stops capture and hides existing receipts without
 deleting them. Re-enabling never backfills results completed while disabled.
 
+On a compatible hosted board, a private Home conversation can show a
+read-only app handoff. Type the exact question you want shared, then check
+the recipient and text in its decision card.
+**Approve** records consent but does not run anything; **Run handoff** sends
+only the reviewed question to the app specialist. **Check reply** reads that
+same run from Home. If the status is unconfirmed, check again without starting
+another run. Direct app tools do not require this handoff.
+
 Inside a turn, the operation's scope reaches both the model and its tools. A
 run can hold more than one input — the engine appends each steering input to
 the live run — so the runtime attributes a run only when every one of its
@@ -1168,6 +1176,10 @@ cadence --org acme artifact submit <art-id>
   `stage`, `type`, `typeConfirmed` and, for an unconfirmed type, `baseline`.
   The lifecycle is in [Delivery](delivery.md#document-review-for-non-code-work);
   the board side is in `docs/BOARD.md`.
+- On a Wiki-managed hosted board, a readable submitted version appears under
+  **Home → To do** for its effective approver. **Review** opens that exact Wiki
+  version. The owner sets the type's rule under **Settings → Workspace → General**.
+  Older hosted boards keep the original **Documents** workflow.
 - Submitting again answers the current stage and does not submit twice, so
   after a lost answer (exit 1) repeat the same command.
 - `document_lifecycle_unavailable` (exit 3) means the workspace has no document
