@@ -156,7 +156,9 @@ fi
 if [ "$GUEST_PROVIDER" = agenticos ]; then
   [[ ${#GUEST_MODEL} -le 190 && "$GUEST_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]] \
     || die "--guest-model must be an explicit AgenticOS author/model id"
-  [ "$GUEST_EFFORT" = off ] || die "AgenticOS requires --guest-effort off"
+  if [[ "$GUEST_EFFORT" != off && ( "$GUEST_MODEL" != tencent/hy4 || "$GUEST_EFFORT" != high ) ]]; then
+    die "AgenticOS requires --guest-effort off, or high for tencent/hy4"
+  fi
 else
   [[ "$GUEST_MODEL" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "--guest-model is malformed"
 fi
