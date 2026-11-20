@@ -54,6 +54,8 @@ const translate = (text: string) => text === "Assistant" ? "助理" : text;
     "an empty shared roster can still link to the caller’s personal profile");
   ok(personalAssistantProfileHref(actor.scope, actor.read, { ...roster, status: "stale" }) === undefined,
     "a failed roster refresh does not offer the cached profile link");
+  ok(personalAssistantProfileHref(actor.scope, actor.read, { ...roster, error: "Roster refresh failed" }) === undefined,
+    "a shared-roster event does not restore the cached private link after a failed refresh");
 }
 
 // A present but invalid hosted projection may never fall back to a valid workspace profile.

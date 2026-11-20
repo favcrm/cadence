@@ -67,10 +67,10 @@ async function main() {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host);
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };
-  const mount = async (hosted: boolean) => {
+  const mount = async (hosted: boolean, operator?: boolean) => {
     await React.act(async () => {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
-        readOnly: false, hosted, overview: resources.overview.get(),
+        readOnly: false, hosted, operator, overview: resources.overview.get(),
         onOpenIssue: () => undefined, onOpenDecision: () => undefined,
         permissionsHref: "/permissions", resolveAppPath: () => null,
       })));
@@ -98,7 +98,7 @@ async function main() {
   };
   const menu = () => Array.from(host.querySelectorAll(".slashmenu [role=option]")).map((row) => row.textContent ?? "");
 
-  await mount(true);
+  await mount(true, true);
   assert(box() !== null, "the composer is on the page");
   assert(host.querySelector(".master-chips .chip-btn") === null, "a hosted board shows no model chip");
   assert(!requests.some((r) => r.includes("/api/master/models")), "a hosted chip reads no model list");
@@ -108,6 +108,9 @@ async function main() {
   await React.act(async () => { about.click(); });
   await settle();
   assert(document.body.querySelector("[data-assistant-model]")?.textContent?.includes("deepseek/flash"), "About shows the model");
+  assert(document.querySelector('.assistant-about[data-identity-state="ready"]'), "the identity fixture is ready");
+  assert(document.querySelector('.assistant-about a[href="/agents/master?tab=instructions"]') === null,
+    "a tenant response missing its actor projection never links to Master");
   await React.act(async () => {
     document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
   });

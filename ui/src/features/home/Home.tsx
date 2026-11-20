@@ -1257,12 +1257,16 @@ function MasterHome({
     !readOnly,
     personalBootstrap.identity,
   );
-  // A hosted Master transport can serve a personal conversation. Only an
-  // explicit workspace projection admits the workspace profile link.
-  const workspaceProfile =
-    hosted === false ||
-    (hosted === true && operator === true && homeProjection?.scope === "workspace" &&
-      homeProjection.conversation_id === homeConversation);
+  // A native public board is also hosted, but its daemon returns a native
+  // endpoint and no actor projection. Tenant Home needs a workspace projection
+  // for this conversation; a missing tenant projection proves nothing.
+  const nativePublicMaster = master.status === "ok" && master.data !== null &&
+    !Object.hasOwn(master.data, "actor_identity") &&
+    master.data.provider !== "cadence" && Boolean(master.data.endpoint_kind) &&
+    master.data.endpoint_kind !== "durable_object";
+  const workspaceProfile = hosted === false || (hosted === true && operator === true && (
+    nativePublicMaster || (homeProjection?.scope === "workspace" && homeProjection.conversation_id === homeConversation)
+  ));
   const profileHref =
     actor.scope === "workspace" && actor.read.state === "ready" && masterRow && workspaceProfile
       ? `/agents/${MASTER}?tab=instructions`

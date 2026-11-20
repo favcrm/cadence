@@ -174,6 +174,8 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             announced.clear();
             toast.clear();
             setInbox(null);
+            setNotice(null);
+            setSettingsNotice(null);
             setSettingsOpen(false);
             setPopoverOpen(false);
             popover.current?.close();
@@ -273,6 +275,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   }, [popoverOpen, settingsOpen]);
 
   if (inbox === null) return null;
+  const browserAlertsAvailable = inbox.push.available && pushSupported();
   const total = inbox.unread_total;
   const groups = inbox.groups.filter((g) => filter === "all" || g.unread > 0);
 
@@ -454,11 +457,11 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         <div className="notification-setting notification-browser-alerts">
           <span>
             <strong>{t("Browser alerts")}</strong>
-            {deviceId === null && !(inbox.push.available && pushSupported()) && <small>{t("Browser alerts unavailable")}</small>}
+            {!browserAlertsAvailable && <small>{t("Browser alerts unavailable")}</small>}
           </span>
           {deviceId !== null ? (
             <button type="button" className="lnk" onClick={() => disable(deviceId)}>{t("Turn off browser alerts")}</button>
-          ) : inbox.push.available && pushSupported() ? (
+          ) : browserAlertsAvailable ? (
             <button type="button" className="lnk" onClick={enable}>{t("Enable browser alerts")}</button>
           ) : null}
         </div>
