@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AppScope, AskResult, HostedSessionOptions, HostedState, OperationReply, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
+import type { AppScope, AskResult, HostedSessionInspection, HostedSessionOptions, HostedState, OperationReply, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
 /**
  * One agent conversation, one Durable Object.
  *
@@ -50,6 +50,11 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     ask(prompt: string, operationId?: string, app?: AppScope): Promise<AskResult>;
     /** Map the engine's committed records, including durable input metadata, for the board. */
     transcript(includeThinking: boolean): Promise<ThreadEntry[]>;
+    /**
+     * Inspect the current or a previously observed generation without opening
+     * the engine, submitting work or reading the transcript.
+     */
+    sessionSummary(sessionId?: string): HostedSessionInspection;
     /** Stored runtime records, not expanded presentation entries. Read-only. */
     recordCount(): Promise<number>;
     /** Abort this instance; durable state is retained when it is reconstructed. */

@@ -438,6 +438,25 @@ Terminal failed turns carry only a safe `payload.status`/`payload.error`
 projection. Retry and compaction errors stay hidden while their outcome is
 uncertain; raw provider diagnostics, URLs and keys are not presentation data.
 
+The host can call `HostedSession.sessionSummary()` for the current execution
+generation, or pass a previously returned `sessionId` to recheck it after a
+reset. This read uses committed engine metadata only: it does not open the
+engine, queue work, write logs or return transcript, model, tool or error
+content. Scope the opaque `sessionId` to the host/environment in its index;
+it survives Durable Object eviction and changes only at a proven reset.
+`unobserved` means no generation was found; `unknown` means the evidence
+could not be read. Neither should close an indexed session.
+
+`open` includes idle and does not attest to running or recovered work.
+`reset` closes that generation, but a reset without a recorded timestamp
+leaves `endedAt` null. `startedAt` is the first recorded activity when
+the opening boundary has no clock; `lastActivityAt` is the most recent
+timestamped execution entry. `lastRunFailureCode` is a coarse code for
+the latest run when its failure is attributable to this generation;
+it does not mark the session failed. AgenticOS owns tenant and agent
+labels, ticket/routine completion, and authorization for the summary index
+and any separate transcript lookup.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh

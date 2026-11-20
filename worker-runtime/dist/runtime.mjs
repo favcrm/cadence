@@ -56854,6 +56854,99 @@ function threadEntries(records, includeThinking, budgetProof, settledBudgetProof
   return entries;
 }
 
+// src/session-summary.ts
+var MAX_ID = Number.MAX_SAFE_INTEGER;
+var TIMESTAMP = "json_extract(record, '$.model[0].timestamp')";
+function recordedTime(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+function runFailureCode(reason) {
+  switch (reason) {
+    case "model_error":
+    case "no_model":
+    case "faulted":
+    case "orphaned":
+    case "interrupted":
+    case "restart_limit":
+    case "turn_limit":
+      return reason;
+    default:
+      return null;
+  }
+}
+function resetBetween(sql, min, max, order) {
+  return sql.exec(`SELECT id, ${TIMESTAMP} AS timestamp FROM pi_entries
+      WHERE conversation_id = ? AND id BETWEEN ? AND ? AND head IS NOT NULL AND head = id
+        AND json_extract(record, '$.kind') = ?
+      ORDER BY id ${order} LIMIT 1`, ROOT_CONVERSATION_ID, min, max, RESET_KIND).toArray()[0];
+}
+function activityBetween(sql, min, max, order) {
+  const row = sql.exec(`SELECT ${TIMESTAMP} AS timestamp FROM pi_entries
+      WHERE conversation_id = ? AND id BETWEEN ? AND ?
+        AND json_extract(record, '$.kind') IN (?, 'pi.user', 'pi.assistant', 'pi.tool-result')
+        AND json_type(record, '$.model[0].timestamp') = 'integer'
+        AND ${TIMESTAMP} BETWEEN 1 AND ?
+      ORDER BY id ${order} LIMIT 1`, ROOT_CONVERSATION_ID, min, max, BOARD_MESSAGE_KIND, MAX_ID).toArray()[0];
+  return recordedTime(row?.timestamp);
+}
+function readSessionSummary(sql, objectId, sessionId) {
+  const prefix = `${objectId}:`;
+  try {
+    let anchor = 0;
+    let openedAt = null;
+    let boundary;
+    if (sessionId === undefined) {
+      const reset = resetBetween(sql, 1, MAX_ID, "DESC");
+      if (reset !== undefined) {
+        if (typeof reset.id !== "number" || !Number.isSafeInteger(reset.id) || reset.id <= 0)
+          return { state: "unknown" };
+        anchor = reset.id;
+        openedAt = recordedTime(reset.timestamp);
+      }
+    } else {
+      if (!sessionId.startsWith(prefix))
+        return { state: "unobserved" };
+      const suffix = sessionId.slice(prefix.length);
+      anchor = Number(suffix);
+      if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix)
+        return { state: "unobserved" };
+      if (anchor !== 0) {
+        const reset = resetBetween(sql, anchor, anchor, "ASC");
+        if (reset === undefined)
+          return { state: "unobserved" };
+        openedAt = recordedTime(reset.timestamp);
+      }
+      boundary = resetBetween(sql, anchor + 1, MAX_ID, "ASC");
+    }
+    const upper = typeof boundary?.id === "number" ? boundary.id - 1 : MAX_ID;
+    const run = sql.exec(`SELECT status, json_extract(record, '$.type') AS type,
+              json_extract(record, '$.entry') AS entry,
+              json_extract(record, '$.reason') AS reason
+         FROM pi_submissions
+        WHERE conversation_id = ? AND id BETWEEN ? AND ?
+          AND json_extract(record, '$.type') IN ('input', 'continue')
+        ORDER BY id DESC LIMIT 1`, ROOT_CONVERSATION_ID, anchor + 1, upper).toArray()[0];
+    const startedAt = openedAt ?? activityBetween(sql, anchor + 1, upper, "ASC");
+    if (anchor === 0 && run === undefined && startedAt === null)
+      return { state: "unobserved" };
+    const latest = activityBetween(sql, anchor + 1, upper, "DESC") ?? startedAt;
+    const placedHere = typeof run?.entry === "number" && run.entry > anchor && run.entry <= upper;
+    return {
+      state: "observed",
+      session: {
+        sessionId: `${prefix}${anchor}`,
+        startedAt,
+        lastActivityAt: latest,
+        status: boundary === undefined ? "open" : "reset",
+        endedAt: recordedTime(boundary?.timestamp),
+        lastRunFailureCode: run?.status === "unanswered" && (placedHere || run.type === "continue") ? runFailureCode(run.reason) : null
+      }
+    };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
 // src/hosted-session.ts
 var RESOLVED_MODEL_KEY = "tenant_resolved_model";
 function engineViewChanges(ops) {
@@ -57201,6 +57294,9 @@ data: ${JSON.stringify(entry)}
   async transcript(includeThinking) {
     const conversation = await this.harness.conversation(this.harness.session().id);
     return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message));
+  }
+  sessionSummary(sessionId) {
+    return readSessionSummary(this.ctx.storage.sql, this.ctx.id.toString(), sessionId);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
