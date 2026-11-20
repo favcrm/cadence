@@ -198,8 +198,9 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     /**
      * Inspect durable settlement without opening the engine or waking work.
      * Absence is evidence only; the host must separately fence admission.
+     * Only interactive chat admission may opt in to overlapping a passive summary.
      */
-    settledOperation(operationId: string): Promise<OperationSettlement>;
+    settledOperation(operationId: string, mode?: "chat"): Promise<OperationSettlement>;
     /** Inspect one reply without resending, waking the engine, or reading a transcript. */
     operationReply(operationId: string): Promise<OperationReply>;
     /**

@@ -54704,6 +54704,26 @@ function terminalOutcome(value) {
       return false;
   }
 }
+function passiveSummary(task, state) {
+  if (task.kind !== "pi.compaction" || task.version !== 1 || task.owner !== undefined || task.background !== true || task.abortRequested !== false || state.outcome !== undefined)
+    return false;
+  const input = task.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input) || !("reason" in input) || input.reason !== "threshold" || "instructions" in input)
+    return false;
+  const checkpoint = state.checkpoint;
+  if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+    return false;
+  const request = checkpoint;
+  const active = state.status === "pending" || state.status === "running";
+  if (request.phase === "select")
+    return active;
+  const model = request.model;
+  if (!isEntryId(request.attempt) || !isEntryId(request.tail) || !isEntryId(request.firstKept) || request.firstKept > request.tail || typeof request.maxTokens !== "number" || !Number.isSafeInteger(request.maxTokens) || request.maxTokens < 0 || typeof request.thinkingLevel !== "string" || typeof request.streamOptions !== "object" || request.streamOptions === null || Array.isArray(request.streamOptions) || typeof model !== "object" || model === null || Array.isArray(model) || !("provider" in model) || typeof model.provider !== "string" || !model.provider || !("modelId" in model) || typeof model.modelId !== "string" || !model.modelId)
+    return false;
+  if (request.phase === "summarize")
+    return active;
+  return request.phase === "retry" && typeof request.until === "number" && Number.isFinite(request.until) && (active || state.status === "sleeping" && state.until === request.until);
+}
 function entryHasRole(sql, id, conversationId, role) {
   const rows = sql.exec("SELECT id, conversation_id, record FROM pi_entries WHERE id=?", id).toArray();
   if (rows.length !== 1)
@@ -54712,7 +54732,7 @@ function entryHasRole(sql, id, conversationId, role) {
   const entry = parseRecord(row.record);
   return Number(row.id) === id && Number(row.conversation_id) === conversationId && entry !== null && entry.id === id && entry.conversationId === conversationId && Array.isArray(entry.model) && entry.model.some((message) => typeof message === "object" && message !== null && !Array.isArray(message) && message.role === role);
 }
-function readSubmissionSettlement(sql, conversationId, operationId) {
+function readSubmissionSettlement(sql, conversationId, operationId, allowPassiveSummary = false) {
   const schema = sql.exec(`SELECT name, type FROM sqlite_master
       WHERE name IN ('pi_submissions','pi_tasks','pi_entries','pi_submissions_by_request')
          OR (type='table' AND name GLOB 'pi_*')`).toArray();
@@ -54732,13 +54752,18 @@ function readSubmissionSettlement(sql, conversationId, operationId) {
       const id = Number(row.id);
       const conversation = Number(row.conversation_id);
       const record = parseRecord(row.record);
-      if (!isEntryId(id) || !isEntryId(conversation) || record === null || record.id !== id || record.conversationId !== conversation || typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind || typeof record.version !== "number" || !Object.hasOwn(record, "input") || typeof record.background !== "boolean" || Number(record.background) !== row.background || typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested || row.status !== "terminal")
+      if (!isEntryId(id) || !isEntryId(conversation) || record === null || record.id !== id || record.conversationId !== conversation || typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind || typeof record.version !== "number" || !Object.hasOwn(record, "input") || typeof record.background !== "boolean" || Number(record.background) !== row.background || typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested)
         return { state: "unknown" };
       const state = record.state;
       if (typeof state !== "object" || state === null || Array.isArray(state))
         return { state: "unknown" };
-      const terminal = state;
-      if (terminal.status !== "terminal" || terminal.checkpoint !== undefined || !terminalOutcome(terminal.outcome))
+      const taskState = state;
+      if (taskState.status !== row.status)
+        return { state: "unknown" };
+      if (taskState.status === "terminal") {
+        if (taskState.checkpoint !== undefined || !terminalOutcome(taskState.outcome))
+          return { state: "unknown" };
+      } else if (!allowPassiveSummary || conversation !== conversationId || !passiveSummary(record, taskState))
         return { state: "unknown" };
       taskAfter = id;
     }
@@ -57339,10 +57364,10 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
       compactionFailure: failureSentence(readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)))
     };
   }
-  async settledOperation(operationId) {
+  async settledOperation(operationId, mode) {
     const id = requireOperationId(operationId);
     const conversation = String(ROOT_CONVERSATION_ID);
-    const settlement = readSubmissionSettlement(this.ctx.storage.sql, ROOT_CONVERSATION_ID, id);
+    const settlement = readSubmissionSettlement(this.ctx.storage.sql, ROOT_CONVERSATION_ID, id, mode === "chat");
     if (settlement.state === "settled")
       return {
         state: "settled",
