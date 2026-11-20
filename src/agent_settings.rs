@@ -2,12 +2,13 @@
 //! model defaults, Pi policy, and profile text. `.pi/agents` and
 //! `.claude/agents` under the PM root are generated exports.
 
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapter::registry::{self, EndpointSpec};
 use crate::error::{Error, Result};
+use crate::fd_fs::{self, DirFd};
 use crate::issue::Pm;
 use crate::master;
 use crate::model_defaults::{
@@ -229,10 +231,7 @@ pub fn catalog(_pm_dir: &Path, provider: &str) -> Result<Value> {
         Ok(err(message.to_string()))
     };
     let mut pipe = child.stdout.take().expect("catalog stdout was piped");
-    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
+    if fd_fs::set_nonblocking(pipe.as_fd()).is_err() {
         return fail(&mut child, "catalog stdout could not be made nonblocking");
     }
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -2122,43 +2121,24 @@ fn export_component(name: &str) -> Result<CString> {
     CString::new(name).map_err(|_| Error::rejected("export path contains an interior nul"))
 }
 
-fn open_export_root(pm_dir: &Path) -> Result<Option<OwnedFd>> {
-    let name = CString::new(pm_dir.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("PM directory contains an interior nul"))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
+fn open_export_root(pm_dir: &Path) -> Result<Option<DirFd>> {
+    match DirFd::open_dir(pm_dir) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == ErrorKind::InvalidInput => {
+            Err(Error::rejected("PM directory contains an interior nul"))
         }
-        return Err(Error::from(err));
+        Err(err) => Err(Error::from(err)),
     }
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
-fn kind_at(dir: &OwnedFd, name: &str) -> Result<AtExport> {
+fn kind_at(dir: &DirFd, name: &str) -> Result<AtExport> {
     let c_name = export_component(name)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
+    let st = match dir.fstatat_nofollow(&c_name) {
+        Ok(st) => st,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AtExport::Missing),
+        Err(err) => return Err(Error::from(err)),
     };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(AtExport::Missing);
-        }
-        return Err(Error::from(err));
-    }
     Ok(match st.st_mode & libc::S_IFMT {
         mode if mode == libc::S_IFLNK => AtExport::Symlink,
         mode if mode == libc::S_IFDIR => AtExport::Dir,
@@ -2173,37 +2153,22 @@ enum AtExport {
     Other,
 }
 
-fn open_export_dir(dir: &OwnedFd, name: &str) -> Result<OwnedFd> {
+fn open_export_dir(dir: &DirFd, name: &str) -> Result<DirFd> {
     let c_name = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "{name} is a symlink or not a directory"
-        )));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    dir.open_child_dir(&c_name)
+        .map_err(|_| Error::rejected(format!("{name} is a symlink or not a directory")))
 }
 
-fn mkdir_export(dir: &OwnedFd, name: &str) -> Result<()> {
+fn mkdir_export(dir: &DirFd, name: &str) -> Result<()> {
     let c_name = export_component(name)?;
-    let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o755) };
-    if rc == 0 {
-        return Ok(());
+    match dir.mkdir(&c_name, 0o755) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(Error::from(err)),
     }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == std::io::ErrorKind::AlreadyExists {
-        return Ok(());
-    }
-    Err(Error::from(err))
 }
 
-fn open_or_make(parent: &OwnedFd, name: &str, create: bool) -> Result<Option<OwnedFd>> {
+fn open_or_make(parent: &DirFd, name: &str, create: bool) -> Result<Option<DirFd>> {
     match kind_at(parent, name)? {
         AtExport::Missing if !create => Ok(None),
         AtExport::Missing => {
@@ -2217,7 +2182,7 @@ fn open_or_make(parent: &OwnedFd, name: &str, create: bool) -> Result<Option<Own
     }
 }
 
-fn walk_export_dir(root: &OwnedFd, harness: &str, create: bool) -> Result<Option<OwnedFd>> {
+fn walk_export_dir(root: &DirFd, harness: &str, create: bool) -> Result<Option<DirFd>> {
     let top = if harness == "claude" {
         ".claude"
     } else {
@@ -2229,25 +2194,17 @@ fn walk_export_dir(root: &OwnedFd, harness: &str, create: bool) -> Result<Option
     open_or_make(&first, "agents", create)
 }
 
-fn read_regular_at(dir: &OwnedFd, name: &str) -> Result<Option<String>> {
+fn read_regular_at(dir: &DirFd, name: &str) -> Result<Option<String>> {
     let c_name = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
+    let mut file = match dir.open_readonly_nofollow(&c_name) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(Error::rejected(format!(
+                "{name} is a symlink or cannot be opened"
+            )));
         }
-        return Err(Error::rejected(format!(
-            "{name} is a symlink or cannot be opened"
-        )));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    };
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(Error::rejected(format!("{name} is not a regular file")));
@@ -2288,58 +2245,44 @@ fn export_sync_unknown(error: Error) -> Error {
     ))
 }
 
-fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
+fn write_export_at(dir: &DirFd, name: &str, text: &str) -> Result<()> {
     let cname = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd >= 0 {
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(Error::rejected("export is not a private regular file"));
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error::rejected("export is busy; retry sync"));
-        }
-        let mut previous = String::new();
-        Read::take(&mut file, 1024 * 1024).read_to_string(&mut previous)?;
-        if !previous.starts_with(&format!("---\n# {GEN_MARKER} ")) {
-            return Err(Error::rejected(format!(
-                "{name} is unmanaged; refusing to write it"
-            )));
-        }
-        // Write the validated inode, never a replacement at `name`. Preserve
-        // the ownership header through partial writes; truncate only afterward.
-        file.seek(SeekFrom::Start(0))?;
-        return (|| -> Result<()> {
-            file.write_all(text.as_bytes())?;
-            file.set_len(text.len() as u64)?;
-            file.sync_all()?;
-            let current_fd = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                )
-            };
-            if current_fd < 0 {
-                return Err(Error::rejected("export destination changed during sync"));
+    match dir.open_file_nofollow(&cname, libc::O_RDWR | libc::O_NONBLOCK, 0) {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(Error::rejected("export is not a private regular file"));
             }
-            let current = unsafe { File::from_raw_fd(current_fd) }.metadata()?;
-            if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-                return Err(Error::rejected("export destination changed during sync"));
+            if fd_fs::flock_exclusive_nonblocking(&file).is_err() {
+                return Err(Error::rejected("export is busy; retry sync"));
             }
-            Ok(())
-        })()
-        .map_err(export_sync_unknown);
-    }
-    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-        return Err(Error::rejected("export is a symlink or cannot be opened"));
+            let mut previous = String::new();
+            Read::take(&mut file, 1024 * 1024).read_to_string(&mut previous)?;
+            if !previous.starts_with(&format!("---\n# {GEN_MARKER} ")) {
+                return Err(Error::rejected(format!(
+                    "{name} is unmanaged; refusing to write it"
+                )));
+            }
+            // Write the validated inode, never a replacement at `name`. Preserve
+            // the ownership header through partial writes; truncate only afterward.
+            file.seek(SeekFrom::Start(0))?;
+            return (|| -> Result<()> {
+                file.write_all(text.as_bytes())?;
+                file.set_len(text.len() as u64)?;
+                file.sync_all()?;
+                let current = dir
+                    .open_readonly_nofollow(&cname)
+                    .map_err(|_| Error::rejected("export destination changed during sync"))?
+                    .metadata()?;
+                if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+                    return Err(Error::rejected("export destination changed during sync"));
+                }
+                Ok(())
+            })()
+            .map_err(export_sync_unknown);
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(_) => return Err(Error::rejected("export is a symlink or cannot be opened")),
     }
     let tmp = format!(
         ".{}.{}.tmp",
@@ -2347,44 +2290,25 @@ fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
         uuid::Uuid::new_v4().simple()
     );
     let ctmp = export_component(&tmp)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            ctmp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(
-            "export temp could not be created exclusively",
-        ));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut file = dir
+        .open_file_nofollow(&ctmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o644)
+        .map_err(|_| Error::rejected("export temp could not be created exclusively"))?;
     let written = file
         .write_all(text.as_bytes())
         .and_then(|_| file.sync_all());
     drop(file);
     if written.is_err() {
-        unsafe { libc::unlinkat(dir.as_raw_fd(), ctmp.as_ptr(), 0) };
+        let _ = dir.unlink_child(&ctmp);
         return Err(Error::rejected("export write failed"));
     }
     // Publish only if the destination is still absent; never replace an entry
     // another writer created after the absence check.
-    let rc = unsafe {
-        libc::linkat(
-            dir.as_raw_fd(),
-            ctmp.as_ptr(),
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            0,
-        )
-    };
-    unsafe { libc::unlinkat(dir.as_raw_fd(), ctmp.as_ptr(), 0) };
-    if rc != 0 {
+    let linked = dir.link_child(&ctmp, &cname);
+    let _ = dir.unlink_child(&ctmp);
+    if linked.is_err() {
         return Err(Error::rejected("export destination appeared during sync"));
     }
-    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+    if dir.sync_all().is_err() {
         return Err(export_sync_unknown(Error::rejected(
             "export directory sync failed",
         )));

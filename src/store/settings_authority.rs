@@ -5,18 +5,20 @@
 //! in the same `write_tx`. `pi` NULL is an absent policy (`None`): every Pi
 //! launch denies. The table is not created from a request handler.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::File;
-use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 use rusqlite::params;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 use crate::model_defaults::ModelDefaults;
 use crate::pi_policy::PiPolicy;
 
@@ -600,48 +602,31 @@ fn c_name(name: &str) -> Result<CString> {
 
 /// The configured PM directory may itself be a symlink the operator chose.
 /// Everything opened underneath it is no-follow.
-fn open_pm_root(pm_dir: &Path) -> Result<Option<OwnedFd>> {
-    let name = CString::new(pm_dir.as_os_str().as_bytes())
-        .map_err(|_| import_refused("pm dir contains an interior nul; import refused"))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(import_refused(format!(
+fn open_pm_root(pm_dir: &Path) -> Result<Option<DirFd>> {
+    match DirFd::open_dir(pm_dir) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == ErrorKind::InvalidInput => Err(import_refused(
+            "pm dir contains an interior nul; import refused",
+        )),
+        Err(err) => Err(import_refused(format!(
             "cannot open {}: {err}; import refused",
             pm_dir.display()
-        )));
+        ))),
     }
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
-fn at_kind(dir: &OwnedFd, name: &str) -> Result<AtKind> {
+fn at_kind(dir: &DirFd, name: &str) -> Result<AtKind> {
     let c_name = c_name(name)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(AtKind::Missing);
+    let st = match dir.fstatat_nofollow(&c_name) {
+        Ok(st) => st,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AtKind::Missing),
+        Err(err) => {
+            return Err(import_refused(format!(
+                "cannot stat {name}: {err}; import refused"
+            )));
         }
-        return Err(import_refused(format!(
-            "cannot stat {name}: {err}; import refused"
-        )));
-    }
+    };
     Ok(match st.st_mode & libc::S_IFMT {
         mode if mode == libc::S_IFLNK => AtKind::Symlink,
         mode if mode == libc::S_IFDIR => AtKind::Dir,
@@ -650,39 +635,17 @@ fn at_kind(dir: &OwnedFd, name: &str) -> Result<AtKind> {
     })
 }
 
-fn open_dir_at(dir: &OwnedFd, name: &str) -> Result<OwnedFd> {
+fn open_dir_at(dir: &DirFd, name: &str) -> Result<DirFd> {
     let c_name = c_name(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(import_refused(format!(
-            "{name} is not a real directory; import refused"
-        )));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    dir.open_child_dir(&c_name)
+        .map_err(|_| import_refused(format!("{name} is not a real directory; import refused")))
 }
 
-fn open_file_at(dir: &OwnedFd, name: &str) -> Result<File> {
+fn open_file_at(dir: &DirFd, name: &str) -> Result<File> {
     let c_name = c_name(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(import_refused(format!(
-            "cannot open {name}: {err}; import refused"
-        )));
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = dir
+        .open_readonly_nofollow(&c_name)
+        .map_err(|err| import_refused(format!("cannot open {name}: {err}; import refused")))?;
     let meta = file
         .metadata()
         .map_err(|err| import_refused(format!("cannot stat {name}: {err}; import refused")))?;
@@ -707,50 +670,19 @@ fn read_limited(mut file: File, label: &str, cap: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn dir_names(dir: &OwnedFd) -> Result<Vec<String>> {
-    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-    if dup < 0 {
-        return Err(import_refused("cannot list agents; import refused"));
-    }
-    let ptr = unsafe { libc::fdopendir(dup) };
-    if ptr.is_null() {
-        unsafe { libc::close(dup) };
-        return Err(import_refused("cannot list agents; import refused"));
-    }
+fn dir_names(dir: &DirFd) -> Result<Vec<String>> {
+    let iter = dir
+        .read_dir()
+        .map_err(|_| import_refused("cannot list agents; import refused"))?;
     let mut names = Vec::new();
-    loop {
-        #[cfg(target_os = "linux")]
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            *libc::__error() = 0;
-        }
-        let ent = unsafe { libc::readdir(ptr) };
-        if ent.is_null() {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error().unwrap_or(0) != 0 {
-                unsafe { libc::closedir(ptr) };
-                return Err(import_refused(format!(
-                    "cannot list agents: {err}; import refused"
-                )));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
-        let Ok(name) = name.to_str() else {
-            unsafe { libc::closedir(ptr) };
-            return Err(import_refused(
-                "agents entry is not valid UTF-8; import refused",
-            ));
-        };
-        if name == "." || name == ".." {
-            continue;
-        }
-        names.push(name.to_string());
+    for entry in iter {
+        let raw = entry
+            .map_err(|err| import_refused(format!("cannot list agents: {err}; import refused")))?;
+        let name = raw
+            .into_string()
+            .map_err(|_| import_refused("agents entry is not valid UTF-8; import refused"))?;
+        names.push(name);
     }
-    unsafe { libc::closedir(ptr) };
     Ok(names)
 }
 
