@@ -344,6 +344,7 @@ export interface MemberAssistProfileRequest {
 export interface InstructionsRead<R> {
   instructions: string | null;
   revision: R;
+  built_in_instruction_tokens?: number;
 }
 
 export interface MemberAssistProfileResult extends MemberAssistState {

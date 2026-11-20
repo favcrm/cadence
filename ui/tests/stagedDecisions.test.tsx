@@ -43,7 +43,7 @@ const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import(".
 const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
+const { parseStagedRow, askedBy, sourceLine, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
 
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
@@ -189,6 +189,60 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   await click(c.querySelector(".todo-hit"));
   assert(!c.hasAttribute("data-open") && text(c) === text(v.cards()[0]) && !c.querySelector("dl, pre"), "nothing expands in the rail");
   assert(!document.querySelector('.crm-drawer[data-drawer="review"]'), "not the issue-backed drawer");
+  await v.done();
+}
+
+// AOS-660: fixture mirrored byte-for-byte from AgenticOS packages/contracts/fixtures.
+{
+  const fixture = JSON.parse(require("fs").readFileSync(
+    `${require("process").cwd()}/../tests/fixtures/agenticos/assistant-action-proposers.json`, "utf8",
+  )) as {
+    personal: { id: string; proposer: { scope: "personal"; label: string } };
+    workspace: { id: string; proposer: { scope: "workspace"; label: string } };
+    legacy: { id: string };
+  };
+  const personal = fixture.personal.proposer;
+  const workspace = fixture.workspace.proposer;
+  for (const proposer of [personal, workspace]) {
+    const row = parseStagedRow(customer("scoped", { origin: null, proposer }))!;
+    assert(row.proposer?.scope === proposer.scope && askedBy(row) === proposer.label, "scoped proposer parses");
+    assert(sourceLine(row) === `CRM · ${proposer.label}`, "rail uses the same attribution");
+  }
+  const issue = parseStagedRow({ ...issueRow("issue"), proposer: workspace })!;
+  assert(askedBy(issue) === workspace.label, "issue proposal carries scoped attribution");
+  const connected = parseStagedRow({
+    id: "connected", tool: "connected_effect", status: "pending", createdAt: 1, proposer: personal,
+    input: { slug: "gmail_send", toolkit: "gmail", account: "a@b.test", connection_id: "c", effect: "send", args: "{}" },
+  })!;
+  assert(askedBy(connected) === personal.label, "connected effect carries scoped attribution");
+  for (const proposer of [undefined, null, {}, { scope: "other", label: "Wrong" }, { scope: "personal", label: "  " }, { scope: "workspace", label: 42 }]) {
+    const row = parseStagedRow(customer("unknown", { origin: null, proposer }))!;
+    assert(row.proposer === null && askedBy(row) === null && sourceLine(row) === "CRM", "invalid or absent proposer is unknown");
+  }
+  const cli = parseStagedRow(customer("cli", { proposer: personal }))!;
+  assert(cli.proposer === null && askedBy(cli) === "Atlas (agent)", "CLI origin wins over conflicting assistant metadata");
+  const malformedOrigin = parseStagedRow(customer("unknown-origin", { origin: {}, proposer: personal }))!;
+  assert(askedBy(malformedOrigin) === null, "malformed origin does not expose a potentially different proposer");
+
+  actions = [
+    customer(fixture.personal.id, { origin: null, ...fixture.personal }),
+    customer(fixture.workspace.id, { origin: null, ...fixture.workspace }),
+    customer(fixture.legacy.id, { origin: null, ...fixture.legacy }),
+  ];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 3, "scoped and legacy cards render"));
+  assert(text(v.cards()[0].querySelector(".todo-meta")).includes(personal.label), "personal proposer on Home");
+  assert(text(v.cards()[1].querySelector(".todo-meta")).includes(workspace.label), "workspace proposer on Home");
+  assert(!text(v.cards()[2]).includes(personal.label) && !text(v.cards()[2]).includes(workspace.label), "legacy card does not guess a proposer");
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "scoped detail opens"));
+  assert(text(drawerEl()!.querySelector(".dx-asked")).includes(personal.label), "detail shows personal proposer");
+  assert(text(drawerEl()).includes(`${personal.label}'s note`), "note uses the same proposer");
+  await click(labelled(drawerEl()!, "Overview"));
+  assert(text(drawerEl()).includes(personal.label), "overview shows personal proposer");
+  await click(labelled(drawerEl()!, "Not now"));
+  await settle(() => assert(text(drawerEl()!.querySelector(".dx-asked")).includes(workspace.label), "next detail shows workspace proposer"));
+  assert(!text(drawerEl()).includes(personal.label), "next detail does not leak previous proposer");
   await v.done();
 }
 

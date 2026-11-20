@@ -43,7 +43,7 @@ export default function MyAssistantPage({
     onSaved: () => undefined,
     toast: onToast,
   });
-  const context = contextOf(doc.draft ?? doc.served ?? "", doc.kind, doc.applies);
+  const context = contextOf(doc.draft ?? doc.served ?? "", doc.kind, doc.applies, doc.builtInInstructionTokens);
   const [own, setOwn] = useState<{ name: string | null; look: string } | null>(null);
   useEffect(() => {
     let live = true;

@@ -518,6 +518,13 @@ the address that received it, choose **Join company** to accept, then choose
 opens that workspace's board. Nothing on this path creates a credential,
 registers an agent or installs a CLI.
 
+In **Agents**, members can open their own assistant; workspace owners can also
+open the workspace Master. The teammate directory shows who has an assistant
+without linking to their private profile or instructions. In **Instructions →
+Context**, built-in and managed instructions have separate estimates. A board
+that does not report a built-in estimate shows **Not counted**; the built-in text
+is not displayed.
+
 If the browser cannot join, the cause changes the next step:
 
 - **Wrong account** — sign out and sign in with the address that received the
@@ -807,6 +814,10 @@ explicit handle; do not change it merely because an outcome is uncertain.
 For a staged write, the receipt's status is the outcome: `pending` awaits an
 owner, `applied` was written, and `denied` or `failed` exits nonzero while
 keeping the receipt on stdout.
+
+On Home, a staged decision names the proposer when the board can verify the
+assistant that staged it. Older records without provenance stay generic; a
+recorded CLI or MCP actor keeps its original attribution.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action

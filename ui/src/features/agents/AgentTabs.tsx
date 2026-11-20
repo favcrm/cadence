@@ -497,7 +497,7 @@ function History({ c }: { c: TabContext }) {
 function Instructions({ c }: { c: TabContext }) {
   const t = useTranslate();
   const doc = c.doc;
-  const context = contextOf(doc.draft ?? doc.served ?? "", doc.kind, doc.applies);
+  const context = contextOf(doc.draft ?? doc.served ?? "", doc.kind, doc.applies, doc.builtInInstructionTokens);
   const editor = (reason?: string) => (
     <div className="ap-body">
       {reason && <Note>{t(reason)}</Note>}

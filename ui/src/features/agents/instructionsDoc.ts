@@ -34,6 +34,7 @@ export const isOwnKind = (kind: DocKind | null): kind is OwnKind => kind === "wo
 export interface OwnDoc {
   text: string;
   revision: string | number;
+  builtInInstructionTokens?: number;
 }
 
 /** The calls behind those two kinds. A board without the routes answers
@@ -175,7 +176,7 @@ export async function saveHosted(deps: DocDeps, base: StoredAgentProfile, text: 
  *  writes at THAT revision and a newer one is refused again, not overwritten. */
 export async function saveOwn(deps: OwnDeps, kind: OwnKind, base: OwnDoc, text: string): Promise<DocOutcome> {
   try {
-    const own = await deps.write(kind, base, text);
+    const own = { ...await deps.write(kind, base, text), builtInInstructionTokens: base.builtInInstructionTokens };
     return { kind: "saved", text: own.text, profile: null, applies: null, own };
   } catch (error) {
     const out = failure(error, kind);
@@ -295,22 +296,23 @@ export interface ContextLine {
   count?: number;
 }
 
-/** What loads, said only where it is true. Only the document is measured, and
- *  only as an estimate; the rest is named and not counted. Hosted conversations
- *  are not bound to a profile, and an agent whose last save was not delivered
- *  does not read the text, so neither is told "every session starts with" it. */
-export function contextOf(text: string, kind: DocKind | null, applies: string | null): { heading: string; lines: ContextLine[] } {
+/** What loads, with estimates only where provided or calculated from the document.
+ *  Hosted conversations are not bound to a profile, and an agent whose last
+ *  save was not delivered does not read the text. */
+export function contextOf(text: string, kind: DocKind | null, applies: string | null, builtInTokens?: number): { heading: string; lines: ContextLine[] } {
   const rest: ContextLine[] = [
     { name: "Platform and workspace rules", size: "Not counted" },
     { name: "Skill names and descriptions", size: "Not counted" },
     { name: "Tool definitions", size: "Not counted" },
   ];
   if (isOwnKind(kind)) {
-    // Built-in text is never shown, so it is named and not counted.
+    const known = Number.isSafeInteger(builtInTokens) && builtInTokens! >= 0;
     return {
       heading: "Made up of",
       lines: [
-        { name: "Built-in instructions", size: "Not counted" },
+        known
+          ? { name: "Built-in instructions", size: "About {n} tokens (estimate)", count: builtInTokens }
+          : { name: "Built-in instructions", size: "Not counted" },
         { name: kind === "workspace" ? "Owner-managed instructions" : "Your instructions", size: "About {n} tokens (estimate)", count: estimateTokens(text) },
         ...rest,
       ],

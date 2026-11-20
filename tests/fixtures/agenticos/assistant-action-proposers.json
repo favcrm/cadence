@@ -1,0 +1,15 @@
+{
+  "personal": {
+    "id": "personal",
+    "proposer": { "scope": "personal", "label": "Private assistant name" }
+  },
+  "workspace": {
+    "id": "workspace",
+    "proposer": { "scope": "workspace", "label": "Company assistant" }
+  },
+  "legacy": { "id": "legacy" },
+  "crossMemberRefusal": {
+    "status": 404,
+    "body": { "ok": false, "error": { "code": "not_found", "message": "Unknown conversation." } }
+  }
+}

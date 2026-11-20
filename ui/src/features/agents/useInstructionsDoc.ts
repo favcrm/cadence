@@ -35,12 +35,13 @@ export const liveDeps: DocDeps = {
  *  identity fields so separately edited name, tone and look are preserved. */
 export const liveOwnDeps: OwnDeps = {
   read: async (kind) => {
-    if (kind === "personal") {
-      const r = await api.memberAssistInstructions();
-      return { text: r.instructions ?? "", revision: r.revision };
-    }
-    const r = await api.masterInstructions();
-    return { text: r.instructions ?? "", revision: r.revision };
+    const r = kind === "personal" ? await api.memberAssistInstructions() : await api.masterInstructions();
+    const tokens = r.built_in_instruction_tokens;
+    return {
+      text: r.instructions ?? "",
+      revision: r.revision,
+      ...(Number.isSafeInteger(tokens) && tokens! >= 0 ? { builtInInstructionTokens: tokens } : {}),
+    };
   },
   write: async (kind, base, text) => {
     if (kind === "personal") {
@@ -79,6 +80,7 @@ export interface InstructionsDoc {
   read: "idle" | "reading" | "failed" | "ready" | "unsupported";
   /** The text the board holds, as of the last read or save. */
   served: string | null;
+  builtInInstructionTokens?: number;
   draft: string | null;
   setDraft: (text: string | null) => void;
   phase: DocPhase;
@@ -326,6 +328,9 @@ export function useInstructionsDoc(opts: {
     kind,
     read: state,
     served,
+    builtInInstructionTokens: isOwnKind(kind)
+      ? (phase === "conflict" && theirsOwn ? theirsOwn : own)?.builtInInstructionTokens
+      : undefined,
     draft,
     setDraft,
     phase,
