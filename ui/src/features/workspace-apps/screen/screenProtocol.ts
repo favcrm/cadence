@@ -53,6 +53,7 @@ export type ChildToHost =
   | { v: 1; op: "state"; data: string }
   | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
+  | { v: 2; op: "whatsapp-compose"; conversation_id: string | null }
   | AudioRequest
   | AudioSessionRequest
   | CallRequest
@@ -218,6 +219,10 @@ export interface ReadObservation { operation: string; args: ActionArgs; data: un
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
 /** Host-selected presentation locale only (`"en" | "zh-TW"`); never an operation or permission. */
 export const SCREEN_LOCALE_V1 = "screen-locale.v1";
+/** Selects an existing thread for a board-owned composer, not a service verb. */
+export const SCREEN_WHATSAPP_COMPOSE_V1 = "screen-whatsapp-compose.v1";
+export const WHATSAPP_COMPOSE_HASH = "#cadence-whatsapp-compose-v1";
+const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.us)$/;
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
 /** Headless inline host-mediated audio capture/upload session streaming (`screen-audio.v2`). */
@@ -478,7 +483,7 @@ export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -889,7 +894,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -960,6 +965,10 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   if (Object.keys(d).sort().join() === "op,unsaved,v" && d.v === 2 && d.op === "leave" &&
       typeof d.unsaved === "boolean") {
     return { v: 2, op: "leave", unsaved: d.unsaved };
+  }
+  if (Object.keys(d).sort().join() === "conversation_id,op,v" && d.v === 2 && d.op === "whatsapp-compose" &&
+      (d.conversation_id === null || typeof d.conversation_id === "string" && LINKED_WHATSAPP_CHAT.test(d.conversation_id))) {
+    return { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {

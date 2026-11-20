@@ -1,0 +1,59 @@
+.wa-reply-dock {
+  flex: none;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.4rem;
+  padding: 0.4rem 0.75rem 0.75rem;
+}
+
+.wa-reply-dock > * {
+  box-sizing: border-box;
+  width: min(100%, 44rem);
+  margin-inline: auto;
+}
+
+.wa-reply-card {
+  border-radius: 1.125rem;
+  box-shadow: 0 3px 12px rgb(0 0 0 / 16%);
+}
+
+.wa-reply-card textarea { box-sizing: border-box; }
+
+.wa-reply-to, .wa-reply-status, .wa-reply-hint {
+  margin-block: 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  overflow-wrap: anywhere;
+}
+
+.wa-reply-to bdi { color: var(--color-ink-100); }
+
+.wa-reply-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.6rem;
+}
+
+.wa-reply-status > p { margin: 0; }
+.wa-reply-tools { justify-content: flex-end; }
+.wa-reply-hint { margin-inline-end: auto; }
+
+.wa-reply-send {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 2.125rem;
+  aspect-ratio: 1;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  cursor: pointer;
+}
+
+.wa-reply-send:not(:disabled):hover { filter: brightness(1.12); }
+.wa-reply-send:disabled { background: var(--color-ink-700); color: var(--color-ink-400); cursor: default; }
+.wa-reply-send:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }

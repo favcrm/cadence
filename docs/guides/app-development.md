@@ -328,6 +328,15 @@ from `cadence-app-toolchain-v0.3.20`; `app-kit.lock.json` pins every file.
 `screen-records.v1` plus `screen-startup`, with the app owning the projection
 and the host owning effects and approval.
 
+**WhatsApp Business.** On an owner mount that offers the WhatsApp reply composer,
+the installed bundle may nominate an existing linked-device conversation. The
+board verifies the recipient and owns both the draft and the Send control.
+The send uses the existing one-time confirmation and delivery receipt; status
+checks never resend. Within the same board session, switching threads preserves
+an uncertain reply or the latest accepted direct reply still awaiting delivery.
+Only uncertainty pauses sending. Recovery keeps no message text or confirmation
+token. Older boards and the Official API keep the approval card.
+
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is
 not.
