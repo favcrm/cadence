@@ -187,6 +187,11 @@ portal and API.
    AgenticOS workspace owner. Keep the existing signed-release and custody
    enablement policy; no sign-in unlocks custody, authorizes a model/tool call,
    or grants any billing permission by itself.
+5. For qualification, verify the one-use entry handoff and saved encrypted
+   credential on the private entry host before enabling a real provider call.
+   Sign out of the original AgenticOS session and verify that an already-open
+   entry form can no longer submit. Qualify the provider, tools and billing
+   independently; a ready guest by itself does not prove any of them.
 
 Loss of the exact original AgenticOS session, owner membership, or deployment
 registration closes protected access. An unavailable platform refuses public

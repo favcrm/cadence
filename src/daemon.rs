@@ -165,13 +165,6 @@ mod board_producer_golden;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod credential_entry_rpc;
-/// CAD-1128: the `connection_custody_*` operator verbs.
-pub(crate) mod custody_rpc;
-pub(crate) mod native_model_turn;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) mod protected_connections;
 #[cfg(all(
     test,
     feature = "test-seam",
@@ -179,6 +172,13 @@ pub(crate) mod protected_connections;
     target_arch = "x86_64"
 ))]
 mod credential_entry_fixture;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod credential_entry_rpc;
+/// CAD-1128: the `connection_custody_*` operator verbs.
+pub(crate) mod custody_rpc;
+pub(crate) mod native_model_turn;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod protected_connections;
 #[cfg(all(
     test,
     feature = "test-seam",
