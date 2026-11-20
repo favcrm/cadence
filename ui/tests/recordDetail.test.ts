@@ -56,7 +56,7 @@ const layout = recordLayout(model!);
 check(layout?.view === "detail", "and lays out as a detail");
 const detail = (layout as any).detail;
 equal([detail.name, detail.address, detail.title, detail.to, detail.attachments, detail.source, detail.account], ["Mei Chan", "mei@harbour.example", "Re: Invoice INV-0140", "ops@example.test", ["INV-0140.pdf"], "Gmail", "ops@example.test"], "detail fields");
-equal([detail.star, detail.unread, detail.chips, detail.truncated], [true, true, [], false], "label mapping: IMPORTANT is the star, UNREAD hidden but marks unread");
+equal([detail.star, detail.unread, detail.chips, detail.truncated], [true, false, [], false], "label mapping: IMPORTANT is the star");
 check(detail.body.startsWith("Hi Chris,\n\n") && detail.time.instant === Date.parse("2026-11-18T09:41:00Z"), "the body keeps its line breaks and the date parses");
 for (const bad of fixture("record-ref-detail-invalid")) {
   equal(parseRecordRef(entryOf(bad.entry)), null, `invalid fixture rejected: ${bad.case}`);
@@ -76,13 +76,17 @@ const state = mergePage(null, { thread: { id: "t" }, entries: [{ seq: 1, role: "
 const item: any = threadItems(state).find((i) => i.type === "record");
 const card = html(createElement(RecordCard, { entry: item.entry }));
 check(card.includes('data-record-view="detail"') && card.includes("recordcard-detail"), "a detail card renders the compact card");
-check(card.includes("data-unread") && card.includes("recordcard-star"), "unread and star show");
+check(card.includes("recordcard-star"), "the star shows");
+const unreadMail = clone(valid);
+unreadMail.payload.items[0].label_ids = ["IMPORTANT", "UNREAD"];
+const unreadHtml = html(createElement(RecordCard, { entry: entryOf(unreadMail, 6) }));
+check(unreadHtml.includes("data-unread") && unreadHtml.includes("Unread") && !card.includes("data-unread"), "the unread rule marks the card");
 check(card.includes("2 attachments") && card.includes("data-record-open") && card.includes(">Open<"), "attachment count and Open");
 check(!card.includes("<img") && !card.includes("<script") && !card.includes("<a ") && !card.includes("<b>"), "third-party text is escaped, never linked");
 check(card.includes("&lt;img") && !card.includes("A".repeat(300)) && !card.includes("N".repeat(301)), "values are plain and capped");
 check(!card.includes("Ask for more") && !card.includes("data-record-truncated"), "a detail card has no list footer");
 const plain = html(createElement(RecordCard, { entry: entryOf(valid, 5) }));
-check(plain.includes("Mei Chan") && plain.includes("mei@harbour.example") && plain.includes("Re: Invoice INV-0140") && plain.includes("1 attachment") && plain.includes("Thanks for the invoice"), "compact card content");
+check(plain.includes("Mei Chan") && plain.includes("mei@harbour.example") && plain.includes("Re: Invoice INV-0140") && plain.includes("1 attachment") && plain.includes("Thanks for sending INV-0140"), "compact card content");
 check(!plain.includes("\n\nThanks"), "the preview is one flowed paragraph");
 // A malformed detail card is the text line, never a half card.
 const bad = clone(valid);
@@ -124,7 +128,7 @@ function canvasTab(ref: any): any {
   return { id: ref.id, kind: "record", title: ref.title, record: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null };
 }
 const reader = read(view);
-check(reader.includes("Mei Chan &lt;mei@harbour.example&gt;") && reader.includes("ops@example.test") && reader.includes("Thanks for the invoice"), "header and body");
+check(reader.includes("Mei Chan &lt;mei@harbour.example&gt;") && reader.includes("ops@example.test") && reader.includes("Thanks for sending INV-0140"), "header and body");
 check(reader.includes('<li class="rv-file"') && reader.includes("INV-0140.pdf") && !reader.includes("<a ") && !reader.includes("href"), "attachment chips are names, not links");
 check(reader.includes("From Gmail · ops@example.test · read-only"), "footer names toolkit, account and read-only");
 check(!reader.includes("data-record-truncated"), "no truncation note on a full body");

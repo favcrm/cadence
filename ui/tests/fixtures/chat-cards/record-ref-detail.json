@@ -1,7 +1,7 @@
 {
   "role": "agent",
   "kind": "record_ref",
-  "text": "Gmail \u00b7 Re: Invoice INV-0140",
+  "text": "Gmail · Re: Invoice INV-0140",
   "payload": {
     "v": 1,
     "toolkit": "gmail",
@@ -10,25 +10,6 @@
     "toolkit_label": "Gmail",
     "account": "ops@example.test",
     "view": "detail",
-    "roles": {
-      "title": "subject",
-      "actor": "from",
-      "to": "to",
-      "cc": "cc",
-      "time": "date",
-      "body": "body_text",
-      "attachments": "attachment_names",
-      "labels": {
-        "IMPORTANT": "\u2605",
-        "UNREAD": null
-      },
-      "unread": {
-        "key": "label_ids",
-        "values": [
-          "UNREAD"
-        ]
-      }
-    },
     "items": [
       {
         "subject": "Re: Invoice INV-0140",
@@ -36,13 +17,12 @@
         "to": "ops@example.test",
         "cc": "",
         "date": "2026-11-18T09:41:00Z",
-        "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+        "body_text": "Hi Chris,\n\nThanks for sending INV-0140. We will pay it on Friday.\n\nBest,\nMei",
         "attachment_names": [
           "INV-0140.pdf"
         ],
         "label_ids": [
-          "IMPORTANT",
-          "UNREAD"
+          "IMPORTANT"
         ]
       }
     ],
@@ -96,6 +76,25 @@
         "untrusted": false
       }
     ],
+    "roles": {
+      "title": "subject",
+      "actor": "from",
+      "to": "to",
+      "cc": "cc",
+      "time": "date",
+      "body": "body_text",
+      "attachments": "attachment_names",
+      "labels": {
+        "IMPORTANT": "★",
+        "UNREAD": null
+      },
+      "unread": {
+        "key": "label_ids",
+        "values": [
+          "UNREAD"
+        ]
+      }
+    },
     "truncated": false
   }
 }
