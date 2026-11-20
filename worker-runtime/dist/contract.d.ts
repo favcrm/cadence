@@ -393,6 +393,27 @@ export interface HostedState {
      */
     readonly compactionFailure: string | null;
 }
+/** A known engine failure of the latest run, not a terminal session outcome. */
+export type HostedRunFailureCode = "model_error" | "no_model" | "faulted" | "orphaned" | "interrupted" | "restart_limit" | "turn_limit";
+/** Content-free durable evidence for one hosted execution generation. */
+export interface HostedSessionSummary {
+    /** Opaque and stable within the host across eviction and subsequent operations. */
+    readonly sessionId: string;
+    /** First and latest recorded activity, in Unix milliseconds. Null if unrecorded. */
+    readonly startedAt: number | null;
+    readonly lastActivityAt: number | null;
+    /** Open does not imply running. Reset is a verified boundary, not a successful run. */
+    readonly status: "open" | "reset";
+    /** Time of the closing reset, if that reset recorded a time. */
+    readonly endedAt: number | null;
+    readonly lastRunFailureCode: HostedRunFailureCode | null;
+}
+export type HostedSessionInspection = {
+    readonly state: "observed";
+    readonly session: HostedSessionSummary;
+} | {
+    readonly state: "unobserved" | "unknown";
+};
 /** Shown when a blocking compaction failed and its run ended without an answer. */
 export declare const COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
 /** The board sentence for a failed blocking compaction, by reason category. */

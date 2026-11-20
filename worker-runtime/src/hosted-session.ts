@@ -22,6 +22,7 @@ import type {
   AppScope,
   AskResult,
   GenerationIdentity,
+  HostedSessionInspection,
   HostedSessionOptions,
   HostedState,
   OperationReply,
@@ -82,6 +83,7 @@ import { runtimeProfile } from "./profile.ts";
 import { runtimeSkillSources } from "./workspace-skills.ts";
 import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
+import { readSessionSummary } from "./session-summary.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
@@ -619,6 +621,18 @@ export class HostedSession<
       this.options.projectThread,
       (entry, message) => this.contextBudgetProofs.matches(entry, message),
       (entry, message) => this.contextBudgetProofs.settled(entry, message),
+    );
+  }
+
+  /**
+   * Inspect the current or a previously observed generation without opening
+   * the engine, submitting work or reading the transcript.
+   */
+  sessionSummary(sessionId?: string): HostedSessionInspection {
+    return readSessionSummary(
+      this.ctx.storage.sql as unknown as TaskSql,
+      this.ctx.id.toString(),
+      sessionId,
     );
   }
 

@@ -123,10 +123,11 @@ async function session(
       return { toArray: () => [] };
     },
   };
+  const id = { name: "conversation", toString: () => "test-object-id" };
   const requests: RequestRecord[] = [];
   let toolExecutions = 0;
   const hosted = new HostedSession(
-    { id: { name: "conversation" }, storage: { sql, get: async () => undefined } } as never,
+    { id, storage: { sql, get: async () => undefined } } as never,
     {} as never,
     {
       modelAlias: "default",
@@ -196,6 +197,10 @@ async function session(
   let operations = 0;
   return {
     hosted, requests, toolExecutions: () => toolExecutions,
+    reset: () => conversation.reset(undefined, BACKGROUND_CONTEXT),
+    inspectReconstructed: (readSql: typeof sql = sql) => (Object.assign(Object.create(HostedSession.prototype), {
+      ctx: { id, storage: { sql: readSql } },
+    }) as InstanceType<typeof HostedSession>).sessionSummary(),
     async submit(content: string) {
       const id = `operation-${++operations}`;
       return conversation.submit({
@@ -205,6 +210,73 @@ async function session(
     },
   };
 }
+
+describe("hosted session summaries", () => {
+  it("keeps a whole generation across operations and eviction, and closes it only on reset", async () => {
+    const run = await session(() => answer("private answer"));
+    expect(run.hosted.sessionSummary()).toEqual({ state: "unobserved" });
+    await (await run.submit("private first prompt")).wait(BACKGROUND_CONTEXT);
+    const first = run.hosted.sessionSummary();
+    if (first.state !== "observed") throw new Error("expected first session");
+    expect(first.session.startedAt).toBeGreaterThan(0);
+    await (await run.submit("private second prompt")).wait(BACKGROUND_CONTEXT);
+    const beforeReset = run.hosted.sessionSummary();
+    if (beforeReset.state !== "observed") throw new Error("expected same session");
+    expect(beforeReset.session).toEqual({
+      ...first.session,
+      lastActivityAt: expect.any(Number),
+      status: "open",
+      endedAt: null,
+      lastRunFailureCode: null,
+    });
+    expect(beforeReset.session.lastActivityAt!).toBeGreaterThanOrEqual(first.session.lastActivityAt!);
+    expect(run.inspectReconstructed()).toEqual(beforeReset);
+    expect(run.hosted.sessionSummary("different-object:0")).toEqual({ state: "unobserved" });
+
+    await run.reset();
+    const fresh = run.hosted.sessionSummary();
+    if (fresh.state !== "observed") throw new Error("expected reset generation");
+    expect(fresh.session.sessionId).not.toBe(first.session.sessionId);
+    expect(fresh.session.startedAt).toBeNull(); // No timestamp on a bare reset.
+    expect(run.hosted.sessionSummary(first.session.sessionId)).toEqual({
+      state: "observed",
+      session: { ...beforeReset.session, status: "reset", endedAt: null },
+    });
+    await (await run.submit("private fresh prompt")).wait(BACKGROUND_CONTEXT);
+    const active = run.hosted.sessionSummary();
+    if (active.state !== "observed") throw new Error("expected fresh session");
+    expect(active.session.sessionId).toBe(fresh.session.sessionId);
+    expect(active.session.startedAt).toBeGreaterThan(0);
+    expect(JSON.stringify([beforeReset, active])).not.toContain("private");
+  });
+
+  it("reports a safe run failure without calling the whole session failed", async () => {
+    const run = await session(() => Response.json({
+      error: { message: "private gateway diagnostics" },
+    }, { status: 403 }));
+    await (await run.submit("private input")).wait(BACKGROUND_CONTEXT);
+    expect(run.hosted.sessionSummary()).toEqual({
+      state: "observed",
+      session: {
+        sessionId: expect.any(String),
+        startedAt: expect.any(Number),
+        lastActivityAt: expect.any(Number),
+        status: "open",
+        endedAt: null,
+        lastRunFailureCode: "model_error",
+      },
+    });
+  });
+
+  it("keeps an unavailable summary read distinct from no execution evidence", async () => {
+    const run = await session(() => answer("answer"));
+    expect(run.inspectReconstructed({ exec() { throw new Error("SQL unavailable"); } }))
+      .toEqual({ state: "unknown" });
+    await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
+    expect(run.requests).toHaveLength(1);
+    expect(run.hosted.sessionSummary().state).toBe("observed");
+  });
+});
 
 const LIMIT = 256 * 1024;
 const HTML_CHARS = 261_000;
