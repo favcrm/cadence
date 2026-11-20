@@ -23,7 +23,7 @@
 .agents-settings .tab.on { color: var(--color-accent); border-bottom-color: var(--color-accent); }
 .agents-settings .tabn { display: inline-block; margin-left: 6px; padding: 0 0.3rem; border-radius: 0.2rem; background: var(--color-ink-800); color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
 .agents-settings .pane { padding-top: 16px; }
-.agents-settings .card { border: 1px solid var(--color-ink-700); background: var(--color-ink-850); border-radius: 0.5rem; overflow: hidden; }
+.agents-settings .card { background: var(--color-ink-850); border-radius: 0.5rem; overflow: hidden; }
 .agents-settings .hrow, .agents-settings .prow { display: grid; gap: 14px; align-items: center; padding: 11px 14px; border-bottom: 1px solid var(--color-ink-800); }
 .agents-settings .hrow { grid-template-columns: minmax(0, 13rem) minmax(0, 1fr) 8rem 6rem; }
 .agents-settings .prow { grid-template-columns: minmax(0, 1fr) 13rem 9rem auto; cursor: pointer; }

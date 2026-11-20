@@ -34,7 +34,6 @@ svg { display: inline-block; vertical-align: middle; }
   font-variant-numeric: tabular-nums lining-nums;
 }
 .card {
-  border: 1px solid var(--color-ink-700);
   background: var(--color-ink-850);
   border-radius: .5rem;
   transition: border-color .15s ease, background-color .15s ease;
