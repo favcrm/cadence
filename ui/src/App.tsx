@@ -1169,7 +1169,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       : hireBlock(meta)}>
     <div
       data-app-shell
-      className={`grid ${sidebarCollapsed ? "lg:grid-cols-[64px_minmax(0,1fr)]" : "lg:grid-cols-[208px_minmax(0,1fr)]"} bg-ink-900 ${
+      data-sidebar-collapsed={sidebarCollapsed || undefined}
+      className={`app-shell-root grid bg-ink-900 ${
         fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >

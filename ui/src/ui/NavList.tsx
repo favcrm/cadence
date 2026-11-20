@@ -38,9 +38,19 @@ function Fold({ id, open, children }: { id: string; open: boolean; children: Rea
 }
 
 /** The chevron button beside a nav row; the row's link keeps navigating. */
-function Disclosure({ open, controls, label, onToggle }: { open: boolean; controls: string; label: string; onToggle: () => void }) {
+function Disclosure({ open, controls, label, hidden = false, onToggle }: { open: boolean; controls: string; label: string; hidden?: boolean; onToggle: () => void }) {
   return (
-    <button type="button" className="navdisc" aria-expanded={open} aria-controls={controls} aria-label={label} title={label} onClick={onToggle}>
+    <button
+      type="button"
+      className="navdisc"
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={label}
+      aria-hidden={hidden || undefined}
+      tabIndex={hidden ? -1 : undefined}
+      title={label}
+      onClick={onToggle}
+    >
       <IconCaret size={12} />
     </button>
   );
@@ -96,7 +106,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 aria-current={here ? "page" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
                 {item.screen === "home" && homeCount > 0 && (
                   <span className="navbadge num" title={`${homeCount} ${t("waiting for you")}`}>
                     {homeCount}
@@ -115,7 +125,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
         const open = prefs.appsOpen;
         const parent = here && currentApp !== null && open && !rail;
         return (
-          <Fragment key={item.screen}>
+          <div key={item.screen} className="navgroup">
             <div className="navrow">
               <Link
                 href={navHref(item.route)}
@@ -127,24 +137,25 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 data-parent-current={parent ? "" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
               </Link>
               <Disclosure
                 open={open}
                 controls={foldId}
                 label={t(open ? "Collapse apps" : "Expand apps")}
+                hidden={rail}
                 onToggle={() => updateSidebarPrefs((p) => ({ ...p, appsOpen: !p.appsOpen }))}
               />
             </div>
             {appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
             {/* The Apps parent is current while the tree is folded or the rail is compact. */}
-            <Fold id={foldId} open={open}>
+            <Fold id={foldId} open={open && !rail}>
               <div className="navtree">
                 {apps.map((app) => {
-                  const sectionsOpen = !prefs.closedApps.includes(app.installId);
+                  const sectionsOpen = prefs.openApps.includes(app.installId);
                   const sectionsId = `${foldId}-${app.installId}`;
                   return (
-                    <Fragment key={app.installId}>
+                    <div key={app.installId} className="navgroup">
                       <div className="navrow">
                         <Link
                           href={app.href}
@@ -169,17 +180,18 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             open={sectionsOpen}
                             controls={sectionsId}
                             label={`${t(sectionsOpen ? "Collapse" : "Expand")} ${app.title} ${t("sections")}`}
+                            hidden={rail}
                             onToggle={() => updateSidebarPrefs((p) => ({
                               ...p,
-                              closedApps: p.closedApps.includes(app.installId)
-                                ? p.closedApps.filter((id) => id !== app.installId)
-                                : [...p.closedApps, app.installId],
+                              openApps: p.openApps.includes(app.installId)
+                                ? p.openApps.filter((id) => id !== app.installId)
+                                : [...p.openApps, app.installId],
                             }))}
                           />
                         )}
                       </div>
                       {app.sections && (
-                        <Fold id={sectionsId} open={sectionsOpen}>
+                        <Fold id={sectionsId} open={sectionsOpen && !rail}>
                           <nav aria-label={`${app.title} ${t("sections")}`} className="navtree">
                             {app.sections.map((s) => (
                               <Link
@@ -197,12 +209,12 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           </nav>
                         </Fold>
                       )}
-                    </Fragment>
+                    </div>
                   );
                 })}
               </div>
             </Fold>
-          </Fragment>
+          </div>
         );
       })}
     </nav>
