@@ -41,6 +41,7 @@ import {
   runtimeExtension,
   type AppScopeResolver,
 } from "./engine.ts";
+import { LoopGuard, loopGuardExtension } from "./loop-guard.ts";
 import {
   configureOperationReplyCapture,
   readCompactionFailure,
@@ -163,6 +164,7 @@ export class HostedSession<
   private readonly operationScopes: OperationScopes;
   private readonly contextBudgetProofs: ContextBudgetProofs;
   private readonly modelTaskContext = new ModelTaskContext();
+  private readonly loopGuard = new LoopGuard();
   /** The app scope of the operation that owns one tool call, read from the engine. */
   private readonly toolAppScope: AppScopeResolver = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -225,6 +227,8 @@ export class HostedSession<
       ],
     });
     this.registry.install(intentGuard(options.toolRefusal));
+    // Install after intentGuard so policy and authority refusals always take precedence.
+    this.registry.install(loopGuardExtension(this.loopGuard));
     this.registry.install(runtimeProfile);
     // Pi's token-based cut may fall inside the current operation, including
     // an artifact read. Decline rather than silently summarize that input.
@@ -655,6 +659,7 @@ export class HostedSession<
    */
   async resetConversation(): Promise<void> {
     await this.harness.session().reset();
+    this.loopGuard?.reset();
   }
 
   /**
@@ -695,12 +700,14 @@ export class HostedSession<
     app: AppScope | undefined,
   ): Promise<OperationEnvelope> {
     const id = operationId ?? crypto.randomUUID();
-    return this.operationScopes.admit(
+    const envelope = await this.operationScopes.admit(
       app === undefined
         ? { operationId: id, text }
         : { operationId: id, text, app },
       await this.engineEvidence(id),
     );
+    this.loopGuard?.reset();
+    return envelope;
   }
 
   /**
