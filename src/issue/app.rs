@@ -57,6 +57,10 @@ mod grammar;
 mod skill;
 
 pub(crate) use grammar::{bundle_path_ok, file_cap, root_member, skill_subdir_ok, MAX_APP_BYTES};
+// Preserve existing crate-internal re-exports from `issue::app` verbatim.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use grammar::{bundle_grammar_json, GRAMMAR_VERSION};
 pub use grammar::{
     skill_member_ok, SKILL_DIR, SKILL_ENTRY, SKILL_FILES_MAX, SKILL_FILE_BYTES, SKILL_MANIFEST,
     SKILL_MANIFEST_BYTES, SKILL_PACKAGE_BYTES,
@@ -65,6 +69,8 @@ use grammar::{
     skill_nested_ext, MAX_FILES, SKILL_ALL_EXTS, SKILL_REFERENCES_EXTS, SKILL_ROOT_EXTS,
     SKILL_SCRIPTS_EXTS,
 };
+#[allow(unused_imports)]
+pub(crate) use grammar::{DirRule, DIR_RULES, MAX_SCREEN_ASSET_BYTES, ROOT_MEMBERS};
 
 pub use skill::{
     parse_skill_manifest, skill_package, skill_packages, SkillFile, SkillManifest, SkillPackage,

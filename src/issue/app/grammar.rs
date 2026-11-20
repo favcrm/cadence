@@ -12,7 +12,7 @@ const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
 /// A screen asset may use the whole app budget; the aggregate bound still
 /// applies to the complete package.
-const MAX_SCREEN_ASSET_BYTES: u64 = MAX_APP_BYTES;
+pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = MAX_APP_BYTES;
 
 /// The per-member safety bound. Screen assets share the app budget; screen
 /// declarations, workflows and other files retain their own smaller bounds.
@@ -46,7 +46,7 @@ pub(crate) fn file_cap(rel: &str) -> u64 {
 /// the catalogue importer and the board's files-mode transport. CAD-1415 added
 /// `app-actions.json` to the first two and missed the third, so a bundle the
 /// daemon accepts was refused before it ever reached the daemon.
-const ROOT_MEMBERS: &[&str] = &[
+pub(crate) const ROOT_MEMBERS: &[&str] = &[
     MANIFEST,
     crate::issue::app_chat::FILE,
     crate::issue::app_assistant::FILE,
@@ -79,7 +79,7 @@ fn workflow_leaf_ok(seg: &str) -> bool {
 
 /// How one flat top-level directory admits its leaves.
 #[derive(Clone, Copy)]
-enum DirRule {
+pub(crate) enum DirRule {
     /// `<tag>.md`, the installer's own tag rule.
     WorkflowMdTag,
     /// One tag-shaped stem and exactly one declared suffix.
@@ -102,7 +102,7 @@ enum DirRule {
 /// The directory half of the grammar, in one table. [`bundle_path_ok`]
 /// evaluates it and [`bundle_grammar_json`] publishes it; there is no second
 /// list to keep in step.
-const DIR_RULES: &[(&str, DirRule)] = &[
+pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
     ("workflows", DirRule::WorkflowMdTag),
     ("views", DirRule::Exact(crate::issue::app_view::FILE)),
     ("rubrics", DirRule::VisibleLeaf),
