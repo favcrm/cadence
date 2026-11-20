@@ -38,14 +38,23 @@ function rememberSubmitted(key: string, value: boolean): void {
   } catch { /* the in-memory fence still covers this tab */ }
 }
 
-function HandoffCard({ conversation, row }: { conversation: string; row: AppHandoffDecision }) {
+function HandoffCard({
+  conversation,
+  row,
+  onDismissed,
+}: {
+  conversation: string;
+  row: AppHandoffDecision;
+  onDismissed: (id: string) => void;
+}) {
   const t = useTranslate();
   const id = useId();
   const status = useRef<HTMLParagraphElement>(null);
   const active = useRef<AbortController | null>(null);
   const [receipt, setReceipt] = useState<AppHandoffDecision | null>(null);
   const [busy, setBusy] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [busyKind, setBusyKind] = useState<"check" | "dismiss">("check");
+  const [failed, setFailed] = useState<"check" | "dismiss" | null>(null);
   const key = `cadence.appHandoff.submitted.${row.id}`;
   const [runUncertain, setRunUncertain] = useState(() => submitted(key));
   useEffect(() => () => active.current?.abort(), []);
@@ -67,7 +76,8 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
     const abort = new AbortController();
     active.current = abort;
     setBusy(true);
-    setFailed(false);
+    setBusyKind(mutation === "dismiss" ? "dismiss" : "check");
+    setFailed(null);
     try {
       const result = await appHandoffDecision(conversation, row.id, mutation, abort.signal);
       if (abort.signal.aborted) return;
@@ -75,10 +85,15 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
       // already-reviewed id, even when the destination or locale changes.
       if (result.app !== row.app || result.recipient !== row.recipient || result.question !== row.question)
         throw new Error("The reviewed app handoff changed.");
+      if (mutation === "dismiss") {
+        rememberSubmitted(key, false);
+        onDismissed(row.id);
+        return;
+      }
       setReceipt(result);
     } catch {
       if (abort.signal.aborted) return;
-      setFailed(true);
+      setFailed(mutation === "dismiss" ? "dismiss" : "check");
     } finally {
       active.current = null;
       if (!abort.signal.aborted) {
@@ -110,9 +125,13 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
         <p id={`${id}-question`} className="text-label text-ink-200 whitespace-pre-wrap [overflow-wrap:anywhere]" dir="auto">{row.question}</p>
       </div>
       <p ref={status} id={`${id}-status`} className="text-label text-ink-300" role="status" tabIndex={-1}>
-        {busy ? t("Checking handoff…") : t(summary[state])}
+        {busy ? t(busyKind === "dismiss" ? "Dismissing handoff…" : "Checking handoff…") : t(summary[state])}
       </p>
-      {failed && <p className="text-label text-fail" role="alert">{t("The handoff status could not be confirmed.")}</p>}
+      {failed !== null && (
+        <p className="text-label text-fail" role="alert">
+          {t(failed === "dismiss" ? "The handoff could not be dismissed." : "The handoff status could not be confirmed.")}
+        </p>
+      )}
       {decision.state === "answered" && (
         <p className="text-label text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere]" dir="auto">{decision.answer}</p>
       )}
@@ -120,7 +139,8 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
         {state === "pending" && action("Approve", "approve")}
         {(state === "pending" || state === "approved") && action("Deny", "deny")}
         {state === "approved" && action("Run handoff", "run")}
-        {(state === "running" || state === "unconfirmed" || failed) && action("Check reply")}
+        {(state === "running" || state === "unconfirmed" || failed === "check") && action("Check reply")}
+        {action("Dismiss", "dismiss")}
       </div>
     </article>
   );
@@ -141,8 +161,15 @@ export default function AppHandoffCards({ conversation, revision }: { conversati
   }, [conversation, revision]);
   if (rows.length === 0) return null;
   return (
-    <section className="app-assistant-activity" aria-label={t("Private app handoffs")}>
-      {rows.map((row) => <HandoffCard key={row.id} conversation={conversation} row={row} />)}
+    <section className="app-handoff-list" aria-label={t("Private app handoffs")}>
+      {rows.map((row) => (
+        <HandoffCard
+          key={row.id}
+          conversation={conversation}
+          row={row}
+          onDismissed={(dismissedId) => setRows((prev) => prev.filter((item) => item.id !== dismissedId))}
+        />
+      ))}
     </section>
   );
 }
