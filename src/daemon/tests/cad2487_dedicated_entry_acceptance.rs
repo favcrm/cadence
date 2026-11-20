@@ -533,16 +533,34 @@ fn dedicated_owner_entry_isolated() {
     );
     let now = crate::issue::time::now_epoch();
     let header = json!({"alg":"EdDSA","typ":"JWT","kid":KEY});
-    let claims = json!({"iss":crate::test_web_issuer_tls::ISSUER,"aud":HOST,"company":COMPANY,"sub":SUBJECT,"email":"owner@example.test","name":"Owner","role":"owner","iat":now,"exp":now+60,"jti":jti});
-    let input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    let signed = |role: &str| {
+        let claims = json!({
+            "iss": crate::test_web_issuer_tls::ISSUER, "aud": HOST, "company": COMPANY,
+            "sub": SUBJECT, "email": "owner@example.test", "name": "Fixture",
+            "role": role, "iat": now, "exp": now + 60, "jti": jti,
+        });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).as_ref())
+        )
+    };
+    let (status, response) = body(post(
+        port,
+        "/__platform/session",
+        Some(&cookie),
+        json!({"assertion":signed("member"),"state":state_value}),
+    ));
+    assert_eq!(
+        status, 401,
+        "signed member must not open a session: {response}"
     );
-    let assertion = format!(
-        "{input}.{}",
-        URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).as_ref())
-    );
+    assert_eq!(issuer.granted.load(Ordering::SeqCst), 0);
+    let assertion = signed("owner");
     let (status, response) = body(post(
         port,
         "/__platform/session",
