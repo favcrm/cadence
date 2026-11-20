@@ -173,7 +173,9 @@ portal and API.
    `AGENTICOS_BOARD_ISSUER` on the board and daemon. The issuer is the public
    HTTPS API origin. Set the board's `AGENTICOS_BOARD_AUTHORIZE_URL` to the
    AgenticOS **portal** origin followed by `/v2/board/authorize`. Do not set
-   native hosted placement flags.
+   native hosted placement flags. Persist the settings in the service
+   configuration: a board/daemon mode mismatch refuses new browser sessions,
+   including after a restart.
 3. Set `AGENTICOS_DEDICATED_BOARD_VERIFIER_FILE` only for the daemon. Point it
    at its private verifier credential file; protect the file from both agents
    and the browser-facing process. With systemd, prefer `LoadCredential=` in

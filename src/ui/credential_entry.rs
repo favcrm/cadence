@@ -515,6 +515,26 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     request_id(tail).then_some(Route::Show(tail))
 }
 
+/// The only entry routes where a verified public-owner entry session may
+/// replace local TCP operator proof. Call this only after `board_caller`
+/// has checked the live session and attributed the peer.
+pub(super) fn public_scoped_owner_route(request: &Request, opts: &ServeOpts) -> bool {
+    if !opts.board_public_only
+        || super::operator::credential_entry_session_proof(request, opts).is_none()
+    {
+        return false;
+    }
+    let path = request.url().split('?').next().unwrap_or_default();
+    matches!(
+        (request.method(), route(path)),
+        (&Method::Get | &Method::Head, Some(Route::Show(_)))
+            | (
+                &Method::Post,
+                Some(Route::EntrySession(_) | Route::Submit(_) | Route::Cancel(_))
+            )
+    )
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SubmitBody {

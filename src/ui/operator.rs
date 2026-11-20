@@ -759,6 +759,13 @@ fn admit_operator_class(
         // public surface — no loopback process proof applies to a
         // request the platform relay delivered.
         Caller::Named(_) => Ok(()),
+        // Only these scoped HTTPS routes already proved current board owner
+        // authority and rejected agent attribution in `board_caller`.
+        Caller::Operator(_)
+            if super::credential_entry::public_scoped_owner_route(request, opts) =>
+        {
+            Ok(())
+        }
         Caller::Operator(_) => {
             super::home::prove_operator_peer(request, state_dir, opts, what, None)
         }
@@ -808,6 +815,11 @@ pub(super) fn admit_operator_read_caller(
             ),
         )),
         Caller::Named(_) => Ok(caller),
+        Caller::Operator(_)
+            if super::credential_entry::public_scoped_owner_route(request, opts) =>
+        {
+            Ok(caller)
+        }
         Caller::Operator(_) => {
             super::home::prove_operator_peer(request, state_dir, opts, &what, None)?;
             Ok(caller)
@@ -2785,6 +2797,10 @@ const CLEAR_INTENT: &str =
 
 /// Resolve the dedicated mode once, before the server starts accepting requests.
 pub(super) fn dedicated_config(opts: &ServeOpts) -> CadenceResult<Option<String>> {
+    #[cfg(test)]
+    if let Some(value) = &opts.dedicated_deployment_for_test {
+        return validate_dedicated_config(opts, value.clone());
+    }
     let value = match std::env::var("AGENTICOS_DEDICATED_BOARD_DEPLOYMENT") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
@@ -3119,7 +3135,7 @@ pub(super) fn platform_session(
     opts: &ServeOpts,
     dedicated: Option<&str>,
 ) -> HttpResp {
-    let mut response = platform_session_inner(request, state_dir, opts, dedicated.is_some());
+    let mut response = platform_session_inner(request, state_dir, opts, dedicated);
     if dedicated.is_some() {
         set_cookie(&mut response, CLEAR_INTENT);
     }
@@ -3130,7 +3146,7 @@ fn platform_session_inner(
     request: &mut Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
-    dedicated: bool,
+    dedicated: Option<&str>,
 ) -> HttpResp {
     if opts.public.is_none() {
         return platform_fail(404, "not_found", "Unknown route.");
@@ -3150,7 +3166,7 @@ fn platform_session_inner(
             return platform_fail(403, "assertion_invalid", "cross-site request rejected");
         }
     }
-    if dedicated {
+    if dedicated.is_some() {
         let expected = format!("https://{}", opts.public.as_ref().unwrap().host);
         let origins: Vec<_> = request
             .headers()
@@ -3183,7 +3199,7 @@ fn platform_session_inner(
         assertion: String,
         state: Option<String>,
     }
-    let parsed = if dedicated {
+    let parsed = if dedicated.is_some() {
         parse_json::<DedicatedSession>(&bytes).map(|req| (req.assertion, req.state))
     } else {
         parse_json::<LegacySession>(&bytes).map(|req| (req.assertion, None))
@@ -3194,7 +3210,7 @@ fn platform_session_inner(
     if assertion.is_empty() {
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
     }
-    if dedicated {
+    if dedicated.is_some() {
         let mut cookies = request
             .headers()
             .iter()
@@ -3217,15 +3233,15 @@ fn platform_session_inner(
     // Only relay a prior session the browser actually presented. The daemon
     // verifies this opaque proof before allowing it to affect consent state.
     let prior_session = session_cookie(request, opts, Origin::Public);
-    match client::rpc(
-        state_dir,
-        "board_session_open",
-        json!({
-            "assertion": assertion,
-            "user_agent": user_agent,
-            "prior_session": prior_session,
-        }),
-    ) {
+    let mut proof = json!({
+        "assertion": assertion,
+        "user_agent": user_agent,
+        "prior_session": prior_session,
+    });
+    if let Some(deployment) = dedicated {
+        proof["dedicated_deployment"] = json!(deployment);
+    }
+    match client::rpc(state_dir, "board_session_open", proof) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();
             // The server's own session expiry rides the success body so

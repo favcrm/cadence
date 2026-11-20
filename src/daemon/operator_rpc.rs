@@ -995,6 +995,24 @@ impl Shared {
                 who.lane()
             )));
         }
+        // Only the local board peer relays this field, after its dedicated
+        // browser-intent check. A UI restarted without its startup setting
+        // cannot offer the legacy exchange to a still-dedicated daemon.
+        let deployment = params.get("dedicated_deployment");
+        let mode_matches = match &self.membership_mode {
+            public_membership::MembershipMode::Dedicated(ctx) => {
+                deployment.and_then(Value::as_str) == Some(ctx.deployment.as_str())
+            }
+            public_membership::MembershipMode::Standalone
+            | public_membership::MembershipMode::Native(_) => deployment.is_none(),
+            public_membership::MembershipMode::RequiredUnavailable => false,
+        };
+        if !mode_matches {
+            return Err(Error::invalid(
+                "capability_unavailable",
+                "board sign-in does not match the daemon's configured identity mode",
+            ));
+        }
         let assertion = required_str(params, "assertion")?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
         let prior_session = optional_str(params, "prior_session");

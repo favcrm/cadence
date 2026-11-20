@@ -604,6 +604,9 @@ pub struct ServeOpts {
     /// command line — a test's board on a thread of the runner stops
     /// with its test instead of serving for the rest of the run.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Isolated acceptance fixture override; use the production config validator.
+    #[cfg(test)]
+    pub(crate) dedicated_deployment_for_test: Option<String>,
     /// Test-only barrier after a member batch is captured, before projection.
     #[cfg(test)]
     pub(crate) member_stream_batch_hook: Option<std::sync::Arc<MemberStreamBatchHook>>,
@@ -1238,6 +1241,8 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync_every: None,
         delivery_sync: None,
         stop: None,
+        #[cfg(test)]
+        dedicated_deployment_for_test: None,
         #[cfg(test)]
         member_stream_batch_hook: None,
         #[cfg(test)]
