@@ -41,7 +41,9 @@ export function personalAssistantProfileHref(
   read: IdentityRead,
   roster: ResourceState<AgentsPayload>,
 ): string | undefined {
-  if (scope !== "personal" || read.state !== "ready" || roster.status !== "ok") return;
+  if (scope !== "personal" || read.state !== "ready") return;
+  // The shared agents array can be empty while the personal row is present.
+  if (roster.status !== "ok" && roster.status !== "empty") return;
   const payload = roster.data;
   const row = payload && "personal_assistant" in payload ? payload.personal_assistant : null;
   if (
