@@ -39,16 +39,19 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
   const tag = declarations.length === 1 ? declarations[0].split("/")[1] : null;
   const liveContext = contexts.some(c => c.id === contextId && c.install_id === installation.install_id && c.state === "active");
   // CAD-2534: only legacy/non-records screens need snapshot polling and retained
-  // tool extras; `screen-records.v1` mounts read directly via host services. Wait
-  // for the verified mount receipt before starting any background snapshot/tool reads.
-  const [mountKind, setMountKind] = useState<"pending" | "records" | "legacy">("pending");
-  useEffect(() => {
-    setMountKind("pending");
-  }, [installation.install_id, installation.digest, tag, contextId, admitted]);
+  // tool extras; `screen-records.v1` mounts read directly via host services. Keyed
+  // synchronously to `mountScope` so context/digest transitions flip back to "pending"
+  // on the same render and never race with fast mount receipts.
+  const mountScope = JSON.stringify([installation.install_id, installation.digest, tag, contextId, admitted]);
+  const [mountedState, setMountedState] = useState<{ scope: string; kind: "records" | "legacy" } | null>(null);
+  const mountKind = mountedState?.scope === mountScope ? mountedState.kind : "pending";
   const handleMounted = useCallback((info: { hostContract: string | null } | null) => {
-    if (info === null) setMountKind("pending");
-    else setMountKind(info.hostContract === "screen-records.v1" ? "records" : "legacy");
-  }, []);
+    setMountedState(
+      info === null
+        ? null
+        : { scope: mountScope, kind: info.hostContract === "screen-records.v1" ? "records" : "legacy" },
+    );
+  }, [mountScope]);
   const legacyPolling = admitted && tag !== null && mountKind === "legacy";
   const [snapshot, setSnapshot] = useState<WorkspaceAppSnapshot | null>(() => readWorkspaceAppSnapshot(installation.install_id));
   const scopedSnapshot = snapshot?.installation.install_id === installation.install_id ? snapshot : null;

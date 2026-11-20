@@ -132,7 +132,9 @@ async function main() {
   noTabBar("Default view");
   assert(host.firstElementChild?.getAttribute("aria-label") === "Installed app screen", "The app screen is the outlet's first child: nothing sits above it");
   assert(columnLayout(), "App screen lays the outlet out as a column, so the frame fills the pane");
+  assert(host.querySelector(".wa-screen-frame-container")?.hasAttribute("inert"), "CAD-2534: mounting iframe container stays inert while loading");
   const port = await handshake();
+  assert(!host.querySelector(".wa-screen-frame-container")?.hasAttribute("inert"), "CAD-2534: frame container drops inert once handshake completes");
 
   // The operator back door: ?screen=native tears down the frame and the port, like a context switch.
   await go("/app-installations/install-a?screen=native");

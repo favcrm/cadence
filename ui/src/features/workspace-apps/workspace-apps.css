@@ -235,17 +235,17 @@ button.wa-post-card:hover {
   flex: 1 1 0%;
   min-height: 0;
 }
-.wa-loading-surface--drawer {
-  padding: 0.75rem;
-}
-.wa-loading-surface--canvas {
-  padding: 0.75rem 1rem;
-}
 .wa-screen-loading-overlay {
   position: absolute;
   inset: 0;
   z-index: 1;
   padding: 0.75rem 0.5rem;
+}
+.wa-loading-surface--drawer {
+  padding: 0.75rem;
+}
+.wa-loading-surface--canvas {
+  padding: 0.75rem 1rem;
 }
 .wa-loading-header {
   display: flex;

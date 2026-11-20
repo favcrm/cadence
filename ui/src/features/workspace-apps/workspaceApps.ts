@@ -981,7 +981,7 @@ export function prefetchWorkspaceApp(installId: string): void {
 let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
 
 export function readInstallationsSnapshot(): Installation[] | null {
-  if (!installationsSnapshot || installationsSnapshot.session !== sessionKey() ||
+  if (!installationsSnapshot || !privateReadsAllowed() || installationsSnapshot.session !== sessionKey() ||
       Date.now() - installationsSnapshot.at > SNAPSHOT_TTL_MS) return null;
   return installationsSnapshot.rows;
 }

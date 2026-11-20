@@ -863,8 +863,19 @@ pub(crate) fn render_checked_package_frame_html(
         }
     }
     let scripts: Vec<&str> = match checked.startup() {
-        Some(order) => order.iter().map(|name| assets[name].as_str()).collect(),
-        None => vec![assets[checked.entry()].as_str()],
+        Some(order) => order
+            .iter()
+            .map(|name| {
+                assets
+                    .get(name)
+                    .map(String::as_str)
+                    .ok_or_else(|| Error::rejected("screen script asset missing"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![assets
+            .get(checked.entry())
+            .map(String::as_str)
+            .ok_or_else(|| Error::rejected("screen entry asset missing"))?],
     };
     assemble_frame_document(
         csp_nonce,

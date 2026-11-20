@@ -594,6 +594,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           ref={container}
           className="wa-screen-frame-container"
           aria-hidden={state !== "ready" || undefined}
+          inert={state !== "ready"}
           style={{
             position: "absolute",
             inset: 0,

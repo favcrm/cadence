@@ -1929,19 +1929,28 @@ pub(super) fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static,
 /// (`app_screens::service` acquires [`WRITE_LOCK`] only for mutating ops so
 /// read-only screen queries do not contend with board writes; CAD-2534).
 fn serialized_write(method: &Method, url: &str) -> bool {
-    let path = url.split('?').next().unwrap_or("");
-    matches!(
+    if !matches!(
         method,
         Method::Post | Method::Patch | Method::Delete | Method::Put
-    ) && !(method == &Method::Post
+    ) {
+        return false;
+    }
+    let raw_path = url.split('?').next().unwrap_or("");
+    // Match `handle`'s percent-decoded path so encoded equivalents never take
+    // the outer lock and spin on `app_screens::service_with_lock_wait`; malformed
+    // escapes fail closed as serialized.
+    let Some(path) = pct_decode(raw_path) else {
+        return true;
+    };
+    !(method == &Method::Post
         && (matches!(
-            path,
+            path.as_str(),
             "/api/session/device/code"
                 | "/api/session/device/poll"
                 | "/api/app-screen-services/call"
-        ) || app_screens::tool_revoke_route(path)
+        ) || app_screens::tool_revoke_route(&path)
             || matches!(
-                endpoints::resolve("POST", path).map(|b| b.endpoint.id),
+                endpoints::resolve("POST", &path).map(|b| b.endpoint.id),
                 Some(endpoints::RouteId::Mount)
             )))
 }
@@ -4428,8 +4437,11 @@ mod write_lock_tests {
             "/api/session/device/code",
             "/api/session/device/poll",
             "/api/app-installations/inst-1/screens/main/mount",
+            "/api/app-installations/inst-1/screens/main/m%6funt",
             "/api/app-screen-tools/revoke",
+            "/api/app-screen-tools/%72evoke",
             "/api/app-screen-services/call",
+            "/api/app-screen-services/%63all",
         ] {
             assert!(
                 !serialized_write(&Method::Post, path),
@@ -4440,6 +4452,10 @@ mod write_lock_tests {
                 "a query string does not bypass the exemption for {path}"
             );
         }
+        assert!(
+            serialized_write(&Method::Post, "/api/app-screen-services/%ZZcall"),
+            "malformed percent encoding must fail closed under serialized_write"
+        );
         for path in [
             "/api/app-screen-services/slot-prepare",
             "/api/app-screen-services/slot-confirm",
@@ -4564,6 +4580,41 @@ mod write_lock_tests {
             "daemon_unavailable",
             "slot-prepare must proceed past the lock guard to client::rpc"
         );
+
+        // Screen mount and tool revoke also execute without deadlocking while WRITE_LOCK is held.
+        let mut mount_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-installations/inst-1/screens/main/mount")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(r"{}")
+            .into();
+        let mount_resp = app_screens::mount(&mut mount_req, state.path(), &opts, "inst-1", "main");
+        assert!(
+            !mount_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "screen mount must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(body_json(mount_resp)["code"], "daemon_unavailable");
+
+        let mut revoke_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-screen-tools/revoke")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(r#"{"action_token":"act-1"}"#)
+            .into();
+        let revoke_resp = app_screens::tool_revoke(&mut revoke_req, state.path(), &opts);
+        assert!(
+            !revoke_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "screen tool revoke must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(body_json(revoke_resp)["code"], "daemon_unavailable");
     }
 
     #[test]

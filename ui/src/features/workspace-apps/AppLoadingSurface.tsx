@@ -26,14 +26,14 @@ export default function AppLoadingSurface({
   return (
     <div className={classes} role="status" aria-label={label}>
       <span className="sr-only">{label}</span>
-      <div className="wa-loading-header">
+      <div className="wa-loading-header" aria-hidden="true">
         <span className="wa-loading-bar wa-skel-pulse" style={{ width: variant === "drawer" ? "48%" : "11rem", height: "1rem" }} />
         {variant === "page" && (
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "5.5rem", height: "0.85rem", marginLeft: "auto" }} />
         )}
       </div>
       {variant === "page" ? (
-        <div className="wa-loading-blocks">
+        <div className="wa-loading-blocks" aria-hidden="true">
           <div className="wa-loading-card">
             <span className="wa-loading-bar wa-skel-pulse" style={{ width: "36%", height: "0.8rem" }} />
             <span className="wa-loading-bar wa-skel-pulse" style={{ width: "88%", height: "2.25rem" }} />
@@ -45,13 +45,13 @@ export default function AppLoadingSurface({
           </div>
         </div>
       ) : variant === "drawer" ? (
-        <div className="wa-loading-rows">
+        <div className="wa-loading-rows" aria-hidden="true">
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "86%", height: "2rem" }} />
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "94%", height: "3.25rem" }} />
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "68%", height: "2rem" }} />
         </div>
       ) : (
-        <div className="wa-loading-card">
+        <div className="wa-loading-card" aria-hidden="true">
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "84%", height: "2rem" }} />
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "64%", height: "2rem" }} />
         </div>

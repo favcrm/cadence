@@ -92,6 +92,7 @@ async function settle(check: () => void) {
   check();
 }
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { notifyAppsChanged } = require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
 const go = (path: string) => React.act(async () => { navigate(path); });
 const appLinks = () => Array.from(host.querySelectorAll('aside nav[aria-label="Primary"] > div a.navlink-sub')) as HTMLAnchorElement[];
 const appLink = (title: string) => appLinks().find((a) => a.textContent?.trim() === title);
@@ -104,10 +105,17 @@ const retryButton = () => Array.from(host.querySelectorAll('aside nav[aria-label
 
 await settle(() => assert(appLink("CRM") && appLink("Social Content"), "apps list on Home"));
 assert(!notice(), "no notice while healthy");
+assert(listCalls === 1, "initial render fetches installations once");
+
+// Navigating to unrelated screens keeps the seeded list without re-fetching installations (CAD-2534).
+await go("/settings/email-sending");
+await flush();
+assert(listCalls === 1, "switching away from Home does not re-fetch installations");
+assert(appLink("CRM") && appLink("Social Content"), "sidebar apps stay visible across unrelated routes");
 
 // A failed refresh keeps the last good list and shows a retry notice.
 mode = "fail";
-await go("/settings/email-sending");
+await React.act(async () => { notifyAppsChanged(); });
 await settle(() => assert(notice() && retryButton(), "failed refresh shows a notice with Retry"));
 assert(notice()!.textContent!.includes("list exploded"), "the notice carries the error");
 assert(appLink("CRM") && appLink("Social Content"), "the last good list stays");
@@ -121,6 +129,7 @@ assert(appLink("CRM") && appLink("Social Content"), "list intact after retry");
 // A busy daemon is retried automatically, with the notice while waiting.
 mode = "busy-once";
 await go("/");
+await React.act(async () => { notifyAppsChanged(); });
 await settle(() => assert(notice()?.textContent?.includes("busy") && !retryButton(), "busy shows a retrying notice without a manual button"));
 assert(appLink("CRM"), "the last good list stays while retrying");
 for (let i = 0; i < 40 && notice(); i++) await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });

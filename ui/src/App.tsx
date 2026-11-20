@@ -977,7 +977,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-1537: a member resolves app keys from `/api/app-home`, never the
   // operator-only installed-app list.
   const memberHome = screenReader && !boardReadOnly;
-  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`, memberHome ? "home" : "list");
+  const installationsRefreshKey = `${route.screen === "apps" || route.screen === "appsExplore" ? route.screen : "steady"}:${appsTick}`;
+  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list");
   // A removed or disabled app is not an app to open: drop it from the menu.
   // It stays visible on the Apps surface, which is where it is managed.
   const installed: VerifiedApp[] = useMemo(
