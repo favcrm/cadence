@@ -521,7 +521,8 @@ export default function ManageApp({
         {hasCatalogSlots && !removed && (
           catalogBindings ? (
             <CatalogBindings installation={inst} bindings={catalogBindings} canWrite={isOp}
-              busy={catalogBusy || checking || applying || restoring || removing} mutate={mutateCatalog} />
+              busy={catalogBusy || checking || applying || restoring || removing} mutate={mutateCatalog}
+              refresh={() => setReread((n) => n + 1)} />
           ) : (
             <div className="card mcard">
               {catalogError ? <p role="alert">{t("The saved tool grant could not be verified.")}</p>

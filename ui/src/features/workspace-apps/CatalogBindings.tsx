@@ -13,6 +13,7 @@ type Props = {
   canWrite: boolean;
   busy: boolean;
   mutate: (work: () => Promise<void>) => Promise<void>;
+  refresh: () => void;
 };
 
 /** Owner-selected catalogue grants are separate from provider connections. */
@@ -20,7 +21,6 @@ export function CatalogBindings(props: Props) {
   const t = useTranslate();
   const [requests, setRequests] = useState<PlatformToolRequest[] | null | undefined>(undefined);
   const [requestError, setRequestError] = useState(false);
-  const [reload, setReload] = useState(0);
   const slots = props.installation.source_kind === "private"
     ? declaredSlots(props.installation).filter(isCatalogSlot)
     : [];
@@ -33,11 +33,11 @@ export function CatalogBindings(props: Props) {
       () => { if (!controller.signal.aborted) setRequestError(true); },
     );
     return () => controller.abort();
-  }, [props.installation.install_id, props.installation.digest, props.canWrite, slots.length, reload]);
+  }, [props.installation.install_id, props.installation.digest, props.canWrite, slots.length]);
   if (slots.length === 0) return null;
   return <>
     {props.canWrite && (requestError
-      ? <div className="card mcard"><p className="wa-alert" role="alert">{t("Could not load tool access requests.")}</p><Button onClick={() => setReload(n => n + 1)}>{t("Retry")}</Button></div>
+      ? <div className="card mcard"><p className="wa-alert" role="alert">{t("Could not load tool access requests.")}</p><Button disabled={props.busy} onClick={props.refresh}>{t("Retry")}</Button></div>
       : requests === undefined ? <p role="status">{t("Loading tool access requests…")}</p>
       : requests !== null && requests.length === 0 ? <p className="wa-muted">{t("No pending tool access requests.")}</p> : null)}
     {slots.map(slot => <CatalogSlot key={slot.slot} {...props} slot={slot}
@@ -69,16 +69,17 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot, req
     }
   }
   const bindingId = binding?.id ?? null;
+  const loadTools = bindingId === null || requests.length > 0;
   useEffect(() => {
     setSelected(""); setAccountId(""); setTools(null); setUnavailable(false);
-    if (!canWrite || invalid || (bindingId && requests.length === 0)) return;
+    if (!canWrite || invalid || !loadTools) return;
     const controller = new AbortController();
     void workspaceApps.platformTools(installation.install_id, slot.slot, effect, controller.signal).then(
       value => { if (!controller.signal.aborted) setTools(value); },
       () => { if (!controller.signal.aborted) setUnavailable(true); },
     );
     return () => controller.abort();
-  }, [installation.install_id, installation.digest, slot.slot, effect, canWrite, bindingId, invalid, requests.length]);
+  }, [installation.install_id, installation.digest, slot.slot, effect, canWrite, bindingId, invalid, loadTools]);
   const selectedTool = tools?.find(tool => tool.slug === selected);
   const needsAccount = selectedTool?.connectedAccounts !== undefined;
   const selectedAccount = selectedTool?.connectedAccounts?.find(account => account.id === accountId);
@@ -86,17 +87,22 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot, req
     <h3>{t(effect === "read" ? "Read tool" : "Draft tool")} <span className="text-ink-400 text-label">· {slot.slot}</span></h3>
     <p className="wa-muted">{t("The app can send inputs to this tool. Charges use the workspace balance at the price when the tool runs.")}</p>
     <p className="wa-muted">{t("Some app screens run tools as the owner without asking again.")}</p>
-    {canWrite && requests.map(request => <div key={request.id} className="wa-stack">
-      <p className="wa-kicker break-words">{t("Requested tool")}: {tools?.find(tool => tool.slug === request.tool_slug)?.displayName ?? request.tool_slug}</p>
-      <div className="flex flex-wrap gap-2">
-        <Button variant="primary" disabled={busy || invalid || binding !== null} onClick={() => void mutate(async () => {
-          await workspaceApps.decidePlatformToolRequest(request, "approve");
-        })}>{t("Grant access")}</Button>
-        <Button disabled={busy} onClick={() => void mutate(async () => {
-          await workspaceApps.decidePlatformToolRequest(request, "deny");
-        })}>{t("Decline")}</Button>
-      </div>
-    </div>)}
+    {canWrite && requests.map(request => {
+      const label = tools?.find(tool => tool.slug === request.tool_slug)?.displayName;
+      return <div key={request.id} className="wa-stack">
+        <p className="wa-kicker break-words">{t("Requested tool")}: {label && label !== request.tool_slug
+          ? <>{label} <code className="text-label">({request.tool_slug})</code></>
+          : <code>{request.tool_slug}</code>}</p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="primary" disabled={busy || invalid || binding !== null} onClick={() => void mutate(async () => {
+            await workspaceApps.decidePlatformToolRequest(request, "approve");
+          })}>{t("Grant access")}</Button>
+          <Button disabled={busy} onClick={() => void mutate(async () => {
+            await workspaceApps.decidePlatformToolRequest(request, "deny");
+          })}>{t("Decline")}</Button>
+        </div>
+      </div>;
+    })}
     {invalid ? <p className="wa-alert" role="alert">{t("The saved tool grant could not be verified.")}</p> : binding ? <>
       <p className="wa-kicker break-words">{t("Granted tool")}: {binding.config.tool_slug?.replace(/[_.-]+/g, " ").replace(/^./, (letter) => letter.toUpperCase())}</p>
       <details className="text-label">
