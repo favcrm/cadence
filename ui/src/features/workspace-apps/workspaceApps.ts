@@ -106,6 +106,27 @@ export interface AppBinding {
     publish?: { destination_id: string; destination_label: string; toolkit: string } };
   drift?: BindingDrift;
 }
+
+export interface PlatformToolRequest {
+  id: string;
+  install_id: string;
+  slot: string;
+  bundle_digest: string;
+  tool_slug: string;
+  state: "pending" | "approved" | "denied" | "stale";
+  management_url: string;
+}
+
+function platformToolRequest(value: unknown, installId: string): PlatformToolRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ApiError("Invalid tool access request", 502);
+  const row = value as Record<string, unknown>;
+  if (typeof row.id !== "string" || !/^atr_[0-9a-f]{32}$/.test(row.id) ||
+    row.install_id !== installId || typeof row.slot !== "string" || !row.slot ||
+    typeof row.bundle_digest !== "string" || typeof row.tool_slug !== "string" || !row.tool_slug ||
+    !["pending", "approved", "denied", "stale"].includes(String(row.state)) ||
+    typeof row.management_url !== "string") throw new ApiError("Invalid tool access request", 502);
+  return row as unknown as PlatformToolRequest;
+}
 /** Declared access changed by a checked bundle (CAD-1565): which
  * connection slots appear/disappear and which capability slot
  * declarations differ between the installed and checked manifests. */
@@ -403,6 +424,33 @@ export const workspaceApps = {
   /** CAD-1939: retire one binding (one destination) at the revision the caller read. */
   revokeBinding: (id: string, bindingId: string, expectedRevision: number) =>
     request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/revoke`, undefined, { expected_revision: expectedRevision }),
+  platformToolRequests: async (id: string, digest: string, signal?: AbortSignal): Promise<PlatformToolRequest[] | null> => {
+    let value: unknown;
+    try {
+      value = await request<unknown>(`${installation(id)}/platform-tool-requests`, signal);
+    } catch (error) {
+      // Older boards have no route; an installation-specific 404 remains an error.
+      if (error instanceof ApiError && (error.status === 501 ||
+        (error.status === 404 && /^(404(?: Not Found)?|not found)$/i.test(error.message)))) return null;
+      throw error;
+    }
+    if (!value || typeof value !== "object" || !("requests" in value) || !Array.isArray(value.requests))
+      throw new ApiError("Invalid tool access requests", 502);
+    const rows = value.requests.map((row: unknown) => platformToolRequest(row, id));
+    if (rows.some((row: PlatformToolRequest) => row.state !== "pending" || row.bundle_digest !== digest))
+      throw new ApiError("Invalid tool access requests", 502);
+    return rows;
+  },
+  decidePlatformToolRequest: async (target: PlatformToolRequest, decision: "approve" | "deny") => {
+    const value = await request<unknown>(`${installation(target.install_id)}/platform-tool-requests/${part(target.id)}/decision`, undefined, { decision });
+    if (!value || typeof value !== "object" || !("request" in value)) throw new ApiError("Invalid tool access decision", 502);
+    const row = platformToolRequest(value.request, target.install_id);
+    if (row.id !== target.id || row.slot !== target.slot ||
+        row.bundle_digest !== target.bundle_digest || row.tool_slug !== target.tool_slug ||
+        row.state !== (decision === "approve" ? "approved" : "denied"))
+      throw new ApiError("Invalid tool access decision", 502);
+    return row;
+  },
   platformTools: async (id: string, slot: string, effect: CatalogEffect, signal?: AbortSignal) => {
     const query = new URLSearchParams({ slot });
     return parseCatalogTools(await request<unknown>(`${installation(id)}/platform-tools?${query}`, signal), effect);

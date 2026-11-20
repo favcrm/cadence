@@ -5,7 +5,7 @@ import { useTranslate } from "../../lib/locale";
 import { declaredSlots, isCatalogSlot, type DeclaredSlot } from "./bindingChoices";
 import { parseCatalogGrant, type CatalogEffect, type CatalogTool } from "./platformCatalog";
 import { completeRequest, retainedRequest } from "./requests";
-import { workspaceApps, type AppBinding, type Installation } from "./workspaceApps";
+import { workspaceApps, type AppBinding, type Installation, type PlatformToolRequest } from "./workspaceApps";
 
 type Props = {
   installation: Installation;
@@ -17,14 +17,36 @@ type Props = {
 
 /** Owner-selected catalogue grants are separate from provider connections. */
 export function CatalogBindings(props: Props) {
+  const t = useTranslate();
+  const [requests, setRequests] = useState<PlatformToolRequest[] | null | undefined>(undefined);
+  const [requestError, setRequestError] = useState(false);
+  const [reload, setReload] = useState(0);
   const slots = props.installation.source_kind === "private"
     ? declaredSlots(props.installation).filter(isCatalogSlot)
     : [];
+  useEffect(() => {
+    if (!props.canWrite || slots.length === 0) return;
+    const controller = new AbortController();
+    setRequests(undefined); setRequestError(false);
+    void workspaceApps.platformToolRequests(props.installation.install_id, props.installation.digest, controller.signal).then(
+      value => { if (!controller.signal.aborted) setRequests(value); },
+      () => { if (!controller.signal.aborted) setRequestError(true); },
+    );
+    return () => controller.abort();
+  }, [props.installation.install_id, props.installation.digest, props.canWrite, slots.length, reload]);
   if (slots.length === 0) return null;
-  return <>{slots.map(slot => <CatalogSlot key={slot.slot} {...props} slot={slot} />)}</>;
+  return <>
+    {props.canWrite && (requestError
+      ? <div className="card mcard"><p className="wa-alert" role="alert">{t("Could not load tool access requests.")}</p><Button onClick={() => setReload(n => n + 1)}>{t("Retry")}</Button></div>
+      : requests === undefined ? <p role="status">{t("Loading tool access requests…")}</p>
+      : requests !== null && requests.length === 0 ? <p className="wa-muted">{t("No pending tool access requests.")}</p> : null)}
+    {slots.map(slot => <CatalogSlot key={slot.slot} {...props} slot={slot}
+      requests={requests?.filter(request => request.slot === slot.slot &&
+        request.install_id === props.installation.install_id && request.bundle_digest === props.installation.digest) ?? []} />)}
+  </>;
 }
 
-function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: Props & { slot: DeclaredSlot }) {
+function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot, requests }: Props & { slot: DeclaredSlot; requests: PlatformToolRequest[] }) {
   const t = useTranslate();
   const [tools, setTools] = useState<CatalogTool[] | null>(null);
   const [selected, setSelected] = useState("");
@@ -49,14 +71,14 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
   const bindingId = binding?.id ?? null;
   useEffect(() => {
     setSelected(""); setAccountId(""); setTools(null); setUnavailable(false);
-    if (!canWrite || bindingId || invalid) return;
+    if (!canWrite || invalid || (bindingId && requests.length === 0)) return;
     const controller = new AbortController();
     void workspaceApps.platformTools(installation.install_id, slot.slot, effect, controller.signal).then(
       value => { if (!controller.signal.aborted) setTools(value); },
       () => { if (!controller.signal.aborted) setUnavailable(true); },
     );
     return () => controller.abort();
-  }, [installation.install_id, installation.digest, slot.slot, effect, canWrite, bindingId, invalid]);
+  }, [installation.install_id, installation.digest, slot.slot, effect, canWrite, bindingId, invalid, requests.length]);
   const selectedTool = tools?.find(tool => tool.slug === selected);
   const needsAccount = selectedTool?.connectedAccounts !== undefined;
   const selectedAccount = selectedTool?.connectedAccounts?.find(account => account.id === accountId);
@@ -64,6 +86,17 @@ function CatalogSlot({ installation, bindings, canWrite, busy, mutate, slot }: P
     <h3>{t(effect === "read" ? "Read tool" : "Draft tool")} <span className="text-ink-400 text-label">· {slot.slot}</span></h3>
     <p className="wa-muted">{t("The app can send inputs to this tool. Charges use the workspace balance at the price when the tool runs.")}</p>
     <p className="wa-muted">{t("Some app screens run tools as the owner without asking again.")}</p>
+    {canWrite && requests.map(request => <div key={request.id} className="wa-stack">
+      <p className="wa-kicker break-words">{t("Requested tool")}: {tools?.find(tool => tool.slug === request.tool_slug)?.displayName ?? request.tool_slug}</p>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="primary" disabled={busy || invalid || binding !== null} onClick={() => void mutate(async () => {
+          await workspaceApps.decidePlatformToolRequest(request, "approve");
+        })}>{t("Grant access")}</Button>
+        <Button disabled={busy} onClick={() => void mutate(async () => {
+          await workspaceApps.decidePlatformToolRequest(request, "deny");
+        })}>{t("Decline")}</Button>
+      </div>
+    </div>)}
     {invalid ? <p className="wa-alert" role="alert">{t("The saved tool grant could not be verified.")}</p> : binding ? <>
       <p className="wa-kicker break-words">{t("Granted tool")}: {binding.config.tool_slug?.replace(/[_.-]+/g, " ").replace(/^./, (letter) => letter.toUpperCase())}</p>
       <details className="text-label">
