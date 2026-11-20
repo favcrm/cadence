@@ -12,7 +12,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::board_identity::Role;
+use crate::board_identity::{dedicated_deployment_ok, dedicated_issuer_ok, Role};
 use crate::error::{Error, Result};
 use crate::operator_auth::{PublicRealm, PublicSnapshot, SessionView};
 
@@ -61,23 +61,6 @@ impl std::fmt::Debug for DedicatedContext {
             .field("verifier", &"[redacted]")
             .finish()
     }
-}
-
-pub(crate) fn dedicated_deployment_ok(s: &str) -> bool {
-    (1..=64).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-}
-
-fn dedicated_issuer_ok(s: &str) -> bool {
-    let Ok(uri) = s.parse::<ureq::http::Uri>() else {
-        return false;
-    };
-    uri.scheme_str() == Some("https")
-        && uri
-            .authority()
-            .is_some_and(|a| !a.as_str().contains('@') && s == format!("https://{}", a.as_str()))
 }
 
 fn read_verifier(path: &std::path::Path) -> Option<String> {

@@ -2813,26 +2813,13 @@ fn validate_dedicated_config(opts: &ServeOpts, value: String) -> CadenceResult<O
     if !opts.board_public_only {
         return Err(Error::rejected("dedicated board requires public-only mode"));
     }
-    let bytes = value.as_bytes();
-    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    if bytes.is_empty()
-        || bytes.len() > 64
-        || !alnum(bytes[0])
-        || !bytes.iter().all(|b| alnum(*b) || *b == b'-')
-    {
+    if !crate::board_identity::dedicated_deployment_ok(&value) {
         return Err(Error::rejected("invalid dedicated board deployment"));
     }
     let public = opts
         .public
         .as_ref()
         .ok_or_else(|| Error::rejected("dedicated board requires public identity"))?;
-    let issuer = public
-        .issuer
-        .parse::<ureq::http::Uri>()
-        .map_err(|_| Error::rejected("invalid dedicated board issuer"))?;
-    let authority = issuer
-        .authority()
-        .ok_or_else(|| Error::rejected("invalid dedicated board issuer"))?;
     let authorize = public
         .authorize_url
         .parse::<ureq::http::Uri>()
@@ -2840,11 +2827,7 @@ fn validate_dedicated_config(opts: &ServeOpts, value: String) -> CadenceResult<O
     let authorize_authority = authorize
         .authority()
         .ok_or_else(|| Error::rejected("invalid dedicated authorize URL"))?;
-    if issuer.scheme_str() != Some("https")
-        || authority.as_str().contains('@')
-        || issuer.path() != "/"
-        || issuer.query().is_some()
-        || public.issuer != format!("https://{}", authority.as_str())
+    if !crate::board_identity::dedicated_issuer_ok(&public.issuer)
         || authorize.scheme_str() != Some("https")
         || authorize_authority.as_str().contains('@')
         || authorize.path() != "/v2/board/authorize"

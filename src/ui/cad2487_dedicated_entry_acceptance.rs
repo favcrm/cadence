@@ -1,6 +1,11 @@
-//! Independent CAD-2487 HTTP acceptance: the same original platform grant
-//! must still be live when a signed-in owner continues credential entry.
-#![cfg(all(test, target_os = "linux", feature = "test-seam"))]
+//! Dedicated browser acceptance exercising real HTTP, signed owner
+//! revalidation, one-use entry and encrypted custody with an offline token.
+#![cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "test-seam"
+))]
 
 use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -14,11 +19,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const HOST: &str = "dedicated.example.test";
+const ENTRY_HOST: &str = "entry.example.test";
+const ENTRY_ORIGIN: &str = "https://entry.example.test";
+const BOARD_ORIGIN: &str = "https://dedicated.example.test";
 const COMPANY: &str = "fixture-workspace";
 const DEPLOYMENT: &str = "fixture-board";
 const SUBJECT: &str = "fixture-owner";
 const KEY: &str = "fixture-key";
-const REQUEST: &str = "bdb2c121-85fa-443e-8849-92a0f9434187";
+const SECRET: &str = "cad2487-synthetic-enrollment-token";
+const CHILD: &str = "CAD2487_BROWSER_CHILD";
 
 fn openssl(dir: &Path, args: &[&str]) {
     assert!(Command::new("/usr/bin/openssl")
@@ -227,7 +236,7 @@ fn post(
         .post(format!("http://127.0.0.1:{port}{path}"))
         .header("Host", HOST)
         .header("Content-Type", "application/json")
-        .header("Origin", format!("https://{HOST}"))
+        .header("Origin", BOARD_ORIGIN)
         .header("Sec-Fetch-Site", "same-origin")
         .header("X-Cadence-Board", "1");
     if let Some(cookie) = cookie {
@@ -235,6 +244,90 @@ fn post(
     }
     req.send(serde_json::to_vec(&body).unwrap().as_slice())
         .expect("board HTTP transport")
+}
+
+fn handoff(
+    port: u16,
+    nonce: &str,
+    request: &str,
+    agent_token: Option<&str>,
+) -> ureq::http::Response<ureq::Body> {
+    let mut req = agent()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/credential-entry/authenticate"
+        ))
+        .header("Host", ENTRY_HOST)
+        .header("Origin", BOARD_ORIGIN)
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("Content-Type", "application/x-www-form-urlencoded");
+    if let Some(token) = agent_token {
+        req = req
+            .header(crate::test_seam::AS_HEADER, "agent:enrollment-fixture")
+            .header(crate::test_seam::TOKEN_HEADER, token);
+    }
+    req.send(format!("nonce={nonce}&request_id={request}").as_bytes())
+        .expect("entry form HTTP transport")
+}
+
+fn entry_post(
+    port: u16,
+    request: &str,
+    verb: &str,
+    origin: &str,
+    session: (&str, &str),
+    payload: &Value,
+) -> (u16, Value) {
+    body(
+        agent()
+            .post(format!(
+                "http://127.0.0.1:{port}/api/credential-requests/{request}/{verb}"
+            ))
+            .header("Host", ENTRY_HOST)
+            .header("Origin", origin)
+            .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("X-Cadence-Board", "1")
+            .header("Cookie", session.0)
+            .header(super::operator::SESSION_HEADER, session.1)
+            .send(serde_json::to_vec(payload).unwrap().as_slice())
+            .expect("entry API HTTP transport"),
+    )
+}
+
+fn ok(response: ureq::http::Response<ureq::Body>, step: &str) -> Value {
+    let (status, value) = body(response);
+    assert_eq!(status, 200, "{step}: {value}");
+    value
+}
+
+fn open_entry(mut response: ureq::http::Response<ureq::Body>, request: &str) -> (String, String) {
+    if response.status().as_u16() != 200 {
+        let (status, value) = body(response);
+        panic!("handoff must open the entry document: {status} {value}");
+    }
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cookie.starts_with("__Host-cadence_entry_"));
+    assert!(cookie.ends_with("; Path=/; HttpOnly; SameSite=Strict; Secure"));
+    let cookie = cookie.split_once(';').unwrap().0.to_string();
+    let html = response.body_mut().read_to_string().unwrap();
+    let (_, bootstrap) = html
+        .split_once("window.__CADENCE_ENTRY_BOOTSTRAP__={key:\"")
+        .expect("entry document has an in-memory key");
+    let (key, _) = bootstrap.split_once('"').unwrap();
+    assert!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(html.contains(&format!("requestId:\"{request}\"")));
+    assert!(!html.contains(SECRET));
+    (cookie, key.to_owned())
+}
+
+fn request_id(response: &Value) -> &str {
+    response["request"]["request_id"].as_str().unwrap()
 }
 fn body(mut response: ureq::http::Response<ureq::Body>) -> (u16, Value) {
     let status = response.status().as_u16();
@@ -246,11 +339,18 @@ fn body(mut response: ureq::http::Response<ureq::Body>) -> (u16, Value) {
 }
 
 #[test]
-fn cad2487_owner_entry_requires_same_live_platform_session() {
+fn cad2487_owner_enrolls_only_through_live_scoped_handoff() {
+    if std::env::var_os(CHILD).is_some() {
+        dedicated_owner_entry_isolated();
+        return;
+    }
     // The issuer TLS seam is process-global. A separate test process makes
-    // this fixture independent of every other concurrent issuer test.
-    let module = module_path!().split_once("::").unwrap().1;
-    let name = format!("{module}::dedicated_owner_entry_isolated");
+    // this fixture independent of concurrent issuer tests; the outer test
+    // is selected normally by CI, not as an ignored/manual test.
+    let name = format!(
+        "{}::cad2487_owner_enrolls_only_through_live_scoped_handoff",
+        module_path!().split_once("::").unwrap().1
+    );
     let home = tempfile::Builder::new()
         .prefix("cad2487-child-home-")
         .tempdir()
@@ -273,9 +373,9 @@ fn cad2487_owner_entry_requires_same_live_platform_session() {
         .env("XDG_STATE_HOME", &state)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("PATH", "/usr/bin:/bin")
+        .env(CHILD, "1")
         .arg("--exact")
         .arg(name)
-        .arg("--ignored")
         .arg("--nocapture")
         .output()
         .expect("isolated acceptance process");
@@ -287,8 +387,6 @@ fn cad2487_owner_entry_requires_same_live_platform_session() {
     );
 }
 
-#[test]
-#[ignore = "run by cad2487_owner_entry_requires_same_live_platform_session in an isolated process"]
 fn dedicated_owner_entry_isolated() {
     block_sigchld();
     let dir = tempfile::Builder::new()
@@ -301,6 +399,13 @@ fn dedicated_owner_entry_isolated() {
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
     crate::issue::Pm::init(&pm).unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir(&dist).unwrap();
+    std::fs::write(
+        dist.join("index.html"),
+        "<!doctype html><html><head><title>Entry fixture shell</title></head><body></body></html>",
+    )
+    .unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&[87; 32]).unwrap();
     let jti = uuid::Uuid::new_v4().to_string();
     let verifier = "a".repeat(64);
@@ -338,13 +443,15 @@ fn dedicated_owner_entry_isolated() {
         crate::daemon::TestMembershipMode::capture(&crate::lease::Hosted::default(), &|name| {
             vars.get(name).cloned()
         });
-    let opts = crate::daemon::ServeOptions {
+    let mut opts = crate::daemon::ServeOptions {
         test_seam: true,
         stop: Some(stop.clone()),
         membership_mode_for_test: Some(mode),
         provider_env: crate::adapter::ProviderEnv::refusing_providers(),
         ..Default::default()
     };
+    crate::daemon::configure_credential_entry_fixture(&mut opts, dir.path(), ENTRY_ORIGIN)
+        .expect("configure isolated owner and encrypted custody");
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     let daemon_state = state.clone();
@@ -371,8 +478,9 @@ fn dedicated_owner_entry_isolated() {
             test_seam: true,
             board_public_only: true,
             allow_hosts: vec![HOST.into()],
-            allow_origins: vec![format!("https://{HOST}")],
-            credential_entry_origin: Some("https://entry.example.test".into()),
+            allow_origins: vec![BOARD_ORIGIN.into()],
+            credential_entry_origin: Some(ENTRY_ORIGIN.into()),
+            dist: Some(dist.clone()),
             public: Some(PublicBoard {
                 host: HOST.into(),
                 issuer: crate::test_web_issuer_tls::ISSUER.into(),
@@ -478,65 +586,221 @@ fn dedicated_owner_entry_isolated() {
         .next()
         .unwrap()
         .to_string();
-    let request = || json!({"request_id":REQUEST});
-    let (status, value) = body(post(
+    let board_post = |path: &str, payload| post(port, path, Some(&board_cookie), payload);
+    for (action, unlocked) in [("custody_initialize", false), ("custody_unlock", true)] {
+        let ticket = ok(
+            board_post(
+                "/api/protected-management/session",
+                json!({"action": action, "params": {}}),
+            ),
+            action,
+        );
+        let receipt = ok(
+            board_post(
+                "/api/protected-management/action",
+                json!({
+                    "action": action, "params": {},
+                    "nonce": ticket["nonce"], "attempt_id": ticket["attempt_id"]
+                }),
+            ),
+            action,
+        );
+        assert_eq!(receipt["custody"]["unlocked"], unlocked);
+    }
+
+    let create = || {
+        ok(
+            board_post(
+                "/api/credential-requests",
+                json!({"provider":"openrouter","verb":"enroll","shape":"token"}),
+            ),
+            "create credential request",
+        )
+    };
+    let first = create();
+    let second = create();
+    let request = request_id(&first);
+    let other = request_id(&second);
+    assert_ne!(request, other);
+    let page = format!("/connections/enroll/{request}");
+    assert_eq!(
+        first["request"]["entry_url"],
+        format!("{ENTRY_ORIGIN}{page}"),
+    );
+    let get = |host: &str, path: &str| {
+        agent()
+            .get(format!("http://127.0.0.1:{port}{path}"))
+            .header("Host", host)
+            .header("Cookie", &board_cookie)
+            .call()
+            .unwrap()
+    };
+    assert_eq!(get(ENTRY_HOST, &page).status().as_u16(), 200);
+    assert!(
+        get(&format!("127.0.0.1:{port}"), &page)
+            .status()
+            .is_client_error(),
+        "a loopback host must never serve the entry form"
+    );
+    assert_eq!(get(HOST, &page).status().as_u16(), 404);
+    assert_eq!(get(ENTRY_HOST, "/api/projects").status().as_u16(), 404);
+    assert!(
+        get("unlisted.example.test", &page)
+            .status()
+            .is_client_error(),
+        "a different host must never serve the entry form"
+    );
+    assert!(post(
         port,
         "/api/credential-entry/prepare",
-        Some(&board_cookie),
-        request(),
+        None,
+        json!({"request_id": request})
+    )
+    .status()
+    .is_client_error());
+
+    let prepare = |request: &str| {
+        ok(
+            board_post(
+                "/api/credential-entry/prepare",
+                json!({"request_id": request}),
+            ),
+            "prepare signed owner handoff",
+        )["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let wrong_request_nonce = prepare(request);
+    for id in [other, request] {
+        let refusal = handoff(port, &wrong_request_nonce, id, None);
+        assert_ne!(
+            refusal.status().as_u16(),
+            200,
+            "wrong request spends the nonce"
+        );
+        assert!(refusal.headers().get("set-cookie").is_none());
+    }
+
+    let nonce = prepare(request);
+    let fixture_token = crate::test_seam::Seam::token_at(&state).unwrap();
+    let (status, refusal) = body(handoff(port, &nonce, request, Some(&fixture_token)));
+    assert_eq!(status, 403, "agent peer must be refused: {refusal}");
+    assert_eq!(refusal["check"], "session_from_agent");
+    let (cookie, key) = open_entry(handoff(port, &nonce, request, None), request);
+    let replay = handoff(port, &nonce, request, None);
+    assert_ne!(replay.status().as_u16(), 200, "handoff replay must fail");
+    assert!(replay.headers().get("set-cookie").is_none());
+
+    let entry_call = |id: &str, verb: &str, origin: &str, payload: &Value| {
+        entry_post(port, id, verb, origin, (&cookie, &key), payload)
+    };
+    let (status, _) = entry_call(other, "session", ENTRY_ORIGIN, &json!({}));
+    assert_eq!(status, 401, "entry cookie cannot authorize another request");
+    let (status, session) = entry_call(request, "session", ENTRY_ORIGIN, &json!({}));
+    assert_eq!(status, 200, "mint single-use submission: {session}");
+    let payload = json!({"nonce":session["nonce"],"secret":SECRET});
+    let (status, refusal) = entry_call(request, "submit", BOARD_ORIGIN, &payload);
+    assert_eq!(status, 403);
+    assert_eq!(refusal["code"], "wrong_entry_origin");
+    let (status, refusal) = body(board_post(
+        &format!("/api/credential-requests/{request}/submit"),
+        payload.clone(),
     ));
-    assert_eq!(
-        status, 409,
-        "live owner must reach the genuine pending-request guard: {value}"
+    assert_eq!(status, 403);
+    assert_eq!(refusal["code"], "wrong_entry_origin");
+    let (status, saved) = entry_call(request, "submit", ENTRY_ORIGIN, &payload);
+    assert_eq!(status, 200, "synthetic token was not saved");
+    assert_eq!(saved["status"], "saved");
+    assert!(!saved.to_string().contains(SECRET));
+    let (status, refusal) = entry_call(request, "submit", ENTRY_ORIGIN, &payload);
+    assert_eq!(status, 409);
+    assert_eq!(refusal["code"], "already_submitted");
+
+    // An already-open entry session must lose its submission authority
+    // when the issuer withdraws its original board sign-in.
+    let (other_cookie, other_key) = open_entry(handoff(port, &prepare(other), other, None), other);
+    let (status, session) = entry_post(
+        port,
+        other,
+        "session",
+        ENTRY_ORIGIN,
+        (&other_cookie, &other_key),
+        &json!({}),
     );
-    assert_eq!(value["code"], "request_changed");
-    let before = issuer.granted.load(Ordering::SeqCst);
+    assert_eq!(status, 200, "second open entry: {session}");
+    assert!(issuer.granted.load(Ordering::SeqCst) > 1);
+    issuer.revoked.store(true, Ordering::SeqCst);
+    let (status, _) = entry_post(
+        port,
+        other,
+        "submit",
+        ENTRY_ORIGIN,
+        (&other_cookie, &other_key),
+        &json!({"nonce": session["nonce"], "secret": SECRET}),
+    );
     assert!(
-        before >= 2,
-        "mint and entry both need live verifier responses"
+        matches!(status, 401 | 403),
+        "revoked entry unexpectedly returned {status}"
     );
+    assert!(
+        issuer.denied.load(Ordering::SeqCst) > 0,
+        "the issuer must refuse the original JTI"
+    );
+
     let db = rusqlite::Connection::open_with_flags(
         state.join("cadence.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let counts = || -> (i64, i64) {
-        (
-            db.query_row(
-                "SELECT count(*) FROM credential_request_nonces",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-            db.query_row(
-                "SELECT count(*) FROM credential_request_attempts",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
+    let attempts: Vec<String> = db
+        .prepare("SELECT request_id FROM credential_request_attempts WHERE state = 'applied'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(attempts, [request]);
+    let attempt_count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM credential_request_attempts",
+            [],
+            |r| r.get(0),
         )
-    };
-    let before_mutation = counts();
-    issuer.revoked.store(true, Ordering::SeqCst);
-    let (status, value) = body(post(
-        port,
-        "/api/credential-entry/prepare",
-        Some(&board_cookie),
-        request(),
-    ));
-    assert!(
-        matches!(status, 401 | 403),
-        "withdrawn original session must be refused: {status} {value}"
-    );
-    assert!(
-        issuer.denied.load(Ordering::SeqCst) > 0,
-        "the actual verifier must answer 403 for the original jti"
-    );
+        .unwrap();
     assert_eq!(
-        counts(),
-        before_mutation,
-        "withdrawn authority cannot create credential nonces or attempts"
+        attempt_count, 1,
+        "attempts on denied paths must never persist"
     );
-    drop(db);
-    drop(servers);
+    let custody: String = db
+        .query_row(
+            "SELECT custody FROM platform_credentials WHERE platform = 'openrouter'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let locator = custody
+        .strip_prefix(crate::platform::encrypted_sqlite::TAG_PREFIX)
+        .expect("the connection references encrypted custody");
+    let vault = rusqlite::Connection::open_with_flags(
+        state.join("vault/custody.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let ciphertext: Vec<u8> = vault
+        .query_row(
+            "SELECT ciphertext FROM records WHERE lower(hex(locator)) = ? AND provider = 'openrouter'",
+            [locator],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!ciphertext
+        .windows(SECRET.len())
+        .any(|w| w == SECRET.as_bytes()));
+    assert_eq!(
+        vault
+            .query_row("SELECT count(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
