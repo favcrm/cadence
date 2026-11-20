@@ -10,6 +10,10 @@ validator and Tier 2 frame mounting, and CRM/Social bundle digests change, so
 the implementation PR must be classified against
 `docs/roles/risk-classes.md` and may be `human` class.
 
+CAD-2524 supersedes the header picker and `+ New` described below. The current
+installed-app header names the active conversation without a picker; composer
+commands, scoped conversation links, subject selection and wire shapes are unchanged.
+
 ## Goals and non-goals
 
 Problem on main (514ffc84). Two chat renderers exist: Home uses

@@ -21,7 +21,6 @@ import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
 import { useQuery, useResource } from "../../../lib/useResource";
-import Link from "../../../ui/Link";
 import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
@@ -115,7 +114,6 @@ import ConversationDecisions from "./ConversationDecisions";
 import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 import { StagedSourceContext } from "../../../ui/StagedChip";
 import {
-  AssistantAboutButton,
   AssistantActorProvider,
   AssistantFace,
   useConversationActor,
@@ -129,7 +127,7 @@ import type { ChatBinding, MediaComposerTarget } from "./types";
 import { usePendingPermissionRequest } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "./TurnBar";
-import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
+import { writeSeen } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
 import { earlierStep, useThreadStream, type StreamLink } from "./conversationThread";
@@ -758,46 +756,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     onPendingDecision?.(operationPending || stagedPending);
   }, [onPendingDecision, operationPending, stagedPending]);
   const streamDown = streamLink !== "live" || !operationsCurrent;
-  const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
   // records its newest reply sequence; other tabs observe the seen write.
-  const [seenState, setSeenState] = useState<{ installId: string; seen: SeenMap } | null>(null);
-  const unreadSeen = seenState?.installId === installId ? seenState.seen : null;
-  useEffect(() => onSeenChanged(installId, (seen) => setSeenState({ installId, seen })), [installId]);
   const selectedId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const selectedReply = active.state === "ready" ? (active.selected?.replySeq ?? null) : null;
   useEffect(() => {
     if (!documentVisible || collapsed || selectedId === null || selectedReply === null || selectedReply <= 0) return;
     void writeSeen(installId, selectedId, selectedReply);
   }, [selectedId, selectedReply, installId, collapsed, documentVisible]);
-  // A real assistant reply elsewhere lights the Conversations button.
-  const hasUnreadOther =
-    unreadSeen !== null && active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
-  const historyButtonRef = useRef<HTMLButtonElement | null>(null);
-  const historyMenuRef = useRef<HTMLDivElement | null>(null);
-  // Escape and an outside press close the Conversations menu; focus goes
-  // back to its button so keyboard users keep their place.
-  const closeHistory = useCallback(() => {
-    setHistoryOpen(false);
-    historyButtonRef.current?.focus();
-  }, []);
-  useEffect(() => {
-    if (!historyOpen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeHistory();
-    };
-    const onPress = (event: PointerEvent) => {
-      const target = event.target as Node | null;
-      if (target && (historyMenuRef.current?.contains(target) || historyButtonRef.current?.contains(target))) return;
-      setHistoryOpen(false);
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("pointerdown", onPress);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("pointerdown", onPress);
-    };
-  }, [historyOpen, closeHistory]);
   // CAD-1431: the CSV importer mounts only when the operator first opens it
   // from the composer's More actions menu. Once mounted it is hidden, not
   // unmounted, on Close, so a confirm already in flight still hands its
@@ -1421,7 +1387,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (unanswered) void masterSource.refresh();
   }, [unanswered, masterSource]);
 
-  // "+ New", `/new` and `/clear` are one call: a fresh conversation.
+  // `/new` and `/clear` start a fresh conversation without sending a message.
   const startNew = () => {
     if (!canCreate || creating) return;
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
@@ -2055,48 +2021,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             <span className="assistant-scope truncate">{scopeDescriptor(actor.scope, t)}</span>
           </div>
         </div>
-        <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>
+        <div className="app-chat-head-tools">
           {lastAnswer !== null && (
             <CopyAnswerButton text={lastAnswer} label={t("Copy last answer")} copiedLabel={t("Copied")} />
           )}
-          {active.state !== "legacy" && (
-            <button
-              type="button"
-              className="app-chat-iconbtn"
-              data-chat-new
-              aria-label={t("New conversation")}
-              title={t("New conversation")}
-              disabled={!canCreate || creating}
-              onClick={startNew}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M20 14.5a2 2 0 0 1-2 2H8l-4 3.5V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z" />
-                <path d="M12 7.5v6M9 10.5h6" />
-              </svg>
-            </button>
-          )}
-          {active.state !== "legacy" && (
-            <button
-              ref={historyButtonRef}
-              type="button"
-              className="app-chat-iconbtn"
-              aria-label={t("Conversations")}
-              title={t("Conversations")}
-              aria-haspopup="menu"
-              aria-expanded={historyOpen}
-              disabled={active.state !== "ready" || active.conversations.length === 0}
-              onClick={() => setHistoryOpen((o) => !o)}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5" />
-                <path d="M3.5 3.5v5h5" />
-                <path d="M12 7.5V12l3 2" />
-              </svg>
-              {hasUnreadOther && <span className="app-chat-iconbtn-dot" aria-hidden />}
-            </button>
-          )}
-          <AssistantAboutButton />
-          <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
             className="app-chat-iconbtn app-chat-close"
@@ -2107,68 +2035,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             <IconClose size={14} />
           </button>
         </div>
-        {historyOpen && active.state === "ready" && (
-          <div
-            ref={historyMenuRef}
-            className="app-chat-history"
-            role="menu"
-            aria-label={t("Conversations")}
-            data-chat-history
-          >
-            {active.conversations.map((c, i) => {
-              const unread = unreadSeen !== null && isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={c.id === convId}
-                  className="app-chat-history-row"
-                  data-unread={unread || undefined}
-                  onClick={() => {
-                    onCollapsed(false);
-                    selectConversation(installId, c.id);
-                    closeHistory();
-                  }}
-                >
-                  <span className="app-chat-history-mark" aria-hidden>
-                    {c.id === convId ? "✓" : ""}
-                  </span>
-                  <span className="app-chat-history-name">{conversationLabel(c, i, subjects, t)}</span>
-                  {unread && (
-                    <span className="app-chat-history-new" aria-label={t("New reply")}>
-                      {t("new")}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-            {active.selected !== null &&
-              !active.selected.isGeneral &&
-              binding.scope !== null &&
-              binding.error === null &&
-              binding.scope.install_id === installId &&
-              binding.scope.context_id !== "" &&
-              mode.contextProof?.status === "ready" &&
-              mode.contextProof.contextId === binding.scope.context_id &&
-              mode.appPath != null && (
-                <>
-                  <div className="app-chat-history-divider" role="separator" />
-                  <Link
-                    href={`${mode.appPath}?install=${encodeURIComponent(installId)}&ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
-                    className="app-chat-history-row"
-                    role="menuitem"
-                    aria-label={t("Link to this conversation")}
-                    title={t("Shareable link to this conversation")}
-                    data-chat-conversation-link
-                  >
-                    <span className="app-chat-history-mark" aria-hidden />
-                    <span className="app-chat-history-name">{t("Link to this conversation")}</span>
-                  </Link>
-                </>
-              )}
-          </div>
-        )}
       </div>
       {active.requestPending && (
         <p className="text-label text-ink-500" role="status" data-chat-link-pending>

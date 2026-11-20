@@ -3248,9 +3248,10 @@ original content/app binding. An unrelated transport failure keeps its own
 same-id row Retry; neither action uses a later draft.
 An unresolved conversation id never claims an unthreaded running turn;
 the surface can still identify its own pending or stored operator message.
-The Conversations dropdown belongs to the positioned pane header, so it opens
-below the header rather than the page and keyboard focus does not scroll the
-workspace down to reach it.
+The installed-app chat header shows the assistant and active conversation,
+with Copy last answer when available and Collapse. Use `/new` or `/clear` to
+start a fresh app conversation. Existing conversation links still open their
+scoped conversation.
 
 The shell loads conversation replies on mount and observes them while their
 pane is offscreen: an app reply opens its exact conversation, and a Home
