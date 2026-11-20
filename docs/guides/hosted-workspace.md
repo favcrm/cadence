@@ -103,7 +103,8 @@ skill loaded or that any action ran.
 An owner can review a write staged in an installed app's assistant conversation
 beside that conversation. **Review** shows the stored changes and declared
 effects; **Not now** leaves it pending. Approval may still fail to apply, so
-the conversation's Updates shows the recorded outcome, not just the decision.
+expand **Updates** below the messages to see the recorded outcome, not just the
+decision.
 If a reply is lost, **Check again** re-reads the outcome rather than submitting
 another decision. Reads and decisions retain the selected conversation; the
 Home queue remains separate. Members cannot decide these requests.
