@@ -4,6 +4,7 @@ import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
 import type * as ConversationModule from "../src/features/app-shell/chat/Conversation";
+import type * as ConversationClient from "../src/features/app-shell/conversationClient";
 import type { MasterState } from "../src/lib/types";
 import type * as CanvasStoreModule from "../src/features/canvas/canvasStore";
 import type * as ComposerStoreModule from "../src/features/app-shell/chat/composerStore";
@@ -55,7 +56,7 @@ const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
         React.createElement(CanvasDrawer)) }));
 };
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList, readChatCollapsedChoice } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList, readChatCollapsedChoice, selectConversation } = require("../src/features/app-shell/conversationClient") as typeof ConversationClient;
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
@@ -196,7 +197,9 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 const settle = async () => { for (let i = 0; i < 8; i++) await flush(); };
+let mountedInstall = "";
 async function mount(installId: string, viewer = { operator: true, readOnly: false }, context = "ctx-a") {
+  mountedInstall = installId;
   history.pushState(null, "", `/app-installations/${installId}?ctx=${context}`);
   await React.act(async () => {
     win.dispatchEvent(new win.PopStateEvent("popstate"));
@@ -204,26 +207,17 @@ async function mount(installId: string, viewer = { operator: true, readOnly: fal
   });
   await settle();
 }
-// CAD-1700: the header names the open conversation; the Conversations menu
-// (history icon) lists them, the current one checked.
-const histBtn = () => host.querySelector('[aria-label="Conversations"]') as HTMLButtonElement;
-const rows = () => Array.from(host.querySelectorAll('[data-chat-history] [role="menuitemradio"]')) as HTMLButtonElement[];
-async function openHistory() {
-  if (!host.querySelector("[data-chat-history]")) {
-    await React.act(async () => { histBtn().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-  }
-}
-const rowName = (r: Element) => r.querySelector(".app-chat-history-name")?.textContent ?? null;
-const optionLabels = async () => { await openHistory(); return rows().map(rowName); };
 const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent?.replace(/^·\s*/, "") ?? null;
 const pane = () => (host.querySelector("[data-chat-pane]") as HTMLElement).textContent ?? "";
 const box = () => host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
-const newButton = () => host.querySelector("[data-chat-new]") as HTMLButtonElement;
+// Drive the same host selection used by app routes and reply notifications.
 async function pick(label: string) {
-  await openHistory();
-  const row = rows().find((r) => rowName(r) === label);
-  assert(row, `history lists ${label}`);
-  await React.act(async () => { row!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  const conversation = convs[mountedInstall].find((c) => (c.is_general ? "General" : c.title) === label);
+  assert(conversation, `${mountedInstall} has a ${label} fixture`);
+  await React.act(async () => {
+    selectConversation(mountedInstall, conversation.id);
+    host.querySelector<HTMLButtonElement>('.app-header-assistant[aria-expanded="false"]')?.click();
+  });
   await settle();
 }
 async function type(text: string, key = "Enter") {
@@ -237,14 +231,13 @@ async function type(text: string, key = "Enter") {
 
 await mount("install-crm");
 
-// Picker: General, the campaign conversation, and + New; only the selected conversation's entries show.
-equal(await optionLabels(), ["General", "Spring launch"], "history lists General and the campaign conversation");
-assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits in the header tools");
-assert(newButton().closest(".app-chat-head-tools") && newButton().nextElementSibling === histBtn(), "New sits before the history button in the header tools");
-assert(!host.querySelector('select[aria-label="Conversation"], [data-chat-home-link], [data-chat-conversations]'), "no conversation select, row or Home link");
+// The app header names the selected conversation without duplicating navigation.
+equal(
+  Array.from(host.querySelectorAll(".app-chat-head button"), (button) => button.getAttribute("aria-label")),
+  ["Copy last answer", "Collapse assistant chat"],
+  "the app header keeps copy and collapse as its only actions",
+);
 equal(openLabel(), "General", "General is the default and the scope row names it");
-await optionLabels();
-equal(rows()[0].getAttribute("aria-checked"), "true", "the Conversations menu checks General as the open one");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("Spring launch");
 assert(pane().includes("campaign brief") && !pane().includes("general answer"), "the campaign conversation shows only its own thread");
@@ -259,20 +252,11 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
-assert(openLabel() !== null, "the fresh conversation has an open-conversation label");
-await openHistory(); // CAD-1700: the shareable link lives in the Conversations menu.
-const newConversationLink = host.querySelector("[data-chat-conversation-link]") as HTMLAnchorElement | null;
-assert(newConversationLink, "the fresh conversation has a shareable link");
-equal(new URL(newConversationLink.href).searchParams.get("conversation"), "new-1", "the fresh conversation is the selected conversation");
-assert((await optionLabels()).length === 3 && (await optionLabels()).includes("General"), "older conversations stay listed");
+equal(canvasSnapshot().conversation, "new-1", "/new selects the exact conversation returned by the create");
 equal(box().value, "", "the command is cleared from the composer");
 await type("/clear");
 equal(messagePosts.length, 1, "/clear is not sent as a message");
-equal(createPosts.length, 2, "/clear creates another conversation");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
-equal(createPosts.length, 3, "+ New is the same call");
-equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }, { context_id: "ctx-a" }], "New never carries a subject");
+equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }], "both commands create a fresh conversation without a subject");
 
 // Create-on-first-send: opening a campaign page creates nothing; the first message
 // creates the conversation (idempotent subject) and is sent to the returned id.
@@ -648,7 +632,7 @@ assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"
 await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat expands independently");
-equal(await optionLabels(), ["General"], "another app lists only its own conversations");
+equal(openLabel(), "General", "the other app shows its own General conversation");
 await mount("install-crm");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the CRM chat stays collapsed");
 await mount("install-other");
@@ -707,17 +691,14 @@ const prompts = () => host.querySelector("[data-chat-prompts]");
 assert(prompts(), "an empty conversation shows the quick actions");
 await pick("Has messages");
 assert(!prompts(), "a conversation with messages hides the quick actions");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
+await type("/new");
 assert(prompts(), "a new empty conversation brings the quick actions back");
 
-// A read-only viewer cannot create a conversation by any route.
+// A read-only viewer cannot create a conversation from the composer.
 await mount("install-crm", { operator: true, readOnly: true });
 const before = createPosts.length;
-assert(newButton().disabled, "+ New is disabled read-only");
 assert(box().disabled, "the composer (and so /new) is disabled read-only");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
+await type("/new");
 equal(createPosts.length, before, "no conversation is created read-only");
 await pick("General");
 turn = { state: "working", message: "m-gen", conversation: "c-gen" };
