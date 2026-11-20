@@ -37,6 +37,7 @@ export default function AgentSidebar({
   profileStatus,
   open,
   query,
+  hasTeammateMatches,
   onQuery,
   onOpen,
   onOpenPersonal,
@@ -53,6 +54,7 @@ export default function AgentSidebar({
   profileStatus: (profile: HiredProfile) => string;
   open: string | null;
   query: string;
+  hasTeammateMatches: boolean;
   onQuery: (query: string) => void;
   onOpen: (alias: string) => void;
   onOpenPersonal: (() => void) | null;
@@ -177,7 +179,7 @@ export default function AgentSidebar({
             </div>
           ),
         )}
-        {!personal && groups.length === 0 && query.trim() !== "" && (
+        {!personal && groups.length === 0 && query.trim() !== "" && !hasTeammateMatches && (
           <p className="ag-side-none" role="status">
             {t("No agents match “{query}”.").replace("{query}", () => query)}{" "}
             <button type="button" className="lnk" onClick={() => onQuery("")}>

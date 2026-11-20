@@ -1,6 +1,7 @@
 import { MASTER } from "../home/master";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, PersonalAssistantRow } from "../../lib/types";
+import { IconLock } from "../../ui/icons";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { activeTasks } from "./AgentBlocks";
 import { agentStatus, lifecycleBadge, lifecycleOf, type LifecycleTone } from "./agentView";
@@ -107,5 +108,23 @@ export function PersonalSeat({ row, onOpen }: { row: PersonalAssistantRow; onOpe
         <span className="s">{t("Chats on Home")}</span>
       </span>
     </button>
+  );
+}
+
+/** A default personal seat, not an agent detail destination or a live status. */
+export function TeammateSeat({ name }: { name: string }) {
+  const t = useTranslate();
+  return (
+    <li className="rc-seat">
+      <AgentAvatar slug="robot" still size={44} />
+      <span className="min-w-0 break-words">
+        <span className="t">{name || t("Teammate")}</span>
+        <span className="s">{t("Personal assistant")}</span>
+      </span>
+      <span className="st">
+        <IconLock aria-hidden="true" />
+        {t("Private")}
+      </span>
+    </li>
   );
 }

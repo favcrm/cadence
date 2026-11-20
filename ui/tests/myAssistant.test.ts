@@ -49,6 +49,7 @@ const Agents = (
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
+const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
 type Agent = import("../src/lib/types").Agent;
 type AgentsPayload = import("../src/lib/types").AgentsPayload;
 type AgentTab = import("../src/features/agents/agentTabModel").AgentTab;
@@ -81,8 +82,19 @@ const hostedRoster = (extra: Partial<AgentsPayload> = {}) =>
   roster({ master: { scope: "workspace", name: "Acme" }, personal_assistant: personalRow, ...extra });
 let memberStateReads = 0;
 let threadReads: string[] = [];
+let directoryReads = 0;
+let directoryAvailable = true;
 globalThis.fetch = async (input) => {
   const path = new URL(String(input), "http://localhost").pathname;
+  if (path === "/api/team/members") {
+    directoryReads += 1;
+    if (!directoryAvailable) return json({ error: "unavailable" }, 503);
+    return json({ members: [
+      { userId: "viewer", name: "Lee Chen", role: "member", joinedAt: "2026-11-16" },
+      { userId: "teammate", name: "Maya Park", email: "maya@example.test", role: "owner", joinedAt: "2026-11-16" },
+      { userId: "unnamed", name: "hidden@example.test", email: "hidden@example.test", role: "member", joinedAt: "2026-11-16" },
+    ] });
+  }
   if (path === "/api/member-assistant/state") {
     memberStateReads += 1;
     return json({ assistant: { alias: "assistant-1", identity: { name: "Nova", tone: null, look: "robot", revision: 1 } }, conversation_id: "c1" });
@@ -117,6 +129,7 @@ const flush = async () => {
 let payload: AgentsPayload = roster();
 let hostedBoard = true;
 let operator: boolean | null = true;
+let viewerSub: string | null = "viewer";
 let profiles: unknown[] = [];
 /** Reads the route from the real URL, as the app does. */
 function route(): { open: string | null; tab: AgentTab } {
@@ -125,6 +138,7 @@ function route(): { open: string | null; tab: AgentTab } {
 }
 async function render() {
   const { open, tab } = route();
+  const viewer = { viewerSub: hostedBoard ? viewerSub : null };
   await React.act(() =>
     root.render(
       React.createElement(LocaleProvider, null, React.createElement(Agents, {
@@ -132,6 +146,7 @@ async function render() {
         operator,
         onRetryAccess: () => {},
         hostedBoard,
+        ...viewer,
         state: loaded({ ...payload, profiles } as AgentsPayload),
         issues: loaded([]),
         open,
@@ -165,6 +180,18 @@ async function click(el: Element | null | undefined) {
   await render();
 }
 async function main() {
+  allowPrivateReads();
+  const checkDirectory = () => {
+    const cards = [...host.querySelectorAll(".rc-seats .rc-seat")];
+    const maya = cards.find((card) => card.textContent?.includes("Maya Park"));
+    assert(maya, "a teammate has a private assistant card");
+    assert(maya.textContent?.includes("Personal assistant") && maya.textContent.includes("Private"), "the card describes privacy, not status");
+    assert(!maya.matches("a, button, [tabindex], [role=button], [role=link]") && !maya.querySelector("a, button, [tabindex]"), "teammate card has no way to open it");
+    assert(maya.querySelector(".agent-avatar") !== null, "teammate card wears an assistant avatar");
+    assert(!sideRows().some((s) => s.includes("Maya Park")), "teammate is not a sidebar destination");
+    assert(!host.textContent?.includes("Lee Chen") && !host.textContent?.includes("@example.test"), "viewer and email fallback are not rendered");
+    assert(cards.some((card) => card.textContent?.includes("Teammate") && card.textContent.includes("Private")), "a missing public name still has a generic private card");
+  };
   // A member on a hosted board: My assistant first, no Master row in the cards or the sidebar.
   payload = hostedRoster();
   operator = false;
@@ -174,6 +201,15 @@ async function main() {
   assert(sideRows()[1].includes("Nova · Your assistant"), "member: My assistant is the first sidebar row after Overview");
   assert(!sideRows().some((s) => s.includes("Acme") || s.includes("master")), "member: no Master sidebar row");
   assert(host.querySelector(".rc-seats .rc-seat svg, .rc-seats .rc-seat [class*=avatar]") !== null, "the card wears a face");
+  checkDirectory();
+  const search = host.querySelector<HTMLInputElement>("#agents-search");
+  assert(search, "Agents offers search");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(search, "MAYA");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert(seats().length === 1 && seats()[0].includes("Maya Park"), "Agents search matches teammate names without an empty-state message");
+  assert(!host.textContent?.includes("No agents match"), "teammate match is a roster result");
 
   // An owner: My assistant first, then Master labelled company and owners-only (workspace name as the title).
   operator = true;
@@ -181,6 +217,16 @@ async function main() {
   assert(seats()[0].includes("Nova · Your assistant"), "owner: My assistant first");
   assert(seats()[1].includes("Acme") && seats()[1].includes("Master · company, owners only"), "owner: Master follows, labelled");
   assert(sideRows().some((s) => s.includes("Master · company, owners only")), "owner: the sidebar row is labelled too");
+  checkDirectory();
+  const priorReads = directoryReads;
+  viewerSub = null;
+  await render();
+  assert(!host.textContent?.includes("Maya Park") && directoryReads === priorReads, "an unidentified viewer does not read or render the directory");
+  directoryAvailable = false;
+  viewerSub = "viewer";
+  await render();
+  assert(!host.textContent?.includes("Maya Park"), "a failed read does not display earlier directory data");
+  directoryAvailable = true;
 
   // Clicking Master (card, then sidebar row) navigates to the Master page, not a chat.
   await at("/agents");
@@ -225,6 +271,7 @@ async function main() {
 
   // An older API (no scope, no personal_assistant) renders as today, Master shown to everyone.
   payload = roster();
+  const legacyReads = directoryReads;
   for (const who of [false, true]) {
     operator = who;
     await at("/agents");
@@ -238,11 +285,14 @@ async function main() {
   operator = false;
   await at("/agents");
   assert(seats()[0].startsWith("master"), "native: Master is unchanged");
+  assert(directoryReads === legacyReads, "legacy and native boards do not read the directory");
   await React.act(() => root.unmount());
+  resetPrivateSession();
   console.log("my assistant checks passed");
 }
 main().catch(async (error) => {
   await React.act(() => root.unmount());
+  resetPrivateSession();
   throw error;
 });
 export {};

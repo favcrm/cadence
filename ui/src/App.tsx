@@ -1665,6 +1665,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             operator={access.operator}
             onRetryAccess={retryAccess}
             hostedBoard={meta.hosted === true}
+            viewerSub={meta.signed_in && viewerSub && !viewerSub.startsWith("operator-token:") ? viewerSub : null}
             state={agentsState}
             issues={issuesState}
             open={route.alias}

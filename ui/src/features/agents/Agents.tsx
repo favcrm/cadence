@@ -1,15 +1,16 @@
-import { useContext, useState, type ReactNode } from "react";
+import { useContext, useEffect, useState, type ReactNode } from "react";
 import type { ResourceState } from "../../lib/cache";
 import { issueIndex } from "../../lib/scope";
 import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
 import { resources } from "../../lib/resources";
+import { readTeamMembers } from "../../lib/teamRoster";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
-import SeatCard, { PersonalSeat } from "./SeatCard";
+import SeatCard, { PersonalSeat, TeammateSeat } from "./SeatCard";
 import MyAssistantPage from "./MyAssistantPage";
 import { isCompanyMaster, masterShownTo, MASTER_LABEL, PERSONAL_ALIAS, personalOf } from "./personalAssistant";
 import { MASTER } from "../home/master";
@@ -81,12 +82,14 @@ export default function Agents({
   operator,
   onRetryAccess,
   hostedBoard,
+  viewerSub,
 }: {
   /** `true` alone lets the viewer read and send agent conversations, as on
    *  Threads. `null` is an unanswered check, not a non-operator. */
   operator: boolean | null;
   onRetryAccess: () => void;
   hostedBoard: boolean;
+  viewerSub?: string | null;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
@@ -122,16 +125,50 @@ export default function Agents({
     hostedBoard &&
     ((payload != null && Object.hasOwn(payload, "personal_assistant")) ||
       roster.some((a) => isCompanyMaster(a, payload)));
+  const directoryViewer = scopedRoster && !open && !ask && !recruit ? viewerSub ?? null : null;
+  const [directory, setDirectory] = useState<{
+    viewer: string;
+    rows: { userId: string; name: string }[];
+  } | null>(null);
+  useEffect(() => {
+    if (!directoryViewer) {
+      setDirectory(null);
+      return;
+    }
+    // Every current workspace member has a personal seat. Show only the team
+    // roster name; never read a teammate's profile or whether they opened Home.
+    const abort = new AbortController();
+    readTeamMembers(abort.signal)
+      .then((members) => {
+        if (abort.signal.aborted) return;
+        setDirectory({
+          viewer: directoryViewer,
+          rows: members.flatMap(({ userId, name }) => {
+            if (userId === directoryViewer) return [];
+            const displayName = name.trim();
+            return [{ userId, name: /^\S+@\S+$/.test(displayName) ? "" : displayName }];
+          }),
+        });
+      })
+      .catch(() => {
+        if (!abort.signal.aborted) setDirectory(null);
+      });
+    return () => abort.abort();
+  }, [directoryViewer]);
+  const teammateRows = directory && directory.viewer === directoryViewer ? directory.rows : [];
+  const searchTerm = query.trim().toLowerCase();
+  const matchingTeammates = searchTerm
+    ? teammateRows.filter(({ name }) => (name || t("Teammate")).toLowerCase().includes(searchTerm))
+    : teammateRows;
   const companyMaster = allAgents.find((a) => isCompanyMaster(a, payload)) ?? null;
   const personalMatches =
     personal !== null &&
-    (query.trim() === "" ||
-      `${personal.name} ${PERSONAL_ALIAS}`.toLowerCase().includes(query.trim().toLowerCase()));
+    `${personal.name} ${PERSONAL_ALIAS}`.toLowerCase().includes(searchTerm);
   const profiles = payload?.profiles ?? [];
   const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
   // The cards are the current team; a search reaches everyone. Stopped agents
   // and mailboxes otherwise live in the sidebar's folded groups.
-  const searching = query.trim() !== "";
+  const searching = searchTerm !== "";
   const filter: AgentFilter = searching ? "all" : "current";
   const sidebarAgents = allAgents.filter((a) => agentMatchesSearch(a, query, issueIndexed));
   const sidebarProfiles = idleProfiles.filter((p) => profileMatchesSearch(p, query));
@@ -147,7 +184,7 @@ export default function Agents({
         a.alias.localeCompare(b.alias),
     );
   const emptyCopy =
-    allAgents.length + idleProfiles.length === 0
+    allAgents.length + idleProfiles.length + teammateRows.length === 0 && !personal
       ? t("No agents registered.")
       : searching
         ? t("No agents match “{query}”.").replace("{query}", () => query)
@@ -220,6 +257,7 @@ export default function Agents({
         }}
         open={open}
         query={query}
+        hasTeammateMatches={matchingTeammates.length > 0}
         onQuery={setQuery}
         onOpen={openAgent}
         onOpenPersonal={scopedRoster ? () => setOpen(PERSONAL_ALIAS) : null}
@@ -392,6 +430,17 @@ export default function Agents({
             ))}
             {!searching && tile}
           </div>
+          {matchingTeammates.length > 0 && (
+            <section aria-labelledby="teammate-assistants-heading">
+              <div className="rc-sec">
+                <h2 id="teammate-assistants-heading">{t("Teammate assistants")}</h2>
+              </div>
+              <ul className="rc-seats" role="list">
+                {matchingTeammates.map(({ userId, name }) => <TeammateSeat key={userId} name={name} />)}
+              </ul>
+              <p className="mt-2 text-label text-ink-500">{t("Only the teammate can open their personal assistant.")}</p>
+            </section>
+          )}
           {folded.length > 0 && (
             <details className="ag-folded">
               <summary>
@@ -402,7 +451,7 @@ export default function Agents({
               </div>
             </details>
           )}
-          {agents.length + shownProfiles.length === 0 && !personalMatches && (
+          {agents.length + shownProfiles.length + matchingTeammates.length === 0 && !personalMatches && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
             </p>
