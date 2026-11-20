@@ -62,6 +62,19 @@ for (const bad of fixture("record-ref-detail-invalid")) {
   equal(parseRecordRef(entryOf(bad.entry)), null, `invalid fixture rejected: ${bad.case}`);
 }
 
+// to/cc/body/attachments are detail-only: a list card naming one is refused.
+const listWithBody = fixture("record-ref-list");
+listWithBody.payload.roles.body = "name";
+equal(parseRecordRef(entryOf(listWithBody)), null, "a body role outside a detail view is refused");
+// The truncation flag is the payload's; an item key of that name changes nothing.
+const itemFlag = clone(valid);
+itemFlag.payload.items[0].truncated = true;
+check((recordLayout(parseRecordRef(entryOf(itemFlag))!) as any).detail.truncated === false, "an item truncated key is not read");
+// A body without text is still a card.
+const noBody = clone(valid);
+noBody.payload.items[0].body_text = null;
+check(parseRecordRef(entryOf(noBody)) !== null, "a null body parses");
+
 // ---- the compact card ----
 const hostile = `<img src=x onerror=alert(1)> [x](https://e.test/p) **b** ${"A".repeat(3000)}`;
 const long = clone(valid);
@@ -92,6 +105,13 @@ check(!plain.includes("\n\nThanks"), "the preview is one flowed paragraph");
 const bad = clone(valid);
 bad.payload.items.push(clone(bad.payload.items[0]));
 check(html(createElement(RecordCard, { entry: entryOf(bad) })).includes("chatcard-line"), "malformed detail shows the text line");
+
+// A literal "<" from a decoded entity is text, in the card and the reader.
+const lt = clone(valid);
+lt.payload.items[0].body_text = "if a < b && c <d> then 1 &lt; 2 <b>x</b>";
+lt.payload.items[0].subject = "Re: 5 < 6 <i>";
+const ltCard = html(createElement(RecordCard, { entry: entryOf(lt, 12) }));
+check(ltCard.includes("a &lt; b &amp;&amp; c &lt;d&gt;") && !ltCard.includes("<b>x") && !ltCard.includes("<i>"), "a literal < in the card is escaped");
 
 // ---- the record tab comes from the stored card ----
 const view = recordCardView(entryOf(valid, 7))!;
@@ -134,6 +154,8 @@ check(reader.includes("From Gmail · ops@example.test · read-only"), "footer na
 check(!reader.includes("data-record-truncated"), "no truncation note on a full body");
 check(reader.includes("Ask about this") && reader.includes("Draft reply") && !reader.includes("disabled"), "Ask and Draft reply are offered with a composer");
 check(read(view, null).includes("disabled"), "no composer, no fill");
+const ltRead = html(createElement(RecordViewBody, { tab: canvasTab(recordCardView(entryOf(lt, 12))!), view: recordCardView(entryOf(lt, 12))!, composerKey: "k", sheet: false, expanded: false, canExpand: true, onExpand() {}, onClose() {} }));
+check(ltRead.includes("a &lt; b &amp;&amp; c &lt;d&gt;") && ltRead.includes("1 &amp;lt; 2") && !ltRead.includes("<b>x"), "a literal < in the reader is escaped");
 const cut = clone(valid);
 cut.payload.truncated = true;
 cut.payload.items[0].body_text = "Hello…";

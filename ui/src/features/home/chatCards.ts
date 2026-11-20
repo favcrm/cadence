@@ -34,6 +34,8 @@ const VIEWS = ["list", "thread", "table", "detail"] as const;
 export const DETAIL_BODY_MAX = 20_000;
 export const DETAIL_ATTACHMENTS_MAX = 20;
 export const DETAIL_ATTACHMENT_NAME_MAX = 200;
+/** Roles only a `detail` card may name. */
+const DETAIL_ROLES = ["to", "cc", "body", "attachments"] as const;
 
 export type RecordFieldType = (typeof FIELD_TYPES)[number];
 export type RecordView = (typeof VIEWS)[number];
@@ -213,7 +215,7 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
   }
   const roles = hasRoles ? parseRoles(p.roles, parsedFields.map((f) => f.key)) : null;
   if (hasRoles && !roles) return null;
-  if (view === "detail" && !validDetail(roles, parsedItems)) return null;
+  if (view === "detail" ? !validDetail(roles, parsedItems) : roles && DETAIL_ROLES.some((r) => roles[r] !== undefined)) return null;
   return {
     toolkit,
     tool,
@@ -233,7 +235,7 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
 function validDetail(roles: RecordRoles | null, items: Record<string, Cell>[]): boolean {
   if (!roles || roles.title === undefined || roles.body === undefined || items.length !== 1) return false;
   const body = items[0][roles.body];
-  if (typeof body !== "string" || body.length > DETAIL_BODY_MAX) return false;
+  if (body !== undefined && body !== null && (typeof body !== "string" || body.length > DETAIL_BODY_MAX)) return false;
   const names = roles.attachments === undefined ? null : items[0][roles.attachments];
   if (names === null || names === undefined) return true;
   return Array.isArray(names) && names.length <= DETAIL_ATTACHMENTS_MAX && names.every((n) => n.length <= DETAIL_ATTACHMENT_NAME_MAX);
@@ -457,7 +459,7 @@ function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLab
         cc: text(item, roles.cc),
         time: time(item),
         body: typeof body === "string" ? plainText(body, DETAIL_BODY_MAX) : "",
-        truncated: model.truncated || item.truncated === true,
+        truncated: model.truncated,
         attachments: Array.isArray(names) ? names.map((n) => plainText(n, DETAIL_ATTACHMENT_NAME_MAX)).filter(Boolean) : [],
         star: shown.some((v) => v.star),
         unread: isUnread(item, roles.unread),

@@ -18,12 +18,8 @@
         "cc": "",
         "date": "2026-11-18T09:41:00Z",
         "body_text": "Hi Chris,\n\nThanks for sending INV-0140. We will pay it on Friday.\n\nBest,\nMei",
-        "attachment_names": [
-          "INV-0140.pdf"
-        ],
-        "label_ids": [
-          "IMPORTANT"
-        ]
+        "attachment_names": ["INV-0140.pdf"],
+        "label_ids": ["IMPORTANT"]
       }
     ],
     "fields": [
@@ -90,9 +86,7 @@
       },
       "unread": {
         "key": "label_ids",
-        "values": [
-          "UNREAD"
-        ]
+        "values": ["UNREAD"]
       }
     },
     "truncated": false
