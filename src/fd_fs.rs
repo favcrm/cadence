@@ -37,6 +37,25 @@ mod unix {
             owned_fd_from_rc(fd).map(Self)
         }
 
+        /// Open `path` as a directory, following a symlink at `path` itself.
+        ///
+        /// Intended only for operator-configured root directories (such as a PM
+        /// root); every child operation on the returned handle enforces
+        /// `O_NOFOLLOW`.
+        pub(crate) fn open_dir(path: &Path) -> io::Result<Self> {
+            let c_path = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+            // SAFETY: `c_path` is a live NUL-terminated C string and `open`
+            // with read-only flags takes no mode argument.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            owned_fd_from_rc(fd).map(Self)
+        }
+
         /// Open `path` as a directory without following a symlink at the final
         /// component.
         pub(crate) fn open_nofollow(path: &Path) -> io::Result<Self> {
@@ -179,6 +198,16 @@ mod unix {
             // SAFETY: `dir` is a valid open directory fd and `from`/`to` are
             // valid NUL-terminated C strings.
             let rc = unsafe { libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()) };
+            check_zero(rc)
+        }
+
+        /// Create a hard link `to` pointing to `from` within `self` without
+        /// replacing an existing entry (`EEXIST` if `to` already exists).
+        pub(crate) fn link_child(&self, from: &CStr, to: &CStr) -> io::Result<()> {
+            let dir = self.0.as_raw_fd();
+            // SAFETY: `dir` is a valid open directory fd and `from`/`to` are
+            // valid NUL-terminated C strings.
+            let rc = unsafe { libc::linkat(dir, from.as_ptr(), dir, to.as_ptr(), 0) };
             check_zero(rc)
         }
 
@@ -337,6 +366,21 @@ mod unix {
         check_zero(rc)
     }
 
+    /// Set `O_NONBLOCK` on an open descriptor while preserving existing status
+    /// flags.
+    pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+        let raw = fd.as_raw_fd();
+        // SAFETY: `raw` is a live descriptor borrowed for this call.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a live descriptor and `F_SETFL` accepts the bitwise
+        // OR of the current status flags with `O_NONBLOCK`.
+        let rc = unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        check_zero(rc)
+    }
+
     fn duplicate_cloexec(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
         // SAFETY: `fd` is a valid open descriptor and `F_DUPFD_CLOEXEC` with
         // minimum fd 3 returns a new unowned descriptor or -1 on error.
@@ -376,7 +420,9 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{flock_exclusive_nonblocking, fstat, geteuid, getuid, DirFd};
+pub(crate) use unix::{
+    flock_exclusive_nonblocking, fstat, geteuid, getuid, set_nonblocking, DirFd,
+};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -399,6 +445,11 @@ mod tests {
         symlink(real_dir.join("secret.txt"), &link_file).unwrap();
 
         assert!(DirFd::open_nofollow(&link_dir).is_err());
+
+        // `open_dir` follows a symlink at the configured root while still
+        // enforcing `O_NOFOLLOW` on every child operation.
+        let via_link = DirFd::open_dir(&link_dir).unwrap();
+        assert!(via_link.open_readonly_nofollow(c"link-file").is_err());
 
         let parent = DirFd::open_nofollow(tmp.path()).unwrap();
         assert!(parent.open_child_dir(c"link-dir").is_err());
@@ -445,6 +496,9 @@ mod tests {
 
         let child_stat = dir.fstatat_nofollow(c"alpha.txt").unwrap();
         assert_eq!(child_stat.st_mode & libc::S_IFMT, libc::S_IFREG);
+        dir.link_child(c"alpha.txt", c"beta.txt").unwrap();
+        assert!(dir.link_child(c"alpha.txt", c"beta.txt").is_err());
+        dir.unlink_child(c"beta.txt").unwrap();
         dir.sync_all().unwrap();
 
         let file = dir.open_readonly_nofollow(c"alpha.txt").unwrap();

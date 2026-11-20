@@ -9,14 +9,16 @@
 //! rename it over the target inside the same root. Nothing is truncated in
 //! place. No network, no generic document framework.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 
 /// The platform-supplied, one-time setup file.
 pub const BOOTSTRAP: &str = "BOOTSTRAP.md";
@@ -133,19 +135,14 @@ pub fn read_identity(root: &Path) -> Result<Identity> {
 }
 
 /// Open `root` as a directory fd, refusing a symlink at the root itself.
-fn open_root(root: &Path) -> Result<OwnedFd> {
-    let name = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("bootstrap root contains an interior nul"))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected("bootstrap root is missing or a symlink"));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+fn open_root(root: &Path) -> Result<DirFd> {
+    DirFd::open_nofollow(root).map_err(|err| {
+        if err.kind() == ErrorKind::InvalidInput {
+            Error::rejected("bootstrap root contains an interior nul")
+        } else {
+            Error::rejected("bootstrap root is missing or a symlink")
+        }
+    })
 }
 
 fn literal(name: &str) -> Result<CString> {
@@ -159,28 +156,22 @@ fn literal(name: &str) -> Result<CString> {
 
 /// Open a managed file read-only, no-follow, non-blocking, and require a
 /// regular file. `Ok(None)` only for a genuinely absent file.
-fn open_read(root: &OwnedFd, name: &str) -> Result<Option<File>> {
+fn open_read(root: &DirFd, name: &str) -> Result<Option<File>> {
     let cname = literal(name)?;
-    let fd = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
+    let file = match root.open_readonly_nofollow(&cname) {
+        Ok(file) => file,
+        Err(err) => {
+            return match err.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::ELOOP) => Err(Error::rejected(format!(
+                    "bootstrap file '{name}' is a symlink; refused"
+                ))),
+                _ => Err(Error::rejected(format!(
+                    "bootstrap file '{name}' could not be opened"
+                ))),
+            };
+        }
     };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ENOENT) => Ok(None),
-            Some(libc::ELOOP) => Err(Error::rejected(format!(
-                "bootstrap file '{name}' is a symlink; refused"
-            ))),
-            _ => Err(Error::rejected(format!(
-                "bootstrap file '{name}' could not be opened"
-            ))),
-        };
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
     if !file.metadata()?.file_type().is_file() {
         return Err(Error::rejected(format!(
             "bootstrap file '{name}' is not a regular file"
@@ -220,24 +211,19 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
     let mut created = false;
     for (name, text) in files {
         let cname = literal(name)?;
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::AlreadyExists {
-                continue;
+        let mut file = match dir.open_file_nofollow(
+            &cname,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(Error::rejected(format!(
+                    "bootstrap seed of '{name}' failed: {err}"
+                )));
             }
-            return Err(Error::rejected(format!(
-                "bootstrap seed of '{name}' failed: {err}"
-            )));
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        };
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         created = true;
@@ -251,56 +237,35 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
 /// Flush the trusted root's directory entry (a create or a rename) to disk.
 /// A failure is returned, so the caller never commits state on an unflushed
 /// directory entry.
-fn fsync_dir(root: &OwnedFd) -> Result<()> {
-    if unsafe { libc::fsync(root.as_raw_fd()) } != 0 {
-        return Err(Error::rejected(
-            "bootstrap directory sync failed; state is not committed",
-        ));
-    }
-    Ok(())
+fn fsync_dir(root: &DirFd) -> Result<()> {
+    root.sync_all()
+        .map_err(|_| Error::rejected("bootstrap directory sync failed; state is not committed"))
 }
 
 /// Replace one managed file atomically: bounded read, exclusive temp file,
 /// fsync, `renameat` within the trusted root. The temp name is removed on any
 /// failure. Existing content is never truncated in place.
-fn replace_file(root: &OwnedFd, name: &str, next: &str) -> Result<()> {
+fn replace_file(root: &DirFd, name: &str, next: &str) -> Result<()> {
     let cname = literal(name)?;
     let temp = format!(".{name}.{}.tmp", std::process::id());
-    let ctemp = CString::new(temp.clone()).map_err(|_| Error::rejected("bad temp name"))?;
-    let fd = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            ctemp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "bootstrap temp for '{name}' could not be created"
-        )));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let ctemp = CString::new(temp).map_err(|_| Error::rejected("bad temp name"))?;
+    let mut file = root
+        .open_file_nofollow(&ctemp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)
+        .map_err(|_| {
+            Error::rejected(format!("bootstrap temp for '{name}' could not be created"))
+        })?;
     let written = file
         .write_all(next.as_bytes())
         .and_then(|()| file.sync_all());
     drop(file);
     if written.is_err() {
-        unsafe { libc::unlinkat(root.as_raw_fd(), ctemp.as_ptr(), 0) };
+        let _ = root.unlink_child(&ctemp);
         return Err(Error::rejected(format!(
             "bootstrap write of '{name}' failed"
         )));
     }
-    let rc = unsafe {
-        libc::renameat(
-            root.as_raw_fd(),
-            ctemp.as_ptr(),
-            root.as_raw_fd(),
-            cname.as_ptr(),
-        )
-    };
-    if rc != 0 {
-        unsafe { libc::unlinkat(root.as_raw_fd(), ctemp.as_ptr(), 0) };
+    if root.rename_child(&ctemp, &cname).is_err() {
+        let _ = root.unlink_child(&ctemp);
         return Err(Error::rejected(format!(
             "bootstrap rename of '{name}' failed"
         )));
@@ -345,17 +310,13 @@ pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
 pub fn remove_bootstrap(root: &Path) -> Result<()> {
     let dir = open_root(root)?;
     let cname = literal(BOOTSTRAP)?;
-    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
-    if rc == 0 {
-        return Ok(());
+    match dir.unlink_child(&cname) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(Error::rejected(
+            "bootstrap file cleanup failed (state is already committed)",
+        )),
     }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == ErrorKind::NotFound {
-        return Ok(());
-    }
-    Err(Error::rejected(
-        "bootstrap file cleanup failed (state is already committed)",
-    ))
 }
 
 /// Read one managed file for prompt context. Only a genuinely absent file is
