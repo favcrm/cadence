@@ -823,10 +823,21 @@ green while the gate refuses.
 4. **Hand off through the CLI.** Once only the operator step remains, put the
    ticket in Review and post one comment: PR, full head, CI and review links,
    Browser QA report when required, and the exact decision or approval ID.
-   For a hosted Cadence merge, give paste-ready operator commands with all
-   selectors and the actual approval source: `audit approve`, then
-   `delivery enqueue`. If the gate says a matching author-posted QA pass
-   needs exact-head approval, ask the operator to read the report first.
+   If a hosted Cadence merge still needs approval, give the operator one
+   paste-ready block. Replace the variables with shell-quoted values for the
+   actual selectors, full head, and truthful approval source. Keep `&&`:
+   enqueue must not run if approval fails.
+
+   ```bash
+   cadence --org "$org" audit approve --project "$project" --issue "$issue" \
+     --repo "$repo" --pr "$pr" --head "$head" --source "$source" &&
+   cadence --org "$org" delivery enqueue --project "$project" --issue "$issue" \
+     --repo "$repo" --pr "$pr" --head "$head"
+   ```
+
+   If approval is refused, stop and report why. If its outcome is uncertain,
+   read back the approval and queue before retrying. If a matching author-posted
+   Browser QA pass needs exact-head approval, ask the operator to read it first.
    If approval is already in force or not required, give only enqueue; if
    already queued, give neither. Use the UI if requested or if the CLI
    route is unavailable; it authenticates the human, not bypasses a refusal.
