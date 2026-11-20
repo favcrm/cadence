@@ -3,7 +3,7 @@ import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { object, type recordServices } from "./screenServices";
-import type { WhatsAppReplyAvailability } from "./screenProtocol";
+import type { WhatsAppReplyAvailability, WhatsAppReplyBounds } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
 export interface WhatsAppReplySelection {
@@ -66,7 +66,7 @@ function recordedState(state: unknown): Outcome {
   return state === "sent" || state === "accepted" || state === "failed" ? state : "uncertain";
 }
 
-export default function WhatsAppReplyComposer({ selection }: { selection: WhatsAppReplySelection }) {
+export default function WhatsAppReplyComposer({ selection, bounds }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null }) {
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
   const [verification, setVerification] = useState<RecipientCheck>();
@@ -110,12 +110,13 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     return () => { cancelled = true; };
   }, [selection, retry]);
   useLayoutEffect(() => {
+    if (bounds === null) return;
     const box = input.current;
     if (box) {
       box.style.height = "auto";
       box.style.height = `${box.scrollHeight}px`;
     }
-  }, [text, recipient]);
+  }, [bounds, text, recipient]);
   useLayoutEffect(() => { selection.announce(!!text || busy); }, [selection, text, busy]);
   useEffect(() => { selection.announceAvailability?.(availability); }, [selection, availability]);
 
@@ -198,7 +199,8 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
 
-  return <div className="wa-reply-dock">
+  return <div className="wa-reply-dock" hidden={bounds === null} data-positioned={bounds ? "" : undefined}
+    style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
     {note && <div className="wa-reply-status">
       <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
       {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}

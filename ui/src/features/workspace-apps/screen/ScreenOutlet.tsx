@@ -22,7 +22,7 @@ import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
 import { readOnlyReceipt } from "./screenReadOnly";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 import AppLoadingSurface from "../AppLoadingSurface";
@@ -129,7 +129,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [preview, setPreview] = useState<InertPreview | null>(null);
   const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
-  const [whatsappReply, setWhatsAppReply] = useState<{ revision: number; selection: WhatsAppReplySelection } | null>(null);
+  const [whatsappReply, setWhatsAppReply] = useState<{
+    revision: number;
+    selection: WhatsAppReplySelection;
+    bounds?: WhatsAppReplyBounds | null;
+  } | null>(null);
   const whatsappRevision = useRef(0);
   const [link, setLink] = useState<string | null>(null);
   const [audioModal, setAudioModal] = useState<{
@@ -407,7 +411,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         const mountedTheme = appliedFrameTheme();
         const mountQuery = new URLSearchParams();
         if (mountedTheme) mountQuery.set("theme", mountedTheme);
-        if (composeServices) mountQuery.set("wa_compose_availability", "1");
+        if (composeServices) {
+          mountQuery.set("wa_compose_availability", "1");
+          mountQuery.set("wa_compose_layout", "1");
+        }
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
@@ -470,7 +477,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken, allowAssetRef: ref => channel.current?.allowAssetRef(ref) } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
-            ...(composeServices ? { onWhatsAppCompose: selectWhatsApp } : {}),
+            ...(composeServices ? {
+              onWhatsAppCompose: selectWhatsApp,
+              onWhatsAppReplyLayout: bounds => {
+                if (!selectedWhatsApp || !composeCurrent()) return;
+                const revision = whatsappRevision.current;
+                setWhatsAppReply(reply => reply?.revision === revision ? { ...reply, bounds } : reply);
+              },
+            } : {}),
             onScreenDrawer: onScreenDrawer
               ? (mode, surface, independent, size, context) => {
                   if (!isCurrent()) return;
@@ -613,7 +627,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           />
         )}
       </div>
-      {whatsappReply?.selection.current() && <WhatsAppReplyComposer key={whatsappReply.revision} selection={whatsappReply.selection} />}
+      {whatsappReply?.selection.current() && <WhatsAppReplyComposer key={whatsappReply.revision}
+        selection={whatsappReply.selection} bounds={whatsappReply.bounds} />}
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}

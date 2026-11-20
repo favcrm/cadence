@@ -1,5 +1,5 @@
-/* The outlet's content width also defines the app iframe viewport. */
-[data-installed-app-screen]:has(> .wa-reply-dock) {
+/* Only legacy packages need the board to infer the left rail. */
+[data-installed-app-screen]:has(> .wa-reply-dock:not([data-positioned])) {
   container: wa-reply-surface / inline-size;
 }
 
@@ -12,10 +12,12 @@
   padding: 0.4rem 0.75rem max(0.75rem, env(safe-area-inset-bottom));
 }
 
-/* Match the WABA inbox's 19rem rail (including its gutter) and 48rem split.
-   The dock remains in flow, so a wrapped receipt or draft cannot cover history. */
+.wa-reply-dock[hidden] { display: none; }
+
+/* Legacy WABA package: 19rem rail including gutter. A negotiated pane
+   supplies its actual edges and uses symmetric padding inside those edges. */
 @container wa-reply-surface (min-width: 48rem) {
-  .wa-reply-dock { padding-inline-start: 19.75rem; }
+  .wa-reply-dock:not([data-positioned]) { padding-inline-start: 19.75rem; }
 }
 
 .wa-reply-dock > * {

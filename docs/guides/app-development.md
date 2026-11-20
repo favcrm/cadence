@@ -343,10 +343,15 @@ opts into `screen-whatsapp-reply-availability.v1` only when the mount URL offers
 ordinal of the existing nomination on that port. It never publishes a
 recipient proof, confirmation token, or draft in this event. Older bundles
 get the status in the dock instead.
-The WABA inbox reserves a 19rem rail, including its gutter, when the iframe
-is at least 48rem wide. The board uses the same split to center the dock
-under the conversation. On narrower mounts, the active conversation and
-dock use the full width. The dock stays in flow below the iframe.
+On the primary inbox mount, the `wa_compose_layout=1` offer lets a bundle
+with reply availability opt into `screen-whatsapp-reply-layout.v1`. The
+bundle may send `whatsapp-reply-layout` with the current `nomination` and
+`bounds`: two ordered integers from 0 to 10000 for the physical left and
+right edges of the message pane, relative to the iframe viewport. Use `null`
+when details replace the pane. An old nomination cannot change the layout.
+Unnegotiated or malformed messages close the port. This hint only positions
+or hides the existing dock; it changes no draft, recipient, or send rights.
+The dock remains below the iframe, with a rail-based layout for older bundles.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is
