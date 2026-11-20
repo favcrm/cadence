@@ -21,11 +21,11 @@ mod unix {
     ///
     /// All child operations execute relative to this descriptor, preventing
     /// ancestor path replacement races after the handle is opened.
-    pub(crate) struct DirFd(OwnedFd);
+    pub struct DirFd(OwnedFd);
 
     impl DirFd {
         /// Open the filesystem root (`/`) as a pinned directory descriptor.
-        pub(crate) fn open_root() -> io::Result<Self> {
+        pub fn open_root() -> io::Result<Self> {
             // SAFETY: `c"/"` is a static NUL-terminated path and `libc::open`
             // with `O_RDONLY | O_DIRECTORY | O_CLOEXEC` requires no mode arg.
             let fd = unsafe {
@@ -42,7 +42,7 @@ mod unix {
         /// Intended only for operator-configured root directories (such as a PM
         /// root); every child operation on the returned handle enforces
         /// `O_NOFOLLOW`.
-        pub(crate) fn open_dir(path: &Path) -> io::Result<Self> {
+        pub fn open_dir(path: &Path) -> io::Result<Self> {
             let c_path = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
             // SAFETY: `c_path` is a live NUL-terminated C string and `open`
@@ -58,7 +58,7 @@ mod unix {
 
         /// Open `path` as a directory without following a symlink at the final
         /// component.
-        pub(crate) fn open_nofollow(path: &Path) -> io::Result<Self> {
+        pub fn open_nofollow(path: &Path) -> io::Result<Self> {
             let c_path = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
             // SAFETY: `c_path` is a live NUL-terminated C string and `open`
@@ -74,7 +74,7 @@ mod unix {
 
         /// Wrap an already-opened descriptor after verifying via `fstat` that
         /// it refers to a directory.
-        pub(crate) fn from_verified_dir(fd: OwnedFd, stat: &libc::stat) -> Option<Self> {
+        pub fn from_verified_dir(fd: OwnedFd, stat: &libc::stat) -> Option<Self> {
             if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 Some(Self(fd))
             } else {
@@ -83,24 +83,24 @@ mod unix {
         }
 
         /// Convert this pinned directory descriptor into a [`File`] handle.
-        pub(crate) fn into_file(self) -> File {
+        pub fn into_file(self) -> File {
             File::from(self.0)
         }
 
         /// Duplicate this directory descriptor with `FD_CLOEXEC`, avoiding
         /// standard I/O slots 0..=2.
-        pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        pub fn try_clone(&self) -> io::Result<Self> {
             duplicate_cloexec(self.0.as_fd()).map(Self)
         }
 
         /// Inspect metadata for this pinned directory via `fstat`.
-        pub(crate) fn stat(&self) -> io::Result<libc::stat> {
+        pub fn stat(&self) -> io::Result<libc::stat> {
             fstat(self.0.as_fd())
         }
 
         /// Inspect metadata for a direct child entry relative to `self`
         /// without following symlinks (`fstatat(..., AT_SYMLINK_NOFOLLOW)`).
-        pub(crate) fn fstatat_nofollow(&self, name: &CStr) -> io::Result<libc::stat> {
+        pub fn fstatat_nofollow(&self, name: &CStr) -> io::Result<libc::stat> {
             let mut stat = MaybeUninit::<libc::stat>::uninit();
             // SAFETY: `self.0` is a valid open directory fd, `name` is a valid
             // NUL-terminated C string, and `stat.as_mut_ptr()` points to valid
@@ -121,7 +121,7 @@ mod unix {
         }
 
         /// Flush directory metadata changes to storage via `fsync`.
-        pub(crate) fn sync_all(&self) -> io::Result<()> {
+        pub fn sync_all(&self) -> io::Result<()> {
             // SAFETY: `self.0` is a valid open directory fd.
             let rc = unsafe { libc::fsync(self.0.as_raw_fd()) };
             check_zero(rc)
@@ -129,7 +129,7 @@ mod unix {
 
         /// Open an existing child directory relative to `self` without
         /// following symlinks.
-        pub(crate) fn open_child_dir(&self, name: &CStr) -> io::Result<Self> {
+        pub fn open_child_dir(&self, name: &CStr) -> io::Result<Self> {
             // SAFETY: `self.0` is a valid open directory fd, `name` is a valid
             // NUL-terminated C string, and no `O_CREAT`/`O_TMPFILE` flag is set.
             let fd = unsafe {
@@ -143,17 +143,24 @@ mod unix {
         }
 
         /// Create a child directory relative to `self` with `mode`.
-        pub(crate) fn mkdir(&self, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
+        pub fn mkdir(&self, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
             // SAFETY: `self.0` is a valid open directory fd and `name` is a
             // valid NUL-terminated C string.
             let rc = unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), mode) };
             check_zero(rc)
         }
 
+        /// Set POSIX permission bits on this pinned directory (`fchmod`).
+        pub fn fchmod(&self, mode: libc::mode_t) -> io::Result<()> {
+            // SAFETY: `self.0` is a valid open directory descriptor.
+            let rc = unsafe { libc::fchmod(self.0.as_raw_fd(), mode) };
+            check_zero(rc)
+        }
+
         /// Open a child entry read-only with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`,
         /// returning a raw `OwnedFd` so callers can `fstat` before deciding
         /// whether it is a regular file or directory.
-        pub(crate) fn open_nofollow_fd(&self, name: &CStr) -> io::Result<OwnedFd> {
+        pub fn open_nofollow_fd(&self, name: &CStr) -> io::Result<OwnedFd> {
             // SAFETY: `self.0` is a valid open directory fd, `name` is a valid
             // NUL-terminated C string, and read-only `openat` takes no mode arg.
             let fd = unsafe {
@@ -167,13 +174,13 @@ mod unix {
         }
 
         /// Open a child file read-only with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
-        pub(crate) fn open_readonly_nofollow(&self, name: &CStr) -> io::Result<File> {
+        pub fn open_readonly_nofollow(&self, name: &CStr) -> io::Result<File> {
             self.open_nofollow_fd(name).map(File::from)
         }
 
         /// Open or create a child file with `flags | O_NOFOLLOW | O_CLOEXEC`
         /// and permission `mode`.
-        pub(crate) fn open_file_nofollow(
+        pub fn open_file_nofollow(
             &self,
             name: &CStr,
             flags: libc::c_int,
@@ -198,7 +205,7 @@ mod unix {
         }
 
         /// Atomically rename a child entry within `self`.
-        pub(crate) fn rename_child(&self, from: &CStr, to: &CStr) -> io::Result<()> {
+        pub fn rename_child(&self, from: &CStr, to: &CStr) -> io::Result<()> {
             let dir = self.0.as_raw_fd();
             // SAFETY: `dir` is a valid open directory fd and `from`/`to` are
             // valid NUL-terminated C strings.
@@ -206,27 +213,109 @@ mod unix {
             check_zero(rc)
         }
 
+        /// Rename `from` inside `self` to `to` inside `dst_dir` without
+        /// replacing an existing destination entry.
+        ///
+        /// Returns `Ok(true)` when renamed, `Ok(false)` when the platform or
+        /// filesystem does not support no-replace cross-rename (`ENOSYS`,
+        /// `EINVAL`, or `EOPNOTSUPP`), and `Err` on other failures (such as
+        /// `EEXIST`).
+        pub fn rename_child_to_noreplace(
+            &self,
+            from: &CStr,
+            dst_dir: &DirFd,
+            to: &CStr,
+        ) -> io::Result<bool> {
+            #[cfg(target_os = "linux")]
+            // SAFETY: both descriptors are valid open directory fds and both
+            // C strings are NUL-terminated.
+            let rc = unsafe {
+                libc::renameat2(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    dst_dir.0.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            #[cfg(target_vendor = "apple")]
+            // SAFETY: both descriptors are valid open directory fds and both
+            // C strings are NUL-terminated.
+            let rc = unsafe {
+                libc::renameatx_np(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    dst_dir.0.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+            {
+                if rc == 0 {
+                    return Ok(true);
+                }
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+                ) {
+                    return Ok(false);
+                }
+                Err(error)
+            }
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+            {
+                let _ = (from, dst_dir, to);
+                Ok(false)
+            }
+        }
+
         /// Create a hard link `to` pointing to `from` within `self` without
         /// replacing an existing entry (`EEXIST` if `to` already exists).
-        pub(crate) fn link_child(&self, from: &CStr, to: &CStr) -> io::Result<()> {
-            let dir = self.0.as_raw_fd();
-            // SAFETY: `dir` is a valid open directory fd and `from`/`to` are
-            // valid NUL-terminated C strings.
-            let rc = unsafe { libc::linkat(dir, from.as_ptr(), dir, to.as_ptr(), 0) };
+        pub fn link_child(&self, from: &CStr, to: &CStr) -> io::Result<()> {
+            self.link_child_to(from, self, to)
+        }
+
+        /// Create a hard link `to` inside `dst_dir` pointing to `from` inside
+        /// `self` without replacing an existing entry (`EEXIST` if `to`
+        /// already exists).
+        pub fn link_child_to(&self, from: &CStr, dst_dir: &DirFd, to: &CStr) -> io::Result<()> {
+            // SAFETY: `self.0` and `dst_dir.0` are valid open directory fds and
+            // both `from`/`to` are valid NUL-terminated C strings.
+            let rc = unsafe {
+                libc::linkat(
+                    self.0.as_raw_fd(),
+                    from.as_ptr(),
+                    dst_dir.0.as_raw_fd(),
+                    to.as_ptr(),
+                    0,
+                )
+            };
             check_zero(rc)
         }
 
         /// Unlink a non-directory child entry within `self`.
-        pub(crate) fn unlink_child(&self, name: &CStr) -> io::Result<()> {
+        pub fn unlink_child(&self, name: &CStr) -> io::Result<()> {
             // SAFETY: `self.0` is a valid open directory fd and `name` is a
             // valid NUL-terminated C string.
             let rc = unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) };
             check_zero(rc)
         }
 
+        /// Remove an empty child directory within `self` without following
+        /// symlinks (`unlinkat(..., AT_REMOVEDIR)`).
+        pub fn rmdir_child(&self, name: &CStr) -> io::Result<()> {
+            // SAFETY: `self.0` is a valid open directory fd and `name` is a
+            // valid NUL-terminated C string.
+            let rc =
+                unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            check_zero(rc)
+        }
+
         /// Enumerate direct child names (excluding `.` and `..`) using a
         /// duplicated directory descriptor so `self` remains usable.
-        pub(crate) fn read_dir(&self) -> io::Result<DirIter> {
+        pub fn read_dir(&self) -> io::Result<DirIter> {
             let scan_fd = duplicate_cloexec(self.0.as_fd())?;
             let raw = scan_fd.as_raw_fd();
             // SAFETY: `raw` is a newly duplicated open directory fd. On success
@@ -242,7 +331,7 @@ mod unix {
 
         /// Create an anonymous (`O_TMPFILE`) read/write inode inside `self`.
         #[cfg(target_os = "linux")]
-        pub(crate) fn open_tmpfile(&self, mode: libc::mode_t) -> io::Result<File> {
+        pub fn open_tmpfile(&self, mode: libc::mode_t) -> io::Result<File> {
             // SAFETY: `self.0` is a valid open directory fd, `c"."` is a static
             // NUL-terminated C string, and `O_TMPFILE` consumes `mode` (`u32` on Linux).
             let fd = unsafe {
@@ -263,7 +352,7 @@ mod unix {
         /// `/proc/self/fd/<fd>` when `CAP_DAC_READ_SEARCH` is absent
         /// (`EPERM` / `EINVAL`).
         #[cfg(target_os = "linux")]
-        pub(crate) fn link_fd(&self, file: &File, name: &CStr) -> io::Result<()> {
+        pub fn link_fd(&self, file: &File, name: &CStr) -> io::Result<()> {
             // SAFETY: `file` and `self.0` are valid open descriptors and both
             // C strings are NUL-terminated.
             let mut rc = unsafe {
@@ -302,7 +391,7 @@ mod unix {
     }
 
     /// RAII iterator over direct entry names of a [`DirFd`], skipping `.` and `..`.
-    pub(crate) struct DirIter(*mut libc::DIR);
+    pub struct DirIter(*mut libc::DIR);
 
     impl Drop for DirIter {
         fn drop(&mut self) {
@@ -340,7 +429,7 @@ mod unix {
     }
 
     /// Query `fstat` for any borrowed file descriptor.
-    pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+    pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `fd` is a live descriptor and `stat.as_mut_ptr()` points to
         // valid writable storage for `libc::stat`.
@@ -353,19 +442,19 @@ mod unix {
     }
 
     /// Return the calling process's effective user ID.
-    pub(crate) fn geteuid() -> libc::uid_t {
+    pub fn geteuid() -> libc::uid_t {
         // SAFETY: `geteuid` is always safe to call and cannot fail.
         unsafe { libc::geteuid() }
     }
 
     /// Return the calling process's real user ID.
-    pub(crate) fn getuid() -> libc::uid_t {
+    pub fn getuid() -> libc::uid_t {
         // SAFETY: `getuid` is always safe to call and cannot fail.
         unsafe { libc::getuid() }
     }
 
     /// Acquire a non-blocking exclusive `flock` on `file`.
-    pub(crate) fn flock_exclusive_nonblocking(file: &File) -> io::Result<()> {
+    pub fn flock_exclusive_nonblocking(file: &File) -> io::Result<()> {
         // SAFETY: `file` owns a live open descriptor.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         check_zero(rc)
@@ -373,7 +462,7 @@ mod unix {
 
     /// Set `O_NONBLOCK` on an open descriptor while preserving existing status
     /// flags.
-    pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    pub fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
         let raw = fd.as_raw_fd();
         // SAFETY: `raw` is a live descriptor borrowed for this call.
         let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
@@ -425,8 +514,8 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{
-    flock_exclusive_nonblocking, fstat, geteuid, getuid, set_nonblocking, DirFd,
+pub use unix::{
+    flock_exclusive_nonblocking, fstat, geteuid, getuid, set_nonblocking, DirFd, DirIter,
 };
 
 #[cfg(all(test, unix))]
@@ -508,5 +597,43 @@ mod tests {
 
         let file = dir.open_readonly_nofollow(c"alpha.txt").unwrap();
         flock_exclusive_nonblocking(&file).unwrap();
+    }
+
+    #[test]
+    fn cross_dir_operations_and_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let root = DirFd::open_nofollow(tmp.path()).unwrap();
+        root.mkdir(c"spool", 0o755).unwrap();
+        let spool = root.open_child_dir(c"spool").unwrap();
+        spool.fchmod(0o700).unwrap();
+        #[allow(clippy::useless_conversion)]
+        let mode: u32 = spool.stat().unwrap().st_mode.into();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let _ = spool
+            .open_file_nofollow(
+                c"artifact",
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+            .unwrap();
+        if !spool
+            .rename_child_to_noreplace(c"artifact", &root, c"published")
+            .unwrap()
+        {
+            spool
+                .link_child_to(c"artifact", &root, c"published")
+                .unwrap();
+            spool.unlink_child(c"artifact").unwrap();
+        }
+        assert!(root.fstatat_nofollow(c"published").is_ok());
+
+        let _ = spool
+            .open_file_nofollow(c"dup", libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)
+            .unwrap();
+        assert!(spool.link_child_to(c"dup", &root, c"published").is_err());
+        spool.unlink_child(c"dup").unwrap();
+        root.rmdir_child(c"spool").unwrap();
+        assert!(root.open_child_dir(c"spool").is_err());
     }
 }

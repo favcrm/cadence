@@ -62,7 +62,7 @@ pub mod device_login;
 pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
-pub(crate) mod fd_fs;
+pub mod fd_fs;
 pub mod filter;
 pub mod gh_guard;
 pub mod github_connect;

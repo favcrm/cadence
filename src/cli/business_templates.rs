@@ -7,10 +7,13 @@
 //! and revise omit `--docx`, and `show --out` writes that exact version
 //! into a new directory. It does not render, price, or approve anything.
 
+#![forbid(unsafe_code)]
+
 use super::*;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+use cadence_agent::fd_fs::DirFd;
 
 #[derive(Subcommand)]
 pub(crate) enum TemplateAction {
@@ -721,49 +724,23 @@ fn io_pack_err(context: &str, err: std::io::Error) -> Error {
     }
 }
 
-fn open_dir_path(path: &Path) -> Result<OwnedFd> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("path contains NUL"))?;
-    // SAFETY: `c` is a NUL-terminated path; the returned fd is owned.
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io_pack_err(
-            &format!("cannot open directory {}", path.display()),
-            std::io::Error::last_os_error(),
-        ));
+fn open_dir_path(path: &Path) -> Result<DirFd> {
+    if CString::new(path.as_os_str().as_bytes()).is_err() {
+        return Err(Error::rejected("path contains NUL"));
     }
-    // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    DirFd::open_nofollow(path)
+        .map_err(|err| io_pack_err(&format!("cannot open directory {}", path.display()), err))
 }
 
-fn openat_dir(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
+fn openat_dir(dir: &DirFd, name: &OsStr) -> Result<DirFd> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| Error::rejected("path component contains NUL"))?;
-    // SAFETY: `dir` is an open directory fd and `c` is one path component.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io_pack_err(
-            &format!("cannot open {}", name.to_string_lossy()),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    dir.open_child_dir(&c)
+        .map_err(|err| io_pack_err(&format!("cannot open {}", name.to_string_lossy()), err))
 }
 
 /// Walk `path` with `O_NOFOLLOW` on every component, including `.` and `/`.
-fn open_nofollow_dir(path: &Path) -> Result<OwnedFd> {
+fn open_nofollow_dir(path: &Path) -> Result<DirFd> {
     use std::path::Component;
     let mut components = path.components().peekable();
     if components.peek().is_none() {
@@ -795,8 +772,8 @@ fn open_nofollow_dir(path: &Path) -> Result<OwnedFd> {
 /// A directory this process just created. Dropping it leaves the files in
 /// place; `abort` removes only the names this process created.
 struct FreshDir {
-    parent: OwnedFd,
-    dir: OwnedFd,
+    parent: DirFd,
+    dir: DirFd,
     name: CString,
     files: Vec<CString>,
 }
@@ -830,12 +807,9 @@ impl FreshDir {
         })?;
         let name = CString::new(leaf.as_bytes())
             .map_err(|_| Error::rejected("output directory name contains NUL"))?;
-        // SAFETY: `parent` is an open directory and `name` is one component.
         // mkdirat creates exclusively; an existing file or link gives EEXIST.
         // 0700, not 0755: the pack can hold confidential company references.
-        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = parent.mkdir(&name, 0o700) {
             if err.raw_os_error() == Some(libc::EEXIST) {
                 return Err(Error::rejected(format!(
                     "refusing to overwrite {}; template show --out requires a directory that does not exist",
@@ -849,14 +823,8 @@ impl FreshDir {
         }
         let dir = openat_dir(&parent, leaf)?;
         // mkdirat masks with the process umask. Force owner-only access.
-        // SAFETY: `dir` is the directory this process just created.
-        let chmod_rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
-        if chmod_rc != 0 {
-            let err = std::io::Error::last_os_error();
-            // SAFETY: removes only the empty directory this process created.
-            unsafe {
-                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-            }
+        if let Err(err) = dir.fchmod(0o700) {
+            let _ = parent.rmdir_child(&name);
             return Err(io_pack_err(
                 &format!("cannot restrict permissions on {}", out.display()),
                 err,
@@ -872,44 +840,29 @@ impl FreshDir {
 
     fn create_file(&mut self, name: &str) -> Result<std::fs::File> {
         let c = leaf_cstring(name)?;
-        // SAFETY: `O_EXCL|O_NOFOLLOW` creates one regular file and refuses a
-        // symlink or an existing name. The fd is owned immediately below.
-        let fd = unsafe {
-            libc::openat(
-                self.dir.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o644,
-            )
-        };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EEXIST) {
-                return Err(Error::rejected(format!(
-                    "refusing to overwrite {name} in the output directory"
-                )));
+        let file = match self.dir.open_file_nofollow(
+            &c,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        ) {
+            Ok(file) => file,
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Err(Error::rejected(format!(
+                        "refusing to overwrite {name} in the output directory"
+                    )));
+                }
+                return Err(io_pack_err(&format!("cannot create {name}"), err));
             }
-            return Err(io_pack_err(&format!("cannot create {name}"), err));
-        }
+        };
         self.files.push(c);
-        // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(file)
     }
 
     fn abort(self) {
         for name in &self.files {
-            // SAFETY: unlinks a basename this process created in `dir`.
-            unsafe {
-                libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0);
-            }
+            let _ = self.dir.unlink_child(name);
         }
-        // SAFETY: removes the directory this process created, not a symlink.
-        unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            );
-        }
+        let _ = self.parent.rmdir_child(&self.name);
     }
 }
