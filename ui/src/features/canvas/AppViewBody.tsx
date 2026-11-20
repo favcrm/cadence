@@ -13,7 +13,8 @@ import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenPaneState } from "../workspace-apps/screen/screenFailure";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 import { installedAppHref } from "../apps/appViewModel";
-import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import AppLoadingSurface from "../workspace-apps/AppLoadingSurface";
+import { readAppScopeFresh, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
 
@@ -31,7 +32,7 @@ function useAppScope(installId: string, attempt: number): Load {
   useEffect(() => {
     const controller = new AbortController();
     setLoad({ status: "loading" });
-    Promise.all([workspaceApps.detail(installId, controller.signal), workspaceApps.contexts(installId, controller.signal)]).then(
+    readAppScopeFresh(installId, controller.signal).then(
       ([installation, contexts]) => { if (!controller.signal.aborted) setLoad({ status: "ready", installation, contexts }); },
       (error: unknown) => {
         if (controller.signal.aborted) return;
@@ -125,7 +126,7 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
         ) : null}
       </header>
       <div className="cv-body cv-appview-body" data-canvas-body data-app-view>
-        {load.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
+        {load.status === "loading" ? <AppLoadingSurface label={t("Loading…")} variant="canvas" /> : null}
         {load.status === "denied" ? denied : null}
         {load.status === "failed" ? (
           <div className="cv-appview-note" role="alert">

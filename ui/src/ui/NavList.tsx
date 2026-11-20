@@ -1,9 +1,9 @@
 import { Fragment, useId, useLayoutEffect, useRef, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
-import type { AppNav } from "../features/app-shell/appNav";
+import type { AppNav, AppNavEntry } from "../features/app-shell/appNav";
 import { updateSidebarPrefs, useSidebarPrefs } from "../features/app-shell/sidebarPrefs";
-import { prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
+import { prefetchAppScope, prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
 import { navMatches } from "../features/issues/model";
 import { navItems, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
@@ -12,6 +12,11 @@ import { IconAgents, IconApps, IconCaret, IconDocuments, IconHome, IconMyWork, I
 import { AppGlyph } from "../features/explorer/shared";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
+
+const prefetchApp = (app: Pick<AppNavEntry, "installId" | "kind">) => {
+  if (app.kind === "social-content") prefetchWorkspaceApp(app.installId);
+  else prefetchAppScope(app.installId);
+};
 
 const NAV_ICONS: Record<string, ReactNode> = {
   home: <IconHome size={16} />,
@@ -160,10 +165,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                         <Link
                           href={app.href}
                           onClick={onNavigate}
-                          // CAD-1137: hover/focus warms the app's snapshot so
-                          // opening it paints the last data at once.
-                          onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
-                          onFocus={() => prefetchWorkspaceApp(app.installId)}
+                          // CAD-1137 / CAD-2534: hover/focus warms the app's scope or legacy snapshot.
+                          onMouseEnter={() => prefetchApp(app)}
+                          onFocus={() => prefetchApp(app)}
                           className="navlink navlink-sub"
                           title={app.title}
                           aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
@@ -198,8 +202,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                                 key={s.label}
                                 href={s.href}
                                 onClick={onNavigate}
-                                onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
-                                onFocus={() => prefetchWorkspaceApp(app.installId)}
+                                onMouseEnter={() => prefetchApp(app)}
+                                onFocus={() => prefetchApp(app)}
                                 className="navlink navlink-sub"
                                 aria-current={s.current && app.current ? "page" : undefined}
                               >

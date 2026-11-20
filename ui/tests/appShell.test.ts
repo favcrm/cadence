@@ -312,6 +312,16 @@ assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render i
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell").length,
+  1,
+  "CAD-2534: cold shell mount fetches installation detail once without Round-2 re-fetch",
+);
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell/contexts").length,
+  1,
+  "CAD-2534: cold shell mount fetches contexts once without Round-2 re-fetch",
+);
 
 // The header disclosure changes visibility without replacing either pane.
 const toggle = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;

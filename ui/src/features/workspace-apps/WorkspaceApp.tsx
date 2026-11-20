@@ -5,6 +5,7 @@ import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { StoredDraftCard } from "./StoredDraftCard";
+import AppLoadingSurface from "./AppLoadingSurface";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import {
@@ -1297,36 +1298,8 @@ export default function WorkspaceApp({
         </p>
       )}
       {loading && !data && (
-        // The first load only: a quiet skeleton in the page's real shape,
-        // never a spinner — a revisit paints the snapshot before this.
-        <div className="wa-skeleton" role="status" aria-label={t("Loading this workspace app")}>
-          <span className="sr-only">{t("Loading this workspace app…")}</span>
-          <div className="wa-skel-head">
-            <span className="wa-skel wa-skel-pulse" style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem" }} />
-            <span className="wa-skel wa-skel-pulse" style={{ width: "10rem", height: "1.25rem" }} />
-            <span style={{ flex: 1 }} />
-            <span className="wa-skel wa-skel-pulse" style={{ width: "5rem", height: "2rem" }} />
-          </div>
-          <div className="wa-skel-head">
-            <span className="wa-skel wa-skel-pulse" style={{ width: "min(18rem, 55%)", height: "2rem" }} />
-            <span style={{ flex: 1 }} />
-            <span className="wa-skel wa-skel-pulse" style={{ width: "5.5rem", height: "2rem" }} />
-          </div>
-          <div className="wa-skel-tabs">
-            {[5.5, 4.5, 3, 5.5, 4, 5, 4.5].map((w, i) => (
-              <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />
-            ))}
-          </div>
-          <div className="wa-skel-board">
-            {["Drafting", "In review", "Needs you", "Released"].map((lane) => (
-              <div key={lane} className="wa-skel-lane">
-                <span className="wa-skel wa-skel-pulse" style={{ width: "45%", height: "0.8rem" }} />
-                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
-                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
-              </div>
-            ))}
-          </div>
-        </div>
+        // The first load only: quiet neutral loading surface — a revisit paints the snapshot before this.
+        <AppLoadingSurface label={t("Loading this workspace app…")} variant="page" />
       )}
       {data && (
         <>

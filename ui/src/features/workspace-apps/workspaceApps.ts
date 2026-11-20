@@ -822,54 +822,61 @@ export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppS
   snapshots.set(installId, { at: Date.now(), session, data });
 }
 
-/** Forget one installation's snapshot (access refusal, removal). */
-export function dropWorkspaceAppSnapshot(installId: string): void {
-  snapshots.delete(installId);
-  for (const [key, flight] of snapshotReads) {
+type InFlightRead<T> = {
+  installId: string;
+  controller: AbortController;
+  subscribers: number;
+  settled: boolean;
+  promise: Promise<T>;
+};
+
+const snapshotReads = new Map<string, InFlightRead<WorkspaceAppSnapshot>>();
+const scopeReads = new Map<string, InFlightRead<[Installation, AppContext[]]>>();
+let snapshotEpoch = 0;
+
+function abortFlights<T>(reads: Map<string, InFlightRead<T>>): void {
+  for (const flight of reads.values()) flight.controller.abort();
+  reads.clear();
+}
+
+function abortInstallFlights<T>(reads: Map<string, InFlightRead<T>>, installId: string): void {
+  for (const [key, flight] of reads) {
     if (flight.installId === installId) {
-      if (snapshotReads.get(key) === flight) snapshotReads.delete(key);
+      if (reads.get(key) === flight) reads.delete(key);
       flight.controller.abort();
     }
   }
 }
 
-/** The app page's reads, fired in parallel and stored as one snapshot. */
-type SnapshotRead = { installId: string; controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
-const snapshotReads = new Map<string, SnapshotRead>();
-let snapshotEpoch = 0;
-export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
+/** Coalesce concurrent identical in-flight reads without retaining settled past receipts. */
+function coalesceInFlightRead<T>(
+  reads: Map<string, InFlightRead<T>>,
+  installId: string,
+  loader: (signal: AbortSignal, requestSession: string | null, generation: number) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
   const requestSession = sessionKey();
   const generation = privateSessionGeneration();
   const epoch = snapshotEpoch;
   const key = JSON.stringify([installId, requestSession, generation]);
-  let flight = snapshotReads.get(key);
+  let flight = reads.get(key);
   if (!flight) {
     const controller = new AbortController();
-    const created: SnapshotRead = { installId, controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
+    const created: InFlightRead<T> = { installId, controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
     created.promise = (async () => {
-      const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
-        workspaceApps.detail(installId, controller.signal),
-        workspaceApps.contexts(installId, controller.signal),
-        workspaceApps.bindings(installId, undefined, controller.signal),
-        workspaceApps.connections(controller.signal),
-        workspaceApps.agents(controller.signal),
-        workspaceApps.runs(installId, undefined, controller.signal),
-        workspaceApps.effects(installId, undefined, controller.signal),
-      ]);
+      const value = await loader(controller.signal, requestSession, generation);
       if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
       if (epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
         throw new ApiError("The session changed while loading this app", 401);
       }
-      const data = { installation, contexts, bindings, connections, agents, runs, effects };
-      writeWorkspaceAppSnapshot(installId, data, requestSession, generation);
-      return data;
+      return value;
     })().finally(() => {
       created.settled = true;
-      if (snapshotReads.get(key) === created) snapshotReads.delete(key);
+      if (reads.get(key) === created) reads.delete(key);
     });
     flight = created;
-    snapshotReads.set(key, flight);
+    reads.set(key, flight);
   }
   const shared = flight;
   shared.subscribers += 1;
@@ -881,7 +888,7 @@ export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortS
       signal?.removeEventListener("abort", abort);
       shared.subscribers -= 1;
       if (shared.subscribers === 0 && !shared.settled) {
-        if (snapshotReads.get(key) === shared) snapshotReads.delete(key);
+        if (reads.get(key) === shared) reads.delete(key);
         shared.controller.abort();
       }
     };
@@ -897,6 +904,61 @@ export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortS
       }
     }, error => { if (!released) { release(); reject(error); } });
   });
+}
+
+/** Forget one installation's snapshot (access refusal, removal). */
+export function dropWorkspaceAppSnapshot(installId: string): void {
+  snapshots.delete(installId);
+  abortInstallFlights(snapshotReads, installId);
+  abortInstallFlights(scopeReads, installId);
+}
+
+/** Concurrent `(detail, contexts)` scope reads share the in-flight request without retaining past receipts. */
+export function readAppScopeFresh(installId: string, signal?: AbortSignal): Promise<[Installation, AppContext[]]> {
+  return coalesceInFlightRead(
+    scopeReads,
+    installId,
+    (sharedSignal) => Promise.all([
+      workspaceApps.detail(installId, sharedSignal),
+      workspaceApps.contexts(installId, sharedSignal),
+    ]),
+    signal,
+  );
+}
+
+/** The app page's reads, fired in parallel and stored as one snapshot. */
+export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
+  return coalesceInFlightRead(
+    snapshotReads,
+    installId,
+    async (sharedSignal, requestSession, generation) => {
+      const [[installation, contexts], bindings, connections, agents, runs, effects] = await Promise.all([
+        readAppScopeFresh(installId, sharedSignal),
+        workspaceApps.bindings(installId, undefined, sharedSignal),
+        workspaceApps.connections(sharedSignal),
+        workspaceApps.agents(sharedSignal),
+        workspaceApps.runs(installId, undefined, sharedSignal),
+        workspaceApps.effects(installId, undefined, sharedSignal),
+      ]);
+      const data = { installation, contexts, bindings, connections, agents, runs, effects };
+      writeWorkspaceAppSnapshot(installId, data, requestSession, generation);
+      return data;
+    },
+    signal,
+  );
+}
+
+/**
+ * Warm only `(detail, contexts)` on sidebar hover/focus for screen-records apps
+ * without triggering legacy polling endpoints; joins an in-flight scope read.
+ */
+const prefetchingScopes = new Map<string, Promise<unknown>>();
+export function prefetchAppScope(installId: string): void {
+  if (prefetchingScopes.has(installId)) return;
+  const task = readAppScopeFresh(installId)
+    .catch(() => null)
+    .finally(() => { if (prefetchingScopes.get(installId) === task) prefetchingScopes.delete(installId); });
+  prefetchingScopes.set(installId, task);
 }
 
 /**
@@ -934,7 +996,7 @@ export async function readInstallationsFresh(signal?: AbortSignal): Promise<Inst
   if (epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
     throw new ApiError("The session changed while loading apps", 401);
   }
-  installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  if (Array.isArray(rows)) installationsSnapshot = { at: Date.now(), session: requestSession, rows };
   return rows;
 }
 
@@ -944,15 +1006,17 @@ export function dropInstallationsSnapshot(): void {
 
 onPrivateReadsPaused(() => {
   snapshotEpoch += 1;
-  for (const flight of snapshotReads.values()) flight.controller.abort();
-  snapshotReads.clear();
+  abortFlights(snapshotReads);
+  abortFlights(scopeReads);
   prefetching.clear();
+  prefetchingScopes.clear();
 });
 
 onPrivateSessionReset(() => {
-  for (const flight of snapshotReads.values()) flight.controller.abort();
-  snapshotReads.clear();
+  abortFlights(snapshotReads);
+  abortFlights(scopeReads);
   snapshots.clear();
   prefetching.clear();
+  prefetchingScopes.clear();
   dropInstallationsSnapshot();
 });

@@ -1904,13 +1904,13 @@ fn read_dispatch(
 /// A board write waits this long for the one writer before answering
 /// `resource_busy`: long enough for an ordinary write queued behind
 /// another, short enough that a stuck request never queues the board.
-const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
+pub(super) const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// [`WRITE_LOCK`] with a deadline. `None` means another write still holds
 /// it after `within`, so the caller answers a retryable refusal instead of
 /// blocking its thread for the holder's whole daemon call. A poisoned lock
 /// is recovered exactly as the blocking `lock()` did.
-fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
+pub(super) fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
     let deadline = Instant::now() + within;
     loop {
         match WRITE_LOCK.try_lock() {
@@ -1924,16 +1924,26 @@ fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
 
 /// Whether this request takes the board's one writer. Every method
 /// `handle` treats as a write is serialized — `PUT` included, because the
-/// wiki serves PUT writes — except the device sign-in exchange (CAD-777:
-/// its handlers call the issuer, and its own state is separately locked).
+/// wiki serves PUT writes — except the device sign-in exchange (CAD-777),
+/// frame mount minting, mount token teardown, and closed screen-service calls
+/// (`app_screens::service` acquires [`WRITE_LOCK`] only for mutating ops so
+/// read-only screen queries do not contend with board writes; CAD-2534).
 fn serialized_write(method: &Method, url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or("");
     matches!(
         method,
         Method::Post | Method::Patch | Method::Delete | Method::Put
-    ) && !matches!(
-        url.split('?').next().unwrap_or(""),
-        "/api/session/device/code" | "/api/session/device/poll"
-    )
+    ) && !(method == &Method::Post
+        && (matches!(
+            path,
+            "/api/session/device/code"
+                | "/api/session/device/poll"
+                | "/api/app-screen-services/call"
+        ) || app_screens::tool_revoke_route(path)
+            || matches!(
+                endpoints::resolve("POST", path).map(|b| b.endpoint.id),
+                Some(endpoints::RouteId::Mount)
+            )))
 }
 
 /// Run one write under [`WRITE_LOCK`]. The guard is dropped only after
@@ -1957,7 +1967,7 @@ fn run_serialized_write(
 
 /// The board's writer is still busy: transient, like a daemon `busy`
 /// refusal (`busy_response`), so the client retries instead of failing.
-fn board_busy_response() -> HttpResp {
+pub(super) fn board_busy_response() -> HttpResp {
     let mut resp = coded_response(
         503,
         "resource_busy",
@@ -2141,8 +2151,11 @@ fn handle(
         };
         let read_only = opts.read_only
             || matches!(&caller, Some(operator::Caller::Named(named)) if !named.operator);
-        let response = app_screens::service(&mut request, state_dir, opts, rpc, read_only);
-        read_model::get(state_dir, pm_dir).invalidate();
+        let (response, mutated) =
+            app_screens::service(&mut request, state_dir, opts, rpc, read_only);
+        if mutated {
+            read_model::get(state_dir, pm_dir).invalidate();
+        }
         send(request, response);
         return;
     }
@@ -4411,17 +4424,146 @@ mod write_lock_tests {
                 "{method:?} is a read"
             );
         }
-        for path in ["/api/session/device/code", "/api/session/device/poll"] {
+        for path in [
+            "/api/session/device/code",
+            "/api/session/device/poll",
+            "/api/app-installations/inst-1/screens/main/mount",
+            "/api/app-screen-tools/revoke",
+            "/api/app-screen-services/call",
+        ] {
             assert!(
                 !serialized_write(&Method::Post, path),
-                "{path} stays exempt"
+                "{path} stays exempt from the global POST write lock"
             );
             assert!(
                 !serialized_write(&Method::Post, &format!("{path}?retry=1")),
-                "a query string does not bypass the exemption"
+                "a query string does not bypass the exemption for {path}"
+            );
+        }
+        for path in [
+            "/api/app-screen-services/slot-prepare",
+            "/api/app-screen-services/slot-confirm",
+            "/api/app-screen-tools/invoke",
+            "/api/app-installations/inst-1/upgrade",
+        ] {
+            assert!(
+                serialized_write(&Method::Post, path),
+                "{path} remains serialized under the global POST write lock"
+            );
+        }
+        for method in [Method::Put, Method::Patch, Method::Delete] {
+            assert!(
+                serialized_write(&method, "/api/app-screen-services/call"),
+                "non-POST {method:?} cannot claim the POST-only exemption"
             );
         }
         assert!(serialized_write(&Method::Post, "/api/session"));
+    }
+
+    #[test]
+    fn cad2534_screen_service_write_lock_and_slot_prepare_guard() {
+        let state = tempfile::tempdir().expect("state dir");
+        let opts = ServeOpts::default();
+        let host = operator::board_host(opts.port);
+        let cookie = format!("cadence_operator_{}=tok-1", opts.port);
+        const WRITE_BODY: &str =
+            r#"{"action_token":"act-1","operation":"records.create","args":{}}"#;
+        const READ_BODY: &str = r#"{"action_token":"act-1","operation":"records.list","args":{}}"#;
+        let service_req = |body: &'static str| -> Request {
+            tiny_http::TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/app-screen-services/call")
+                .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+                .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+                .with_body(body)
+                .into()
+        };
+        let _held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let body_json = |resp: HttpResp| -> Value {
+            serde_json::from_reader(resp.into_reader()).expect("JSON response")
+        };
+
+        // Write screen service call must contend on WRITE_LOCK and fail closed with 503.
+        let mut write_req = service_req(WRITE_BODY);
+        let (write_resp, write_mutated) = app_screens::service_with_lock_wait(
+            &mut write_req,
+            state.path(),
+            &opts,
+            "app_screen_service_call",
+            false,
+            Duration::from_millis(30),
+        );
+        assert_eq!(write_resp.status_code(), StatusCode(503));
+        assert!(
+            !write_mutated,
+            "busy refusal must not invalidate read_model"
+        );
+        assert!(
+            write_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "503 response must include Retry-After"
+        );
+        assert_eq!(body_json(write_resp)["code"], "resource_busy");
+
+        // Read screen service call bypasses WRITE_LOCK, reaches client::rpc, and does not
+        // invalidate read_model.
+        let mut read_req = service_req(READ_BODY);
+        let (read_resp, read_mutated) = app_screens::service_with_lock_wait(
+            &mut read_req,
+            state.path(),
+            &opts,
+            "app_screen_service_call",
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(
+            !read_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "read-only screen service call must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(
+            body_json(read_resp)["code"],
+            "daemon_unavailable",
+            "read-only screen service call must bypass WRITE_LOCK and reach client::rpc"
+        );
+        assert!(
+            !read_mutated,
+            "read-only screen service call must not invalidate read_model"
+        );
+
+        // Slot prepare keeps outer serialized_write WRITE_LOCK and must not re-lock/deadlock.
+        let mut slot_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-screen-services/slot-prepare")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(WRITE_BODY)
+            .into();
+        let (slot_resp, _) = app_screens::service_with_lock_wait(
+            &mut slot_req,
+            state.path(),
+            &opts,
+            "app_screen_service_slot_prepare",
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(
+            !slot_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "slot-prepare holds outer WRITE_LOCK and must not re-acquire or busy-refuse itself"
+        );
+        assert_eq!(
+            body_json(slot_resp)["code"],
+            "daemon_unavailable",
+            "slot-prepare must proceed past the lock guard to client::rpc"
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@ import Link from "../../ui/Link";
 import { IconMore, IconThreads } from "../../ui/icons";
 import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
-import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { dropWorkspaceAppSnapshot, readAppScopeFresh, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import AppLoadingSurface from "../workspace-apps/AppLoadingSurface";
 import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
@@ -478,10 +479,8 @@ export default function AppShell({
     installId,
     viewer.operator,
     screenViewer,
-    // The shell's one scope is part of the receipt key: a workspace-emitted
-    // selection (the same mechanism a URL adoption uses) re-proves the
-    // install/context membership instead of trusting the emitted id.
-    contextId,
+    // CAD-2534: initial context adoption derives from the contexts response we
+    // just fetched, so keeping `contextId` out avoids a Round-2 re-fetch.
     scopedConversationVisit,
   ]);
   const readVersionRef = useRef({ inputKey: "", version: 0 });
@@ -679,10 +678,7 @@ export default function AppShell({
       };
     }
     setRequestLoading(true);
-    Promise.all([
-      workspaceApps.detail(installId, controller.signal),
-      workspaceApps.contexts(installId, controller.signal),
-    ])
+    readAppScopeFresh(installId, controller.signal)
       .then(([next, nextContexts]) => {
         if (!isCurrent()) return;
         setInstallation(next);
@@ -1320,9 +1316,7 @@ export default function AppShell({
                 contextId={cachedPreviewContextId}
               />
             ) : loading ? (
-              <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
-                {t("Loading this app…")}
-              </p>
+              <AppLoadingSurface label={t("Loading this app…")} variant="page" />
             ) : null}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
@@ -1415,7 +1409,7 @@ export default function AppShell({
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
-                    : <Loading>{t("Loading this app…")}</Loading>} />
+                    : <AppLoadingSurface label={t("Loading this app…")} variant="page" />} />
               )}
             </>
           )}

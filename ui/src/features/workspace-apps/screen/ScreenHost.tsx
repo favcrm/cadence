@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
-import { readWorkspaceAppSnapshot, readWorkspaceAppSnapshotFresh, workspaceApps, type Installation, type AppContext, type AppBinding, type WorkspaceAppSnapshot } from "../workspaceApps";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { readWorkspaceAppSnapshot, readWorkspaceAppSnapshotFresh, type Installation, type AppContext, type WorkspaceAppSnapshot } from "../workspaceApps";
 import { runCall, makePlanner } from "./screenActions";
 import { useHref } from "../../../lib/useLocation";
 import ScreenOutlet from "./ScreenOutlet";
@@ -22,7 +22,7 @@ import type { ScreenPush } from "./screenProtocol";
  * host but keep the mounted frame and its handshake; only a context
  * switch, a new bundle or another screen rebuilds it.
  */
-export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit" | "readOnly" | "route">) {
+export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onMounted" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit" | "readOnly" | "route">) {
   const href = useHref();
   // A canvas frame (it owns its route) never follows the board URL's back door.
   const native = !callbacks.route && new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
@@ -38,21 +38,30 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
   const declarations = installation.files.filter(f => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f));
   const tag = declarations.length === 1 ? declarations[0].split("/")[1] : null;
   const liveContext = contexts.some(c => c.id === contextId && c.install_id === installation.install_id && c.state === "active");
-  // The scope's own rows, read exactly as the native workspace reads them, so an
-  // app screen is handed the same projection instead of a stubbed one. Until the
-  // snapshot arrives the previous empty projection stands: mounting behaviour is
-  // unchanged, it simply gains rows once they are known.
+  // CAD-2534: only legacy/non-records screens need snapshot polling and retained
+  // tool extras; `screen-records.v1` mounts read directly via host services. Wait
+  // for the verified mount receipt before starting any background snapshot/tool reads.
+  const [mountKind, setMountKind] = useState<"pending" | "records" | "legacy">("pending");
+  useEffect(() => {
+    setMountKind("pending");
+  }, [installation.install_id, installation.digest, tag, contextId, admitted]);
+  const handleMounted = useCallback((info: { hostContract: string | null } | null) => {
+    if (info === null) setMountKind("pending");
+    else setMountKind(info.hostContract === "screen-records.v1" ? "records" : "legacy");
+  }, []);
+  const legacyPolling = admitted && tag !== null && mountKind === "legacy";
   const [snapshot, setSnapshot] = useState<WorkspaceAppSnapshot | null>(() => readWorkspaceAppSnapshot(installation.install_id));
-  // Runs progress and reviewers approve out of band, so the screen follows its
-  // scope the way the native workspace does: a fresh read now, another every
-  // five seconds while the tab is visible, and one straight after an action.
+  const scopedSnapshot = snapshot?.installation.install_id === installation.install_id ? snapshot : null;
+  // Runs progress and reviewers approve out of band, so legacy screens follow
+  // their scope: a fresh read now, another every five seconds while the tab is
+  // visible, and one straight after an action.
   const activeRead = useRef<AbortController | null>(null);
   const reread = useRef<(fresh: boolean) => void>(() => undefined);
   useEffect(() => {
-    // A viewer the frame would not admit is not polled for at all, and a read that
-    // is no longer wanted must not be started by a late action callback.
+    // A viewer the frame would not admit (or a screen-records.v1 mount) is not
+    // polled at all, and a superseded read cannot be restarted by a late action callback.
     reread.current = () => undefined;
-    if (!admitted || tag === null) return;
+    if (!legacyPolling) return;
     let live = true;
     const read = (fresh: boolean) => {
       if (!live) return;
@@ -82,29 +91,31 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       window.clearInterval(timer);
       activeRead.current?.abort();
     };
-  }, [installation.install_id, admitted, tag]);
-  // Approved text for the pushed runs, resolved the way `read.run` resolves it: the
-  // run's reviewer-approved text artifact, read by id. Bindings come from the same
-  // read the native path uses; `workers` stays null — "unknown", as the type states —
-  // rather than asserted, so nothing here claims a scope the host did not state.
-  const [bindings, setBindings] = useState<AppBinding[]>([]);
-  useEffect(() => {
-    if (!admitted) return;
-    const controller = new AbortController();
-    workspaceApps.bindings(installation.install_id, contextId || undefined, controller.signal)
-      .then((rows) => { if (!controller.signal.aborted) setBindings(rows); }, () => undefined);
-    return () => controller.abort();
-  }, [installation.install_id, contextId, admitted]);
+  }, [installation.install_id, legacyPolling]);
+  // Reuse snapshot bindings instead of issuing a separate workspaceApps.bindings call.
+  const bindings = useMemo(
+    () =>
+      scopedSnapshot
+        ? contextId
+          ? scopedSnapshot.bindings.filter((b) => b.context_id === contextId)
+          : scopedSnapshot.bindings
+        : [],
+    [scopedSnapshot, contextId],
+  );
+  const runs = useMemo(
+    () => (scopedSnapshot && Array.isArray(scopedSnapshot.runs) ? scopedSnapshot.runs : []),
+    [scopedSnapshot],
+  );
   // Approved text and the image loader come from the same bounded readers the
   // native workspace uses — the newest 32 runs, 600 characters each, read in
   // sequence and cached by artifact id — so the generic path inherits that
   // budget instead of fetching every artifact the scope holds.
   const { extras, loadAsset, reloadTools } = useScreenExtras({
-    enabled: admitted,
+    enabled: legacyPolling,
     installation,
     installId: installation.install_id,
     contextId: contextId || "",
-    runs: Array.isArray(snapshot?.runs) ? snapshot.runs : [],
+    runs,
     bindings,
     workers: null,
     onDenied: () => undefined,
@@ -116,21 +127,21 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       contexts: contexts.filter(c => c.install_id === installation.install_id && c.state === "active").map(c => ({ id: c.id, label: c.config.label })),
       runs: [], outbox: [], publish_intents: { status: "ok", withheld: 0, rows: [] }, readiness: { ok: true, blockers: [] }, actions: [], now: Math.floor(Date.now() / 1000),
     };
-    if (snapshot === null || tag === null) return empty;
+    if (scopedSnapshot === null || tag === null) return empty;
     // Intent state is publish-intent state (social's concern) and stays absent
     // rather than guessed — the same state the native path settles to when its
     // own reads fail. Approved text arrives through `extras`.
     try {
-      return screenProjection(snapshot.installation, tag, contextId, snapshot.contexts, Array.isArray(snapshot.runs) ? snapshot.runs : [], Array.isArray(snapshot.effects) ? snapshot.effects : [], undefined, extras) ?? empty;
+      return screenProjection(scopedSnapshot.installation, tag, contextId, scopedSnapshot.contexts, runs, Array.isArray(scopedSnapshot.effects) ? scopedSnapshot.effects : [], undefined, extras) ?? empty;
     } catch {
       // An oversized or otherwise unavailable scope keeps today's behaviour.
       return empty;
     }
-  }, [snapshot, installation, contexts, contextId, tag, extras]);
+  }, [scopedSnapshot, runs, installation, contexts, contextId, tag, extras]);
   const actions = useMemo(() => {
-    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs: snapshot?.runs ?? [], onChanged: () => reread.current(true) });
+    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs, onChanged: () => reread.current(true) });
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };
-  }, [installation, contextId, snapshot]);
+  }, [installation, contextId, runs]);
   return admitted && liveContext && tag && installation.executable && installation.approval.state === "approved" && installation.removed == null
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={callbacks.readOnly ? undefined : actions} onToolInvoked={reloadTools} {...callbacks} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={callbacks.readOnly ? undefined : actions} onMounted={handleMounted} onToolInvoked={reloadTools} {...callbacks} /> : fallback;
 }

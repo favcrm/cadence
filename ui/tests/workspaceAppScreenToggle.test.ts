@@ -211,6 +211,92 @@ async function main() {
   assert(host.textContent?.includes("Sign in as the operator"), "Non-operator sees the operator sign-in notice");
   await React.act(async () => root.unmount());
   assert(frameLoads.length > 0 && frameLoads.every(path => path === receipt.mount), "Only the stubbed frame document was loaded");
+
+  // CAD-2534: a screen-records.v1 mount skips legacy snapshot polling,
+  // duplicate bindings reads, and tool-results fetches altogether.
+  const { InstalledScreenOutlet } = require("../src/features/workspace-apps/screen/ScreenHost") as typeof import("../src/features/workspace-apps/screen/ScreenHost");
+  const recordsHost = document.createElement("section");
+  recordsHost.className = "app-shell-outlet";
+  document.body.append(recordsHost);
+  const recordsRoot = createRoot(recordsHost);
+  const previousFetch = globalThis.fetch;
+  const seenRecordsFetches: string[] = [];
+  const recordsDigest = `sha256:${"d".repeat(64)}`;
+  const recordsMountReceipt = {
+    mount: `/api/app-screen/${"c".repeat(64)}`,
+    bridge_nonce: nonce,
+    generation: 2,
+    tag: "main",
+    host_contract: "screen-records.v1",
+    install_id: "install-records",
+    context_id: "ctx-records",
+    digest: recordsDigest,
+    display_session_key: "e".repeat(64),
+    display_scope_key: "f".repeat(64),
+    action_token: "1".repeat(64),
+    tools: [],
+    navigation: null,
+    remote_images: [],
+    operations: ["records.list"],
+  };
+  globalThis.fetch = (async (input: any) => {
+    const path = String(input);
+    seenRecordsFetches.push(path);
+    if (path === "/api/app-installations/install-records/screens/main/mount") {
+      return json(recordsMountReceipt);
+    }
+    if (path === "/api/app-screen-tools/revoke") {
+      return json({ ok: true });
+    }
+    throw new Error(`Unexpected legacy read on screen-records.v1 mount: ${path}`);
+  }) as typeof fetch;
+  try {
+    const recordsInstall: any = {
+      ...installation,
+      install_id: "install-records",
+      digest: recordsDigest,
+      name: "crm",
+      title: "CRM",
+      approval: { state: "approved" },
+      files: ["screens/main/screens.json"],
+    };
+    const recordsContexts: any[] = [{
+      id: "ctx-records",
+      install_id: "install-records",
+      revision: 1,
+      state: "active",
+      digest: "cr",
+      config: { schema: 1, label: "Main", input_defaults: {} },
+    }];
+    await React.act(async () => {
+      recordsRoot.render(React.createElement(LocaleProvider, null, React.createElement(InstalledScreenOutlet, {
+        installation: recordsInstall,
+        contexts: recordsContexts,
+        contextId: "ctx-records",
+        admitted: true,
+        fallback: null,
+      })));
+    });
+    await flush(); await flush(); await flush();
+    assert(seenRecordsFetches.includes("/api/app-installations/install-records/screens/main/mount"), "screen-records.v1 outlet mounted via /mount");
+    assert(
+      !seenRecordsFetches.some((p) =>
+        p.includes("/bindings") ||
+        p.includes("/api/connections") ||
+        p.includes("/api/agents") ||
+        p.includes("/api/app-runs") ||
+        p.includes("/effects") ||
+        p.includes("/api/app-screen-tools/results"),
+      ),
+      `screen-records.v1 mount skipped all legacy snapshot/extras reads: ${JSON.stringify(seenRecordsFetches)}`,
+    );
+    assert(recordsHost.querySelector('[role="status"][aria-label="Loading installed app…"]'), "AppLoadingSurface renders inside Installed app screen while handshake is pending");
+  } finally {
+    await React.act(async () => { recordsRoot.unmount(); });
+    recordsHost.remove();
+    globalThis.fetch = previousFetch;
+  }
+
   console.log("workspace app screen host checks passed");
 }
 void main();

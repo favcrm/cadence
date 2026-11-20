@@ -213,26 +213,48 @@ impl<'de> serde::Deserialize<'de> for UniqueServiceJson {
 
 /// `read_only` (CAD-1537): a member or `--read-only` board caller — the
 /// board refuses a non-read operation itself before relaying, as strict
-/// as the daemon's own read-only mount rule.
+/// as the daemon's own read-only mount rule. Returns `(response, mutated)`
+/// so callers skip invalidating the board read model on read-only ops (CAD-2534).
 pub(super) fn service(
     request: &mut Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     method: &'static str,
     read_only: bool,
-) -> HttpResp {
+) -> (HttpResp, bool) {
+    service_with_lock_wait(
+        request,
+        state_dir,
+        opts,
+        method,
+        read_only,
+        super::serve::WRITE_LOCK_WAIT,
+    )
+}
+
+pub(super) fn service_with_lock_wait(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    method: &'static str,
+    read_only: bool,
+    lock_wait: std::time::Duration,
+) -> (HttpResp, bool) {
     // One finite read budget before bounded envelope inspection. The named
     // operation then imposes its smaller exact raw-envelope + args budget.
     let bytes = match read_body(request, 327_680 + 4096) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return (resp, false),
     };
     let mut body = match serde_json::from_slice::<UniqueServiceJson>(&bytes) {
         Ok(UniqueServiceJson(v)) if v.is_object() => v,
         _ => {
-            return err_response(
-                400,
-                "screen service body must be duplicate-free JSON object",
+            return (
+                err_response(
+                    400,
+                    "screen service body must be duplicate-free JSON object",
+                ),
+                false,
             )
         }
     };
@@ -248,24 +270,30 @@ pub(super) fn service(
         .keys()
         .any(|key| !allowed.contains(&key.as_str()))
     {
-        return err_response(400, "screen service body has unsupported fields");
+        return (
+            err_response(400, "screen service body has unsupported fields"),
+            false,
+        );
     }
-    let cap = if confirm {
-        16_384
+    let (cap, is_read) = if confirm {
+        (16_384, false)
     } else {
         match serde_json::from_value::<crate::issue::app_screen_decl::ScreenOperation>(
             body["operation"].clone(),
         ) {
             Ok(operation) if read_only && !operation.is_screen_read() => {
-                return super::coded_response(
-                    403,
-                    "forbidden",
-                    "a read-only screen admits only read operations",
-                    None,
+                return (
+                    super::coded_response(
+                        403,
+                        "forbidden",
+                        "a read-only screen admits only read operations",
+                        None,
+                    ),
+                    false,
                 )
             }
-            Ok(operation) => operation.args_limit(),
-            Err(_) => return err_response(400, "unknown screen service operation"),
+            Ok(operation) => (operation.args_limit(), operation.is_screen_read()),
+            Err(_) => return (err_response(400, "unknown screen service operation"), false),
         }
     };
     let args = if confirm {
@@ -274,15 +302,33 @@ pub(super) fn service(
         &body["args"]
     };
     if bytes.len() > cap + 4096 || !args.is_object() || args.to_string().len() > cap {
-        return err_response(400, "screen service request exceeds operation byte bound");
+        return (
+            err_response(400, "screen service request exceeds operation byte bound"),
+            false,
+        );
     }
     let Some((token, key, origin)) = request_credentials(request, opts) else {
-        return super::coded_response(
-            403,
-            "forbidden",
-            "screen service requires live operator session",
-            None,
+        return (
+            super::coded_response(
+                403,
+                "forbidden",
+                "screen service requires live operator session",
+                None,
+            ),
+            false,
         );
+    };
+    // CAD-2534: `app_screen_service_call` bypasses global POST serialization so
+    // read-only calls never contend with writes, while mutating `call` operations
+    // acquire the single writer here. `slot-prepare`/`slot-confirm` still hold
+    // the outer `WRITE_LOCK` from `serialized_write` and must NOT re-lock it.
+    let _write_guard = if method == "app_screen_service_call" && !is_read {
+        match super::serve::acquire_write_lock(lock_wait) {
+            Some(guard) => Some(guard),
+            None => return (super::serve::board_busy_response(), false),
+        }
+    } else {
+        None
     };
     let operation = body
         .get("operation")
@@ -291,7 +337,7 @@ pub(super) fn service(
     body["token"] = json!(token);
     body["key"] = json!(key);
     body["origin"] = json!(origin);
-    match client::rpc(state_dir, method, body) {
+    let response = match client::rpc(state_dir, method, body) {
         Ok(v) => service_json_response(&v),
         Err(error)
             if error.kind() == "rejected" && error.code() == Some("screen_access_denied") =>
@@ -329,7 +375,8 @@ pub(super) fn service(
             super::coded_response(409, code, &error.to_string(), error.revision())
         }
         Err(error) => home::rpc_err(&error, method),
-    }
+    };
+    (response, !is_read)
 }
 
 /// Serialize once: the exact compact wire bytes, not a compact estimate
@@ -524,10 +571,17 @@ pub(super) fn frame(
     // value so the host recognizes the child's echoed init. Never mint a
     // fresh one at render and never accept a child-chosen nonce.
     let bridge_nonce = out["bridge_nonce"].as_str().unwrap_or("").to_string();
-    // Rebuild from the native manifest + exact string bodies, never from a
-    // host/frame-selected script vector or an order inferred from file names.
-    let package = (|| -> crate::error::Result<crate::issue::app_screen_pkg::ScreenPackage> {
+    // Validate from the native manifest + exact string bodies once, then render
+    // directly without building a redundant ScreenPackage or repeating validation.
+    let validated = (|| -> crate::error::Result<(
+        &str,
+        std::collections::BTreeMap<String, String>,
+        crate::issue::app_screen_decl::IntegrityCheckedScreen,
+    )> {
         use crate::error::Error;
+        let tag = out["tag"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("screen tag unavailable"))?;
         let manifest = out["manifest"]
             .as_str()
             .ok_or_else(|| Error::rejected("screen manifest unavailable"))?;
@@ -543,36 +597,21 @@ pub(super) fn frame(
             })
             .collect::<crate::error::Result<std::collections::BTreeMap<_, _>>>()?;
         let checked = crate::issue::app_screen_decl::validate_map(manifest, &assets)?;
-        Ok(crate::issue::app_screen_pkg::ScreenPackage {
-            tag: out["tag"]
-                .as_str()
-                .ok_or_else(|| Error::rejected("screen tag unavailable"))?
-                .to_owned(),
-            manifest: manifest.to_owned(),
-            assets,
-            app: checked.app().to_owned(),
-            remote_images: checked.remote_images().to_vec(),
-            contract: checked.contract().to_owned(),
-            may: checked.may().to_vec(),
-            tools: checked.tools().clone(),
-            host_contract: checked.host_contract().map(str::to_owned),
-            operations: checked.operations().to_vec(),
-            navigation: checked.navigation().cloned(),
-        })
+        Ok((tag, assets, checked))
     })();
-    let package = match package {
-        Ok(package) => package,
+    let (tag, assets, checked) = match validated {
+        Ok(v) => v,
         Err(_) => return err_response(500, "screen package refused"),
     };
     let origin_str = board_origin(request, opts);
     let generation = out["generation"].as_u64().unwrap_or(0);
-    let tag = out["tag"].as_str().unwrap_or("");
-    let html = match crate::daemon::render_package_frame_html(
+    let html = match crate::daemon::render_checked_package_frame_html(
         &csp_nonce,
         tag,
         &bridge_nonce,
         generation,
-        &package,
+        &checked,
+        &assets,
         &origin_str,
     ) {
         Ok(h) => h,
@@ -583,7 +622,7 @@ pub(super) fn frame(
     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
-    let csp = frame_csp(&csp_nonce, &origin_str, &package.remote_images);
+    let csp = frame_csp(&csp_nonce, &origin_str, checked.remote_images());
     resp.add_header(Header::from_bytes("Content-Security-Policy", csp).unwrap());
     resp
 }
