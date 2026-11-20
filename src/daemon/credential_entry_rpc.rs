@@ -1186,7 +1186,15 @@ impl Shared {
             {
                 return Ok(None);
             }
-            None if public_only => return Ok(None),
+            None
+                if public_only
+                    || matches!(
+                        &self.membership_mode,
+                        super::public_membership::MembershipMode::Dedicated(_)
+                    ) =>
+            {
+                return Ok(None);
+            }
             _ => {}
         }
         Ok(Some(session))

@@ -2810,6 +2810,9 @@ pub(super) fn dedicated_config(opts: &ServeOpts) -> CadenceResult<Option<String>
 }
 
 fn validate_dedicated_config(opts: &ServeOpts, value: String) -> CadenceResult<Option<String>> {
+    if !opts.board_public_only {
+        return Err(Error::rejected("dedicated board requires public-only mode"));
+    }
     let bytes = value.as_bytes();
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     if bytes.is_empty()
@@ -3312,6 +3315,7 @@ mod tests {
 
     fn dedicated_fixture() -> ServeOpts {
         ServeOpts {
+            board_public_only: true,
             public: Some(super::super::PublicBoard {
                 host: "board.example.test".into(),
                 issuer: "https://api.example.test".into(),
@@ -3325,6 +3329,9 @@ mod tests {
     #[test]
     fn dedicated_login_uses_portal_and_intent_cookie() {
         let opts = dedicated_fixture();
+        let mut not_public_only = opts.clone();
+        not_public_only.board_public_only = false;
+        assert!(validate_dedicated_config(&not_public_only, "fixture-board".into()).is_err());
         assert_eq!(
             validate_dedicated_config(&opts, "fixture-board".into())
                 .unwrap()

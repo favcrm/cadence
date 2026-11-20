@@ -172,7 +172,9 @@ portal and API.
    `AGENTICOS_BOARD_HOST`, `AGENTICOS_BOARD_COMPANY` and
    `AGENTICOS_BOARD_ISSUER` on the board and daemon. The issuer is the public
    HTTPS API origin. Set the board's `AGENTICOS_BOARD_AUTHORIZE_URL` to the
-   AgenticOS **portal** origin followed by `/v2/board/authorize`. Do not set
+   AgenticOS **portal** origin followed by `/v2/board/authorize`.
+   `CADENCE_BOARD_PUBLIC_ONLY=1` is required on the board; separate-origin
+   device credential entry is not an alternative to public owner proof. Do not set
    native hosted placement flags. Persist the settings in the service
    configuration: a board/daemon mode mismatch refuses new browser sessions,
    including after a restart.
