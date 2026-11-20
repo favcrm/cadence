@@ -7,10 +7,12 @@
 //! envelope through [`crate::remote_cli::call_verb`]. The source tree is
 //! walked and the manifest checked before any mutating op.
 
+#![forbid(unsafe_code)]
+
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::fd_fs::{self, DirFd};
 use crate::wiki::transfer::{manifest_digest, Manifest, ManifestEntry};
 use crate::wiki::ABSENT;
 
@@ -2089,6 +2092,7 @@ fn open_contained(path: &Path) -> Result<File> {
     let mut cur = PathBuf::new();
     cur.push(Component::RootDir);
     let abs = lexical_abs(path)?;
+    let mut leaf: Option<File> = None;
     for component in abs.components() {
         let Component::Normal(seg) = component else {
             if matches!(component, Component::RootDir) {
@@ -2108,40 +2112,61 @@ fn open_contained(path: &Path) -> Result<File> {
         // (some kernels return ENOTSUP). The leaf uses O_NONBLOCK so a
         // fifo cannot stall admission; a directory leaf that a kernel
         // refuses that way is retried below. Symlinks stay ELOOP.
-        let flags = if is_last {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
-        } else {
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        };
-        let mut next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
-        if next < 0 && is_last {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOTSUP) {
-                let dir_flags =
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-                next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), dir_flags) };
-            }
-        }
-        if next < 0 {
-            let err = std::io::Error::last_os_error();
-            // Linux reports a symlink as ELOOP. A kernel that returns the
-            // link descriptor is still refused by fstat below.
-            if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(current.as_raw_fd(), &name)
-            {
+        if is_last {
+            let opened = match current.open_nofollow_fd(&name) {
+                Ok(fd) => File::from(fd),
+                Err(err) if err.raw_os_error() == Some(libc::ENOTSUP) => {
+                    match current.open_child_dir(&name) {
+                        Ok(dir) => dir.into_file(),
+                        Err(retry_err) => {
+                            if retry_err.raw_os_error() == Some(libc::ELOOP)
+                                || is_symlink_at(&current, &name)
+                            {
+                                return Err(refused_path(&cur, "symlink"));
+                            }
+                            return Err(Error::rejected(format!(
+                                "wiki cp cannot read {}: {retry_err}",
+                                cur.display()
+                            )));
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Linux reports a symlink as ELOOP. A kernel that returns the
+                    // link descriptor is still refused by fstat below.
+                    if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(&current, &name) {
+                        return Err(refused_path(&cur, "symlink"));
+                    }
+                    return Err(Error::rejected(format!(
+                        "wiki cp cannot read {}: {err}",
+                        cur.display()
+                    )));
+                }
+            };
+            if is_symlink_fd(opened.as_fd()) {
                 return Err(refused_path(&cur, "symlink"));
             }
-            return Err(Error::rejected(format!(
-                "wiki cp cannot read {}: {err}",
-                cur.display()
-            )));
+            leaf = Some(opened);
+        } else {
+            let child = match current.open_child_dir(&name) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(&current, &name) {
+                        return Err(refused_path(&cur, "symlink"));
+                    }
+                    return Err(Error::rejected(format!(
+                        "wiki cp cannot read {}: {err}",
+                        cur.display()
+                    )));
+                }
+            };
+            if is_symlink_dir(&child) {
+                return Err(refused_path(&cur, "symlink"));
+            }
+            current = child;
         }
-        let opened = unsafe { OwnedFd::from_raw_fd(next) };
-        if is_symlink_fd(opened.as_raw_fd()) {
-            return Err(refused_path(&cur, "symlink"));
-        }
-        current = opened;
     }
-    let file = File::from(current);
+    let file = leaf.unwrap_or_else(|| current.into_file());
     let meta = file
         .metadata()
         .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))?;
@@ -2154,19 +2179,9 @@ fn open_contained(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn open_root_dir() -> Result<OwnedFd> {
-    let fd = unsafe {
-        libc::open(
-            c"/".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(
-            "wiki cp cannot open the filesystem root — nothing was sent",
-        ));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+fn open_root_dir() -> Result<DirFd> {
+    DirFd::open_root()
+        .map_err(|_| Error::rejected("wiki cp cannot open the filesystem root — nothing was sent"))
 }
 
 fn os_str_bytes(seg: &std::ffi::OsStr) -> &[u8] {
@@ -2174,101 +2189,65 @@ fn os_str_bytes(seg: &std::ffi::OsStr) -> &[u8] {
     seg.as_bytes()
 }
 
-fn is_symlink_fd(fd: std::os::fd::RawFd) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd, &mut st) };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+fn is_symlink_fd(fd: BorrowedFd<'_>) -> bool {
+    fd_fs::fstat(fd).is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
 }
 
-fn is_symlink_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+fn is_symlink_dir(dir: &DirFd) -> bool {
+    dir.stat()
+        .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
 }
 
-/// Names in a directory fd from [`open_contained`]. `fdopendir` consumes
-/// `file`. `.` and `..` are omitted. The caller's path is not opened again.
+fn is_symlink_at(dir: &DirFd, name: &std::ffi::CStr) -> bool {
+    dir.fstatat_nofollow(name)
+        .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
+}
+
+/// Names in a directory fd from [`open_contained`]. `.` and `..` are omitted.
+/// The caller's path is not opened again.
 fn list_nofollow_dir(file: File, path: &Path) -> Result<Vec<std::ffi::OsString>> {
-    use std::ffi::{CStr, OsStr};
-    use std::os::fd::IntoRawFd;
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    struct CloseDir(*mut libc::DIR);
-    impl Drop for CloseDir {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-    }
-
-    let fd = file.into_raw_fd();
-    let dir = unsafe { libc::fdopendir(fd) };
-    if dir.is_null() {
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(Error::rejected(format!(
-            "wiki cp cannot read {}: {err}",
+    let st = fd_fs::fstat(file.as_fd())
+        .map_err(|err| Error::rejected(format!("wiki cp cannot read {}: {err}", path.display())))?;
+    let dir = DirFd::from_verified_dir(OwnedFd::from(file), &st).ok_or_else(|| {
+        Error::rejected(format!(
+            "wiki cp cannot read {}: not a directory",
             path.display()
-        )));
-    }
-    let dir = CloseDir(dir);
+        ))
+    })?;
+    let iter = dir
+        .read_dir()
+        .map_err(|err| Error::rejected(format!("wiki cp cannot read {}: {err}", path.display())))?;
     let mut names = Vec::new();
-    loop {
-        clear_errno();
-        let ent = unsafe { libc::readdir(dir.0) };
-        if ent.is_null() {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error().unwrap_or(0) != 0 {
-                return Err(Error::rejected(format!(
-                    "wiki cp cannot read {}: {err}",
-                    path.display()
-                )));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
-        let bytes = name.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        names.push(OsStr::from_bytes(bytes).to_os_string());
+    for entry in iter {
+        let name = entry.map_err(|err| {
+            Error::rejected(format!("wiki cp cannot read {}: {err}", path.display()))
+        })?;
+        names.push(OsStr::from_bytes(name.to_bytes()).to_os_string());
     }
     Ok(names)
-}
-
-fn clear_errno() {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe {
-        *libc::__error() = 0;
-    }
 }
 
 /// Private export stage in a held directory fd. `Drop` unlinks only the
 /// stage name. After `renameat` that name is already gone, so cleanup
 /// cannot remove the published file.
 struct PrivateStage {
-    dir: OwnedFd,
+    dir: DirFd,
     name: CString,
     file: File,
 }
 
 impl Drop for PrivateStage {
     fn drop(&mut self) {
-        unsafe {
-            libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0);
-        }
+        let _ = self.dir.unlink_child(&self.name);
     }
 }
 
 impl PrivateStage {
-    fn create(dir: &File, display: &Path) -> Result<Self> {
-        let flags =
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    fn create(dir: &DirFd, display: &Path) -> Result<Self> {
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
         let mut last = None;
         for _ in 0..8 {
             let label = format!(".cadence-transfer-{}", hex_encode(stage_nonce()));
@@ -2278,34 +2257,35 @@ impl PrivateStage {
                     display.display()
                 ))
             })?;
-            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
-            if fd >= 0 {
-                let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    let err = std::io::Error::last_os_error();
-                    unsafe {
-                        libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
-                        libc::close(fd);
-                    }
+            match dir.open_file_nofollow(&name, flags, 0o600) {
+                Ok(file) => {
+                    let dup = match dir.try_clone() {
+                        Ok(dup) => dup,
+                        Err(err) => {
+                            let _ = dir.unlink_child(&name);
+                            drop(file);
+                            return Err(Error::rejected(format!(
+                                "cannot stage {}: {err}",
+                                display.display()
+                            )));
+                        }
+                    };
+                    return Ok(Self {
+                        dir: dup,
+                        name,
+                        file,
+                    });
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EEXIST) => {
+                    last = Some(err);
+                }
+                Err(err) => {
                     return Err(Error::rejected(format!(
                         "cannot stage {}: {err}",
                         display.display()
                     )));
                 }
-                return Ok(Self {
-                    dir: unsafe { OwnedFd::from_raw_fd(dup) },
-                    name,
-                    file: File::from(unsafe { OwnedFd::from_raw_fd(fd) }),
-                });
             }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EEXIST) {
-                return Err(Error::rejected(format!(
-                    "cannot stage {}: {err}",
-                    display.display()
-                )));
-            }
-            last = Some(err);
         }
         Err(Error::rejected(format!(
             "cannot stage {}: {}",
@@ -2339,28 +2319,12 @@ fn commit_stage(
     update: bool,
     display: &Path,
 ) -> Result<()> {
-    let rc = if update {
-        unsafe {
-            libc::renameat(
-                stage.dir.as_raw_fd(),
-                stage.name.as_ptr(),
-                stage.dir.as_raw_fd(),
-                dest.as_ptr(),
-            )
-        }
+    let res = if update {
+        stage.dir.rename_child(&stage.name, dest)
     } else {
-        unsafe {
-            libc::linkat(
-                stage.dir.as_raw_fd(),
-                stage.name.as_ptr(),
-                stage.dir.as_raw_fd(),
-                dest.as_ptr(),
-                0,
-            )
-        }
+        stage.dir.link_child(&stage.name, dest)
     };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = res {
         if !update
             && (err.kind() == std::io::ErrorKind::AlreadyExists
                 || err.raw_os_error() == Some(libc::EEXIST))
@@ -2376,9 +2340,7 @@ fn commit_stage(
         )));
     }
     if !update {
-        unsafe {
-            libc::unlinkat(stage.dir.as_raw_fd(), stage.name.as_ptr(), 0);
-        }
+        let _ = stage.dir.unlink_child(&stage.name);
     }
     Ok(())
 }
@@ -2400,7 +2362,7 @@ fn hash_open_file(file: &mut File) -> Result<(u64, String)> {
 }
 
 struct ExportAnchor {
-    dir: File,
+    dir: DirFd,
     root: PathBuf,
     single_name: Option<CString>,
 }
@@ -2446,9 +2408,9 @@ impl ExportAnchor {
 /// Walk `path` from `/` with the same `O_NOFOLLOW` directory opens as
 /// [`open_contained`]. Missing components are created with `mkdirat` on
 /// the held parent. The returned fd, not the path, is the destination.
-fn hold_export_dir(path: &Path) -> Result<File> {
+fn hold_export_dir(path: &Path) -> Result<DirFd> {
     let abs = lexical_abs(path)?;
-    let mut current = File::from(open_root_dir()?);
+    let mut current = open_root_dir()?;
     let mut built = PathBuf::new();
     built.push(Component::RootDir);
     for component in abs.components() {
@@ -2465,7 +2427,7 @@ fn hold_export_dir(path: &Path) -> Result<File> {
     Ok(current)
 }
 
-fn hold_relative_dir(root: &File, rel: &Path) -> Result<File> {
+fn hold_relative_dir(root: &DirFd, rel: &Path) -> Result<DirFd> {
     if rel.as_os_str().is_empty() {
         return root.try_clone().map_err(|err| {
             Error::rejected(format!("wiki cp cannot hold export directory: {err}"))
@@ -2503,50 +2465,46 @@ enum DirFail {
     Io(std::io::Error),
 }
 
-fn open_dir_at(parent: &File, name: &std::ffi::CStr) -> std::result::Result<File, DirFail> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(parent.as_raw_fd(), name) {
-            return Err(DirFail::Symlink);
+fn open_dir_at(parent: &DirFd, name: &std::ffi::CStr) -> std::result::Result<DirFd, DirFail> {
+    let dir = match parent.open_child_dir(name) {
+        Ok(dir) => dir,
+        Err(err) => {
+            if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(parent, name) {
+                return Err(DirFail::Symlink);
+            }
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Err(DirFail::Missing);
+            }
+            if err.raw_os_error() == Some(libc::ENOTDIR) {
+                return Err(DirFail::NotDir);
+            }
+            return Err(DirFail::Io(err));
         }
-        if err.raw_os_error() == Some(libc::ENOENT) {
-            return Err(DirFail::Missing);
-        }
-        if err.raw_os_error() == Some(libc::ENOTDIR) {
-            return Err(DirFail::NotDir);
-        }
-        return Err(DirFail::Io(err));
-    }
-    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    if is_symlink_fd(file.as_raw_fd()) {
-        return Err(DirFail::Symlink);
-    }
-    match file.metadata() {
-        Ok(meta) if meta.is_dir() => Ok(file),
+    };
+    match dir.stat() {
+        Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK => Err(DirFail::Symlink),
+        Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR => Ok(dir),
         Ok(_) => Err(DirFail::NotDir),
         Err(err) => Err(DirFail::Io(err)),
     }
 }
 
-fn open_or_create_dir(parent: &File, name: &std::ffi::CStr, display: &Path) -> Result<File> {
+fn open_or_create_dir(parent: &DirFd, name: &std::ffi::CStr, display: &Path) -> Result<DirFd> {
     match open_dir_at(parent, name) {
-        Ok(file) => Ok(file),
+        Ok(dir) => Ok(dir),
         Err(DirFail::Missing) => {
-            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
-            let created = rc == 0;
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EEXIST) {
+            let created = match parent.mkdir(name, 0o777) {
+                Ok(()) => true,
+                Err(err) if err.raw_os_error() == Some(libc::EEXIST) => false,
+                Err(err) => {
                     return Err(Error::rejected(format!(
                         "wiki cp cannot create {}: {err}",
                         display.display()
                     )));
                 }
-            }
+            };
             let child = match open_dir_at(parent, name) {
-                Ok(file) => file,
+                Ok(dir) => dir,
                 Err(DirFail::Symlink) => return Err(refused_path(display, "symlink")),
                 Err(DirFail::NotDir) => return Err(refused_path(display, "not a directory")),
                 Err(DirFail::Missing) => {
@@ -2596,30 +2554,21 @@ fn leaf_name(seg: &std::ffi::OsStr, display: &Path) -> Result<CString> {
 }
 
 fn refuse_export_leaf(
-    dir: &File,
+    dir: &DirFd,
     name: &std::ffi::CStr,
     display: &Path,
     update: bool,
 ) -> Result<()> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(());
+    let st = match dir.fstatat_nofollow(name) {
+        Ok(st) => st,
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(err) => {
+            return Err(Error::rejected(format!(
+                "wiki cp cannot stat {}: {err}",
+                display.display()
+            )));
         }
-        return Err(Error::rejected(format!(
-            "wiki cp cannot stat {}: {err}",
-            display.display()
-        )));
-    }
+    };
     let kind = st.st_mode & libc::S_IFMT;
     if kind == libc::S_IFLNK {
         return Err(refused_path(display, "symlink"));

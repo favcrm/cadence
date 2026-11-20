@@ -82,6 +82,11 @@ mod unix {
             }
         }
 
+        /// Convert this pinned directory descriptor into a [`File`] handle.
+        pub(crate) fn into_file(self) -> File {
+            File::from(self.0)
+        }
+
         /// Duplicate this directory descriptor with `FD_CLOEXEC`, avoiding
         /// standard I/O slots 0..=2.
         pub(crate) fn try_clone(&self) -> io::Result<Self> {
