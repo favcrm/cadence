@@ -343,6 +343,10 @@ opts into `screen-whatsapp-reply-availability.v1` only when the mount URL offers
 ordinal of the existing nomination on that port. It never publishes a
 recipient proof, confirmation token, or draft in this event. Older bundles
 get the status in the dock instead.
+The WABA inbox reserves a 19rem rail, including its gutter, when the iframe
+is at least 48rem wide. The board uses the same split to center the dock
+under the conversation. On narrower mounts, the active conversation and
+dock use the full width. The dock stays in flow below the iframe.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is
