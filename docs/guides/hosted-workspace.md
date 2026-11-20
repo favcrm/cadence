@@ -51,7 +51,8 @@ installation. It sends only a sign-in and one read, then reports each step:
 
 GitHub App authorization and project selection are separate. If the repository
 is not already authorized for the workspace, its owner first runs
-`cadence --org <org> connect github` and completes the GitHub approval.
+`cadence --org <org> connect github`. Confirm that the browser approval page
+shows the same workspace before completing the GitHub approval.
 
 On a host with project repository settings, open [AgenticOS Account](https://app-v2.agenticos.hk/account),
 select the same workspace, and find **GitHub project repositories**. Enter
