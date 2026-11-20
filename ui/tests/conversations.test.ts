@@ -252,7 +252,7 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
-assert(openLabel() !== null && !pane().includes("campaign brief"), "the fresh conversation is selected instead of the previous thread");
+equal(canvasSnapshot().conversation, "new-1", "/new selects the exact conversation returned by the create");
 equal(box().value, "", "the command is cleared from the composer");
 await type("/clear");
 equal(messagePosts.length, 1, "/clear is not sent as a message");
