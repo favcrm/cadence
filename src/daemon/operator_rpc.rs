@@ -61,6 +61,16 @@ fn origin_param(params: &Value) -> Result<Origin> {
     }
 }
 
+/// Only the trusted relay supplies this board mode, never the browser form.
+pub(super) fn public_entry_required(params: &Value) -> Result<bool> {
+    match params.get("public_only") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| Error::invalid("invalid_request", "invalid board entry mode")),
+    }
+}
+
 /// The login link's typed audience is carried by the dedicated entry-login
 /// RPCs (pending reviewer PASS). The legacy board RPCs must not accept an
 /// entry audience at all.
@@ -443,7 +453,8 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("credential entry continue open", params, peer_pid)?;
-        Self::entry_login_keys(params, &["nonce", "request_id"])?;
+        Self::entry_login_keys(params, &["nonce", "request_id", "public_only"])?;
+        let public_only = public_entry_required(params)?;
         let nonce = required_str(params, "nonce")?;
         let now = self.operator_now();
         let Some(request_id) = optional_str(params, "request_id") else {
@@ -491,17 +502,18 @@ impl Shared {
                         return Err(Error::internal("entry login produced a board session"))
                     }
                 };
-                if let Some(hash) = handoff.public_owner_hash.as_deref() {
-                    let current = self
-                        .entry_public_owner_is_current(hash, opened.session.account_id.as_deref());
-                    if !matches!(current, Ok(true)) {
-                        self.operator_auth().revoke_token(&opened.token)?;
-                        current?;
-                        return Err(Error::invalid(
-                            "entry_session_required",
-                            "the originating public board owner session is no longer current",
-                        ));
-                    }
+                let current = match handoff.public_owner_hash.as_deref() {
+                    Some(hash) => self
+                        .entry_public_owner_is_current(hash, opened.session.account_id.as_deref()),
+                    None => Ok(!public_only),
+                };
+                if !matches!(current, Ok(true)) {
+                    self.operator_auth().revoke_token(&opened.token)?;
+                    current?;
+                    return Err(Error::invalid(
+                        "entry_session_required",
+                        "a current owner session is required for this entry",
+                    ));
                 }
                 let destination = handoff.request_id;
                 let _ = self.store.event_public(
@@ -568,6 +580,7 @@ impl Shared {
             if !key.is_empty() {
                 return Err(unavailable());
             }
+            self.require_live_public_entry_authority()?;
             return match self.current_public_session(token)? {
                 public_membership::Authority::Granted {
                     role: crate::board_identity::Role::Operator,
@@ -598,6 +611,7 @@ impl Shared {
     ) -> Result<bool> {
         use super::public_membership::Authority;
         use crate::board_identity::Role;
+        self.require_live_public_entry_authority()?;
         Ok(matches!(
             self.current_session_for_hash(hash)?,
             Authority::Granted {
@@ -606,6 +620,22 @@ impl Shared {
                 ..
             } if account_id.is_some() && account_id == view.account_id.as_deref()
         ))
+    }
+
+    /// Ordinary standalone sessions may use their signed role until expiry.
+    /// Custody requires an authority that can confirm current membership.
+    fn require_live_public_entry_authority(&self) -> Result<()> {
+        if matches!(
+            &self.membership_mode,
+            public_membership::MembershipMode::Native(_)
+        ) {
+            Ok(())
+        } else {
+            Err(Error::invalid(
+                "capability_unavailable",
+                "protected public credential entry requires a live owner authority",
+            ))
+        }
     }
 
     /// `operator_session_open_device {token, origin, user_agent?}` —
@@ -775,7 +805,9 @@ impl Shared {
         let key = optional_str(params, "key").unwrap_or_default();
         let entry_origin = required_str(params, "entry_origin")?;
         let now = self.operator_now();
-        let session = self.verify_entry_session(token, key, entry_origin, None, now)?;
+        let public_only = public_entry_required(params)?;
+        let session =
+            self.verify_entry_session(token, key, entry_origin, None, public_only, now)?;
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 

@@ -383,10 +383,12 @@ fn entry_session_binding(shared: &Shared, proof: &Value, request_id: &str) -> Re
     let object = proof
         .as_object()
         .ok_or_else(|| Error::invalid("entry_session_required", "entry session is unavailable"))?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "token" | "key" | "origin" | "entry_origin"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "token" | "key" | "origin" | "entry_origin" | "public_only"
+        )
+    }) {
         return Err(Error::invalid(
             "entry_session_required",
             "entry session is unavailable",
@@ -420,6 +422,7 @@ fn entry_session_binding(shared: &Shared, proof: &Value, request_id: &str) -> Re
             key,
             entry_origin,
             Some(request_id),
+            super::operator_rpc::public_entry_required(proof)?,
             shared.operator_now(),
         )?
         .ok_or_else(|| {
@@ -775,13 +778,14 @@ fn request_response(shared: &Shared, request: &CredentialRequest, now_ms: i64) -
     json!({"request": row})
 }
 
-fn reveal_nonce(shared: &Shared, request_id: &str, proof: &Value, now_ms: i64) -> Result<Value> {
+fn reveal_nonce(shared: &Shared, request_id: &str, proof: &Value) -> Result<Value> {
     let binding = entry_session_binding(shared, proof, request_id)?;
     let request = shared
         .store
         .credential_request(request_id)?
         .ok_or_else(|| Error::invalid("request_changed", "credential request is unavailable"))?;
     let (context, context_digest) = entry_context(shared, &target_of_request(&request))?;
+    let now_ms = now_ms();
     let (nonce, request) = shared.store.issue_credential_nonce(
         request_id,
         &binding,
@@ -803,7 +807,6 @@ fn reveal_nonce(shared: &Shared, request_id: &str, proof: &Value, now_ms: i64) -
 fn submit(
     shared: &Arc<Shared>,
     params: &Value,
-    now_ms: i64,
     apply: impl FnOnce(&VerifiedHumanAttemptV1, &BoundedSecretInputV1) -> Result<Value>,
 ) -> Result<Value> {
     let proof = params
@@ -898,6 +901,7 @@ fn submit(
             ))
         }
     };
+    let now_ms = now_ms();
     let claimed = shared.store.claim_credential_attempt(
         &request_id,
         &nonce,
@@ -1138,9 +1142,9 @@ pub(crate) fn rpc_credential_entry(
             let proof = params.get("session").ok_or_else(|| {
                 Error::invalid("entry_session_required", "entry session is unavailable")
             })?;
-            reveal_nonce(shared, request_id, proof, now)
+            reveal_nonce(shared, request_id, proof)
         }
-        "credential_request_submit" => submit(shared, params, now, apply),
+        "credential_request_submit" => submit(shared, params, apply),
         "credential_request_cancel" => {
             let request_id = required_str(params, "request_id")?;
             if let Some(proof) = params.get("session") {
@@ -1164,6 +1168,7 @@ impl Shared {
         key: &str,
         entry_origin: &str,
         request_id: Option<&str>,
+        public_only: bool,
         now: i64,
     ) -> Result<Option<crate::operator_auth::SessionView>> {
         if self.protected_entry_origin() != Some(entry_origin) {
@@ -1175,10 +1180,14 @@ impl Shared {
         let Some((session, owner_hash)) = checked else {
             return Ok(None);
         };
-        if let Some(hash) = owner_hash {
-            if !self.entry_public_owner_is_current(&hash, session.account_id.as_deref())? {
+        match owner_hash {
+            Some(hash)
+                if !self.entry_public_owner_is_current(&hash, session.account_id.as_deref())? =>
+            {
                 return Ok(None);
             }
+            None if public_only => return Ok(None),
+            _ => {}
         }
         Ok(Some(session))
     }

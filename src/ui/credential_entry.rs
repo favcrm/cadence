@@ -78,10 +78,11 @@ pub(super) fn accepts_host(opts: &ServeOpts, host: &str) -> bool {
 pub(super) struct EntryOrigin {
     origin: String,
     host: String,
+    pub(super) public_only: bool,
 }
 
 impl EntryOrigin {
-    fn parse(raw: &str) -> Option<Self> {
+    fn parse(raw: &str, public_only: bool) -> Option<Self> {
         let rest = raw.strip_prefix("https://")?;
         if rest.is_empty()
             || rest.len() > 200
@@ -99,6 +100,7 @@ impl EntryOrigin {
         Some(Self {
             origin: format!("https://{rest}"),
             host,
+            public_only,
         })
     }
 
@@ -107,7 +109,10 @@ impl EntryOrigin {
     /// no credential form is served anywhere) or the profile named one that
     /// is also a board origin.
     pub(super) fn from_opts(opts: &ServeOpts) -> Option<Self> {
-        let entry = Self::parse(opts.credential_entry_origin.as_deref()?)?;
+        let entry = Self::parse(
+            opts.credential_entry_origin.as_deref()?,
+            opts.board_public_only,
+        )?;
         entry.separate_from_board(opts).then_some(entry)
     }
 
@@ -927,6 +932,7 @@ pub(super) fn authenticate(request: &mut Request, state: &Path, opts: &ServeOpts
         json!({
             "nonce": fields.nonce,
             "request_id": fields.request_id,
+            "public_only": opts.board_public_only,
         }),
     ) {
         Ok(value) => value,

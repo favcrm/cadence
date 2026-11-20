@@ -1348,10 +1348,12 @@ fn check_entry_session(
     state_dir: &std::path::Path,
     token: &str,
     key: &str,
-    entry_origin: &str,
+    entry: &super::credential_entry::EntryOrigin,
     budget: Option<&client::MetaBudget>,
 ) -> Result<Option<Value>, HttpResp> {
-    let params = json!({"token": token, "key": key, "entry_origin": entry_origin});
+    let params = json!({
+        "token": token, "key": key, "entry_origin": entry.origin(), "public_only": entry.public_only,
+    });
     let answered = match budget {
         Some(b) => b.read(state_dir, "credential_entry_session_check", params),
         None => client::rpc(state_dir, "credential_entry_session_check", params),
@@ -1523,7 +1525,7 @@ impl ReadAdmission {
                 check_session(state_dir, token, key, *origin, Some(&budget))
             }
             SessionScope::Entry(entry) => {
-                check_entry_session(state_dir, token, key, entry.origin(), Some(&budget))
+                check_entry_session(state_dir, token, key, entry, Some(&budget))
             }
         };
         match live {
@@ -1591,9 +1593,7 @@ pub(super) fn admit_read(
             if let Some(token) = entry_session_cookie(request, opts) {
                 let key = session_key(request);
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-                if check_entry_session(state_dir, &token, &key, entry.origin(), Some(&budget))?
-                    .is_some()
-                {
+                if check_entry_session(state_dir, &token, &key, entry, Some(&budget))?.is_some() {
                     return Ok(admission(
                         Some((token, key, SessionScope::Entry(entry.clone()))),
                         Some(Held::Operator),
@@ -2014,13 +2014,8 @@ pub(super) fn board_caller(
                 if write {
                     require_entry_origin(request, entry)?;
                 }
-                match check_entry_session(
-                    state_dir,
-                    &token,
-                    &session_key(request),
-                    entry.origin(),
-                    budget,
-                )? {
+                match check_entry_session(state_dir, &token, &session_key(request), entry, budget)?
+                {
                     Some(_) => (Some(Held::Operator), Some(token)),
                     None => (None, None),
                 }
@@ -2136,7 +2131,7 @@ pub(super) fn meta(
                     state_dir,
                     token,
                     &session_key(request),
-                    entry.origin(),
+                    &entry,
                     Some(budget),
                 )
                 .ok()
@@ -2254,6 +2249,7 @@ pub(super) fn credential_entry_session_proof(request: &Request, opts: &ServeOpts
         "key": session_key(request),
         "origin": Origin::Loopback.as_str(),
         "entry_origin": entry.origin(),
+        "public_only": entry.public_only,
     }))
 }
 

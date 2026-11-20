@@ -662,4 +662,53 @@ mod tests {
             .expect_err("the same public proof must fail after live demotion");
         assert_eq!(error.code(), Some("entry_session_required"));
     }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn cad2487_standalone_public_login_does_not_authorize_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::board_identity::write_config(
+            dir.path(),
+            &crate::board_identity::Config {
+                host: HOST.into(),
+                issuer: ISSUER.into(),
+                company: COMPANY.into(),
+            },
+        )
+        .unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let now = shared.operator_now();
+        let opened = shared
+            .operator_auth()
+            .open_public_bound(
+                BoardUser {
+                    sub: "standalone-owner".into(),
+                    email: "owner@example.test".into(),
+                    name: "Fixture owner".into(),
+                    role: "operator".into(),
+                    handle: "standalone-owner".into(),
+                },
+                "standalone-owner-jti",
+                now + 60,
+                "cad2487-fixture",
+                realm(),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            shared.current_public_session(&opened.token).unwrap(),
+            Authority::Granted {
+                role: Role::Operator,
+                ..
+            }
+        ));
+        let proof = json!({"token": opened.token, "key": "", "origin": "public"});
+        let error = super::super::credential_entry_rpc::management_session_binding(&shared, &proof)
+            .expect_err("a signed standalone session cannot prove current owner membership");
+        assert_eq!(error.code(), Some("capability_unavailable"));
+    }
 }
