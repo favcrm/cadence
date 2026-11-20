@@ -9,6 +9,7 @@ import { navItems, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
 import { IconAgents, IconApps, IconCaret, IconDocuments, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
+import { AppGlyph } from "../features/explorer/shared";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
 
@@ -157,6 +158,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
                           data-parent-current={here && app.current && app.sections ? "" : undefined}
                         >
+                          <AppGlyph name={app.kind ?? app.installId} title={app.title} size="xs" />
                           <span className="truncate">{app.title}</span>
                           {assistantUnread.has(app.installId) && (
                             <span className="navdot" role="img" aria-label={t("New assistant reply")} />

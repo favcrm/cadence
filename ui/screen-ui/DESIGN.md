@@ -40,8 +40,17 @@ fills; `--color-edge` for boundaries; `--color-accent` for focus and active
 states; and `--color-on-accent` for text on accent. Use the scrim token for
 overlays. Reserve blue for ongoing work and green for completion in status
 badges; retain text labels so color is not the only cue. The brand mark does not
-set the control palette. Theme selection supports explicit
-`data-theme="light"` / `"dark"` and a system fallback.
+set the control palette. Theme selection supports explicit `data-theme="light"` / `"dark"` and a system
+fallback.
+
+**Keep page canvases and tab bars transparent.** App screens sit directly on the
+host board's background (`cadence-kit` sets `html, body { background: transparent; }`).
+Do not paint an opaque background color on `html`, `body`, the root page
+container, or top tab bars — including re-applying `var(--color-ink-950)` or
+hardcoded hex values — because an opaque app canvas or filled tab-bar stripe
+clashes with the board whenever the host theme updates. Apply surface fills
+(`--color-ink-850`, `--color-ink-875`, `--color-ink-800`) only to discrete
+components (cards, tables, inputs, popovers, drawers).
 
 Use `--font-sans` (IBM Plex Sans with system fallbacks), and `.num` /
 `--font-mono` (IBM Plex Mono) for tabular numbers. Use the existing type scale:

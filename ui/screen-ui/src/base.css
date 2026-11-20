@@ -1,7 +1,12 @@
 @import "./foundation.css";
 
+/* App screens inherit the host board backdrop; keep the frame canvas transparent
+   so embedded apps never paint a mismatched box over the workspace theme. */
+html,
 body {
-  background: var(--color-ink-950);
+  background: transparent;
+}
+body {
   color: var(--color-ink-300);
   font-family: var(--font-sans);
   font-size: var(--text-body);

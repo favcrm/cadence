@@ -3418,6 +3418,23 @@ const CAD2316_ZHTW: Record<string, string> = {
   "Template name is required.": "必須填寫範本名稱。",
   "Tax and discount bps must be non-negative integers.": "稅率及折扣基點必須為非負整數。",
   "Couldn’t save template.": "無法儲存範本。",
+  "Launch installed workspace apps, pin daily tools, or manage permissions.": "開啟已安裝的工作區應用程式、釘選常用工具，或管理權限。",
+  "Filter apps": "篩選應用程式",
+  "Layout": "版面配置",
+  "List view": "清單檢視",
+  "Pin any app with ★ or Choose favorites to keep everyday tools here and in the sidebar.": "點擊任一應用程式的 ★ 或使用「選擇常用」，即可將常用工具固定於此與側邊欄。",
+  "No installed apps match the current filter.": "沒有符合目前篩選條件的已安裝應用程式。",
+  "Inspect the requested package and its workspace access before approving.": "核准前請檢視所要求的套件與工作區權限。",
+  "Private apps stay in this workspace and never appear in the public directory.": "私人應用程式僅留在此工作區，不會出現在公開目錄。",
+  "Local Cadence app kit bundle, up to 8 MiB.": "本機 Cadence app kit 套件，上限 8 MiB。",
+  "Tagged public release .zip with SHA-256 checksum.": "含 SHA-256 校驗碼的公開 GitHub Release .zip。",
+  "Drop your .zip package here, or click to browse": "將 .zip 套件拖曳至此，或點擊選擇檔案",
+  "Max 8 MiB": "上限 8 MiB",
+  "Compatible": "相容",
+  "Incompatible": "不相容",
+  "Connections": "連線",
+  "Capabilities": "能力",
+  "Screens": "畫面",
 };
 for (const [key, value] of Object.entries(CAD2316_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;

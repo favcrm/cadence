@@ -5,11 +5,17 @@ import { useTranslate } from "../../lib/locale";
 
 export function WorkspaceDialog({
   title,
+  subtitle,
+  badge,
+  footer,
   onClose,
   className,
   children,
 }: {
   title: string;
+  subtitle?: string;
+  badge?: string;
+  footer?: ReactNode;
   className?: string;
   onClose: () => void;
   children: ReactNode;
@@ -21,6 +27,9 @@ export function WorkspaceDialog({
     if (!dialog) return;
     const previous = document.activeElement;
     dialog.showModal();
+    // Move initial focus to the dialog container itself rather than flashing
+    // a focus ring onto the Close button on open.
+    dialog.focus({ preventScroll: true });
     return () => {
       dialog.close();
       if (previous instanceof HTMLElement) previous.focus();
@@ -29,6 +38,7 @@ export function WorkspaceDialog({
   return (
     <dialog
       ref={panel}
+      tabIndex={-1}
       className={className ? `wa-dialog ${className}` : "wa-dialog"}
       aria-label={title}
       onCancel={(event) => {
@@ -49,8 +59,15 @@ export function WorkspaceDialog({
       }}
     >
       <header className="wa-dialog-head">
-        <h2>{title}</h2>
+        <div className="wa-dialog-title-wrap">
+          <div className="wa-dialog-title-row">
+            <h2>{title}</h2>
+            {badge && <span className="chip wa-dialog-badge">{badge}</span>}
+          </div>
+          {subtitle && <p className="wa-dialog-sub">{subtitle}</p>}
+        </div>
         <Button
+          className="btn-ghost wa-dialog-close"
           icon={<IconClose />}
           aria-label={t("Close {title}").replace("{title}", () => title)}
           onClick={onClose}
@@ -59,6 +76,7 @@ export function WorkspaceDialog({
         </Button>
       </header>
       <div className="wa-dialog-body">{children}</div>
+      {footer && <footer className="wa-dialog-foot">{footer}</footer>}
     </dialog>
   );
 }
