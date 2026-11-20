@@ -514,3 +514,78 @@ fn sanitize_hint_label(label: &str) -> String {
         .take(80)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{delivery_envelope, thread_refs, visual_delivery_bytes};
+    use crate::store::Message;
+    use serde_json::{json, Value};
+
+    fn sample_message() -> Message {
+        Message {
+            seq: 1,
+            id: "msg-1".into(),
+            alias: "dev".into(),
+            body: "hello".into(),
+            reply_to: None,
+            source: "cli".into(),
+            state: "queued".into(),
+            turn_id: None,
+            result: None,
+            error: None,
+            task_id: None,
+            issue: None,
+            worktree: None,
+            priority: crate::store::Priority::Normal,
+            created: 0.0,
+            started: None,
+            completed: None,
+            stall_secs: None,
+            sender_uid: None,
+            sender: None,
+            recipient_uid: Some("uid-dev".into()),
+            recipient: Some("dev".into()),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn thread_refs_normalizes_valid_entries_and_refuses_extra_fields() {
+        let ok = thread_refs(&json!([{"kind": "issue", "id": "CAD-2488"}])).unwrap();
+        assert_eq!(ok, json!([{"kind": "issue", "id": "CAD-2488"}]));
+        assert!(thread_refs(&json!([])).is_err());
+        assert!(thread_refs(&json!([{"kind": "issue", "id": "1", "extra": true}])).is_err());
+        assert!(thread_refs(&json!([{"kind": "bad kind!", "id": "1"}])).is_err());
+    }
+
+    #[test]
+    fn delivery_envelope_wraps_peer_and_unattributed_only() {
+        let mut peer = sample_message();
+        peer.sender = Some("pm".into());
+        peer.sender_uid = Some("uid-pm".into());
+        let wrapped: Value =
+            serde_json::from_str(&delivery_envelope(&peer, "managed").unwrap()).unwrap();
+        assert_eq!(wrapped["kind"], "peer_message");
+        assert_eq!(wrapped["sender_uid"], "uid-pm");
+        assert_eq!(wrapped["content"], "hello");
+
+        let unattributed = sample_message();
+        let wrapped: Value =
+            serde_json::from_str(&delivery_envelope(&unattributed, "managed").unwrap()).unwrap();
+        assert_eq!(wrapped["kind"], "unattributed_message");
+
+        let mut operator = sample_message();
+        operator.sender = Some("operator".into());
+        assert!(delivery_envelope(&operator, "managed").is_none());
+        assert!(delivery_envelope(&peer, "pty").is_none());
+    }
+
+    #[test]
+    fn visual_delivery_bytes_counts_rasters_and_refuses_invalid_svg() {
+        assert_eq!(
+            visual_delivery_bytes("image/png", &[1, 2, 3, 4]).unwrap(),
+            4
+        );
+        assert!(visual_delivery_bytes("image/svg+xml", b"not svg").is_err());
+    }
+}
