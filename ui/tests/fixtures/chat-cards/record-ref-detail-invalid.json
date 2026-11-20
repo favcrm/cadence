@@ -1,0 +1,1251 @@
+[
+  {
+    "case": "two items",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          },
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "no items",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "no body role",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "no title role",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "no roles",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "role names a missing field",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "nope",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "body not a string",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": [
+              "x"
+            ],
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "body over 20000",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "21 attachments",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf",
+              "a.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "attachment name over 200",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  {
+    "case": "unknown payload key",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "detail",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false,
+        "url": "https://example.test/x"
+      }
+    }
+  },
+  {
+    "case": "unknown view",
+    "entry": {
+      "role": "agent",
+      "kind": "record_ref",
+      "text": "Gmail \u00b7 Re: Invoice INV-0140",
+      "payload": {
+        "v": 1,
+        "toolkit": "gmail",
+        "tool": "gmail_fetch_message_by_thread_id",
+        "tool_label": "Gmail: read email",
+        "toolkit_label": "Gmail",
+        "account": "ops@example.test",
+        "view": "email",
+        "roles": {
+          "title": "subject",
+          "actor": "from",
+          "to": "to",
+          "cc": "cc",
+          "time": "date",
+          "body": "body_text",
+          "attachments": "attachment_names",
+          "labels": {
+            "IMPORTANT": "\u2605",
+            "UNREAD": null
+          },
+          "unread": {
+            "key": "label_ids",
+            "values": [
+              "UNREAD"
+            ]
+          }
+        },
+        "items": [
+          {
+            "subject": "Re: Invoice INV-0140",
+            "from": "Mei Chan <mei@harbour.example>",
+            "to": "ops@example.test",
+            "cc": "",
+            "date": "2026-11-18T09:41:00Z",
+            "body_text": "Hi Chris,\n\nThanks for the invoice. Could you confirm the PO number?\n\nBest,\nMei",
+            "attachment_names": [
+              "INV-0140.pdf"
+            ],
+            "label_ids": [
+              "IMPORTANT",
+              "UNREAD"
+            ]
+          }
+        ],
+        "fields": [
+          {
+            "key": "subject",
+            "label": "Subject",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "from",
+            "label": "From",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "to",
+            "label": "To",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "cc",
+            "label": "Cc",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "date",
+            "label": "Date",
+            "type": "string",
+            "untrusted": false
+          },
+          {
+            "key": "body_text",
+            "label": "Body",
+            "type": "string",
+            "untrusted": true
+          },
+          {
+            "key": "attachment_names",
+            "label": "Attachments",
+            "type": "string_array",
+            "untrusted": true
+          },
+          {
+            "key": "label_ids",
+            "label": "Labels",
+            "type": "string_array",
+            "untrusted": false
+          }
+        ],
+        "truncated": false
+      }
+    }
+  }
+]

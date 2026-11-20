@@ -5,7 +5,7 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
-import { HOME_VIEW_SCOPE, parseViewRef, viewCardAppView, viewHere, type ViewScope } from "../home/chatCards";
+import { HOME_VIEW_SCOPE, parseViewRef, recordCardView, viewCardAppView, viewHere, type ViewScope } from "../home/chatCards";
 import { isArtifactPutCall, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
@@ -13,6 +13,7 @@ import {
   type ArtifactKind,
   type ArtifactRef,
   type FeedCard,
+  type FeedRecord,
   type FeedView,
   type Surface,
   type Working,
@@ -47,6 +48,7 @@ function putTargets(text: string): string[] {
 export interface FeedParts {
   cards: FeedCard[];
   views: FeedView[];
+  records: FeedRecord[];
   working: Working | null;
   turn: string | null;
 }
@@ -71,7 +73,14 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
   });
   const cards: FeedCard[] = [];
   const views: FeedView[] = [];
+  const records: FeedRecord[] = [];
   for (const item of items) {
+    if (item.type === "record") {
+      const ref = recordCardView(item.entry);
+      const message = item.entry.message ?? null;
+      if (ref) records.push({ key: `record:${item.key}`, ref, live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      continue;
+    }
     if (item.type === "view") {
       const model = parseViewRef(item.entry);
       const ref = model && viewCardAppView(model, viewScope);
@@ -108,7 +117,7 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
     }
     working = { turn, updating: [...updating] };
   }
-  return { cards, views, working, turn };
+  return { cards, views, records, working, turn };
 }
 
 /** The highest stored seq among the items — the mount watermark. */
