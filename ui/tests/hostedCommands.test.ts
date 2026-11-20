@@ -1,4 +1,6 @@
 /** CAD-2027: a hosted board offers only what it can run, and says so plainly. */
+import type * as Navigation from "../screen-ui/src/navigation";
+import type * as HostNavigation from "../src/ui/hostNavigation";
 import { streamFixture } from "./streamFixture";
 import type * as HappyDOM from "happy-dom";
 import type * as ReactModule from "react";
@@ -28,6 +30,8 @@ const React = require<typeof ReactModule>("react");
 const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
+const { NavigationProvider } = require<typeof Navigation>("../screen-ui/src/navigation");
+const { hostNavigation } = require<typeof HostNavigation>("../src/ui/hostNavigation");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { AssistantAboutButton, AssistantActorProvider, useConversationActor } = require<typeof Identity>("../src/features/assistant/AssistantIdentity");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
@@ -69,11 +73,12 @@ async function main() {
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };
   const mount = async (hosted: boolean, operator?: boolean) => {
     await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
-        readOnly: false, hosted, operator, overview: resources.overview.get(),
-        onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-        permissionsHref: "/permissions", resolveAppPath: () => null,
-      })));
+      root.render(React.createElement(LocaleProvider, null,
+        React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(Home, {
+          readOnly: false, hosted, operator, overview: resources.overview.get(),
+          onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+          permissionsHref: "/permissions", resolveAppPath: () => null,
+        }) })));
     });
     await settle();
     await React.act(async () => {
@@ -109,8 +114,8 @@ async function main() {
   await settle();
   assert(document.body.querySelector("[data-assistant-model]")?.textContent?.includes("deepseek/flash"), "About shows the model");
   assert(document.querySelector('.assistant-about[data-identity-state="ready"]'), "the identity fixture is ready");
-  assert(document.querySelector('.assistant-about a[href="/agents/master?tab=instructions"]') === null,
-    "a tenant response missing its actor projection never links to Master");
+  assert(!document.querySelector(".assistant-about")?.textContent?.includes("View assistant profile"),
+    "a tenant response missing its actor projection never offers a profile link");
   await React.act(async () => {
     document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
   });
