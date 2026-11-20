@@ -129,6 +129,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "agent_instructions_set",
         Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),
     ),
+    (
+        "agent_skills_set",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-2092)"),
+    ),
+    (
+        "agent_tools_set",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-2092)"),
+    ),
     ("model_defaults_get", Rule::Read),
     (
         "model_defaults_set",

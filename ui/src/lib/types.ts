@@ -892,6 +892,47 @@ export interface ThreadRef {
   id: string;
 }
 
+/** CAD-2092: one bundled skill on a native agent detail payload. */
+export interface NativeSkillItem {
+  name: string;
+  line: string;
+  source: string;
+  bundled: boolean;
+  required: boolean;
+  enabled: boolean;
+  /** Strictly from live runtime evidence; null when the runtime did not report. */
+  loaded: boolean | null;
+  applies: "next_launch" | "immediate";
+  skill_md: string;
+  files: string[];
+}
+
+/** CAD-2092: one built-in runtime tool on a native agent detail payload. */
+export interface NativeToolItem {
+  name: string;
+  line: string;
+  description: string;
+  source: string;
+  bundled: boolean;
+  required: boolean;
+  enabled: boolean;
+  applies: "next_launch" | "immediate";
+}
+
+export interface AgentSkillsResult {
+  alias: string;
+  state: string;
+  applies: string;
+  skills: string[];
+}
+
+export interface AgentToolsResult {
+  alias: string;
+  state: string;
+  applies: string;
+  disabled_tools: string[];
+}
+
 /** GET /api/agents/<alias> — the drawer detail. */
 export interface AgentDetail {
   agent: {
@@ -931,6 +972,8 @@ export interface AgentDetail {
     /** The stored job, when the board serves it. */
     instructions?: string | null;
     team_role?: string | null;
+    /** CAD-2092: runtime-reported loaded skill names for the live session only. */
+    loaded_skills?: string[] | null;
   };
   queued: number;
   unknown: number;
@@ -943,6 +986,10 @@ export interface AgentDetail {
     prs_merged: number | null;
     drafts_sent: number | null;
   } | null;
+  /** CAD-2092: native bundled skills with per-agent toggle and runtime evidence. */
+  native_skills?: NativeSkillItem[] | null;
+  /** CAD-2092: native built-in runtime tools with per-agent toggle. */
+  native_tools?: NativeToolItem[] | null;
   running: {
     id: string;
     task?: string;

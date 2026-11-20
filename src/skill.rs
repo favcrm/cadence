@@ -167,6 +167,8 @@ const CADENCE_APP_DEV: BundledSkill = BundledSkill {
     ],
 };
 
+pub const REQUIRED_SKILL: &str = CADENCE.name;
+
 pub const SKILL_NAMES: [&str; 7] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
@@ -176,6 +178,182 @@ pub const SKILL_NAMES: [&str; 7] = [
     DELIVERABLE_QA.name,
     CADENCE_APP_DEV.name,
 ];
+
+/// Short one-line description for each bundled skill, matching the agent page UI.
+pub fn bundled_line(name: &str) -> &'static str {
+    match name {
+        "cadence" => "Tickets, threads and reports",
+        "business-documents" => "Document intake, templates and pricing checks",
+        "company-outputs" => "Quotes, invoices, proposals and reports",
+        "website-builder" => "Build and publish a static website",
+        "incident-response" => "Contain and close out incidents across teams",
+        "deliverable-qa" => "Independent browser and visual QA before release",
+        "cadence-app-dev" => "Build, audit and package sandboxed Cadence apps",
+        _ => "Bundled skill",
+    }
+}
+
+fn bundle_by_name(name: &str) -> Option<&'static BundledSkill> {
+    match name {
+        "cadence" => Some(&CADENCE),
+        "business-documents" => Some(&BUSINESS_DOCUMENTS),
+        "company-outputs" => Some(&COMPANY_OUTPUTS),
+        "website-builder" => Some(&WEBSITE_BUILDER),
+        "incident-response" => Some(&INCIDENT_RESPONSE),
+        "deliverable-qa" => Some(&DELIVERABLE_QA),
+        "cadence-app-dev" => Some(&CADENCE_APP_DEV),
+        _ => None,
+    }
+}
+
+/// CAD-2092: validate a per-agent `params.skills` allowlist.
+/// Every entry must be a known bundled skill, and the required `cadence`
+/// skill cannot be turned off.
+pub fn validate_skill_selection(names: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if bundle_by_name(name).is_none() {
+            return Err(Error::rejected(format!(
+                "unknown bundled skill {name:?}; expected {}",
+                SKILL_NAMES.join(", ")
+            )));
+        }
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    if !out.iter().any(|n| n == REQUIRED_SKILL) {
+        return Err(Error::rejected(format!(
+            "required skill '{REQUIRED_SKILL}' cannot be turned off"
+        )));
+    }
+    Ok(out)
+}
+
+/// CAD-2092: parse a JSON `params.skills` value into a validated skill list.
+pub fn validate_skills_param(value: &Value) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("'skills' must be an array of bundled skill names"))?;
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(Error::rejected("'skills' entries must be strings"));
+        };
+        names.push(name.to_string());
+    }
+    validate_skill_selection(&names)
+}
+
+/// CAD-2092: bundled skill catalog including exact `SKILL.md` bytes and file list
+/// so the agent page drawer shows what the agent sees.
+pub fn bundled_catalog() -> Vec<Value> {
+    SKILL_NAMES
+        .iter()
+        .filter_map(|&name| {
+            let bundle = bundle_by_name(name)?;
+            let skill_md = bundle
+                .files
+                .iter()
+                .find(|(rel, _)| *rel == "SKILL.md")
+                .map(|(_, body)| *body)
+                .unwrap_or("");
+            let files: Vec<&str> = bundle.files.iter().map(|(rel, _)| *rel).collect();
+            Some(json!({
+                "name": bundle.name,
+                "line": bundled_line(bundle.name),
+                "source": "bundled",
+                "bundled": true,
+                "required": bundle.name == REQUIRED_SKILL,
+                "skill_md": skill_md,
+                "files": files,
+            }))
+        })
+        .collect()
+}
+
+/// CAD-2092: stage ONLY the selected bundled skills into an agent's private
+/// directory (`<state_dir>/agents/<alias>/skills/<name>`), removing any
+/// previously staged unselected skill directories. Never touches `$HOME`.
+pub fn stage_agent_skills(
+    state_dir: &Path,
+    alias: &str,
+    selected: &[String],
+) -> Result<Vec<(String, PathBuf)>> {
+    crate::proto::identifier(alias, "agent alias")?;
+    let validated = validate_skill_selection(selected)?;
+    let agent_dir = state_dir.join("agents").join(alias);
+    let root = agent_dir.join("skills");
+    if root
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(Error::rejected(format!(
+            "refusing to stage skills into symlink {}",
+            root.display()
+        )));
+    }
+    std::fs::create_dir_all(&root)
+        .map_err(|e| Error::provider(format!("create {}: {e}", root.display())))?;
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let keep = name
+                .to_str()
+                .is_some_and(|s| validated.iter().any(|want| want == s));
+            if !keep {
+                let path = entry.path();
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_dir())
+                {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    let mut staged = Vec::with_capacity(validated.len());
+    for name in validated {
+        let bundle = bundle_by_name(&name).expect("validated skill exists");
+        let dir = root.join(&name);
+        if dir
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(Error::rejected(format!(
+                "refusing to write staged skill symlink {}",
+                dir.display()
+            )));
+        }
+        for (relative, content) in bundle.files {
+            let file = dir.join(relative);
+            if file
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(Error::rejected(format!(
+                    "refusing to write staged skill file symlink {}",
+                    file.display()
+                )));
+            }
+            let stale = std::fs::read(&file)
+                .map(|bytes| bytes != content.as_bytes())
+                .unwrap_or(true);
+            if stale {
+                let parent = file.parent().expect("bundled file has a parent");
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::provider(format!("create {}: {e}", parent.display())))?;
+                std::fs::write(&file, content)
+                    .map_err(|e| Error::provider(format!("write {}: {e}", file.display())))?;
+            }
+        }
+        staged.push((name, dir));
+    }
+    Ok(staged)
+}
 
 /// Provider skill directories that receive links to each selected bundle.
 const LINK_PARENTS: [&str; 4] = [
@@ -1051,5 +1229,42 @@ mod tests {
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }
+    }
+
+    #[test]
+    fn cad2092_stage_agent_skills_exposes_only_selected_and_enforces_required() {
+        let state = tempfile::tempdir().unwrap();
+        // Turning off required `cadence` is refused.
+        let err = stage_agent_skills(state.path(), "worker-1", &["deliverable-qa".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("required skill 'cadence'"));
+
+        // Unknown / path-traversal names are refused.
+        assert!(stage_agent_skills(
+            state.path(),
+            "worker-1",
+            &["cadence".to_string(), "../escape".to_string()],
+        )
+        .is_err());
+
+        // Stage two skills: only those two exist under agents/worker-1/skills.
+        let first = stage_agent_skills(
+            state.path(),
+            "worker-1",
+            &["cadence".to_string(), "deliverable-qa".to_string()],
+        )
+        .unwrap();
+        assert_eq!(first.len(), 2);
+        let root = state.path().join("agents/worker-1/skills");
+        assert!(root.join("cadence/SKILL.md").is_file());
+        assert!(root.join("deliverable-qa/SKILL.md").is_file());
+        assert!(!root.join("website-builder").exists());
+
+        // Narrowing selection prunes previously staged unselected skills.
+        let second =
+            stage_agent_skills(state.path(), "worker-1", &["cadence".to_string()]).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(root.join("cadence/SKILL.md").is_file());
+        assert!(!root.join("deliverable-qa").exists());
     }
 }

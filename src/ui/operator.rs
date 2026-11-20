@@ -528,6 +528,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/agents/*/instructions",
         RouteClass::OperatorOnly,
     ),
+    route("POST", "/api/agents/*/skills", RouteClass::OperatorOnly),
+    route("POST", "/api/agents/*/tools", RouteClass::OperatorOnly),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
     // the same way; listed so a reader sees they are the operator's.
     route("POST", "/api/issues/*/lane/ask", RouteClass::OperatorOnly),
@@ -3515,6 +3517,165 @@ mod tests {
                 "{what} must admit the board owner's role, refused {}",
                 refusal.status_code().0
             ),
+        }
+    }
+
+    /// CAD-2092 independent HTTP peer acceptance. Authored from the ticket, not
+    /// the implementation (AGENTS.md "Gates and security work"): the HTTP peer
+    /// must be at least as strict as the daemon RPCs (`agent_skills_set` and
+    /// `agent_tools_set`). Both routes are explicitly declared `OperatorOnly`
+    /// alongside `/api/agents/*/instructions`, refuse an agent caller and a
+    /// non-operator member at `admit_operator_class`, admit the owner positive
+    /// control, and reject extra/malformed body fields before relaying to the
+    /// daemon.
+    #[test]
+    fn agent_skills_and_tools_routes_are_operator_only_and_reject_extra_fields() {
+        use std::io::Read;
+
+        let read_json = |resp: HttpResp| -> (u16, Value) {
+            let status = resp.status_code().0;
+            let mut body = String::new();
+            resp.into_reader()
+                .read_to_string(&mut body)
+                .expect("HTTP response carries a readable body");
+            let parsed: Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("expected JSON response, got {body:?}: {e}"));
+            (status, parsed)
+        };
+
+        let request: Request = tiny_http::TestRequest::new().into();
+        let state_dir = std::path::Path::new("/nonexistent/cad-2092");
+        let opts = ServeOpts::default();
+        let signed_in = |operator: bool| {
+            Caller::Named(Named {
+                actor: "Fable Chen <fable@example.com> (board)".into(),
+                author: "usr_fable".into(),
+                sub: "sub_fable".into(),
+                operator,
+            })
+        };
+
+        // 1. Explicit OperatorOnly classification matching `/instructions`, and
+        //    admission refuses agent and non-operator member callers while
+        //    admitting the owner positive control.
+        for path in [
+            "/api/agents/worker/instructions",
+            "/api/agents/worker/skills",
+            "/api/agents/worker/tools",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "POST {path} must be OperatorOnly"
+            );
+            assert!(
+                WRITE_ROUTES.iter().any(|r| r.method == "POST"
+                    && r.class == RouteClass::OperatorOnly
+                    && matches(r.pattern, path)),
+                "POST {path} must be explicitly listed in WRITE_ROUTES as OperatorOnly"
+            );
+            for method in ["PUT", "PATCH", "DELETE"] {
+                assert_eq!(
+                    route_class(method, path),
+                    RouteClass::OperatorOnly,
+                    "{method} {path} must stay OperatorOnly"
+                );
+            }
+
+            let what = format!("POST {path}");
+
+            let agent_refused = admit_operator_class(
+                &request,
+                state_dir,
+                &opts,
+                &Caller::Agent("worker".into()),
+                &what,
+            )
+            .expect_err("an agent caller must be refused on operator-only agent config routes");
+            let (status, body) = read_json(agent_refused);
+            assert_eq!(status, 403, "{what} must refuse an agent caller with 403");
+            assert_eq!(
+                body["check"], "operator_only",
+                "{what} must refuse an agent caller on operator_only, got {body}"
+            );
+
+            let member_refused =
+                admit_operator_class(&request, state_dir, &opts, &signed_in(false), &what)
+                    .expect_err("a non-operator member must be refused on agent config routes");
+            let (status, body) = read_json(member_refused);
+            assert_eq!(status, 403, "{what} must refuse a member caller with 403");
+            assert_eq!(
+                body["check"], "member_role",
+                "{what} must refuse a member caller on member_role, got {body}"
+            );
+
+            // Positive control: the board owner passes the same gate.
+            match admit_operator_class(&request, state_dir, &opts, &signed_in(true), &what) {
+                Ok(()) => {}
+                Err(refusal) => panic!(
+                    "{what} must admit the board owner's role, refused {}",
+                    refusal.status_code().0
+                ),
+            }
+        }
+
+        // 2. Route matching and strict body rejection before the daemon relay:
+        //    unknown/forged extra fields and non-string/missing arrays return
+        //    400 directly from `agent_action`.
+        assert_eq!(
+            crate::ui::home::agent_action_route("/api/agents/worker/skills"),
+            Some(("worker", "skills"))
+        );
+        assert_eq!(
+            crate::ui::home::agent_action_route("/api/agents/worker/tools"),
+            Some(("worker", "tools"))
+        );
+
+        let post_action = |path: &'static str, verb: &str, raw: &'static str| -> (u16, Value) {
+            let mut req: Request = tiny_http::TestRequest::new()
+                .with_method(tiny_http::Method::Post)
+                .with_path(path)
+                .with_body(raw)
+                .into();
+            read_json(crate::ui::home::agent_action(
+                &mut req, state_dir, "worker", verb,
+            ))
+        };
+
+        for (raw, expected_fragment) in [
+            (r#"{"skills":["cadence"],"by":"operator"}"#, "by"),
+            (r#"{"skills":["cadence"],"extra":true}"#, "extra"),
+            (r#"{}"#, "skills"),
+            (r#"{"skills":["cadence",42]}"#, "strings"),
+        ] {
+            let (status, body) = post_action("/api/agents/worker/skills", "skills", raw);
+            assert_eq!(
+                status, 400,
+                "skills body {raw} must be rejected with 400, got {status} {body}"
+            );
+            let err = body["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains(expected_fragment),
+                "skills error for {raw} should mention {expected_fragment:?}, got {err:?}"
+            );
+        }
+
+        for (raw, expected_fragment) in [
+            (r#"{"disabled_tools":["bash"],"actor":"operator"}"#, "actor"),
+            (r#"{"disabled_tools":["bash"],"extra":1}"#, "extra"),
+            (r#"{}"#, "tools"),
+            (r#"{"disabled_tools":["bash",1]}"#, "strings"),
+        ] {
+            let (status, body) = post_action("/api/agents/worker/tools", "tools", raw);
+            assert_eq!(
+                status, 400,
+                "tools body {raw} must be rejected with 400, got {status} {body}"
+            );
+            let err = body["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains(expected_fragment),
+                "tools error for {raw} should mention {expected_fragment:?}, got {err:?}"
+            );
         }
     }
 }

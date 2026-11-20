@@ -241,6 +241,22 @@ fn build_command_for(
     for tool in allowed {
         cmd.extend(["--allowedTools".to_string(), tool]);
     }
+    if let Some(disabled) = params
+        .get("disabled_tools")
+        .filter(|v| !v.is_null())
+        .and_then(|v| {
+            crate::adapter::registry::validate_disabled_tools_param(
+                &agent.provider,
+                &agent.endpoint_kind,
+                v,
+            )
+            .ok()
+        })
+    {
+        for tool in disabled {
+            cmd.extend(["--disallowedTools".to_string(), tool]);
+        }
+    }
     if let Some(config) = mcp_config {
         cmd.extend([
             "--mcp-config".to_string(),
@@ -721,6 +737,15 @@ impl Shared {
         // recorded as the agent's reported model.
         if let Some(model) = event.get("model").and_then(Value::as_str) {
             self.emit("cadence/claude_init", &json!({"model": model}));
+        }
+        if let Some(skills) = event.get("skills").and_then(Value::as_array) {
+            let loaded: Vec<String> = skills
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            self.emit("cadence/skills_loaded", &json!({ "skills": loaded }));
         }
         let observed = event.get("session_id").and_then(Value::as_str);
         let expected = self.expected_session.lock().unwrap().clone();

@@ -320,6 +320,8 @@ pub static SPECS: &[EndpointSpec] = &[
             "effort",
             "permission_mode",
             "allowed_tools",
+            "skills",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "broker_approvals",
@@ -372,6 +374,8 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_params: &[
             "model",
             "effort",
+            "skills",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "session",
@@ -419,6 +423,8 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_params: &[
             "model",
             "effort",
+            "skills",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "session",
@@ -1359,6 +1365,8 @@ pub const TRUST_BEARING_PARAMS: &[&str] = &[
     "bypass",
     "bypass_approval",
     "allowed_tools",
+    "skills",
+    "disabled_tools",
     "broker_approvals",
     "permission_timeout_secs",
     "secret_ids",
@@ -1922,7 +1930,172 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             ));
         }
     }
+    if let Some(v) = params.get("skills") {
+        if !v.is_null() {
+            crate::skill::validate_skills_param(v)?;
+        }
+    }
+    if let Some(v) = params.get("disabled_tools") {
+        if !v.is_null() {
+            validate_disabled_tools_param(provider, kind, v)?;
+        }
+    }
     Ok(())
+}
+
+/// CAD-2092: required built-in tool present on every Cadence agent.
+pub const REQUIRED_TOOL: &str = "cadence";
+
+/// One built-in tool exposed by a native provider's managed runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeToolSpec {
+    pub name: &'static str,
+    pub line: &'static str,
+    pub required: bool,
+}
+
+const fn built_in_tool(name: &'static str, line: &'static str, required: bool) -> NativeToolSpec {
+    NativeToolSpec {
+        name,
+        line,
+        required,
+    }
+}
+
+const CADENCE_TOOL: NativeToolSpec =
+    built_in_tool(REQUIRED_TOOL, "Tickets, threads and reports", true);
+const PI_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("read", "Read files in the workspace", false),
+    built_in_tool("bash", "Run shell commands", false),
+    built_in_tool("edit", "Edit existing files", false),
+    built_in_tool("write", "Create or overwrite files", false),
+    built_in_tool("grep", "Search file contents", false),
+    built_in_tool("find", "Find files by name", false),
+    built_in_tool("ls", "List directory entries", false),
+];
+const OMP_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("read", "Read files in the workspace", false),
+    built_in_tool("bash", "Run shell commands", false),
+    built_in_tool("edit", "Edit existing files", false),
+    built_in_tool("write", "Create or overwrite files", false),
+    built_in_tool("grep", "Search file contents", false),
+    built_in_tool("glob", "Find files by pattern", false),
+];
+const CLAUDE_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("Read", "Read files in the workspace", false),
+    built_in_tool("Edit", "Edit existing files", false),
+    built_in_tool("Write", "Create or overwrite files", false),
+    built_in_tool("Bash", "Run shell commands", false),
+    built_in_tool("Glob", "Find files by pattern", false),
+    built_in_tool("Grep", "Search file contents", false),
+    built_in_tool("WebFetch", "Fetch web pages", false),
+    built_in_tool("WebSearch", "Search the web", false),
+];
+const DEFAULT_BUILT_IN_TOOLS: &[NativeToolSpec] = &[CADENCE_TOOL];
+
+/// CAD-2092: built-in tools this provider's managed runtime enforces at launch.
+pub fn native_tool_catalog(provider: &str, kind: &str) -> &'static [NativeToolSpec] {
+    match (provider, kind) {
+        ("pi", "managed") => PI_BUILT_IN_TOOLS,
+        ("omp", "managed") => OMP_BUILT_IN_TOOLS,
+        ("claude", "managed") => CLAUDE_BUILT_IN_TOOLS,
+        _ => DEFAULT_BUILT_IN_TOOLS,
+    }
+}
+
+/// CAD-2092: validate `params.disabled_tools` against the provider's allowlist.
+/// The required `cadence` tool can never be disabled.
+pub fn validate_disabled_tools(
+    provider: &str,
+    kind: &str,
+    disabled: &[String],
+) -> Result<Vec<String>> {
+    let catalog = native_tool_catalog(provider, kind);
+    let mut out = Vec::with_capacity(disabled.len());
+    for name in disabled {
+        if name == REQUIRED_TOOL {
+            return Err(Error::rejected(format!(
+                "required tool '{REQUIRED_TOOL}' cannot be turned off"
+            )));
+        }
+        let Some(spec) = catalog.iter().find(|t| t.name == name) else {
+            let toggleable: Vec<&str> = catalog
+                .iter()
+                .filter(|t| !t.required)
+                .map(|t| t.name)
+                .collect();
+            return Err(Error::rejected(format!(
+                "unknown or non-toggleable tool {name:?} for {provider}/{kind}; toggleable: {}",
+                if toggleable.is_empty() {
+                    "none".to_string()
+                } else {
+                    toggleable.join(", ")
+                }
+            )));
+        };
+        if spec.required {
+            return Err(Error::rejected(format!(
+                "required tool '{}' cannot be turned off",
+                spec.name
+            )));
+        }
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// CAD-2092: parse and validate a JSON `params.disabled_tools` value.
+pub fn validate_disabled_tools_param(
+    provider: &str,
+    kind: &str,
+    value: &Value,
+) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("'disabled_tools' must be an array of tool names"))?;
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(Error::rejected("'disabled_tools' entries must be strings"));
+        };
+        names.push(name.to_string());
+    }
+    validate_disabled_tools(provider, kind, &names)
+}
+
+/// CAD-2092: JSON view of a native agent's built-in tools for `/api/agents/<alias>`.
+pub fn native_tools_json(provider: &str, kind: &str, params: Option<&Value>) -> Vec<Value> {
+    let disabled: Vec<String> = params
+        .and_then(|p| p.get("disabled_tools"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    native_tool_catalog(provider, kind)
+        .iter()
+        .map(|tool| {
+            let enabled = tool.required || !disabled.iter().any(|d| d == tool.name);
+            json!({
+                "name": tool.name,
+                "line": tool.line,
+                "description": tool.line,
+                "source": "built_in",
+                "bundled": true,
+                "required": tool.required,
+                "enabled": enabled,
+                "applies": "next_launch",
+            })
+        })
+        .collect()
 }
 
 impl Attach {

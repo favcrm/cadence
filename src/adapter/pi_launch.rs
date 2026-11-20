@@ -735,12 +735,37 @@ pub(super) fn build_command(
                 ]);
             }
         }
-        let tools = if agent.provider == "omp" {
+        // CAD-2092: expose only the selected bundled skills from this agent's
+        // private staged directory while `--no-skills` blocks ambient discovery.
+        if let Some(raw_skills) = params.get("skills").filter(|v| !v.is_null()) {
+            let selected = crate::skill::validate_skills_param(raw_skills)?;
+            for (_, dir) in crate::skill::stage_agent_skills(state_dir, &agent.alias, &selected)? {
+                cmd.extend(["--skill".to_string(), dir.to_string_lossy().to_string()]);
+            }
+        }
+        let disabled_tools = match params.get("disabled_tools").filter(|v| !v.is_null()) {
+            Some(v) => crate::adapter::registry::validate_disabled_tools_param(
+                &agent.provider,
+                &agent.endpoint_kind,
+                v,
+            )?,
+            None => Vec::new(),
+        };
+        let base_tools = if agent.provider == "omp" {
             OMP_WORKER_TOOLS
         } else {
             PI_WORKER_TOOLS
         };
-        cmd.extend(["--tools".to_string(), tools.join(",")]);
+        let tools: Vec<&str> = base_tools
+            .iter()
+            .copied()
+            .filter(|tool| !disabled_tools.iter().any(|d| d == tool))
+            .collect();
+        if tools.is_empty() {
+            cmd.push("--no-tools".to_string());
+        } else {
+            cmd.extend(["--tools".to_string(), tools.join(",")]);
+        }
     }
     // `agent.model` is the provider's report, never a launch param —
     // only the configured param is replayed (same rule as Claude).

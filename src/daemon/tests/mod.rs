@@ -13,6 +13,8 @@ mod cad1989_group_root_profile_read;
 mod cad1989_profile_context_refusal;
 mod cad1989_profile_create_refusal;
 #[cfg(feature = "test-seam")]
+mod cad2092_skills_tools_refusal;
+#[cfg(feature = "test-seam")]
 mod cad2239_reviewer_pane_refusal;
 #[cfg(feature = "test-seam")]
 mod cad2285_master_ask_form_refusal;

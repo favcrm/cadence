@@ -22,6 +22,8 @@ import type {
   WorkspaceSkillRead,
   WorkspaceSkillSummary,
   AgentRolesPayload,
+  AgentSkillsResult,
+  AgentToolsResult,
   InstructionsResult,
   AgentsPayload,
   AppDetail,
@@ -1200,6 +1202,14 @@ export const api = {
    *  agent's standing instructions. Operator only. */
   setAgentInstructions: (alias: string, instructions: string) =>
     post<InstructionsResult>(`/api/agents/${encodeURIComponent(alias)}/instructions`, { instructions }),
+  /** `POST /api/agents/<alias>/skills` (CAD-2092) — replace the native
+   *  agent's selected bundled skills. Operator only; applies next session. */
+  setAgentSkills: (alias: string, skills: string[]) =>
+    post<AgentSkillsResult>(`/api/agents/${encodeURIComponent(alias)}/skills`, { skills }),
+  /** `POST /api/agents/<alias>/tools` (CAD-2092) — replace the native
+   *  agent's disabled built-in tools. Operator only; applies next session. */
+  setAgentTools: (alias: string, disabled_tools: string[]) =>
+    post<AgentToolsResult>(`/api/agents/${encodeURIComponent(alias)}/tools`, { disabled_tools }),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;
