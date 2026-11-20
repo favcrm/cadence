@@ -22,7 +22,7 @@
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
-import { appViewId, appViewRef, appViewTitle, applyRoutePatch, type AppViewRef } from "./appView";
+import { appViewId, appViewRef, appViewTitle, applyRoutePatch, sameRoute, type AppViewRef } from "./appView";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
@@ -112,6 +112,8 @@ export interface FeedView {
   /** Stable per entry. */
   key: string;
   ref: AppViewRef;
+  /** The card is for the app page already on screen: it moves that page (`showHere`), never a canvas tab. */
+  here?: true;
   live: boolean;
   operatorTurn: boolean;
   turn: string | null;
@@ -124,6 +126,8 @@ export interface FeedInput {
   cards: FeedCard[];
   /** `view_ref` cards (CAD-2475); absent: none. */
   views?: FeedView[];
+  /** Moves the live app page to a route (CAD-2512). */
+  showHere?: (route: AppViewRef["route"]) => void;
   working: Working | null;
   /** The turn in flight, if any — a close is remembered against it. */
   turn: string | null;
@@ -262,6 +266,10 @@ export function feedCanvas(input: FeedInput): void {
     seen.add(view.key);
     if (input.autoOpen === false || !view.live || !view.operatorTurn || !view.turn || autoOpened.has(view.turn) || closedTurns.has(view.turn)) continue;
     autoOpened.add(view.turn);
+    if (view.here) {
+      input.showHere?.(view.ref.route);
+      continue;
+    }
     const id = appViewId(view.ref);
     if (!tabs.some((t) => t.id === id)) tabs = [...tabs, appTab(id, view.ref)];
     open = true;
@@ -312,8 +320,9 @@ export function openAppView(input: unknown): boolean {
   const ref = appViewRef(input);
   if (!ref) return false;
   const id = appViewId(ref);
+  // An open tab that moved inside its frame goes back to the card's own route.
   const tabs = state.tabs.some((t) => t.id === id)
-    ? state.tabs
+    ? state.tabs.map((t) => (t.id === id && t.app && !sameRoute(t.app.route, ref.route) ? { ...t, title: ref.title, app: { ...t.app, route: ref.route } } : t))
     : [...state.tabs, appTab(id, ref)];
   set({ ...state, tabs, active: id, open: true });
   artifactFocused("user");

@@ -5,9 +5,9 @@ import { LocaleProvider } from "../src/lib/locale";
 import { appViewId, appViewRef, appViewTitle } from "../src/features/canvas/appView";
 import { canvasSnapshot, closeTab, feedCanvas, openAppView, patchAppViewRoute, resetCanvas } from "../src/features/canvas/canvasStore";
 import { feedParts } from "../src/features/canvas/feed";
-import { parseViewRef, viewCardAppView } from "../src/features/home/chatCards";
+import { HOME_VIEW_SCOPE, parseViewRef, viewCardAppView, viewHere } from "../src/features/home/chatCards";
 import { asEntry, mergePage, threadItems } from "../src/features/home/thread";
-import { ViewCard, viewState } from "../src/features/home/ViewCard";
+import { ViewCard, ViewScopeContext, viewState } from "../src/features/home/ViewCard";
 
 export {};
 declare function require(name: string): any;
@@ -68,7 +68,10 @@ equal(viewCardAppView(model!, { installId: "other", contextId: "ctx_7" })?.conte
 equal(viewCardAppView({ ...model!, screenTag: "Crm_Mount" }), null, "a tag the frame refuses is not openable");
 
 // Card states.
-equal([viewState("ok", true, true), viewState("ok", true, false), viewState("denied", true, true), viewState("missing", true, false), viewState("ok", false, false)], ["showing", "closed", "denied", "missing", "missing"], "states");
+equal([viewState("ok", true, "showing"), viewState("ok", true, "closed"), viewState("denied", true, "showing"), viewState("missing", true, "closed"), viewState("ok", false, "closed"), viewState("ok", true, "moved"), viewState("ok", true, "here"), viewState("denied", true, "here")], ["showing", "closed", "denied", "missing", "missing", "moved", "here", "denied"], "states");
+// CAD-2512: the same-app decision is the install match and a pane that can move its page.
+const showHere = () => {};
+check(viewHere(model!, { installId: "install_crm", contextId: "c", showHere }) && !viewHere(model!, { installId: "other", contextId: "c", showHere }) && !viewHere(model!, { installId: "install_crm", contextId: "c" }) && !viewHere(model!, HOME_VIEW_SCOPE), "same app, with a page to move");
 
 // Render: hostile title stays plain text, truncation hooks are present, a bad payload is the text line.
 resetCanvas("c", "k", "home");
@@ -140,3 +143,26 @@ equal(canvasSnapshot().tabs[0].title, "Ada Example", "back on the opened record,
 patchAppViewRoute(tabId, { record_id: null, segment_id: null });
 equal(canvasSnapshot().tabs[0].title, "customers", "a list shows the section");
 equal(appViewTitle(tabId, "Ada Example", home!.route), "Ada Example", "unchanged route keeps the title");
+
+// CAD-2512: the card reopens its own route; a tab that moved away reads Opened.
+resetCanvas("c", "k", "app");
+openAppView(home);
+patchAppViewRoute(tabId, { record_id: "cust-0002", segment_id: null });
+check(render(valid).includes("data-view-state=\"moved\"") && render(valid).includes("Opened") && render(valid).includes("data-view-open"), "a moved tab reads Opened, with the Open button");
+openAppView(home);
+equal([canvasSnapshot().tabs[0].app?.route.record_id, canvasSnapshot().tabs[0].title], ["cust-0001", "Ada Example"], "the card resets the tab to its own record");
+check(render(valid).includes("data-view-state=\"showing\""), "back on its record the card reads Open");
+
+// CAD-2512: in the app's own pane the card moves the live page and opens no canvas tab.
+const moves: unknown[] = [];
+const pane = { installId: "install_crm", contextId: "ctx_7", showHere: (route: unknown) => moves.push(route) };
+const hereHtml = renderToStaticMarkup(createElement(LocaleProvider, null, createElement(ViewScopeContext.Provider, { value: pane }, createElement(ViewCard, { entry: entryOf(valid) }))));
+check(hereHtml.includes("data-view-state=\"here\"") && hereHtml.includes("Shown in CRM") && hereHtml.includes("data-view-here") && !hereHtml.includes("data-view-open"), "same-app card reads Shown in <App>");
+resetCanvas("c", "k", "app");
+const herePart = feedParts(items.slice(0, 2), 0, "m1", pane);
+equal(herePart.views.map((v) => v.here), [true], "same-app card is marked here");
+feedCanvas({ conversation: "c", surface: "app", composerKey: "k", showHere: pane.showHere, ...herePart });
+equal([moves, canvasSnapshot().tabs.length, canvasSnapshot().open], [[{ section: "customers", view: "list", record_id: "cust-0001", segment_id: null }], 0, false], "live same-app card moves the page, no tab");
+resetCanvas("c", "k", "app");
+const otherPart = feedParts(items.slice(0, 2), 0, "m1", { installId: "other", contextId: "c", showHere: pane.showHere });
+equal(otherPart.views.map((v) => v.here), [undefined], "another app's card keeps the canvas");

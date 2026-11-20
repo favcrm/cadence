@@ -151,6 +151,7 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
       <footer className="cv-foot">
         <span>{t("Live")}</span>
         <span>{t("Shown as you")}</span>
+        {noAccess ? null : <span className="cv-foot-ro">{t("Read-only here · Open in {app} to edit").replace("{app}", appName)}</span>}
       </footer>
     </>
   );

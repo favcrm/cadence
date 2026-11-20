@@ -1185,6 +1185,15 @@ export default function AppShell({
     [effectiveNavigation, writeQuery],
   );
 
+  // CAD-2512: a view card for this installation moves this page: the same
+  // route patch the full-page app writes to the board URL, never a canvas tab.
+  const showRoute = useCallback(
+    (route: RoutePatch) => {
+      if (effectiveNavigation) writeQuery({ screenRoute: { patch: route, navigation: effectiveNavigation } });
+    },
+    [effectiveNavigation, writeQuery],
+  );
+
   // Capability-free local-text workflows reuse the guarded start lifecycle.
   // Host execution and priced capability calls keep their existing approval UI.
   // `scope.contextId` is exactly the context the run binds to; "" is the
@@ -1443,6 +1452,7 @@ export default function AppShell({
             onPendingDecision={reportPendingDecision}
             onWaitingChange={setWaitingReply}
             onOpenView={openView}
+            onShowRoute={effectiveNavigation ? showRoute : undefined}
           />
         </div>
       </div>
