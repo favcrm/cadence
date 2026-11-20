@@ -320,7 +320,6 @@ pub static SPECS: &[EndpointSpec] = &[
             "effort",
             "permission_mode",
             "allowed_tools",
-            "skills",
             "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
@@ -1932,6 +1931,11 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
     }
     if let Some(v) = params.get("skills") {
         if !v.is_null() {
+            if !supports_per_agent_skills(provider, kind) {
+                return Err(Error::rejected(format!(
+                    "'skills' is only enforced on managed Pi/OMP runtimes, not {provider}/{kind}"
+                )));
+            }
             crate::skill::validate_skills_param(v)?;
         }
     }
@@ -1941,6 +1945,12 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
         }
     }
     Ok(())
+}
+
+/// CAD-2092: whether this provider/endpoint enforces per-agent `params.skills`
+/// at launch (via `--no-skills --skill <staged_dir>`).
+pub fn supports_per_agent_skills(provider: &str, kind: &str) -> bool {
+    pi_family_managed(provider, kind)
 }
 
 /// CAD-2092: required built-in tool present on every Cadence agent.

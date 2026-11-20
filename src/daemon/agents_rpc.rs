@@ -379,8 +379,14 @@ impl Shared {
         let raw = params
             .get("skills")
             .ok_or_else(|| Error::rejected("missing 'skills' array"))?;
+        let agent = self.store.agent(&alias)?;
+        if !registry::supports_per_agent_skills(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "per-agent skills are only enforced on managed Pi/OMP runtimes, not {}/{}",
+                agent.provider, agent.endpoint_kind
+            )));
+        }
         let selected = crate::skill::validate_skills_param(raw)?;
-        let _agent = self.store.agent(&alias)?;
         let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
         self.store
             .set_params_by(&alias, &json!({"skills": selected}), &audit)?;

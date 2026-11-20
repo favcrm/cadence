@@ -172,6 +172,7 @@ fn build_command(
         mcp_config,
         crate::master::Profile::Home,
     )
+    .expect("valid claude test command")
 }
 
 fn build_command_for(
@@ -181,7 +182,7 @@ fn build_command_for(
     resume: bool,
     mcp_config: Option<&Path>,
     profile: crate::master::Profile,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let params = agent.params.clone().unwrap_or(Value::Null);
     let mut cmd = claude_command(env);
     for flag in [
@@ -227,7 +228,7 @@ fn build_command_for(
         for tool in crate::master::CLAUDE_DISALLOWED_TOOLS {
             cmd.extend(["--disallowedTools".to_string(), tool.to_string()]);
         }
-        return cmd;
+        return Ok(cmd);
     }
     let mode = params
         .get("permission_mode")
@@ -241,18 +242,12 @@ fn build_command_for(
     for tool in allowed {
         cmd.extend(["--allowedTools".to_string(), tool]);
     }
-    if let Some(disabled) = params
-        .get("disabled_tools")
-        .filter(|v| !v.is_null())
-        .and_then(|v| {
-            crate::adapter::registry::validate_disabled_tools_param(
-                &agent.provider,
-                &agent.endpoint_kind,
-                v,
-            )
-            .ok()
-        })
-    {
+    if let Some(raw_disabled) = params.get("disabled_tools").filter(|v| !v.is_null()) {
+        let disabled = crate::adapter::registry::validate_disabled_tools_param(
+            &agent.provider,
+            &agent.endpoint_kind,
+            raw_disabled,
+        )?;
         for tool in disabled {
             cmd.extend(["--disallowedTools".to_string(), tool]);
         }
@@ -266,7 +261,7 @@ fn build_command_for(
             "mcp__cadence__approve".to_string(),
         ]);
     }
-    cmd
+    Ok(cmd)
 }
 
 /// The command the generated mcp-config points at — this same binary's
@@ -320,7 +315,7 @@ fn launch_command_for(
     mcp_config: Option<&Path>,
     profile: crate::master::Profile,
 ) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
-    let command = build_command_for(env, agent, session_id, resume, mcp_config, profile);
+    let command = build_command_for(env, agent, session_id, resume, mcp_config, profile)?;
     if !master_confined(env, agent) {
         if crate::master::is_master(&agent.alias)
             && env.workspace().is_some()
@@ -1256,6 +1251,7 @@ mod cad1553_company_authority_acceptance {
             None,
             crate::master::Profile::Home,
         )
+        .unwrap()
     }
 
     fn refused(env: &ProviderEnv, state: &Path, agent: &Agent, case: &str) {
@@ -1662,7 +1658,7 @@ mod tests {
         let master = agent("master", json!({}));
         let tools = |profile| {
             flag_values(
-                &build_command_for(&env, &master, "s", false, None, profile),
+                &build_command_for(&env, &master, "s", false, None, profile).unwrap(),
                 "--allowedTools",
             )
         };
@@ -1686,8 +1682,26 @@ mod tests {
         // A worker's launch ignores the profile.
         let worker = agent("w1", json!({}));
         assert_eq!(
-            build_command_for(&env, &worker, "s", false, None, Home),
-            build_command_for(&env, &worker, "s", false, None, App)
+            build_command_for(&env, &worker, "s", false, None, Home).unwrap(),
+            build_command_for(&env, &worker, "s", false, None, App).unwrap()
+        );
+    }
+
+    #[test]
+    fn cad2092_claude_disabled_tools_fails_closed_on_invalid_entry() {
+        let env = ProviderEnv::default();
+        let valid = agent("w-tools", json!({"disabled_tools": ["Write", "WebFetch"]}));
+        let cmd = build_command_for(&env, &valid, "s", false, None, crate::master::Profile::Home)
+            .unwrap();
+        assert_eq!(
+            flag_values(&cmd, "--disallowedTools"),
+            ["Write", "WebFetch"]
+        );
+
+        let bad = agent("w-bad", json!({"disabled_tools": ["not-a-tool"]}));
+        assert!(
+            build_command_for(&env, &bad, "s", false, None, crate::master::Profile::Home).is_err(),
+            "invalid disabled_tools must fail closed rather than launching with tools enabled"
         );
     }
 }

@@ -1509,47 +1509,52 @@ pub(crate) fn agent_detail(
     };
     let (native_skills, native_tools) = if operator {
         let params_opt = agent.get("params").filter(|v| v.is_object());
-        let configured_skills: Option<Vec<String>> = params_opt
-            .and_then(|p| p.get("skills"))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            });
-        // Loaded skill evidence comes strictly from runtime-reported
-        // `loaded_skills` on the live session, never from installed files.
-        let loaded_skills: Option<Vec<String>> = agent
-            .get("loaded_skills")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            });
-        let skills: Vec<Value> = crate::skill::bundled_catalog()
-            .into_iter()
-            .map(|mut item| {
-                let name = item["name"].as_str().unwrap_or_default().to_string();
-                let required = item["required"].as_bool().unwrap_or(false);
-                let enabled = required
-                    || configured_skills
+        let skills_json = if registry::supports_per_agent_skills(provider, kind) {
+            let configured_skills: Option<Vec<String>> = params_opt
+                .and_then(|p| p.get("skills"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
+            // Loaded skill evidence comes strictly from runtime-reported
+            // `loaded_skills` on the live session, never from installed files.
+            let loaded_skills: Option<Vec<String>> = agent
+                .get("loaded_skills")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
+            let skills: Vec<Value> = crate::skill::bundled_catalog()
+                .into_iter()
+                .map(|mut item| {
+                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let required = item["required"].as_bool().unwrap_or(false);
+                    let enabled = required
+                        || configured_skills
+                            .as_ref()
+                            .map(|list| list.iter().any(|s| s == &name))
+                            .unwrap_or(true);
+                    let loaded = loaded_skills
                         .as_ref()
-                        .map(|list| list.iter().any(|s| s == &name))
-                        .unwrap_or(true);
-                let loaded = loaded_skills
-                    .as_ref()
-                    .map(|list| list.iter().any(|s| s == &name));
-                item["enabled"] = json!(enabled);
-                item["loaded"] = json!(loaded);
-                item["applies"] = json!("next_launch");
-                item
-            })
-            .collect();
+                        .map(|list| list.iter().any(|s| s == &name));
+                    item["enabled"] = json!(enabled);
+                    item["loaded"] = json!(loaded);
+                    item["applies"] = json!("next_launch");
+                    item
+                })
+                .collect();
+            json!(skills)
+        } else {
+            Value::Null
+        };
         let tools = registry::native_tools_json(provider, kind, params_opt);
-        (json!(skills), json!(tools))
+        (skills_json, json!(tools))
     } else {
         (Value::Null, Value::Null)
     };
