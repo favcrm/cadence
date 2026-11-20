@@ -5,6 +5,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1 } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
@@ -63,6 +64,7 @@ export interface ScreenActions {
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
   onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
+  onWhatsAppCompose?(conversationId: string | null): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -248,6 +250,7 @@ export abstract class FrameChannel {
   protected state(_data: string): void {}
   /** screen.v2 unsaved-edit leave warning hint: a frame kind without it closes. */
   protected leave(_unsaved: boolean): void { this.close(true); }
+  protected whatsappCompose(_conversationId: string | null): void { this.close(true); }
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
   protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
@@ -292,6 +295,10 @@ export abstract class FrameChannel {
         if (!this.ready) { this.close(true); return; }
         this.audioSession(child);
       }
+      if (child.op === "whatsapp-compose") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappCompose(child.conversation_id);
+      }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
         if (child.op === "call") this.call(child);
@@ -320,6 +327,11 @@ export abstract class FrameChannel {
  *  the social publish relays send the host-held action token, never a frame-supplied credential. */
 const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm", "publish.draft.schedule"];
 
+export function admitsWhatsAppComposer(receipt: MountReceipt): boolean {
+  return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
+    ["whatsapp.conversations.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.reply.status"].every(verb => receipt.operations?.includes(verb));
+}
+
 export class ScreenChannel extends FrameChannel {
   /** Set once, by the child's `ready`: the PUSH shape it negotiated. */
   private shape: Shape = "v1";
@@ -341,6 +353,7 @@ export class ScreenChannel extends FrameChannel {
   private wantsLocale = false;
   private wantsPresentation = false;
   private wantsSurfaces = false;
+  private wantsWhatsAppCompose = false;
   /** CAD-1777 — the host-derived surface role of this mount. The outlet
    *  sets it from its own mount request (a drawer only exists behind a
    *  private parent token); the ready opt-in and call args cannot choose
@@ -387,6 +400,14 @@ export class ScreenChannel extends FrameChannel {
     // navigation or effect authority, and non-v2 mounts close on v2 ops.
     if (!this.ready || this.closed || this.shape !== "v2") { this.close(true); return; }
     this.onUnsaved?.(unsaved);
+  }
+  protected whatsappCompose(conversationId: string | null): void {
+    if (!this.wantsWhatsAppCompose || !this.actions?.onWhatsAppCompose) { this.close(true); return; }
+    this.actions.onWhatsAppCompose(conversationId);
+  }
+  whatsappComposeState(dirty: boolean, refresh: boolean): void {
+    if (!this.closed && this.ready && this.wantsWhatsAppCompose)
+      this.port?.postMessage({ v: 2, op: "whatsapp-compose-state", dirty, refresh });
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
@@ -688,6 +709,10 @@ export class ScreenChannel extends FrameChannel {
     if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if ((wantsAudio || wantsAudioV2) && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
+    const wantsWhatsAppCompose = accepts.includes(SCREEN_WHATSAPP_COMPOSE_V1);
+    if (wantsWhatsAppCompose && (!records || this.surfaceRole !== "primary" || !admitsWhatsAppComposer(this.receipt) ||
+        this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppCompose)) return false;
+    this.wantsWhatsAppCompose = wantsWhatsAppCompose;
     this.records = records;
     this.wantsLocale = wantsLocale;
     this.wantsAudio = wantsAudio;

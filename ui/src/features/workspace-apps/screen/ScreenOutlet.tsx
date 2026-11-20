@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
-import { compareShellVersions, parseMount, ScreenChannel, shellVersion, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
+import { admitsWhatsAppComposer, compareShellVersions, parseMount, ScreenChannel, shellVersion, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
 import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
@@ -22,9 +22,10 @@ import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
 import { readOnlyReceipt } from "./screenReadOnly";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
+import WhatsAppReplyComposer, { type WhatsAppReplySelection } from "./WhatsAppReplyComposer";
 
 /** The pane renderer: the outlet's typed failure and a retry that re-mounts
  *  this same projection without a reload. */
@@ -125,6 +126,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [preview, setPreview] = useState<InertPreview | null>(null);
   const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
+  const [whatsappReply, setWhatsAppReply] = useState<{ revision: number; selection: WhatsAppReplySelection } | null>(null);
+  const whatsappRevision = useRef(0);
   const [link, setLink] = useState<string | null>(null);
   const [audioModal, setAudioModal] = useState<{
     key: number;
@@ -265,6 +268,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     let services: ReturnType<typeof recordServices> | null = null;
     const isCurrent = () => !retired && !controller.signal.aborted && !session.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && JSON.stringify([latest.current.install_id, latest.current.digest, latest.current.tag, latest.current.context_id]) === scope;
     let releaseLeaveGuard: (() => void) | null = null;
+    let frameUnsaved = false;
+    let composerUnsaved = false;
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
       if (!releaseLeaveGuard || !isCurrent() || owned !== channel.current) return;
       event.preventDefault();
@@ -274,6 +279,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       releaseLeaveGuard?.();
       releaseLeaveGuard = null;
       window.removeEventListener("beforeunload", warnBeforeUnload);
+    };
+    const updateLeaveGuard = () => {
+      if (!frameUnsaved && !composerUnsaved) { clearLeaveGuard(); return; }
+      if (releaseLeaveGuard) return;
+      releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
+        window.confirm(translateUiText("You have unsaved changes. Leave this page and discard your local edits?", presentationLocale.current)));
+      window.addEventListener("beforeunload", warnBeforeUnload);
     };
     const command = (c: HostCommand) => {
       if (!isCurrent() || !mounted.current) return;
@@ -298,6 +310,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     setState("loading");
     setFailure(null);
     setSlot(null); setLink(null); setPreview(null); setRemoteImages([]); setAudioModal(null);
+    setWhatsAppReply(null);
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
@@ -343,6 +356,36 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           setRemoteImages(receipt.remote_images ?? []);
           services = recordServices(receipt, JSON.stringify([current.install_id, current.context_id]), { current: isCurrent, command, refused: () => { owned?.close(true); } });
         }
+        let selectedWhatsApp: string | null = null;
+        const composeServices = primary && !readOnly && current.installation.name === "waba" && admitsWhatsAppComposer(receipt)
+          ? services : null;
+        const composeCurrent = () => isCurrent() && !!owned && channel.current === owned && mounted.current === receipt &&
+          frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current).section === "inbox";
+        const selectWhatsApp = (conversationId: string | null) => {
+          if (!composeServices || !isCurrent() || !owned || channel.current !== owned || selectedWhatsApp === conversationId) return;
+          selectedWhatsApp = composeCurrent() ? conversationId : null;
+          const revision = ++whatsappRevision.current;
+          composerUnsaved = false;
+          updateLeaveGuard();
+          owned.whatsappComposeState(false, false);
+          if (!selectedWhatsApp) { setWhatsAppReply(null); return; }
+          const currentSelection = () => composeCurrent() && revision === whatsappRevision.current;
+          setWhatsAppReply({
+            revision,
+            selection: {
+              conversationId: selectedWhatsApp,
+              services: composeServices,
+              current: currentSelection,
+              announce: (dirty, refresh = false) => {
+                if (!currentSelection()) return;
+                const changed = composerUnsaved !== dirty;
+                composerUnsaved = dirty;
+                updateLeaveGuard();
+                if (changed || refresh) owned?.whatsappComposeState(dirty, refresh);
+              },
+            },
+          });
+        };
         const frame = document.createElement("iframe");
         frame.title = current.installation.title;
         frame.setAttribute("sandbox", "allow-scripts");
@@ -354,7 +397,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // Read it now, not from this effect's render: a pick that changed while
         // the mount request was pending must not mint the old theme.
         const mountedTheme = appliedFrameTheme();
-        frame.src = mountedTheme ? `${receipt.mount}?theme=${mountedTheme}` : receipt.mount;
+        frame.src = `${receipt.mount}${mountedTheme ? `?theme=${mountedTheme}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
         // current pick on load. A host that has no listener ignores it.
@@ -416,6 +459,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken, allowAssetRef: ref => channel.current?.allowAssetRef(ref) } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
+            ...(composeServices ? { onWhatsAppCompose: selectWhatsApp } : {}),
             onScreenDrawer: onScreenDrawer
               ? (mode, surface, independent, size, context) => {
                   if (!isCurrent()) return;
@@ -464,11 +508,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             } : {}),
           } : undefined, undefined, unsaved => {
             if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
-            clearLeaveGuard();
-            if (!unsaved) return;
-            releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
-              window.confirm(translateUiText("You have unsaved changes. Leave this page and discard your local edits?", presentationLocale.current)));
-            window.addEventListener("beforeunload", warnBeforeUnload);
+            frameUnsaved = unsaved;
+            updateLeaveGuard();
           });
         // The role is host-derived from this outlet's mount; the surface
         // state is stored before the handshake, so `send()` can post it
@@ -504,6 +545,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       owned?.close();
       channel.current = null;
       setSlot(null); setLink(null); setPreview(null); setAudioModal(null);
+      setWhatsAppReply(null);
       container.current?.replaceChildren();
       // A primary's retirement takes its child drawer with it; the shell
       // overlay closes so no blank blocking panel can remain.
@@ -534,8 +576,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;
   return <>
-    <div data-installed-app-screen="" aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
-      <div ref={container} style={{ position: "absolute", inset: 0 }} />
+    <div data-installed-app-screen="" aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "flex" : "none", flexDirection: "column" }}>
+      <div style={{ position: "relative", flex: "1 1 0%", minHeight: 0 }}><div ref={container} style={{ position: "absolute", inset: 0 }} /></div>
+      {whatsappReply?.selection.current() && <WhatsAppReplyComposer key={whatsappReply.revision} selection={whatsappReply.selection} />}
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}
