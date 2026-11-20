@@ -1,22 +1,20 @@
 //! Dedicated browser acceptance exercising real HTTP, signed owner
 //! revalidation, one-use entry and encrypted custody with an offline token.
-#![cfg(all(
-    test,
-    target_os = "linux",
-    target_arch = "x86_64",
-    feature = "test-seam"
-))]
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::signature::{Ed25519KeyPair, KeyPair};
+use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::ui::{block_sigchld, PublicBoard, ServeOpts};
 
 const HOST: &str = "dedicated.example.test";
 const ENTRY_HOST: &str = "entry.example.test";
@@ -289,7 +287,7 @@ fn entry_post(
             .header("Sec-Fetch-Site", "same-origin")
             .header("X-Cadence-Board", "1")
             .header("Cookie", session.0)
-            .header(super::operator::SESSION_HEADER, session.1)
+            .header("X-Cadence-Session", session.1)
             .send(serde_json::to_vec(payload).unwrap().as_slice())
             .expect("entry API HTTP transport"),
     )

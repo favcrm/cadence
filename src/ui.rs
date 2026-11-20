@@ -58,8 +58,6 @@ mod cad2321_actor_kind_http_acceptance;
 mod cad2378_time_zone_guard_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad2402_routines_list_guard_acceptance;
-#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
-mod cad2487_dedicated_entry_acceptance;
 mod cli_route;
 mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
@@ -1330,7 +1328,7 @@ fn qr_term(text: &str) -> Option<String> {
 /// does not retry it. Blocking it on the test thread is inherited by every
 /// thread the rig spawns; `wait`/`waitpid` do not need it delivered.
 #[cfg(all(test, feature = "test-seam"))]
-fn block_sigchld() {
+pub(crate) fn block_sigchld() {
     // SAFETY: a local signal set and a mask change on the calling thread.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
