@@ -59,14 +59,19 @@ assert(nav("home", null, "Workspace").includes('aria-label="Workspace"'), "phone
 assert(!nav("home", null).includes("navlink-sub"), "no sub rows without an app menu");
 assert(!nav("home", null).includes("data-parent-current"), "no parent marker without an app menu");
 
+const prefsMod = require("../src/features/app-shell/sidebarPrefs") as typeof import("../src/features/app-shell/sidebarPrefs");
+const { readSidebarPrefs, updateSidebarPrefs, noteAppScreen, DEFAULT_SIDEBAR_PREFS, SIDEBAR_PREFS_KEY } = prefsMod;
+const set = (p: Partial<typeof DEFAULT_SIDEBAR_PREFS>) => updateSidebarPrefs(() => ({ ...DEFAULT_SIDEBAR_PREFS, ...p }));
+
 // Without an app menu the Apps row is the plain current page.
 const plain = nav("apps", null);
 assert(/<a [^>]*aria-current="page"[^>]*>(?:(?!<\/a>).)*Apps/.test(plain), "Apps is aria-current=page without a menu");
 assert(!plain.includes("data-parent-current"), "no data-parent-current without a menu");
 
-// With an app menu the sub row carries the accent; Apps is a quiet parent.
+// With an app menu expanded, the sub row carries the accent; Apps is a quiet parent.
+set({ appsOpen: true, openApps: ["install-crm"] });
 const withMenu = nav("apps", appMenu);
-const apps = /<a [^>]*>(?:(?!<\/a>).)*Apps<\/a>/.exec(withMenu)![0];
+const apps = /<a [^>]*>(?:(?!<\/a>).)*Apps(?:(?!<\/a>).)*<\/a>/.exec(withMenu)![0];
 assert(apps.includes('aria-current="true"') && apps.includes("data-parent-current"), "Apps is the quiet parent");
 assert(!apps.includes('aria-current="page"'), "parent does not take the accent");
 assert(/class="navlink navlink-sub"[^>]*aria-current="page"[^>]*>Segments|aria-current="page"[^>]*class="navlink navlink-sub"[^>]*>Segments/.test(withMenu), "current sub row carries aria-current=page");
@@ -77,10 +82,11 @@ assert(!/aria-label="Social Content sections"/.test(withMenu), "no sections list
 assert(!withMenu.includes("slabel"), "no separate app heading");
 // An open app without sections takes the accent alone; Apps is the quiet parent.
 const social = nav("apps", { apps: [{ ...appMenu.apps[1], current: true }] });
-assert(!/<a [^>]*aria-current="page"[^>]*>(?:(?!<\/a>).)*Apps<\/a>/.test(social), "Apps is not page-current when an app row is");
+assert(!/<a [^>]*aria-current="page"[^>]*>(?:(?!<\/a>).)*Apps(?:(?!<\/a>).)*<\/a>/.test(social), "Apps is not page-current when an app row is");
 assert(/aria-current="page"[^>]*>(?:(?!<\/a>).)*Social Content/.test(social), "the open app row is page-current");
 // Off the Apps screen the parent marker is absent even when a menu is passed.
 assert(!nav("home", appMenu).includes("data-parent-current") && !nav("home", appMenu).includes('aria-current="true"'), "parent marker only when Apps is current");
+set({});
 
 // Projects: empty list shows a plain line instead of the All projects row.
 const state = (data: unknown[] | null, status = "ready") => ({ data, status, error: null }) as any;
@@ -95,26 +101,30 @@ const several = projectList([{ key: "alpha", prefix: "ALP" }, { key: "beta", pre
 assert(several.includes("All projects") && !several.includes("No projects yet"), "projects keep the All projects row");
 equal(hrefs(several), ["/p/all", "/p/alpha", "/p/beta"], "one row per project");
 
-// CAD-1692: per-browser fold and pin state. The store is shared by the
+// CAD-1692 / CAD-2514: per-browser fold and pin state. The store is shared by the
 // desktop sidebar and the phone menu; static markup reads its snapshot.
-const prefsMod = require("../src/features/app-shell/sidebarPrefs") as typeof import("../src/features/app-shell/sidebarPrefs");
-const { readSidebarPrefs, updateSidebarPrefs, noteAppScreen, DEFAULT_SIDEBAR_PREFS, SIDEBAR_PREFS_KEY } = prefsMod;
 const mem = (raw: string | null) => ({ getItem: (k: string) => (k === SIDEBAR_PREFS_KEY ? raw : null) });
 equal(readSidebarPrefs(null), DEFAULT_SIDEBAR_PREFS, "no storage means the defaults");
 equal(readSidebarPrefs({ getItem: () => { throw new Error("blocked"); } }), DEFAULT_SIDEBAR_PREFS, "throwing storage means the defaults");
 equal(readSidebarPrefs(mem("{not json")), DEFAULT_SIDEBAR_PREFS, "malformed storage means the defaults");
-equal(readSidebarPrefs(mem('{"appsOpen":"no","pinned":["a",3,"a",""],"closedApps":"x"}')),
-  { ...DEFAULT_SIDEBAR_PREFS, pinned: ["a"] }, "wrong-typed fields fall back; pins keep only unique non-empty strings");
+equal(readSidebarPrefs(mem('{"appsOpen":"no","pinned":["a",3,"a",""],"openApps":["x","x",""]}')),
+  { ...DEFAULT_SIDEBAR_PREFS, pinned: ["a"], openApps: ["x"] }, "wrong-typed fields fall back; ids keep only unique non-empty strings");
+equal(readSidebarPrefs(mem('{"collapsed":true,"appsOpen":true,"closedApps":[],"projectsOpen":false,"pinned":["a"],"showAll":true}')),
+  { collapsed: true, appsOpen: false, openApps: [], projectsOpen: false, pinned: ["a"], showAll: true },
+  "legacy storage (without openApps) migrates Apps folds to calm default while keeping rail and project prefs");
 
 const pick = (html: string, re: RegExp) => (re.exec(html) ?? [""])[0];
 const nameTexts = (html: string) => Array.from(html.matchAll(/<span class="truncate">([^<]*)<\/span>/g)).map((m) => m[1]);
-const set = (p: Partial<typeof DEFAULT_SIDEBAR_PREFS>) => updateSidebarPrefs(() => ({ ...DEFAULT_SIDEBAR_PREFS, ...p }));
 
-// Apps fold: the Apps link still navigates; a separate button folds the tree.
+// Apps fold: defaults calm (collapsed); the Apps link still navigates; a separate button folds the tree.
 set({});
+const defaultFolded = nav("apps", appMenu);
+assert(/<button[^>]*aria-expanded="false"[^>]*aria-label="Expand apps"/.test(defaultFolded), "Apps starts collapsed by default");
+assert(/<button[^>]*aria-expanded="false"[^>]*aria-label="Expand CRM sections"/.test(defaultFolded), "app sections start collapsed by default");
+set({ appsOpen: true, openApps: ["install-crm"] });
 const open = nav("apps", appMenu);
 assert(/<button[^>]*class="navdisc"[^>]*aria-expanded="true"[^>]*aria-label="Collapse apps"/.test(open), "Apps has an expanded disclosure button");
-assert(/<a [^>]*href="\/apps"[^>]*>(?:(?!<\/a>).)*Apps<\/a>/.test(open), "the Apps label stays a link to the Apps page");
+assert(/<a [^>]*href="\/apps"[^>]*>(?:(?!<\/a>).)*Apps(?:(?!<\/a>).)*<\/a>/.test(open), "the Apps label stays a link to the Apps page");
 assert(/<button[^>]*aria-expanded="true"[^>]*aria-label="Collapse CRM sections"/.test(open), "an app with sections has its own disclosure");
 assert(!/aria-label="[^"]*Social Content sections"/.test(open), "an app without sections has none");
 set({ appsOpen: false });
@@ -126,34 +136,34 @@ assert(!/<div class="navtree"><a /.test(folded), "a folded Apps tree has no peek
 assert(/<a [^>]*href="\/apps"[^>]*aria-current="page"/.test(folded), "the Apps parent is current while its tree is folded");
 set({ appsOpen: false });
 assert(!/<div class="navtree"><a /.test(nav("home", appMenu)), "folded off an app screen, no peek row");
-set({ closedApps: ["install-crm"] });
+set({ appsOpen: true, openApps: [] });
 const crmClosed = nav("apps", appMenu);
 assert(/<button[^>]*aria-expanded="false"[^>]*aria-label="Expand CRM sections"/.test(crmClosed), "a closed app's sections say so");
 assert(/<div [^>]*class="navfold"[^>]*aria-hidden="true"[^>]*><div class="navfold-in"><nav aria-label="CRM sections"/.test(crmClosed), "a closed app's sections are folded");
 
-// Entering an app reopens Apps and that app. Loading straight onto an app
-// page (even before its installation resolves), staying, and leaving never do.
+// Entering an app reopens Apps and switches open sections to that active app
+// (accordion). Loading straight onto an app page, staying, and leaving never do.
 const { resetPrivateSession: resetSession, allowPrivateReads: allowReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
 const expanded = () => /aria-label="Collapse apps"/.test(nav("apps", appMenu));
 const crmOpen = () => /aria-label="Collapse CRM sections"/.test(nav("apps", appMenu));
 // (a) Reload onto an app page: unresolved first, then resolved — a load, not an entry.
 resetSession(); allowReads();
-set({ appsOpen: false, closedApps: ["install-crm"] });
+set({ appsOpen: false, openApps: [] });
 noteAppScreen(true, null);
 noteAppScreen(true, "install-crm");
 assert(!expanded() && !crmOpen(), "loading onto an app page keeps the folds");
 noteAppScreen(true, "install-crm");
 assert(!expanded(), "staying on one app keeps the fold");
 noteAppScreen(true, "install-soc");
-assert(expanded(), "switching to another app unfolds Apps");
-set({ appsOpen: false, closedApps: ["install-crm"] });
+assert(expanded() && !crmOpen(), "switching to another app unfolds Apps and folds previous app sections");
+set({ appsOpen: false, openApps: [] });
 noteAppScreen(false, null);
 assert(!expanded(), "leaving an app keeps a fold");
 noteAppScreen(true, "install-crm");
 assert(expanded() && crmOpen(), "entering an app unfolds Apps and its sections");
 // (b) Reload onto Home, then enter an app before the installed-app list answers.
 resetSession(); allowReads();
-set({ appsOpen: false, closedApps: ["install-crm"] });
+set({ appsOpen: false, openApps: [] });
 noteAppScreen(false, null);
 noteAppScreen(true, null);
 assert(!expanded(), "an unresolved app screen decides nothing yet");
@@ -200,11 +210,11 @@ assert(/<div [^>]*class="navfold"[^>]*aria-hidden="true"/.test(closed), "folded 
 set({});
 
 // A confirmed identity change drops the previous session's layout and pins.
-set({ pinned: ["alpha"], appsOpen: false });
+set({ pinned: ["alpha"], appsOpen: true, openApps: ["install-crm"] });
 resetSession();
 allowReads();
 equal(nameTexts(projectList(five)), ["All projects", ...five.map((p) => p.key)], "a session reset unpins everything");
-assert(/aria-label="Collapse apps"/.test(nav("apps", appMenu)), "a session reset unfolds Apps");
+assert(/aria-label="Expand apps"/.test(nav("apps", appMenu)), "a session reset restores calm collapsed Apps");
 
 // One row style: the phone menu no longer carries its own grid.
 const app = fs.readFileSync("src/App.tsx", "utf8");

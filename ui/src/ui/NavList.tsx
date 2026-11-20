@@ -96,7 +96,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 aria-current={here ? "page" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
                 {item.screen === "home" && homeCount > 0 && (
                   <span className="navbadge num" title={`${homeCount} ${t("waiting for you")}`}>
                     {homeCount}
@@ -115,7 +115,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
         const open = prefs.appsOpen;
         const parent = here && currentApp !== null && open && !rail;
         return (
-          <Fragment key={item.screen}>
+          <div key={item.screen} className="navgroup">
             <div className="navrow">
               <Link
                 href={navHref(item.route)}
@@ -127,7 +127,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 data-parent-current={parent ? "" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
               </Link>
               <Disclosure
                 open={open}
@@ -141,10 +141,10 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
             <Fold id={foldId} open={open}>
               <div className="navtree">
                 {apps.map((app) => {
-                  const sectionsOpen = !prefs.closedApps.includes(app.installId);
+                  const sectionsOpen = prefs.openApps.includes(app.installId);
                   const sectionsId = `${foldId}-${app.installId}`;
                   return (
-                    <Fragment key={app.installId}>
+                    <div key={app.installId} className="navgroup">
                       <div className="navrow">
                         <Link
                           href={app.href}
@@ -171,9 +171,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             label={`${t(sectionsOpen ? "Collapse" : "Expand")} ${app.title} ${t("sections")}`}
                             onToggle={() => updateSidebarPrefs((p) => ({
                               ...p,
-                              closedApps: p.closedApps.includes(app.installId)
-                                ? p.closedApps.filter((id) => id !== app.installId)
-                                : [...p.closedApps, app.installId],
+                              openApps: p.openApps.includes(app.installId)
+                                ? p.openApps.filter((id) => id !== app.installId)
+                                : [...p.openApps, app.installId],
                             }))}
                           />
                         )}
@@ -197,12 +197,12 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           </nav>
                         </Fold>
                       )}
-                    </Fragment>
+                    </div>
                   );
                 })}
               </div>
             </Fold>
-          </Fragment>
+          </div>
         );
       })}
     </nav>
