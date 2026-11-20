@@ -357,57 +357,14 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Validate the ordinary operator session/page-key proof used by protected
-/// management metadata (the board's `/settings/connections`). Management is
-/// not secret collection, so it keeps the existing board-origin proof and
-/// rejects only the public surface. Credential collection uses the strict
-/// typed entry binding below.
+/// Bind a protected management attempt to the ordinary board operator's
+/// verified session. Management does not handle credential bytes; collection
+/// requires the separate entry session below.
 pub(crate) fn management_session_binding(shared: &Shared, proof: &Value) -> Result<String> {
-    let object = proof
-        .as_object()
-        .ok_or_else(|| Error::invalid("entry_session_required", "entry session is unavailable"))?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "token" | "key" | "origin"))
-    {
-        return Err(Error::invalid(
-            "entry_session_required",
-            "entry session is unavailable",
-        ));
-    }
-    let token = required_str(proof, "token")?;
-    let key = required_str(proof, "key")?;
-    let origin = crate::operator_auth::Origin::parse(required_str(proof, "origin")?)
-        .ok_or_else(|| Error::invalid("entry_session_required", "entry session is unavailable"))?;
-    if origin == crate::operator_auth::Origin::Public {
-        return Err(Error::invalid(
-            "entry_session_required",
-            "management is the operator's own browser session",
-        ));
-    }
-    if token.is_empty() || key.is_empty() {
-        return Err(Error::invalid(
-            "entry_session_required",
-            "entry session is unavailable",
-        ));
-    }
-    let session = shared
-        .operator_auth()
-        .verified_session(token, key, origin, shared.operator_now())?
-        .ok_or_else(|| Error::invalid("entry_session_required", "entry session is unavailable"))?;
-    if session
-        .user
-        .as_ref()
-        .is_some_and(|user| !user.is_operator())
-    {
-        return Err(Error::invalid(
-            "entry_session_required",
-            "management is the operator's own browser session",
-        ));
-    }
+    let session = shared.verified_board_operator_session(proof)?;
     Ok(crate::operator_auth::digest(&format!(
         "cadence-credential-entry-session-v1\0{}\0{}",
-        origin.as_str(),
+        session.origin.as_str(),
         session.id
     )))
 }

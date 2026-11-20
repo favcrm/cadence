@@ -363,11 +363,11 @@ impl Shared {
     /// `credential_entry_continue_mint {request_id, session}` — the trusted
     /// board's human Continue action. The UI peer must be the positive
     /// operator connection; `session` must be the actual live ordinary board
-    /// operator session (not public, not entry-scoped) with its durable
-    /// account. The pending request is resolved in this workspace/profile at
-    /// the current owner/core floor. The entry-purpose one-use link binds
-    /// the exact root-pinned origin AND that canonical request id. No
-    /// credential row/key is touched. The nonce never rides a URL.
+    /// operator session (keyed local/tailnet or verified public, never
+    /// entry-scoped) with its durable account. The pending request is resolved
+    /// in this workspace/profile at the current owner/core floor. The
+    /// one-use link binds the exact root-pinned origin and that canonical
+    /// request id. No credential row/key is touched. The nonce never rides a URL.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn rpc_credential_entry_continue_mint(
         &self,
@@ -383,10 +383,9 @@ impl Shared {
                 "board operator session is unavailable",
             )
         })?;
-        let session = self.ordinary_board_session(proof)?;
-        let account_id = session
+        let account_id = self
+            .verified_board_operator_session(proof)?
             .account_id
-            .clone()
             .filter(|account| !account.is_empty())
             .ok_or_else(|| {
                 Error::invalid(
@@ -521,57 +520,48 @@ impl Shared {
         Ok(object)
     }
 
-    /// The actual live ordinary board operator session behind the human
-    /// Continue action. Entry-scoped and public sessions are rejected by the
-    /// ordinary check; the account and operator identity come from the row,
-    /// never from caller fields.
-    fn ordinary_board_session(&self, proof: &Value) -> Result<auth::SessionView> {
-        let object = proof.as_object().ok_or_else(|| {
+    /// Verify the ordinary board operator behind a protected management
+    /// action. Public cookies require the current board realm and effective
+    /// role; local/tailnet sessions still require a page key. Neither path
+    /// accepts an entry-scoped session.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn verified_board_operator_session(
+        &self,
+        proof: &Value,
+    ) -> Result<auth::SessionView> {
+        let unavailable = || {
             Error::invalid(
                 "entry_session_required",
                 "board operator session is unavailable",
             )
-        })?;
-        if object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "token" | "key" | "origin"))
-        {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
-        }
+        };
+        Self::entry_login_keys(proof, &["token", "key", "origin"])?;
         let token = required_str(proof, "token")?;
         let key = required_str(proof, "key")?;
-        let origin = origin_param(proof)?;
-        if token.is_empty() || key.is_empty() {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
+        let origin = Origin::parse(required_str(proof, "origin")?).ok_or_else(unavailable)?;
+        if origin == Origin::Public {
+            if !key.is_empty() {
+                return Err(unavailable());
+            }
+            return match self.current_public_session(token)? {
+                public_membership::Authority::Granted {
+                    role: crate::board_identity::Role::Operator,
+                    view,
+                    ..
+                } => Ok(*view),
+                _ => Err(unavailable()),
+            };
         }
         let session = self
             .operator_auth()
-            .verified_session(token, key, origin, self.operator_now())?
-            .ok_or_else(|| {
-                Error::invalid(
-                    "entry_session_required",
-                    "board operator session is unavailable",
-                )
-            })?;
+            .check(token, key, origin, self.operator_now())?
+            .ok_or_else(unavailable)?;
         if session
-            .account_id
-            .as_deref()
-            .is_none_or(|account| account.is_empty())
-            || session
-                .user
-                .as_ref()
-                .is_some_and(|user| !user.is_operator())
+            .user
+            .as_ref()
+            .is_some_and(|user| !user.is_operator())
         {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
+            return Err(unavailable());
         }
         Ok(session)
     }

@@ -607,4 +607,36 @@ mod tests {
              never the outage error"
         );
     }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn cad2487_protected_management_requires_current_public_owner_role() {
+        for role in [Role::Operator, Role::Member] {
+            let dir = tempfile::tempdir().unwrap();
+            let (shared, token) = native_shared(
+                dir.path(),
+                "protected-owner",
+                "operator",
+                move |_, _, _, _| Ok(Some(role)),
+            );
+            let proof = json!({"token": token, "key": "", "origin": "public"});
+            let binding =
+                super::super::credential_entry_rpc::management_session_binding(&shared, &proof);
+            match role {
+                Role::Operator => {
+                    binding.expect("a current owner can manage custody");
+                    let no_cookie = json!({"token": "", "key": "", "origin": "public"});
+                    assert!(
+                        super::super::credential_entry_rpc::management_session_binding(
+                            &shared, &no_cookie,
+                        )
+                        .is_err()
+                    );
+                }
+                Role::Member => {
+                    assert_eq!(binding.unwrap_err().code(), Some("entry_session_required"));
+                }
+            }
+        }
+    }
 }

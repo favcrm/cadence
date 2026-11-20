@@ -1102,7 +1102,16 @@ pub(super) fn board_origin(opts: &ServeOpts) -> String {
 /// The auth-only POST's single cross-origin exception admits exactly this
 /// set; the nonce/human Continue is still the authority.
 pub(super) fn is_board_origin(opts: &ServeOpts, origin: &str) -> bool {
-    let origin = origin.trim().to_ascii_lowercase();
+    let origin = origin.trim();
+    if opts.board_public_only {
+        return opts.public.as_ref().is_some_and(|public| {
+            origin.split_once("://").is_some_and(|(scheme, host)| {
+                scheme.eq_ignore_ascii_case(public_scheme(&public.host))
+                    && host.eq_ignore_ascii_case(&public.host)
+            })
+        });
+    }
+    let origin = origin.to_ascii_lowercase();
     if let Some(entry) = super::credential_entry::EntryOrigin::from_opts(opts) {
         if origin == entry.origin().to_ascii_lowercase() {
             return false;

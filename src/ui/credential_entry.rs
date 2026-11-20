@@ -270,10 +270,8 @@ fn legacy_secret_route(path: &str) -> bool {
 /// What the pinned origin serves: its entry page, the shell/assets and
 /// sign-in it needs, and the credential-request metadata/one-use routes.
 /// Everything else — every other board screen and API — is absent there.
-fn entry_origin_allows(path: &str) -> bool {
+fn entry_origin_allows(path: &str, board_public_only: bool) -> bool {
     path.starts_with("/assets/")
-        || path == "/login"
-        || path == "/login/"
         || is_entry_page(path)
         || matches!(
             path,
@@ -282,21 +280,23 @@ fn entry_origin_allows(path: &str) -> bool {
                 | "/api/version"
                 | "/api/locale"
                 | "/api/protected-entry"
-                | "/api/session"
                 | "/api/session/logout"
-                | "/api/session/device/code"
-                | "/api/session/device/poll"
         )
         || matches!(
             route(path),
-            Some(
-                Route::Collection
-                    | Route::Show(_)
-                    | Route::EntrySession(_)
-                    | Route::Submit(_)
-                    | Route::Cancel(_)
-            )
+            Some(Route::Show(_) | Route::EntrySession(_) | Route::Submit(_) | Route::Cancel(_))
         )
+        // A public-only board uses the signed board handoff, not local/device
+        // entry sign-in. New requests also start on the board, not here.
+        || (!board_public_only
+            && (matches!(
+                path,
+                "/login"
+                    | "/login/"
+                    | "/api/session"
+                    | "/api/session/device/code"
+                    | "/api/session/device/poll"
+            ) || matches!(route(path), Some(Route::Collection))))
 }
 
 /// The single origin gate `handle` runs before any handler or body read.
@@ -322,7 +322,7 @@ pub(super) fn gate(
                 ENTRY_ORIGIN_REQUIRED,
             ));
         }
-        if !entry_origin_allows(path) {
+        if !entry_origin_allows(path, opts.board_public_only) {
             return Some(err_response(404, "not found"));
         }
         return None;
@@ -1236,6 +1236,72 @@ pub(super) fn handle_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cad2487_public_only_auth_rejects_local_board_origin() {
+        use std::io::Read;
+
+        const BOARD_HOST: &str = "board.example.test";
+        const BOARD_ORIGIN: &str = "https://board.example.test";
+        const ENTRY_HOST: &str = "entry.example.test";
+        const LOCAL_ORIGIN: &str = "http://cadence-3110.localhost:3110";
+        // A browser-shaped form, but the nonce must fail parsing so even a
+        // broken origin gate cannot forward this request to a daemon.
+        const FORM: &str = "nonce=not-issued&request_id=0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+
+        let state = tempfile::tempdir().unwrap();
+        let opts = ServeOpts {
+            host: "127.0.0.1".into(),
+            port: 3110,
+            board_public_only: true,
+            public: Some(crate::ui::PublicBoard {
+                host: BOARD_HOST.into(),
+                issuer: "https://identity.example.test".into(),
+                company: "co_test".into(),
+                authorize_url: "https://identity.example.test/authorize".into(),
+            }),
+            credential_entry_origin: Some("https://entry.example.test".into()),
+            ..ServeOpts::default()
+        };
+
+        for (host, origin, status) in [
+            (ENTRY_HOST, LOCAL_ORIGIN, 403),
+            (BOARD_HOST, BOARD_ORIGIN, 404),
+            (ENTRY_HOST, BOARD_ORIGIN, 400),
+        ] {
+            let mut request: Request = tiny_http::TestRequest::new()
+                .with_https()
+                .with_remote_addr("192.0.2.1:12345".parse().unwrap())
+                .with_method(Method::Post)
+                .with_path(AUTH_PATH)
+                .with_body(FORM)
+                .with_header(Header::from_bytes("Host", host).unwrap())
+                .with_header(Header::from_bytes("Origin", origin).unwrap())
+                .with_header(
+                    Header::from_bytes("Content-Type", "application/x-www-form-urlencoded")
+                        .unwrap(),
+                )
+                .with_header(Header::from_bytes("Sec-Fetch-Mode", "navigate").unwrap())
+                .into();
+
+            let response = authenticate(&mut request, state.path(), &opts);
+            assert_eq!(response.status_code().0, status, "{origin} → {host}");
+            assert!(
+                !response
+                    .headers()
+                    .iter()
+                    .any(|header| header.field.equiv("Set-Cookie")),
+                "{origin} → {host} must not issue a cookie"
+            );
+            let mut unread = Vec::new();
+            Read::read_to_end(request.as_reader(), &mut unread).unwrap();
+            if (host, origin) == (ENTRY_HOST, BOARD_ORIGIN) {
+                assert!(unread.is_empty(), "the public form must reach the parser");
+            } else {
+                assert_eq!(unread.as_slice(), FORM.as_bytes(), "{origin} → {host}");
+            }
+        }
+    }
 
     #[test]
     fn exact_routes_and_canonical_request_ids() {

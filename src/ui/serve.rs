@@ -2093,9 +2093,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // CAD-747: a hosted agent shares this network namespace and can dial
     // the board's loopback port (or the image's blind TCP relay) itself.
     // Host is therefore a surface selector, never proof of the Worker.
-    // In hosted-only mode the public board session gate must cover every
-    // protected route, even when the caller chooses a local Host.
-    if opts.board_public_only && !public_host {
+    // In public-only mode a local Host still cannot reach the board.
+    // The separately pinned entry host has already passed its own narrower
+    // route/origin gate above; it never enters the public board dispatcher.
+    if opts.board_public_only && !public_host && !at_entry_origin {
         if matches!(method, Method::Get | Method::Head)
             && raw_path == "/api/health"
             && raw_query.is_empty()
@@ -4448,6 +4449,65 @@ mod write_lock_tests {
         assert!(poisoned.join().is_err());
         let guard = acquire_write_lock(Duration::from_millis(50));
         assert!(guard.is_some(), "a poisoned lock is recovered, as before");
+    }
+}
+
+#[cfg(test)]
+mod protected_entry_host_tests {
+    use super::*;
+
+    #[test]
+    fn cad2487_public_only_board_serves_handoff_only_on_pinned_host() {
+        let state = tempfile::tempdir().unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let board = "board.example.test";
+        let entry = "entry.example.test";
+        let opts = ServeOpts {
+            port,
+            allow_hosts: vec![board.into()],
+            board_public_only: true,
+            public: Some(crate::ui::PublicBoard {
+                host: board.into(),
+                issuer: "https://identity.example.test".into(),
+                company: "co_test".into(),
+                authorize_url: "https://identity.example.test/authorize".into(),
+            }),
+            credential_entry_origin: Some(format!("https://{entry}")),
+            ..ServeOpts::default()
+        };
+        let id = "0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+        let handoff = format!("/connections/enroll/{id}");
+        let scope = state.path();
+        let local = format!("127.0.0.1:{port}");
+        let cases = [
+            (entry, handoff.as_str(), 200),
+            (board, handoff.as_str(), 404),
+            (entry, "/api/projects", 404),
+            (entry, "/api/credential-requests", 404),
+            (entry, "/api/session/device/code", 404),
+            (local.as_str(), "/api/projects", 421),
+        ];
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                for _ in 0..cases.len() {
+                    let request = server
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                    handle(request, scope, scope, &opts);
+                }
+            });
+            for (host, path, status) in cases {
+                let (actual, body) =
+                    crate::ui::http_get("127.0.0.1", port, path, host, &[]).unwrap();
+                assert_eq!(actual, status, "{host}{path}: {body}");
+                if status == 200 {
+                    assert!(body.contains(&format!("https://{board}/connections/authorize/{id}")));
+                    assert!(!body.contains("<input"), "handoff cannot collect secrets");
+                }
+            }
+        });
     }
 }
 
