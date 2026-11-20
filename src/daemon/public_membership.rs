@@ -503,11 +503,10 @@ impl Shared {
         })
     }
 
-    /// Local residue of a native public decision whose central membership
-    /// lookup already finished outside PM, custody and release guards.
-    /// Re-reads the cookie row and current realm only: no membership POST
-    /// and no JWKS fetch. `fresh_operator` is that central decision; the
-    /// stored role can withhold operator authority and cannot grant it.
+    /// Local residue of a fresh platform owner decision completed outside PM,
+    /// custody and release guards. Re-reads the exact cookie row and realm;
+    /// there is no network call. The saved role may withhold, but cannot grant,
+    /// the operator authority established by `fresh_operator`.
     pub(super) fn public_session_still(
         &self,
         token: &str,
@@ -517,12 +516,6 @@ impl Shared {
         fresh_operator: bool,
     ) -> Result<bool> {
         if !fresh_operator {
-            return Ok(false);
-        }
-        let MembershipMode::Native(native) = &self.membership_mode else {
-            return Ok(false);
-        };
-        if native.realm != *fresh_realm {
             return Ok(false);
         }
         let now = self.operator_now();
@@ -537,6 +530,20 @@ impl Shared {
             return Ok(false);
         };
         if after.hash != fresh_hash || after.revoked || after.realm.as_ref() != Some(fresh_realm) {
+            return Ok(false);
+        }
+        let binding_matches = match &self.membership_mode {
+            MembershipMode::Native(ctx) => ctx.realm == *fresh_realm && after.dedicated.is_none(),
+            MembershipMode::Dedicated(ctx) => {
+                ctx.realm == *fresh_realm
+                    && after
+                        .dedicated
+                        .as_ref()
+                        .is_some_and(|binding| binding.deployment == ctx.deployment)
+            }
+            _ => false,
+        };
+        if !binding_matches {
             return Ok(false);
         }
         let Some(user) = after.view.user else {
@@ -787,6 +794,78 @@ mod tests {
         env.remove(ENV_VERIFIER_FILE);
         assert!(matches!(capture(&env), MembershipMode::Standalone));
     }
+
+    #[test]
+    fn dedicated_pinned_owner_recheck_requires_the_exact_bound_row() {
+        use crate::operator_auth::DedicatedBinding;
+
+        let dir = tempfile::tempdir().unwrap();
+        let realm = PublicRealm {
+            issuer: "https://api.example.test".into(),
+            company: "fixture-workspace".into(),
+            host: "board.vps.test".into(),
+        };
+        crate::board_identity::write_config(
+            dir.path(),
+            &crate::board_identity::Config {
+                host: realm.host.clone(),
+                issuer: realm.issuer.clone(),
+                company: realm.company.clone(),
+            },
+        )
+        .unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
+        let mut shared = Shared::new(dir.path(), &opts).unwrap();
+        Arc::get_mut(&mut shared).unwrap().membership_mode =
+            MembershipMode::Dedicated(DedicatedContext {
+                deployment: "fixture-board".into(),
+                realm: realm.clone(),
+                verifier: "a".repeat(64),
+            });
+
+        let sub = "fixture-owner";
+        let now = shared.operator_now();
+        let check = |deployment: Option<&str>, jti: &str| {
+            let opened = shared
+                .operator_auth()
+                .open_public_bound_with_dedicated_intent(
+                    BoardUser {
+                        sub: sub.into(),
+                        email: "owner@example.test".into(),
+                        name: "Fixture Owner".into(),
+                        role: "operator".into(),
+                        handle: "owner".into(),
+                    },
+                    (jti, now + 60),
+                    "test",
+                    realm.clone(),
+                    deployment.map(|deployment: &str| DedicatedBinding {
+                        deployment: deployment.into(),
+                        assertion_jti: jti.into(),
+                    }),
+                    now,
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .unwrap();
+            let hash = crate::operator_auth::digest(&opened.token);
+            shared
+                .public_session_still(&opened.token, &hash, sub, &realm, true)
+                .unwrap()
+        };
+        assert!(check(
+            Some("fixture-board"),
+            "bdb2c121-85fa-443e-8849-92a0f9434187"
+        ));
+        assert!(!check(
+            Some("other-board"),
+            "9b6dde13-57cc-4dca-b645-1b291fc46581"
+        ));
+        assert!(!check(None, "8ddee254-7085-4822-8315-a2589df6abf9"));
+    }
+
     const INSTANCE: &str = "inst0001";
     const ISSUER: &str = "http://127.0.0.1:3999";
     const HOST: &str = "outage.board.localhost:3111";
