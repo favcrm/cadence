@@ -515,6 +515,12 @@ pub struct PublicRealm {
     pub host: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DedicatedBinding {
+    pub deployment: String,
+    pub assertion_jti: String,
+}
+
 /// CAD-1374: a stored public row's identity, with no authority claim.
 /// `revoked` lets a denial be audited against a withdrawn session.
 pub(crate) struct PublicSnapshot {
@@ -522,6 +528,7 @@ pub(crate) struct PublicSnapshot {
     pub view: SessionView,
     pub realm: Option<PublicRealm>,
     pub revoked: bool,
+    pub dedicated: Option<DedicatedBinding>,
 }
 
 /// The verified platform tenancy a public session was opened under
@@ -576,6 +583,8 @@ struct Row {
     /// legacy public rows and on every local session.
     #[serde(default)]
     realm: Option<PublicRealm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dedicated: Option<DedicatedBinding>,
     /// CAD-1374: the platform authority of a public row is withdrawn. The
     /// row keeps its identity until its normal TTL, so a denial can name
     /// who was refused, but no authority lookup returns it.
@@ -987,6 +996,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -1085,6 +1095,7 @@ impl Auth {
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -1114,7 +1125,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (None, None, None),
+            (None, None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1138,7 +1149,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (Some(realm), None, None),
+            (Some(realm), None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1158,6 +1169,21 @@ impl Auth {
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
+        self.open_public_bound_with_dedicated_intent(
+            user, jti, user_agent, realm, None, now, intent,
+        )
+    }
+
+    pub(crate) fn open_public_bound_with_dedicated_intent(
+        &mut self,
+        user: BoardUser,
+        jti: (&str, i64),
+        user_agent: &str,
+        realm: PublicRealm,
+        dedicated: Option<DedicatedBinding>,
+        now: i64,
+        intent: impl FnOnce(&AuditTarget) -> Result<()>,
+    ) -> Result<Option<Opened>> {
         // Scope derives from the realm `verify` matched against this
         // board's config — issuer and company, never request params.
         let scope = HumanScope {
@@ -1168,7 +1194,7 @@ impl Auth {
             user,
             jti,
             user_agent,
-            (Some(realm), Some(scope), None),
+            (Some(realm), Some(scope), None, dedicated),
             now,
             intent,
         )
@@ -1179,7 +1205,12 @@ impl Auth {
         user: BoardUser,
         (jti, jti_exp): (&str, i64),
         user_agent: &str,
-        (realm, scope, account_id): (Option<PublicRealm>, Option<HumanScope>, Option<String>),
+        (realm, scope, account_id, dedicated): (
+            Option<PublicRealm>,
+            Option<HumanScope>,
+            Option<String>,
+            Option<DedicatedBinding>,
+        ),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1219,6 +1250,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: Some(user),
             realm,
+            dedicated,
             revoked: false,
             scope,
             account_id,
@@ -1659,6 +1691,7 @@ impl Auth {
             hash: row.hash.clone(),
             view: row.view(),
             realm: row.realm.clone(),
+            dedicated: row.dedicated.clone(),
             revoked: row.revoked,
         })
     }
@@ -1673,6 +1706,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
     }
@@ -1695,6 +1729,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
             .collect()
@@ -1828,6 +1863,7 @@ mod tests {
             max_idle_secs: IDLE_SECS,
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id: None,

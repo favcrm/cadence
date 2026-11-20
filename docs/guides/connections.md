@@ -154,6 +154,40 @@ These owner commands are not chat-driven setup or CLI browser enrollment.
 Trusted credential-entry components, isolated agent access and hosted encrypted
 execution are separate requirements; never paste credentials into agent chat.
 
+## Protected entry on a dedicated public board
+
+A dedicated Linux deployment can use AgenticOS for owner sign-in without
+running its board or saving its workspace in AgenticOS. The daemon, SQLite,
+workspace files and credential custody stay on the VPS. HTTPS ingress may be
+Cloudflare or another reverse proxy; its authentication is not the board's
+custody authority. Use a separate registrable domain from the AgenticOS
+portal and API.
+
+1. Have the platform operator register the exact public HTTPS origin, the
+   AgenticOS workspace ID, a unique deployment ID, and the SHA-256 digest of a
+   randomly generated 32-byte key encoded as lowercase hex. Only the daemon
+   receives the key itself. Never put it in a UI unit, app configuration, or
+   agent environment.
+2. Configure the same `AGENTICOS_DEDICATED_BOARD_DEPLOYMENT`,
+   `AGENTICOS_BOARD_HOST`, `AGENTICOS_BOARD_COMPANY` and
+   `AGENTICOS_BOARD_ISSUER` on the board and daemon. The issuer is the public
+   HTTPS API origin. Set the board's `AGENTICOS_BOARD_AUTHORIZE_URL` to the
+   AgenticOS **portal** origin followed by `/v2/board/authorize`. Do not set
+   native hosted placement flags.
+3. Set `AGENTICOS_DEDICATED_BOARD_VERIFIER_FILE` only for the daemon. Point it
+   at its private verifier credential file; protect the file from both agents
+   and the browser-facing process. With systemd, prefer `LoadCredential=` in
+   the daemon unit. Do not copy it into the workspace or commit it.
+4. Keep the daemon and board loopback-bound behind HTTPS ingress. Sign in at
+   the board URL in a browser, then open protected credential entry as the
+   AgenticOS workspace owner. Keep the existing signed-release and custody
+   enablement policy; no sign-in unlocks custody, authorizes a model/tool call,
+   or grants any billing permission by itself.
+
+Loss of the exact original AgenticOS session, owner membership, or deployment
+registration closes protected access. An unavailable platform refuses public
+authority rather than falling back to the last verified role. Existing local
+operator access stays independent.
 
 ## HTTP contract
 

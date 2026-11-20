@@ -1945,12 +1945,13 @@ fn run_serialized_write(
     state_dir: &Path,
     pm_dir: &Path,
     opts: &ServeOpts,
+    dedicated: Option<&str>,
     within: Duration,
 ) -> Option<Request> {
     let Some(_guard) = acquire_write_lock(within) else {
         return Some(request);
     };
-    handle(request, state_dir, pm_dir, opts);
+    handle(request, state_dir, pm_dir, opts, dedicated);
     None
 }
 
@@ -1967,7 +1968,13 @@ fn board_busy_response() -> HttpResp {
     resp
 }
 
-fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
+fn handle(
+    mut request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
+) {
     // CAD-482: a seam-armed board honors the assertion headers; the
     // scope makes the asserted identity visible to attribution and to
     // the daemon calls this request relays. Absent headers, or absent
@@ -2142,10 +2149,12 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {
-                ("GET" | "HEAD", "/__platform/login") => operator::platform_login(opts, raw_query),
-                ("GET" | "HEAD", _) => operator::platform_read(&path),
+                ("GET" | "HEAD", "/__platform/login") => {
+                    operator::platform_login(opts, raw_query, dedicated)
+                }
+                ("GET" | "HEAD", _) => operator::platform_read(&path, dedicated),
                 ("POST", "/__platform/session") => {
-                    operator::platform_session(&mut request, state_dir, opts)
+                    operator::platform_session(&mut request, state_dir, opts, dedicated)
                 }
                 _ => operator::platform_unknown(),
             };
@@ -2287,7 +2296,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             Ok(admission) => Some(admission),
             Err(resp) => {
                 let resp = if public_host && resp.status_code().0 == 401 {
-                    operator::session_bounce(&request, &path, opts)
+                    operator::session_bounce(&request, &path, opts, dedicated)
                 } else {
                     resp
                 };
@@ -3905,6 +3914,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     }
 }
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    let dedicated = operator::dedicated_config(opts)?.map(std::sync::Arc::<str>::from);
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
@@ -4127,8 +4137,12 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         };
         // Thread per request: `/api/stream` holds its connection open
         // for the session's lifetime and must not starve the board.
-        let (state_dir, pm_dir, opts) =
-            (state_dir.to_path_buf(), pm_dir.to_path_buf(), opts.clone());
+        let (state_dir, pm_dir, opts, dedicated) = (
+            state_dir.to_path_buf(),
+            pm_dir.to_path_buf(),
+            opts.clone(),
+            dedicated.clone(),
+        );
         std::thread::spawn(move || {
             // CAD-777: the device sign-in exchange is exempt — its
             // handlers make issuer HTTP calls (up to 20 s each), so a
@@ -4137,16 +4151,21 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             // the pending map under its own mutex, and the daemon
             // serializes the mint itself.
             if serialized_write(request.method(), request.url()) {
-                if let Some(busy) =
-                    run_serialized_write(request, &state_dir, &pm_dir, &opts, WRITE_LOCK_WAIT)
-                {
+                if let Some(busy) = run_serialized_write(
+                    request,
+                    &state_dir,
+                    &pm_dir,
+                    &opts,
+                    dedicated.as_deref(),
+                    WRITE_LOCK_WAIT,
+                ) {
                     // A writer that never returns must not queue the board
                     // behind it: answer the retryable refusal the client
                     // already renders as busy (CAD-1653).
                     let _ = busy.respond(board_busy_response());
                 }
             } else {
-                handle(request, &state_dir, &pm_dir, &opts);
+                handle(request, &state_dir, &pm_dir, &opts, dedicated.as_deref());
             }
         });
     }
@@ -4422,6 +4441,7 @@ mod write_lock_tests {
             state.path(),
             pm.path(),
             &ServeOpts::default(),
+            None,
             Duration::from_millis(50),
         );
         assert!(refused.is_some(), "a held writer must not dispatch");
@@ -4433,6 +4453,7 @@ mod write_lock_tests {
                 state.path(),
                 pm.path(),
                 &ServeOpts::default(),
+                None,
                 Duration::from_millis(50),
             )
             .is_none(),
@@ -4495,7 +4516,7 @@ mod protected_entry_host_tests {
                         .recv_timeout(Duration::from_secs(5))
                         .unwrap()
                         .unwrap();
-                    handle(request, scope, scope, &opts);
+                    handle(request, scope, scope, &opts, None);
                 }
             });
             for (host, path, status) in cases {

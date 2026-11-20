@@ -6810,8 +6810,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease))
         .transpose()?;
     let hot = hot_restart_begin(state_dir);
-    let membership =
-        public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
+    let membership = public_membership::MembershipMode::capture(&hosted, &|name| {
+        opts.provider_env.own(name).or_else(|| {
+            // A present but malformed setting is not an absent opt-in.
+            std::env::var_os(name).map(|raw| raw.into_string().unwrap_or_default())
+        })
+    });
     let (shared, prepared) = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
     // Two-phase init: the backend/coordinator holds a Weak back-reference, so
     // it is installed only after the Arc exists and before the listener binds.

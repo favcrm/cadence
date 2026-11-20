@@ -51,6 +51,7 @@ use super::{
     UI_ACTOR,
 };
 use crate::client;
+use crate::error::{Error, Result as CadenceResult};
 use crate::operator_auth::Origin;
 
 /// What a write route requires (ADR 0004 §5.9).
@@ -2778,6 +2779,135 @@ fn repend(login: &DeviceLogin, pending_id: String, code: String, expires_at: i64
     );
 }
 
+const INTENT_COOKIE: &str = "__Host-aos-board-intent";
+const CLEAR_INTENT: &str =
+    "__Host-aos-board-intent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
+
+/// Resolve the dedicated mode once, before the server starts accepting requests.
+pub(super) fn dedicated_config(opts: &ServeOpts) -> CadenceResult<Option<String>> {
+    let value = match std::env::var("AGENTICOS_DEDICATED_BOARD_DEPLOYMENT") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err(Error::rejected("invalid dedicated board deployment")),
+    };
+    validate_dedicated_config(opts, value)
+}
+
+fn validate_dedicated_config(opts: &ServeOpts, value: String) -> CadenceResult<Option<String>> {
+    let bytes = value.as_bytes();
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || !alnum(bytes[0])
+        || !bytes.iter().all(|b| alnum(*b) || *b == b'-')
+    {
+        return Err(Error::rejected("invalid dedicated board deployment"));
+    }
+    let public = opts
+        .public
+        .as_ref()
+        .ok_or_else(|| Error::rejected("dedicated board requires public identity"))?;
+    let issuer = public
+        .issuer
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| Error::rejected("invalid dedicated board issuer"))?;
+    let authority = issuer
+        .authority()
+        .ok_or_else(|| Error::rejected("invalid dedicated board issuer"))?;
+    let authorize = public
+        .authorize_url
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| Error::rejected("invalid dedicated authorize URL"))?;
+    let authorize_authority = authorize
+        .authority()
+        .ok_or_else(|| Error::rejected("invalid dedicated authorize URL"))?;
+    if issuer.scheme_str() != Some("https")
+        || authority.as_str().contains('@')
+        || issuer.path() != "/"
+        || issuer.query().is_some()
+        || public.issuer != format!("https://{}", authority.as_str())
+        || authorize.scheme_str() != Some("https")
+        || authorize_authority.as_str().contains('@')
+        || authorize.path() != "/v2/board/authorize"
+        || authorize.query().is_some()
+        || public.authorize_url
+            != format!(
+                "https://{}/v2/board/authorize",
+                authorize_authority.as_str()
+            )
+        || public_scheme(&public.host) != "https"
+        || !crate::board_identity::valid_aud(&public.host)
+        || public.company.is_empty()
+    {
+        return Err(Error::rejected(
+            "invalid dedicated public HTTPS configuration",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn intent_redirect(to: &str, opts: &ServeOpts, deployment: &str) -> HttpResp {
+    let Some(public) = opts.public.as_ref() else {
+        return platform_fail(503, "capability_unavailable", "public identity unavailable");
+    };
+    let Ok(state) = crate::operator_auth::random_credential() else {
+        return platform_fail(503, "capability_unavailable", "sign-in unavailable");
+    };
+    let location = format!(
+        "{}?deployment={}&to={}&state={}",
+        public.authorize_url,
+        pct_encode(deployment),
+        pct_encode(to),
+        state
+    );
+    let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(302));
+    resp.add_header(Header::from_bytes("Location", location.as_bytes()).unwrap());
+    set_cookie(
+        &mut resp,
+        &format!("{INTENT_COOKIE}={state}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300"),
+    );
+    no_store(resp)
+}
+
+fn safe_dedicated_to(raw: &str, opts: &ServeOpts) -> Option<String> {
+    let public = opts.public.as_ref()?;
+    let origin = format!("https://{}", public.host);
+    let tail = raw.strip_prefix(&origin)?;
+    if !tail.starts_with('/')
+        || tail.starts_with("//")
+        || tail.starts_with("/__platform/")
+        || tail.contains('#')
+        || tail.bytes().any(|b| b == b'\\' || b.is_ascii_control())
+    {
+        return None;
+    }
+    let decoded = pct_decode(tail)?;
+    if decoded.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+        return None;
+    }
+    Some(format!("{origin}{tail}"))
+}
+
+const CALLBACK_JS: &str = r#"(() => {
+  const fragment = location.hash.slice(1);
+  history.replaceState(null, '', location.pathname);
+  const fail = () => { document.getElementById('status').textContent = 'Sign-in failed. Please try again.'; };
+  const p = new URLSearchParams(fragment);
+  if ([...p.keys()].some(k => !['assertion','state','next'].includes(k)) ||
+      ['assertion','state','next'].some(k => p.getAll(k).length !== 1 || !p.get(k))) { fail(); return; }
+  const assertion = p.get('assertion'), state = p.get('state'), next = p.get('next');
+  let decoded;
+  try { decoded = decodeURIComponent(next); } catch (_) { fail(); return; }
+  if (!next.startsWith('/') || next.startsWith('//') || /[\\\x00-\x1f\x7f]/.test(next) ||
+      /[\\\x00-\x1f\x7f]/.test(decoded)) { fail(); return; }
+  let target;
+  try { target = new URL(next, location.origin); } catch (_) { fail(); return; }
+  if (target.origin !== location.origin || target.hash || target.pathname.startsWith('/__platform/')) { fail(); return; }
+  fetch('/__platform/session', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body:JSON.stringify({assertion,state})})
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(r => { if (!r.ok) throw new Error(); location.replace(target.href); })
+    .catch(fail);
+})();"#;
 // ---------- `/__platform/*` — the AgenticOS sign-in contract (CAD-526) ----------
 //
 // What the board itself answers on its public name
@@ -2878,12 +3008,29 @@ fn request_url(request: &Request) -> String {
 /// `GET /__platform/login` — the container-side bounce (contract §3):
 /// `?to=<absolute board URL>` is honoured when it names this host;
 /// anything else sends the user to the board root.
-pub(super) fn platform_login(opts: &ServeOpts, query: &str) -> HttpResp {
+pub(super) fn platform_login(opts: &ServeOpts, query: &str, dedicated: Option<&str>) -> HttpResp {
     let fallback = opts
         .public
         .as_ref()
         .map(|public| format!("{}://{}/", public_scheme(&public.host), public.host))
         .unwrap_or_else(|| "/".to_string());
+    if let Some(deployment) = dedicated {
+        let values: Vec<_> = query
+            .split('&')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (pct_decode(key).as_deref() == Some("to")).then_some(value)
+            })
+            .collect();
+        let to = if values.len() == 1 {
+            pct_decode(values[0])
+                .and_then(|raw| safe_dedicated_to(&raw, opts))
+                .unwrap_or(fallback)
+        } else {
+            fallback
+        };
+        return intent_redirect(&to, opts, deployment);
+    }
     let to = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
@@ -2898,7 +3045,19 @@ pub(super) fn platform_login(opts: &ServeOpts, query: &str) -> HttpResp {
 /// `/__platform/callback` is the worker's own static page — a request
 /// that still reached the container is bounced to `/`, everything else
 /// is a plain 404 (contract §5/§8).
-pub(super) fn platform_read(path: &str) -> HttpResp {
+pub(super) fn platform_read(path: &str, dedicated: Option<&str>) -> HttpResp {
+    if dedicated.is_some() && (path == "/__platform/callback" || path == "/__platform/callback.js")
+    {
+        let (body, content_type) = if path.ends_with(".js") {
+            (CALLBACK_JS, "application/javascript")
+        } else {
+            ("<!doctype html><html><head><meta charset=\"utf-8\"><title>Signing in</title><script defer src=\"/__platform/callback.js\"></script></head><body><p id=\"status\">Signing in…</p><a href=\"/__platform/login\">Try again</a></body></html>", "text/html; charset=utf-8")
+        };
+        let mut resp = Response::from_data(body.as_bytes().to_vec());
+        resp.add_header(Header::from_bytes("Content-Type", content_type).unwrap());
+        resp.add_header(Header::from_bytes("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'").unwrap());
+        return no_store(resp);
+    }
     if path == "/__platform/callback" {
         let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(302));
         if let Ok(h) = Header::from_bytes("Location", "/") {
@@ -2920,13 +3079,24 @@ pub(super) fn platform_unknown() -> HttpResp {
 /// current URL as `to`; an API/fetch read gets `401` —
 /// `board_session_required` — so no SPA request is mistaken for a
 /// navigation.
-pub(super) fn session_bounce(request: &Request, path: &str, opts: &ServeOpts) -> HttpResp {
+pub(super) fn session_bounce(
+    request: &Request,
+    path: &str,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
+) -> HttpResp {
     let navigation = !path.starts_with("/api/")
         && header_value(request, "Accept")
             .unwrap_or_default()
             .contains("text/html");
     if navigation {
-        redirect_to_authorize(&request_url(request), opts)
+        if let Some(deployment) = dedicated {
+            let fallback = format!("https://{}/", opts.public.as_ref().unwrap().host);
+            let to = safe_dedicated_to(&request_url(request), opts).unwrap_or(fallback);
+            intent_redirect(&to, opts, deployment)
+        } else {
+            redirect_to_authorize(&request_url(request), opts)
+        }
     } else {
         platform_fail(
             401,
@@ -2947,6 +3117,20 @@ pub(super) fn platform_session(
     request: &mut Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
+    dedicated: Option<&str>,
+) -> HttpResp {
+    let mut response = platform_session_inner(request, state_dir, opts, dedicated.is_some());
+    if dedicated.is_some() {
+        set_cookie(&mut response, CLEAR_INTENT);
+    }
+    response
+}
+
+fn platform_session_inner(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    dedicated: bool,
 ) -> HttpResp {
     if opts.public.is_none() {
         return platform_fail(404, "not_found", "Unknown route.");
@@ -2966,6 +3150,17 @@ pub(super) fn platform_session(
             return platform_fail(403, "assertion_invalid", "cross-site request rejected");
         }
     }
+    if dedicated {
+        let expected = format!("https://{}", opts.public.as_ref().unwrap().host);
+        let origins: Vec<_> = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.equiv("Origin"))
+            .collect();
+        if origins.len() != 1 || origins[0].value.as_str() != expected {
+            return platform_fail(403, "assertion_invalid", "origin is not this board's");
+        }
+    }
     if let Some(origin) = header_value(request, "Origin") {
         let host = header_value(request, "Host").unwrap_or_default();
         let own = format!("{}://{}", public_scheme(&host), host.to_ascii_lowercase());
@@ -2979,15 +3174,44 @@ pub(super) fn platform_session(
     };
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct PlatformSessionReq {
+    struct LegacySession {
         assertion: String,
     }
-    let req: PlatformSessionReq = match parse_json(&bytes) {
-        Ok(r) => r,
-        Err(_) => return platform_fail(400, "assertion_invalid", "request body is not valid JSON"),
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DedicatedSession {
+        assertion: String,
+        state: Option<String>,
+    }
+    let parsed = if dedicated {
+        parse_json::<DedicatedSession>(&bytes).map(|req| (req.assertion, req.state))
+    } else {
+        parse_json::<LegacySession>(&bytes).map(|req| (req.assertion, None))
     };
-    if req.assertion.is_empty() {
+    let Ok((assertion, state)) = parsed else {
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
+    };
+    if assertion.is_empty() {
+        return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
+    }
+    if dedicated {
+        let mut cookies = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.equiv("Cookie"))
+            .flat_map(|h| h.value.as_str().split(';'))
+            .filter_map(|part| part.trim().split_once('='))
+            .filter(|(name, _)| *name == INTENT_COOKIE)
+            .map(|(_, value)| value);
+        let state = state.as_deref().unwrap_or("");
+        if !crate::operator_auth::well_formed(state)
+            || !cookies
+                .next()
+                .is_some_and(|cookie| crate::operator_auth::same_credential(state, cookie))
+            || cookies.next().is_some()
+        {
+            return platform_fail(403, "assertion_invalid", "sign-in intent invalid");
+        }
     }
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
     // Only relay a prior session the browser actually presented. The daemon
@@ -2997,7 +3221,7 @@ pub(super) fn platform_session(
         state_dir,
         "board_session_open",
         json!({
-            "assertion": req.assertion,
+            "assertion": assertion,
             "user_agent": user_agent,
             "prior_session": prior_session,
         }),
@@ -3069,6 +3293,104 @@ mod tests {
         );
     }
     use super::*;
+
+    fn dedicated_fixture() -> ServeOpts {
+        ServeOpts {
+            public: Some(super::super::PublicBoard {
+                host: "board.example.test".into(),
+                issuer: "https://api.example.test".into(),
+                company: "workspace".into(),
+                authorize_url: "https://app.example.test/v2/board/authorize".into(),
+            }),
+            ..ServeOpts::default()
+        }
+    }
+
+    #[test]
+    fn dedicated_login_uses_portal_and_intent_cookie() {
+        let opts = dedicated_fixture();
+        assert_eq!(
+            validate_dedicated_config(&opts, "fixture-board".into())
+                .unwrap()
+                .as_deref(),
+            Some("fixture-board")
+        );
+        let response = platform_login(
+            &opts,
+            "to=https%3A%2F%2Fboard.example.test%2Fprojects",
+            Some("fixture-board"),
+        );
+        assert_eq!(response.status_code().0, 302);
+        let header = |name: &'static str| {
+            response
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .unwrap()
+                .value
+                .as_str()
+                .to_owned()
+        };
+        let location = header("Location");
+        let cookie = header("Set-Cookie");
+        assert!(location.starts_with(
+            "https://app.example.test/v2/board/authorize?deployment=fixture-board&to="
+        ));
+        let state = location.split("&state=").nth(1).unwrap();
+        assert_eq!(state.len(), 64);
+        assert!(cookie.starts_with(&format!("{INTENT_COOKIE}={state};")));
+        assert!(cookie.contains("Secure; HttpOnly; SameSite=Lax; Max-Age=300"));
+        assert_eq!(
+            platform_read("/__platform/callback", Some("fixture-board"))
+                .status_code()
+                .0,
+            200
+        );
+        assert_eq!(
+            platform_read("/__platform/callback", None).status_code().0,
+            302
+        );
+        assert!(safe_dedicated_to("https://board.example.test/%5cevil", &opts).is_none());
+    }
+
+    #[test]
+    fn dedicated_session_refuses_missing_and_mismatched_intent() {
+        let opts = dedicated_fixture();
+        let state_dir = tempfile::tempdir().unwrap();
+        for (body, cookie) in [
+            (r#"{"assertion":"x"}"#, "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (r#"{"assertion":"x","state":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#, "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (r#"{"assertion":"x","state":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#, ""),
+        ] {
+            let mut request: Request = tiny_http::TestRequest::new()
+                .with_method(tiny_http::Method::Post)
+                .with_body(body)
+                .with_header(Header::from_bytes("Host", "board.example.test").unwrap())
+                .with_header(Header::from_bytes("Origin", "https://board.example.test").unwrap())
+                .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+                .with_header(Header::from_bytes("Cookie", cookie).unwrap())
+                .into();
+            let response = platform_session(&mut request, state_dir.path(), &opts, Some("fixture-board"));
+            assert_eq!(response.status_code().0, 403);
+            assert!(response.headers().iter().any(|h| h.field.equiv("Set-Cookie") && h.value.as_str() == CLEAR_INTENT));
+        }
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_method(tiny_http::Method::Post)
+            .with_body(r#"{"assertion":"x","state":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#)
+            .with_header(Header::from_bytes("Host", "board.example.test").unwrap())
+            .with_header(Header::from_bytes("Origin", "https://board.example.test").unwrap())
+            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+            .with_header(Header::from_bytes("Cookie", "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap())
+            .into();
+        // A matching intent reaches the existing daemon RPC; this fixture has no daemon.
+        let response =
+            platform_session(&mut request, state_dir.path(), &opts, Some("fixture-board"));
+        assert_ne!(response.status_code().0, 403);
+        assert!(response
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Set-Cookie") && h.value.as_str() == CLEAR_INTENT));
+    }
 
     #[test]
     fn agent_uid_socket_never_becomes_operator_on_either_fallback_arm() {

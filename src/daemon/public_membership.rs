@@ -21,6 +21,8 @@ const ENV_INSTANCE: &str = "AGENTICOS_INSTANCE";
 const ENV_BOARD_HOST: &str = "AGENTICOS_BOARD_HOST";
 const ENV_BOARD_ISSUER: &str = "AGENTICOS_BOARD_ISSUER";
 const ENV_BOARD_COMPANY: &str = "AGENTICOS_BOARD_COMPANY";
+const ENV_DEDICATED: &str = "AGENTICOS_DEDICATED_BOARD_DEPLOYMENT";
+const ENV_VERIFIER_FILE: &str = "AGENTICOS_DEDICATED_BOARD_VERIFIER_FILE";
 
 /// The platform-placed membership context, captured once at startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,7 @@ pub(crate) enum MembershipMode {
     Standalone,
     /// Platform-placed. Authority is re-proven fresh against the platform.
     Native(NativeContext),
+    Dedicated(DedicatedContext),
     /// Native placement was signalled but its context is partial or invalid.
     /// Every public authority decision is refused.
     RequiredUnavailable,
@@ -41,6 +44,158 @@ pub(crate) struct NativeContext {
     pub company: String,
     pub instance: String,
     pub realm: PublicRealm,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DedicatedContext {
+    pub deployment: String,
+    pub realm: PublicRealm,
+    verifier: String,
+}
+
+impl std::fmt::Debug for DedicatedContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DedicatedContext")
+            .field("deployment", &self.deployment)
+            .field("realm", &self.realm)
+            .field("verifier", &"[redacted]")
+            .finish()
+    }
+}
+
+pub(crate) fn dedicated_deployment_ok(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn dedicated_issuer_ok(s: &str) -> bool {
+    let Ok(uri) = s.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("https")
+        && uri
+            .authority()
+            .is_some_and(|a| !a.as_str().contains('@') && s == format!("https://{}", a.as_str()))
+}
+
+fn read_verifier(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || !matches!(meta.len(), 64 | 65) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 || meta.nlink() != 1 {
+            return None;
+        }
+    }
+    let mut verifier = String::with_capacity(65);
+    file.take(66).read_to_string(&mut verifier).ok()?;
+    if verifier.ends_with('\n') {
+        verifier.pop();
+    }
+    (verifier.len() == 64
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(verifier)
+}
+
+fn unavailable() -> Error {
+    Error::invalid(
+        "capability_unavailable",
+        "dedicated owner authority is unavailable",
+    )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerEnvelope {
+    ok: bool,
+    data: OwnerProof,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerProof {
+    version: String,
+    deployment_id: String,
+    workspace_id: String,
+    audience: String,
+    subject_id: String,
+    assertion_jti: String,
+    role: String,
+}
+
+fn owner_body_matches(bytes: &[u8], ctx: &DedicatedContext, jti: &str, sub: &str) -> bool {
+    let Ok(body) = serde_json::from_slice::<OwnerEnvelope>(bytes) else {
+        return false;
+    };
+    body.ok
+        && body.data.version == "dedicated-board-owner.v1"
+        && body.data.deployment_id == ctx.deployment
+        && body.data.workspace_id == ctx.realm.company
+        && body.data.audience == ctx.realm.host
+        && body.data.subject_id == sub
+        && body.data.assertion_jti == jti
+        && body.data.role == "owner"
+}
+
+impl DedicatedContext {
+    // A 403 alone is an authoritative withdrawal. All other failures are
+    // unavailable, including a malformed or mismatched success body.
+    fn owner(&self, jti: &str, sub: &str) -> Result<bool> {
+        if uuid::Uuid::parse_str(jti).is_err() {
+            return Err(unavailable());
+        }
+        let url = format!(
+            "{}/v2/board/dedicated/owner?deployment={}&assertion={}",
+            self.realm.issuer, self.deployment, jti
+        );
+        let agent = crate::issuer_transport::agent(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .max_redirects(0)
+                .http_status_as_error(false),
+        );
+        let mut response = agent
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.verifier))
+            .call()
+            .map_err(|_| unavailable())?;
+        match response.status().as_u16() {
+            403 => Ok(false),
+            200 => {
+                let bytes = response
+                    .body_mut()
+                    .with_config()
+                    .limit(8192)
+                    .read_to_vec()
+                    .map_err(|_| unavailable())?;
+                if owner_body_matches(&bytes, self, jti, sub) {
+                    Ok(true)
+                } else {
+                    Err(unavailable())
+                }
+            }
+            _ => Err(unavailable()),
+        }
+    }
 }
 
 /// The outcome of a central authority check. `Granted` carries the view
@@ -103,7 +258,57 @@ impl MembershipMode {
     ) -> Self {
         let raw_company = read(ENV_COMPANY);
         let raw_instance = read(ENV_INSTANCE);
+        let raw_dedicated = read(ENV_DEDICATED);
+        let verifier_file = read(ENV_VERIFIER_FILE);
+        if verifier_file.is_some() && raw_dedicated.is_none() {
+            return Self::RequiredUnavailable;
+        }
         let native_lease = hosted.lease.as_deref().is_some_and(is_native_lease);
+        if let Some(deployment) = raw_dedicated {
+            if raw_company.is_some()
+                || raw_instance.is_some()
+                || native_lease
+                || !dedicated_deployment_ok(&deployment)
+            {
+                return Self::RequiredUnavailable;
+            }
+            let (Some(host), Some(issuer), Some(company), Some(path)) = (
+                nonempty(read(ENV_BOARD_HOST)),
+                nonempty(read(ENV_BOARD_ISSUER)),
+                nonempty(read(ENV_BOARD_COMPANY)),
+                nonempty(verifier_file),
+            ) else {
+                return Self::RequiredUnavailable;
+            };
+            if !dedicated_issuer_ok(&issuer)
+                || !(1..=128).contains(&company.len())
+                || !company
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                || host.is_empty()
+                || host.bytes().any(|b| {
+                    b.is_ascii_uppercase()
+                        || b.is_ascii_control()
+                        || b.is_ascii_whitespace()
+                        || matches!(b, b'/' | b'?' | b'#' | b'@')
+                })
+                || host.parse::<ureq::http::uri::Authority>().is_err()
+            {
+                return Self::RequiredUnavailable;
+            }
+            let Some(verifier) = read_verifier(std::path::Path::new(&path)) else {
+                return Self::RequiredUnavailable;
+            };
+            return Self::Dedicated(DedicatedContext {
+                deployment,
+                realm: PublicRealm {
+                    issuer,
+                    company,
+                    host,
+                },
+                verifier,
+            });
+        }
         if raw_company.is_none() && raw_instance.is_none() && !native_lease {
             return Self::Standalone;
         }
@@ -185,6 +390,7 @@ impl Shared {
             view,
             realm,
             revoked,
+            dedicated,
         } = snap;
         if revoked || view.expires_at <= self.operator_now() {
             return Ok(Authority::Denied);
@@ -200,17 +406,7 @@ impl Shared {
         if saved != self.current_realm()? {
             return Ok(Authority::Denied);
         }
-        let native = match &self.membership_mode {
-            MembershipMode::RequiredUnavailable => return Ok(Authority::Denied),
-            MembershipMode::Standalone => None,
-            MembershipMode::Native(ctx) => {
-                if saved != ctx.realm {
-                    return Ok(Authority::Denied);
-                }
-                Some(ctx.clone())
-            }
-        };
-        let Some(ctx) = native else {
+        if matches!(&self.membership_mode, MembershipMode::Standalone) && dedicated.is_none() {
             // Standalone: no private check. The saved identity stands, with
             // its stored role, which is what it always was.
             let role = if user.is_operator() {
@@ -226,31 +422,42 @@ impl Shared {
                 display: user.actor(),
                 view: Box::new(with_effective_role(view, role)),
             });
+        }
+        let fresh = match &self.membership_mode {
+            MembershipMode::Native(ctx) if dedicated.is_none() && saved == ctx.realm => {
+                #[cfg(test)]
+                let result = match &self.membership_lookup_for_test {
+                    Some(lookup) => lookup(&hash, &user.sub, &ctx.company, &ctx.instance),
+                    None => crate::board_membership::lookup_current_membership_by_digest(
+                        &hash,
+                        &user.sub,
+                        &ctx.company,
+                        &ctx.instance,
+                        &self.board_jwks,
+                    ),
+                };
+                #[cfg(not(test))]
+                let result = crate::board_membership::lookup_current_membership_by_digest(
+                    &hash,
+                    &user.sub,
+                    &ctx.company,
+                    &ctx.instance,
+                    &self.board_jwks,
+                );
+                result
+            }
+            MembershipMode::Dedicated(ctx) if saved == ctx.realm && user.is_operator() => {
+                let Some(binding) = dedicated
+                    .as_ref()
+                    .filter(|b| b.deployment == ctx.deployment)
+                else {
+                    return Ok(Authority::Denied);
+                };
+                ctx.owner(&binding.assertion_jti, &user.sub)
+                    .map(|valid| valid.then_some(Role::Operator))
+            }
+            _ => return Ok(Authority::Denied),
         };
-        // CAD-XXXX test seam: when a `#[cfg(test)]` driver installed a
-        // synthetic lookup on `Shared`, resolve the fresh platform role
-        // through it so the real mapping below sees the injected outcome
-        // verbatim. Production builds carry no field and always call the
-        // private `api.internal` transport.
-        #[cfg(test)]
-        let fresh = match &self.membership_lookup_for_test {
-            Some(lookup) => lookup(&hash, &user.sub, &ctx.company, &ctx.instance),
-            None => crate::board_membership::lookup_current_membership_by_digest(
-                &hash,
-                &user.sub,
-                &ctx.company,
-                &ctx.instance,
-                &self.board_jwks,
-            ),
-        };
-        #[cfg(not(test))]
-        let fresh = crate::board_membership::lookup_current_membership_by_digest(
-            &hash,
-            &user.sub,
-            &ctx.company,
-            &ctx.instance,
-            &self.board_jwks,
-        );
         // A transient outage is unavailable, not evidence that the session
         // was revoked. Propagate it without granting cached authority.
         let fresh = fresh?;
@@ -265,7 +472,11 @@ impl Shared {
         let Some(after) = self.operator_auth().public_snapshot_by_hash(&hash, now) else {
             return Ok(Authority::Denied);
         };
-        if after.hash != hash || after.revoked || after.realm.as_ref() != Some(&saved) {
+        if after.hash != hash
+            || after.revoked
+            || after.realm.as_ref() != Some(&saved)
+            || after.dedicated != dedicated
+        {
             return Ok(Authority::Denied);
         }
         let Some(after_user) = after.view.user.clone() else {
@@ -450,11 +661,37 @@ impl Shared {
         match &self.membership_mode {
             MembershipMode::Standalone => Ok(()),
             MembershipMode::Native(ctx) if ctx.realm == *realm => Ok(()),
+            MembershipMode::Dedicated(ctx) if ctx.realm == *realm => Ok(()),
             _ => Err(Error::invalid(
                 "capability_unavailable",
                 "the board realm does not match this platform-placed daemon",
             )),
         }
+    }
+
+    pub(super) fn dedicated_mint_binding(
+        &self,
+        realm: &PublicRealm,
+        user: &crate::operator_auth::BoardUser,
+        jti: &str,
+    ) -> Result<Option<crate::operator_auth::DedicatedBinding>> {
+        self.require_realm_matches_mode(realm)?;
+        let MembershipMode::Dedicated(ctx) = &self.membership_mode else {
+            return Ok(None);
+        };
+        if !user.is_operator() || !ctx.owner(jti, &user.sub)? {
+            return Err(Error::invalid(
+                "assertion_invalid",
+                "current owner authority was not proven",
+            ));
+        }
+        if self.current_realm()? != *realm {
+            return Err(unavailable());
+        }
+        Ok(Some(crate::operator_auth::DedicatedBinding {
+            deployment: ctx.deployment.clone(),
+            assertion_jti: jti.to_string(),
+        }))
     }
 
     /// Does a live public member named `handle` hold a current membership?
@@ -485,6 +722,71 @@ mod tests {
     use std::sync::Arc;
 
     const COMPANY: &str = "co_outage";
+
+    #[test]
+    fn dedicated_mode_and_closed_owner_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verifier");
+        let secret = "a".repeat(64);
+        std::fs::write(&path, &secret).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut env = std::collections::HashMap::from([
+            (ENV_DEDICATED, "fixture-board".to_string()),
+            (ENV_BOARD_HOST, "dedicated.example.test".to_string()),
+            (ENV_BOARD_ISSUER, "https://issuer.example.test".to_string()),
+            (ENV_BOARD_COMPANY, "fixture-workspace".to_string()),
+            (ENV_VERIFIER_FILE, path.to_str().unwrap().to_string()),
+        ]);
+        let capture = |env: &std::collections::HashMap<&str, String>| {
+            MembershipMode::capture(&crate::lease::Hosted::default(), &|name| {
+                env.get(name).cloned()
+            })
+        };
+        let MembershipMode::Dedicated(ctx) = capture(&env) else {
+            panic!("dedicated config refused")
+        };
+        assert!(!format!("{ctx:?}").contains(&secret));
+        let jti = "bdb2c121-85fa-443e-8849-92a0f9434187";
+        let mut body = json!({"ok": true, "data": {
+            "version": "dedicated-board-owner.v1", "deployment_id": "fixture-board",
+            "workspace_id": "fixture-workspace", "audience": "dedicated.example.test",
+            "subject_id": "fixture-owner", "assertion_jti": jti, "role": "owner"
+        }});
+        assert!(owner_body_matches(
+            &serde_json::to_vec(&body).unwrap(),
+            &ctx,
+            jti,
+            "fixture-owner"
+        ));
+        body["data"]["role"] = json!("member");
+        assert!(!owner_body_matches(
+            &serde_json::to_vec(&body).unwrap(),
+            &ctx,
+            jti,
+            "fixture-owner"
+        ));
+        body["data"]["role"] = json!("owner");
+        body["data"]["extra"] = json!(true);
+        assert!(!owner_body_matches(
+            &serde_json::to_vec(&body).unwrap(),
+            &ctx,
+            jti,
+            "fixture-owner"
+        ));
+        env.insert(ENV_INSTANCE, "native".into());
+        assert!(matches!(capture(&env), MembershipMode::RequiredUnavailable));
+        env.remove(ENV_INSTANCE);
+        env.insert(ENV_DEDICATED, String::new());
+        assert!(matches!(capture(&env), MembershipMode::RequiredUnavailable));
+        env.remove(ENV_DEDICATED);
+        assert!(matches!(capture(&env), MembershipMode::RequiredUnavailable));
+        env.remove(ENV_VERIFIER_FILE);
+        assert!(matches!(capture(&env), MembershipMode::Standalone));
+    }
     const INSTANCE: &str = "inst0001";
     const ISSUER: &str = "http://127.0.0.1:3999";
     const HOST: &str = "outage.board.localhost:3111";

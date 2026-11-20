@@ -628,6 +628,7 @@ impl Shared {
         if matches!(
             &self.membership_mode,
             public_membership::MembershipMode::Native(_)
+                | public_membership::MembershipMode::Dedicated(_)
         ) {
             Ok(())
         } else {
@@ -1058,6 +1059,7 @@ impl Shared {
         // realm before any session opens; a standalone one saves the realm
         // it verified under. Captured mode is never re-read here.
         self.require_realm_matches_mode(&realm)?;
+        let dedicated = self.dedicated_mint_binding(&realm, &identity.user(), parsed.jti())?;
         // CAD-1412: the bound open also persists the verified `HumanScope`
         // (issuer + company), derived from this typed realm inside
         // `open_public_bound_with_intent` — never a request field.
@@ -1087,11 +1089,12 @@ impl Shared {
             // already have pruned the jti).
             let mut auth = self.operator_auth();
             let opened_at = self.operator_now();
-            auth.open_public_bound_with_intent(
+            auth.open_public_bound_with_dedicated_intent(
                 identity.user(),
                 (parsed.jti(), deadline),
                 user_agent,
                 realm,
+                dedicated,
                 opened_at,
                 |row| {
                     let a = open_audit(&company, &request, row);
