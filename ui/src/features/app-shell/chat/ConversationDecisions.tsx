@@ -25,6 +25,7 @@ export default function ConversationDecisions({
   const [review, setReview] = useState<{ queue: string[]; at: number } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
   const activity = useRef<HTMLElement | null>(null);
+  const historySummary = useRef<HTMLElement | null>(null);
   const previousRevision = useRef(revision);
 
   useEffect(() => {
@@ -53,13 +54,14 @@ export default function ConversationDecisions({
     setReview(null);
     window.requestAnimationFrame(() => {
       if (opener.current?.isConnected) opener.current.focus();
-      else activity.current?.focus();
+      else (activity.current ?? historySummary.current)?.focus();
     });
   };
 
   return (
     <>
-      {(decisions.phase === "error" || decisions.phase === "unavailable" || decisions.notice !== null || decisions.pending.length > 0 || decisions.decided.length > 0) && (
+      {decisions.notice && review === null && <p className="m-0 text-label text-ink-300" role="status">{noticeText(decisions.notice, t)}</p>}
+      {(decisions.phase === "error" || decisions.phase === "unavailable" || decisions.pending.length > 0) && (
         <section ref={activity} className="app-assistant-activity" aria-label={t("Decisions")} tabIndex={-1}>
           {decisions.phase === "error" && (
             <p className="text-label text-fail" role="alert">
@@ -70,7 +72,6 @@ export default function ConversationDecisions({
           {decisions.phase === "unavailable" && (
             <p className="text-label text-fail" role="alert">{t("Decisions are unavailable.")}</p>
           )}
-          {decisions.notice && review === null && <p className="text-label text-ink-300" role="status">{noticeText(decisions.notice, t)}</p>}
           {decisions.pending.map((write) => (
             <article className="app-assistant-card" key={write.id} data-chat-staged>
               <div className="app-assistant-card-head">
@@ -83,23 +84,23 @@ export default function ConversationDecisions({
               </button>
             </article>
           ))}
-          {decisions.decided.length > 0 && (
-            <details className="app-assistant-card">
-              <summary className="text-label text-ink-300">{t("Updates")}</summary>
-              <ul>
-                {decisions.decided.map((write) => {
-                  const outcome = outcomeOf(write);
-                  const label = outcome === "applied" ? t("Applied") : outcome === "denied" ? t("Denied") : outcome === "failed" ? t("Did not apply") : t("Result not confirmed");
-                  return (
-                    <li key={write.id} className="text-label text-ink-300">
-                      <bdi>{isolate(write.title)}</bdi> · {label}{outcome === "failed" ? ` · ${t(failureReason(write))}` : ""}
-                    </li>
-                  );
-                })}
-              </ul>
-            </details>
-          )}
         </section>
+      )}
+      {decisions.decided.length > 0 && (
+        <details className="app-decision-history">
+          <summary ref={historySummary} className="text-label text-ink-300">{t("Updates")} ({decisions.decided.length})</summary>
+          <ul>
+            {decisions.decided.map((write) => {
+              const outcome = outcomeOf(write);
+              const label = outcome === "applied" ? t("Applied") : outcome === "denied" ? t("Denied") : outcome === "failed" ? t("Did not apply") : t("Result not confirmed");
+              return (
+                <li key={write.id} className="text-label text-ink-300">
+                  <bdi>{isolate(write.title)}</bdi> · {label}{outcome === "failed" ? ` · ${t(failureReason(write))}` : ""}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
       )}
       {review !== null && (
         <StagedWriteDetail
