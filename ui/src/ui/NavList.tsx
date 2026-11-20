@@ -38,9 +38,19 @@ function Fold({ id, open, children }: { id: string; open: boolean; children: Rea
 }
 
 /** The chevron button beside a nav row; the row's link keeps navigating. */
-function Disclosure({ open, controls, label, onToggle }: { open: boolean; controls: string; label: string; onToggle: () => void }) {
+function Disclosure({ open, controls, label, hidden = false, onToggle }: { open: boolean; controls: string; label: string; hidden?: boolean; onToggle: () => void }) {
   return (
-    <button type="button" className="navdisc" aria-expanded={open} aria-controls={controls} aria-label={label} title={label} onClick={onToggle}>
+    <button
+      type="button"
+      className="navdisc"
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={label}
+      aria-hidden={hidden || undefined}
+      tabIndex={hidden ? -1 : undefined}
+      title={label}
+      onClick={onToggle}
+    >
       <IconCaret size={12} />
     </button>
   );
@@ -133,12 +143,13 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 open={open}
                 controls={foldId}
                 label={t(open ? "Collapse apps" : "Expand apps")}
+                hidden={rail}
                 onToggle={() => updateSidebarPrefs((p) => ({ ...p, appsOpen: !p.appsOpen }))}
               />
             </div>
             {appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
             {/* The Apps parent is current while the tree is folded or the rail is compact. */}
-            <Fold id={foldId} open={open}>
+            <Fold id={foldId} open={open && !rail}>
               <div className="navtree">
                 {apps.map((app) => {
                   const sectionsOpen = prefs.openApps.includes(app.installId);
@@ -169,6 +180,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             open={sectionsOpen}
                             controls={sectionsId}
                             label={`${t(sectionsOpen ? "Collapse" : "Expand")} ${app.title} ${t("sections")}`}
+                            hidden={rail}
                             onToggle={() => updateSidebarPrefs((p) => ({
                               ...p,
                               openApps: p.openApps.includes(app.installId)
@@ -179,7 +191,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                         )}
                       </div>
                       {app.sections && (
-                        <Fold id={sectionsId} open={sectionsOpen}>
+                        <Fold id={sectionsId} open={sectionsOpen && !rail}>
                           <nav aria-label={`${app.title} ${t("sections")}`} className="navtree">
                             {app.sections.map((s) => (
                               <Link

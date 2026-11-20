@@ -224,20 +224,6 @@ body {
     grid-template-columns: 64px minmax(0, 1fr);
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .app-shell-root,
-  .navfold,
-  .navfold-in,
-  .navdisc,
-  .navdisc svg,
-  .projhead-toggle svg,
-  .navlabel,
-  .sidebar-brand-text,
-  .sidebar-projects,
-  .account-row > span:not(:first-child) {
-    transition: none;
-  }
-}
 /* Projects heading: the label folds the section. */
 .projhead {
   display: flex;
@@ -346,9 +332,27 @@ body {
   border-radius: 50%;
   font-size: 0;
 }
+[data-sidebar-rail] .sidebar-brand-text {
+  opacity: 0;
+  pointer-events: none;
+}
 [data-sidebar-rail] .account-row > span:not(:first-child) {
   opacity: 0;
   pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell-root,
+  .navfold,
+  .navfold-in,
+  .navdisc,
+  .navdisc svg,
+  .projhead-toggle svg,
+  .navlabel,
+  .sidebar-brand-text,
+  .sidebar-projects,
+  .account-row > span:not(:first-child) {
+    transition: none;
+  }
 }
 .rail-notice { text-align: center; color: var(--color-warn); font-weight: 700; }
 .rail-notice button { min-width: 28px; min-height: 28px; }

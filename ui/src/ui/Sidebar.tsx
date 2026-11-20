@@ -69,10 +69,13 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
               <Logo size={25} />
             </button>
           ) : (
-            <span className="sidebar-brand-title inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
-              <Logo size={25} /><span className="sidebar-brand-text">cadence<span className="text-ink-400 font-normal"> board</span></span>
+            <span className="sidebar-brand-title inline-flex items-center text-ink-100">
+              <Logo size={25} />
             </span>
           )}
+          <span className="sidebar-brand-text ml-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]" aria-hidden={collapsed || undefined}>
+            cadence<span className="text-ink-400 font-normal"> board</span>
+          </span>
         </div>
         <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} noWiki={noWiki} hiddenScreens={hiddenScreens} rail={collapsed} />
         <div className="sidebar-projects" aria-hidden={collapsed || undefined} inert={collapsed || undefined}>
