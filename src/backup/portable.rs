@@ -38,10 +38,12 @@
 //! buffer is hashed and classified for the package, on inspection and on the
 //! staged restore before publication.
 
+#![deny(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +58,7 @@ use super::{
     artifact_snapshot, inspect, quote_ident, require_ok, scan_db, scrub, sync_dir, ArtifactDir,
 };
 use crate::error::{Error, Result};
+use crate::fd_fs::{self, DirFd};
 use crate::rollout::db_file;
 use crate::secret::Allowlist;
 
@@ -2286,7 +2289,7 @@ fn stream_member(mut input: std::fs::File, dst: &Path, m: &Member) -> Result<()>
 /// the pin cannot redirect a read outside the package. The package may be
 /// owned by a different unprivileged UID, so path-based checks are not enough.
 struct PackageRoot {
-    fd: std::os::fd::OwnedFd,
+    dir: DirFd,
 }
 
 impl PackageRoot {
@@ -2297,59 +2300,41 @@ impl PackageRoot {
         // directory, so `a/../b` keeps POSIX traversal semantics and a
         // symlinked or missing `a` refuses instead of being skipped as text.
         // `canonicalize` is never used: it would follow a swapped ancestor.
-        let mut stack: Vec<std::fs::File> = if root.is_absolute() {
-            vec![std::fs::File::open("/")?]
+        let mut stack: Vec<DirFd> = if root.is_absolute() {
+            vec![DirFd::open_root()?]
         } else {
-            vec![std::fs::File::open(".")?]
+            vec![DirFd::open_nofollow(Path::new("."))?]
         };
         for component in root.components() {
             match component {
                 std::path::Component::RootDir => {
                     stack.truncate(1);
-                    stack[0] = std::fs::File::open("/")?;
+                    stack[0] = DirFd::open_root()?;
                 }
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
                     if stack.len() > 1 {
                         stack.pop();
                     } else {
-                        let parent = CString::new("..").expect("parent has no NUL");
-                        let raw = unsafe {
-                            libc::openat(
-                                stack[0].as_raw_fd(),
-                                parent.as_ptr(),
-                                libc::O_RDONLY
-                                    | libc::O_DIRECTORY
-                                    | libc::O_NOFOLLOW
-                                    | libc::O_CLOEXEC,
-                            )
-                        };
-                        if raw < 0 {
-                            return Err(Error::rejected("package parent directory is unavailable"));
-                        }
-                        stack[0] = unsafe { std::fs::File::from_raw_fd(raw) };
+                        stack[0] = stack[0].open_child_dir(c"..").map_err(|_| {
+                            Error::rejected("package parent directory is unavailable")
+                        })?;
                     }
                 }
                 std::path::Component::Normal(name) => {
                     let encoded = CString::new(name.as_bytes())
                         .map_err(|_| Error::rejected("package path has NUL"))?;
-                    let raw = unsafe {
-                        libc::openat(
-                            stack
-                                .last()
-                                .expect("the stack starts with a root handle")
-                                .as_raw_fd(),
-                            encoded.as_ptr(),
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                    };
-                    if raw < 0 {
-                        return Err(Error::rejected(format!(
-                            "package {} is not reachable through real directories",
-                            root.display()
-                        )));
-                    }
-                    stack.push(unsafe { std::fs::File::from_raw_fd(raw) });
+                    let child = stack
+                        .last()
+                        .expect("the stack starts with a root handle")
+                        .open_child_dir(&encoded)
+                        .map_err(|_| {
+                            Error::rejected(format!(
+                                "package {} is not reachable through real directories",
+                                root.display()
+                            ))
+                        })?;
+                    stack.push(child);
                 }
                 std::path::Component::Prefix(_) => {
                     return Err(Error::rejected("unsupported package path prefix"))
@@ -2359,12 +2344,10 @@ impl PackageRoot {
         let current = stack
             .pop()
             .ok_or_else(|| Error::rejected("package path is empty"))?;
-        if !current.metadata()?.is_dir() {
+        if current.stat()?.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(Error::rejected("package is not a plain directory"));
         }
-        Ok(Self {
-            fd: std::os::fd::OwnedFd::from(current),
-        })
+        Ok(Self { dir: current })
     }
 
     /// Open one package-relative member through the pinned descriptor.
@@ -2379,45 +2362,25 @@ impl PackageRoot {
         let Some((leaf, dirs)) = parts.split_last() else {
             return Err(Error::rejected("empty package member path"));
         };
-        let mut dir = self.fd.try_clone()?;
+        let mut dir = self.dir.try_clone()?;
         for name in dirs {
             let encoded = CString::new(name.as_bytes())
                 .map_err(|_| Error::rejected("package member path has NUL"))?;
-            let raw = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    encoded.as_ptr(),
-                    libc::O_RDONLY
-                        | libc::O_DIRECTORY
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC
-                        | libc::O_NONBLOCK,
-                )
-            };
-            if raw < 0 {
-                return Err(Error::rejected(format!(
+            dir = dir.open_child_dir(&encoded).map_err(|_| {
+                Error::rejected(format!(
                     "package member {} is not reachable through a real directory",
                     rel.display()
-                )));
-            }
-            dir = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                ))
+            })?;
         }
         let encoded =
             CString::new(leaf.as_bytes()).map_err(|_| Error::rejected("member path has NUL"))?;
-        let raw = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                encoded.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if raw < 0 {
-            return Err(Error::rejected(format!(
+        let file = dir.open_readonly_nofollow(&encoded).map_err(|_| {
+            Error::rejected(format!(
                 "package member {} is not a plain readable file",
                 rel.display()
-            )));
-        }
-        let file = unsafe { std::fs::File::from_raw_fd(raw) };
+            ))
+        })?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.nlink() != 1 {
             return Err(Error::rejected(format!(
@@ -2430,47 +2393,30 @@ impl PackageRoot {
 }
 
 /// Every package-relative regular file, walked through pinned directory
-/// handles. Linux: `/proc/self/fd/<fd>` names the exact open inode and each
-/// step descends with `openat(O_NOFOLLOW)`, so no path component can be
-/// swapped mid-walk.
-#[cfg(target_os = "linux")]
+/// handles. Each directory is enumerated via `fdopendir` on a duplicated
+/// descriptor and each step descends with `openat(O_NOFOLLOW)`, so no path
+/// component can be swapped mid-walk on either Linux or macOS.
+#[cfg(unix)]
 fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
-    fn walk(dir: &std::os::fd::OwnedFd, prefix: &str, out: &mut Vec<String>) -> Result<()> {
-        let view = format!("/proc/self/fd/{}", dir.as_raw_fd());
-        for entry in fs::read_dir(&view)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let encoded = std::ffi::CString::new(name.as_bytes())
-                .map_err(|_| Error::rejected("package entry name has NUL"))?;
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::fstatat(
-                    dir.as_raw_fd(),
-                    encoded.as_ptr(),
-                    &mut stat,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc != 0 {
-                return Err(Error::rejected("package entry cannot be classified"));
-            }
-            let rel = format!("{prefix}{}", name.to_string_lossy());
+    fn walk(dir: &DirFd, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+        let entries = dir
+            .read_dir()
+            .map_err(|_| Error::rejected("cannot enumerate a package directory"))?;
+        for entry in entries {
+            let encoded =
+                entry.map_err(|_| Error::rejected("cannot enumerate a package directory"))?;
+            let stat = dir
+                .fstatat_nofollow(&encoded)
+                .map_err(|_| Error::rejected("package entry cannot be classified"))?;
+            let rel = format!("{prefix}{}", String::from_utf8_lossy(encoded.as_bytes()));
             match stat.st_mode & libc::S_IFMT {
                 libc::S_IFLNK => {
                     return Err(Error::rejected("package contains a symlink"));
                 }
                 libc::S_IFDIR => {
-                    let raw = unsafe {
-                        libc::openat(
-                            dir.as_raw_fd(),
-                            encoded.as_ptr(),
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                    };
-                    if raw < 0 {
-                        return Err(Error::rejected("package directory is not reachable"));
-                    }
-                    let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                    let child = dir
+                        .open_child_dir(&encoded)
+                        .map_err(|_| Error::rejected("package directory is not reachable"))?;
                     walk(&child, &format!("{rel}/"), out)?;
                 }
                 libc::S_IFREG => out.push(rel),
@@ -2482,109 +2428,9 @@ fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
         Ok(())
     }
     let mut out = Vec::new();
-    let fd = root.fd.try_clone()?;
-    walk(&fd, "", &mut out)?;
+    walk(&root.dir, "", &mut out)?;
     out.sort();
     Ok(out)
-}
-
-/// macOS enumeration through pinned directory handles.
-#[cfg(target_os = "macos")]
-fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-    fn walk(dir: &std::os::fd::OwnedFd, prefix: &str, out: &mut Vec<String>) -> Result<()> {
-        let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if dup < 0 {
-            return Err(Error::rejected(
-                "cannot duplicate a package directory handle",
-            ));
-        }
-        let stream = unsafe { libc::fdopendir(dup) };
-        if stream.is_null() {
-            unsafe { libc::close(dup) };
-            return Err(Error::rejected("cannot enumerate a package directory"));
-        }
-        let stream = DirectoryStream(stream);
-        loop {
-            unsafe { *libc::__error() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                if unsafe { *libc::__error() } != 0 {
-                    return Err(Error::rejected("cannot enumerate a package directory"));
-                }
-                break;
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            let encoded = std::ffi::CString::new(name)
-                .map_err(|_| Error::rejected("package entry name has NUL"))?;
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::fstatat(
-                    dir.as_raw_fd(),
-                    encoded.as_ptr(),
-                    &mut stat,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            let rel = format!("{prefix}{}", String::from_utf8_lossy(name));
-            match rc {
-                0 => match stat.st_mode & libc::S_IFMT {
-                    libc::S_IFLNK => {
-                        return Err(Error::rejected("package contains a symlink"));
-                    }
-                    libc::S_IFDIR => {
-                        let raw = unsafe {
-                            libc::openat(
-                                dir.as_raw_fd(),
-                                encoded.as_ptr(),
-                                libc::O_RDONLY
-                                    | libc::O_DIRECTORY
-                                    | libc::O_NOFOLLOW
-                                    | libc::O_CLOEXEC,
-                            )
-                        };
-                        if raw < 0 {
-                            return Err(Error::rejected("package directory is not reachable"));
-                        }
-                        let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-                        // Recurse here, as the Linux enumeration does: `rel`
-                        // is only consumed by the regular-file arm, so a
-                        // deferred `walk` after the match would use it after a
-                        // move.
-                        walk(&child, &format!("{rel}/"), out)?;
-                    }
-                    libc::S_IFREG => out.push(rel),
-                    _ => {
-                        return Err(Error::rejected("package contains a non-regular file"));
-                    }
-                },
-                _ => {
-                    return Err(Error::rejected("package entry cannot be classified"));
-                }
-            }
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    let fd = root.fd.try_clone()?;
-    walk(&fd, "", &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn package_paths(_root: &PackageRoot) -> Result<Vec<String>> {
-    Err(Error::rejected(
-        "package inspection is unavailable on this platform",
-    ))
 }
 
 /// Read a pinned member fully.
@@ -4119,7 +3965,7 @@ fn check_config_keys(config: &Path, tracker: &Path, admission: Admission) -> Res
 /// regular file or directory owned by the current user; a symlink, device,
 /// hardlinked file, or foreign owner refuses.
 fn check_metadata_tree(dir: &Path, tracker: &Path) -> Result<()> {
-    let me = unsafe { libc::geteuid() };
+    let me = fd_fs::geteuid();
     let mut count = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -4532,6 +4378,8 @@ fn rename_noreplace(src: &Path, dst: &Path) -> Result<()> {
         CString::new(src.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;
     let d =
         CString::new(dst.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;
+    // SAFETY: `s` and `d` are live NUL-terminated C strings passed to
+    // `renameat2(AT_FDCWD, ..., RENAME_NOREPLACE)`.
     let rc = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
