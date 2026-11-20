@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
@@ -90,12 +90,16 @@ export default function MemberChat({
   readOnly,
   onOpenIssue,
   documentFollowUps,
+  templateRail,
+  templateCount,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   documentFollowUps?: DocumentFollowUpState;
+  templateRail?: ReactNode;
+  templateCount?: number;
 }) {
   const t = useTranslate();
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
@@ -534,10 +538,12 @@ export default function MemberChat({
           </div>
         </div>
       </section>
-      {documentFollowUps && (
+      {(documentFollowUps || templateRail) && (
         <aside className="absolute rail:static min-w-0 rail:h-full rail:min-h-0">
           <NeedsRail
             documentFollowUps={documentFollowUps}
+            templateRail={templateRail}
+            templateCount={templateCount}
             readOnly={readOnly}
             collapsed={railCollapsed}
             onToggleCollapse={() => {

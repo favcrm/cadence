@@ -2642,6 +2642,20 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
+Hosted quotation and invoice templates live in **Home → To do → Template
+approvals**, including on workspaces without the Wiki file lifecycle. From a
+saved Canvas draft, **Review template** opens the same review at that exact
+version. Review the fill-in fields and calculation rules with a short or
+continuation SAMPLE PDF in a new tab. The sample contains synthetic values
+only. Authoring packs still use the existing agent and CLI commands.
+
+Only the workspace owner can approve a version for reuse. That decision binds
+the version's content digest; it does not approve any future document. **Use
+template** adds a request for the approved version to the Home composer without
+sending it or overwriting the existing draft. This does not issue, number, or
+send an invoice. Old hosted `/settings/templates` links return to Home. Native
+boards keep the Templates settings page.
+
 On a hosted board advertising `wiki_managed_files` (CAD-2477), **Wiki** is
 the shared library for durable files and knowledge. An assigned approver
 opens **Home → To do → Review** to read the submitted version in Wiki.

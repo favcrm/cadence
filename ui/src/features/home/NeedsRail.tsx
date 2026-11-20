@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
@@ -86,6 +86,8 @@ export default function NeedsRail({
   onAskAgent,
   onSent,
   decisions: decisionsOn = false,
+  templateRail,
+  templateCount,
 }: {
   /** Only Master Home supplies the existing operator overview. */
   overview?: ResourceState<Overview>;
@@ -106,6 +108,8 @@ export default function NeedsRail({
   /** CAD-2186: also read the owner's staged decisions (`/api/assist/actions`) and
    *  list them in To do. Off for a board with no such route or a non-owner. */
   decisions?: boolean;
+  templateRail?: ReactNode;
+  templateCount?: number;
 }) {
   const [tab, setTab] = useState<"todo" | "updates">("todo");
   const block = useWriteBlock(readOnly);
@@ -231,8 +235,9 @@ export default function NeedsRail({
     waitingRoutines.length +
     routineProposals.length +
     routineStepHolds.length +
-    pendingDocuments.length;
-  const countKnown = Boolean(overviewData) || (privateHome && documentFollowUps?.status === "ready");
+    pendingDocuments.length + (templateCount ?? 0);
+  const countKnown = (Boolean(overviewData) || (privateHome && (documentFollowUps?.status === "ready" || templateCount !== undefined))) &&
+    (templateRail == null || templateCount !== undefined);
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
@@ -287,6 +292,12 @@ export default function NeedsRail({
   };
   const todoBody = (
     <>
+      <div onClickCapture={(event) => {
+        if (drawer && (event.target as Element).closest("[data-template-review-open]")) {
+          reviewOpening.current = true;
+          setDrawer(false);
+        }
+      }}>{templateRail}</div>
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {staged.notice && review === null && (
         <p className="todo-note text-label text-ink-300 px-3 pt-2" role="status">
