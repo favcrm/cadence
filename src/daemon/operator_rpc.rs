@@ -61,6 +61,16 @@ fn origin_param(params: &Value) -> Result<Origin> {
     }
 }
 
+/// Only the trusted relay supplies this board mode, never the browser form.
+pub(super) fn public_entry_required(params: &Value) -> Result<bool> {
+    match params.get("public_only") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| Error::invalid("invalid_request", "invalid board entry mode")),
+    }
+}
+
 /// The login link's typed audience is carried by the dedicated entry-login
 /// RPCs (pending reviewer PASS). The legacy board RPCs must not accept an
 /// entry audience at all.
@@ -363,11 +373,11 @@ impl Shared {
     /// `credential_entry_continue_mint {request_id, session}` — the trusted
     /// board's human Continue action. The UI peer must be the positive
     /// operator connection; `session` must be the actual live ordinary board
-    /// operator session (not public, not entry-scoped) with its durable
-    /// account. The pending request is resolved in this workspace/profile at
-    /// the current owner/core floor. The entry-purpose one-use link binds
-    /// the exact root-pinned origin AND that canonical request id. No
-    /// credential row/key is touched. The nonce never rides a URL.
+    /// operator session (keyed local/tailnet or verified public, never
+    /// entry-scoped) with its durable account. The pending request is resolved
+    /// in this workspace/profile at the current owner/core floor. The
+    /// one-use link binds the exact root-pinned origin and that canonical
+    /// request id. No credential row/key is touched. The nonce never rides a URL.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn rpc_credential_entry_continue_mint(
         &self,
@@ -383,10 +393,14 @@ impl Shared {
                 "board operator session is unavailable",
             )
         })?;
-        let session = self.ordinary_board_session(proof)?;
+        let session = self.verified_board_operator_session(proof)?;
+        let public_owner_hash = if session.origin == Origin::Public {
+            Some(auth::digest(required_str(proof, "token")?))
+        } else {
+            None
+        };
         let account_id = session
             .account_id
-            .clone()
             .filter(|account| !account.is_empty())
             .ok_or_else(|| {
                 Error::invalid(
@@ -394,9 +408,7 @@ impl Shared {
                     "board operator session is unavailable",
                 )
             })?;
-        let now = self.operator_now();
-        let request =
-            super::credential_entry_rpc::pending_request_for_login(self, request_id, now)?;
+        let request = super::credential_entry_rpc::pending_request_for_login(self, request_id)?;
         let entry_origin = self.protected_entry_origin().ok_or_else(|| {
             Error::invalid(
                 "entry_session_required",
@@ -405,11 +417,17 @@ impl Shared {
         })?;
         let scope = auth::LinkScope::Entry {
             origin: entry_origin.to_string(),
-            request_id: request.request_id.clone(),
+            handoff: auth::EntryHandoff {
+                request_id: request.request_id.clone(),
+                public_owner_hash,
+            },
         };
-        let nonce =
-            self.operator_auth()
-                .mint_for_account(Origin::Loopback, scope, now, account_id)?;
+        let nonce = self.operator_auth().mint_for_account(
+            Origin::Loopback,
+            scope,
+            self.operator_now(),
+            account_id,
+        )?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "credential_entry_continue_minted",
@@ -435,7 +453,8 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("credential entry continue open", params, peer_pid)?;
-        Self::entry_login_keys(params, &["nonce", "request_id"])?;
+        Self::entry_login_keys(params, &["nonce", "request_id", "public_only"])?;
+        let public_only = public_entry_required(params)?;
         let nonce = required_str(params, "nonce")?;
         let now = self.operator_now();
         let Some(request_id) = optional_str(params, "request_id") else {
@@ -466,7 +485,10 @@ impl Shared {
         };
         let scope = auth::LinkScope::Entry {
             origin: live.to_string(),
-            request_id: canonical.as_str().to_string(),
+            handoff: auth::EntryHandoff {
+                request_id: canonical.as_str().to_string(),
+                public_owner_hash: None,
+            },
         };
         let opened = self
             .operator_auth()
@@ -474,12 +496,26 @@ impl Shared {
         match opened {
             Ok(created) => {
                 let (opened, stored_scope) = created?;
-                let destination = match stored_scope {
-                    auth::LinkScope::Entry { request_id, .. } => request_id,
+                let handoff = match stored_scope {
+                    auth::LinkScope::Entry { handoff, .. } => handoff,
                     auth::LinkScope::Board => {
                         return Err(Error::internal("entry login produced a board session"))
                     }
                 };
+                let current = match handoff.public_owner_hash.as_deref() {
+                    Some(hash) => self
+                        .entry_public_owner_is_current(hash, opened.session.account_id.as_deref()),
+                    None => Ok(!public_only),
+                };
+                if !matches!(current, Ok(true)) {
+                    self.operator_auth().revoke_token(&opened.token)?;
+                    current?;
+                    return Err(Error::invalid(
+                        "entry_session_required",
+                        "a current owner session is required for this entry",
+                    ));
+                }
+                let destination = handoff.request_id;
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "credential_entry_continue_opened",
@@ -521,59 +557,86 @@ impl Shared {
         Ok(object)
     }
 
-    /// The actual live ordinary board operator session behind the human
-    /// Continue action. Entry-scoped and public sessions are rejected by the
-    /// ordinary check; the account and operator identity come from the row,
-    /// never from caller fields.
-    fn ordinary_board_session(&self, proof: &Value) -> Result<auth::SessionView> {
-        let object = proof.as_object().ok_or_else(|| {
+    /// Verify the ordinary board operator behind a protected management
+    /// action. Public cookies require the current board realm and effective
+    /// role; local/tailnet sessions still require a page key. Neither path
+    /// accepts an entry-scoped session.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn verified_board_operator_session(
+        &self,
+        proof: &Value,
+    ) -> Result<auth::SessionView> {
+        let unavailable = || {
             Error::invalid(
                 "entry_session_required",
                 "board operator session is unavailable",
             )
-        })?;
-        if object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "token" | "key" | "origin"))
-        {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
-        }
+        };
+        Self::entry_login_keys(proof, &["token", "key", "origin"])?;
         let token = required_str(proof, "token")?;
         let key = required_str(proof, "key")?;
-        let origin = origin_param(proof)?;
-        if token.is_empty() || key.is_empty() {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
+        let origin = Origin::parse(required_str(proof, "origin")?).ok_or_else(unavailable)?;
+        if origin == Origin::Public {
+            if !key.is_empty() {
+                return Err(unavailable());
+            }
+            self.require_live_public_entry_authority()?;
+            return match self.current_public_session(token)? {
+                public_membership::Authority::Granted {
+                    role: crate::board_identity::Role::Operator,
+                    view,
+                    ..
+                } => Ok(*view),
+                _ => Err(unavailable()),
+            };
         }
         let session = self
             .operator_auth()
-            .verified_session(token, key, origin, self.operator_now())?
-            .ok_or_else(|| {
-                Error::invalid(
-                    "entry_session_required",
-                    "board operator session is unavailable",
-                )
-            })?;
+            .check(token, key, origin, self.operator_now())?
+            .ok_or_else(unavailable)?;
         if session
-            .account_id
-            .as_deref()
-            .is_none_or(|account| account.is_empty())
-            || session
-                .user
-                .as_ref()
-                .is_some_and(|user| !user.is_operator())
+            .user
+            .as_ref()
+            .is_some_and(|user| !user.is_operator())
         {
-            return Err(Error::invalid(
-                "entry_session_required",
-                "board operator session is unavailable",
-            ));
+            return Err(unavailable());
         }
         Ok(session)
+    }
+
+    pub(super) fn entry_public_owner_is_current(
+        &self,
+        hash: &str,
+        account_id: Option<&str>,
+    ) -> Result<bool> {
+        use super::public_membership::Authority;
+        use crate::board_identity::Role;
+        self.require_live_public_entry_authority()?;
+        Ok(matches!(
+            self.current_session_for_hash(hash)?,
+            Authority::Granted {
+                role: Role::Operator,
+                view,
+                ..
+            } if account_id.is_some() && account_id == view.account_id.as_deref()
+        ))
+    }
+
+    /// Ordinary standalone sessions may use their signed role until expiry.
+    /// Custody requires an authority that can confirm current membership.
+    fn require_live_public_entry_authority(&self) -> Result<()> {
+        if matches!(
+            &self.membership_mode,
+            public_membership::MembershipMode::Native(_)
+                | public_membership::MembershipMode::Dedicated(_)
+        ) {
+            Ok(())
+        } else {
+            Err(Error::invalid(
+                "capability_unavailable",
+                "protected public credential entry requires a live owner authority",
+            ))
+        }
     }
 
     /// `operator_session_open_device {token, origin, user_agent?}` —
@@ -743,7 +806,9 @@ impl Shared {
         let key = optional_str(params, "key").unwrap_or_default();
         let entry_origin = required_str(params, "entry_origin")?;
         let now = self.operator_now();
-        let session = self.verify_entry_session(token, key, entry_origin, now)?;
+        let public_only = public_entry_required(params)?;
+        let session =
+            self.verify_entry_session(token, key, entry_origin, None, public_only, now)?;
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
@@ -930,6 +995,24 @@ impl Shared {
                 who.lane()
             )));
         }
+        // Only the local board peer relays this field, after its dedicated
+        // browser-intent check. A UI restarted without its startup setting
+        // cannot offer the legacy exchange to a still-dedicated daemon.
+        let deployment = params.get("dedicated_deployment");
+        let mode_matches = match &self.membership_mode {
+            public_membership::MembershipMode::Dedicated(ctx) => {
+                deployment.and_then(Value::as_str) == Some(ctx.deployment.as_str())
+            }
+            public_membership::MembershipMode::Standalone
+            | public_membership::MembershipMode::Native(_) => deployment.is_none(),
+            public_membership::MembershipMode::RequiredUnavailable => false,
+        };
+        if !mode_matches {
+            return Err(Error::invalid(
+                "capability_unavailable",
+                "board sign-in does not match the daemon's configured identity mode",
+            ));
+        }
         let assertion = required_str(params, "assertion")?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
         let prior_session = optional_str(params, "prior_session");
@@ -994,6 +1077,7 @@ impl Shared {
         // realm before any session opens; a standalone one saves the realm
         // it verified under. Captured mode is never re-read here.
         self.require_realm_matches_mode(&realm)?;
+        let dedicated = self.dedicated_mint_binding(&realm, &identity.user(), parsed.jti())?;
         // CAD-1412: the bound open also persists the verified `HumanScope`
         // (issuer + company), derived from this typed realm inside
         // `open_public_bound_with_intent` — never a request field.
@@ -1027,7 +1111,7 @@ impl Shared {
                 identity.user(),
                 (parsed.jti(), deadline),
                 user_agent,
-                realm,
+                (realm, dedicated),
                 opened_at,
                 |row| {
                     let a = open_audit(&company, &request, row);

@@ -165,6 +165,13 @@ mod board_producer_golden;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
+#[cfg(all(
+    test,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+mod credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod credential_entry_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
@@ -172,6 +179,13 @@ pub(crate) mod custody_rpc;
 pub(crate) mod native_model_turn;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod protected_connections;
+#[cfg(all(
+    test,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) use credential_entry_fixture::configure_credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod protected_management_rpc;
 // the frozen acceptance check and its genuine fixture.
@@ -945,6 +959,13 @@ pub struct Shared {
     smtp_test_ca: Option<Vec<u8>>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
+    #[cfg(all(
+        test,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    credential_entry_fixture: Option<Arc<credential_entry_fixture::Fixture>>,
     protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
     #[cfg_attr(
         not(all(target_os = "linux", target_arch = "x86_64")),
@@ -1153,7 +1174,21 @@ impl Shared {
         // The OCI custody profile uses the permitted coordination store, not
         // the separate sealed-store constructor. Its recovery waits for the
         // authenticated external ledger floor and checkpoint transport.
-        let (mut store, mut recovered) = if prepared.is_some() {
+        #[cfg(all(
+            test,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let fixture_active = opts.credential_entry_fixture.is_some();
+        #[cfg(not(all(
+            test,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )))]
+        let fixture_active = false;
+        let (mut store, mut recovered) = if prepared.is_some() || fixture_active {
             Store::open_unrecovered_mode(&db_path, crate::store::OpenMode::Legacy)?
         } else if execution_mode.fenced() {
             Store::open_unrecovered(&db_path)?
@@ -1175,6 +1210,25 @@ impl Shared {
                     recovered = store.run_guarded_recover(marker.as_ref(), owner_epoch)?;
                 }
             }
+        }
+        #[cfg(all(
+            test,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if let Some(fixture) = &opts.credential_entry_fixture {
+            if prepared.is_some() || execution_mode.fenced() {
+                return Err(Error::rejected(
+                    "fixture requires an unfenced ordinary test profile",
+                ));
+            }
+            fixture.install_store(&store)?;
+            recovered = store.run_guarded_recover(
+                marker.as_ref(),
+                cadence_core::connection_dispatch::primitives::Revision::new(1)
+                    .map_err(|_| Error::internal("invalid fixture owner epoch"))?,
+            )?;
         }
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
@@ -1471,6 +1525,13 @@ impl Shared {
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             protected: std::sync::OnceLock::new(),
+            #[cfg(all(
+                test,
+                feature = "test-seam",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            credential_entry_fixture: opts.credential_entry_fixture.clone(),
             protected_runtime: std::sync::OnceLock::new(),
             native_model: std::sync::OnceLock::new(),
             lease,
@@ -1487,6 +1548,15 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
+        #[cfg(all(
+            test,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if let Some(fixture) = &opts.credential_entry_fixture {
+            shared.install_protected(Some(fixture.owner()?))?;
+        }
         #[cfg(test)]
         if let Some(observer) = &opts.custody_acceptance_shared {
             *observer.lock().unwrap() = Some(shared.clone());
@@ -6283,6 +6353,13 @@ pub type WaitBaselineObserver = Arc<dyn Fn(&str, i64) + Send + Sync>;
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
+    #[cfg(all(
+        test,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) credential_entry_fixture: Option<Arc<credential_entry_fixture::Fixture>>,
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
     #[cfg(test)]
@@ -6810,11 +6887,30 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease))
         .transpose()?;
     let hot = hot_restart_begin(state_dir);
-    let membership =
-        public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
+    let membership = public_membership::MembershipMode::capture(&hosted, &|name| {
+        opts.provider_env.own(name).or_else(|| {
+            // A present but malformed setting is not an absent opt-in.
+            std::env::var_os(name).map(|raw| raw.into_string().unwrap_or_default())
+        })
+    });
     let (shared, prepared) = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
     // Two-phase init: the backend/coordinator holds a Weak back-reference, so
     // it is installed only after the Arc exists and before the listener binds.
+    #[cfg(all(
+        test,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    if opts.credential_entry_fixture.is_none() {
+        protected_runtime::initialize(&shared, prepared)?;
+    }
+    #[cfg(not(all(
+        test,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
     protected_runtime::initialize(&shared, prepared)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);

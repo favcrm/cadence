@@ -604,6 +604,9 @@ pub struct ServeOpts {
     /// command line — a test's board on a thread of the runner stops
     /// with its test instead of serving for the rest of the run.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Isolated acceptance fixture override; use the production config validator.
+    #[cfg(test)]
+    pub(crate) dedicated_deployment_for_test: Option<String>,
     /// Test-only barrier after a member batch is captured, before projection.
     #[cfg(test)]
     pub(crate) member_stream_batch_hook: Option<std::sync::Arc<MemberStreamBatchHook>>,
@@ -1239,6 +1242,8 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync: None,
         stop: None,
         #[cfg(test)]
+        dedicated_deployment_for_test: None,
+        #[cfg(test)]
         member_stream_batch_hook: None,
         #[cfg(test)]
         agent_detail_read_hook: None,
@@ -1323,7 +1328,7 @@ fn qr_term(text: &str) -> Option<String> {
 /// does not retry it. Blocking it on the test thread is inherited by every
 /// thread the rig spawns; `wait`/`waitpid` do not need it delivered.
 #[cfg(all(test, feature = "test-seam"))]
-fn block_sigchld() {
+pub(crate) fn block_sigchld() {
     // SAFETY: a local signal set and a mask change on the calling thread.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();

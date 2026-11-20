@@ -1743,6 +1743,10 @@ impl Shared {
 
     /// The loaded root-pinned entry origin, not an execution-readiness claim.
     pub(crate) fn protected_entry_origin(&self) -> Option<&str> {
+        #[cfg(all(test, feature = "test-seam", target_os = "linux"))]
+        if let Some(fixture) = &self.credential_entry_fixture {
+            return Some(&fixture.origin);
+        }
         self.protected_runtime
             .get()
             .map(|coordinator| coordinator.profile.operator_origin())
@@ -1759,6 +1763,17 @@ impl Shared {
                 "invalid_request",
                 "expected an empty metadata request",
             ));
+        }
+        #[cfg(all(test, feature = "test-seam", target_os = "linux"))]
+        if let Some(fixture) = &self.credential_entry_fixture {
+            let evidence = fixture.evidence()?;
+            return Ok(json!({"entry": {
+                "configured": true,
+                "protected": true,
+                "origin": fixture.origin,
+                "profile_digest": evidence.profile_digest,
+                "supervisor_generation": evidence.supervisor_generation,
+            }}));
         }
         let Some(coordinator) = self.protected_runtime.get() else {
             return Ok(json!({"entry": {"configured": false, "protected": false}}));

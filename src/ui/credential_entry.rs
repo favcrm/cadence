@@ -78,10 +78,11 @@ pub(super) fn accepts_host(opts: &ServeOpts, host: &str) -> bool {
 pub(super) struct EntryOrigin {
     origin: String,
     host: String,
+    pub(super) public_only: bool,
 }
 
 impl EntryOrigin {
-    fn parse(raw: &str) -> Option<Self> {
+    fn parse(raw: &str, public_only: bool) -> Option<Self> {
         let rest = raw.strip_prefix("https://")?;
         if rest.is_empty()
             || rest.len() > 200
@@ -99,6 +100,7 @@ impl EntryOrigin {
         Some(Self {
             origin: format!("https://{rest}"),
             host,
+            public_only,
         })
     }
 
@@ -107,7 +109,10 @@ impl EntryOrigin {
     /// no credential form is served anywhere) or the profile named one that
     /// is also a board origin.
     pub(super) fn from_opts(opts: &ServeOpts) -> Option<Self> {
-        let entry = Self::parse(opts.credential_entry_origin.as_deref()?)?;
+        let entry = Self::parse(
+            opts.credential_entry_origin.as_deref()?,
+            opts.board_public_only,
+        )?;
         entry.separate_from_board(opts).then_some(entry)
     }
 
@@ -270,10 +275,8 @@ fn legacy_secret_route(path: &str) -> bool {
 /// What the pinned origin serves: its entry page, the shell/assets and
 /// sign-in it needs, and the credential-request metadata/one-use routes.
 /// Everything else — every other board screen and API — is absent there.
-fn entry_origin_allows(path: &str) -> bool {
+fn entry_origin_allows(path: &str, board_public_only: bool) -> bool {
     path.starts_with("/assets/")
-        || path == "/login"
-        || path == "/login/"
         || is_entry_page(path)
         || matches!(
             path,
@@ -282,21 +285,23 @@ fn entry_origin_allows(path: &str) -> bool {
                 | "/api/version"
                 | "/api/locale"
                 | "/api/protected-entry"
-                | "/api/session"
                 | "/api/session/logout"
-                | "/api/session/device/code"
-                | "/api/session/device/poll"
         )
         || matches!(
             route(path),
-            Some(
-                Route::Collection
-                    | Route::Show(_)
-                    | Route::EntrySession(_)
-                    | Route::Submit(_)
-                    | Route::Cancel(_)
-            )
+            Some(Route::Show(_) | Route::EntrySession(_) | Route::Submit(_) | Route::Cancel(_))
         )
+        // A public-only board uses the signed board handoff, not local/device
+        // entry sign-in. New requests also start on the board, not here.
+        || (!board_public_only
+            && (matches!(
+                path,
+                "/login"
+                    | "/login/"
+                    | "/api/session"
+                    | "/api/session/device/code"
+                    | "/api/session/device/poll"
+            ) || matches!(route(path), Some(Route::Collection))))
 }
 
 /// The single origin gate `handle` runs before any handler or body read.
@@ -322,7 +327,7 @@ pub(super) fn gate(
                 ENTRY_ORIGIN_REQUIRED,
             ));
         }
-        if !entry_origin_allows(path) {
+        if !entry_origin_allows(path, opts.board_public_only) {
             return Some(err_response(404, "not found"));
         }
         return None;
@@ -366,6 +371,21 @@ fn entry_origin_proof(request: &Request, opts: &ServeOpts) -> Result<serde_json:
             super::operator::ENTRY_SESSION_REQUIRED,
         )
     })
+}
+
+/// Show/cancel also serve the ordinary board. Only the exact entry host
+/// forwards an entry proof, which limits it to the authorized request.
+fn request_selector(
+    request: &Request,
+    opts: &ServeOpts,
+    request_id: &str,
+) -> Result<Value, HttpResp> {
+    if accepts_host(opts, &request_host(request)) {
+        let proof = entry_origin_proof(request, opts)?;
+        Ok(json!({"request_id": request_id, "session": proof}))
+    } else {
+        Ok(json!({"request_id": request_id}))
+    }
 }
 
 /// The ordinary board-origin operator proof for protected management:
@@ -493,6 +513,26 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         };
     }
     request_id(tail).then_some(Route::Show(tail))
+}
+
+/// The only entry routes where a verified public-owner entry session may
+/// replace local TCP operator proof. Call this only after `board_caller`
+/// has checked the live session and attributed the peer.
+pub(super) fn public_scoped_owner_route(request: &Request, opts: &ServeOpts) -> bool {
+    if !opts.board_public_only
+        || super::operator::credential_entry_session_proof(request, opts).is_none()
+    {
+        return false;
+    }
+    let path = request.url().split('?').next().unwrap_or_default();
+    matches!(
+        (request.method(), route(path)),
+        (&Method::Get | &Method::Head, Some(Route::Show(_)))
+            | (
+                &Method::Post,
+                Some(Route::EntrySession(_) | Route::Submit(_) | Route::Cancel(_))
+            )
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -912,6 +952,7 @@ pub(super) fn authenticate(request: &mut Request, state: &Path, opts: &ServeOpts
         json!({
             "nonce": fields.nonce,
             "request_id": fields.request_id,
+            "public_only": opts.board_public_only,
         }),
     ) {
         Ok(value) => value,
@@ -1044,7 +1085,13 @@ pub(super) fn handle_read(
                 Err(response) => return response,
             },
         ),
-        Route::Show(id) => ("credential_request_show", json!({"request_id": id})),
+        Route::Show(id) => (
+            "credential_request_show",
+            match request_selector(request, opts, id) {
+                Ok(params) => params,
+                Err(response) => return response,
+            },
+        ),
         Route::ManagementStatus => (
             "protected_management_status",
             match management_status_params(request) {
@@ -1144,7 +1191,13 @@ pub(super) fn handle_write(
             if let Err(response) = empty_body(request) {
                 return response;
             }
-            ("credential_request_cancel", json!({"request_id": id}))
+            (
+                "credential_request_cancel",
+                match request_selector(request, opts, id) {
+                    Ok(params) => params,
+                    Err(response) => return response,
+                },
+            )
         }
         Route::Prepare => {
             let body: PrepareBody = match typed(request, BODY_CAP) {
@@ -1236,6 +1289,72 @@ pub(super) fn handle_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cad2487_public_only_auth_rejects_local_board_origin() {
+        use std::io::Read;
+
+        const BOARD_HOST: &str = "board.example.test";
+        const BOARD_ORIGIN: &str = "https://board.example.test";
+        const ENTRY_HOST: &str = "entry.example.test";
+        const LOCAL_ORIGIN: &str = "http://cadence-3110.localhost:3110";
+        // A browser-shaped form, but the nonce must fail parsing so even a
+        // broken origin gate cannot forward this request to a daemon.
+        const FORM: &str = "nonce=not-issued&request_id=0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+
+        let state = tempfile::tempdir().unwrap();
+        let opts = ServeOpts {
+            host: "127.0.0.1".into(),
+            port: 3110,
+            board_public_only: true,
+            public: Some(crate::ui::PublicBoard {
+                host: BOARD_HOST.into(),
+                issuer: "https://identity.example.test".into(),
+                company: "co_test".into(),
+                authorize_url: "https://identity.example.test/authorize".into(),
+            }),
+            credential_entry_origin: Some("https://entry.example.test".into()),
+            ..ServeOpts::default()
+        };
+
+        for (host, origin, status) in [
+            (ENTRY_HOST, LOCAL_ORIGIN, 403),
+            (BOARD_HOST, BOARD_ORIGIN, 404),
+            (ENTRY_HOST, BOARD_ORIGIN, 400),
+        ] {
+            let mut request: Request = tiny_http::TestRequest::new()
+                .with_https()
+                .with_remote_addr("192.0.2.1:12345".parse().unwrap())
+                .with_method(Method::Post)
+                .with_path(AUTH_PATH)
+                .with_body(FORM)
+                .with_header(Header::from_bytes("Host", host).unwrap())
+                .with_header(Header::from_bytes("Origin", origin).unwrap())
+                .with_header(
+                    Header::from_bytes("Content-Type", "application/x-www-form-urlencoded")
+                        .unwrap(),
+                )
+                .with_header(Header::from_bytes("Sec-Fetch-Mode", "navigate").unwrap())
+                .into();
+
+            let response = authenticate(&mut request, state.path(), &opts);
+            assert_eq!(response.status_code().0, status, "{origin} → {host}");
+            assert!(
+                !response
+                    .headers()
+                    .iter()
+                    .any(|header| header.field.equiv("Set-Cookie")),
+                "{origin} → {host} must not issue a cookie"
+            );
+            let mut unread = Vec::new();
+            Read::read_to_end(request.as_reader(), &mut unread).unwrap();
+            if (host, origin) == (ENTRY_HOST, BOARD_ORIGIN) {
+                assert!(unread.is_empty(), "the public form must reach the parser");
+            } else {
+                assert_eq!(unread.as_slice(), FORM.as_bytes(), "{origin} → {host}");
+            }
+        }
+    }
 
     #[test]
     fn exact_routes_and_canonical_request_ids() {

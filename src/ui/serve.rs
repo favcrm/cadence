@@ -1945,12 +1945,13 @@ fn run_serialized_write(
     state_dir: &Path,
     pm_dir: &Path,
     opts: &ServeOpts,
+    dedicated: Option<&str>,
     within: Duration,
 ) -> Option<Request> {
     let Some(_guard) = acquire_write_lock(within) else {
         return Some(request);
     };
-    handle(request, state_dir, pm_dir, opts);
+    handle(request, state_dir, pm_dir, opts, dedicated);
     None
 }
 
@@ -1967,7 +1968,13 @@ fn board_busy_response() -> HttpResp {
     resp
 }
 
-fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
+fn handle(
+    mut request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
+) {
     // CAD-482: a seam-armed board honors the assertion headers; the
     // scope makes the asserted identity visible to attribution and to
     // the daemon calls this request relays. Absent headers, or absent
@@ -2093,9 +2100,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // CAD-747: a hosted agent shares this network namespace and can dial
     // the board's loopback port (or the image's blind TCP relay) itself.
     // Host is therefore a surface selector, never proof of the Worker.
-    // In hosted-only mode the public board session gate must cover every
-    // protected route, even when the caller chooses a local Host.
-    if opts.board_public_only && !public_host {
+    // In public-only mode a local Host still cannot reach the board.
+    // The separately pinned entry host has already passed its own narrower
+    // route/origin gate above; it never enters the public board dispatcher.
+    if opts.board_public_only && !public_host && !at_entry_origin {
         if matches!(method, Method::Get | Method::Head)
             && raw_path == "/api/health"
             && raw_query.is_empty()
@@ -2141,10 +2149,12 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {
-                ("GET" | "HEAD", "/__platform/login") => operator::platform_login(opts, raw_query),
-                ("GET" | "HEAD", _) => operator::platform_read(&path),
+                ("GET" | "HEAD", "/__platform/login") => {
+                    operator::platform_login(opts, raw_query, dedicated)
+                }
+                ("GET" | "HEAD", _) => operator::platform_read(&path, dedicated),
                 ("POST", "/__platform/session") => {
-                    operator::platform_session(&mut request, state_dir, opts)
+                    operator::platform_session(&mut request, state_dir, opts, dedicated)
                 }
                 _ => operator::platform_unknown(),
             };
@@ -2286,7 +2296,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             Ok(admission) => Some(admission),
             Err(resp) => {
                 let resp = if public_host && resp.status_code().0 == 401 {
-                    operator::session_bounce(&request, &path, opts)
+                    operator::session_bounce(&request, &path, opts, dedicated)
                 } else {
                     resp
                 };
@@ -3904,6 +3914,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     }
 }
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    let dedicated = operator::dedicated_config(opts)?.map(std::sync::Arc::<str>::from);
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
@@ -4126,8 +4137,12 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         };
         // Thread per request: `/api/stream` holds its connection open
         // for the session's lifetime and must not starve the board.
-        let (state_dir, pm_dir, opts) =
-            (state_dir.to_path_buf(), pm_dir.to_path_buf(), opts.clone());
+        let (state_dir, pm_dir, opts, dedicated) = (
+            state_dir.to_path_buf(),
+            pm_dir.to_path_buf(),
+            opts.clone(),
+            dedicated.clone(),
+        );
         std::thread::spawn(move || {
             // CAD-777: the device sign-in exchange is exempt — its
             // handlers make issuer HTTP calls (up to 20 s each), so a
@@ -4136,16 +4151,21 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             // the pending map under its own mutex, and the daemon
             // serializes the mint itself.
             if serialized_write(request.method(), request.url()) {
-                if let Some(busy) =
-                    run_serialized_write(request, &state_dir, &pm_dir, &opts, WRITE_LOCK_WAIT)
-                {
+                if let Some(busy) = run_serialized_write(
+                    request,
+                    &state_dir,
+                    &pm_dir,
+                    &opts,
+                    dedicated.as_deref(),
+                    WRITE_LOCK_WAIT,
+                ) {
                     // A writer that never returns must not queue the board
                     // behind it: answer the retryable refusal the client
                     // already renders as busy (CAD-1653).
                     let _ = busy.respond(board_busy_response());
                 }
             } else {
-                handle(request, &state_dir, &pm_dir, &opts);
+                handle(request, &state_dir, &pm_dir, &opts, dedicated.as_deref());
             }
         });
     }
@@ -4421,6 +4441,7 @@ mod write_lock_tests {
             state.path(),
             pm.path(),
             &ServeOpts::default(),
+            None,
             Duration::from_millis(50),
         );
         assert!(refused.is_some(), "a held writer must not dispatch");
@@ -4432,6 +4453,7 @@ mod write_lock_tests {
                 state.path(),
                 pm.path(),
                 &ServeOpts::default(),
+                None,
                 Duration::from_millis(50),
             )
             .is_none(),
@@ -4448,6 +4470,65 @@ mod write_lock_tests {
         assert!(poisoned.join().is_err());
         let guard = acquire_write_lock(Duration::from_millis(50));
         assert!(guard.is_some(), "a poisoned lock is recovered, as before");
+    }
+}
+
+#[cfg(test)]
+mod protected_entry_host_tests {
+    use super::*;
+
+    #[test]
+    fn cad2487_public_only_board_serves_handoff_only_on_pinned_host() {
+        let state = tempfile::tempdir().unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let board = "board.example.test";
+        let entry = "entry.example.test";
+        let opts = ServeOpts {
+            port,
+            allow_hosts: vec![board.into()],
+            board_public_only: true,
+            public: Some(crate::ui::PublicBoard {
+                host: board.into(),
+                issuer: "https://identity.example.test".into(),
+                company: "co_test".into(),
+                authorize_url: "https://identity.example.test/authorize".into(),
+            }),
+            credential_entry_origin: Some(format!("https://{entry}")),
+            ..ServeOpts::default()
+        };
+        let id = "0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+        let handoff = format!("/connections/enroll/{id}");
+        let scope = state.path();
+        let local = format!("127.0.0.1:{port}");
+        let cases = [
+            (entry, handoff.as_str(), 200),
+            (board, handoff.as_str(), 404),
+            (entry, "/api/projects", 404),
+            (entry, "/api/credential-requests", 404),
+            (entry, "/api/session/device/code", 404),
+            (local.as_str(), "/api/projects", 421),
+        ];
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                for _ in 0..cases.len() {
+                    let request = server
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                    handle(request, scope, scope, &opts, None);
+                }
+            });
+            for (host, path, status) in cases {
+                let (actual, body) =
+                    crate::ui::http_get("127.0.0.1", port, path, host, &[]).unwrap();
+                assert_eq!(actual, status, "{host}{path}: {body}");
+                if status == 200 {
+                    assert!(body.contains(&format!("https://{board}/connections/authorize/{id}")));
+                    assert!(!body.contains("<input"), "handoff cannot collect secrets");
+                }
+            }
+        });
     }
 }
 

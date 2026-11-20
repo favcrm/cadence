@@ -515,6 +515,12 @@ pub struct PublicRealm {
     pub host: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DedicatedBinding {
+    pub deployment: String,
+    pub assertion_jti: String,
+}
+
 /// CAD-1374: a stored public row's identity, with no authority claim.
 /// `revoked` lets a denial be audited against a withdrawn session.
 pub(crate) struct PublicSnapshot {
@@ -522,6 +528,7 @@ pub(crate) struct PublicSnapshot {
     pub view: SessionView,
     pub realm: Option<PublicRealm>,
     pub revoked: bool,
+    pub dedicated: Option<DedicatedBinding>,
 }
 
 /// The verified platform tenancy a public session was opened under
@@ -553,6 +560,9 @@ struct Row {
     /// the ordinary board check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     entry_origin: Option<String>,
+    /// Private continuation scope. Device sessions do not use a board link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_handoff: Option<EntryHandoff>,
     created: i64,
     last_used: i64,
     expires_at: i64,
@@ -573,6 +583,8 @@ struct Row {
     /// legacy public rows and on every local session.
     #[serde(default)]
     realm: Option<PublicRealm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dedicated: Option<DedicatedBinding>,
     /// CAD-1374: the platform authority of a public row is withdrawn. The
     /// row keeps its identity until its normal TTL, so a denial can name
     /// who was refused, but no authority lookup returns it.
@@ -684,25 +696,41 @@ struct SessionsFile {
     jtis: HashMap<String, i64>,
 }
 
-/// The typed audience of one login link. A board link can never be
-/// exchanged on the trusted credential-entry origin, and an entry link can
-/// never become a board session.
-///
-/// An entry audience binds BOTH the exact root-pinned origin AND the exact
-/// canonical request UUID whose genuine human Continue authorized it. The
-/// session created from it carries only the entry-origin scope; the request
-/// selector is consumed once and returned as the destination, never stored
-/// as broad session authority.
+/// Private continuation scope, never part of the browser session view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntryHandoff {
+    pub request_id: String,
+    pub public_owner_hash: Option<String>,
+}
+
+/// The typed audience of one login link. A board link and an entry link
+/// never exchange on one another's origin. The entry audience and source
+/// authority survive in the entry session, not in browser-supplied fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LinkScope {
     Board,
-    /// The dedicated entry-login RPCs bind the exact root-pinned origin AND
-    /// the canonical request UUID whose genuine human Continue authorized
-    /// it. The resulting session carries only the entry-origin scope.
+    /// Compare only the audience at exchange. The source authority comes
+    /// exclusively from the nonce's stored scope.
     Entry {
         origin: String,
-        request_id: String,
+        handoff: EntryHandoff,
     },
+}
+
+impl LinkScope {
+    fn same_audience(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Board, Self::Board) => true,
+            (
+                Self::Entry { origin, handoff },
+                Self::Entry {
+                    origin: other_origin,
+                    handoff: other_handoff,
+                },
+            ) => origin == other_origin && handoff.request_id == other_handoff.request_id,
+            _ => false,
+        }
+    }
 }
 
 /// The daemon's operator-auth state: live link nonces (memory only — a
@@ -909,14 +937,21 @@ impl Auth {
         if now > expires {
             return Err(LinkRefusal::Expired);
         }
-        if minted_for != origin || stored_scope != scope {
+        if minted_for != origin || !stored_scope.same_audience(&scope) {
             return Err(LinkRefusal::WrongOrigin);
         }
-        let entry_origin = match &stored_scope {
-            LinkScope::Board => None,
-            LinkScope::Entry { origin, .. } => Some(origin.clone()),
+        let (entry_origin, entry_handoff) = match &stored_scope {
+            LinkScope::Board => (None, None),
+            LinkScope::Entry { origin, handoff } => (Some(origin.clone()), Some(handoff.clone())),
         };
-        let opened = self.create(origin, user_agent, now, account_id, entry_origin);
+        let opened = self.create(
+            origin,
+            user_agent,
+            now,
+            account_id,
+            entry_origin,
+            entry_handoff,
+        );
         Ok(opened.map(|opened| (opened, stored_scope)))
     }
 
@@ -944,6 +979,7 @@ impl Auth {
         now: i64,
         account_id: Option<String>,
         entry_origin: Option<String>,
+        entry_handoff: Option<EntryHandoff>,
     ) -> Result<Opened> {
         let token = random_credential()?;
         let key = random_credential()?;
@@ -952,6 +988,7 @@ impl Auth {
             key_hash: digest(&key),
             origin,
             entry_origin,
+            entry_handoff,
             created: now,
             last_used: now,
             expires_at: now + ABSOLUTE_SECS,
@@ -959,6 +996,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -1049,6 +1087,7 @@ impl Auth {
             key_hash: digest(&key),
             origin,
             entry_origin,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + crate::device_login::REMOTE_ABSOLUTE_SECS,
@@ -1056,6 +1095,7 @@ impl Auth {
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -1085,7 +1125,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (None, None, None),
+            (None, None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1109,7 +1149,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (Some(realm), None, None),
+            (Some(realm), None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1125,7 +1165,7 @@ impl Auth {
         user: BoardUser,
         jti: (&str, i64),
         user_agent: &str,
-        realm: PublicRealm,
+        (realm, dedicated): (PublicRealm, Option<DedicatedBinding>),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1139,7 +1179,7 @@ impl Auth {
             user,
             jti,
             user_agent,
-            (Some(realm), Some(scope), None),
+            (Some(realm), Some(scope), None, dedicated),
             now,
             intent,
         )
@@ -1150,7 +1190,12 @@ impl Auth {
         user: BoardUser,
         (jti, jti_exp): (&str, i64),
         user_agent: &str,
-        (realm, scope, account_id): (Option<PublicRealm>, Option<HumanScope>, Option<String>),
+        (realm, scope, account_id, dedicated): (
+            Option<PublicRealm>,
+            Option<HumanScope>,
+            Option<String>,
+            Option<DedicatedBinding>,
+        ),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1182,6 +1227,7 @@ impl Auth {
             key_hash: String::new(),
             origin: Origin::Public,
             entry_origin: None,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + PUBLIC_SESSION_SECS,
@@ -1189,6 +1235,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: Some(user),
             realm,
+            dedicated,
             revoked: false,
             scope,
             account_id,
@@ -1282,32 +1329,56 @@ impl Auth {
         origin: Origin,
         now: i64,
     ) -> Result<Option<SessionView>> {
-        self.check_scoped(token, key, origin, None, now)
+        self.check_scoped(token, key, origin, None, now, Row::view)
     }
 
     /// Verify one live session bound to the exact root-pinned entry origin.
     /// An ordinary board session never matches, and an entry session can
     /// never satisfy [`Self::check`]: the entry cookie is a distinct scope,
     /// not board authority.
-    pub fn check_entry(
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn check_entry(
         &mut self,
         token: &str,
         key: &str,
         entry_origin: &str,
+        request_id: Option<&str>,
         now: i64,
-    ) -> Result<Option<SessionView>> {
-        let requested = Origin::Loopback;
-        self.check_scoped(token, key, requested, Some(entry_origin), now)
+    ) -> Result<Option<(SessionView, Option<String>)>> {
+        let checked = self.check_scoped(
+            token,
+            key,
+            Origin::Loopback,
+            Some(entry_origin),
+            now,
+            |row| {
+                let public_owner_hash = match &row.entry_handoff {
+                    Some(handoff) => {
+                        if request_id.is_some_and(|id| id != handoff.request_id) {
+                            return None;
+                        }
+                        handoff.public_owner_hash.clone()
+                    }
+                    // Device entry was authorized directly, not by a
+                    // board handoff. Other old rows must reauthorize.
+                    None if row.user.as_ref().is_some_and(BoardUser::is_operator) => None,
+                    None => return None,
+                };
+                Some((row.view(), public_owner_hash))
+            },
+        )?;
+        Ok(checked.flatten())
     }
 
-    fn check_scoped(
+    fn check_scoped<T>(
         &mut self,
         token: &str,
         key: &str,
         origin: Origin,
         entry_origin: Option<&str>,
         now: i64,
-    ) -> Result<Option<SessionView>> {
+        project: impl FnOnce(&Row) -> T,
+    ) -> Result<Option<T>> {
         let mut dirty = self.prune(now);
         if !well_formed(token) || !well_formed(key) {
             if dirty {
@@ -1341,7 +1412,7 @@ impl Auth {
                     row.last_used = now;
                     dirty = true;
                 }
-                row.view()
+                project(row)
             });
         if dirty {
             self.persist()?;
@@ -1605,6 +1676,7 @@ impl Auth {
             hash: row.hash.clone(),
             view: row.view(),
             realm: row.realm.clone(),
+            dedicated: row.dedicated.clone(),
             revoked: row.revoked,
         })
     }
@@ -1619,6 +1691,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
     }
@@ -1641,6 +1714,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
             .collect()
@@ -1695,6 +1769,59 @@ mod tests {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
     }
 
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn cad2487_continued_entry_session_cannot_authorize_another_request() {
+        let dir = state();
+        let mut auth = Auth::load(dir.path());
+        let now = 1_000;
+        let entry = "https://entry.example.test";
+        let request = "0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+        let account = "acu-11111111111111111111111111111111";
+        let owner_hash = digest("synthetic public session");
+        let scope = |public_owner_hash| LinkScope::Entry {
+            origin: entry.into(),
+            handoff: EntryHandoff {
+                request_id: request.into(),
+                public_owner_hash,
+            },
+        };
+        let nonce = auth
+            .mint_for_account(
+                Origin::Loopback,
+                scope(Some(owner_hash.clone())),
+                now,
+                account.into(),
+            )
+            .unwrap();
+        let (opened, _) = auth
+            .open_scoped(&nonce, Origin::Loopback, scope(None), "", now)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            auth.open_scoped(&nonce, Origin::Loopback, scope(None), "", now),
+            Err(LinkRefusal::AlreadyUsed)
+        ));
+
+        let mut auth = Auth::load(dir.path());
+        let (session, parent) = auth
+            .check_entry(&opened.token, &opened.key, entry, Some(request), now)
+            .unwrap()
+            .expect("the exchanged session can authorize the original request");
+        assert_eq!(session.account_id.as_deref(), Some(account));
+        assert_eq!(parent.as_deref(), Some(owner_hash.as_str()));
+        assert!(auth
+            .check_entry(
+                &opened.token,
+                &opened.key,
+                entry,
+                Some("1b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b"),
+                now,
+            )
+            .unwrap()
+            .is_none());
+    }
+
     /// CAD-1006 follow-up: the cap binds a session by its row's FULL
     /// credential hash, not the 8-hex display `id`. Two rows that share
     /// the same first-8 prefix but differ after: revoking one must NOT
@@ -1713,6 +1840,7 @@ mod tests {
             key_hash: "k".repeat(64),
             origin: Origin::Loopback,
             entry_origin: None,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + 10_000,
@@ -1720,6 +1848,7 @@ mod tests {
             max_idle_secs: IDLE_SECS,
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id: None,

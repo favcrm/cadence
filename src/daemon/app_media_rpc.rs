@@ -917,9 +917,9 @@ impl Shared {
                 let (media_type, bytes) = adapter
                     .read_app_media_original(&credential, config, &descriptor)
                     .map_err(Error::rejected)?;
-                // Native public membership cannot run under these guards.
+                // Live public authority cannot be checked under these guards.
                 // Refresh it after they drop, then pin the exact result.
-                if self.native_public_original(origin) {
+                if self.live_public_original(origin) {
                     public_body = Some((media_type, bytes, credential, descriptor));
                     return Ok(None);
                 }
@@ -1041,7 +1041,7 @@ impl Shared {
             action_token,
         } = request;
         let verb = "media original";
-        // Native public membership is refreshed OUTSIDE the runtime and
+        // Live public authority is refreshed OUTSIDE the runtime and
         // release guards, exactly as the provider path does, and the
         // pinned proof is then re-checked inside them.
         let proof = self.original_public_proof(token, origin, action_token, ctx)?;
@@ -1179,7 +1179,7 @@ impl Shared {
     }
 
     /// The caller side of the original authority for sessions whose proof is
-    /// local. Native public membership HTTP is refused here so it cannot run
+    /// local. Live public authority HTTP is refused here so it cannot run
     /// under the caller's PM, custody or release guards.
     fn original_mount_current(
         &self,
@@ -1189,9 +1189,9 @@ impl Shared {
         action_token: &str,
         expected: &ToolContext,
     ) -> Result<()> {
-        if self.native_public_original(origin) {
+        if self.live_public_original(origin) {
             return Err(Error::internal(
-                "media original public membership must be refreshed outside native guards",
+                "media original public authority must be refreshed outside runtime guards",
             ));
         }
         let verb = "media original";
@@ -1215,16 +1215,17 @@ impl Shared {
         self.original_mount_matches(&ctx, expected)
     }
 
-    fn native_public_original(&self, origin: Origin) -> bool {
+    fn live_public_original(&self, origin: Origin) -> bool {
         origin == Origin::Public
             && matches!(
                 self.membership_mode,
                 crate::daemon::public_membership::MembershipMode::Native(_)
+                    | crate::daemon::public_membership::MembershipMode::Dedicated(_)
             )
     }
 
-    /// `None` unless this is a native public session. The lookup, including
-    /// both central membership paths, finishes before the caller takes guards.
+    /// `None` unless this is a public session backed by live platform authority.
+    /// The lookup finishes before the caller takes guards.
     fn original_public_proof(
         &self,
         token: &str,
@@ -1232,7 +1233,7 @@ impl Shared {
         action_token: &str,
         expected: &ToolContext,
     ) -> Result<Option<OriginalPublicProof>> {
-        if !self.native_public_original(origin) {
+        if !self.live_public_original(origin) {
             return Ok(None);
         }
         self.original_public_fresh(token, action_token, expected)
@@ -1280,7 +1281,7 @@ impl Shared {
         })
     }
 
-    /// Re-check the exact fresh native decision under guards already held.
+    /// Re-check the exact fresh platform decision under guards already held.
     /// Local row, realm, mount and approval only. No second membership lookup.
     fn original_public_pinned(
         &self,
@@ -1857,7 +1858,7 @@ struct OriginalPublicProof {
 /// under the held guards before the write: runtime snapshot,
 /// `platform_custody_lock` and `app_release_lock` (pm → custody → release),
 /// the producing binding, approvals and active context, then the caller's
-/// live session and consumed mount. Native public membership HTTP is
+/// live session and consumed mount. Live public authority is
 /// refreshed before those guards and pinned locally inside them. The write
 /// itself is one nonblocking send inside the guards. No guard is held
 /// across a `WouldBlock` wait, so a revoke serializes with a single send.

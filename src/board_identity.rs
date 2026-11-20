@@ -58,6 +58,26 @@ pub fn accepted_until(exp: i64) -> i64 {
     exp + SKEW_SECS
 }
 
+pub(crate) fn dedicated_deployment_ok(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+pub(crate) fn dedicated_issuer_ok(s: &str) -> bool {
+    let Ok(uri) = s.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("https")
+        && uri.path() == "/"
+        && uri.query().is_none()
+        && uri.authority().is_some_and(|authority| {
+            !authority.as_str().contains('@')
+                && s.strip_prefix("https://") == Some(authority.as_str())
+        })
+}
+
 /// The daemon-side trust root for public-name sign-in: this board's
 /// public host (the assertion's `aud`), the platform issuer (`iss` —
 /// also the JWKS origin) and the one company this instance serves.
