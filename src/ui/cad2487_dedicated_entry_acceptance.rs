@@ -249,8 +249,28 @@ fn cad2487_owner_entry_requires_same_live_platform_session() {
     // this fixture independent of every other concurrent issuer test.
     let module = module_path!().split_once("::").unwrap().1;
     let name = format!("{module}::dedicated_owner_entry_isolated");
+    let home = tempfile::Builder::new()
+        .prefix("cad2487-child-home-")
+        .tempdir()
+        .unwrap();
+    let config = home.path().join("config");
+    let data = home.path().join("data");
+    let cache = home.path().join("cache");
+    let state = home.path().join("state");
+    let runtime = home.path().join("runtime");
+    for dir in [&config, &data, &cache, &state, &runtime] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let output = Command::new(std::env::current_exe().unwrap())
         .env_clear()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("PATH", "/usr/bin:/bin")
         .arg("--exact")
         .arg(name)
         .arg("--ignored")
@@ -331,6 +351,10 @@ fn dedicated_owner_entry_isolated() {
     }));
     let deadline = Instant::now() + Duration::from_secs(30);
     while !state.join("cadence.sock").exists() {
+        assert!(
+            !servers.threads[0].is_finished(),
+            "daemon exited during startup"
+        );
         assert!(Instant::now() < deadline, "daemon startup");
         std::thread::sleep(Duration::from_millis(20));
     }
