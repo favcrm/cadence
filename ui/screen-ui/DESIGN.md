@@ -50,7 +50,10 @@ container, or top tab bars — including re-applying `var(--color-ink-950)` or
 hardcoded hex values — because an opaque app canvas or filled tab-bar stripe
 clashes with the board whenever the host theme updates. Apply surface fills
 (`--color-ink-850`, `--color-ink-875`, `--color-ink-800`) only to discrete
-components (cards, tables, inputs, popovers, drawers).
+components (cards, tables, inputs, popovers, drawers). The host
+`.app-shell-outlet` also owns the outer page inset (`1.25rem 2rem` on desktop,
+`1rem` below `1024px`), matching native board pages — keep app roots at
+`padding: 0` instead of adding a second outer gutter.
 
 Use `--font-sans` (IBM Plex Sans with system fallbacks), and `.num` /
 `--font-mono` (IBM Plex Mono) for tabular numbers. Use the existing type scale:

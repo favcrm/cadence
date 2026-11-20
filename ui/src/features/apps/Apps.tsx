@@ -16,6 +16,7 @@ import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
+import { Select } from "../../ui/Select";
 import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
@@ -195,8 +196,15 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const pin = (id: string) => {
     const cur = favs?.favorites ?? [];
     const next = cur.includes(id) ? cur.filter((f) => f !== id) : [...cur, id];
+    setActionError(null);
     setPinned(favs ? { ...favs, favorites: next } : { favorites: next, workspace_default: [], recent: [] });
-    void appExplorer.putFavorites(next).catch(() => { setPinned(null); setRevision((r) => r + 1); });
+    void appExplorer.putFavorites(next)
+      .then((saved) => { setPinned(saved); })
+      .catch((e: unknown) => {
+        setPinned(null);
+        setActionError(t(appErrorCopy(e, "Couldn't save favorites. Try again in a moment.")));
+        setRevision((r) => r + 1);
+      });
   };
   const opened = (id: string) => { void appExplorer.opened(id).catch(() => {}); };
   const restore = (id: string) => {
@@ -386,11 +394,17 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                     ))}
                   </div>
                   <div className="apps-bar-right">
-                    <select className="field apps-sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label={t("Sort")}>
-                      <option value="recent">{t("Recently used")}</option>
-                      <option value="name">{t("Name")}</option>
-                      <option value="attention">{t("Needs attention first")}</option>
-                    </select>
+                    <Select
+                      value={sort}
+                      onChange={(value) => setSort(value as typeof sort)}
+                      aria-label={t("Sort")}
+                      className="apps-sort"
+                      options={[
+                        { value: "recent", label: t("Recently used") },
+                        { value: "name", label: t("Name") },
+                        { value: "attention", label: t("Needs attention first") },
+                      ]}
+                    />
                     <div className="apps-view-switch" role="group" aria-label={t("Layout")}>
                       <button
                         type="button"
@@ -431,27 +445,6 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                   <div className="apps-kicker-row">
                     <h2 className="apps-kicker">{t("Favorites")}</h2>
                     {favorites.length > 0 && <span className="apps-count-pill num">{favorites.length}</span>}
-                    {live.length > 0 && (
-                      <>
-                        <span className="grow" />
-                        <details className="favpick">
-                          <summary>{t("Choose favorites")}</summary>
-                          <div className="favpick-list" role="group" aria-label={t("Choose favorites")}>
-                            {live.map((h) => (
-                              <label key={h.install_id} className="favpick-row">
-                                <input
-                                  type="checkbox"
-                                  checked={favoriteIds.has(h.install_id)}
-                                  disabled={favs === null}
-                                  onChange={() => pin(h.install_id)}
-                                />
-                                <span className="favpick-name">{localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t)}</span>
-                              </label>
-                            ))}
-                          </div>
-                        </details>
-                      </>
-                    )}
                   </div>
                   {favorites.length > 0 ? (
                     <div className="apps-pinned-dock">
@@ -495,7 +488,7 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                   ) : (
                     <p className="apps-fav-inline-hint">
                       <span aria-hidden>★</span>
-                      <span>{t("Pin any app with ★ or Choose favorites to keep everyday tools here and in the sidebar.")}</span>
+                      <span>{t("Pin any app with ★ to keep everyday tools here.")}</span>
                     </p>
                   )}
                 </section>

@@ -144,14 +144,11 @@ async function main() {
     assert(new URL(settings.href).pathname === "/apps/manage/inst-a",
       `settings opens Manage, got ${new URL(settings.href).pathname}`);
   });
-  // 3. Choosing another favorite preserves both it and the existing favorite after reload.
+  // 3. Pinning another favorite via its card star preserves both it and the existing favorite after reload.
   await check("pin round-trip", async () => {
-    const label = Array.from(host.querySelectorAll("label")).find((row) => row.textContent?.trim() === "Social Content");
-    const summary = label?.closest("details")?.querySelector("summary");
-    const checkbox = label?.querySelector("input[type='checkbox']");
-    assert(summary instanceof HTMLElement && checkbox instanceof HTMLInputElement, "the app is available in the favorites chooser");
-    await React.act(() => summary.click());
-    await React.act(() => checkbox.click());
+    const pinButton = host.querySelector("button[aria-label='Pin Social Content']");
+    assert(pinButton instanceof HTMLElement, "the card pin button is available for Social Content");
+    await React.act(() => pinButton.click());
     await flush();
     await React.act(() => root.render(React.createElement("div")));
     await React.act(() => root.render(React.createElement(Apps, { viewer: operator })));
