@@ -109,7 +109,7 @@ afterEach(async () => {
 
 async function session(
   respond: (requests: readonly RequestRecord[]) => Response | Promise<Response>,
-  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean } = {},
+  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean; backgroundTokens?: number } = {},
 ) {
   const { HostedSession } = await import("../src/hosted-session.ts");
   const database = new Database(":memory:");
@@ -178,7 +178,7 @@ async function session(
       telemetry: wired.modelTaskContext.telemetry,
       settings: () => ({
         retry: { enabled: false },
-        compaction: { backgroundTokens: 0, keepRecentTokens: options.keepRecentTokens ?? 20_000, ...(options.reserveTokens === undefined ? {} : { reserveTokens: options.reserveTokens }) },
+        compaction: { backgroundTokens: options.backgroundTokens ?? 0, keepRecentTokens: options.keepRecentTokens ?? 20_000, ...(options.reserveTokens === undefined ? {} : { reserveTokens: options.reserveTokens }) },
       }),
     },
     BACKGROUND_CONTEXT,
@@ -417,6 +417,57 @@ describe("gateway byte-budget recovery", () => {
     const thread = await run.hosted.transcript(false);
     expect(failed(thread).at(-1)?.payload?.error).toBe(CONTEXT_BUDGET_EXCEEDED_TEXT);
     expect(JSON.stringify(thread)).not.toContain("private summary failure");
+  });
+
+  it("answers the next chat turn while a passive summary is still running", async () => {
+    const summarizing = Promise.withResolvers<void>();
+    const finishSummary = Promise.withResolvers<void>();
+    const generating = Promise.withResolvers<void>();
+    const finishGeneration = Promise.withResolvers<void>();
+    let foregroundRequests = 0;
+    const run = await session(async (requests) => {
+      if (isSummary(requests.at(-1)!.input)) {
+        summarizing.resolve();
+        await finishSummary.promise;
+        return answer("Summary of earlier work.");
+      }
+      if (++foregroundRequests === 3) {
+        generating.resolve();
+        await finishGeneration.promise;
+      }
+      return answer("Acknowledged.");
+    }, { keepRecentTokens: 1, reserveTokens: 0, backgroundTokens: 128_001 });
+    cleanups.push(() => Promise.resolve(finishSummary.resolve()));
+    cleanups.push(() => Promise.resolve(finishGeneration.resolve()));
+
+    await (await run.submit("Earlier work.")).wait(BACKGROUND_CONTEXT);
+    const previous = await run.submit("Continue.");
+    await summarizing.promise;
+    expect((await previous.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+
+    expect(await run.hosted.settledOperation("operation-2")).toMatchObject({ state: "unknown" });
+    expect(await run.hosted.settledOperation("operation-2", "chat")).toMatchObject({
+      state: "settled", status: "done",
+    });
+    expect(await run.hosted.settledOperation("operation-3", "chat")).toMatchObject({ state: "absent" });
+
+    const next = await run.submit("One more message.");
+    await generating.promise;
+    // A passive summary must not mask a simultaneous live foreground request.
+    expect(await run.hosted.settledOperation("operation-2", "chat")).toMatchObject({ state: "unknown" });
+    expect(await run.hosted.settledOperation("operation-3", "chat")).toMatchObject({ state: "unknown" });
+    expect(await run.hosted.settledOperation("operation-4", "chat")).toMatchObject({ state: "unknown" });
+    finishGeneration.resolve();
+    expect((await next.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+    expect(await run.hosted.settledOperation("operation-3", "chat")).toMatchObject({
+      state: "settled", status: "done",
+    });
+    expect(await run.hosted.settledOperation("operation-4", "chat")).toMatchObject({ state: "absent" });
+    const thread = await run.hosted.transcript(false);
+    expect(thread.filter(entry => entry.role === "operator").map(entry => entry.text)).toEqual([
+      "Earlier work.", "Continue.", "One more message.",
+    ]);
+    expect(thread.at(-1)?.text).toBe("Acknowledged.");
   });
 
   // CAD-2480: a thread of large HTML tool-call arguments is far over the

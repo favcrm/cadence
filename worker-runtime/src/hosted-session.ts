@@ -1002,14 +1002,16 @@ export class HostedSession<
   /**
    * Inspect durable settlement without opening the engine or waking work.
    * Absence is evidence only; the host must separately fence admission.
+   * Only interactive chat admission may opt in to overlapping a passive summary.
    */
-  async settledOperation(operationId: string): Promise<OperationSettlement> {
+  async settledOperation(operationId: string, mode?: "chat"): Promise<OperationSettlement> {
     const id = requireOperationId(operationId);
     const conversation = String(ROOT_CONVERSATION_ID);
     const settlement = readSubmissionSettlement(
       this.ctx.storage.sql as unknown as TaskSql,
       ROOT_CONVERSATION_ID,
       id,
+      mode === "chat",
     );
     if (settlement.state === "settled")
       return {

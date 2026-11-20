@@ -374,6 +374,36 @@ function terminalOutcome(value: unknown): boolean {
   }
 }
 
+/** Only Pi's conversation-owned, tool-free threshold summary can overlap chat admission. */
+function passiveSummary(task: Record<string, unknown>, state: Record<string, unknown>): boolean {
+  if (task.kind !== "pi.compaction" || task.version !== 1 || task.owner !== undefined ||
+      task.background !== true || task.abortRequested !== false || state.outcome !== undefined)
+    return false;
+  const input = task.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input) ||
+      !("reason" in input) || input.reason !== "threshold" || "instructions" in input)
+    return false;
+  const checkpoint = state.checkpoint;
+  if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+    return false;
+  const request = checkpoint as Record<string, unknown>;
+  const active = state.status === "pending" || state.status === "running";
+  if (request.phase === "select") return active;
+  const model = request.model;
+  if (!isEntryId(request.attempt) || !isEntryId(request.tail) ||
+      !isEntryId(request.firstKept) || request.firstKept > request.tail ||
+      typeof request.maxTokens !== "number" || !Number.isSafeInteger(request.maxTokens) ||
+      request.maxTokens < 0 || typeof request.thinkingLevel !== "string" ||
+      typeof request.streamOptions !== "object" || request.streamOptions === null ||
+      Array.isArray(request.streamOptions) || typeof model !== "object" || model === null ||
+      Array.isArray(model) || !("provider" in model) || typeof model.provider !== "string" ||
+      !model.provider || !("modelId" in model) || typeof model.modelId !== "string" || !model.modelId)
+    return false;
+  if (request.phase === "summarize") return active;
+  return request.phase === "retry" && typeof request.until === "number" &&
+    Number.isFinite(request.until) && (active || (state.status === "sleeping" && state.until === request.until));
+}
+
 function entryHasRole(sql: TaskSql, id: number, conversationId: number, role: string): boolean {
   const rows = sql.exec(
     "SELECT id, conversation_id, record FROM pi_entries WHERE id=?",
@@ -390,14 +420,16 @@ function entryHasRole(sql: TaskSql, id: number, conversationId: number, role: st
 }
 
 /**
- * Prove one submission's terminal state without opening the engine. Both
- * positive and absent evidence require every conversation and task to be at
- * rest. Inconsistent indexes or records cannot prove either result.
+ * Prove one submission's terminal state without opening the engine. Chat
+ * admission may overlap a passive summary in the target conversation. It
+ * still requires every other task and every submission to be terminal.
+ * Inconsistent indexes or records cannot prove either result.
  */
 export function readSubmissionSettlement(
   sql: TaskSql,
   conversationId: number,
   operationId: string,
+  allowPassiveSummary = false,
 ): SubmissionSettlement {
   const schema = sql.exec(
     `SELECT name, type FROM sqlite_master
@@ -433,15 +465,18 @@ export function readSubmissionSettlement(
         typeof record.version !== "number" ||
         !Object.hasOwn(record, "input") ||
         typeof record.background !== "boolean" || Number(record.background) !== row.background ||
-        typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested ||
-        row.status !== "terminal"
+        typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested
       )
         return { state: "unknown" };
       const state = record.state;
       if (typeof state !== "object" || state === null || Array.isArray(state))
         return { state: "unknown" };
-      const terminal = state as Record<string, unknown>;
-      if (terminal.status !== "terminal" || terminal.checkpoint !== undefined || !terminalOutcome(terminal.outcome))
+      const taskState = state as Record<string, unknown>;
+      if (taskState.status !== row.status) return { state: "unknown" };
+      if (taskState.status === "terminal") {
+        if (taskState.checkpoint !== undefined || !terminalOutcome(taskState.outcome))
+          return { state: "unknown" };
+      } else if (!allowPassiveSummary || conversation !== conversationId || !passiveSummary(record, taskState))
         return { state: "unknown" };
       taskAfter = id;
     }

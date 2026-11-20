@@ -152,6 +152,10 @@ starting 1.4 against upgraded data.
 waking the engine. It returns `settled`, `absent` or `unknown`; positive
 evidence requires all conversations and background tasks to be at rest.
 Malformed or inconsistent records return `unknown`, and failed reads throw.
+Interactive chat admission may pass `"chat"` as the second argument. This allows
+only an automatic, conversation-owned threshold summary in that conversation
+to remain active. Live user inputs and any other active task still make
+settlement `unknown`. Reset, dispatch and routines use the strict default.
 Absence is not a fence: the host must separately prevent or await admission
 before relying on it. The result is a point-in-time proof, not evidence of
 external effects or of another deployment's state.
