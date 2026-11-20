@@ -250,6 +250,8 @@ export interface AppPaneProps {
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
+  /** CAD-2512: moves the live app page to a section/record (a same-app view card). */
+  onShowRoute?: (route: { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }) => void;
   onMediaTarget?: (target: MediaComposerTarget) => () => void;
 }
 
@@ -687,7 +689,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onShowRoute, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
   const { locale, t, formatNumber } = useLocale();
   const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
@@ -1300,7 +1302,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     },
     convId,
   );
-  const viewScope = useMemo(() => ({ installId, contextId: mode.contextId }), [installId, mode.contextId]);
+  const viewScope = useMemo(() => ({ installId, contextId: mode.contextId, showHere: onShowRoute }), [installId, mode.contextId, onShowRoute]);
   useCanvasFeed({
     conversation: convId,
     surface: "app",

@@ -5,7 +5,7 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
-import { HOME_VIEW_SCOPE, parseViewRef, viewCardAppView, type ViewScope } from "../home/chatCards";
+import { HOME_VIEW_SCOPE, parseViewRef, viewCardAppView, viewHere, type ViewScope } from "../home/chatCards";
 import { isArtifactPutCall, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
@@ -76,7 +76,7 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
       const model = parseViewRef(item.entry);
       const ref = model && viewCardAppView(model, viewScope);
       const message = item.entry.message ?? null;
-      if (ref) views.push({ key: `view:${item.key}`, ref, live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      if (ref) views.push({ key: `view:${item.key}`, ref, ...(model && viewHere(model, viewScope) ? { here: true as const } : {}), live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
       continue;
     }
     if (item.type !== "artifact") continue;
@@ -142,11 +142,12 @@ export function useCanvasFeed(opts: {
   const { conversation, surface, composerKey, items, loaded, running, autoOpen } = opts;
   const scopeInstall = opts.viewScope?.installId ?? null;
   const scopeContext = opts.viewScope?.contextId ?? HOME_VIEW_SCOPE.contextId;
+  const showHere = opts.viewScope?.showHere;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;
     if (mark.current.seq === null) mark.current.seq = topSeq(items);
-    feedCanvas({ conversation, surface, composerKey, autoOpen, ...feedParts(items, mark.current.seq, running, { installId: scopeInstall, contextId: scopeContext }) });
-  }, [conversation, surface, composerKey, items, loaded, running, autoOpen, scopeInstall, scopeContext]);
+    feedCanvas({ conversation, surface, composerKey, autoOpen, showHere, ...feedParts(items, mark.current.seq, running, { installId: scopeInstall, contextId: scopeContext, showHere }) });
+  }, [conversation, surface, composerKey, items, loaded, running, autoOpen, scopeInstall, scopeContext, showHere]);
 }

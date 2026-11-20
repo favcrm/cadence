@@ -518,6 +518,12 @@ export function parseViewRef(entry: ThreadEntry): ViewCardModel | null {
 export interface ViewScope {
   installId: string | null;
   contextId: string;
+  /** The app pane's own page: moves it to a route through the full-page app's route path. Absent on Home. */
+  showHere?: (route: AppViewRef["route"]) => void;
+}
+/** A card for the installation whose page is on screen moves that page; it opens no canvas tab. */
+export function viewHere(model: ViewCardModel, scope: ViewScope): boolean {
+  return scope.showHere !== undefined && scope.installId === model.installId;
 }
 export const HOME_VIEW_SCOPE: ViewScope = { installId: null, contextId: "default" };
 

@@ -65,6 +65,10 @@ export function appViewTitle(id: string, openedTitle: string, route: ScreenRoute
   return route.record_id ?? route.section;
 }
 
+export function sameRoute(a: ScreenRoute, b: ScreenRoute): boolean {
+  return a.section === b.section && a.view === b.view && a.record_id === b.record_id && a.segment_id === b.segment_id;
+}
+
 /** A route patch from inside the frame, applied to the tab's own route.
  *  The full-page app writes the same patch to the board URL; here it goes nowhere else. */
 export function applyRoutePatch(route: ScreenRoute, patch: RoutePatch): ScreenRoute {

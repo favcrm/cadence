@@ -2,10 +2,10 @@ import { createContext, useContext, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
-import { appViewId } from "../canvas/appView";
+import { appViewId, sameRoute } from "../canvas/appView";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
-import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, type ViewScope } from "./chatCards";
+import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, viewHere, type ViewScope } from "./chatCards";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -15,9 +15,11 @@ import type { ThreadEntry } from "./thread";
  * viewer's own session. A payload that does not parse, or names a section the
  * installation does not declare, shows the entry's text line instead.
  *
- * States: Open (its tab is showing), the Open button (closed), No access (the
- * install cannot be read: 401/403) and Not found (404, removed, or a reference
- * the tab would refuse).
+ * States: Open (its tab is showing its record), Opened (its tab moved away; the
+ * Open button brings it back), the Open button (closed), Shown in <App> (CAD-2512:
+ * the card is for the app page already on screen, so clicking moves that page and
+ * opens no tab), No access (the install cannot be read: 401/403) and Not found
+ * (404, removed, or a reference the tab would refuse).
  */
 
 /** Which install and context the surrounding conversation belongs to (the app pane sets it). */
@@ -50,13 +52,14 @@ function useInstallProbe(installId: string | null): Probe {
   return probe;
 }
 
-export type ViewState = "showing" | "denied" | "missing" | "closed";
+export type ViewPlace = "showing" | "moved" | "closed" | "here";
+export type ViewState = ViewPlace | "denied" | "missing";
 
 /** The card's state: a refused install beats everything; an unopenable reference is Not found. */
-export function viewState(probe: Probe["status"], openable: boolean, showing: boolean): ViewState {
+export function viewState(probe: Probe["status"], openable: boolean, place: ViewPlace): ViewState {
   if (probe === "denied") return "denied";
   if (probe === "missing" || !openable) return "missing";
-  return showing ? "showing" : "closed";
+  return place;
 }
 
 export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; density?: CardDensity }) {
@@ -70,10 +73,14 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
   // The host writes only declared sections; a screen that does not list it means the card is stale.
   if (probe.sections !== null && !probe.sections.includes(model.section)) return line;
   const ref = viewCardAppView(model, scope);
-  const showing = ref !== null && canvas.open && canvas.active === appViewId(ref);
-  const state = viewState(probe.status, ref !== null, showing);
+  const tab = ref === null ? undefined : canvas.tabs.find((x) => x.id === appViewId(ref));
+  const moved = ref !== null && tab?.app !== undefined && !sameRoute(tab.app.route, ref.route);
+  const where: ViewPlace = viewHere(model, scope) ? "here" : moved ? "moved" : ref !== null && canvas.open && canvas.active === appViewId(ref) ? "showing" : "closed";
+  const state = viewState(probe.status, ref !== null, where);
   const status = {
     showing: { text: t("Open"), tone: "ok" as const },
+    moved: { text: t("Opened"), tone: "muted" as const },
+    here: undefined,
     denied: { text: t("No access"), tone: "warn" as const },
     missing: { text: t("Not found"), tone: "muted" as const },
     closed: undefined,
@@ -93,7 +100,11 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
       subject={<span className="viewcard-title" title={model.title}>{model.title}</span>}
       status={status}
       footer={
-        state === "closed" && ref !== null ? (
+        ref === null ? null : state === "here" ? (
+          <button type="button" className="btn btn-ghost" data-view-here onClick={() => scope.showHere?.(ref.route)}>
+            {t("Shown in {app}").replace("{app}", model.appLabel)}
+          </button>
+        ) : state === "closed" || state === "moved" ? (
           <button type="button" className="btn btn-primary" data-view-open onClick={() => openAppView(ref)}>
             {t("Open")}
           </button>

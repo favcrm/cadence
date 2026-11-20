@@ -94,6 +94,7 @@
 .canvas-pdf { display: grid; gap: 6px; align-content: start; }
 .canvas-image { max-width: 100%; height: auto; }
 .cv-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 7px 12px; border-top: 1px solid var(--color-ink-800); background: var(--color-ink-850); color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
+.cv-foot-ro { min-width: 0; overflow-wrap: anywhere; }
 
 /* The thread's artifact card. */
 .artcard { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; max-width: min(100%, 26rem); padding: 9px 10px; border: 1px solid var(--color-ink-700); border-radius: 10px; background: var(--color-ink-850); cursor: pointer; transition: border-color 0.15s ease; }

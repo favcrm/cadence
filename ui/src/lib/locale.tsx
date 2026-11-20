@@ -2385,6 +2385,9 @@ Object.assign(zhTW, {
   "No access": "沒有存取權限",
   "Live": "即時",
   "Shown as you": "以你的身分顯示",
+  "Shown in {app}": "顯示於 {app}",
+  "Opened": "已開啟",
+  "Read-only here · Open in {app} to edit": "此處唯讀 · 請在 {app} 開啟以編輯",
   "This screen could not be opened.": "無法開啟此畫面。",
   "Retry": "重試",
   // CAD-2475: the canvas view card.
