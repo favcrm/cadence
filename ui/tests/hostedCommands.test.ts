@@ -114,7 +114,7 @@ async function main() {
   await settle();
 
   await type("/");
-  assert(menu().length === 1 && menu()[0].includes("help"), `a hosted menu offers help alone (got ${menu().length})`);
+  assert(menu().length === 2 && menu().some((row) => row.includes("/help")) && menu().some((row) => row.includes("/skills")), "an unadvertised hosted menu offers only local Help and Skills");
 
   requests.length = 0;
   await type("/compact");
@@ -160,7 +160,7 @@ async function main() {
   assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
   assert(!help.includes("/compact") && !help.includes("/model") && !help.includes("/permissions"), "help lists only what this board can run");
-  assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
+  assert(help.includes("/skills") && help.includes("Browse approved workspace skills"), "help identifies the local skills browser");
 
   // A board that advertises a verb gets it in the menu and sends it.
   await React.act(async () => { root.render(null); });
@@ -169,7 +169,7 @@ async function main() {
   await React.act(async () => { resources.masterState.write(() => master as never); });
   await mount(true);
   await type("/");
-  assert(menu().length === 3, `a hosted menu offers what the board advertises (got ${menu().length})`);
+  assert(menu().length === 4 && menu().some((row) => row.includes("/new")) && menu().some((row) => row.includes("/stop")), "a hosted menu adds the server’s advertised verbs");
   requests.length = 0;
   await type("/new");
   await enter();

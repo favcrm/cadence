@@ -39,7 +39,7 @@ import {
   useConversationActor,
   useHostedPersonalBootstrap,
 } from "../assistant/AssistantIdentity";
-import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
+import { displayName, personalAssistantProfileHref, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
@@ -1257,11 +1257,16 @@ function MasterHome({
     !readOnly,
     personalBootstrap.identity,
   );
-  // Hosted Home can carry a personal actor over the Master transport.
+  // A hosted Master transport can serve a personal conversation. Only an
+  // explicit workspace projection admits the workspace profile link.
+  const workspaceProfile =
+    hosted === false ||
+    (hosted === true && operator === true && homeProjection?.scope === "workspace" &&
+      homeProjection.conversation_id === homeConversation);
   const profileHref =
-    actor.scope === "workspace" && actor.read.state === "ready" && masterRow && (hosted === false || operator === true)
+    actor.scope === "workspace" && actor.read.state === "ready" && masterRow && workspaceProfile
       ? `/agents/${MASTER}?tab=instructions`
-      : undefined;
+      : personalAssistantProfileHref(actor.scope, actor.read, agents);
   const onRetrySend = useCallback(
     (
       message: string,

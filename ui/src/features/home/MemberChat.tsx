@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
-import { useResource } from "../../lib/useResource";
+import { resources } from "../../lib/resources";
+import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
@@ -12,7 +13,6 @@ import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
-import { readRailCollapsed, writeRailCollapsed } from "./needs";
 import { useDockHeight } from "./useDockHeight";
 import {
   applyMemberEarlier,
@@ -49,6 +49,7 @@ import {
   displayName,
   messageLabel,
   messagePlaceholder,
+  personalAssistantProfileHref,
   readPersonalIdentity,
   scopeDescriptor,
   type AvatarLook,
@@ -107,7 +108,7 @@ export default function MemberChat({
   templateCount?: number;
 }) {
   const t = useTranslate();
-  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
+  const roster = useQuery(resources.agents);
   const store = memberThreadStore(scope);
   const thread = useResource(store);
   // The member scope is never named in stream-resource invalidations
@@ -418,9 +419,7 @@ export default function MemberChat({
     <AssistantActorProvider actor={actor}>
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)] ${
-      !hasRail ? "" : railCollapsed
-        ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
-        : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
+      hasRail ? "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]" : ""
     }`}>
       <section className="min-w-0 flex flex-col min-h-0 gap-4" aria-label={t("assistant thread")}>
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
@@ -453,7 +452,7 @@ export default function MemberChat({
                   {t("Finish setup")}
                 </button>
               )}
-              <AssistantAboutButton />
+              <AssistantAboutButton profileHref={personalAssistantProfileHref(actor.scope, actor.read, roster)} />
             </div>
           </div>
 
@@ -553,11 +552,6 @@ export default function MemberChat({
             templateCount={templateCount}
             readOnly={readOnly}
             decisions={decisions}
-            collapsed={railCollapsed}
-            onToggleCollapse={() => {
-              writeRailCollapsed(!railCollapsed);
-              setRailCollapsed(!railCollapsed);
-            }}
           />
         </aside>
       )}

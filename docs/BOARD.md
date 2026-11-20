@@ -2439,11 +2439,10 @@ to I3+.
 
 ## Overview — needs-me + deploy drift
 
-The landing screen answers two questions at a glance: *what is waiting
-on a human or the PM right now, and with which command*, and *is what
-we merged actually running*. `GET /api/overview` derives the whole
-payload at read time — nothing is stored; `cadence overview [--json]
-[--watch <secs>]` renders the same data as an aligned terminal list.
+Home's rail answers what is waiting for the viewer. The former `/overview`
+page is retired; Home and Apps still use `GET /api/overview`, which derives
+its payload at read time. `cadence overview [--json] [--watch <secs>]` renders
+the same data as a terminal list.
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
@@ -3179,9 +3178,11 @@ without starting an agent session.
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/projects[/:slug[/epics|/milestones|/context]]`, `/agents[/:alias]`, `/setup` and
 `/settings[/memory]`; the nav shows Home, Projects, Agents and Settings.
-Home's rail shows To do and Updates; its narrow-screen drawer can be closed.
-On a board that shows the workspace assistant, its Home About dialog links to
-the Master profile's Instructions tab when the roster and viewer allow it.
+Home's desktop rail always shows To do and Updates; on narrow screens it opens
+as a dismissible drawer. Home About links to the active assistant's Instructions
+tab: the Master profile for a confirmed workspace actor with access, or My
+assistant when a signed-in personal actor has its own roster row. A missing
+personal row never falls back to Master.
 
 Threads notifications (CAD-1423) group received messages by authorized conversation
 in the header inbox. Unread respects both actually viewed thread messages and the
