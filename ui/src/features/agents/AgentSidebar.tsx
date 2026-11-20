@@ -39,6 +39,7 @@ export default function AgentSidebar({
   query,
   onQuery,
   onOpen,
+  onOpenPersonal,
   onOverview,
   onRecruit,
 }: {
@@ -54,16 +55,17 @@ export default function AgentSidebar({
   query: string;
   onQuery: (query: string) => void;
   onOpen: (alias: string) => void;
+  onOpenPersonal: (() => void) | null;
   onOverview: () => void;
   onRecruit: () => void;
 }) {
   const t = useTranslate();
-  const row = (alias: string, face: ReactNode, status: string, title?: string, current = open === alias) => (
+  const row = (alias: string, face: ReactNode, status: string, title?: string) => (
     <button
       key={alias}
       type="button"
       className="ag-side-row"
-      aria-current={current ? "page" : undefined}
+      aria-current={open === alias && !(onOpenPersonal && alias === PERSONAL_ALIAS) ? "page" : undefined}
       onClick={() => onOpen(alias)}
     >
       {face}
@@ -100,9 +102,6 @@ export default function AgentSidebar({
               p.alias,
               <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />,
               profileStatus(p),
-              undefined,
-              // The personal row owns `/agents/assistant`, so a hired `assistant` is not the open page.
-              open === p.alias && !(personal && p.alias === PERSONAL_ALIAS),
             ),
           ),
       ];
@@ -143,12 +142,12 @@ export default function AgentSidebar({
         >
           <span className="t">{t("Overview")}</span>
         </button>
-        {personal && (
+        {personal && onOpenPersonal && (
           <button
             type="button"
             className="ag-side-row"
             aria-current={open === PERSONAL_ALIAS ? "page" : undefined}
-            onClick={() => onOpen(PERSONAL_ALIAS)}
+            onClick={onOpenPersonal}
           >
             <AgentAvatar slug={agentLook(PERSONAL_ALIAS, { look: personal.look })} size={28} still />
             <span className="min-w-0">
@@ -178,7 +177,7 @@ export default function AgentSidebar({
             </div>
           ),
         )}
-        {groups.length === 0 && query.trim() !== "" && (
+        {!personal && groups.length === 0 && query.trim() !== "" && (
           <p className="ag-side-none" role="status">
             {t("No agents match “{query}”.").replace("{query}", () => query)}{" "}
             <button type="button" className="lnk" onClick={() => onQuery("")}>

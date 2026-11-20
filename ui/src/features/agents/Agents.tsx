@@ -115,8 +115,13 @@ export default function Agents({
   // Agents belong to the team, not a project: the roster lists them all.
   // CAD-2353: the company Master is for owners; a hosted roster that names the
   // personal assistant does not list it to anyone else.
-  const allAgents = (payload?.agents ?? []).filter((a) => masterShownTo(a, payload, hostedBoard, operator));
+  const roster = payload?.agents ?? [];
+  const allAgents = roster.filter((a) => masterShownTo(a, payload, hostedBoard, operator));
   const personal = personalOf(payload);
+  const scopedRoster =
+    hostedBoard &&
+    ((payload != null && Object.hasOwn(payload, "personal_assistant")) ||
+      roster.some((a) => isCompanyMaster(a, payload)));
   const companyMaster = allAgents.find((a) => isCompanyMaster(a, payload)) ?? null;
   const personalMatches =
     personal !== null &&
@@ -156,8 +161,14 @@ export default function Agents({
   const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.alias)];
   const askMaster = onAsk;
   // Until the company Master chat exists, its row opens its page, not a chat.
-  const openAgent = (alias: string) =>
-    alias === MASTER && companyMaster && operator === true ? setOpen(alias, "instructions") : setOpen(alias);
+  const openAgent = (alias: string) => {
+    if (scopedRoster && alias === PERSONAL_ALIAS) {
+      onToast("err", t("Agent details are unavailable."));
+      return;
+    }
+    if (alias === MASTER && companyMaster && operator === true) setOpen(alias, "instructions");
+    else setOpen(alias);
+  };
   const seat = (a: Agent) => (
     <SeatCard
       key={a.alias}
@@ -211,6 +222,7 @@ export default function Agents({
         query={query}
         onQuery={setQuery}
         onOpen={openAgent}
+        onOpenPersonal={scopedRoster ? () => setOpen(PERSONAL_ALIAS) : null}
         onOverview={() => setOpen(null)}
         onRecruit={() => onRecruit(true)}
       />
@@ -220,6 +232,32 @@ export default function Agents({
 
   if (open === PERSONAL_ALIAS && personal) {
     return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
+  }
+  const personalUnavailable = scopedRoster && open === PERSONAL_ALIAS;
+  if (personalUnavailable || (scopedRoster && open === MASTER && operator !== true)) {
+    return shell(
+      <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+        <button type="button" className="rc-back" onClick={() => setOpen(null)}>
+          ← {t("Agents")}
+        </button>
+        {personalUnavailable ? (
+          <>
+            <p className="rc-note" role="status">{t("Agent details are unavailable.")}</p>
+            <Button onClick={onRetry}>{t("Retry")}</Button>
+          </>
+        ) : operator === null ? (
+          <>
+            <p className="rc-note">{t("We couldn’t confirm your access")}</p>
+            <Button onClick={onRetryAccess}>{t("Retry")}</Button>
+          </>
+        ) : (
+          <>
+            <p className="rc-note">{t("Chat with the company Master is for owners. Your assistant is on Home.")}</p>
+            <Button href="/">{t("Open Home")}</Button>
+          </>
+        )}
+      </main>,
+    );
   }
   if (open) {
     return shell(
@@ -242,6 +280,7 @@ export default function Agents({
         operator={operator}
         onRetryAccess={onRetryAccess}
         hostedBoard={hostedBoard}
+        scopedRoster={scopedRoster}
         companyMaster={open === MASTER && companyMaster !== null}
         hiredWork={openHired ? profileWork(openHired, issueCards) : null}
         onToast={onToast}
@@ -348,7 +387,7 @@ export default function Agents({
                 profile={profile}
                 roleTitle={profileTitle(profile)}
                 work={profileWork(profile, issueCards)}
-                onOpen={() => setOpen(profile.alias)}
+                onOpen={() => openAgent(profile.alias)}
               />
             ))}
             {!searching && tile}

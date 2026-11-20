@@ -15,10 +15,12 @@ import {
   saveNative,
   saveOwn,
   savedText,
+  stored,
   type DocDeps,
   type DocKind,
   type DocOutcome,
   type OwnDeps,
+  type OwnKind,
   type OwnDoc,
 } from "./instructionsDoc";
 
@@ -29,38 +31,27 @@ export const liveDeps: DocDeps = {
   writeNative: (alias, text) => api.setAgentInstructions(alias, text),
 };
 
-/** The two ends of CAD-2354's seam: each board route's own revision type and
- *  body shape, so everything above it sees one `OwnDoc`. The Master's write is
- *  `POST /api/master/identity`, which takes the identity as a whole, so the
- *  name, tone and look read with the text ride along unchanged. */
+/** Both routes fence their own instructions. A Master write omits other
+ *  identity fields so separately edited name, tone and look are preserved. */
 export const liveOwnDeps: OwnDeps = {
   read: async (kind) => {
     if (kind === "personal") {
       const r = await api.memberAssistInstructions();
       return { text: r.instructions ?? "", revision: r.revision };
     }
-    const [r, state] = await Promise.all([api.masterInstructions(), api.masterState()]);
-    const { name, tone, look } = state.identity;
-    return { text: r.instructions ?? "", revision: r.revision, identity: { name: name ?? null, tone: tone ?? null, look } };
+    const r = await api.masterInstructions();
+    return { text: r.instructions ?? "", revision: r.revision };
   },
   write: async (kind, base, text) => {
-    const instructions = text.trim();
     if (kind === "personal") {
-      const r = await api.memberAssistProfileUpdate({ expected_revision: Number(base.revision), action: "update", instructions });
+      const r = await api.memberAssistProfileUpdate({ expected_revision: Number(base.revision), action: "update", instructions: text });
       // No revision in the answer means the save is not confirmed; a check reads it.
       const revision = r.assistant?.identity?.revision;
       if (typeof revision !== "number") throw new Error("The saved revision was not returned.");
-      return { text: instructions, revision };
+      return { text: stored(kind, text), revision };
     }
-    const id = base.identity;
-    const r = await api.masterIdentityUpdate({
-      expected_revision: String(base.revision),
-      ...(id?.name != null ? { name: id.name } : {}),
-      ...(id?.tone != null ? { tone: id.tone } : {}),
-      ...(id ? { look: id.look } : {}),
-      instructions,
-    });
-    return { text: instructions, revision: r.identity.revision, ...(id ? { identity: { ...id, name: r.identity.name ?? null, tone: r.identity.tone ?? null, look: r.identity.look } } : {}) };
+    const r = await api.masterIdentityUpdate({ expected_revision: String(base.revision), instructions: text });
+    return { text: stored(kind, text), revision: r.identity.revision };
   },
 };
 
@@ -310,6 +301,20 @@ export function useInstructionsDoc(opts: {
   const text = draft ?? served ?? "";
   const ready = writable && kind !== null && state === "ready";
 
+  async function readOwnConflict(scope: OwnKind, adoptRead: (doc: OwnDoc) => void, error: string) {
+    if (busy.current) return;
+    busy.current = true;
+    setWorking("check");
+    try {
+      adoptRead(await ownDeps.read(scope));
+    } catch {
+      toast("err", error);
+    } finally {
+      busy.current = false;
+      setWorking(null);
+    }
+  }
+
   const checkJob = (): (() => Promise<DocOutcome>) | null => {
     const s = sent.current;
     if (!s) return null;
@@ -345,13 +350,10 @@ export function useInstructionsDoc(opts: {
           void run(() => saveOwn(ownDeps, kind, theirsOwn, text), text, null, theirsOwn);
           return;
         }
-        ownDeps
-          .read(kind)
-          .then((doc) => {
-            setTheirsOwn(doc);
-            toast("warn", "Their version was read. Save mine again to write over it.");
-          })
-          .catch(() => toast("err", "Could not read their version, so nothing was saved."));
+        void readOwnConflict(kind, (doc) => {
+          setTheirsOwn(doc);
+          toast("warn", "Their version was read. Save mine again to write over it.");
+        }, "Could not read their version, so nothing was saved.");
         return;
       }
       if (kind !== "hosted" || profileId === null) return;
@@ -371,17 +373,13 @@ export function useInstructionsDoc(opts: {
     },
     useTheirs: () => {
       if (isOwnKind(kind)) {
-        if (busy.current) return;
-        ownDeps
-          .read(kind)
-          .then((doc) => {
-            setOwn(doc);
-            setTheirsOwn(null);
-            setDraftState(null);
-            setPhase("idle");
-            toast("ok", "Loaded their version. Your draft is discarded.");
-          })
-          .catch(() => toast("err", "Could not read their version. Your draft is kept."));
+        void readOwnConflict(kind, (doc) => {
+          setOwn(doc);
+          setTheirsOwn(null);
+          setDraftState(null);
+          setPhase("idle");
+          toast("ok", "Loaded their version. Your draft is discarded.");
+        }, "Could not read their version. Your draft is kept.");
         return;
       }
       if (kind !== "hosted" || profileId === null || busy.current) return;

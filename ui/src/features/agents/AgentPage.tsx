@@ -82,6 +82,7 @@ export default function AgentPage({
   operator,
   onRetryAccess,
   hostedBoard,
+  scopedRoster = false,
   companyMaster,
   hiredWork,
   onToast,
@@ -106,6 +107,7 @@ export default function AgentPage({
   operator: boolean | null;
   onRetryAccess: () => void;
   hostedBoard: boolean;
+  scopedRoster?: boolean;
   /** CAD-2353: this is the company Master. It has no chat yet, so an owner's page for it is the page. */
   companyMaster: boolean;
   /** What a runtime-less profile's card names, if anything. */
@@ -405,7 +407,7 @@ export default function AgentPage({
           }
       : !operator
         ? boardIsHosted
-          ? alias === MASTER
+          ? scopedRoster
             ? {
                 title: t("Chat with the company Master is for owners. Your assistant is on Home."),
                 body: "",

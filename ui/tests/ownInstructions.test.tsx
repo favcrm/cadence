@@ -71,20 +71,21 @@ async function main() {
   // The seam: each route's own revision type and body.
   const calls: [string, unknown][] = [];
   api.masterInstructions = async () => ({ instructions: "Company text", revision: "41" });
-  api.masterState = async () => ({ identity: { name: "Ada", tone: null, look: "robot", revision: "41" } });
+  api.masterState = async () => { throw new Error("instructions do not require a Master-state read"); };
   api.masterIdentityUpdate = async (body) => { calls.push(["master", body]); return { identity: { name: "Ada", tone: null, look: "robot", revision: "42" }, applies: "next_turn" }; };
   api.memberAssistInstructions = async () => ({ instructions: null, revision: 7 });
   api.memberAssistProfileUpdate = async (body) => { calls.push(["personal", body]); return { assistant: { identity: { revision: 8 } } }; };
   const m = await hook.liveOwnDeps.read("workspace");
   assert(m.text === "Company text" && m.revision === "41", "master read, string revision");
-  const mw = await hook.liveOwnDeps.write("workspace", m, "  New company text \n");
-  assert(mw.revision === "42" && mw.text === "New company text", "master write answers the new revision");
+  const instructionText = "    New company text\n";
+  const mw = await hook.liveOwnDeps.write("workspace", m, instructionText);
+  assert(mw.revision === "42" && mw.text === instructionText, "master write confirms the exact text and revision");
   const sent = calls[0]![1] as Record<string, unknown>;
-  assert(sent.expected_revision === "41" && sent.name === "Ada" && sent.look === "robot" && sent.instructions === "New company text" && !("tone" in sent), "identity rides along whole with the new text");
+  assert(JSON.stringify(sent) === JSON.stringify({ expected_revision: "41", instructions: instructionText }), "the instructions write cannot overwrite concurrent identity edits");
   const p = await hook.liveOwnDeps.read("personal");
   assert(p.text === "" && p.revision === 7, "personal read, number revision, unset is empty");
-  await hook.liveOwnDeps.write("personal", p, "Mine");
-  assert(JSON.stringify(calls[1]![1]) === JSON.stringify({ expected_revision: 7, action: "update", instructions: "Mine" }), "personal write body");
+  await hook.liveOwnDeps.write("personal", p, "  Mine\n");
+  assert(JSON.stringify(calls[1]![1]) === JSON.stringify({ expected_revision: 7, action: "update", instructions: "  Mine\n" }), "personal write preserves the exact instructions");
 
   // A fake board for each kind, with its own revision type.
   const boards: Record<OwnKind, { doc: OwnDoc; next: (r: string | number) => string | number }> = {

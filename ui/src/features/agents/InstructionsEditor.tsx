@@ -35,10 +35,10 @@ export default function InstructionsEditor({
   const text = doc.draft ?? served;
   const dirty = isDirty(kind, doc.draft, served);
   const pending = doc.phase === "conflict" || doc.phase === "unconfirmed";
-  const saving = doc.phase === "saving";
+  const saving = doc.phase === "saving" || doc.working !== null;
   // While a save's outcome is unknown the text stays as it was sent, so a
   // check judges what was actually written.
-  const editable = writable && (doc.phase === "idle" || doc.phase === "conflict");
+  const editable = writable && !saving && (doc.phase === "idle" || doc.phase === "conflict");
   const problem = dirty && doc.phase === "idle" ? textProblem(kind, text) : null;
   const unsaved = dirty || pending;
   // Whatever is unsaved stays on screen, even while the board can't take a

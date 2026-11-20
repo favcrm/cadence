@@ -1,5 +1,5 @@
 import { ApiError } from "../../lib/apiError";
-import type { AvatarLook, StoredAgentProfile } from "../../lib/types";
+import type { StoredAgentProfile } from "../../lib/types";
 import { appliesText } from "./agentRoles";
 
 /**
@@ -15,7 +15,7 @@ import { appliesText } from "./agentRoles";
  * drive each outcome without a board.
  */
 
-/** Hosted counts UTF-16 units of the TRIMMED text (`AGENT_PROFILE_RESPONSIBILITIES_MAX`). */
+/** Hosted profiles count trimmed UTF-16 units; scoped instructions count the exact text. */
 export const HOSTED_MAX_UNITS = 8000;
 /** Native counts UTF-8 bytes (`MAX_INSTRUCTIONS_BYTES`). */
 export const NATIVE_MAX_BYTES = 32_000;
@@ -30,12 +30,10 @@ export const isOwnKind = (kind: DocKind | null): kind is OwnKind => kind === "wo
 
 /** The Master's or the member's instructions as one board read them. The
  *  workspace revision is a decimal string and the personal one a number; both
- *  stay as served and are only ever compared for equality. `identity` is the
- *  Master's current name, tone and look, which its write sends back whole. */
+ *  stay as served and are only ever compared for equality. */
 export interface OwnDoc {
   text: string;
   revision: string | number;
-  identity?: { name: string | null; tone: string | null; look: AvatarLook };
 }
 
 /** The calls behind those two kinds. A board without the routes answers
@@ -84,24 +82,25 @@ export function textProblem(kind: DocKind, text: string): string | null {
     const bytes = byteLength(text);
     return bytes > NATIVE_MAX_BYTES ? `Too long: ${bytes.toLocaleString("en")} of ${NATIVE_MAX_BYTES.toLocaleString("en")} bytes.` : null;
   }
-  const trimmed = text.trim();
-  // Whitespace-only clears the Master's or the member's text; a profile cannot be empty.
-  if (trimmed.length === 0 && !isOwnKind(kind)) return "Write something to save. The board does not keep an empty document.";
-  if (trimmed.length > HOSTED_MAX_UNITS) return `Too long: ${trimmed.length.toLocaleString("en")} of ${HOSTED_MAX_UNITS.toLocaleString("en")} characters.`;
-  if (CONTROL.test(trimmed)) return "Contains a control character the board refuses.";
+  const value = isOwnKind(kind) ? text : text.trim();
+  // The Master's and member's instructions may be cleared; a profile cannot be empty.
+  if (value.length === 0 && !isOwnKind(kind)) return "Write something to save. The board does not keep an empty document.";
+  if (value.length > HOSTED_MAX_UNITS) return `Too long: ${value.length.toLocaleString("en")} of ${HOSTED_MAX_UNITS.toLocaleString("en")} characters.`;
+  if (CONTROL.test(value)) return "Contains a control character the board refuses.";
   return null;
 }
 
 /** A size line for the save bar; only near the limit, or over it. */
 export function sizeNote(kind: DocKind, text: string): string | null {
   const [used, max, unit] =
-    kind !== "native" ? [text.trim().length, HOSTED_MAX_UNITS, "characters"] : [byteLength(text), NATIVE_MAX_BYTES, "bytes"];
+    kind !== "native" ? [(isOwnKind(kind) ? text : text.trim()).length, HOSTED_MAX_UNITS, "characters"] : [byteLength(text), NATIVE_MAX_BYTES, "bytes"];
   return used >= max * 0.9 ? `${used.toLocaleString("en")} of ${max.toLocaleString("en")} ${unit}` : null;
 }
 
-/** What the board would store for this draft. The hosted board trims. */
+/** What the board would store for this draft, with unset represented by "". */
 export function stored(kind: DocKind, draft: string): string {
-  return kind !== "native" ? draft.trim() : draft;
+  if (kind === "hosted") return draft.trim();
+  return isOwnKind(kind) && draft.trim() === "" ? "" : draft;
 }
 
 /** Whether saving this draft would change anything. */
@@ -196,7 +195,7 @@ export async function checkOwn(deps: OwnDeps, kind: OwnKind, base: OwnDoc, text:
     const latest = await deps.read(kind);
     if (latest.revision === undefined || typeof latest.text !== "string") throw new Error("unusable read");
     if (String(latest.revision) === String(base.revision)) return { kind: "not_saved", profile: null, own: latest };
-    if (latest.text === text.trim()) return { kind: "saved", text: latest.text, profile: null, applies: null, own: latest };
+    if (latest.text === stored(kind, text)) return { kind: "saved", text: latest.text, profile: null, applies: null, own: latest };
     return { kind: "conflict", profile: null, own: latest };
   } catch {
     return { kind: "unconfirmed" };
