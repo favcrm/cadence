@@ -100,6 +100,8 @@ function Chat({ conversation, showDecisions }: { conversation: string; showDecis
     thread.data !== null,
     () => {},
     onSnapshot,
+    undefined,
+    conversation,
   );
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const send = useCallback(

@@ -2526,6 +2526,8 @@ Object.assign(zhTW, {
   "No fields change.": "沒有欄位變更。",
   "Only the workspace owner can decide this request.": "只有工作區擁有者可對此請求作出決定。",
   "Open record": "開啟記錄",
+  "Download this version": "下載此版本",
+  "Approving shares this version with everyone in the workspace.": "批准後，此版本將與工作區的所有成員分享。",
   "Show raw": "顯示原始內容",
   "The assistant": "助理",
   "the assistant": "助理",

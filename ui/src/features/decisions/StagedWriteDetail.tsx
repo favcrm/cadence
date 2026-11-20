@@ -119,8 +119,9 @@ function ApprovalsTab({
   // An incomplete summary opens the raw call: that is the source of truth.
   const [raw, setRaw] = useState(!write.changesComplete);
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
-  const update = write.target !== null && write.changesComplete;
-  const heading = update ? t("Changes compared with the current record") : write.connected !== null || write.customMcp != null || write.cli ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
+  const share = write.kind === "artifact_share";
+  const update = !share && write.target !== null && write.changesComplete;
+  const heading = share ? t("Artifact") : update ? t("Changes compared with the current record") : write.connected !== null || write.customMcp != null || write.cli ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
   const name = write.origin?.label ?? write.proposer?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
@@ -137,6 +138,7 @@ function ApprovalsTab({
         </p>
       )}
       {state}
+      {share && pending && <p className="rv-note m-0">{t("Approving shares this version with everyone in the workspace.")}</p>}
       {(write.connected !== null || write.customMcp != null) && write.status === "pending" && write.result === null && (
         <p className="rv-note m-0">
           {write.customMcp != null
@@ -280,7 +282,7 @@ function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: St
             </div>
             <div className="dx-kv-line">
               <dt>{t("Kind")}</dt>
-              <dd>{write.kind === "create_issue" ? t("Issue proposal") : write.customMcp ? t("Custom MCP tool") : write.connected ? t("Connected action") : write.cli ? t("Cadence command") : t("App write")}</dd>
+              <dd>{write.kind === "artifact_share" ? t("Share an artifact") : write.kind === "create_issue" ? t("Issue proposal") : write.customMcp ? t("Custom MCP tool") : write.connected ? t("Connected action") : write.cli ? t("Cadence command") : t("App write")}</dd>
             </div>
             <div className="dx-kv-line">
               <dt>{t("Surface")}</dt>
@@ -706,7 +708,7 @@ export default function StagedWriteDetail({
             <>
               {" · "}
               <a className="lnk" href={link}>
-                {t("Open record")} ↗
+                {t(write.kind === "artifact_share" ? "Download this version" : "Open record")} ↗
               </a>
             </>
           )}
