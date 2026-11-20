@@ -76,9 +76,9 @@
   /* The outlet is the pane's own scroller: long app screens scroll
      inside the bounded grid row while the chat column keeps its
      height (CAD-1007). The shell's outer scroller stays the document
-     fallback on flow mounts. */
+     fallback on flow mounts. Matches native Apps & Documents (20px 32px). */
   overflow: auto;
-  padding: 1.5rem 2rem;
+  padding: 1.25rem 2rem;
 }
 @media (max-width: 1023.98px) {
   .app-shell-outlet {
@@ -89,15 +89,13 @@
 /* An installed-app screen mounts a metadata `<p>` above the
    `ScreenOutlet` div. In the grid these become two auto rows, so the
    frame never receives height and renders at its collapsed fallback.
-   Switch just this case to a full-bleed column: the `<p>` takes natural
-   height, the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006),
-   and removing the outer outlet gutter avoids double-padding inside
-   app screens that already manage their own internal spacing. */
+   Switch just this case to a column so the `<p>` takes natural height
+   and the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006),
+   keeping the shell's outer page padding consistent across all apps. */
 .app-shell-outlet:has(> [data-installed-app-screen]),
 .app-shell-outlet:has(> [aria-label="Installed app screen"]) {
   display: flex;
   flex-direction: column;
-  padding: 0;
 }
 
 /* CAD-1615 / CAD-1777 — the app screen presented in the board-wide drawer:

@@ -260,7 +260,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
           <p className="text-label text-ink-400">{t(reviewId !== undefined ? "The workspace did not confirm the decision. Open the review link again to see its current status." : "The workspace did not confirm the result. Refresh your apps before trying again.")}</p>
         </div>
       ) : (
-        <div className="space-y-4">
+        <div className="pa-body-stack">
           {reviewId === undefined && (
             <ol className="pa-stepper" aria-label={t("Installation progress")}>
               <li className="pa-step" aria-current={!review ? "step" : undefined} data-done={review ? "true" : undefined}>
@@ -413,7 +413,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                 <div className="alert fail" role="alert">{t("This package is not compatible with this workspace.")}</div>
               )}
 
-              <section aria-label={t("Requested access")} className="space-y-2">
+              <section aria-label={t("Requested access")} className="pa-section">
                 <h4 className="pa-legend">{t("Requested access")}</h4>
                 <div className="pa-perm-card">
                   <div className="pa-perm-row">
