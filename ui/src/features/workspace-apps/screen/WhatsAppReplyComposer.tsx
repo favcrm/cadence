@@ -99,9 +99,12 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
         }
         return;
       }
-      const receipts = value && replyRecovery.get(receiptKey(selection, value));
-      if (receipts?.pending) setAttempt({ effectId: receipts.pending, outcome: "uncertain" });
-      else if (receipts?.accepted) setAttempt({ effectId: receipts.accepted, outcome: "accepted" });
+      // A retry verifies the current draft; do not replace its outcome with an older receipt.
+      if (!bound && value) {
+        const receipts = replyRecovery.get(receiptKey(selection, value));
+        if (receipts?.pending) setAttempt({ effectId: receipts.pending, outcome: "uncertain" });
+        else if (receipts?.accepted) setAttempt({ effectId: receipts.accepted, outcome: "accepted" });
+      }
       setVerification(check);
     });
     return () => { cancelled = true; };
