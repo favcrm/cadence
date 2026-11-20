@@ -5,7 +5,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
-import { SCREEN_WHATSAPP_COMPOSE_V1 } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, type WhatsAppReplyAvailability } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
@@ -64,7 +64,7 @@ export interface ScreenActions {
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
   onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
-  onWhatsAppCompose?(conversationId: string | null): void;
+  onWhatsAppCompose?(conversationId: string | null, nomination: number | null): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -354,6 +354,9 @@ export class ScreenChannel extends FrameChannel {
   private wantsPresentation = false;
   private wantsSurfaces = false;
   private wantsWhatsAppCompose = false;
+  private wantsReplyAvailability = false;
+  // Both ends count the existing selections (including clears) on the ordered port.
+  private whatsappNomination = 0;
   /** CAD-1777 — the host-derived surface role of this mount. The outlet
    *  sets it from its own mount request (a drawer only exists behind a
    *  private parent token); the ready opt-in and call args cannot choose
@@ -403,11 +406,15 @@ export class ScreenChannel extends FrameChannel {
   }
   protected whatsappCompose(conversationId: string | null): void {
     if (!this.wantsWhatsAppCompose || !this.actions?.onWhatsAppCompose) { this.close(true); return; }
-    this.actions.onWhatsAppCompose(conversationId);
+    this.actions.onWhatsAppCompose(conversationId, this.wantsReplyAvailability ? ++this.whatsappNomination : null);
   }
   whatsappComposeState(dirty: boolean, refresh: boolean): void {
     if (!this.closed && this.ready && this.wantsWhatsAppCompose)
       this.port?.postMessage({ v: 2, op: "whatsapp-compose-state", dirty, refresh });
+  }
+  whatsappReplyAvailability(nomination: number, state: WhatsAppReplyAvailability): void {
+    if (!this.closed && this.ready && this.wantsReplyAvailability && nomination === this.whatsappNomination)
+      this.port?.postMessage({ v: 2, op: "whatsapp-reply-availability", nomination, state });
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
@@ -713,6 +720,8 @@ export class ScreenChannel extends FrameChannel {
     if (wantsWhatsAppCompose && (!records || this.surfaceRole !== "primary" || !admitsWhatsAppComposer(this.receipt) ||
         this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppCompose)) return false;
     this.wantsWhatsAppCompose = wantsWhatsAppCompose;
+    this.wantsReplyAvailability = accepts.includes(SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1);
+    if (this.wantsReplyAvailability && !wantsWhatsAppCompose) return false;
     this.records = records;
     this.wantsLocale = wantsLocale;
     this.wantsAudio = wantsAudio;

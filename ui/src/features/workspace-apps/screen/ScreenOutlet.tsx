@@ -361,7 +361,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           ? services : null;
         const composeCurrent = () => isCurrent() && !!owned && channel.current === owned && mounted.current === receipt &&
           frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current).section === "inbox";
-        const selectWhatsApp = (conversationId: string | null) => {
+        const selectWhatsApp = (conversationId: string | null, nomination: number | null) => {
           if (!composeServices || !isCurrent() || !owned || channel.current !== owned || selectedWhatsApp === conversationId) return;
           selectedWhatsApp = composeCurrent() ? conversationId : null;
           const revision = ++whatsappRevision.current;
@@ -377,6 +377,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               receiptScope: `${generation}:${scope}`,
               services: composeServices,
               current: currentSelection,
+              announceAvailability: nomination === null ? undefined : state => {
+                if (currentSelection()) owned?.whatsappReplyAvailability(nomination, state);
+              },
               announce: (dirty, refresh = false) => {
                 if (!currentSelection()) return;
                 const changed = composerUnsaved !== dirty;
@@ -398,7 +401,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // Read it now, not from this effect's render: a pick that changed while
         // the mount request was pending must not mint the old theme.
         const mountedTheme = appliedFrameTheme();
-        frame.src = `${receipt.mount}${mountedTheme ? `?theme=${mountedTheme}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
+        const mountQuery = new URLSearchParams();
+        if (mountedTheme) mountQuery.set("theme", mountedTheme);
+        if (composeServices) mountQuery.set("wa_compose_availability", "1");
+        frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
         // current pick on load. A host that has no listener ignores it.
