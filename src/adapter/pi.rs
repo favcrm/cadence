@@ -1438,36 +1438,54 @@ impl ProviderAdapter for PiAdapter {
             }
             // An old/mocked runtime may not support the extension commands.
             // Ordinary queued turns remain compatible; native input is disabled.
+            let commands_data = self.checked("get_commands", json!({})).ok();
             let guard_ready = guard_path.is_some()
-                && self
-                    .checked("get_commands", json!({}))
-                    .ok()
-                    .is_some_and(|data| {
-                        data.get("commands")
-                            .and_then(Value::as_array)
-                            .is_some_and(|commands| {
-                                [
-                                    "cadence-bind-turn",
-                                    "cadence-steer-turn",
-                                    "cadence-abandon-turn",
-                                ]
-                                .iter()
-                                .all(|name| {
-                                    commands.iter().any(|command| {
-                                        command.get("name").and_then(Value::as_str) == Some(*name)
-                                            && command.get("source").and_then(Value::as_str)
-                                                == Some("extension")
-                                            && command
-                                                .pointer("/sourceInfo/path")
-                                                .and_then(Value::as_str)
-                                                == guard_path
-                                                    .as_ref()
-                                                    .and_then(|path| path.to_str())
-                                    })
+                && commands_data.as_ref().is_some_and(|data| {
+                    data.get("commands")
+                        .and_then(Value::as_array)
+                        .is_some_and(|commands| {
+                            [
+                                "cadence-bind-turn",
+                                "cadence-steer-turn",
+                                "cadence-abandon-turn",
+                            ]
+                            .iter()
+                            .all(|name| {
+                                commands.iter().any(|command| {
+                                    command.get("name").and_then(Value::as_str) == Some(*name)
+                                        && command.get("source").and_then(Value::as_str)
+                                            == Some("extension")
+                                        && command
+                                            .pointer("/sourceInfo/path")
+                                            .and_then(Value::as_str)
+                                            == guard_path.as_ref().and_then(|path| path.to_str())
                                 })
                             })
-                    });
+                        })
+                });
             self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
+            // CAD-2092: loaded skill evidence comes strictly from what the
+            // runtime reports in `get_commands`, never from installed files.
+            if let Some(commands) = commands_data
+                .as_ref()
+                .and_then(|data| data.get("commands"))
+                .and_then(Value::as_array)
+            {
+                let mut loaded: Vec<String> = Vec::new();
+                for command in commands {
+                    if command.get("source").and_then(Value::as_str) != Some("skill") {
+                        continue;
+                    }
+                    if let Some(raw) = command.get("name").and_then(Value::as_str) {
+                        let name = raw.strip_prefix("skill:").unwrap_or(raw).to_string();
+                        if !name.is_empty() && !loaded.contains(&name) {
+                            loaded.push(name);
+                        }
+                    }
+                }
+                self.shared
+                    .emit("cadence/skills_loaded", &json!({ "skills": loaded }));
+            }
             let state = self.request("get_state", json!({}))?;
             if state.get("success").and_then(Value::as_bool) != Some(true) {
                 return Err(self.command_error("get_state", &state));
@@ -2745,5 +2763,67 @@ mod cad1814_tests {
         event(shared, "response", response);
         event(shared, "session_settled", json!({}));
         assert!(shared.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cad2092_pi_worker_command_exposes_only_selected_skills_and_filters_disabled_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("s");
+        std::fs::create_dir_all(&state).unwrap();
+        let env = ProviderEnv::refusing_providers();
+        env.set("HOME", root.path().to_str().unwrap());
+        env.set("CADENCE_PI_COMMAND", "/bin/false");
+        let agent = Agent {
+            alias: "worker-skills".into(),
+            uid: "agt-cad2092".into(),
+            provider: "pi".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: root.path().to_string_lossy().to_string(),
+            sandbox: "workspace-write".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(json!({
+                "skills": ["cadence", "deliverable-qa"],
+                "disabled_tools": ["write", "edit"],
+            })),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "idle".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let cmd = build_command(&env, &agent, &state).unwrap();
+        assert!(cmd.iter().any(|a| a == "--no-skills"));
+        let skills: Vec<&str> = cmd
+            .windows(2)
+            .filter(|w| w[0] == "--skill")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(skills.len(), 2, "only selected skills passed: {skills:?}");
+        assert!(skills[0].ends_with("agents/worker-skills/skills/cadence"));
+        assert!(skills[1].ends_with("agents/worker-skills/skills/deliverable-qa"));
+        let tools = cmd
+            .windows(2)
+            .find(|w| w[0] == "--tools")
+            .map(|w| w[1].as_str())
+            .expect("--tools present");
+        assert!(tools.contains("read") && tools.contains("bash"));
+        assert!(!tools.contains("write") && !tools.contains("edit"));
     }
 }

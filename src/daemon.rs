@@ -694,6 +694,9 @@ pub struct Shared {
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
     open_attach: Mutex<HashMap<String, &'static str>>,
+    /// CAD-2092: runtime-reported loaded skill names for the live session
+    /// only. Cleared when the actor closes; installed files never populate it.
+    loaded_skills: Mutex<HashMap<String, Vec<String>>>,
     /// Recovery candidates whose actor has not yet settled its pane
     /// proof, keyed by alias and exact (message, submission token).
     adoptions_pending: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -1342,6 +1345,7 @@ impl Shared {
             #[cfg(test)]
             agent_show_selected_hook: opts.agent_show_selected_hook.clone(),
             open_attach: Mutex::new(HashMap::new()),
+            loaded_skills: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
             provider_env,
@@ -1611,6 +1615,20 @@ impl Shared {
             if kind == "claude_init" {
                 if let Some(model) = params.get("model").and_then(Value::as_str) {
                     let _ = self.store.set_model_reported(alias, model);
+                }
+            }
+            if kind == "skills_loaded" {
+                if let Some(skills) = params.get("skills").and_then(Value::as_array) {
+                    let loaded: Vec<String> = skills
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    self.loaded_skills
+                        .lock()
+                        .unwrap()
+                        .insert(alias.to_string(), loaded);
                 }
             }
             if kind == "session_minted" {
@@ -3426,6 +3444,8 @@ impl Shared {
             "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
             "agent_profile_context" => self.rpc_agent_profile_context(params, peer_pid),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
+            "agent_skills_set" => self.rpc_skills_set(params, peer_pid),
+            "agent_tools_set" => self.rpc_tools_set(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
             "agent_settings_get" => {
@@ -4150,6 +4170,16 @@ impl Shared {
                 if scope.is_none() {
                     agent_json["turn_project"] =
                         json!(self.turn_project(&agent).map(|turn| turn.key));
+                    let loaded = if matches!(agent.state.as_str(), "idle" | "busy") {
+                        self.loaded_skills
+                            .lock()
+                            .unwrap()
+                            .get(&agent.alias)
+                            .cloned()
+                    } else {
+                        None
+                    };
+                    agent_json["loaded_skills"] = json!(loaded);
                 }
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
@@ -4816,6 +4846,7 @@ impl Shared {
                         );
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
+                    self.loaded_skills.lock().unwrap().remove(&alias);
                     // The lifecycle lock is still held: a re-registration
                     // under this alias cannot have opened a replacement log.
                     self.remove_provider_log(&alias);
@@ -4866,6 +4897,7 @@ impl Shared {
                                 );
                             }
                             self.open_attach.lock().unwrap().remove(&agent.alias);
+                            self.loaded_skills.lock().unwrap().remove(&agent.alias);
                             self.remove_provider_log(&agent.alias);
                             removed.push(agent.alias);
                         }

@@ -914,6 +914,60 @@ pub(super) fn agent_action(
                 Err(e) => rpc_err(&e, "agent_instructions_set"),
             };
         }
+        // CAD-2092: replace the agent's selected bundled skills. Operator-only
+        // on the board and in the daemon; body is `{skills: [...]}` only.
+        "skills" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "skills takes {\"skills\": [...]}"),
+            };
+            let obj = body.as_object();
+            let Some(skills) = obj.and_then(|o| o.get("skills")).and_then(Value::as_array) else {
+                return err_response(400, "skills needs an array of bundled skill names");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "skills")) {
+                return err_response(
+                    400,
+                    &format!("skills takes the list only — '{extra}' is not accepted"),
+                );
+            }
+            if !skills.iter().all(Value::is_string) {
+                return err_response(400, "skills entries must be strings");
+            }
+            (
+                "agent_skills_set",
+                json!({"alias": alias, "skills": skills}),
+            )
+        }
+        // CAD-2092: replace the agent's disabled built-in tools. Operator-only
+        // on the board and in the daemon; body is `{disabled_tools: [...]}` only.
+        "tools" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "tools takes {\"disabled_tools\": [...]}"),
+            };
+            let obj = body.as_object();
+            let Some(disabled) = obj
+                .and_then(|o| o.get("disabled_tools"))
+                .and_then(Value::as_array)
+            else {
+                return err_response(400, "tools needs an array of disabled tool names");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "disabled_tools"))
+            {
+                return err_response(
+                    400,
+                    &format!("tools takes disabled_tools only — '{extra}' is not accepted"),
+                );
+            }
+            if !disabled.iter().all(Value::is_string) {
+                return err_response(400, "disabled_tools entries must be strings");
+            }
+            (
+                "agent_tools_set",
+                json!({"alias": alias, "disabled_tools": disabled}),
+            )
+        }
         _ => return err_response(404, "no such agent route"),
     };
     match client::rpc(state_dir, method, params) {

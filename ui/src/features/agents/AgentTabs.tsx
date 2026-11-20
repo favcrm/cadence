@@ -8,7 +8,18 @@ import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import type { ToastMsg } from "../../ui/Toast";
 import DrawerShell, { type DrawerTab } from "../app-shell/shared/DrawerShell";
-import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile, WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
+import type {
+  Agent,
+  AgentAccess,
+  AgentDetail,
+  AgentRole,
+  HiredProfile,
+  NativeSkillItem,
+  NativeToolItem,
+  WorkspaceSkillRead,
+  WorkspaceSkillSummary,
+  WorkspaceSkillUser,
+} from "../../lib/types";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
@@ -544,25 +555,146 @@ function Instructions({ c }: { c: TabContext }) {
   );
 }
 
+function NativeToggle({
+  name,
+  required,
+  enabled,
+  canToggle,
+  pending,
+  onToggle,
+}: {
+  name: string;
+  required: boolean;
+  enabled: boolean;
+  canToggle: boolean;
+  pending: boolean;
+  onToggle: () => void;
+}) {
+  const t = useTranslate();
+  return (
+    <span className="sk-switch" data-state={enabled ? "on" : "off"}>
+      {required ? (
+        <>
+          {t("Required")}
+          <Switch checked={true} disabled label={`${t("On for this agent")}: ${name}`} onToggle={() => {}} />
+        </>
+      ) : canToggle ? (
+        <>
+          {t(enabled ? "On" : "Off")}
+          <Switch checked={enabled} pending={pending} label={`${t("On for this agent")}: ${name}`} onToggle={onToggle} />
+        </>
+      ) : (
+        t(enabled ? "On" : "Off")
+      )}
+    </span>
+  );
+}
+
+function loadedLabel(loaded: boolean | null | undefined): string {
+  if (loaded === true) return "Loaded in current session";
+  if (loaded === false) return "Not loaded in running session";
+  return "Not recorded";
+}
+
 function Skills({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [open, setOpen] = useState<string | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [override, setOverride] = useState<{ alias: string; enabled: string[] } | null>(null);
   const named = c.role?.skills ?? [];
-  // A runtime loads every bundled skill. A profile has no runtime, so all that
-  // is known is what its role names, and a hand-written one names nothing.
-  const bundled = c.hired ? [] : BUNDLED_SKILLS.map((skill) => skill.name as string);
-  const names = [...bundled, ...named.filter((name) => !bundled.includes(name))];
+  const isMaster = c.alias === MASTER;
+  // CAD-2092: when the native daemon serves `native_skills`, each bundled skill
+  // carries its real per-agent enabled state, runtime-reported `loaded` evidence,
+  // and the exact `SKILL.md` + files the agent sees. Older daemons / members fall
+  // back to the read-only bundled list and never claim "In every session" without evidence.
+  const nativeCatalog: NativeSkillItem[] | null = !c.hired && Array.isArray(c.detail?.native_skills) ? c.detail.native_skills : null;
+  useEffect(() => {
+    setOverride(null);
+  }, [c.alias, c.detail]);
+
+  const effectiveNative: NativeSkillItem[] | null = nativeCatalog
+    ? nativeCatalog.map((item) => ({
+        ...item,
+        enabled: item.required || (override && override.alias === c.alias ? override.enabled.includes(item.name) : item.enabled),
+      }))
+    : null;
+
+  const canToggleNative = Boolean(effectiveNative && c.writable && !isMaster);
+
+  async function toggleNativeSkill(name: string, nextOn: boolean) {
+    if (!effectiveNative || saving) return;
+    const item = effectiveNative.find((s) => s.name === name);
+    if (!item || item.required) return;
+    const nextEnabled = effectiveNative.filter((s) => (s.name === name ? nextOn : s.enabled)).map((s) => s.name);
+    setSaving(name);
+    try {
+      const res = await api.setAgentSkills(c.alias, nextEnabled);
+      setOverride({ alias: c.alias, enabled: res.skills });
+      c.retryDetail();
+      c.toast("ok", t(res.applies === "immediate" ? "Saved." : "Saved. Applies next session."));
+    } catch (err) {
+      const why = refusal(err);
+      c.toast(why.unconfirmed ? "warn" : "err", t(why.text));
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  const bundledNames = c.hired
+    ? []
+    : effectiveNative
+      ? effectiveNative.map((s) => s.name)
+      : BUNDLED_SKILLS.map((skill) => skill.name as string);
+  const extraRoleNames = named.filter((name) => !bundledNames.includes(name));
   const line = (name: string) =>
-    BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
+    effectiveNative?.find((s) => s.name === name)?.line ??
+    BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ??
+    "Named by its role";
   // CAD-2419: a hosted profile also has the workspace's own skill library.
   const workspace = c.hired !== undefined && c.doc.kind === "hosted";
-  const none = names.length === 0 && c.roleRead === "read" ? <Note>{t("No skills are recorded for this agent.")}</Note> : null;
+  const none = bundledNames.length === 0 && extraRoleNames.length === 0 && c.roleRead === "read" ? <Note>{t("No skills are recorded for this agent.")}</Note> : null;
   if (none && !workspace) return none;
+
+  const openNative = open && effectiveNative ? effectiveNative.find((s) => s.name === open) ?? null : null;
+
   return (
     <div className="ap-body">
-      {names.length > 0 && (
+      {effectiveNative && effectiveNative.length > 0 ? (
+        <div className="sk-list" data-work-panel="native-skills">
+          {effectiveNative.map((skill) => (
+            <div key={skill.name} className="sk-card">
+              <button type="button" className="sk-open" data-record-id={`skill-${skill.name}`} onClick={() => setOpen(skill.name)}>
+                <span className="sk-title">
+                  <b>{skill.name}</b>
+                  {skill.enabled && skill.loaded === false && (
+                    <span className="chip bg-warn/10 text-warn">{t("Not loaded")}</span>
+                  )}
+                </span>
+                <span className="sk-desc">{t(skill.line)}</span>
+              </button>
+              <NativeToggle
+                name={skill.name}
+                required={skill.required}
+                enabled={skill.enabled}
+                canToggle={canToggleNative}
+                pending={saving !== null}
+                onToggle={() => void toggleNativeSkill(skill.name, !skill.enabled)}
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        bundledNames.length > 0 && (
+          <Rows>
+            {bundledNames.map((name) => (
+              <ManageRow key={name} id={`skill-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
+            ))}
+          </Rows>
+        )
+      )}
+      {extraRoleNames.length > 0 && (
         <Rows>
-          {names.map((name) => (
+          {extraRoleNames.map((name) => (
             <ManageRow key={name} id={`skill-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
           ))}
         </Rows>
@@ -574,12 +706,39 @@ function Skills({ c }: { c: TabContext }) {
           <p className="ap-drawer-lead">{t(line(open))}</p>
           <Facts
             items={[
-              ["Source", t(bundled.includes(open) ? "Bundled" : "Role")],
-              // Only a native host is known to load every bundled skill.
-              ["Loaded", t(bundled.includes(open) && !c.hostedBoard ? "In every session" : "Not recorded")],
+              ["Source", t(bundledNames.includes(open) ? "Bundled" : "Role")],
+              [
+                "Policy",
+                openNative
+                  ? t(
+                      openNative.required
+                        ? "Required — cannot be turned off or deleted"
+                        : "Bundled — can be turned off, not deleted",
+                    )
+                  : null,
+              ],
+              // CAD-2092: loaded state comes only from runtime evidence, never installed bytes.
+              ["Loaded", t(loadedLabel(openNative?.loaded))],
+              ["Applies", openNative && !openNative.required ? t("Next session") : null],
               ["Named by its role", c.role ? t(named.includes(open) ? "Yes" : "No") : null],
             ]}
           />
+          {openNative?.skill_md && (
+            <section className="sk-sec">
+              <h4>SKILL.md</h4>
+              <pre className="sk-pre">{openNative.skill_md}</pre>
+            </section>
+          )}
+          {openNative && openNative.files.length > 0 && (
+            <section className="sk-sec">
+              <h4>{t("Files")}</h4>
+              <ul className="sk-files">
+                {openNative.files.map((file) => (
+                  <li key={file} className="mono">{file}</li>
+                ))}
+              </ul>
+            </section>
+          )}
         </ItemDrawer>
       )}
     </div>
@@ -1191,21 +1350,107 @@ function SkillDrawer({
 function Tools({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [open, setOpen] = useState<string | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [override, setOverride] = useState<{ alias: string; disabled: string[] } | null>(null);
   const BUILT_IN = "cadence";
-  const line = (name: string) => (name === BUILT_IN ? "Tickets, threads and reports" : "Named by its role, not connected");
-  const names = [BUILT_IN, ...(c.role?.tools ?? []).filter((name) => name !== BUILT_IN)];
+  const isMaster = c.alias === MASTER;
+  const nativeCatalog: NativeToolItem[] | null = !c.hired && Array.isArray(c.detail?.native_tools) ? c.detail.native_tools : null;
+  useEffect(() => {
+    setOverride(null);
+  }, [c.alias, c.detail]);
+
+  const effectiveNative: NativeToolItem[] | null = nativeCatalog
+    ? nativeCatalog.map((tool) => ({
+        ...tool,
+        enabled: tool.required || (override && override.alias === c.alias ? !override.disabled.includes(tool.name) : tool.enabled),
+      }))
+    : null;
+
+  const canToggleNative = Boolean(effectiveNative && c.writable && !isMaster);
+
+  async function toggleNativeTool(name: string, nextOn: boolean) {
+    if (!effectiveNative || saving) return;
+    const item = effectiveNative.find((tool) => tool.name === name);
+    if (!item || item.required) return;
+    const nextDisabled = effectiveNative
+      .filter((tool) => !tool.required && !(tool.name === name ? nextOn : tool.enabled))
+      .map((tool) => tool.name);
+    setSaving(name);
+    try {
+      const res = await api.setAgentTools(c.alias, nextDisabled);
+      setOverride({ alias: c.alias, disabled: res.disabled_tools });
+      c.retryDetail();
+      c.toast("ok", t(res.applies === "immediate" ? "Saved." : "Saved. Applies next session."));
+    } catch (err) {
+      const why = refusal(err);
+      c.toast(why.unconfirmed ? "warn" : "err", t(why.text));
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  const nativeNames = effectiveNative ? effectiveNative.map((tool) => tool.name) : [BUILT_IN];
+  const roleTools = (c.role?.tools ?? []).filter((name) => !nativeNames.includes(name));
+  const line = (name: string) =>
+    effectiveNative?.find((tool) => tool.name === name)?.line ??
+    (name === BUILT_IN ? "Tickets, threads and reports" : "Named by its role, not connected");
+  const openNative = open && effectiveNative ? effectiveNative.find((tool) => tool.name === open) ?? null : null;
+
   return (
     <div className="ap-body">
-      <Rows>
-        {names.map((name) => (
-          <ManageRow key={name} id={`tool-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
-        ))}
-      </Rows>
+      {effectiveNative && effectiveNative.length > 0 ? (
+        <div className="sk-list" data-work-panel="native-tools">
+          {effectiveNative.map((tool) => (
+            <div key={tool.name} className="sk-card">
+              <button type="button" className="sk-open" data-record-id={`tool-${tool.name}`} onClick={() => setOpen(tool.name)}>
+                <span className="sk-title">
+                  <b>{tool.name}</b>
+                </span>
+                <span className="sk-desc">{t(tool.line)}</span>
+              </button>
+              <NativeToggle
+                name={tool.name}
+                required={tool.required}
+                enabled={tool.enabled}
+                canToggle={canToggleNative}
+                pending={saving !== null}
+                onToggle={() => void toggleNativeTool(tool.name, !tool.enabled)}
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <Rows>
+          <ManageRow id={`tool-${BUILT_IN}`} name={BUILT_IN} line={t(line(BUILT_IN))} onOpen={() => setOpen(BUILT_IN)} />
+        </Rows>
+      )}
+      {roleTools.length > 0 && (
+        <Rows>
+          {roleTools.map((name) => (
+            <ManageRow key={name} id={`tool-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
+          ))}
+        </Rows>
+      )}
       <RoleRead c={c} />
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
-          <p className="ap-drawer-lead">{t(line(open))}</p>
-          <Facts items={[["Source", t(open === BUILT_IN ? "Built in" : "Role")]]} />
+          <p className="ap-drawer-lead">{t(openNative ? openNative.description : line(open))}</p>
+          <Facts
+            items={[
+              ["Source", t(openNative || open === BUILT_IN ? "Built in" : "Role")],
+              [
+                "Policy",
+                openNative
+                  ? t(
+                      openNative.required
+                        ? "Required — cannot be turned off or deleted"
+                        : "Built-in — can be turned off, not deleted",
+                    )
+                  : null,
+              ],
+              ["Applies", openNative && !openNative.required ? t("Next session") : null],
+            ]}
+          />
         </ItemDrawer>
       )}
     </div>

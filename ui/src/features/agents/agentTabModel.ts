@@ -25,13 +25,15 @@ export function parseAgentTab(value: string | null): AgentTab {
   return (value !== null && MOVED_TABS.get(value)) || "overview";
 }
 
-/** The skills Cadence bundles; every agent on the host loads all of them today. */
+/** The skills Cadence bundles; matches `src/skill.rs::SKILL_NAMES`. */
 export const BUNDLED_SKILLS = [
-  { name: "cadence", line: "Tickets, threads and reports" },
-  { name: "business-documents", line: "Document intake, templates and pricing checks" },
-  { name: "company-outputs", line: "Quotes, invoices, proposals and reports" },
-  { name: "website-builder", line: "Build and publish a static website" },
-  { name: "incident-response", line: "Contain and close out incidents across teams" },
+  { name: "cadence", line: "Tickets, threads and reports", required: true },
+  { name: "business-documents", line: "Document intake, templates and pricing checks", required: false },
+  { name: "company-outputs", line: "Quotes, invoices, proposals and reports", required: false },
+  { name: "website-builder", line: "Build and publish a static website", required: false },
+  { name: "incident-response", line: "Contain and close out incidents across teams", required: false },
+  { name: "deliverable-qa", line: "Independent browser and visual QA before release", required: false },
+  { name: "cadence-app-dev", line: "Build, audit and package sandboxed Cadence apps", required: false },
 ] as const;
 
 export type HistoryFilter = "all" | "turns" | "messages" | "reports" | "memory";

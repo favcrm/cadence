@@ -364,6 +364,71 @@ impl Shared {
         }))
     }
 
+    /// CAD-2092: replace an agent's per-agent bundled skill allowlist
+    /// (`params.skills`). Operator only, by connection — no agent (neither
+    /// the target nor its PM) may change its own skills. Never restarts a
+    /// running session; changes apply on the next launch.
+    pub(super) fn rpc_skills_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection_on_agent("agent skills", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's skills are fixed by its runtime posture",
+            ));
+        }
+        let raw = params
+            .get("skills")
+            .ok_or_else(|| Error::rejected("missing 'skills' array"))?;
+        let agent = self.store.agent(&alias)?;
+        if !registry::supports_per_agent_skills(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "per-agent skills are only enforced on managed Pi/OMP runtimes, not {}/{}",
+                agent.provider, agent.endpoint_kind
+            )));
+        }
+        let selected = crate::skill::validate_skills_param(raw)?;
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        self.store
+            .set_params_by(&alias, &json!({"skills": selected}), &audit)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "state": "updated",
+            "applies": "next_launch",
+            "skills": selected,
+        }))
+    }
+
+    /// CAD-2092: replace an agent's disabled built-in tools list
+    /// (`params.disabled_tools`). Operator only, by connection — no agent
+    /// may change its own tools. Required `cadence` cannot be turned off.
+    /// Never restarts a running session; changes apply on the next launch.
+    pub(super) fn rpc_tools_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection_on_agent("agent tools", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's tools are fixed by its runtime posture",
+            ));
+        }
+        let agent = self.store.agent(&alias)?;
+        let raw = params
+            .get("disabled_tools")
+            .ok_or_else(|| Error::rejected("missing 'disabled_tools' array"))?;
+        let disabled =
+            registry::validate_disabled_tools_param(&agent.provider, &agent.endpoint_kind, raw)?;
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        self.store
+            .set_params_by(&alias, &json!({"disabled_tools": disabled}), &audit)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "state": "updated",
+            "applies": "next_launch",
+            "disabled_tools": disabled,
+        }))
+    }
+
     /// CAD-1989: `POST /api/agent-profiles` - a catalogue hire saves a settings
     /// profile and launches nothing. Operator only, by the connection.
     pub(super) fn rpc_agent_profile_create(
@@ -1201,6 +1266,12 @@ impl Shared {
         };
         let caller =
             self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
+        if patch
+            .as_object()
+            .is_some_and(|o| o.contains_key("skills") || o.contains_key("disabled_tools"))
+        {
+            self.operator_connection_on_agent("agent set skills/tools", params, peer_pid)?;
+        }
         // CAD-804: `gc_keep` is a registry keep, not an endpoint param.
         // Take it out before the endpoint-param allowlist runs; every
         // other key still validates and merges exactly as before.
