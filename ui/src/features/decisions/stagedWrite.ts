@@ -510,6 +510,8 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "custom_mcp_effect") return parseCustomMcpEffect(base, row, result);
   if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
   if (row.tool === "artifact_share" && isRecord(row.input)) {
+    // The hosted approval and denial routes accept only this action ID format.
+    if (!/^[a-f0-9]{32}$/.test(id)) return null;
     const { id: artifactId, version, title } = row.input;
     if (typeof artifactId !== "string" || !/^art-[A-Za-z0-9]{1,40}$/.test(artifactId) ||
         typeof version !== "number" || !Number.isSafeInteger(version) || version < 1 ||

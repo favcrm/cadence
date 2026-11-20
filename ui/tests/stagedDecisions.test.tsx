@@ -284,14 +284,15 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   await settle(() => assert(text(drawerEl()?.querySelector(".dx-asked") ?? null).includes(`${sharedLabel} · Workspace assistant`), "Recruit review identifies workspace proposer"));
   await click(labelled(drawerEl()!, "Not now"));
   const pendingShare = {
-    id: "share-recruit", tool: "artifact_share", status: "pending", createdAt: Date.now() - AGO,
+    id: "ab0123456789abcdef0123456789abcd", tool: "artifact_share", status: "pending", createdAt: Date.now() - AGO,
     input: { id: "art-Brief", version: 2, title: "Hiring brief" },
     proposer: fixture.workspace.proposer,
   };
   scopedActions.set("recruit-conversation", [
     customer("live-recruit", { origin: null, proposer: fixture.workspace.proposer, title: "Live Recruit request" }),
     pendingShare,
-    { ...pendingShare, id: "invalid-share", input: { ...pendingShare.input, title: "Malformed artifact", version: 0 } },
+    { ...pendingShare, id: "cd0123456789abcdef0123456789abcd", input: { ...pendingShare.input, title: "Malformed artifact", version: 0 } },
+    { ...pendingShare, id: "bad-action-id", input: { ...pendingShare.input, title: "Unreviewable share" } },
   ]);
   await settle(() => assert(recruitStream, "Recruit stream opened"));
   const snapshot = {
@@ -305,6 +306,7 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   assert(text(home.cards()[0]).includes("Home only"), "Recruit refresh leaves Home distinct");
   const share = Array.from(host.querySelectorAll("[data-chat-staged]")).find((card) => text(card).includes("Hiring brief"));
   assert(share && !text(host).includes("Malformed artifact"), "Recruit shows the saved artifact version, not malformed requests");
+  assert(!text(host).includes("Unreviewable share"), "Recruit omits a share the decision endpoint cannot address");
   await click(labelled(share, "Review"));
   await settle(() => assert(text(drawerEl()).includes("Approving shares this version with everyone in the workspace."), "artifact review names the effect before deciding"));
   assert(drawerEl()?.querySelector("a[href='/api/artifacts/art-Brief/2']")?.textContent?.includes("Download this version"), "artifact review links to the exact authorized version");
