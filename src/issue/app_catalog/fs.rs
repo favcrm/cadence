@@ -1,8 +1,8 @@
 //! Descriptor-relative reads: a swapped ancestor cannot redirect the catalog.
-use std::ffi::{CStr, CString};
-use std::fs::File;
+#![forbid(unsafe_code)]
+
+use std::ffi::CString;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::{
     ffi::OsStrExt,
     fs::{MetadataExt, PermissionsExt},
@@ -10,8 +10,9 @@ use std::os::unix::{
 use std::path::{Component, Path};
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 
-pub(in crate::issue) struct Root(File);
+pub(in crate::issue) struct Root(DirFd);
 
 fn name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| {
@@ -22,29 +23,16 @@ fn name(bytes: &[u8]) -> std::io::Result<CString> {
     })
 }
 
-fn open_at(parent: &File, value: &[u8], flags: i32) -> std::io::Result<File> {
-    let value = name(value)?;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), value.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-const DIRECTORY: i32 = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
-
 impl Root {
     pub(in crate::issue) fn open(path: &Path) -> Result<Self> {
-        let start = if path.is_absolute() { "/" } else { "." };
-        let c = name(start.as_bytes())?;
-        let fd = unsafe { libc::open(c.as_ptr(), DIRECTORY) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let mut dir = unsafe { File::from_raw_fd(fd) };
+        let mut dir = if path.is_absolute() {
+            DirFd::open_root()?
+        } else {
+            DirFd::open_nofollow(Path::new("."))?
+        };
         for part in path.components() {
             match part {
-                Component::Normal(n) => dir = open_at(&dir, n.as_bytes(), DIRECTORY)?,
+                Component::Normal(n) => dir = dir.open_child_dir(&name(n.as_bytes())?)?,
                 Component::RootDir | Component::CurDir => {}
                 _ => return Err(Error::rejected("catalog root contains an unsafe component")),
             }
@@ -52,10 +40,10 @@ impl Root {
         Ok(Self(dir))
     }
 
-    pub(super) fn dir(&self, path: &Path) -> std::io::Result<File> {
-        // A dup shares directory offsets; reopen the pinned dot so repeated
-        // inventory scans cannot inherit a prior readdir cursor.
-        let mut dir = open_at(&self.0, b".", DIRECTORY)?;
+    pub(super) fn dir(&self, path: &Path) -> std::io::Result<DirFd> {
+        // Reopen the pinned dot so repeated inventory scans cannot share a
+        // prior readdir cursor.
+        let mut dir = self.0.open_child_dir(c".")?;
         for part in path.components() {
             let Component::Normal(n) = part else {
                 return Err(std::io::Error::new(
@@ -63,12 +51,12 @@ impl Root {
                     "catalog path must stay below its workspace",
                 ));
             };
-            dir = open_at(&dir, n.as_bytes(), DIRECTORY)?;
+            dir = dir.open_child_dir(&name(n.as_bytes())?)?;
         }
         Ok(dir)
     }
 
-    fn parent(&self, path: &Path) -> std::io::Result<(File, CString)> {
+    fn parent(&self, path: &Path) -> std::io::Result<(DirFd, CString)> {
         let leaf = path.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -87,23 +75,11 @@ impl Root {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let rc = unsafe {
-            libc::fstatat(
-                parent.as_raw_fd(),
-                leaf.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(error.into());
+        match parent.fstatat_nofollow(&leaf) {
+            Ok(stat) => Ok(Some(stat.st_mode & libc::S_IFMT)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
         }
-        Ok(Some(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT))
     }
 
     pub(in crate::issue) fn read(&self, path: &Path, cap: u64) -> Result<Option<String>> {
@@ -112,16 +88,11 @@ impl Root {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(error.into());
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = match parent.open_readonly_nofollow(&leaf) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.nlink() > 1 {
             return Err(Error::rejected(
@@ -152,48 +123,15 @@ impl Root {
     }
 
     pub(super) fn list(&self, path: &Path, budget: &mut usize) -> Result<Vec<String>> {
-        struct Directory(*mut libc::DIR);
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::closedir(self.0);
-                }
-            }
-        }
-        let fd = self.dir(path)?.into_raw_fd();
-        let raw = unsafe { libc::fdopendir(fd) };
-        if raw.is_null() {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let dir = Directory(raw);
+        let dir = self.dir(path)?;
         let mut names = Vec::new();
-        loop {
-            #[cfg(target_os = "linux")]
-            let errno = unsafe { libc::__errno_location() };
-            #[cfg(target_os = "macos")]
-            let errno = unsafe { libc::__error() };
-            unsafe {
-                *errno = 0;
-            }
-            let next = unsafe { libc::readdir(dir.0) };
-            if next.is_null() {
-                if unsafe { *errno } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                break;
-            }
-            let bytes = unsafe { CStr::from_ptr((*next).d_name.as_ptr()) }.to_bytes();
-            if bytes == b"." || bytes == b".." {
-                continue;
-            }
+        for entry in dir.read_dir()? {
+            let entry = entry?;
             *budget = budget
                 .checked_sub(1)
                 .ok_or_else(|| Error::rejected("catalog global inventory limit exceeded"))?;
             names.push(
-                std::str::from_utf8(bytes)
+                std::str::from_utf8(entry.as_bytes())
                     .map_err(|_| Error::rejected("catalog names must be UTF-8"))?
                     .to_string(),
             );
@@ -204,8 +142,7 @@ impl Root {
 
     pub(super) fn mkdir(&self, path: &Path) -> Result<()> {
         let (parent, leaf) = self.parent(path)?;
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } < 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = parent.mkdir(&leaf, 0o700) {
             if error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(error.into());
             }
@@ -217,11 +154,7 @@ impl Root {
 
     pub(super) fn put(&self, path: &Path, text: &str) -> Result<()> {
         let (parent, leaf) = self.parent(path)?;
-        let mode = match open_at(
-            &parent,
-            leaf.to_bytes(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        ) {
+        let mode = match parent.open_readonly_nofollow(&leaf) {
             Ok(file) => {
                 let meta = file.metadata()?;
                 if !meta.is_file() || meta.nlink() != 1 {
@@ -235,43 +168,28 @@ impl Root {
             Err(e) => return Err(e.into()),
         };
         let temp = name(format!(".tmp-{}", uuid::Uuid::new_v4().simple()).as_bytes())?;
-        let flags =
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), temp.as_ptr(), flags, 0o600) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = parent.open_file_nofollow(
+            &temp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
         let result = (|| {
             file.write_all(text.as_bytes())?;
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             file.sync_all()?;
-            if unsafe {
-                libc::renameat(
-                    parent.as_raw_fd(),
-                    temp.as_ptr(),
-                    parent.as_raw_fd(),
-                    leaf.as_ptr(),
-                )
-            } < 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            parent.rename_child(&temp, &leaf)?;
             parent.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
-            unsafe {
-                libc::unlinkat(parent.as_raw_fd(), temp.as_ptr(), 0);
-            }
+            let _ = parent.unlink_child(&temp);
         }
         result
     }
 
     pub(super) fn remove(&self, path: &Path) -> Result<()> {
         let (parent, leaf) = self.parent(path)?;
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0) } < 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = parent.unlink_child(&leaf) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(error.into());
             }
