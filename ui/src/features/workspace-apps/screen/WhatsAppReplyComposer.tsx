@@ -16,7 +16,9 @@ export interface WhatsAppReplySelection {
 }
 
 type Recipient = { workRef: string; label: string; reference: string | null };
-type RecipientCheck = { recipient: Recipient; retryable?: never } | { recipient: null; retryable?: boolean };
+type RecipientCheck = { recipient: Recipient; retryable?: never; bound?: never } | { recipient: null; retryable?: boolean; bound?: Recipient };
+const sameRecipient = (left: Recipient | null, right: Recipient) =>
+  left?.workRef === right.workRef && left.label === right.label;
 type Outcome = "unsent" | "failed" | "uncertain" | "accepted" | "sent";
 const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
@@ -68,7 +70,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
   const [verification, setVerification] = useState<RecipientCheck>();
-  const [load, setLoad] = useState(0);
+  const [retry, setRetry] = useState<{ bound?: Recipient }>();
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [staleRecipient, setStaleRecipient] = useState(false);
@@ -85,16 +87,25 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
 
   useEffect(() => {
     let cancelled = false;
-    void recipientFor(selection).then(check => {
+    const bound = retry?.bound;
+    void recipientFor(selection, bound?.workRef).then(check => {
       if (cancelled || !selection.current()) return;
       const value = check.recipient;
+      if (bound && !sameRecipient(value, bound)) {
+        if (check.retryable) setVerification({ ...check, bound });
+        else {
+          setStaleRecipient(true);
+          setVerification({ recipient: bound });
+        }
+        return;
+      }
       const receipts = value && replyRecovery.get(receiptKey(selection, value));
       if (receipts?.pending) setAttempt({ effectId: receipts.pending, outcome: "uncertain" });
       else if (receipts?.accepted) setAttempt({ effectId: receipts.accepted, outcome: "accepted" });
       setVerification(check);
     });
     return () => { cancelled = true; };
-  }, [selection, load]);
+  }, [selection, retry]);
   useLayoutEffect(() => {
     const box = input.current;
     if (box) {
@@ -125,13 +136,14 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
       effectId = prepared.data.effect_id;
       // Re-read the exact account epoch after prepare. Since a re-pair changes
       // workRef, a prepared effect cannot be carried to a different account.
-      const [{ recipient: live }, plan] = await Promise.all([
+      const [live, plan] = await Promise.all([
         recipientFor(selection, recipient.workRef),
         selection.services.planner("whatsapp.reply.send", { ...args, effect_id: effectId }),
       ]);
       if (!selection.current()) return;
-      if (!live || live.workRef !== recipient.workRef || live.label !== recipient.label) {
-        setStaleRecipient(true);
+      if (!sameRecipient(live.recipient, recipient)) {
+        if (live.retryable) setVerification({ ...live, bound: recipient });
+        else setStaleRecipient(true);
         return;
       }
       if (!("run" in plan)) return;
@@ -205,7 +217,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
         }} />
       <div className="app-chat-composer-tools wa-reply-tools">
         {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
-        {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setVerification(undefined); setLoad(n => n + 1); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
+        {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
         {(!readOnly || busy) && <span className="wa-reply-hint" aria-live="polite">{busy ? (zh ? "處理中…" : "Working…") : (zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line")}</span>}
         <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
           onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
