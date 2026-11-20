@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, SCREEN_CANVAS_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ScreenSection,
   type ScreenSectionI18n,
@@ -353,6 +353,7 @@ export class ScreenChannel extends FrameChannel {
   private wantsLocale = false;
   private wantsPresentation = false;
   private wantsSurfaces = false;
+  private wantsCanvas = false;
   private wantsWhatsAppCompose = false;
   private wantsReplyAvailability = false;
   // Both ends count the existing selections (including clears) on the ordered port.
@@ -367,6 +368,10 @@ export class ScreenChannel extends FrameChannel {
    *  child mount; a reopen starts with a new channel. */
   drawerContext: unknown = null;
   setDrawerContext(context: unknown): void { this.drawerContext = context ?? null; }
+  /** CAD-2525 — this mount is the chat canvas's read-only app view. Host-
+   *  derived like the role; told to the frame only if it opted into
+   *  `screen-canvas.v1`. */
+  canvasReadOnly = false;
   private surfaceState: { role: ScreenSurfaceRole; modal: boolean } | null = null;
   private surfaceSent: string | null = null;
   /** CAD-1615 — tell the child which surface its frame is in (legacy). The
@@ -392,10 +397,14 @@ export class ScreenChannel extends FrameChannel {
     if (this.closed || !this.ready || !this.port || !this.wantsSurfaces) return;
     this.surfaceState ??= { role: this.surfaceRole, modal: false };
     const named = this.surfaceState.role === "drawer" && this.drawerSurface ? this.drawerSurface : undefined;
-    const key = `${this.surfaceState.role}:${this.surfaceState.modal ? 1 : 0}:${named ?? ""}`;
+    // CAD-2525 — only a frame that opted into `screen-canvas.v1` is told it is
+    // in the canvas; every other frame keeps `primary` and no `readOnly`.
+    const canvas = this.wantsCanvas && this.canvasReadOnly && this.surfaceState.role === "primary";
+    const role: ScreenSurfaceRole = canvas ? "canvas" : this.surfaceState.role;
+    const key = `${role}:${this.surfaceState.modal ? 1 : 0}:${named ?? ""}`;
     if (this.surfaceSent === key) return;
     this.surfaceSent = key;
-    const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}) };
+    const message: ScreenSurface = { v: 1, op: "surface", role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}), ...(canvas ? { readOnly: true as const } : {}) };
     this.port.postMessage(message);
   }
   protected leave(unsaved: boolean): void {
@@ -743,6 +752,8 @@ export class ScreenChannel extends FrameChannel {
     // primary or a drawer; a frame that does not advertise it never sees
     // the message.
     this.wantsSurfaces = accepts.includes(SCREEN_SURFACES_V1);
+    // CAD-2525 — canvas/readOnly ride on the surface push, never alone.
+    this.wantsCanvas = this.wantsSurfaces && accepts.includes(SCREEN_CANVAS_V1);
     return true;
   }
   /** Only a v2 child, for a ref the last PUSH carried or a call reply just

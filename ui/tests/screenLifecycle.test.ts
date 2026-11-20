@@ -197,6 +197,30 @@ legacyDrawerPort.receive({ v: 2, op: "call", id: "legacy-open", verb: "screen.dr
 const openedLegacy = legacyDrawerPort.sent.find(m => (m as { id?: string }).id === "legacy-open") as { ok?: boolean } | undefined;
 check(openedLegacy?.ok === true && legacyDrawerCalls.length === 1, "legacy context-free opens still work");
 
+// CAD-2525: the canvas mount tells only a frame that opted into
+// screen-canvas.v1 that it is `canvas` + `readOnly`; every other frame keeps
+// today's `primary` message with no readOnly key, and a non-canvas mount never
+// carries it.
+function surfaceMessage(accepts: string[], canvasMount: boolean) {
+  const source = {} as Window; const port = new Port();
+  const channel = new ScreenChannel(source, drawerReceipt, drawerPush, () => {}, () => {}, () => {}, undefined, drawerHost);
+  channel.surfaceRole = "primary";
+  channel.canvasReadOnly = canvasMount;
+  channel.surface("primary", false);
+  channel.receive({ source, origin: "null", data: init, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts });
+  return port.sent.find(m => (m as { op?: string }).op === "surface") as Record<string, unknown> | undefined;
+}
+const canvasAccepts = ["screen.v2", "screen-actions.v1", "screen-surfaces.v1", "screen-canvas.v1"];
+check(JSON.stringify(surfaceMessage(canvasAccepts, true)) === JSON.stringify({ v: 1, op: "surface", role: "canvas", modal: false, readOnly: true }),
+  "a canvas mount tells a screen-canvas.v1 frame role canvas and readOnly");
+check(JSON.stringify(surfaceMessage(canvasAccepts, false)) === JSON.stringify({ v: 1, op: "surface", role: "primary", modal: false }),
+  "a full-page mount tells a screen-canvas.v1 frame primary with no readOnly");
+check(JSON.stringify(surfaceMessage(["screen.v2", "screen-actions.v1", "screen-surfaces.v1"], true)) === JSON.stringify({ v: 1, op: "surface", role: "primary", modal: false }),
+  "a frame without screen-canvas.v1 still gets exactly primary in the canvas");
+check(surfaceMessage(["screen.v2", "screen-actions.v1", "screen-canvas.v1"], true) === undefined,
+  "screen-canvas.v1 without screen-surfaces.v1 gets no surface message");
+
 // CAD-2268: generic screen-locale.v1 and {v:2, op:"leave", unsaved} work on
 // any screen.v2 mount; legacy CRM tokens and non-v2 mounts are refused.
 check(SCREEN_LOCALE_V1 === "screen-locale.v1", "generic locale token exported");

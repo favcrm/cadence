@@ -131,6 +131,32 @@ test("surfaces opt-in is advertised and the drawer surface is dispatched", async
   assert.deepEqual(seen.pop(), ["drawer", "settings", false]);
 });
 
+test("canvas role and readOnly need the screen-canvas.v1 opt-in (CAD-2525)", async () => {
+  const seen = [];
+  const accepts = ["screen.v2", "screen-surfaces.v1", "screen-canvas.v1"];
+  const { inbox, host, receiver } = connect({ accepts, onSurface: (...a) => seen.push(a) });
+  await tick();
+  assert.deepEqual(inbox[0].accepts, accepts);
+  assert.equal(receiver.readOnly(), false);
+  host.postMessage({ v: 1, op: "surface", role: "canvas", modal: false, readOnly: true });
+  await tick();
+  assert.equal(receiver.surfaceRole(), "canvas");
+  assert.equal(receiver.readOnly(), true);
+  assert.deepEqual(seen.pop(), ["canvas", undefined, false, true]);
+  // A later primary message clears readOnly.
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  await tick();
+  assert.equal(receiver.readOnly(), false);
+  // An app that did not opt in refuses canvas and readOnly.
+  for (const shape of [{ role: "canvas" }, { role: "primary", readOnly: true }]) {
+    const plain = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+    plain.host.postMessage({ v: 1, op: "surface", modal: false, ...shape });
+    await tick();
+    assert.equal(plain.errors.length, 1, `${JSON.stringify(shape)} is refused without the opt-in`);
+  }
+  assert.throws(() => connect({ accepts: ["screen.v2", "screen-canvas.v1"] }), /needs screen-surfaces\.v1/);
+});
+
 test("every surface shape the host sends is admitted", async () => {
   const shapes = [
     { v: 1, op: "surface", role: "primary", modal: false },
