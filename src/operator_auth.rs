@@ -1165,22 +1165,7 @@ impl Auth {
         user: BoardUser,
         jti: (&str, i64),
         user_agent: &str,
-        realm: PublicRealm,
-        now: i64,
-        intent: impl FnOnce(&AuditTarget) -> Result<()>,
-    ) -> Result<Option<Opened>> {
-        self.open_public_bound_with_dedicated_intent(
-            user, jti, user_agent, realm, None, now, intent,
-        )
-    }
-
-    pub(crate) fn open_public_bound_with_dedicated_intent(
-        &mut self,
-        user: BoardUser,
-        jti: (&str, i64),
-        user_agent: &str,
-        realm: PublicRealm,
-        dedicated: Option<DedicatedBinding>,
+        (realm, dedicated): (PublicRealm, Option<DedicatedBinding>),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {

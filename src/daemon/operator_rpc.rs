@@ -1089,12 +1089,11 @@ impl Shared {
             // already have pruned the jti).
             let mut auth = self.operator_auth();
             let opened_at = self.operator_now();
-            auth.open_public_bound_with_dedicated_intent(
+            auth.open_public_bound_with_intent(
                 identity.user(),
                 (parsed.jti(), deadline),
                 user_agent,
-                realm,
-                dedicated,
+                (realm, dedicated),
                 opened_at,
                 |row| {
                     let a = open_audit(&company, &request, row);

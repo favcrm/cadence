@@ -830,7 +830,7 @@ mod tests {
         let check = |deployment: Option<&str>, jti: &str| {
             let opened = shared
                 .operator_auth()
-                .open_public_bound_with_dedicated_intent(
+                .open_public_bound_with_intent(
                     BoardUser {
                         sub: sub.into(),
                         email: "owner@example.test".into(),
@@ -840,11 +840,13 @@ mod tests {
                     },
                     (jti, now + 60),
                     "test",
-                    realm.clone(),
-                    deployment.map(|deployment: &str| DedicatedBinding {
-                        deployment: deployment.into(),
-                        assertion_jti: jti.into(),
-                    }),
+                    (
+                        realm.clone(),
+                        deployment.map(|deployment| DedicatedBinding {
+                            deployment: deployment.into(),
+                            assertion_jti: jti.into(),
+                        }),
+                    ),
                     now,
                     |_| Ok(()),
                 )
