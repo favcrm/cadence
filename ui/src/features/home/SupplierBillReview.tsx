@@ -11,15 +11,29 @@ export default function SupplierBillReview({ conversation, handoff }: { conversa
   const [review, setReview] = useState<SupplierBillDraftReview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const staged = useDecisions(review?.actionId != null);
   useEffect(() => {
     const abort = new AbortController();
     void appHandoffReview(conversation, handoff, false, abort.signal).then((value) => {
       if (!abort.signal.aborted) setReview(value);
-    }, () => undefined);
+    }, () => {
+      if (!abort.signal.aborted) setLoadFailed(true);
+    });
     return () => { abort.abort(); active.current?.abort(); };
-  }, [conversation, handoff]);
-  if (!review) return null;
+  }, [conversation, handoff, loadAttempt]);
+  if (!review) {
+    return loadFailed ? (
+      <div className="text-label">
+        <p role="alert" className="text-fail">{t("Could not load the draft proposal.")}</p>
+        <button type="button" className="btn btn-sm" onClick={() => {
+          setLoadFailed(false);
+          setLoadAttempt((attempt) => attempt + 1);
+        }}>{t("Retry")}</button>
+      </div>
+    ) : null;
+  }
   const actionId = review.actionId;
 
   const send = async (opener: HTMLButtonElement) => {

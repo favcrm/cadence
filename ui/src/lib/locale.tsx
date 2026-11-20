@@ -2492,6 +2492,7 @@ Object.assign(zhTW, {
   "Open owner review": "開啟擁有者覆核",
   "Send to owner review": "送交擁有者覆核",
   "Could not confirm the review request.": "未能確認覆核請求。",
+  "Could not load the draft proposal.": "未能載入草稿建議。",
   "Denying…": "拒絕中…",
   "Did not apply": "未能套用",
   "Hide raw": "隱藏原始內容",
