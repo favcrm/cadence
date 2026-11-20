@@ -226,7 +226,6 @@ export function useInstructionsDoc(opts: {
           setTheirs(out.profile);
           setTheirsOwn(out.own ?? null);
           setPhase("conflict");
-          toast("warn", "Someone else changed this. Your draft is kept.");
           return;
         case "unconfirmed":
           setPhase("unconfirmed");

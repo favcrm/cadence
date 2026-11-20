@@ -2772,6 +2772,10 @@ first and the company Master only to workspace owners. **Teammate assistants**
 lists other current members with their workspace display name and a default
 assistant avatar. The cards are informational: they do not show setup or activity
 and do not let anyone, including an owner, open a teammate’s assistant.
+**My assistant** opens your own profile at `/agents/assistant`, and its Home
+link opens your private chat even when you own the workspace. Hired profiles
+on these boards open by ID at `/agents/profile/<id>`, so a legacy profile
+named `assistant` remains separate and accessible.
 
 Native Master-backed Home/app conversations are still workspace-owned. Their
 headers keep that scope visible at narrow widths too. The About panel offers

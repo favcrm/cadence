@@ -904,8 +904,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     else openWorkItem(id, "home", outcome.next);
   }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
-    (alias: string | null, tab?: AgentTab) =>
-      update((c) => ({ ...c, route: { screen: "agents", alias, ...(alias && tab && tab !== "overview" ? { tab } : {}) } })),
+    (alias: string | null, tab?: AgentTab, profileId?: string) =>
+      update((c) => ({ ...c, route: { screen: "agents", alias, profileId, ...(tab && tab !== "overview" ? { tab } : {}) } })),
     [],
   );
   // CAD-561: the draining banner. Cheap (the daemon's own view), polled
@@ -1669,6 +1669,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             state={agentsState}
             issues={issuesState}
             open={route.alias}
+            openProfileId={route.profileId}
             tab={route.tab ?? "overview"}
             recruit={route.recruit === true}
             ask={route.ask === true}
@@ -1680,7 +1681,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onTab={(tab) =>
               update((c) => ({
                 ...c,
-                route: { screen: "agents", alias: route.alias, ...(tab === "overview" ? {} : { tab }) },
+                route: { ...route, tab: tab === "overview" ? undefined : tab },
               }))
             }
             onRecruit={(on) =>

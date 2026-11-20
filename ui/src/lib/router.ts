@@ -85,7 +85,7 @@ export type Route =
   | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
   | { screen: "workspaceAppKey"; appKey: string }
-  | { screen: "agents"; alias: string | null; tab?: AgentTab; recruit?: boolean; ask?: boolean }
+  | { screen: "agents"; alias: string | null; profileId?: string; tab?: AgentTab; recruit?: boolean; ask?: boolean }
   | { screen: "threads" }
   /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
   | { screen: "myWork"; view?: MyWorkView }
@@ -301,6 +301,10 @@ export function matchRoute(pathname: string): Route {
       const alias = segment(a);
       if (alias) return { screen: "agents", alias };
     }
+    if (head === "agents" && a === "profile" && b && !rest.length) {
+      const profileId = segment(b);
+      if (profileId && /^ap_[A-Za-z0-9_-]+$/.test(profileId)) return { screen: "agents", alias: null, profileId };
+    }
     if (head === "threads" && !a) return { screen: "threads" };
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
@@ -387,7 +391,9 @@ export function routePath(route: Route): string {
     case "appsManage":
       return `/apps/manage/${encodeURIComponent(route.installId)}`;
     case "agents":
-      return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
+      return route.profileId
+        ? `/agents/profile/${encodeURIComponent(route.profileId)}`
+        : route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "threads":
       return "/threads";
     case "wiki": {
@@ -479,12 +485,12 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   }
   if (route.screen === "agents") {
     const tab = parseAgentTab(q.get("tab"));
+    const detail = route.alias !== null || route.profileId !== undefined;
     route = {
-      screen: "agents",
-      alias: route.alias,
-      ...(route.alias && tab !== "overview" ? { tab } : {}),
-      ...(!route.alias && q.get("recruit") === "1" ? { recruit: true } : {}),
-      ...(!route.alias && q.get("ask") === "1" ? { ask: true } : {}),
+      ...route,
+      ...(detail && tab !== "overview" ? { tab } : {}),
+      ...(!detail && q.get("recruit") === "1" ? { recruit: true } : {}),
+      ...(!detail && q.get("ask") === "1" ? { ask: true } : {}),
     };
   }
   if (route.screen === "myWork") {
@@ -645,9 +651,10 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
     return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
   }
   if (route.screen === "agents") {
-    if (route.alias && route.tab) q.set("tab", route.tab);
-    if (!route.alias && route.recruit) q.set("recruit", "1");
-    if (!route.alias && route.ask) q.set("ask", "1");
+    const detail = route.alias !== null || route.profileId !== undefined;
+    if (detail && route.tab) q.set("tab", route.tab);
+    if (!detail && route.recruit) q.set("recruit", "1");
+    if (!detail && route.ask) q.set("ask", "1");
   }
   if (route.screen === "projects") {
     if (route.section === "issues") {

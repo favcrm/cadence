@@ -69,6 +69,7 @@ export default function AgentPage({
   observed,
   roles,
   profiles,
+  selectedProfile,
   tab,
   onTab,
   onBack,
@@ -91,6 +92,7 @@ export default function AgentPage({
   observed?: Agent;
   roles: RolesState;
   profiles: HiredProfile[];
+  selectedProfile?: HiredProfile;
   tab: AgentTab;
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
@@ -124,7 +126,7 @@ export default function AgentPage({
 
   // The gear opens over the current section; `?tab=settings` opens over Instructions.
   const [gear, setGear] = useState(false);
-  const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
+  const hired = selectedProfile ?? (observed ? undefined : profiles.find((p) => p.alias === alias));
   const masterPage = companyMaster && operator === true;
   const chat = tab === "overview" && !masterPage;
   const leave = chat || masterPage ? onBack : () => onTab("overview");

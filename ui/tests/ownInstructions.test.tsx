@@ -162,9 +162,11 @@ async function main() {
     await type("My newer draft");
     const theirs = boards[kind].doc;
     boards[kind].doc = { text: "Their text", revision: boards[kind].next(theirs.revision) };
+    toasts.length = 0;
     await click("Save");
     assert(area().value === "My newer draft", `${kind}: the draft is kept`);
     assert(button("Save mine") && button("Discard mine, use theirs") && !button("Save"), `${kind}: conflict choices`);
+    assert(host.querySelector("[role=alert]")?.textContent === "Someone else changed this. Your draft is kept." && toasts.length === 0, `${kind}: announce conflicts inline without an overlay blocking the choices`);
     assert((boards[kind].doc.text as string) === "Their text", `${kind}: nothing overwritten`);
     await click("Save mine");
     assert(String(writes[writes.length - 1]!.revision) === String(boards[kind].doc.revision) || (boards[kind].doc.text as string) === "My newer draft", `${kind}: save mine rides their revision`);

@@ -36,10 +36,12 @@ export default function AgentSidebar({
   companyMaster,
   profileStatus,
   open,
+  openProfileId,
   query,
   hasTeammateMatches,
   onQuery,
   onOpen,
+  onOpenProfile,
   onOpenPersonal,
   onOverview,
   onRecruit,
@@ -53,22 +55,26 @@ export default function AgentSidebar({
   /** A profile's one status line, as its card reads it. */
   profileStatus: (profile: HiredProfile) => string;
   open: string | null;
+  openProfileId?: string;
   query: string;
   hasTeammateMatches: boolean;
   onQuery: (query: string) => void;
   onOpen: (alias: string) => void;
+  onOpenProfile: (profile: HiredProfile) => void;
   onOpenPersonal: (() => void) | null;
   onOverview: () => void;
   onRecruit: () => void;
 }) {
   const t = useTranslate();
-  const row = (alias: string, face: ReactNode, status: string, title?: string) => (
+  const row = (alias: string, face: ReactNode, status: string, title?: string, profile?: HiredProfile) => (
     <button
-      key={alias}
+      key={profile?.id ?? alias}
       type="button"
       className="ag-side-row"
-      aria-current={open === alias && !(onOpenPersonal && alias === PERSONAL_ALIAS) ? "page" : undefined}
-      onClick={() => onOpen(alias)}
+      aria-current={(openProfileId
+        ? profile?.id === openProfileId
+        : open === alias && !(onOpenPersonal && alias === PERSONAL_ALIAS)) ? "page" : undefined}
+      onClick={() => profile ? onOpenProfile(profile) : onOpen(alias)}
     >
       {face}
       <span className="min-w-0">
@@ -104,6 +110,8 @@ export default function AgentSidebar({
               p.alias,
               <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />,
               profileStatus(p),
+              undefined,
+              p,
             ),
           ),
       ];
@@ -139,7 +147,7 @@ export default function AgentSidebar({
         <button
           type="button"
           className="ag-side-row plain"
-          aria-current={open === null ? "page" : undefined}
+          aria-current={open === null && !openProfileId ? "page" : undefined}
           onClick={onOverview}
         >
           <span className="t">{t("Overview")}</span>

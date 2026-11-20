@@ -77,7 +77,7 @@ export default function MyAssistantPage({
           </div>
         </div>
         <div className="ap-acts">
-          <Button href="/">{t("Open Home")}</Button>
+          <Button href="/?chat=assistant">{t("Open Home")}</Button>
         </div>
       </header>
       <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>

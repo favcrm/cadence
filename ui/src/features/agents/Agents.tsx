@@ -69,6 +69,7 @@ export default function Agents({
   state,
   issues: issuesState,
   open,
+  openProfileId,
   tab,
   recruit,
   ask,
@@ -93,12 +94,13 @@ export default function Agents({
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
+  openProfileId?: string;
   tab: AgentTab;
   recruit: boolean;
   ask: boolean;
   onAsk: () => void;
   /** `tab` lands on a section instead of the chat (the company Master has no chat yet). */
-  onOpenAgent: (alias: string | null, tab?: AgentTab) => void;
+  onOpenAgent: (alias: string | null, tab?: AgentTab, profileId?: string) => void;
   onTab: (tab: AgentTab) => void;
   onToast: (kind: ToastMsg["kind"], text: string) => void;
   onRecruit: (on: boolean) => void;
@@ -125,7 +127,7 @@ export default function Agents({
     hostedBoard &&
     ((payload != null && Object.hasOwn(payload, "personal_assistant")) ||
       roster.some((a) => isCompanyMaster(a, payload)));
-  const directoryViewer = scopedRoster && !open && !ask && !recruit ? viewerSub ?? null : null;
+  const directoryViewer = scopedRoster && !open && !openProfileId && !ask && !recruit ? viewerSub ?? null : null;
   const [directory, setDirectory] = useState<{
     viewer: string;
     rows: { userId: string; name: string }[];
@@ -206,6 +208,10 @@ export default function Agents({
     if (alias === MASTER && companyMaster && operator === true) setOpen(alias, "instructions");
     else setOpen(alias);
   };
+  const openProfile = (profile: HiredProfile) => {
+    if (scopedRoster) setOpen(null, undefined, profile.id);
+    else openAgent(profile.alias);
+  };
   const seat = (a: Agent) => (
     <SeatCard
       key={a.alias}
@@ -243,7 +249,9 @@ export default function Agents({
     />
   );
 
-  const openHired = profiles.find((p) => p.alias === open);
+  const selectedProfile = scopedRoster && openProfileId ? profiles.find((p) => p.id === openProfileId) : undefined;
+  const openAlias = selectedProfile?.alias ?? open;
+  const openHired = selectedProfile ?? profiles.find((p) => p.alias === open);
   const shell = (content: ReactNode) => (
     <div className="ag-shell">
       <AgentSidebar
@@ -256,10 +264,12 @@ export default function Agents({
           return work ? workText(work, t) : t("Idle · no runtime");
         }}
         open={open}
+        openProfileId={openProfileId}
         query={query}
         hasTeammateMatches={matchingTeammates.length > 0}
         onQuery={setQuery}
         onOpen={openAgent}
+        onOpenProfile={openProfile}
         onOpenPersonal={scopedRoster ? () => setOpen(PERSONAL_ALIAS) : null}
         onOverview={() => setOpen(null)}
         onRecruit={() => onRecruit(true)}
@@ -268,17 +278,28 @@ export default function Agents({
     </div>
   );
 
-  if (open === PERSONAL_ALIAS && personal) {
-    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
-  }
-  const personalUnavailable = scopedRoster && open === PERSONAL_ALIAS;
-  if (personalUnavailable || (scopedRoster && open === MASTER && operator !== true)) {
+  // Only a roster response can establish that a hosted alias is legacy.
+  if (hostedBoard && payload == null && (open === PERSONAL_ALIAS || openProfileId)) {
     return shell(
       <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
         <button type="button" className="rc-back" onClick={() => setOpen(null)}>
           ← {t("Agents")}
         </button>
-        {personalUnavailable ? (
+        <ResourceGate state={state} loading="Loading agents…" failed="Could not load agents" onRetry={onRetry} />
+      </main>,
+    );
+  }
+  if (open === PERSONAL_ALIAS && personal) {
+    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
+  }
+  const detailUnavailable = (scopedRoster && open === PERSONAL_ALIAS) || (openProfileId && !selectedProfile);
+  if (detailUnavailable || (scopedRoster && open === MASTER && operator !== true)) {
+    return shell(
+      <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+        <button type="button" className="rc-back" onClick={() => setOpen(null)}>
+          ← {t("Agents")}
+        </button>
+        {detailUnavailable ? (
           <>
             <p className="rc-note" role="status">{t("Agent details are unavailable.")}</p>
             <Button onClick={onRetry}>{t("Retry")}</Button>
@@ -297,14 +318,15 @@ export default function Agents({
       </main>,
     );
   }
-  if (open) {
+  if (openAlias) {
     return shell(
       <AgentPage
-        key={open}
-        alias={open}
-        observed={agent}
+        key={selectedProfile?.id ?? openAlias}
+        alias={openAlias}
+        observed={selectedProfile ? undefined : agent}
         roles={roles}
         profiles={profiles}
+        selectedProfile={selectedProfile}
         tab={tab}
         onTab={onTab}
         onBack={() => setOpen(null)}
@@ -425,7 +447,7 @@ export default function Agents({
                 profile={profile}
                 roleTitle={profileTitle(profile)}
                 work={profileWork(profile, issueCards)}
-                onOpen={() => openAgent(profile.alias)}
+                onOpen={() => openProfile(profile)}
               />
             ))}
             {!searching && tile}

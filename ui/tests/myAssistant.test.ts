@@ -48,11 +48,12 @@ const Agents = (
 ).default;
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
-const { readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
+const { locationHref, readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
 const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 type Agent = import("../src/lib/types").Agent;
 type AgentsPayload = import("../src/lib/types").AgentsPayload;
-type AgentTab = import("../src/features/agents/agentTabModel").AgentTab;
 const base: Agent = {
   alias: "dev",
   provider: "pi",
@@ -81,6 +82,7 @@ const roster = (over: Partial<AgentsPayload> & { master?: Partial<Agent> } = {})
 const hostedRoster = (extra: Partial<AgentsPayload> = {}) =>
   roster({ master: { scope: "workspace", name: "Acme" }, personal_assistant: personalRow, ...extra });
 let memberStateReads = 0;
+let aliasReads = 0;
 let threadReads: string[] = [];
 let directoryReads = 0;
 let directoryAvailable = true;
@@ -107,7 +109,7 @@ globalThis.fetch = async (input) => {
   }
   if (path.startsWith("/api/agents/")) {
     const alias = decodeURIComponent(path.split("/").pop()!);
-    if (alias === "assistant") throw new Error("the personal assistant must never read /api/agents/assistant");
+    if (alias === "assistant") aliasReads += 1;
     return json({ agent: { alias, provider: "pi", endpoint_kind: "pty", instructions: "x" }, queued: 0, unknown: 0, running: [], events: [], fenced: false, on: [] });
   }
   return json({ error: "unavailable" }, 503);
@@ -131,23 +133,28 @@ let hostedBoard = true;
 let operator: boolean | null = true;
 let viewerSub: string | null = "viewer";
 let profiles: unknown[] = [];
+let rosterFailed = false;
 /** Reads the route from the real URL, as the app does. */
-function route(): { open: string | null; tab: AgentTab } {
+function route() {
   const r = readLocation(location.pathname, location.search).route;
-  return r.screen === "agents" ? { open: r.alias, tab: r.tab ?? "overview" } : { open: null, tab: "overview" };
+  return r.screen === "agents" ? r : { alias: null, profileId: undefined, tab: undefined };
 }
 async function render() {
-  const { open, tab } = route();
+  const { alias: open, profileId: openProfileId, tab = "overview" } = route();
   const viewer = { viewerSub: hostedBoard ? viewerSub : null };
   await React.act(() =>
     root.render(
+      React.createElement(NavigationProvider, { adapter: hostNavigation, children:
       React.createElement(LocaleProvider, null, React.createElement(Agents, {
         key: `${operator}${hostedBoard}`,
         operator,
         onRetryAccess: () => {},
         hostedBoard,
         ...viewer,
-        state: loaded({ ...payload, profiles } as AgentsPayload),
+        openProfileId,
+        state: rosterFailed
+          ? { ...loaded<AgentsPayload | null>(null), status: "failed", error: "Offline" }
+          : loaded({ ...payload, profiles } as AgentsPayload),
         issues: loaded([]),
         open,
         tab,
@@ -155,8 +162,9 @@ async function render() {
         ask: false,
         onAsk: () => {},
         // The app's own handler: a navigation, read back from the URL.
-        onOpenAgent: (alias, to) => {
-          navigate(alias ? `/agents/${encodeURIComponent(alias)}${to && to !== "overview" ? `?tab=${to}` : ""}` : "/agents");
+        onOpenAgent: (alias, to, profileId) => {
+          const loc = readLocation(location.pathname, location.search);
+          navigate(locationHref({ ...loc, route: { screen: "agents", alias, profileId, tab: to === "overview" ? undefined : to } }));
         },
         onTab: () => {},
         onToast: () => {},
@@ -164,6 +172,7 @@ async function render() {
         onOpenIssue: () => {},
         onRetry: () => {},
       })),
+      }),
     ),
   );
   await flush();
@@ -252,6 +261,13 @@ async function main() {
   );
   assert(host.querySelector("textarea") === null, "member: no composer for the company Master");
 
+  // An initial roster failure is not proof that a hosted alias is a hired agent.
+  rosterFailed = true;
+  await at("/agents/assistant?tab=instructions");
+  assert(aliasReads === 0, "failed hosted roster never reads the reserved alias");
+  assert(host.textContent?.includes("Could not load agents") && host.querySelector("main [role=alert] button"), "a failed roster offers retry");
+  rosterFailed = false;
+
   // /agents/assistant is the personal page, even beside a hired profile named assistant.
   profiles = [{ id: "ap_1", alias: "assistant", role: "worker", team_role: "worker", catalogue: null, look: null, job: "x", model: "inherit", runtimes: [] }];
   operator = true;
@@ -262,7 +278,24 @@ async function main() {
   assert(host.textContent?.includes("not edited here yet"), "Instructions is the honest read-only note");
   assert(!host.textContent?.includes("Manage profile"), "no fake controls");
   assert(host.querySelectorAll("[aria-current='page']").length === 1, "one sidebar row is current");
+  const homeLink = [...host.querySelectorAll("a")].find((link) => link.textContent === "Open Home");
+  assert(homeLink?.getAttribute("href") === "/?chat=assistant", "Open Home offers the owner's own assistant chat URL");
   assert(host.querySelector("[aria-current='page']")?.textContent?.includes("Your assistant"), "the personal row is the current one");
+  await click(homeLink);
+  assert(String(location.pathname) === "/" && String(location.search) === "?chat=assistant", "Open Home navigates to the owner's own assistant chat");
+  await at("/agents");
+  await click(host.querySelector(".rc-seats [aria-label='Open agent assistant']"));
+  assert(String(location.pathname) === "/agents/profile/ap_1", "a hired assistant opens its own ID route instead of the caller's assistant");
+  assert(host.querySelector("h1")?.textContent === "assistant" && aliasReads === 0, "the profile stays separate without an agent alias read");
+  assert(host.querySelectorAll("[aria-current='page']").length === 1 && host.querySelector("[aria-current='page']")?.textContent?.startsWith("assistant"), "only the hired profile row is current");
+  await at("/agents/profile/ap_1?tab=instructions");
+  assert(host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Instructions" && aliasReads === 0, "a hired profile ID deep link keeps the requested tab");
+  await at("/agents");
+  await click([...host.querySelectorAll(".ag-side-row")].find((row) => row.textContent?.startsWith("assistant")));
+  assert(String(location.pathname) === "/agents/profile/ap_1", "the hired sidebar row opens the same ID route");
+  await at("/agents/profile/ap_missing");
+  assert(host.textContent?.includes("Agent details are unavailable.") && aliasReads === 0, "an unknown profile ID never falls back to the personal route");
+  await at("/agents/assistant");
   // Without a personal row (an older API) the same route is the hired profile, as today.
   payload = roster();
   await render();
