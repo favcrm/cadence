@@ -10,6 +10,7 @@ import {
   extractHtmlPlaceholders,
   onSaveAsTemplateRequested,
   parameterizeHtmlForTemplate,
+  requestCanvasTemplateReview,
   stageCanvasTemplatePrefill,
 } from "../templates/canvasTemplateDraft";
 import { templatesApi } from "../templates/templatesApi";
@@ -100,7 +101,7 @@ function focusFallback(fallbackArtifactId?: string | null): void {
   target?.focus();
 }
 
-function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView, hosted, templateReviewEnabled }: {
   conversation: string;
   tab: ArtifactTab;
   composerKey: string | null;
@@ -110,6 +111,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
   canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
+  hosted: boolean;
+  templateReviewEnabled: boolean;
   htmlView: HtmlView;
   onHtmlView: (view: HtmlView) => void;
 }) {
@@ -130,9 +133,14 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
 
   useEffect(() => {
     const reset = () => { saveLifecycle.current += 1; setSaveOpen(false); setTplBusy(false); setTplError(null); setTplSaved(null); };
-    reset();
-    return onPrivateReadsPaused(reset);
-  }, [tab.id, tab.selected]);
+    // Body is keyed by artifact version. Reset on revocation, not on effect
+    // replay: replay would clear a Save as Template request just consumed.
+    const unsubscribe = onPrivateReadsPaused(reset);
+    return () => {
+      saveLifecycle.current += 1;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (tab.kind !== "html") return;
@@ -174,11 +182,13 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
       const created = await templatesApi.createHtml(cleanName, prepared.html, spec);
       if (token !== saveLifecycle.current || !privateReadsAllowed()) return;
       let sampleHtml: string | undefined;
-      try {
-        const s = await templatesApi.sample(created.template.name, created.template.version, "html");
-        if (token !== saveLifecycle.current || !privateReadsAllowed()) return;
-        sampleHtml = s.html ?? (s.html_base64 ? new TextDecoder().decode(Uint8Array.from(atob(s.html_base64), (c) => c.charCodeAt(0))) : undefined);
-      } catch {}
+      if (!hosted) {
+        try {
+          const s = await templatesApi.sample(created.template.name, created.template.version, "html");
+          if (token !== saveLifecycle.current || !privateReadsAllowed()) return;
+          sampleHtml = s.html ?? (s.html_base64 ? new TextDecoder().decode(Uint8Array.from(atob(s.html_base64), (c) => c.charCodeAt(0))) : undefined);
+        } catch {}
+      }
       setTplSaved({ name: created.template.name, version: created.template.version, sha256: created.template.content_sha256, html: prepared.html, specJson: JSON.stringify(spec, null, 2), sampleHtml });
     } catch (cause) {
       if (token === saveLifecycle.current && privateReadsAllowed()) setTplError(cause instanceof Error ? cause.message : t("Couldn’t save template."));
@@ -368,7 +378,14 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
                   <iframe className="w-full h-44 rounded border border-ink-800 bg-white" sandbox="" referrerPolicy="no-referrer" srcDoc={htmlFrameDocument(tplSaved.sampleHtml)} title={`SAMPLE HTML of ${tplSaved.name} v${tplSaved.version}`} />
                 </div>
               )}
-              <div className="flex justify-end"><button type="button" className="btn btn-ghost" data-open-in-templates onClick={() => { stageCanvasTemplatePrefill({ name: tplSaved.name, html: tplSaved.html, specJson: tplSaved.specJson }); onClose(); navigate("/settings/templates"); }}>{t("Open in Templates")}</button></div>
+              <div className="flex justify-end">{templateReviewEnabled ? (
+                <button type="button" className="btn btn-ghost" onClick={(event) => {
+                  requestCanvasTemplateReview({ name: tplSaved.name, version: tplSaved.version, digest: tplSaved.sha256 }, event.currentTarget);
+                  if (window.location.pathname !== "/") navigate("/");
+                }}>{t("Review template")}</button>
+              ) : !hosted ? (
+                <button type="button" className="btn btn-ghost" data-open-in-templates onClick={() => { stageCanvasTemplatePrefill({ name: tplSaved.name, html: tplSaved.html, specJson: tplSaved.specJson }); onClose(); navigate("/settings/templates"); }}>{t("Open in Templates")}</button>
+              ) : null}</div>
             </div>
           )}
           <div className="flex justify-end gap-2"><button type="submit" className="btn" disabled={tplBusy || writeGate !== null || !tplForm.name.trim() || !tplForm.confirmed}>{tplBusy ? t("Saving…") : t("Save draft v1")}</button></div>
@@ -402,7 +419,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
  * (see `drawerLayout`); resizable by pointer and arrow keys; Esc closes; no
  * scrim, no focus trap.
  */
-export default function CanvasDrawer() {
+export default function CanvasDrawer({ hosted = false, templateReviewEnabled = false }: { hosted?: boolean; templateReviewEnabled?: boolean }) {
   const t = useTranslate();
   const canvas = useCanvas();
   const browser = useBrowserTab();
@@ -647,6 +664,8 @@ export default function CanvasDrawer() {
               canExpand={canExpand}
               onExpand={() => setExpanded((x) => !x)}
               onClose={closeAll}
+              hosted={hosted}
+              templateReviewEnabled={templateReviewEnabled}
               htmlView={htmlViews[tab.id] ?? "rendered"}
               onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
             />

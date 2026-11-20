@@ -94,6 +94,7 @@ import {
   hireBlock,
   kickoffBlock as operatorKickoffBlock,
   policyBlock,
+  sessionAdmissible,
   writeBlock,
 } from "./features/auth/gate";
 import { HireBlock, WriteGate } from "./features/auth/WriteGate";
@@ -382,6 +383,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // also produces `Meta.wiki`); local boards use transfer jobs.
   const hosted = meta ? meta.hosted === true : undefined;
   const viewerSub = meta?.session?.user?.sub ?? null;
+  const hostedBoard = meta?.hosted === true || meta?.session?.origin === "public";
+  const templateReviewEnabled = Boolean(hostedBoard && meta?.signed_in === true && meta.session?.origin === "public" && sessionAdmissible(meta.session) && viewerSub && !viewerSub.startsWith("operator-token:"));
+  const templateReviewCanApprove = templateReviewEnabled && meta?.session?.user?.role === "operator" && meta?.operator === true && !readOnly;
   // Platform operator sessions do not own a private app-agent setting.
   const appAgentSession = hosted && meta?.signed_in && meta.session?.id && viewerSub && !viewerSub.startsWith("operator-token:")
     ? JSON.stringify([meta.session.id, viewerSub])
@@ -396,13 +400,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // makes no request for the rest of the session.
 
   // A board that says what Settings it serves never shows a page it doesn't.
-  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  const hostedTemplatesRedirect = route.screen === "settings" && route.section === "templates" && hostedBoard;
+  const settingsTarget = route.screen === "settings" && !hostedTemplatesRedirect ? settingsRedirect(route.section, meta) : null;
   useEffect(() => {
     if (settingsTarget) {
       const targetRoute: Route = { screen: "settings", section: settingsTarget };
       navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
     }
   }, [settingsTarget]);
+  useEffect(() => {
+    if (hostedTemplatesRedirect) navigate("/", { replace: true });
+  }, [hostedTemplatesRedirect]);
   const legacyDocumentsHref = managedFiles && route.screen === "documents"
     ? route.archived ? "/wiki?archived=1" : "/wiki"
     : null;
@@ -1371,6 +1379,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
             operator={meta?.operator === true}
+            templateReviewEnabled={templateReviewEnabled}
+            templateReviewCanApprove={templateReviewCanApprove}
             overview={overviewState}
             documentFollowUps={documentFollowUps}
             onOpenIssue={openHomeWork}
@@ -1737,9 +1747,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
-        {route.screen === "settings" && (
+        {route.screen === "settings" && !hostedTemplatesRedirect && (
           <SettingsLayout
-            groups={settingsNavGroups(meta).map((group) => ({
+            groups={settingsNavGroups({ ...meta, hosted: hostedBoard }).map((group) => ({
               label: group.label,
               items: group.items.map((item) => ({
                 label: item.label,
@@ -1772,8 +1782,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
             )}
             {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
-            {route.section === "templates" && (
-              <Templates viewer={{ operator: viewer.operator, hosted: Boolean(meta?.hosted || meta?.settings_sections) }} />
+            {route.section === "templates" && !hostedBoard && (
+              <Templates viewer={{ operator: viewer.operator, hosted: false }} />
             )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
             {route.section === "general" && <General documentPolicy={
@@ -1864,7 +1874,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       )}
 
       <Toast msg={toast} />
-      <CanvasDrawer />
+      <CanvasDrawer hosted={hostedBoard} templateReviewEnabled={templateReviewEnabled} />
     </div>
     </HireBlock.Provider>
     </WriteGate.Provider>

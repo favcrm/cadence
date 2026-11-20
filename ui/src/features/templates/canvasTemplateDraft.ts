@@ -1,4 +1,5 @@
 import { onPrivateReadsPaused } from "../../lib/privateSession";
+import type { HostedTemplateReviewTarget } from "./HostedTemplateReview";
 
 export interface ExtractedPlaceholders { scalars: string[]; itemFields: string[] }
 export interface CanvasTemplatePrefill { name: string; html: string; specJson: string }
@@ -58,9 +59,13 @@ function makeSignal<T>() {
 }
 
 const prefill = makeSignal<CanvasTemplatePrefill>(), saveReq = makeSignal<string>();
+const reviewReq = makeSignal<{ target: HostedTemplateReviewTarget; opener?: HTMLElement }>();
 export const stageCanvasTemplatePrefill = (p: CanvasTemplatePrefill) => prefill.set(p);
 export const consumeCanvasTemplatePrefill = () => prefill.take();
 export const onCanvasTemplatePrefill = (fn: () => void) => prefill.sub(fn);
 export const requestSaveAsTemplateForArtifact = (id: string) => saveReq.set(id);
 export const consumeSaveAsTemplateRequest = (id: string) => saveReq.take((v) => v === id) !== null;
 export const onSaveAsTemplateRequested = (fn: () => void) => saveReq.sub(fn);
+export const requestCanvasTemplateReview = (target: HostedTemplateReviewTarget, opener?: HTMLElement) => reviewReq.set({ target, opener });
+export const consumeCanvasTemplateReview = () => reviewReq.take();
+export const onCanvasTemplateReview = (fn: () => void) => reviewReq.sub(fn);

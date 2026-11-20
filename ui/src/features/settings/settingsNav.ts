@@ -30,6 +30,7 @@ const ENTRIES = {
 /** The fields of `/api/meta` that decide what Settings offers. */
 export type SettingsMeta = {
   settings_sections?: readonly string[];
+  hosted?: boolean;
   platform_account_configured?: boolean;
   wiki_managed_files?: boolean;
 } | null | undefined;
@@ -47,18 +48,18 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   if (!listed) {
     return [
       { label: "You", items: [ENTRIES.preferences] },
-      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ENTRIES.templates, ENTRIES.general, ENTRIES.memory] },
+      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ...(!meta?.hosted ? [ENTRIES.templates] : []), ENTRIES.general, ENTRIES.memory] },
       { label: "System", items: [ENTRIES.status, ...account, ENTRIES.permissions, ENTRIES.custody] },
     ];
   }
   const pick = (...names: (keyof typeof ENTRIES)[]) =>
-    names.filter((name) => listed.includes(name)).map((name) => ENTRIES[name]);
+    names.filter((name) => listed?.includes(name)).map((name) => ENTRIES[name]);
   return [
     { label: "You", items: pick("preferences") },
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
-    { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", "email", "templates", "general") },
+    { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", "email", ...(!meta?.hosted ? ["templates" as const] : []), "general") },
     { label: "System", items: [...pick("status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }

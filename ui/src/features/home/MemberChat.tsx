@@ -4,6 +4,7 @@ import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
+import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
@@ -90,12 +91,16 @@ export default function MemberChat({
   readOnly,
   onOpenIssue,
   documentFollowUps,
+  templateRail,
+  templateCount,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   documentFollowUps?: DocumentFollowUpState;
+  templateRail?: HostedTemplateRail;
+  templateCount?: number;
 }) {
   const t = useTranslate();
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
@@ -534,10 +539,12 @@ export default function MemberChat({
           </div>
         </div>
       </section>
-      {documentFollowUps && (
+      {(documentFollowUps || templateRail) && (
         <aside className="absolute rail:static min-w-0 rail:h-full rail:min-h-0">
           <NeedsRail
             documentFollowUps={documentFollowUps}
+            templateRail={templateRail}
+            templateCount={templateCount}
             readOnly={readOnly}
             collapsed={railCollapsed}
             onToggleCollapse={() => {

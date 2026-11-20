@@ -56,13 +56,16 @@ import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
 import { useDockHeight } from "./useDockHeight";
 import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
-import { composerDraftState, setComposerDraft } from "../app-shell/chat/composerStore";
+import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
+import { useHostedTemplateReview, type HostedTemplateRail } from "../templates/HostedTemplateReview";
+import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
+import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
@@ -769,10 +772,14 @@ export default function Home({
   setupNotice = null,
   operator = null,
   credentialRequestsEnabled = true,
+  templateReviewEnabled = false,
+  templateReviewCanApprove = false,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
+  templateReviewEnabled?: boolean;
+  templateReviewCanApprove?: boolean;
   /** CAD-1817: the verified session proves operator authority, the only
    *  viewer that may edit the workspace coordinator's identity. `null`
    *  is unproven, never an operator. */
@@ -816,34 +823,64 @@ export default function Home({
   // assistant by default; an owner reaches theirs only through the query.
   const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
   const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  const composerKey = memberChat && viewerSub !== null ? `member-assist:${memberScope(sessionId, viewerSub)}` : "home";
+  const onCompose = useCallback((text: string) => {
+    if (readOnly) return;
+    closeCanvas();
+    setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+    requestComposerFocus(composerKey);
+  }, [composerKey, readOnly]);
+  const review = useHostedTemplateReview({ enabled: templateReviewEnabled, canApprove: templateReviewCanApprove && !readOnly, onCompose: readOnly ? undefined : onCompose });
+  useEffect(() => {
+    if (!templateReviewEnabled) return;
+    const openPending = () => {
+      const request = consumeCanvasTemplateReview();
+      if (request) {
+        review.refresh();
+        review.open(request.target, request.opener?.isConnected ? request.opener : undefined);
+      }
+    };
+    openPending();
+    return onCanvasTemplateReview(openPending);
+  }, [templateReviewEnabled, review.open, review.refresh]);
   if (memberChat && viewerSub !== null) {
     const scope = memberScope(sessionId, viewerSub);
     return (
-      <MemberChat
-        key={scope}
-        scope={scope}
-        readOnly={readOnly}
-        onOpenIssue={onOpenIssue}
-        documentFollowUps={documentFollowUps}
-      />
+      <>
+        <MemberChat
+          key={scope}
+          scope={scope}
+          readOnly={readOnly}
+          onOpenIssue={onOpenIssue}
+          documentFollowUps={documentFollowUps}
+          templateRail={review.rail}
+          templateCount={review.pendingCount}
+        />
+        {review.drawer}
+      </>
     );
   }
   return (
-    <MasterHome
-      readOnly={readOnly}
-      hosted={hosted}
-      overview={overview}
-      documentFollowUps={documentFollowUps}
-      onOpenIssue={onOpenIssue}
-      onOpenDecision={onOpenDecision}
-      decisions={decisions}
-      overviewHref={overviewHref}
-      permissionsHref={permissionsHref}
-      resolveAppPath={resolveAppPath}
-      setupNotice={setupNotice}
-      operator={operator}
-      credentialRequestsEnabled={credentialRequestsEnabled}
-    />
+    <>
+      <MasterHome
+        readOnly={readOnly}
+        hosted={hosted}
+        overview={overview}
+        documentFollowUps={documentFollowUps}
+        onOpenIssue={onOpenIssue}
+        onOpenDecision={onOpenDecision}
+        decisions={decisions}
+        overviewHref={overviewHref}
+        permissionsHref={permissionsHref}
+        resolveAppPath={resolveAppPath}
+        setupNotice={setupNotice}
+        operator={operator}
+        credentialRequestsEnabled={credentialRequestsEnabled}
+        templateRail={review.rail}
+        templateCount={review.pendingCount}
+      />
+      {review.drawer}
+    </>
   );
 }
 
@@ -863,10 +900,14 @@ function MasterHome({
   setupNotice = null,
   operator = null,
   credentialRequestsEnabled = true,
+  templateRail,
+  templateCount,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
+  templateRail?: HostedTemplateRail;
+  templateCount?: number;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
@@ -1590,6 +1631,8 @@ function MasterHome({
         <NeedsRail
           overview={overview}
           documentFollowUps={documentFollowUps}
+          templateRail={templateRail}
+          templateCount={templateCount}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}

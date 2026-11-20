@@ -40,6 +40,8 @@ export interface TemplateDirectoryEntry {
   kind: string;
   source_format: string;
   status: string;
+  /** Hosted directory includes immutable version summaries; native directories may not. */
+  versions?: TemplateSummary[];
 }
 
 export interface TemplateSpec {
@@ -118,6 +120,7 @@ export interface SampleView {
   status: "draft" | "approved";
   template: string;
   version: number;
+  content_digest?: string;
   context: Record<string, unknown>;
   docx_base64?: string;
   pdf_base64?: string;
@@ -215,6 +218,6 @@ export const templatesApi = {
       ? write<ExportView>("/api/documents/export", { id, format })
       : read<ExportView>(`/api/documents/export?id=${encodeURIComponent(id)}${format ? `&format=${encodeURIComponent(format)}` : ""}`),
   intake: (file: string, source: string) => write<IntakeView>("/api/templates/intake", { file, source }),
-  sample: (name: string, version: number, format?: "html" | "pdf" | "docx" | "both") =>
-    read<SampleView>(`/api/templates/sample?name=${encodeURIComponent(name)}&version=${version}${format ? `&format=${encodeURIComponent(format)}` : ""}`),
+  sample: (name: string, version: number, format?: "html" | "pdf" | "docx" | "both", sampleRows?: number) =>
+    read<SampleView>(`/api/templates/sample?name=${encodeURIComponent(name)}&version=${version}${format ? `&format=${encodeURIComponent(format)}` : ""}${sampleRows !== undefined ? `&sample_rows=${sampleRows}` : ""}`),
 };
