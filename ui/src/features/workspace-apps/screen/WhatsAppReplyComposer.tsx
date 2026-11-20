@@ -3,6 +3,7 @@ import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { object, type recordServices } from "./screenServices";
+import type { WhatsAppReplyAvailability } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
 export interface WhatsAppReplySelection {
@@ -10,10 +11,12 @@ export interface WhatsAppReplySelection {
   receiptScope: string;
   services: ReturnType<typeof recordServices>;
   current(): boolean;
+  announceAvailability?(state: WhatsAppReplyAvailability): void;
   announce(dirty: boolean, refresh?: boolean): void;
 }
 
 type Recipient = { workRef: string; label: string; reference: string | null };
+type RecipientCheck = { recipient: Recipient; retryable?: never } | { recipient: null; retryable?: boolean };
 type Outcome = "unsent" | "failed" | "uncertain" | "accepted" | "sent";
 const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
@@ -37,21 +40,22 @@ function settleReceipt(key: string, effectId: string, outcome: Outcome, group: b
   if (!receipts.pending && !receipts.accepted) replyRecovery.delete(key);
 }
 
-async function recipientFor(selection: WhatsAppReplySelection, ref = selection.conversationId): Promise<Recipient | null> {
-  if (!selection.current()) return null;
+async function recipientFor(selection: WhatsAppReplySelection, ref = selection.conversationId): Promise<RecipientCheck> {
+  if (!selection.current()) return { recipient: null };
   const result = await selection.services.call("whatsapp.conversations.show", { provider, conversation_id: ref });
-  if (!result.ok || !selection.current() || !object(result.data)) return null;
+  if (!result.ok) return { recipient: null, retryable: result.refusal.code === "unavailable" };
+  if (!selection.current() || !object(result.data)) return { recipient: null };
   const data = result.data;
   const id = selection.conversationId;
   if (data.contract !== "agenticos.whatsapp-door.v1" || data.conversationId !== id ||
       typeof data.workRef !== "string" || !WORK_REF.test(data.workRef) ||
-      !object(data.contact)) return null;
+      !object(data.contact)) return { recipient: null };
   const address = /^([1-9]\d{7,14})(?::\d{1,5})?@s\.whatsapp\.net$/.exec(id);
   const phone = id.endsWith("@g.us") ? null
     : address ? `+${address[1]}`
     : typeof data.contact.phone === "string" && PHONE.test(data.contact.phone) ? data.contact.phone : null;
   const name = typeof data.contact.name === "string" && data.contact.name.length <= 160 ? data.contact.name.trim() : "";
-  return { workRef: data.workRef, label: [name !== phone ? name : "", phone].filter(Boolean).join(" · "), reference: phone ? null : id };
+  return { recipient: { workRef: data.workRef, label: [name !== phone ? name : "", phone].filter(Boolean).join(" · "), reference: phone ? null : id } };
 }
 
 function recordedState(state: unknown): Outcome {
@@ -63,7 +67,7 @@ function recordedState(state: unknown): Outcome {
 export default function WhatsAppReplyComposer({ selection }: { selection: WhatsAppReplySelection }) {
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
-  const [recipient, setRecipient] = useState<Recipient | null>();
+  const [verification, setVerification] = useState<RecipientCheck>();
   const [load, setLoad] = useState(0);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -73,17 +77,21 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
   const pointer = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
   const group = selection.conversationId.endsWith("@g.us");
+  const recipient = verification?.recipient;
+  const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
   const locked = attempt?.outcome === "uncertain";
-  const disabled = busy || locked || staleRecipient || !text.trim() || !recipient;
+  const readOnly = busy || locked || availability !== "verified";
+  const disabled = readOnly || !text.trim();
 
   useEffect(() => {
     let cancelled = false;
-    void recipientFor(selection).then(value => {
+    void recipientFor(selection).then(check => {
       if (cancelled || !selection.current()) return;
+      const value = check.recipient;
       const receipts = value && replyRecovery.get(receiptKey(selection, value));
       if (receipts?.pending) setAttempt({ effectId: receipts.pending, outcome: "uncertain" });
       else if (receipts?.accepted) setAttempt({ effectId: receipts.accepted, outcome: "accepted" });
-      setRecipient(value);
+      setVerification(check);
     });
     return () => { cancelled = true; };
   }, [selection, load]);
@@ -95,6 +103,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     }
   }, [text, recipient]);
   useLayoutEffect(() => { selection.announce(!!text || busy); }, [selection, text, busy]);
+  useEffect(() => { selection.announceAvailability?.(availability); }, [selection, availability]);
 
   async function send() {
     if (disabled || !recipient || running.current || !selection.current()) return;
@@ -116,7 +125,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
       effectId = prepared.data.effect_id;
       // Re-read the exact account epoch after prepare. Since a re-pair changes
       // workRef, a prepared effect cannot be carried to a different account.
-      const [live, plan] = await Promise.all([
+      const [{ recipient: live }, plan] = await Promise.all([
         recipientFor(selection, recipient.workRef),
         selection.services.planner("whatsapp.reply.send", { ...args, effect_id: effectId }),
       ]);
@@ -175,39 +184,40 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
 
   return <div className="wa-reply-dock">
-    {recipient === undefined ? <p className="wa-reply-status" role="status">{zh ? "正在核對收件人…" : "Verifying recipient…"}</p>
-      : !recipient ? <div className="wa-reply-status"><p role="alert">{zh ? "未能核對此對話，無法回覆。" : "Couldn’t verify this conversation. Sending is unavailable."}</p>
-        <Button size="sm" onClick={() => { setRecipient(undefined); setLoad(n => n + 1); }}>{zh ? "重試" : "Retry"}</Button></div>
-      : <>
-        {note && <div className="wa-reply-status">
-          <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
-          {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
-        </div>}
-        <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
-          <p className="wa-reply-to">{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
-            {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</p>
-          <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"} placeholder={zh ? "輸入回覆…" : "Write a reply…"}
-            value={text} rows={1} maxLength={4096} readOnly={busy || locked || staleRecipient}
-            onChange={e => setText(e.target.value)} onKeyDown={e => {
-              if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;
-              e.preventDefault();
-              if (e.nativeEvent.isTrusted && !e.repeat) void send();
-            }} />
-          <div className="app-chat-composer-tools wa-reply-tools">
-            {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
-            <span className="wa-reply-hint" aria-live="polite">{busy ? (zh ? "處理中…" : "Working…") : (zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line")}</span>
-            <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
-              onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
-              onClick={e => {
-                e.preventDefault();
-                const deliberate = e.nativeEvent.isTrusted && (e.detail === 0 || pointer.current);
-                pointer.current = false;
-                if (deliberate) void send();
-              }}>
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
-            </button>
-          </div>
-        </form>
-      </>}
+    {note && <div className="wa-reply-status">
+      <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
+      {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
+    </div>}
+    <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
+      <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
+        {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
+          {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
+          : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
+          : availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…")
+          : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
+      </p>
+      <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"} placeholder={zh ? "輸入回覆…" : "Write a reply…"}
+        value={text} rows={1} maxLength={4096} readOnly={readOnly}
+        onChange={e => setText(e.target.value)} onKeyDown={e => {
+          if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          if (e.nativeEvent.isTrusted && !e.repeat) void send();
+        }} />
+      <div className="app-chat-composer-tools wa-reply-tools">
+        {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
+        {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setVerification(undefined); setLoad(n => n + 1); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
+        {(!readOnly || busy) && <span className="wa-reply-hint" aria-live="polite">{busy ? (zh ? "處理中…" : "Working…") : (zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line")}</span>}
+        <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
+          onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
+          onClick={e => {
+            e.preventDefault();
+            const deliberate = e.nativeEvent.isTrusted && (e.detail === 0 || pointer.current);
+            pointer.current = false;
+            if (deliberate) void send();
+          }}>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
+        </button>
+      </div>
+    </form>
   </div>;
 }

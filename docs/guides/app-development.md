@@ -336,6 +336,13 @@ checks never resend. Within the same board session, switching threads preserves
 an uncertain reply or the latest accepted direct reply still awaiting delivery.
 Only uncertainty pauses sending. Recovery keeps no message text or confirmation
 token. Older boards and the Official API keep the approval card.
+While recipient verification is pending or unavailable, the board leaves the
+dock in place with a read-only draft and disabled Send. A compatible bundle
+opts into `screen-whatsapp-reply-availability.v1` only when the mount URL offers
+`wa_compose_availability=1`. The board publishes presentation state with the
+ordinal of the existing nomination on that port. It never publishes a
+recipient proof, confirmation token, or draft in this event. Older bundles
+get the status in the dock instead.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is
