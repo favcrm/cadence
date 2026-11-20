@@ -93,6 +93,7 @@
    height, the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006),
    and removing the outer outlet gutter avoids double-padding inside
    app screens that already manage their own internal spacing. */
+.app-shell-outlet:has(> [data-installed-app-screen]),
 .app-shell-outlet:has(> [aria-label="Installed app screen"]) {
   display: flex;
   flex-direction: column;
@@ -137,6 +138,7 @@
   overscroll-behavior: contain;
 }
 /* The frame fills the panel; everything inside is the app's to draw. */
+.app-shell[data-screen-drawer="true"] .app-shell-outlet > [data-installed-app-screen],
 .app-shell[data-screen-drawer="true"] .app-shell-outlet > [aria-label="Installed app screen"] {
   flex: 1 1 0%;
   min-height: 0;

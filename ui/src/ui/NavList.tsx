@@ -158,7 +158,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
                           data-parent-current={here && app.current && app.sections ? "" : undefined}
                         >
-                          <AppGlyph name={app.installId} title={app.title} size="xs" />
+                          <AppGlyph name={app.kind ?? app.installId} title={app.title} size="xs" />
                           <span className="truncate">{app.title}</span>
                           {assistantUnread.has(app.installId) && (
                             <span className="navdot" role="img" aria-label={t("New assistant reply")} />

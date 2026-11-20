@@ -3421,7 +3421,6 @@ const CAD2316_ZHTW: Record<string, string> = {
   "Launch installed workspace apps, pin daily tools, or manage permissions.": "開啟已安裝的工作區應用程式、釘選常用工具，或管理權限。",
   "Filter apps": "篩選應用程式",
   "Layout": "版面配置",
-  "Grid view": "圖示檢視",
   "List view": "清單檢視",
   "Pin any app with ★ or Choose favorites to keep everyday tools here and in the sidebar.": "點擊任一應用程式的 ★ 或使用「選擇常用」，即可將常用工具固定於此與側邊欄。",
   "No installed apps match the current filter.": "沒有符合目前篩選條件的已安裝應用程式。",

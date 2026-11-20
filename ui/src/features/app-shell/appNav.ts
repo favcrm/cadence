@@ -11,6 +11,8 @@ import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
   installId: string;
+  /** Verified app package name/kind (used for consistent app iconography across locales). */
+  kind?: string;
   title: string;
   /** The installation itself. */
   href: string;
@@ -195,6 +197,7 @@ export function buildAppNav(input: {
       }
       return {
         installId: app.installId,
+        kind: app.kind,
         title: localizedAppTitle(app, locale, t),
         href,
         current: active,
