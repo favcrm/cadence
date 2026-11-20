@@ -226,13 +226,15 @@ fn post(
     let mut req = agent()
         .post(format!("http://127.0.0.1:{port}{path}"))
         .header("Host", HOST)
+        .header("Content-Type", "application/json")
         .header("Origin", format!("https://{HOST}"))
         .header("Sec-Fetch-Site", "same-origin")
         .header("X-Cadence-Board", "1");
     if let Some(cookie) = cookie {
         req = req.header("Cookie", cookie);
     }
-    req.send_json(body).expect("board HTTP transport")
+    req.send(serde_json::to_vec(&body).unwrap().as_slice())
+        .expect("board HTTP transport")
 }
 fn body(mut response: ureq::http::Response<ureq::Body>) -> (u16, Value) {
     let status = response.status().as_u16();
@@ -434,7 +436,7 @@ fn dedicated_owner_entry_isolated() {
         "{input}.{}",
         URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).as_ref())
     );
-    let (status, _) = body(post(
+    let (status, response) = body(post(
         port,
         "/__platform/session",
         None,
@@ -442,9 +444,9 @@ fn dedicated_owner_entry_isolated() {
     ));
     assert_eq!(
         status, 403,
-        "missing initiating cookie must not mint a session"
+        "missing initiating cookie must not mint a session: {response}"
     );
-    let (status, _) = body(post(
+    let (status, response) = body(post(
         port,
         "/__platform/session",
         Some(&cookie),
@@ -452,7 +454,7 @@ fn dedicated_owner_entry_isolated() {
     ));
     assert_eq!(
         status, 403,
-        "mismatched browser intent must not mint a session"
+        "mismatched browser intent must not mint a session: {response}"
     );
     let session = post(
         port,
@@ -460,11 +462,10 @@ fn dedicated_owner_entry_isolated() {
         Some(&cookie),
         json!({"assertion":assertion,"state":state_value}),
     );
-    assert_eq!(
-        session.status().as_u16(),
-        200,
-        "live signed owner must open the board session"
-    );
+    if session.status().as_u16() != 200 {
+        let (status, response) = body(session);
+        panic!("live signed owner must open the board session: {status} {response}");
+    }
     let board_cookie = session
         .headers()
         .get_all("set-cookie")
