@@ -83,6 +83,7 @@ const hostedRoster = (extra: Partial<AgentsPayload> = {}) =>
   roster({ master: { scope: "workspace", name: "Acme" }, personal_assistant: personalRow, ...extra });
 let memberStateReads = 0;
 let aliasReads = 0;
+let masterReads = 0;
 let threadReads: string[] = [];
 let directoryReads = 0;
 let directoryAvailable = true;
@@ -110,6 +111,7 @@ globalThis.fetch = async (input) => {
   if (path.startsWith("/api/agents/")) {
     const alias = decodeURIComponent(path.split("/").pop()!);
     if (alias === "assistant") aliasReads += 1;
+    if (alias === "master") masterReads += 1;
     return json({ agent: { alias, provider: "pi", endpoint_kind: "pty", instructions: "x" }, queued: 0, unknown: 0, running: [], events: [], fenced: false, on: [] });
   }
   return json({ error: "unavailable" }, 503);
@@ -134,6 +136,7 @@ let operator: boolean | null = true;
 let viewerSub: string | null = "viewer";
 let profiles: unknown[] = [];
 let rosterFailed = false;
+let rosterLoading = false;
 /** Reads the route from the real URL, as the app does. */
 function route() {
   const r = readLocation(location.pathname, location.search).route;
@@ -154,7 +157,9 @@ async function render() {
         openProfileId,
         state: rosterFailed
           ? { ...loaded<AgentsPayload | null>(null), status: "failed", error: "Offline" }
-          : loaded({ ...payload, profiles } as AgentsPayload),
+          : rosterLoading
+            ? { ...loaded<AgentsPayload | null>(null), status: "loading", inFlight: true }
+            : loaded({ ...payload, profiles } as AgentsPayload),
         issues: loaded([]),
         open,
         tab,
@@ -260,6 +265,16 @@ async function main() {
     "member: the gate says who Master is for",
   );
   assert(host.querySelector("textarea") === null, "member: no composer for the company Master");
+
+  const priorMasterReads = masterReads;
+  rosterLoading = true;
+  await at("/agents/master?tab=instructions");
+  assert(masterReads === priorMasterReads && host.querySelector(".ap-hero") === null, "loading hosted roster never mounts or reads Master");
+  rosterLoading = false;
+  rosterFailed = true;
+  await render();
+  assert(masterReads === priorMasterReads && host.textContent?.includes("Could not load agents"), "failed hosted roster never reads Master and offers retry");
+  rosterFailed = false;
 
   // An initial roster failure is not proof that a hosted alias is a hired agent.
   rosterFailed = true;

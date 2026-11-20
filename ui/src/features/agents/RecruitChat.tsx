@@ -7,8 +7,9 @@ import Button from "../../ui/Button";
 import { AssistantAboutButton, AssistantActorProvider, AssistantFace, useConversationActor } from "../assistant/AssistantIdentity";
 import { displayName, scopeDescriptor } from "../assistant/identity";
 import HireProposalCard from "./HireProposalCard";
-import { addPending, loadThread, newMessageId, settlePending, threadItems, type ThreadItem, type ThreadState } from "../home/thread";
+import { addPending, lastSeq, loadThread, newMessageId, settlePending, threadItems, type ThreadItem, type ThreadState } from "../home/thread";
 import { useThreadStream } from "../app-shell/chat/conversationThread";
+import ConversationDecisions from "../app-shell/chat/ConversationDecisions";
 import Md from "../../ui/Md";
 import { HireGate } from "./RecruitCards";
 
@@ -31,9 +32,11 @@ const recruitThread = cache.family<string, ThreadState>("recruitThread", (key) =
 export default function RecruitChat({
   hireBlock,
   onBack,
+  showDecisions,
 }: {
   hireBlock: string | null;
   onBack: () => void;
+  showDecisions: boolean;
 }) {
   const t = useTranslate();
   const [conversation, setConversation] = useState<string | null>(null);
@@ -75,16 +78,18 @@ export default function RecruitChat({
           {error}
         </div>
       )}
-      {conversation && !hireBlock && <Chat key={conversation} conversation={conversation} />}
+      {conversation && !hireBlock && <Chat key={conversation} conversation={conversation} showDecisions={showDecisions} />}
     </main>
     </AssistantActorProvider>
   );
 }
 
-function Chat({ conversation }: { conversation: string }) {
+function Chat({ conversation, showDecisions }: { conversation: string; showDecisions: boolean }) {
   const t = useTranslate();
   const store = recruitThread(`${conversation}:`);
   const thread = useResource(store);
+  const [streamRevision, setStreamRevision] = useState(0);
+  const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   useEffect(() => {
     void store.revalidate();
   }, [store]);
@@ -94,6 +99,7 @@ function Chat({ conversation }: { conversation: string }) {
     `/api/threads/master/stream?conversation=${encodeURIComponent(conversation)}`,
     thread.data !== null,
     () => {},
+    onSnapshot,
   );
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const send = useCallback(
@@ -169,6 +175,7 @@ function Chat({ conversation }: { conversation: string }) {
       <div role="log" aria-live="polite" aria-label={t("messages")} className="chat">
         {items.map(bubble)}
       </div>
+      {showDecisions && <ConversationDecisions conversation={conversation} revision={`${streamRevision}:${lastSeq(thread.data) ?? 0}`} />}
       <form className="compose" onSubmit={submit} data-composer="">
         <input
           className="field"

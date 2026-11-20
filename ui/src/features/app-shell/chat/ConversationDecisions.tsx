@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "../../../lib/locale";
 import StagedWriteDetail, { noticeText } from "../../decisions/StagedWriteDetail";
-import { failureReason, isolate, outcomeOf } from "../../decisions/stagedWrite";
+import { failureReason, isolate, outcomeOf, sourceLine } from "../../decisions/stagedWrite";
 import { conversationDecisions, useDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 
 /** The caller keys this component by the selected, server-proven conversation. */
@@ -13,9 +13,9 @@ export default function ConversationDecisions({
   store: shared,
 }: {
   conversation: string;
-  revision: number;
-  onPendingChange: (conversation: string, pending: boolean) => void;
-  onReview: () => void;
+  revision: number | string;
+  onPendingChange?: (conversation: string, pending: boolean) => void;
+  onReview?: () => void;
   /** CAD-2364: the pane's store for this conversation, so its answers' chips read the same list. */
   store?: DecisionsStore;
 }) {
@@ -29,7 +29,7 @@ export default function ConversationDecisions({
   const previousRevision = useRef(revision);
 
   useEffect(() => {
-    onPendingChange(conversation, decisions.pending.length > 0);
+    onPendingChange?.(conversation, decisions.pending.length > 0);
   }, [conversation, decisions.pending.length, onPendingChange]);
 
   useEffect(() => {
@@ -41,7 +41,7 @@ export default function ConversationDecisions({
     const queue = decisions.pending.map((row) => row.id);
     const at = queue.indexOf(id);
     if (at < 0) return;
-    onReview();
+    onReview?.();
     opener.current = button;
     store.clearNotice();
     setReview({ queue, at });
@@ -72,18 +72,21 @@ export default function ConversationDecisions({
           {decisions.phase === "unavailable" && (
             <p className="text-label text-fail" role="alert">{t("Decisions are unavailable.")}</p>
           )}
-          {decisions.pending.map((write) => (
-            <article className="app-assistant-card" key={write.id} data-chat-staged>
-              <div className="app-assistant-card-head">
-                <strong className="text-label text-ink-100"><bdi>{isolate(write.title)}</bdi></strong>
-                <span className="text-micro text-ink-400">{t("Waiting")}</span>
-              </div>
-              {write.app && <p className="text-label text-ink-300"><bdi>{isolate(write.app)}</bdi></p>}
-              <button type="button" className="btn btn-sm" aria-label={`${t("Review")} \u2068${isolate(write.title)}\u2069`} onClick={(event) => open(write.id, event.currentTarget)}>
-                {t("Review")}
-              </button>
-            </article>
-          ))}
+          {decisions.pending.map((write) => {
+            const source = sourceLine(write, t);
+            return (
+              <article className="app-assistant-card" key={write.id} data-chat-staged>
+                <div className="app-assistant-card-head">
+                  <strong className="text-label text-ink-100"><bdi>{isolate(write.title)}</bdi></strong>
+                  <span className="text-micro text-ink-400">{t("Waiting")}</span>
+                </div>
+                {source && <p className="text-label text-ink-300"><bdi>{isolate(source)}</bdi></p>}
+                <button type="button" className="btn btn-sm" aria-label={`${t("Review")} \u2068${isolate(write.title)}\u2069`} onClick={(event) => open(write.id, event.currentTarget)}>
+                  {t("Review")}
+                </button>
+              </article>
+            );
+          })}
         </section>
       )}
       {decisions.decided.length > 0 && (

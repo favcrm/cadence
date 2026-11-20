@@ -279,7 +279,7 @@ export default function Agents({
   );
 
   // Only a roster response can establish that a hosted alias is legacy.
-  if (hostedBoard && payload == null && (open === PERSONAL_ALIAS || openProfileId)) {
+  if (hostedBoard && payload == null && (open === PERSONAL_ALIAS || open === MASTER || openProfileId)) {
     return shell(
       <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
         <button type="button" className="rc-back" onClick={() => setOpen(null)}>
@@ -350,6 +350,7 @@ export default function Agents({
   if (ask) {
     return shell(
       <RecruitChat
+        showDecisions={scopedRoster && operator === true}
         hireBlock={hireBlock}
         onBack={() => setOpen(null)}
       />

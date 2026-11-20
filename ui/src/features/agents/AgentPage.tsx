@@ -268,6 +268,7 @@ export default function AgentPage({
     role,
     hosted,
     hostedBoard: hostedBoard || hosted,
+    scopedRoster,
     resume,
     onOpenIssue,
     hired,

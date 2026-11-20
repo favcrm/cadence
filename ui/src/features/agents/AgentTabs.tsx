@@ -69,6 +69,7 @@ export interface TabContext {
   hosted: boolean;
   /** The board is hosted (its meta or its install says so). */
   hostedBoard: boolean;
+  scopedRoster?: boolean;
   resume: string | null | undefined;
   onOpenIssue: (id: string) => void;
   /** Set when this page is a profile with no runtime: nothing to read but itself. */
@@ -707,7 +708,7 @@ function Skills({ c }: { c: TabContext }) {
         </Rows>
       )}
       <RoleRead c={c} />
-      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} absent={none} />}
+      {workspace && <WorkspaceSkills doc={c.doc} writable={c.writable} toast={c.toast} absent={none} scopedRoster={c.scopedRoster} />}
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
@@ -781,6 +782,7 @@ export function WorkspaceSkills({
   absent = null,
   deps = liveSkillDeps,
   profiles = liveDocDeps,
+  scopedRoster = false,
 }: {
   doc: InstructionsDoc;
   writable: boolean;
@@ -790,6 +792,7 @@ export function WorkspaceSkills({
   deps?: SkillDeps;
   /** Reads and saves another agent's profile, for "Turn off for this agent". */
   profiles?: Pick<DocDeps, "readProfile" | "writeProfile">;
+  scopedRoster?: boolean;
 }) {
   const t = useTranslate();
   const [library, setLibrary] = useState<Library>({ state: "reading" });
@@ -1015,6 +1018,7 @@ export function WorkspaceSkills({
           profileId={doc.profile?.id ?? null}
           agentName={doc.profile?.name ?? t("this agent")}
           writable={writable}
+          scopedRoster={scopedRoster}
           deps={deps}
           toast={toast}
           tick={tick}
@@ -1044,6 +1048,7 @@ function SkillDrawer({
   profileId,
   agentName,
   writable,
+  scopedRoster,
   deps,
   toast,
   tick,
@@ -1059,6 +1064,7 @@ function SkillDrawer({
   profileId: string | null;
   agentName: string;
   writable: boolean;
+  scopedRoster: boolean;
   deps: SkillDeps;
   toast: TabContext["toast"];
   /** Changes when who uses a skill did: read it again. */
@@ -1204,6 +1210,7 @@ function SkillDrawer({
                     users={skill.used_by}
                     profileId={profileId}
                     writable={writable}
+                    scopedRoster={scopedRoster}
                     notice={notice ? { text: notice.text, reload: () => { const user = notice.user; setNotice(null); reloadFor(user); } } : null}
                     onTurnOff={(user) => !busy && setConfirming({ turnOff: user })}
                   />

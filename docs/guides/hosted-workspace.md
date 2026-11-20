@@ -815,9 +815,10 @@ For a staged write, the receipt's status is the outcome: `pending` awaits an
 owner, `applied` was written, and `denied` or `failed` exits nonzero while
 keeping the receipt on stdout.
 
-On Home, a staged decision names the proposer when the board can verify the
-assistant that staged it. Older records without provenance stay generic; a
-recorded CLI or MCP actor keeps its original attribution.
+Home shows decisions from your personal conversation; the workspace assistant's
+Recruit decisions stay in Recruit. A decision shows the assistant's display
+name and scope when the board verifies who staged it. Older records without
+provenance stay generic; a recorded CLI or MCP actor keeps its attribution.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action

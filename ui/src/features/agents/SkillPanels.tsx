@@ -6,6 +6,7 @@ import Link from "../../ui/Link";
 import RowMenu from "../../ui/RowMenu";
 import Switch from "../../ui/Switch";
 import { navigate } from "../../lib/useLocation";
+import { routePath } from "../../lib/router";
 import type { WorkspaceSkillRead, WorkspaceSkillUser } from "../../lib/types";
 import {
   approvedWhen,
@@ -19,7 +20,10 @@ import {
 
 /** CAD-2438: the panels of the skill drawer. State and writes live in SkillDrawer. */
 
-const agentHref = (name: string) => `/agents/${encodeURIComponent(name)}?tab=skills`;
+const agentHref = (user: WorkspaceSkillUser, scopedRoster: boolean) =>
+  `${routePath(scopedRoster
+    ? { screen: "agents", alias: null, profileId: user.profile_id }
+    : { screen: "agents", alias: user.name })}?tab=skills`;
 
 /** One button of a segmented switch; `aria-pressed` marks the shown one. */
 function Segment<T extends string>({ label, value, options, onChange }: { label: string; value: T; options: [T, string][]; onChange: (next: T) => void }) {
@@ -180,12 +184,14 @@ export function UsedByPanel({
   users,
   profileId,
   writable,
+  scopedRoster,
   notice,
   onTurnOff,
 }: {
   users: WorkspaceSkillUser[];
   profileId: string | null;
   writable: boolean;
+  scopedRoster: boolean;
   /** A stale or unconfirmed turn-off, with the way to read again. */
   notice: { text: string; reload: () => void } | null;
   onTurnOff: (user: WorkspaceSkillUser) => void;
@@ -241,7 +247,7 @@ export function UsedByPanel({
                   {mine || archived ? (
                     user.name
                   ) : (
-                    <Link className="lnk" href={agentHref(user.name)} aria-label={`${t("Skills")}: ${user.name}`}>
+                    <Link className="lnk" href={agentHref(user, scopedRoster)} aria-label={`${t("Skills")}: ${user.name}`}>
                       {user.name}
                     </Link>
                   )}
@@ -251,7 +257,7 @@ export function UsedByPanel({
                   <RowMenu
                     label={`${t("Actions for")} ${user.name}`}
                     items={[
-                      ...(mine || archived ? [] : [{ key: "open", label: "Open agent", hint: t("Go to {agent}’s Skills tab").replace("{agent}", () => user.name), onSelect: () => navigate(agentHref(user.name)) }]),
+                      ...(mine || archived ? [] : [{ key: "open", label: "Open agent", hint: t("Go to {agent}’s Skills tab").replace("{agent}", () => user.name), onSelect: () => navigate(agentHref(user, scopedRoster)) }]),
                       { key: "off", label: "Turn off for this agent", hint: t("{agent} stops getting this skill").replace("{agent}", () => user.name), danger: true, onSelect: () => onTurnOff(user) },
                     ]}
                   />

@@ -606,7 +606,7 @@ const same: Say = (s) => s;
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
   if (write.cli) return write.cli.requestedBy ?? (write.origin?.label ?? null);
   const o = write.origin;
-  if (o === null) return write.proposer?.label ?? null;
+  if (o === null) return write.proposer ? `${write.proposer.label} · ${t(write.proposer.scope === "workspace" ? "Workspace assistant" : "Personal assistant")}` : null;
   return `${o.label} (${o.kind === "agent" || o.kind === "person" ? t(o.kind) : o.kind})`;
 }
 
