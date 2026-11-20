@@ -9684,9 +9684,7 @@ mod agent_credential_refusals {
                     "zip_sha256": format!("sha256:{}", "b".repeat(64)),
                 },
             });
-            let err = r
-                .send(None, "platform_call", args.as_object().unwrap().clone())
-                .unwrap_err();
+            let err = r.send(None, "platform_call", args).unwrap_err();
             assert_eq!(err.kind() == "unknown", unknown, "{err}");
             assert_eq!(
                 err.to_string().contains("private_app_review_reconcile"),
