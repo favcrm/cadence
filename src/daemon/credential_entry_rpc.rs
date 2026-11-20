@@ -1186,12 +1186,11 @@ impl Shared {
             {
                 return Ok(None);
             }
-            None
-                if public_only
-                    || matches!(
-                        &self.membership_mode,
-                        super::public_membership::MembershipMode::Dedicated(_)
-                    ) =>
+            None if public_only
+                || matches!(
+                    &self.membership_mode,
+                    super::public_membership::MembershipMode::Dedicated(_)
+                ) =>
             {
                 return Ok(None);
             }
