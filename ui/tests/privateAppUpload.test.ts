@@ -1,5 +1,12 @@
 import { checkPrivateApp, applyPrivateApp, decideHostedPrivateReview, getHostedPrivateReview } from "../src/features/workspace-apps/privateAppUpload";
 import { ApiError } from "../src/lib/apiError";
+import type * as HappyDom from "happy-dom";
+import type * as React from "react";
+import type * as ReactDom from "react-dom/client";
+import type * as Locale from "../src/lib/locale";
+import type * as Dialog from "../src/features/workspace-apps/PrivateAppDialog";
+
+declare function require(name: string): unknown;
 function equal(actual: unknown, expected: unknown, message = "values differ"): void {
   if (actual !== expected) throw new Error(message);
 }
@@ -117,6 +124,71 @@ async function main() {
   responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, digest: `sha256:${"b".repeat(64)}` } } }];
   await rejected(getHostedPrivateReview(reviewId), (error) => error instanceof ApiError && error.status === 502,
     "a mismatched review fingerprint cannot be presented for approval");
+
+  // Mount the real owner dialog against the same transport fixtures.
+  const { Window } = require("happy-dom") as typeof HappyDom;
+  const win = new Window({ url: "http://localhost/apps" });
+  for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement",
+    "navigator", "Event", "MouseEvent", "location", "history"] as const) {
+    Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true });
+  }
+  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+  const { act, createElement } = require("react") as typeof React;
+  const { createRoot } = require("react-dom/client") as typeof ReactDom;
+  const { LocaleProvider } = require("../src/lib/locale") as typeof Locale;
+  // The icon package's CommonJS entry is mislabeled; icons are unrelated to the dialog behavior.
+  const loader = require("node:module") as {
+    prototype: { require(this: unknown, name: string): unknown };
+  };
+  const originalRequire = loader.prototype.require;
+  loader.prototype.require = function (name) {
+    if (name === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+    if (name === "@hugeicons/react") return { HugeiconsIcon: () => null };
+    return originalRequire.call(this, name);
+  };
+  let dialog: typeof Dialog;
+  try {
+    dialog = require("../src/features/workspace-apps/PrivateAppDialog") as typeof Dialog;
+  } finally {
+    loader.prototype.require = originalRequire;
+  }
+  const { PrivateAppDialog } = dialog;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const mount = (key: string) => act(async () => root.render(createElement(LocaleProvider, null,
+    createElement(PrivateAppDialog, { key, reviewId, onClose() {}, onInstalled() {} }))));
+  const approve = () => [...host.querySelectorAll("button")].find((button) =>
+    button.textContent?.trim() === "Approve and install");
+  const staleReceipt = { ...receipt, data: { ...receipt.data, catalog_stale: true } };
+  const recovery = "Workspace apps changed after this review was created. Ask the requester for a new review.";
+  try {
+    calls = [];
+    responses = [{ status: 200, body: staleReceipt }];
+    await mount("already-stale");
+    equal(host.querySelector('[role="alert"]')?.textContent?.trim(), recovery);
+    equal(approve(), undefined, "an already-stale review has no approval action");
+    equal(calls.length, 1, "opening a stale dialog does not submit a decision");
+
+    calls = [];
+    responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, catalog_stale: false } } }];
+    await mount("then-stale");
+    equal(approve()?.disabled, true, "a current review first requires consent");
+    const consent = host.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    if (!consent) throw new Error("the current review must offer consent");
+    await act(async () => consent.click());
+    const button = approve();
+    if (!button || button.disabled) throw new Error("a current review can be approved after consent");
+    responses = [staleResponse, { status: 200, body: staleReceipt }];
+    await act(async () => button.click());
+    equal(host.querySelector('[role="alert"]')?.textContent?.trim(), recovery);
+    equal(approve(), undefined, "a late refused approval cannot be submitted again from the stale dialog");
+    equal(calls.map(({ init }) => init.method ?? "GET").join(" "), "GET POST GET",
+      "the stale refusal is reconciled without replaying approval");
+  } finally {
+    await act(async () => root.unmount());
+    await win.happyDOM.close();
+  }
   console.log("private app upload receipt checks passed");
 }
 void main();
