@@ -7,6 +7,7 @@ import {
   type AppHandoffState,
 } from "../../lib/appHandoffs";
 import { useTranslate } from "../../lib/locale";
+import SupplierBillReview from "./SupplierBillReview";
 
 const summary: Record<AppHandoffState, string> = {
   pending: "Awaiting approval. The specialist has not started.",
@@ -116,6 +117,7 @@ function HandoffCard({ conversation, row }: { conversation: string; row: AppHand
       {decision.state === "answered" && (
         <p className="text-label text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere]" dir="auto">{decision.answer}</p>
       )}
+      {decision.state === "answered" && <SupplierBillReview conversation={conversation} handoff={row.id} />}
       <div className="flex flex-wrap gap-2">
         {state === "pending" && action("Approve", "approve")}
         {(state === "pending" || state === "approved") && action("Deny", "deny")}

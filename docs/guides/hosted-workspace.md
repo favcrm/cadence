@@ -353,6 +353,15 @@ only the reviewed question to the app specialist. **Check reply** reads that
 same run from Home. If the status is unconfirmed, check again without starting
 another run. Direct app tools do not require this handoff.
 
+For a complete supplier bill on a compatible Accounting install, ask the
+Bookkeeper to prepare a draft for owner review and paste the relevant bill
+text. If the reply includes a draft proposal, compare its supplier,
+reference, dates, amounts and quoted excerpt with the original. The excerpt
+is unverified. **Send to owner review** adds one request to the existing
+owner approval queue; it does not save anything. A separate approval saves a
+draft with account codes left blank. It does not post or pay the bill. A
+duplicate or unverified supplier leaves the proposal unsent.
+
 Inside a turn, the operation's scope reaches both the model and its tools. A
 run can hold more than one input — the engine appends each steering input to
 the live run — so the runtime attributes a run only when every one of its
