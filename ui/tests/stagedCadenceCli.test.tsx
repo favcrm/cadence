@@ -75,6 +75,12 @@ const cliRow = (id: string, extra: Record<string, unknown> = {}) => {
   const v = parseStagedRow(cliRow("c2", { changes: [change("title", `pay${RLO}evil${ZWSP}x`)] }));
   assert(v !== null && v.changes[0].after === "pay[U+202E]evil[U+200B]x", `bidi and zero-width made visible (got ${v?.changes[0].after})`);
 
+  const fe = parseStagedRow(cliRow("c4", { changes: [change("set", "owner=agents/x\uFE0F"), change("set", "a\u2800b\u{E0101}c\u{1D173}d")] }));
+  assert(fe !== null && fe.changes[0].after === "owner=agents/x[U+FE0F]" && fe.changes[1].after === "a[U+2800]b[U+E0101]c[U+1D173]d", "variation selectors, braille blank, tag and musical controls are visible");
+  for (const f of ["\u115F", "\u1160", "\u3164", "\uFFA0"]) assert(parseStagedRow(cliRow("c5", { changes: [change("x", `a${f}b`)] }))!.changes[0].after!.includes("[U+"), `filler ${f.codePointAt(0)!.toString(16)} is visible`);
+  const vr = parseStagedRow(cliRow("c6", { origin: { via: `ho${RLO}me`, kind: "agent", label: "A" }, status: "approved", result: { ok: false, code: `bad${RLO}code` } }));
+  assert(vr !== null && vr.origin?.via === "ho[U+202E]me" && vr.result?.code === "bad[U+202E]code", "origin.via and result.code are visible");
+
   for (const bad of [{ changes_complete: false }, { changes_complete: "true" }, { changes_complete: undefined }]) {
     const n = parseStagedRow(cliRow("c3", bad));
     assert(n !== null && !n.changesComplete && !approvable(n) && n.changes.length === 0 && n.cli?.summary === null, `${JSON.stringify(bad)} is not approvable and carries no summary`);
@@ -125,11 +131,11 @@ async function settle(check: () => void) {
   check();
 }
 const sleep = (ms: number) => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
-async function click(element: Element | undefined | null) {
+async function click(element: Element | undefined | null, detail = 1) {
   assert(element, "click target exists");
   const label = element.textContent?.trim();
   if (element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Deny")) await sleep(850);
-  await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 } as any)); });
+  await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail } as any)); });
   await flush();
 }
 const buttons = (scope: ParentNode) => Array.from(scope.querySelectorAll("button")) as HTMLButtonElement[];
@@ -196,6 +202,24 @@ async function render() {
   await v.done();
 }
 
+// ---- 3b. two identical entries both render; origin.via and result.code show visibly ----
+{
+  actions = [cliRow("c1", { changes: [change("set", "a=b"), change("set", "a=b")], origin: { via: `ho${RLO}me`, kind: "agent", label: "A" } })];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "a card"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "the drawer opens"));
+  const d = drawerEl()!;
+  assert(d.querySelectorAll(".dx-row").length === 2, "both identical entries render");
+  assert(text(d).includes("via ho[U+202E]me") && !d.textContent!.includes(RLO), "origin.via is visible");
+  await v.done();
+  actions = [cliRow("c2", { status: "approved", decidedAt: Date.now(), result: { ok: false, code: `bad${RLO}code` } })];
+  const w = await render();
+  await click(labelled(w.host, "Updates"));
+  assert(text(w.host).includes("refused (bad[U+202E]code)") && !w.host.textContent!.includes(RLO), "result.code is visible");
+  await w.done();
+}
+
 // ---- 4. an incomplete row is not reviewable: no summary, Approve off, Deny still runs ----
 {
   actions = [cliRow("c1", { changes_complete: false })];
@@ -210,6 +234,8 @@ async function render() {
   assert(labelled(d, "Approve")?.getAttribute("aria-disabled") === "true", "Approve is disabled");
   await click(labelled(d, "Approve"));
   assert(seen().length === 0, "a click on the disabled Approve posts nothing");
+  await click(labelled(d, "Approve"), 0);
+  assert(seen().length === 0, "a keyboard (detail 0) Approve on an incomplete row is refused");
   await click(labelled(d, "Deny"));
   assert(seen().join() === "/api/assist/actions/c1/deny", "Deny uses the existing route");
   await v.done();

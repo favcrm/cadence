@@ -334,7 +334,7 @@ function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "created
  * as `[U+202E]` so a staged value cannot read differently from what it is.
  * Newlines and tabs stay; display only, never applied to what runs.
  */
-const HIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u2028-\u202E\u2060-\u206F\u3164\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0000}-\u{E0FFF}]|\u034F/gu;
+const HIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u2028-\u202E\u2060-\u206F\u2800\u3164\uFEFF\uFFA0\uFFF9-\uFFFB\u{1D173}-\u{1D17A}\u{E0000}-\u{E0FFF}]|\u034F|[\uFE00-\uFE0F]/gu;
 export const visible = (text: string): string =>
   text.replace(HIDDEN, (c) => `[U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}]`);
 
@@ -379,8 +379,8 @@ function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" |
     consent: null,
     effects: [],
     raw: visible(rawText(typeof row.args === "string" ? row.args : (input.args ?? ""))),
-    origin: origin === null ? null : { ...origin, label: visible(origin.label) },
-    result,
+    origin: origin === null ? null : { ...origin, label: visible(origin.label), via: visible(origin.via) },
+    result: result?.code === undefined ? result : { ...result, code: visible(result.code) },
     recordLink: null,
     cli: { verb: visible(verb), summary: summary === null ? null : visible(summary), requestedBy: requestedBy === null ? null : visible(requestedBy) },
     connected: null,
