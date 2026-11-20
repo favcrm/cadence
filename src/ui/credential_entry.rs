@@ -368,6 +368,21 @@ fn entry_origin_proof(request: &Request, opts: &ServeOpts) -> Result<serde_json:
     })
 }
 
+/// Show/cancel also serve the ordinary board. Only the exact entry host
+/// forwards an entry proof, which limits it to the authorized request.
+fn request_selector(
+    request: &Request,
+    opts: &ServeOpts,
+    request_id: &str,
+) -> Result<Value, HttpResp> {
+    if accepts_host(opts, &request_host(request)) {
+        let proof = entry_origin_proof(request, opts)?;
+        Ok(json!({"request_id": request_id, "session": proof}))
+    } else {
+        Ok(json!({"request_id": request_id}))
+    }
+}
+
 /// The ordinary board-origin operator proof for protected management:
 /// management is metadata/authority only, carries no credential body, and
 /// stays on the board origin.
@@ -1044,7 +1059,13 @@ pub(super) fn handle_read(
                 Err(response) => return response,
             },
         ),
-        Route::Show(id) => ("credential_request_show", json!({"request_id": id})),
+        Route::Show(id) => (
+            "credential_request_show",
+            match request_selector(request, opts, id) {
+                Ok(params) => params,
+                Err(response) => return response,
+            },
+        ),
         Route::ManagementStatus => (
             "protected_management_status",
             match management_status_params(request) {
@@ -1144,7 +1165,13 @@ pub(super) fn handle_write(
             if let Err(response) = empty_body(request) {
                 return response;
             }
-            ("credential_request_cancel", json!({"request_id": id}))
+            (
+                "credential_request_cancel",
+                match request_selector(request, opts, id) {
+                    Ok(params) => params,
+                    Err(response) => return response,
+                },
+            )
         }
         Route::Prepare => {
             let body: PrepareBody = match typed(request, BODY_CAP) {

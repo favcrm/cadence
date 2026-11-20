@@ -383,8 +383,13 @@ impl Shared {
                 "board operator session is unavailable",
             )
         })?;
-        let account_id = self
-            .verified_board_operator_session(proof)?
+        let session = self.verified_board_operator_session(proof)?;
+        let public_owner_hash = if session.origin == Origin::Public {
+            Some(auth::digest(required_str(proof, "token")?))
+        } else {
+            None
+        };
+        let account_id = session
             .account_id
             .filter(|account| !account.is_empty())
             .ok_or_else(|| {
@@ -393,9 +398,7 @@ impl Shared {
                     "board operator session is unavailable",
                 )
             })?;
-        let now = self.operator_now();
-        let request =
-            super::credential_entry_rpc::pending_request_for_login(self, request_id, now)?;
+        let request = super::credential_entry_rpc::pending_request_for_login(self, request_id)?;
         let entry_origin = self.protected_entry_origin().ok_or_else(|| {
             Error::invalid(
                 "entry_session_required",
@@ -404,11 +407,17 @@ impl Shared {
         })?;
         let scope = auth::LinkScope::Entry {
             origin: entry_origin.to_string(),
-            request_id: request.request_id.clone(),
+            handoff: auth::EntryHandoff {
+                request_id: request.request_id.clone(),
+                public_owner_hash,
+            },
         };
-        let nonce =
-            self.operator_auth()
-                .mint_for_account(Origin::Loopback, scope, now, account_id)?;
+        let nonce = self.operator_auth().mint_for_account(
+            Origin::Loopback,
+            scope,
+            self.operator_now(),
+            account_id,
+        )?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "credential_entry_continue_minted",
@@ -465,7 +474,10 @@ impl Shared {
         };
         let scope = auth::LinkScope::Entry {
             origin: live.to_string(),
-            request_id: canonical.as_str().to_string(),
+            handoff: auth::EntryHandoff {
+                request_id: canonical.as_str().to_string(),
+                public_owner_hash: None,
+            },
         };
         let opened = self
             .operator_auth()
@@ -473,12 +485,25 @@ impl Shared {
         match opened {
             Ok(created) => {
                 let (opened, stored_scope) = created?;
-                let destination = match stored_scope {
-                    auth::LinkScope::Entry { request_id, .. } => request_id,
+                let handoff = match stored_scope {
+                    auth::LinkScope::Entry { handoff, .. } => handoff,
                     auth::LinkScope::Board => {
                         return Err(Error::internal("entry login produced a board session"))
                     }
                 };
+                if let Some(hash) = handoff.public_owner_hash.as_deref() {
+                    let current = self
+                        .entry_public_owner_is_current(hash, opened.session.account_id.as_deref());
+                    if !matches!(current, Ok(true)) {
+                        self.operator_auth().revoke_token(&opened.token)?;
+                        current?;
+                        return Err(Error::invalid(
+                            "entry_session_required",
+                            "the originating public board owner session is no longer current",
+                        ));
+                    }
+                }
+                let destination = handoff.request_id;
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "credential_entry_continue_opened",
@@ -564,6 +589,23 @@ impl Shared {
             return Err(unavailable());
         }
         Ok(session)
+    }
+
+    pub(super) fn entry_public_owner_is_current(
+        &self,
+        hash: &str,
+        account_id: Option<&str>,
+    ) -> Result<bool> {
+        use super::public_membership::Authority;
+        use crate::board_identity::Role;
+        Ok(matches!(
+            self.current_session_for_hash(hash)?,
+            Authority::Granted {
+                role: Role::Operator,
+                view,
+                ..
+            } if account_id.is_some() && account_id == view.account_id.as_deref()
+        ))
     }
 
     /// `operator_session_open_device {token, origin, user_agent?}` —
@@ -733,7 +775,7 @@ impl Shared {
         let key = optional_str(params, "key").unwrap_or_default();
         let entry_origin = required_str(params, "entry_origin")?;
         let now = self.operator_now();
-        let session = self.verify_entry_session(token, key, entry_origin, now)?;
+        let session = self.verify_entry_session(token, key, entry_origin, None, now)?;
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 

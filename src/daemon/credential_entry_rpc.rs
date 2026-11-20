@@ -373,7 +373,7 @@ pub(crate) fn management_session_binding(shared: &Shared, proof: &Value) -> Resu
 /// the nonce binding from it. The browser never chooses this value, and the
 /// session must have been issued ON the root-pinned entry origin (not an
 /// ordinary board/loopback session with an extra caller string).
-pub(crate) fn entry_session_binding(shared: &Shared, proof: &Value) -> Result<String> {
+fn entry_session_binding(shared: &Shared, proof: &Value, request_id: &str) -> Result<String> {
     let entry_origin = shared.protected_entry_origin().ok_or_else(|| {
         Error::invalid(
             "entry_session_required",
@@ -415,23 +415,19 @@ pub(crate) fn entry_session_binding(shared: &Shared, proof: &Value) -> Result<St
         ));
     }
     let session = shared
-        .verify_entry_session(token, key, entry_origin, shared.operator_now())?
+        .verify_entry_session(
+            token,
+            key,
+            entry_origin,
+            Some(request_id),
+            shared.operator_now(),
+        )?
         .ok_or_else(|| {
             Error::invalid(
                 "entry_session_required",
                 "credential entry is the operator's own entry-origin session",
             )
         })?;
-    if session
-        .user
-        .as_ref()
-        .is_some_and(|user| !user.is_operator())
-    {
-        return Err(Error::invalid(
-            "entry_session_required",
-            "credential entry is the operator's own entry-origin session",
-        ));
-    }
     // Bind the LIVE profile origin, never the proof's copy of it (they were
     // required equal above, but the server value is the authority).
     Ok(crate::operator_auth::digest(&format!(
@@ -513,7 +509,6 @@ fn target_of_request(request: &CredentialRequest) -> EntryTargetV1 {
 pub(crate) fn pending_request_for_login(
     shared: &Shared,
     request_id: &str,
-    now_ms: i64,
 ) -> Result<CredentialRequest> {
     let canonical =
         cadence_core::connection_dispatch::primitives::UuidV1::try_from(request_id.to_string())
@@ -524,7 +519,7 @@ pub(crate) fn pending_request_for_login(
         .ok_or_else(|| Error::invalid("request_changed", "credential request is unavailable"))?;
     if request.request_id.as_str() != canonical.as_str()
         || request.state != "pending"
-        || request.expires_at_ms <= now_ms
+        || request.expires_at_ms <= now_ms()
     {
         return Err(Error::invalid(
             "request_changed",
@@ -781,7 +776,7 @@ fn request_response(shared: &Shared, request: &CredentialRequest, now_ms: i64) -
 }
 
 fn reveal_nonce(shared: &Shared, request_id: &str, proof: &Value, now_ms: i64) -> Result<Value> {
-    let binding = entry_session_binding(shared, proof)?;
+    let binding = entry_session_binding(shared, proof, request_id)?;
     let request = shared
         .store
         .credential_request(request_id)?
@@ -814,8 +809,8 @@ fn submit(
     let proof = params
         .get("session")
         .ok_or_else(|| Error::invalid("entry_session_required", "entry session is unavailable"))?;
-    let session_binding = entry_session_binding(shared, proof)?;
     let request_id = required_str(params, "request_id")?.to_owned();
+    let session_binding = entry_session_binding(shared, proof, &request_id)?;
     let nonce = required_str(params, "nonce")?.to_owned();
     let secret = strict_string(params, "secret")?;
     let peek = shared
@@ -1077,8 +1072,8 @@ pub(crate) fn rpc_credential_entry(
             "agent",
             "target_id",
         ],
-        "credential_request_show" | "credential_request_status" => &["request_id"],
-        "credential_request_cancel" => &["request_id"],
+        "credential_request_show" | "credential_request_cancel" => &["request_id", "session"],
+        "credential_request_status" => &["request_id"],
         "credential_request_list" => &["conversation_id", "limit"],
         "credential_entry_session" => &["request_id", "session"],
         "credential_request_submit" => &["request_id", "nonce", "session", "secret", "transport"],
@@ -1105,6 +1100,9 @@ pub(crate) fn rpc_credential_entry(
         }
         "credential_request_show" | "credential_request_status" => {
             let request_id = required_str(params, "request_id")?;
+            if let Some(proof) = params.get("session") {
+                entry_session_binding(shared, proof, request_id)?;
+            }
             let request = shared
                 .store
                 .credential_request(request_id)?
@@ -1145,6 +1143,9 @@ pub(crate) fn rpc_credential_entry(
         "credential_request_submit" => submit(shared, params, now, apply),
         "credential_request_cancel" => {
             let request_id = required_str(params, "request_id")?;
+            if let Some(proof) = params.get("session") {
+                entry_session_binding(shared, proof, request_id)?;
+            }
             let request = shared.store.cancel_credential_request(request_id, now)?;
             Ok(request_response(shared, &request, now))
         }
@@ -1162,12 +1163,23 @@ impl Shared {
         token: &str,
         key: &str,
         entry_origin: &str,
+        request_id: Option<&str>,
         now: i64,
     ) -> Result<Option<crate::operator_auth::SessionView>> {
         if self.protected_entry_origin() != Some(entry_origin) {
             return Ok(None);
         }
-        self.operator_auth()
-            .check_entry(token, key, entry_origin, now)
+        let checked =
+            self.operator_auth()
+                .check_entry(token, key, entry_origin, request_id, now)?;
+        let Some((session, owner_hash)) = checked else {
+            return Ok(None);
+        };
+        if let Some(hash) = owner_hash {
+            if !self.entry_public_owner_is_current(&hash, session.account_id.as_deref())? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(session))
     }
 }

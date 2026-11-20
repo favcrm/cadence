@@ -610,33 +610,56 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn cad2487_protected_management_requires_current_public_owner_role() {
-        for role in [Role::Operator, Role::Member] {
-            let dir = tempfile::tempdir().unwrap();
-            let (shared, token) = native_shared(
-                dir.path(),
-                "protected-owner",
-                "operator",
-                move |_, _, _, _| Ok(Some(role)),
-            );
-            let proof = json!({"token": token, "key": "", "origin": "public"});
-            let binding =
-                super::super::credential_entry_rpc::management_session_binding(&shared, &proof);
-            match role {
-                Role::Operator => {
-                    binding.expect("a current owner can manage custody");
-                    let no_cookie = json!({"token": "", "key": "", "origin": "public"});
-                    assert!(
-                        super::super::credential_entry_rpc::management_session_binding(
-                            &shared, &no_cookie,
-                        )
-                        .is_err()
-                    );
-                }
-                Role::Member => {
-                    assert_eq!(binding.unwrap_err().code(), Some("entry_session_required"));
-                }
-            }
-        }
+    fn cad2487_entry_refuses_demoted_public_owner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const OWNER_ACCOUNT: &str = "acu-11111111111111111111111111111111";
+        const OTHER_ACCOUNT: &str = "acu-22222222222222222222222222222222";
+
+        let dir = tempfile::tempdir().unwrap();
+        let demoted = Arc::new(AtomicBool::new(false));
+        let membership_demoted = Arc::clone(&demoted);
+        let (shared, token) =
+            native_shared(dir.path(), "entry-owner", "operator", move |_, _, _, _| {
+                let role = if membership_demoted.load(Ordering::Relaxed) {
+                    Role::Member
+                } else {
+                    Role::Operator
+                };
+                Ok(Some(role))
+            });
+        shared
+            .operator_auth()
+            .bind_account(&token, OWNER_ACCOUNT)
+            .unwrap();
+        let hash = crate::operator_auth::digest(&token);
+
+        assert!(
+            shared
+                .entry_public_owner_is_current(&hash, Some(OWNER_ACCOUNT))
+                .unwrap(),
+            "a current owner can continue for the account bound to the source session"
+        );
+        assert!(
+            !shared
+                .entry_public_owner_is_current(&hash, Some(OTHER_ACCOUNT))
+                .unwrap(),
+            "a current owner cannot continue for a different account"
+        );
+
+        let proof = json!({"token": &token, "key": "", "origin": "public"});
+        super::super::credential_entry_rpc::management_session_binding(&shared, &proof)
+            .expect("the current public owner can bind a management session");
+
+        demoted.store(true, Ordering::Relaxed);
+        assert!(
+            !shared
+                .entry_public_owner_is_current(&hash, Some(OWNER_ACCOUNT))
+                .unwrap(),
+            "the source session no longer authorizes entry after live demotion"
+        );
+        let error = super::super::credential_entry_rpc::management_session_binding(&shared, &proof)
+            .expect_err("the same public proof must fail after live demotion");
+        assert_eq!(error.code(), Some("entry_session_required"));
     }
 }

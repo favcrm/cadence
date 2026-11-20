@@ -44,9 +44,11 @@ local surface.
 A protected deployment can also serve credential entry on a separate HTTPS
 origin pinned by its runtime profile. A signed-in public board owner manages
 custody and authorizes one pending request at a time from the board. The
-handoff opens the form only at the pinned origin; the ordinary board and
-loopback never collect the credential. The entry host does not serve ordinary
-workspace APIs or offer a separate device or local login in public-only mode.
+handoff opens the form only at the pinned origin and only for that request.
+The originating public owner session must still be authorized. The ordinary
+board and loopback never collect the credential. The entry host does not
+serve ordinary workspace APIs or offer device or local login in public-only
+mode.
 
 ## My work
 
