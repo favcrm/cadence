@@ -9,7 +9,7 @@ const ACTION_ID = /^[a-f0-9]{32}$/;
 const APP_KEY = /^[a-z][a-z0-9_-]{0,63}$/;
 const states = ["pending", "approved", "denied", "running", "unconfirmed", "unanswered", "refused"] as const;
 export type AppHandoffState = (typeof states)[number] | "answered";
-export type AppHandoffMutation = "approve" | "deny" | "run";
+export type AppHandoffMutation = "approve" | "deny" | "run" | "dismiss";
 export type AppHandoffDecision = {
   id: string;
   app: string;
