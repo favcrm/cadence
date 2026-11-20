@@ -19,11 +19,21 @@ const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
 const EFFECT = /^wae_[0-9a-f]{32}$/;
 const provider = "linked";
-// Only the opaque unresolved effect survives thread or mount changes.
-// Never store draft text, recipient labels, confirmation tokens, or disk data.
-const unresolvedReplies = new Map<string, string>();
+// The board keeps only the effect ID and its last known outcome for a reply
+// that still offers Check status. No text, confirmation token, or disk data.
+const unresolvedReplies = new Map<string, { effectId: string; outcome: "uncertain" | "accepted" }>();
 onPrivateSessionReset(() => unresolvedReplies.clear());
 const receiptKey = (selection: WhatsAppReplySelection, recipient: Recipient) => `${selection.receiptScope}:${recipient.workRef}`;
+
+function settleReceipt(key: string, effectId: string | null, outcome: Outcome, group: boolean): void {
+  const receipt = unresolvedReplies.get(key);
+  if (!receipt || receipt.effectId !== effectId || outcome === "uncertain") return;
+  if (outcome === "accepted" && !group) {
+    if (receipt.outcome !== "accepted") unresolvedReplies.set(key, { effectId: receipt.effectId, outcome });
+  } else {
+    unresolvedReplies.delete(key);
+  }
+}
 
 async function recipientFor(selection: WhatsAppReplySelection, ref = selection.conversationId): Promise<Recipient | null> {
   if (!selection.current()) return null;
@@ -68,8 +78,8 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     let cancelled = false;
     void recipientFor(selection).then(value => {
       if (cancelled || !selection.current()) return;
-      const effectId = value && unresolvedReplies.get(receiptKey(selection, value));
-      if (effectId) setAttempt({ effectId, outcome: "uncertain" });
+      const receipt = value && unresolvedReplies.get(receiptKey(selection, value));
+      if (receipt) setAttempt(receipt);
       setRecipient(value);
     });
     return () => { cancelled = true; };
@@ -87,7 +97,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     if (disabled || !recipient || running.current || !selection.current()) return;
     const key = receiptKey(selection, recipient);
     const held = unresolvedReplies.get(key);
-    if (held) { setAttempt({ effectId: held, outcome: "uncertain" }); return; }
+    if (held?.outcome === "uncertain") { setAttempt(held); return; }
     running.current = true;
     setBusy(true);
     setAttempt(null);
@@ -114,9 +124,9 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
       }
       if (!("run" in plan)) return;
       const held = unresolvedReplies.get(key);
-      if (held) { effectId = held; outcome = "uncertain"; return; }
+      if (held?.outcome === "uncertain") { effectId = held.effectId; outcome = "uncertain"; return; }
       // Retain the effect before starting confirm; navigation could win the response race.
-      unresolvedReplies.set(key, effectId);
+      unresolvedReplies.set(key, { effectId, outcome: "uncertain" });
       // Only reached from the original trusted click or Enter, never a port callback.
       submitted = true;
       const result = await plan.run();
@@ -126,7 +136,7 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
       if (submitted) outcome = "uncertain";
     } finally {
       running.current = false;
-      if (submitted && outcome !== "uncertain" && unresolvedReplies.get(key) === effectId) unresolvedReplies.delete(key);
+      if (submitted) settleReceipt(key, effectId, outcome, group);
       if (selection.current()) {
         const mayHaveSent = submitted && (outcome === "sent" || outcome === "accepted" || outcome === "uncertain");
         setAttempt({ effectId, outcome });
@@ -145,9 +155,10 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     const result = await selection.services.call("whatsapp.reply.status", { provider, effect_id: effectId });
     running.current = false;
     if (!selection.current()) return;
-    const outcome = recordedState(result.ok && object(result.data) ? result.data.state : null);
-    const key = receiptKey(selection, recipient);
-    if (outcome !== "uncertain" && unresolvedReplies.get(key) === effectId) unresolvedReplies.delete(key);
+    const recorded = recordedState(result.ok && object(result.data) ? result.data.state : null);
+    // An inconclusive delivery check cannot un-confirm a known acceptance.
+    const outcome = recorded === "uncertain" && attempt.outcome === "accepted" ? "accepted" : recorded;
+    settleReceipt(receiptKey(selection, recipient), effectId, outcome, group);
     setAttempt({ effectId, outcome });
     setBusy(false);
     selection.announce(!!text, true);
