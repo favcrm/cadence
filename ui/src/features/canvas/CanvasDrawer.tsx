@@ -133,9 +133,14 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
 
   useEffect(() => {
     const reset = () => { saveLifecycle.current += 1; setSaveOpen(false); setTplBusy(false); setTplError(null); setTplSaved(null); };
-    reset();
-    return onPrivateReadsPaused(reset);
-  }, [tab.id, tab.selected]);
+    // Body is keyed by artifact version. Reset on revocation, not on effect
+    // replay: replay would clear a Save as Template request just consumed.
+    const unsubscribe = onPrivateReadsPaused(reset);
+    return () => {
+      saveLifecycle.current += 1;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (tab.kind !== "html") return;

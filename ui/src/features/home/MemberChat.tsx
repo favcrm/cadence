@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
+import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
@@ -98,7 +99,7 @@ export default function MemberChat({
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   documentFollowUps?: DocumentFollowUpState;
-  templateRail?: ReactNode;
+  templateRail?: HostedTemplateRail;
   templateCount?: number;
 }) {
   const t = useTranslate();

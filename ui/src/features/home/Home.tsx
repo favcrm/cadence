@@ -63,7 +63,7 @@ import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
-import { useHostedTemplateReview } from "../templates/HostedTemplateReview";
+import { useHostedTemplateReview, type HostedTemplateRail } from "../templates/HostedTemplateReview";
 import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
 import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
 import { useSendHandoff } from "./sendHandoff";
@@ -906,7 +906,7 @@ function MasterHome({
   readOnly: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
-  templateRail?: ReactNode;
+  templateRail?: HostedTemplateRail;
   templateCount?: number;
   operator?: boolean | null;
   overview: ResourceState<Overview>;

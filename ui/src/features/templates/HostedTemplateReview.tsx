@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import Button from "../../ui/Button";
 import DrawerShell from "../app-shell/shared/DrawerShell";
+import Field from "../app-shell/shared/Field";
 import { htmlFrameDocument } from "../canvas/ArtifactView";
 import { base64Blob, templatesApi, type TemplateDirectoryEntry, type TemplateSpec, type TemplateSummary, type TemplateView } from "./templatesApi";
 
 export type HostedTemplateReviewTarget = { name: string; version: number; digest: string };
+export type HostedTemplateRail = (onReview: () => void) => ReactNode;
 
 type Preview = { kind: "pdf"; url: string; rows: number } | { kind: "html"; html: string; rows: number };
 type SampleRows = 1 | 36;
@@ -32,7 +34,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
   enabled: boolean;
   canApprove: boolean;
   onCompose?: (text: string) => void;
-}): { rail: ReactNode; drawer: ReactNode; pendingCount: number | undefined; open: (target: HostedTemplateReviewTarget, opener?: HTMLElement) => void; refresh: () => void } {
+}): { rail: HostedTemplateRail | undefined; drawer: ReactNode; pendingCount: number | undefined; open: (target: HostedTemplateReviewTarget, opener?: HTMLElement) => void; refresh: () => void } {
   const t = useTranslate();
   const [directory, setDirectory] = useState<TemplateDirectoryEntry[] | null>(null);
   const [listError, setListError] = useState(false);
@@ -184,6 +186,16 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
     });
   }, [target, enabled, current, loadSample]);
 
+  useLayoutEffect(() => {
+    if (!enabled || !target) return;
+    // Approve and retry can remove the focused control. Keep Escape and Tab
+    // in this drawer even when a receipt replaces the action footer.
+    const root = document.querySelector('[data-drawer="template-review"]');
+    if (root && !root.contains(document.activeElement)) {
+      root.querySelector<HTMLElement>(".crm-drawer-title")?.focus({ preventScroll: true });
+    }
+  }, [enabled, target, view, loading, previewBusy]);
+
   const close = () => {
     selection.current += 1;
     const closedSelection = selection.current;
@@ -284,7 +296,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
   const history = target ? byName.get(target.name)?.filter((v) => canApprove || v.status === "approved") ?? [] : [];
   const needsApproval = canApprove && view?.template.status === "draft";
 
-  const rail = enabled ? (
+  const rail: HostedTemplateRail | undefined = enabled ? (onReview) => (
     <section aria-label={t("Template approvals")} data-template-approvals>
       <h3 className="px-3 pt-3 text-label font-medium text-ink-300">{t("Template approvals")}</h3>
       {listError && <p className="px-3 py-2 text-label text-warn" role="alert">{t("Templates could not be loaded.")} <button type="button" className="lnk" onClick={refresh}>{t("Retry")}</button></p>}
@@ -293,12 +305,15 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
       <ul className="todo-list">
         {shown.map((version) => <li key={`${version.name}:${version.version}`} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0" data-record-id={`template:${version.name}:${version.version}`}>
           <div className="min-w-0"><span className="block text-label font-medium text-ink-100 truncate">{version.name} · v{version.version}</span><span className="block text-micro text-ink-400">{version.status === "draft" ? t("Draft awaiting review") : t("Approved for reuse")}</span></div>
-          <button type="button" className="btn btn-sm btn-secondary" aria-label={`${t(version.status === "draft" ? "Review" : "Open")} ${version.name} v${version.version}`} data-template-review-open onClick={(event) => open(targetOf(version), event.currentTarget)}>{t(version.status === "draft" ? "Review" : "Open")}</button>
+          <button type="button" className="btn btn-sm btn-secondary" aria-label={`${t(version.status === "draft" ? "Review" : "Open")} ${version.name} v${version.version}`} onClick={(event) => {
+            open(targetOf(version), event.currentTarget);
+            onReview();
+          }}>{t(version.status === "draft" ? "Review" : "Open")}</button>
         </li>)}
       </ul>
       {relevant.length > 5 && <button type="button" className="lnk px-3 py-2" onClick={() => setShowAll(!showAll)}>{showAll ? t("Show less") : t("Show all templates")}</button>}
     </section>
-  ) : null;
+  ) : undefined;
 
   const drawer = enabled && target ? <DrawerShell
     kind="template-review" label={t("Template review")} kicker={t("Template approvals")} scrim="board" modal trapFocus
@@ -336,7 +351,14 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
           {preview && <p className="text-micro text-ink-400">{t("Verified sample rows")}: {preview.rows}</p>}
         </section>
         {needsApproval && !view.spec.calculation.confirmed && <p className="text-warn">{t("Confirm the calculation rules in a new draft before approving.")}</p>}
-        {needsApproval && <label className="block text-label">{t("Approval source (who decided and where)")}<input className="block w-full" value={source} onChange={(event) => setSource(event.target.value)} disabled={busy || !view.spec.calculation.confirmed} /><span className="block text-micro text-ink-400">{t("Record your decision and where it was made; this is not approval of a finished document.")}</span></label>}
+        {needsApproval && <Field
+          label={t("Approval source (who decided and where)")}
+          hint={t("Record your decision and where it was made; this is not approval of a finished document.")}
+          required
+          disabled={busy || !view.spec.calculation.confirmed}
+        >
+          {(control) => <input {...control} className="field w-full" name="template-approval-source" value={source} onChange={(event) => setSource(event.target.value)} />}
+        </Field>}
       </>}
     </div> }]}
     foot={view && (onCompose || needsApproval) ? <div className="crm-drawer-actions flex flex-wrap gap-2">

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
@@ -15,6 +15,7 @@ import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "..
 import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import { resources } from "../../lib/resources";
 import { routinesApi } from "../agents/routinesApi";
+import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 
@@ -108,7 +109,7 @@ export default function NeedsRail({
   /** CAD-2186: also read the owner's staged decisions (`/api/assist/actions`) and
    *  list them in To do. Off for a board with no such route or a non-owner. */
   decisions?: boolean;
-  templateRail?: ReactNode;
+  templateRail?: HostedTemplateRail;
   templateCount?: number;
 }) {
   const [tab, setTab] = useState<"todo" | "updates">("todo");
@@ -292,12 +293,11 @@ export default function NeedsRail({
   };
   const todoBody = (
     <>
-      <div onClickCapture={(event) => {
-        if (drawer && (event.target as Element).closest("[data-template-review-open]")) {
-          reviewOpening.current = true;
-          setDrawer(false);
-        }
-      }}>{templateRail}</div>
+      {templateRail?.(() => {
+        if (!drawer) return;
+        reviewOpening.current = true;
+        setDrawer(false);
+      })}
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {staged.notice && review === null && (
         <p className="todo-note text-label text-ink-300 px-3 pt-2" role="status">
