@@ -10,6 +10,7 @@ import { WorkspaceDialog } from "./WorkspaceDialog";
 import { applyPrivateApp, checkPrivateApp, decideHostedPrivateReview, fetchGithubPrivateApp, getHostedPrivateReview, githubPrivateAppAvailable, type HostedPrivateReview, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
 
 const ZIP_LIMIT = 8 * 1024 * 1024;
+const STALE_REVIEW = "Workspace apps changed after this review was created. Ask the requester for a new review.";
 
 /** The owner reviews a host-checked package before explicitly committing the same File. */
 export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled }: {
@@ -51,7 +52,9 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       void getHostedPrivateReview(reviewId, controller.signal).then((request) => {
         if (controller.signal.aborted || epoch.current !== current || !privateReadsAllowed()) return;
         setHostedReview(request);
-        setReview(request.state === "pending" ? request.review : null);
+        const stale = request.state === "pending" && request.catalogStale;
+        setError(stale ? STALE_REVIEW : null);
+        setReview(request.state === "pending" && !stale ? request.review : null);
         setUncertain(false);
       }).catch(() => {
         if (!controller.signal.aborted && epoch.current === current) setError("This review is missing or unavailable.");
@@ -131,7 +134,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
   };
   const decide = async (decision: "install" | "reject") => {
     if (!hostedReview || hostedReview.state !== "pending" || inFlight.current ||
-        (decision === "install" && (!consent || !hostedReview.review.compatible || hostedReview.review.warnings))) return;
+        (decision === "install" && (hostedReview.catalogStale || !consent || !hostedReview.review.compatible || hostedReview.review.warnings))) return;
     const current = epoch.current;
     inFlight.current = true;
     setBusy(decision === "install" ? "apply" : "reject"); setError(null);
@@ -144,7 +147,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       if (epoch.current !== current || !privateReadsAllowed()) return;
       setReview(null);
       if (cause instanceof ApiError && cause.status === 409 && (cause.code === "installation_stale" || cause.code === "app_exists" || cause.code === "package_changed")) {
-        setError("This review no longer matches the workspace. Ask for a new review before installing.");
+        setError(STALE_REVIEW);
       } else if (cause instanceof ApiError && cause.status === 403) {
         setError("Only a current workspace owner can review this request.");
       } else {

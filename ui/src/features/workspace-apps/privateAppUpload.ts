@@ -187,6 +187,7 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
 export type HostedPrivateReview = {
   id: string;
   state: "pending" | "installed" | "rejected" | "expired";
+  catalogStale: boolean;
   expiresAt: number;
   source: string;
   zipSha256: string;
@@ -198,6 +199,7 @@ function parseHostedReview(body: unknown, id: string, generation: number): Hoste
   const data = body.data;
   if (data.id !== id || typeof data.state !== "string" ||
       !["pending", "installed", "rejected", "expired"].includes(data.state) ||
+      (data.catalog_stale !== undefined && typeof data.catalog_stale !== "boolean") ||
       typeof data.expires_at !== "number" || !Number.isFinite(data.expires_at) ||
       typeof data.source !== "string" || typeof data.zip_sha256 !== "string" ||
       !DIGEST.test(data.zip_sha256) || !object(data.review)) throw invalid();
@@ -210,8 +212,8 @@ function parseHostedReview(body: unknown, id: string, generation: number): Hoste
   }
   const review = parseReview(raw, target, generation);
   if (data.name !== review.name || data.digest !== review.digest || data.generation !== review.generation) throw invalid();
-  return { id, state: data.state as HostedPrivateReview["state"], expiresAt: data.expires_at,
-    source: data.source, zipSha256: data.zip_sha256, review };
+  return { id, state: data.state as HostedPrivateReview["state"], catalogStale: data.catalog_stale === true,
+    expiresAt: data.expires_at, source: data.source, zipSha256: data.zip_sha256, review };
 }
 
 export async function getHostedPrivateReview(id: string, signal?: AbortSignal): Promise<HostedPrivateReview> {
@@ -229,6 +231,7 @@ export async function getHostedPrivateReview(id: string, signal?: AbortSignal): 
 
 export async function decideHostedPrivateReview(request: HostedPrivateReview, decision: "install" | "reject"): Promise<HostedPrivateReview> {
   if (!HOSTED_REVIEW_ID.test(request.id)) throw invalid();
+  if (decision === "install" && request.catalogStale) throw invalid();
   return withPrivateOperation(async (operation) => {
     if (operation.generation !== request.review.sessionGeneration || request.state !== "pending") throw invalid();
     const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(request.id)}/${decision}`, {

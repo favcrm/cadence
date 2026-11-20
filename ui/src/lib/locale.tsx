@@ -140,7 +140,7 @@ Object.assign(zhTW, {
   "Only a current workspace owner can review this request.": "只有目前的工作區擁有者可以檢視此請求。",
   "Loading review…": "正在載入審查資料…",
   "This review is missing or unavailable.": "找不到此審查資料，或目前無法使用。",
-  "This review no longer matches the workspace. Ask for a new review before installing.": "此審查資料已不符合目前的工作區。請取得新的審查資料後再安裝。",
+  "Workspace apps changed after this review was created. Ask the requester for a new review.": "建立此審查後，工作區的應用程式已有變更。請向提出要求的人索取新的審查資料。",
   "This request has been installed.": "此請求的應用程式已安裝。",
   "This request was rejected.": "此請求已被拒絕。",
   "This request has expired.": "此請求已過期。",

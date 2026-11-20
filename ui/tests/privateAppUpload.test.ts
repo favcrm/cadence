@@ -106,6 +106,14 @@ async function main() {
   responses = [staleResponse, { status: 200, body: { ...receipt, data: { ...receipt.data, state: "installed" } } }];
   equal((await decideHostedPrivateReview(hosted, "install")).state, "installed",
     "an owner who won the activation race leaves a verified installed receipt");
+  responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, catalog_stale: true } } }];
+  const stale = await getHostedPrivateReview(reviewId);
+  equal(stale.catalogStale, true, "the owner read exposes catalog drift without changing the review state");
+  equal(stale.state, "pending");
+  const beforeKnownStale = calls.length;
+  await rejected(decideHostedPrivateReview(stale, "install"), (error) => error instanceof ApiError,
+    "the client does not send an install POST for a known stale review");
+  equal(calls.length, beforeKnownStale);
   responses = [{ status: 200, body: { ...receipt, data: { ...receipt.data, digest: `sha256:${"b".repeat(64)}` } } }];
   await rejected(getHostedPrivateReview(reviewId), (error) => error instanceof ApiError && error.status === 502,
     "a mismatched review fingerprint cannot be presented for approval");
