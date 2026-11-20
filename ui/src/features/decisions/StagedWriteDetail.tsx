@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
+import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -120,7 +120,7 @@ function ApprovalsTab({
   const [raw, setRaw] = useState(!write.changesComplete);
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
   const update = write.target !== null && write.changesComplete;
-  const heading = update ? t("Changes compared with the current record") : write.connected !== null ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
+  const heading = update ? t("Changes compared with the current record") : write.connected !== null || write.cli ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
   const name = write.origin?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
@@ -147,9 +147,22 @@ function ApprovalsTab({
           {t("The last approval attempt did not finish: {reason}. It is still waiting; check before approving again.").replace("{reason}", reasonText(failureReason(write), t))}
         </p>
       )}
-      {!write.changesComplete && (
+      {write.cli && write.status === "pending" && write.changesComplete && write.result === null && (
+        <p className="rv-note m-0">{t("Approving runs this once as the workspace owner. Nothing has run yet.")}</p>
+      )}
+      {write.cli && !write.changesComplete && (
+        <p className="issue-peek-note warn m-0" role="status">
+          {t("This request cannot be reviewed here: its full list of changes is not available. Approve is off. Check the raw call, then deny it or ask for it to be staged again.")}
+        </p>
+      )}
+      {write.cli === undefined && !write.changesComplete && (
         <p className="issue-peek-note warn m-0" role="status">
           {t("This summary may be incomplete. Check the raw call.")}
+        </p>
+      )}
+      {write.cli?.summary && (
+        <p className="rv-note m-0">
+          {t("Summary")}: <B>{write.cli.summary}</B>
         </p>
       )}
       {(write.changes.length > 0 || write.changesComplete) && (
@@ -158,8 +171,8 @@ function ApprovalsTab({
           {write.changes.length > 0 ? (
             <>
               <dl className="dx-chg">
-                {shown.map((c) => (
-                  <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} create={write.target === null} t={t} />
+                {shown.map((c, i) => (
+                  <ChangeRow key={`${i}:${c.kind}:${c.field}`} change={c} update={update} create={write.target === null} t={t} />
                 ))}
               </dl>
               {folded.length > 0 && (
@@ -250,10 +263,7 @@ function ApprovalsTab({
 
 function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: StagedDomain; via: string; t: Say }) {
   const name = write.origin?.label ?? t("The assistant");
-  const originText =
-    write.origin === null
-      ? t("the assistant")
-      : `${write.origin.label} (${write.origin.kind === "agent" || write.origin.kind === "person" ? t(write.origin.kind) : write.origin.kind})`;
+  const originText = askedBy(write, t) ?? t("the assistant");
   return (
     <div className="wi-panel dx-panel">
       <section className="dx-sec" aria-label={t("Overview")}>
@@ -266,7 +276,7 @@ function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: St
             </div>
             <div className="dx-kv-line">
               <dt>{t("Kind")}</dt>
-              <dd>{write.kind === "create_issue" ? t("Issue proposal") : t("App write")}</dd>
+              <dd>{write.kind === "create_issue" ? t("Issue proposal") : write.cli ? t("Cadence command") : t("App write")}</dd>
             </div>
             <div className="dx-kv-line">
               <dt>{t("Surface")}</dt>
@@ -294,7 +304,7 @@ function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: St
             </div>
             <div className="dx-kv-line">
               <dt>{t("Asked by")}</dt>
-              <dd>{write.origin === null ? t("the assistant") : <B>{originText}</B>}</dd>
+              <dd><B>{originText}</B></dd>
             </div>
             <div className="dx-kv-line">
               <dt>{t("Channel")}</dt>
@@ -600,6 +610,7 @@ export default function StagedWriteDetail({
     // The click is for the row that was on screen when the handler was made.
     if (forId !== idRef.current) return;
     if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
+    if (verb === "approve" && write !== null && !approvable(write)) return;
     const reason = verb === "deny" && denyOpen ? denyReason : undefined;
     void run(() => store.decide(forId, verb, reason));
   };
@@ -697,7 +708,7 @@ export default function StagedWriteDetail({
           )}
           <div className="dx-asked">
             {t("Asked by")}{" "}
-            <B>{write.origin === null ? t("the assistant") : `${write.origin.label} (${write.origin.kind === "agent" || write.origin.kind === "person" ? t(write.origin.kind) : write.origin.kind})`}</B>
+            <B>{askedBy(write, t) ?? t("the assistant")}</B>
             , <B>{via}</B> · {ageText(write.createdAt, t)}
           </div>
         </>
@@ -757,9 +768,9 @@ export default function StagedWriteDetail({
                 <button
                   type="button"
                   className="btn btn-sm btn-primary"
-                  aria-disabled={off || undefined}
+                  aria-disabled={off || !approvable(write) || undefined}
                   aria-busy={spin("approve") || undefined}
-                  title={block !== null ? t(READ_ONLY_COPY) : undefined}
+                  title={block !== null ? t(READ_ONLY_COPY) : !approvable(write) ? t("This request cannot be reviewed, so it cannot be approved.") : undefined}
                   onClick={(e) => act("approve", write.id, e.detail)}
                 >
                   {spin("approve") ? (
