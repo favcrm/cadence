@@ -182,6 +182,21 @@ receives `(role, surface, modal)`. `receiver.surfaceRole()` and
 `receiver.surface()` expose the same values after the host message. The drawer
 helpers work under either opt-in; a drawer mount never opens another drawer.
 
+### In the chat canvas
+
+An app can also be shown in the chat canvas. Add `screen-canvas.v1` to
+`accepts` (it needs `screen-surfaces.v1`, or `canvas: true` with `surfaces: true`
+on a bridge). The host then tells the frame `receiver.surfaceRole() ===
+"canvas"` and `receiver.readOnly() === true` (also the 4th `onSurface`
+argument and the bridge's `surface.readOnly`). A frame that did not opt in is
+told `primary` with `readOnly()` false, as before; the host narrows a canvas
+mount's operations either way.
+
+In the canvas an app should hide edit controls, drop member-only wording such
+as "Edits are disabled on this board", and use compact padding. The host shows
+"Open in <App> to edit" itself. `openDrawer` is unchanged: only a `drawer`
+mount refuses it.
+
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
 

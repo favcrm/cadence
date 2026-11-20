@@ -305,6 +305,7 @@ function inert(reason) {
     ownLeaveState: () => null,
     presentation: () => "outlet",
     surfaceRole: () => "primary",
+    readOnly: () => false,
     surface: () => undefined,
     openDrawer: refuse,
     closeDrawer: refuse,
@@ -334,14 +335,14 @@ export function createScreenReceiver(options = {}) {
   if (expectedTag !== undefined && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
     throw new TypeError("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   }
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-canvas.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1, screen-locale.v1, screen-audio.v1 or screen-audio.v2");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-canvas.v1, screen-records.v1, screen-locale.v1, screen-audio.v1 or screen-audio.v2");
   }
   if (accepts.includes(SCREEN_AUDIO_V1) && accepts.includes(SCREEN_AUDIO_V2)) {
     throw new TypeError("accepts cannot combine screen-audio.v1 and screen-audio.v2");
@@ -364,6 +365,12 @@ export function createScreenReceiver(options = {}) {
   const surfacesAccepted = accepts.includes("screen-surfaces.v1");
   if (surfacesAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-surfaces.v1 needs screen.v2");
+  }
+  // CAD-2525 — the host tells a frame it is mounted in the chat canvas
+  // (role `canvas`) and that it is read-only. It rides on the surface push.
+  const canvasAccepted = accepts.includes("screen-canvas.v1");
+  if (canvasAccepted && !surfacesAccepted) {
+    throw new TypeError("screen-canvas.v1 needs screen-surfaces.v1");
   }
   const recordsAccepted = accepts.includes("screen-records.v1");
   if (recordsAccepted && !accepts.includes("screen.v2")) {
@@ -390,6 +397,7 @@ export function createScreenReceiver(options = {}) {
     ...(mediaAccepted ? ["screen-media.v1"] : []),
     ...(presentationAccepted ? ["screen-presentation.v1"] : []),
     ...(surfacesAccepted ? ["screen-surfaces.v1"] : []),
+    ...(canvasAccepted ? ["screen-canvas.v1"] : []),
     ...(recordsAccepted ? ["screen-records.v1"] : []),
     ...(localeAccepted ? ["screen-locale.v1"] : []),
     ...(audioAccepted ? [SCREEN_AUDIO_V1] : []),
@@ -444,6 +452,7 @@ export function createScreenReceiver(options = {}) {
   /** CAD-1777 — the host-derived role of this mount and the surface it names. */
   let surfaceRole = "primary";
   let surfaceName = undefined;
+  let surfaceReadOnly = false;
   let leaveOwner = null;
   let seq = 0;
   // The host closes a mount that starts a second tool while one is running.
@@ -673,9 +682,13 @@ export function createScreenReceiver(options = {}) {
         // Field set, not an exact key string: the host sends `modal` on every
         // surface and `surface` only for a drawer, and a strict key comparison
         // closed the channel on the first mount (SOC-52).
-        const FIELDS = new Set(["v", "op", "role", "modal", "surface"]);
+        const FIELDS = new Set(["v", "op", "role", "modal", "surface", "readOnly"]);
         if (message.v !== 1 || Object.keys(message).some((key) => !FIELDS.has(key)) ||
-            (message.role !== "primary" && message.role !== "drawer") ||
+            (message.role !== "primary" && message.role !== "drawer" && message.role !== "canvas") ||
+            // CAD-2525: `canvas` and `readOnly` are only ever sent to a frame
+            // that opted into screen-canvas.v1, and `readOnly` is only `true`.
+            ((message.role === "canvas" || message.readOnly !== undefined) && !canvasAccepted) ||
+            (message.readOnly !== undefined && message.readOnly !== true) ||
             (message.modal !== undefined && typeof message.modal !== "boolean") ||
             (message.surface !== undefined &&
               (typeof message.surface !== "string" || !DRAWER_SURFACE.test(message.surface)))) {
@@ -683,7 +696,11 @@ export function createScreenReceiver(options = {}) {
         }
         surfaceRole = message.role;
         surfaceName = message.role === "drawer" ? message.surface : undefined;
-        onSurface?.(surfaceRole, surfaceName, message.modal === true);
+        surfaceReadOnly = message.readOnly === true;
+        // The 4th argument exists only for a read-only mount, so a callback
+        // written before screen-canvas.v1 sees exactly the arguments it did.
+        if (surfaceReadOnly) onSurface?.(surfaceRole, surfaceName, message.modal === true, true);
+        else onSurface?.(surfaceRole, surfaceName, message.modal === true);
         return;
       }
       if (message.op === "presentation") {
@@ -743,8 +760,11 @@ export function createScreenReceiver(options = {}) {
     },
     /** The surface the host currently presents this frame in. */
     presentation: () => presentation,
-    /** CAD-1777 — the host-derived role of this mount ("primary" | "drawer"). */
+    /** CAD-1777 — the host-derived role of this mount ("primary" | "drawer" | "canvas"). */
     surfaceRole: () => surfaceRole,
+    /** CAD-2525 — true when the host says this mount is read-only (the chat
+     *  canvas); only ever true after a `screen-canvas.v1` opt-in. */
+    readOnly: () => surfaceReadOnly,
     /** The closed surface idiom this drawer mounts, when the host named one. */
     surface: () => surfaceName,
     /** Ask the host to present the app's surface in the board-wide drawer.
@@ -757,7 +777,7 @@ export function createScreenReceiver(options = {}) {
       if (presentationAccepted && !surfacesAccepted && !presented) {
         return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
       }
-      if (surfaceRole !== "primary") {
+      if (surfaceRole === "drawer") {
         return Promise.reject(new ScreenClosedError("a drawer surface opens no further drawer"));
       }
       if (typeof surface !== "string" || !DRAWER_SURFACE.test(surface)) {
@@ -1026,7 +1046,7 @@ export function createScreenReceiver(options = {}) {
 /** Domain-agnostic reactive `screen.v2` bridge (`subscribe` + `getState`). */
 export function createScreenBridge(options = {}) {
   const {
-    tag, appName, records = false, actions = false, media = false, surfaces = false,
+    tag, appName, records = false, actions = false, media = false, surfaces = false, canvas = false,
     presentation = false, locale = false, audio = false, calls: suppliedCalls = {}, slots: suppliedSlots = {}, catalog = false, argBytes = ACTION_ARGS_BYTES,
     singleFlight = [], writeVerbs = [], route: routeConfig, observations: observationVerbs = [],
     pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, sandboxForms = false, createError,
@@ -1093,6 +1113,7 @@ export function createScreenBridge(options = {}) {
     ...(media ? ["screen-media.v1"] : []),
     ...(presentation ? ["screen-presentation.v1"] : []),
     ...(surfaces ? ["screen-surfaces.v1"] : []),
+    ...(canvas ? ["screen-canvas.v1"] : []),
     ...(records ? ["screen-records.v1"] : []),
     ...(locale ? ["screen-locale.v1"] : []),
     ...negotiatedAudio,
@@ -1102,7 +1123,7 @@ export function createScreenBridge(options = {}) {
   const makeError = (message, status = 502, extra) =>
     createError ? createError(message, status, extra) : new ScreenBridgeError(message, status, extra);
   const invalidBridge = (detail = "The screen bridge refused an invalid or retired message") => makeError(detail, 502);
-  const initialSurface = Object.freeze({ role: "primary", name: undefined, modal: false });
+  const initialSurface = Object.freeze({ role: "primary", name: undefined, modal: false, readOnly: false });
   const makeState = (patch) => Object.freeze({
     status: patch.status, snapshot: patch.snapshot, error: patch.error, pushes: patch.pushes, surface: patch.surface,
   });
@@ -1421,10 +1442,10 @@ export function createScreenBridge(options = {}) {
         },
         onPresentation(mode) {
           if (!retired && !surfaces) {
-            setState({ surface: Object.freeze({ role: mode === "drawer" ? "drawer" : "primary", name: undefined, modal: false }) });
+            setState({ surface: Object.freeze({ role: mode === "drawer" ? "drawer" : "primary", name: undefined, modal: false, readOnly: false }) });
           }
         },
-        onSurface(role, name, modal) { if (!retired) setState({ surface: Object.freeze({ role, name, modal }) }); },
+        onSurface(role, name, modal, readOnly) { if (!retired) setState({ surface: Object.freeze({ role, name, modal, readOnly: readOnly === true }) }); },
         onPush(push) { acceptPush(push); },
         onError(reason) { retire(makeError(reason, 502)); },
       });

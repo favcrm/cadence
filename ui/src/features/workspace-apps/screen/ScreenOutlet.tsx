@@ -522,6 +522,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // state is stored before the handshake, so `send()` can post it
         // before the first projection.
         owned.surfaceRole = surfaceRole;
+        owned.canvasReadOnly = readOnly;
         owned.setDrawerContext(drawerContext);
         owned.surface(surfaceRole, primary && overlayRef.current !== null, primary ? undefined : drawerSurface);
         channel.current = owned;

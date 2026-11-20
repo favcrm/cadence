@@ -25,7 +25,7 @@ export interface ScreenPush {
 }
 
 export type ScreenPresentationMode = "outlet" | "drawer";
-export type ScreenSurfaceRole = "primary" | "drawer";
+export type ScreenSurfaceRole = "primary" | "drawer" | "canvas";
 export type ScreenLocale = "en" | "zh-TW";
 export type ScreenAudioMode = "record" | "upload";
 export type ScreenAudioSource = "recording" | "upload";
@@ -46,6 +46,7 @@ export type ScreenCapability =
   | "screen-media.v1"
   | "screen-presentation.v1"
   | "screen-surfaces.v1"
+  | "screen-canvas.v1"
   | "screen-records.v1"
   | "screen-locale.v1"
   | "screen-audio.v1"
@@ -104,7 +105,7 @@ export interface ScreenReceiverOptions {
   onSlotState?(event: SlotState): void;
   onAudioSessionEvent?(state: ScreenAudioSessionSnapshot): void;
   onPresentation?(mode: ScreenPresentationMode): void;
-  onSurface?(role: ScreenSurfaceRole, surface: string | undefined, modal: boolean): void;
+  onSurface?(role: ScreenSurfaceRole, surface: string | undefined, modal: boolean, readOnly?: boolean): void;
   accepts?: readonly ScreenCapability[];
   /** Largest JSON args/input bag to send. Defaults to 16 KiB. */
   maxArgsBytes?: number;
@@ -152,6 +153,8 @@ export interface ScreenReceiver {
   ownLeaveState(options?: { isLive?: () => boolean }): ScreenLeaveHandle | null;
   presentation(): ScreenPresentationMode;
   surfaceRole(): ScreenSurfaceRole;
+  /** True when the host says this mount is read-only (the chat canvas); needs `screen-canvas.v1`. */
+  readOnly(): boolean;
   surface(): string | undefined;
   openDrawer(surface: string, options?: ScreenDrawerOpenOptions): Promise<unknown>;
   closeDrawer(): Promise<unknown>;
@@ -190,6 +193,7 @@ export interface ScreenSurfaceSnapshot {
   readonly role: ScreenSurfaceRole;
   readonly name: string | undefined;
   readonly modal: boolean;
+  readonly readOnly: boolean;
 }
 
 export interface ScreenScopeSnapshot<
@@ -247,6 +251,8 @@ export interface ScreenBridgeOptions<
   actions?: boolean;
   media?: boolean;
   surfaces?: boolean;
+  /** Opt into `canvas` / `readOnly` from the host (needs `surfaces`). */
+  canvas?: boolean;
   presentation?: boolean;
   locale?: boolean;
   audio?: boolean | "v1" | "v2";
