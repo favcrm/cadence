@@ -3663,6 +3663,18 @@ button.turnsource:hover {
 .recordcard-hact { display: flex; margin-left: auto; opacity: 0; transition: opacity .12s ease; }
 .recordcard-hact + .recordcard-count { margin-left: 0; }
 .chatcard:hover .recordcard-hact, .chatcard:focus-within .recordcard-hact { opacity: 1; }
+/* CAD-2543: a detail record card (one email): header, subject, two-line preview, attachments, Open. */
+.recordcard-detail { display: grid; gap: .25rem; min-width: 0; }
+.recordcard-detail > .recordcard-who { display: flex; align-items: baseline; gap: .375rem; }
+.recordcard-detail .recordcard-dot { flex: none; }
+.recordcard-detail[data-unread] .recordcard-dot { background: var(--color-accent); }
+.recordcard-detail[data-unread] .recordcard-name { font-weight: 650; }
+.recordcard-detail .recordcard-when { margin-left: auto; flex: none; }
+.recordcard-dsubject { min-width: 0; margin: 0; overflow: hidden; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; overflow-wrap: anywhere; text-overflow: ellipsis; white-space: nowrap; }
+.recordcard-dpreview { display: -webkit-box; min-width: 0; margin: 0; overflow: hidden; color: var(--color-ink-400); font-size: var(--text-label); line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+.recordcard-dfoot { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: .5rem; padding-top: .25rem; }
+.recordcard-dattach { min-width: 0; overflow: hidden; color: var(--color-ink-400); font-size: var(--text-micro); text-overflow: ellipsis; white-space: nowrap; }
+.recordcard-open { margin-left: auto; flex: none; }
 .recordcard-foot { display: flex; flex-wrap: wrap; align-items: center; gap: .375rem; margin: 0; color: var(--color-ink-400); font-size: var(--text-micro); overflow-wrap: anywhere; }
 .recordcard-foot .recordcard-act { border-color: transparent; background: none; color: var(--color-accent); }
 @media (hover: none) and (pointer: coarse) {

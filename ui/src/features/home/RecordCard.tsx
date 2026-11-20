@@ -1,13 +1,17 @@
 import { useContext, useEffect, useRef, useState } from "react";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
+import { openRecordView } from "../canvas/canvasStore";
 import {
   dayKey,
+  inPrompt,
   parseRecordRef,
   plainText,
+  recordCardView,
   recordLayout,
   type LabeledValue,
   type RecordCardModel,
+  type RecordDetail,
   type RoleMessage,
   type RoleRow,
   type TimeValue,
@@ -26,9 +30,6 @@ import type { ThreadEntry } from "./thread";
  * action only fills the composer; it never sends.
  */
 const DIRECTION: Record<string, string> = { in: "Received", inbound: "Received", out: "Sent", outbound: "Sent" };
-
-/** A value placed inside a composer prompt: one line, capped. */
-const inPrompt = (value: string) => plainText(value.replace(/\s+/g, " "), 120);
 
 function Pairs({ pairs }: { pairs: LabeledValue[] }) {
   return (
@@ -72,6 +73,8 @@ function RowItem({ row, replyable }: { row: RoleRow; replyable: boolean }) {
   const ask = () => fill?.(t("Summarise the thread '{subject}'").replace("{subject}", () => subject));
   const reply = () =>
     fill?.(t("Draft a reply to {name} about '{subject}'").replace("{name}", () => inPrompt(row.name)).replace("{subject}", () => subject));
+  const read = () =>
+    fill?.(t("Open the email '{subject}' from {name}").replace("{subject}", () => subject).replace("{name}", () => inPrompt(row.name)));
   return (
     <li className="recordcard-row" data-unread={row.unread || undefined} data-open={open || undefined}>
       <button type="button" className="recordcard-rowbtn" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
@@ -98,6 +101,11 @@ function RowItem({ row, replyable }: { row: RoleRow; replyable: boolean }) {
       </button>
       {fill && (
         <span className="recordcard-acts">
+          {replyable && row.name && (
+            <button type="button" className="recordcard-act" onClick={read}>
+              <span aria-hidden>✉</span> {t("Read")}
+            </button>
+          )}
           <button type="button" className="recordcard-act" onClick={ask}>
             <span aria-hidden>↗</span> {t("Ask about this")}
           </button>
@@ -224,6 +232,48 @@ function Head({ model, count, contact }: { model: RecordCardModel; count: number
   );
 }
 
+/** CAD-2543: one record (an email) as a compact header, a two-line preview and Open, which reads it in the canvas. */
+function DetailBody({ detail, entry }: { detail: RecordDetail; entry: ThreadEntry }) {
+  const t = useTranslate();
+  const { formatNumber } = useLocale();
+  const preview = plainText(detail.body.replace(/\s+/g, " "), 240);
+  const attachments = detail.attachments.length;
+  return (
+    <div className="recordcard-detail" data-unread={detail.unread || undefined}>
+      <div className="recordcard-who">
+        <span className="recordcard-dot" aria-hidden />
+        {detail.name && <b className="recordcard-name">{detail.name}</b>}
+        {detail.address && <small className="recordcard-address">{detail.address}</small>}
+        <span className="recordcard-when">
+          {detail.star && <span className="recordcard-star" role="img" aria-label={t("Important")}>★</span>}
+          {detail.time && <Time value={detail.time} />}
+        </span>
+      </div>
+      {detail.title && <p className="recordcard-dsubject">{detail.title}</p>}
+      {detail.unread && <span className="recordcard-sr">{t("Unread")}</span>}
+      {preview && <p className="recordcard-dpreview">{preview}</p>}
+      <div className="recordcard-dfoot">
+        {attachments > 0 && (
+          <span className="recordcard-dattach">
+            {(attachments === 1 ? t("1 attachment") : t("{n} attachments").replace("{n}", formatNumber(attachments)))}
+          </span>
+        )}
+        <button
+          type="button"
+          className="btn btn-primary recordcard-open"
+          data-record-open
+          onClick={() => {
+            const ref = recordCardView(entry);
+            if (ref) openRecordView(ref);
+          }}
+        >
+          {t("Open")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MoreFooter({ model, shown }: { model: RecordCardModel; shown: number }) {
   const t = useTranslate();
   const fill = useContext(ComposerFillContext);
@@ -300,7 +350,8 @@ export function RecordCard({ entry, density = "full" }: { entry: ThreadEntry; de
         </ul>
       )}
       {layout.view === "table" && <Pairs pairs={layout.pairs} />}
-      {model.truncated && <MoreFooter model={model} shown={count ?? model.items.length} />}
+      {layout.view === "detail" && <DetailBody detail={layout.detail} entry={entry} />}
+      {model.truncated && layout.view !== "detail" && <MoreFooter model={model} shown={count ?? model.items.length} />}
     </TurnCard>
   );
 }

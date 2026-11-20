@@ -18,14 +18,21 @@
  *   installed app's screen. A tap opens it; the feed opens one only for a
  *   live `view_ref` card (CAD-2475) under the same once-per-operator-turn rule
  *   as artifacts, and never adds or moves a tab otherwise. It follows the same
- *   focus, close and conversation-change rules.
+ *   focus, close and conversation-change rules;
+ * - a record view (recordView.ts, CAD-2543) is a tab that reads one stored
+ *   `detail` record card (an email). It holds the card's own content, never
+ *   fetches, and follows the same rules: a tap opens it, the feed opens one
+ *   only for a live card under the once-per-operator-turn rule.
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { appViewId, appViewRef, appViewTitle, applyRoutePatch, sameRoute, type AppViewRef } from "./appView";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
+import type { RecordViewRef } from "./recordView";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
+/** A tab's kind: an artifact's, an app view's or a record view's. */
+export type TabKind = ArtifactKind | "app" | "record";
 export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
 
 /** What a thread card carries — never the content. */
@@ -51,9 +58,11 @@ export interface VersionInfo {
 export interface CanvasTab {
   id: string;
   /** `app` is an app view (appView.ts): a reference, with none of the version fields in use. */
-  kind: ArtifactKind | "app";
+  kind: TabKind;
   /** Set exactly for an app view. */
   app?: AppViewRef;
+  /** Set exactly for a record view. */
+  record?: RecordViewRef;
   title: string;
   /** Absent when the version that opened the tab had no known size. */
   bytes?: number;
@@ -71,7 +80,7 @@ export interface CanvasTab {
 }
 
 export type ArtifactTab = CanvasTab & { kind: ArtifactKind };
-export const isArtifactTab = (tab: CanvasTab): tab is ArtifactTab => tab.kind !== "app";
+export const isArtifactTab = (tab: CanvasTab): tab is ArtifactTab => tab.kind !== "app" && tab.kind !== "record";
 
 /** The turn running in the thread, and what it is changing in the canvas. */
 export interface Working {
@@ -119,6 +128,16 @@ export interface FeedView {
   turn: string | null;
 }
 
+/** A `detail` record card in the conversation (CAD-2543). */
+export interface FeedRecord {
+  /** Stable per entry. */
+  key: string;
+  ref: RecordViewRef;
+  live: boolean;
+  operatorTurn: boolean;
+  turn: string | null;
+}
+
 export interface FeedInput {
   conversation: string | null;
   surface: Surface;
@@ -126,6 +145,8 @@ export interface FeedInput {
   cards: FeedCard[];
   /** `view_ref` cards (CAD-2475); absent: none. */
   views?: FeedView[];
+  /** `detail` record cards (CAD-2543); absent: none. */
+  records?: FeedRecord[];
   /** Moves the live app page to a route (CAD-2512). */
   showHere?: (route: AppViewRef["route"]) => void;
   working: Working | null;
@@ -276,6 +297,16 @@ export function feedCanvas(input: FeedInput): void {
     active = id;
     focused = true;
   }
+  for (const record of input.records ?? []) {
+    if (seen.has(record.key)) continue;
+    seen.add(record.key);
+    if (input.autoOpen === false || !record.live || !record.operatorTurn || !record.turn || autoOpened.has(record.turn) || closedTurns.has(record.turn)) continue;
+    autoOpened.add(record.turn);
+    if (!tabs.some((t) => t.id === record.ref.id)) tabs = [...tabs, recordTab(record.ref)];
+    open = true;
+    active = record.ref.id;
+    focused = true;
+  }
   if (tabs.length === 0) {
     open = false;
     active = null;
@@ -312,6 +343,17 @@ export function openArtifact(ref: ArtifactRef): void {
 
 function appTab(id: string, ref: AppViewRef): CanvasTab {
   return { id, kind: "app", title: ref.title, app: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null };
+}
+
+function recordTab(ref: RecordViewRef): CanvasTab {
+  return { id: ref.id, kind: "record", title: ref.title, record: ref, latest: 1, selected: 1, follow: false, versions: {}, turn: null };
+}
+
+/** Open (or focus) a `detail` record card's reader from the card. */
+export function openRecordView(ref: RecordViewRef): void {
+  const tabs = state.tabs.some((t) => t.id === ref.id) ? state.tabs : [...state.tabs, recordTab(ref)];
+  set({ ...state, tabs, active: ref.id, open: true });
+  artifactFocused("user");
 }
 
 /** Open (or focus) an installed app's screen from a resource link. A
@@ -404,18 +446,18 @@ export function clampWidth(px: number, viewport: number, floor = MIN_WIDTH): num
 
 /** The width when the operator has not dragged one: it scales with the
  *  viewport, wider for kinds that are read as a page. */
-export function defaultWidth(kind: ArtifactKind | "app", viewport: number): number {
+export function defaultWidth(kind: TabKind, viewport: number): number {
   const [share, lo, hi] = defaultRange(kind);
   return Math.min(hi, Math.max(lo, Math.round(viewport * share)));
 }
 
-function defaultRange(kind: ArtifactKind | "app"): [number, number, number] {
+function defaultRange(kind: TabKind): [number, number, number] {
   return kind === "app" || kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
 }
 
 /** The default width, held to its kind's floor even where 60% of the
  *  viewport is smaller (a 900px window keeps a document at 560px). */
-export function defaultWidthFor(kind: ArtifactKind | "app", viewport: number): number {
+export function defaultWidthFor(kind: TabKind, viewport: number): number {
   return clampWidth(defaultWidth(kind, viewport), viewport, defaultRange(kind)[1]);
 }
 

@@ -308,3 +308,17 @@
 /* The app workspace sizes its assistant aside to 100%; the canvas is anchored by top and bottom,
    so a full-height box starting below the header would end under the viewport and hide the footer. */
 .app-workspace > aside.canvas-drawer { height: auto; }
+
+/* ---- CAD-2543: a record view (a read-only email reader) ---- */
+.cv-record-body { gap: 10px; min-width: 0; overflow: auto; }
+.cv-record-body > * { flex: none; }
+.rv-meta { display: grid; gap: 2px; margin: 0; min-width: 0; font-size: var(--text-label); }
+.rv-metarow { display: grid; grid-template-columns: 3.5rem minmax(0, 1fr); gap: 8px; min-width: 0; }
+.rv-metarow dt { color: var(--color-ink-500); }
+.rv-metarow dd { min-width: 0; margin: 0; color: var(--color-ink-200); overflow-wrap: anywhere; }
+.rv-subject { min-width: 0; margin: 0; color: var(--color-ink-100); font-size: 1rem; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.rv-text { min-width: 0; color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
+.rv-trunc { margin: 0; color: var(--color-ink-500); font-size: var(--text-micro); font-style: italic; }
+.rv-files { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; margin: 0; padding: 0; list-style: none; }
+.rv-file { max-width: 100%; padding: 2px 10px; border: 1px solid var(--color-ink-700); border-radius: 999px; background: color-mix(in srgb, var(--color-ink-400) 12%, transparent); color: var(--color-ink-300); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-acts { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px; }

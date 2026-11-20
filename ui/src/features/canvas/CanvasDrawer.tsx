@@ -18,6 +18,7 @@ import ArtifactView, { downloadName, htmlFrameDocument, saveBytes, useArtifactBy
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
+import RecordViewBody from "./RecordViewBody";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
@@ -674,6 +675,18 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
               key={tab.id}
               tab={tab}
               app={tab.app}
+              sheet={sheet}
+              expanded={expanded}
+              canExpand={canExpand}
+              onExpand={() => setExpanded((x) => !x)}
+              onClose={closeAll}
+            />
+          ) : tab.record ? (
+            <RecordViewBody
+              key={tab.id}
+              tab={tab}
+              view={tab.record}
+              composerKey={canvas.composerKey}
               sheet={sheet}
               expanded={expanded}
               canExpand={canExpand}

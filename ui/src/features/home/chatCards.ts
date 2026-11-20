@@ -1,4 +1,5 @@
 import { appViewRef, type AppViewRef } from "../canvas/appView";
+import { recordViewId, type RecordViewRef } from "../canvas/recordView";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -28,7 +29,13 @@ const TOOLKIT = /^[a-z_][a-z0-9_-]{0,63}$/;
 const TOOL = /^[a-z][a-z0-9_]{1,63}$/;
 const FIELD_KEY = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const FIELD_TYPES = ["string", "number", "integer", "boolean", "string_array"] as const;
-const VIEWS = ["list", "thread", "table"] as const;
+const VIEWS = ["list", "thread", "table", "detail"] as const;
+/** CAD-2543: a detail card is one record; its body and attachment caps (agenticos-v2 AOS-678). */
+export const DETAIL_BODY_MAX = 20_000;
+export const DETAIL_ATTACHMENTS_MAX = 20;
+export const DETAIL_ATTACHMENT_NAME_MAX = 200;
+/** Roles only a `detail` card may name. */
+const DETAIL_ROLES = ["to", "cc", "body", "attachments"] as const;
 
 export type RecordFieldType = (typeof FIELD_TYPES)[number];
 export type RecordView = (typeof VIEWS)[number];
@@ -46,7 +53,7 @@ export interface RecordField {
   untrusted: boolean;
 }
 
-const ROLE_NAMES = ["title", "subtitle", "snippet", "time", "actor", "status", "badge", "amount"] as const;
+const ROLE_NAMES = ["title", "subtitle", "snippet", "time", "actor", "status", "badge", "amount", "to", "cc", "body", "attachments"] as const;
 type RoleName = (typeof ROLE_NAMES)[number];
 
 /** agenticos-v2 AOS-647: optional layout roles, each naming a `fields[].key`. */
@@ -59,6 +66,11 @@ export interface RecordRoles {
   status?: string;
   badge?: string;
   amount?: string;
+  /** CAD-2543, `detail` view only. */
+  to?: string;
+  cc?: string;
+  body?: string;
+  attachments?: string;
   /** The row is the account's own side when `String(row[key])` is in `self`. */
   side?: { key: string; self: string[] };
   /** Raw badge/status value -> display text; null hides it. Display only. */
@@ -203,6 +215,7 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
   }
   const roles = hasRoles ? parseRoles(p.roles, parsedFields.map((f) => f.key)) : null;
   if (hasRoles && !roles) return null;
+  if (view === "detail" ? !validDetail(roles, parsedItems) : roles && DETAIL_ROLES.some((r) => roles[r] !== undefined)) return null;
   return {
     toolkit,
     tool,
@@ -216,6 +229,16 @@ export function parseRecordRef(entry: ThreadEntry): RecordCardModel | null {
     account,
     total: present.includes("total") ? (p.total as number) : null,
   };
+}
+
+/** `detail`: one item, `title` and `body` roles, a text body within its cap, at most 20 attachment names (agenticos-v2 AOS-678). */
+function validDetail(roles: RecordRoles | null, items: Record<string, Cell>[]): boolean {
+  if (!roles || roles.title === undefined || roles.body === undefined || items.length !== 1) return false;
+  const body = items[0][roles.body];
+  if (body !== undefined && body !== null && (typeof body !== "string" || body.length > DETAIL_BODY_MAX)) return false;
+  const names = roles.attachments === undefined ? null : items[0][roles.attachments];
+  if (names === null || names === undefined) return true;
+  return Array.isArray(names) && names.length <= DETAIL_ATTACHMENTS_MAX && names.every((n) => n.length <= DETAIL_ATTACHMENT_NAME_MAX);
 }
 
 /** "Gmail: fetch emails" under toolkit "Gmail" reads "Fetch emails"; unchanged when there is no such prefix. */
@@ -236,6 +259,9 @@ export function plainText(value: string, max = CELL_MAX_CHARS): string {
   const clean = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim();
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
+
+/** A value placed inside a composer prompt: one line, capped. */
+export const inPrompt = (value: string): string => plainText(value.replace(/\s+/g, " "), 120);
 
 export interface CellLabels {
   yes: string;
@@ -301,6 +327,29 @@ export interface RoleMessage {
   approved: boolean;
 }
 
+/** CAD-2543: one record (an email) laid out for the compact card and the reader tab. Plain text throughout. */
+export interface RecordDetail {
+  /** The subject. */
+  title: string;
+  /** The sender's name and address (`from`), either may be empty. */
+  name: string;
+  address: string;
+  to: string;
+  cc: string;
+  time: TimeValue | null;
+  /** Plain text with its line breaks, capped. */
+  body: string;
+  truncated: boolean;
+  attachments: string[];
+  star: boolean;
+  unread: boolean;
+  /** Mapped labels that show as text. */
+  chips: RoleChip[];
+  /** "Gmail", and the connected account when there is one. */
+  source: string;
+  account: string | null;
+}
+
 /** "Name <address>" split into its two parts; any other text is a name alone. */
 export function splitAddress(value: string): { name: string; address: string } {
   const m = /^(.*?)\s*<([^<>\s/]{1,200})>$/.exec(value);
@@ -323,6 +372,8 @@ export type RecordLayout =
   | { view: "role-list"; rows: RoleRow[] }
   /** Bubbles laid out from `payload.roles`. */
   | { view: "role-thread"; messages: RoleMessage[]; contact: string }
+  /** One record: a compact card, and the reader tab. */
+  | { view: "detail"; detail: RecordDetail }
   /** Message-style rows. `outbound` is true when the board's side sent it. */
   | { view: "thread"; messages: { sender: string; time: string; text: string; outbound: boolean }[] }
   /** Key/value lines of one item. */
@@ -389,6 +440,35 @@ function roleLayout(model: RecordCardModel, roles: RecordRoles, labels?: CellLab
     const t = text(item, roles.time);
     return t ? { text: t, instant: parseInstant(item[roles.time]) } : null;
   };
+  if (model.view === "detail") {
+    const item = model.items[0];
+    if (!item || roles.title === undefined || roles.body === undefined) return null;
+    // Labels come from the status/badge roles, else from the field the unread rule reads.
+    const labelKeys = [roles.status, roles.badge].filter((k): k is string => k !== undefined);
+    if (labelKeys.length === 0 && roles.unread) labelKeys.push(roles.unread.key);
+    const shown = labelKeys.map((k) => chipValues(item[k], roles, labels));
+    const names = roles.attachments === undefined ? null : item[roles.attachments];
+    const from = splitAddress(text(item, roles.actor));
+    const body = item[roles.body];
+    return {
+      view: "detail",
+      detail: {
+        title: text(item, roles.title),
+        ...from,
+        to: text(item, roles.to),
+        cc: text(item, roles.cc),
+        time: time(item),
+        body: typeof body === "string" ? plainText(body, DETAIL_BODY_MAX) : "",
+        truncated: model.truncated,
+        attachments: Array.isArray(names) ? names.map((n) => plainText(n, DETAIL_ATTACHMENT_NAME_MAX)).filter(Boolean) : [],
+        star: shown.some((v) => v.star),
+        unread: isUnread(item, roles.unread),
+        chips: shown.flatMap((v) => v.chips),
+        source: model.toolkitLabel ?? model.toolkit,
+        account: model.account,
+      },
+    };
+  }
   if (model.view === "thread") {
     if (!hasAnyRole(roles, ["snippet", "title", "subtitle"])) return null;
     const side = roles.side;
@@ -451,6 +531,7 @@ export function recordLayout(model: RecordCardModel, labels?: CellLabels): Recor
     const withRoles = roleLayout(model, model.roles, labels);
     if (withRoles) return withRoles;
   }
+  if (model.view === "detail") return null;
   if (model.view === "thread") {
     const textKey = firstKey(model.fields, TEXT_KEYS);
     if (!textKey) return null;
@@ -475,6 +556,15 @@ export function recordLayout(model: RecordCardModel, labels?: CellLabels): Recor
   }
   const columns = model.fields.slice(0, LIST_COLUMNS_MAX);
   return { view: "list", rows: model.items.map((item) => pairs(item, columns)) };
+}
+
+/** The canvas reader tab for a stored `detail` card, from the entry alone (no request). Null when it is not one. */
+export function recordCardView(entry: ThreadEntry): RecordViewRef | null {
+  const model = parseRecordRef(entry);
+  const layout = model?.view === "detail" ? recordLayout(model) : null;
+  if (layout?.view !== "detail") return null;
+  const { detail } = layout;
+  return { key: `e${entry.seq}`, id: recordViewId(`e${entry.seq}`), title: detail.title || detail.source, detail };
 }
 
 // ---- view_ref (CAD-2475; agenticos-v2 AOS-654 `viewRefPayloadSchema`) ----
