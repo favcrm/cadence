@@ -74,6 +74,35 @@ mod unix {
             fstat(self.0.as_fd())
         }
 
+        /// Inspect metadata for a direct child entry relative to `self`
+        /// without following symlinks (`fstatat(..., AT_SYMLINK_NOFOLLOW)`).
+        pub(crate) fn fstatat_nofollow(&self, name: &CStr) -> io::Result<libc::stat> {
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `self.0` is a valid open directory fd, `name` is a valid
+            // NUL-terminated C string, and `stat.as_mut_ptr()` points to valid
+            // writable storage for `libc::stat`.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `libc::fstatat` returned 0, so `stat` is fully initialized.
+            Ok(unsafe { stat.assume_init() })
+        }
+
+        /// Flush directory metadata changes to storage via `fsync`.
+        pub(crate) fn sync_all(&self) -> io::Result<()> {
+            // SAFETY: `self.0` is a valid open directory fd.
+            let rc = unsafe { libc::fsync(self.0.as_raw_fd()) };
+            check_zero(rc)
+        }
+
         /// Open an existing child directory relative to `self` without
         /// following symlinks.
         pub(crate) fn open_child_dir(&self, name: &CStr) -> io::Result<Self> {
@@ -413,6 +442,10 @@ mod tests {
         let fd = dir.open_nofollow_fd(c"sub").unwrap();
         let stat = fstat(fd.as_fd()).unwrap();
         assert!(DirFd::from_verified_dir(fd, &stat).is_some());
+
+        let child_stat = dir.fstatat_nofollow(c"alpha.txt").unwrap();
+        assert_eq!(child_stat.st_mode & libc::S_IFMT, libc::S_IFREG);
+        dir.sync_all().unwrap();
 
         let file = dir.open_readonly_nofollow(c"alpha.txt").unwrap();
         flock_exclusive_nonblocking(&file).unwrap();
