@@ -47,6 +47,24 @@ installation. It sends only a sign-in and one read, then reports each step:
   not a fault. A new login replaces the saved login's access, and a `--web` or
   `--settings` login does not include the wiki.
 
+## Select GitHub repositories before running hosted reviews
+
+GitHub App authorization and project selection are separate. If the repository
+is not already authorized for the workspace, its owner first runs
+`cadence --org <org> connect github` and completes the GitHub approval.
+
+On a host with project repository settings, open [AgenticOS Account](https://app-v2.agenticos.hk/account),
+select the same workspace, and find **GitHub project repositories**. Enter
+the Cadence project key, choose **Load repositories**, and select the authorized
+repositories the project needs. **Save repositories** replaces that project's
+list, so keep any existing repositories it still needs. The setting does not
+grant new GitHub access or change other projects.
+
+Do this before running hosted review workflows or checking delivery. If the
+setting is not present, confirm that you are a workspace owner and that the
+host has shipped project repository settings. Connecting GitHub again does not
+set a project's list.
+
 ## What runs where
 
 | Responsibility | Current owner / effect |
