@@ -28,6 +28,9 @@
 //! auto-commits, auto-discards, deletes a fence by age, bulk resets the
 //! tracker, or force-unlocks anything.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,6 +39,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 use crate::issue::git;
 use crate::issue::pmlock::LockState;
 use crate::issue::Pm;
@@ -1395,9 +1399,8 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
 /// write outside the tracker. Each component is therefore opened
 /// without following links, and the last one is returned as an open
 /// directory descriptor together with the final name.
-fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(i32, Vec<u8>)> {
+fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(DirFd, std::ffi::CString)> {
     use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     let bad = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1408,39 +1411,29 @@ fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(i32, Vec<u
     if parts.is_empty() {
         return Err(bad());
     }
-    let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| bad())?;
-    let mut fd = unsafe {
-        libc::open(
-            root_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut dir = DirFd::open_nofollow(root).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::InvalidInput {
+            bad()
+        } else {
+            err
+        }
+    })?;
     for part in &parts[..parts.len() - 1] {
         let c = CString::new(part.as_bytes()).map_err(|_| bad())?;
-        let mut next = unsafe { libc::openat(fd, c.as_ptr(), flags) };
-        if next < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-            // The crash removed the directory. The committed state has
-            // it, so it is recreated — every existing component was
-            // already opened without following a link.
-            if unsafe { libc::mkdirat(fd, c.as_ptr(), 0o755) } < 0 {
-                let e = std::io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(e);
+        dir = match dir.open_child_dir(&c) {
+            Ok(next) => next,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // The crash removed the directory. The committed state has
+                // it, so it is recreated — every existing component was
+                // already opened without following a link.
+                dir.mkdir(&c, 0o755)?;
+                dir.open_child_dir(&c)?
             }
-            next = unsafe { libc::openat(fd, c.as_ptr(), flags) };
-        }
-        unsafe { libc::close(fd) };
-        if next < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        fd = next;
+            Err(err) => return Err(err),
+        };
     }
-    let name = parts[parts.len() - 1].as_bytes().to_vec();
-    Ok((fd, name))
+    let name = CString::new(parts[parts.len() - 1].as_bytes()).map_err(|_| bad())?;
+    Ok((dir, name))
 }
 
 /// Remove a path inside the tracker without following a symlinked
@@ -1448,24 +1441,8 @@ fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(i32, Vec<u
 /// opened with `O_NOFOLLOW`, so it can only ever remove the file the
 /// path names inside the tracker.
 fn remove_file_no_follow(root: &Path, path: &str) -> std::io::Result<()> {
-    use std::ffi::CString;
-    let (fd, name) = open_parent_no_follow(root, path)?;
-    let c = match CString::new(name) {
-        Ok(c) => c,
-        Err(_) => {
-            unsafe { libc::close(fd) };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "the path is not a literal path inside the tracker",
-            ));
-        }
-    };
-    let rc = unsafe { libc::unlinkat(fd, c.as_ptr(), 0) };
-    unsafe { libc::close(fd) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    let (dir, name) = open_parent_no_follow(root, path)?;
+    dir.unlink_child(&name)
 }
 
 /// Write a path inside the tracker without following a symlinked
@@ -1482,70 +1459,43 @@ fn remove_file_no_follow(root: &Path, path: &str) -> std::io::Result<()> {
 fn write_file_no_follow(root: &Path, path: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
     let invalid = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "the path is not a literal path inside the tracker",
         )
     };
-    let (fd, name) = open_parent_no_follow(root, path)?;
-    let name = match CString::new(name) {
-        Ok(c) => c,
-        Err(_) => {
-            unsafe { libc::close(fd) };
-            return Err(invalid());
-        }
-    };
-    let tmp = match CString::new(format!(
+    let (dir, name) = open_parent_no_follow(root, path)?;
+    let tmp = CString::new(format!(
         ".cadence-recovery-{}-{}",
         std::process::id(),
         unique_suffix()
-    )) {
-        Ok(c) => c,
-        Err(_) => {
-            unsafe { libc::close(fd) };
-            return Err(invalid());
-        }
-    };
-    let file = unsafe {
-        libc::openat(
-            fd,
-            tmp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode as libc::c_uint,
-        )
-    };
-    if file < 0 {
-        unsafe { libc::close(fd) };
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut handle = unsafe { std::fs::File::from_raw_fd(file) };
+    ))
+    .map_err(|_| invalid())?;
+    let mut handle = dir.open_file_nofollow(
+        &tmp,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode as libc::mode_t,
+    )?;
     let written = handle
         .write_all(bytes)
         .and_then(|_| handle.sync_all())
         .and_then(|_| {
-            // The mode is set on the descriptor: no pathname is resolved,
-            // so a symlink swapped in cannot redirect it.
-            if unsafe { libc::fchmod(handle.as_raw_fd(), mode as libc::mode_t) } < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            // The mode is set on the descriptor (`fchmod`): no pathname is
+            // resolved, so a symlink swapped in cannot redirect it.
+            handle.set_permissions(std::fs::Permissions::from_mode(mode))
         });
     if let Err(e) = written {
-        unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
-        unsafe { libc::close(fd) };
+        drop(handle);
+        let _ = dir.unlink_child(&tmp);
         return Err(e);
     }
     drop(handle);
     // A rename replaces the directory entry, so a hard-linked sibling
     // keeps its bytes, and it never follows the target.
-    let rc = unsafe { libc::renameat(fd, tmp.as_ptr(), fd, name.as_ptr()) };
-    unsafe { libc::close(fd) };
-    if rc < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+    if let Err(e) = dir.rename_child(&tmp, &name) {
+        let _ = dir.unlink_child(&tmp);
         return Err(e);
     }
     Ok(())
