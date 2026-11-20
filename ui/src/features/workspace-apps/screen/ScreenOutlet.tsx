@@ -374,6 +374,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             revision,
             selection: {
               conversationId: selectedWhatsApp,
+              receiptScope: `${generation}:${scope}`,
               services: composeServices,
               current: currentSelection,
               announce: (dirty, refresh = false) => {

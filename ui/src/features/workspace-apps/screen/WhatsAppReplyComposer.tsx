@@ -1,11 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocale } from "../../../lib/locale";
+import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { object, type recordServices } from "./screenServices";
 import "./whatsAppReplyComposer.css";
 
 export interface WhatsAppReplySelection {
   conversationId: string;
+  receiptScope: string;
   services: ReturnType<typeof recordServices>;
   current(): boolean;
   announce(dirty: boolean, refresh?: boolean): void;
@@ -17,6 +19,11 @@ const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
 const EFFECT = /^wae_[0-9a-f]{32}$/;
 const provider = "linked";
+// Only the opaque unresolved effect survives thread or mount changes.
+// Never store draft text, recipient labels, confirmation tokens, or disk data.
+const unresolvedReplies = new Map<string, string>();
+onPrivateSessionReset(() => unresolvedReplies.clear());
+const receiptKey = (selection: WhatsAppReplySelection, recipient: Recipient) => `${selection.receiptScope}:${recipient.workRef}`;
 
 async function recipientFor(selection: WhatsAppReplySelection, ref = selection.conversationId): Promise<Recipient | null> {
   if (!selection.current()) return null;
@@ -59,7 +66,12 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
 
   useEffect(() => {
     let cancelled = false;
-    void recipientFor(selection).then(value => { if (!cancelled && selection.current()) setRecipient(value); });
+    void recipientFor(selection).then(value => {
+      if (cancelled || !selection.current()) return;
+      const effectId = value && unresolvedReplies.get(receiptKey(selection, value));
+      if (effectId) setAttempt({ effectId, outcome: "uncertain" });
+      setRecipient(value);
+    });
     return () => { cancelled = true; };
   }, [selection, load]);
   useLayoutEffect(() => {
@@ -73,6 +85,9 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
 
   async function send() {
     if (disabled || !recipient || running.current || !selection.current()) return;
+    const key = receiptKey(selection, recipient);
+    const held = unresolvedReplies.get(key);
+    if (held) { setAttempt({ effectId: held, outcome: "uncertain" }); return; }
     running.current = true;
     setBusy(true);
     setAttempt(null);
@@ -98,6 +113,10 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
         return;
       }
       if (!("run" in plan)) return;
+      const held = unresolvedReplies.get(key);
+      if (held) { effectId = held; outcome = "uncertain"; return; }
+      // Retain the effect before starting confirm; navigation could win the response race.
+      unresolvedReplies.set(key, effectId);
       // Only reached from the original trusted click or Enter, never a port callback.
       submitted = true;
       const result = await plan.run();
@@ -107,18 +126,19 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
       if (submitted) outcome = "uncertain";
     } finally {
       running.current = false;
+      if (submitted && outcome !== "uncertain" && unresolvedReplies.get(key) === effectId) unresolvedReplies.delete(key);
       if (selection.current()) {
-        const didLeave = outcome === "sent" || outcome === "accepted" || outcome === "uncertain";
+        const mayHaveSent = submitted && (outcome === "sent" || outcome === "accepted" || outcome === "uncertain");
         setAttempt({ effectId, outcome });
-        if (didLeave) setText("");
+        if (mayHaveSent) setText("");
         setBusy(false);
-        selection.announce(!didLeave, submitted);
+        selection.announce(!mayHaveSent && !!text, submitted);
       }
     }
   }
 
   async function check() {
-    if (!attempt?.effectId || running.current || !selection.current()) return;
+    if (!attempt?.effectId || !recipient || running.current || !selection.current()) return;
     running.current = true;
     setBusy(true);
     const { effectId } = attempt;
@@ -126,6 +146,8 @@ export default function WhatsAppReplyComposer({ selection }: { selection: WhatsA
     running.current = false;
     if (!selection.current()) return;
     const outcome = recordedState(result.ok && object(result.data) ? result.data.state : null);
+    const key = receiptKey(selection, recipient);
+    if (outcome !== "uncertain" && unresolvedReplies.get(key) === effectId) unresolvedReplies.delete(key);
     setAttempt({ effectId, outcome });
     setBusy(false);
     selection.announce(!!text, true);

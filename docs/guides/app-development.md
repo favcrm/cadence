@@ -332,7 +332,9 @@ and the host owning effects and approval.
 the installed bundle may nominate an existing linked-device conversation. The
 board verifies the recipient and owns both the draft and the Send control.
 The send uses the existing one-time confirmation and delivery receipt; status
-checks never resend. Older boards and the Official API keep the approval card.
+checks never resend. An unresolved reply can be checked after switching threads
+within the same board session. No message text or confirmation token is kept for
+recovery. Older boards and the Official API keep the approval card.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is
