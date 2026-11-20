@@ -371,6 +371,7 @@ fn dedicated_owner_entry_isolated() {
             test_seam: true,
             board_public_only: true,
             allow_hosts: vec![HOST.into()],
+            allow_origins: vec![format!("https://{HOST}")],
             credential_entry_origin: Some("https://entry.example.test".into()),
             public: Some(PublicBoard {
                 host: HOST.into(),
