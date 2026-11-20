@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
+import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
 import { declaredSlots, isCatalogSlot, type DeclaredSlot } from "./bindingChoices";
 import { parseCatalogGrant, type CatalogEffect, type CatalogTool } from "./platformCatalog";
@@ -20,24 +21,32 @@ type Props = {
 export function CatalogBindings(props: Props) {
   const t = useTranslate();
   const [requests, setRequests] = useState<PlatformToolRequest[] | null | undefined>(undefined);
-  const [requestError, setRequestError] = useState(false);
+  const [requestError, setRequestError] = useState<"retry" | "refresh" | null>(null);
+  const [retry, setRetry] = useState(0);
+  const { refresh } = props;
   const slots = props.installation.source_kind === "private"
     ? declaredSlots(props.installation).filter(isCatalogSlot)
     : [];
   useEffect(() => {
     if (!props.canWrite || slots.length === 0) return;
     const controller = new AbortController();
-    setRequests(undefined); setRequestError(false);
+    setRequests(undefined); setRequestError(null);
     void workspaceApps.platformToolRequests(props.installation.install_id, props.installation.digest, controller.signal).then(
       value => { if (!controller.signal.aborted) setRequests(value); },
-      () => { if (!controller.signal.aborted) setRequestError(true); },
+      (error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.code === "installation_stale") {
+          if (retry > 0) refresh();
+          else setRequestError("refresh");
+        } else setRequestError("retry");
+      },
     );
     return () => controller.abort();
-  }, [props.installation.install_id, props.installation.digest, props.canWrite, slots.length]);
+  }, [props.installation.install_id, props.installation.digest, props.canWrite, slots.length, retry, refresh]);
   if (slots.length === 0) return null;
   return <>
     {props.canWrite && (requestError
-      ? <div className="card mcard"><p className="wa-alert" role="alert">{t("Could not load tool access requests.")}</p><Button disabled={props.busy} onClick={props.refresh}>{t("Retry")}</Button></div>
+      ? <div className="card mcard"><p className="wa-alert" role="alert">{t("Could not load tool access requests.")}</p><Button disabled={props.busy} onClick={requestError === "refresh" ? refresh : () => setRetry(n => n + 1)}>{t("Retry")}</Button></div>
       : requests === undefined ? <p role="status">{t("Loading tool access requests…")}</p>
       : requests !== null && requests.length === 0 ? <p className="wa-muted">{t("No pending tool access requests.")}</p> : null)}
     {slots.map(slot => <CatalogSlot key={slot.slot} {...props} slot={slot}

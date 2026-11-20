@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Switch from "../../ui/Switch";
@@ -87,6 +87,7 @@ export default function ManageApp({
   const isOp = viewer.operator === true && !viewer.readOnly;
   const hasCatalogSlots = inst?.source_kind === "private" && declaredSlots(inst).some(isCatalogSlot);
   const [reread, setReread] = useState(0);
+  const refreshCatalog = useCallback(() => setReread(n => n + 1), []);
   // CAD-1438: "Open its page" spells the canonical `/apps/<key>` route,
   // resolved against the verified install list; ambiguous or unsafe
   // keys get no link instead of the retired ID route.
@@ -522,7 +523,7 @@ export default function ManageApp({
           catalogBindings ? (
             <CatalogBindings installation={inst} bindings={catalogBindings} canWrite={isOp}
               busy={catalogBusy || checking || applying || restoring || removing} mutate={mutateCatalog}
-              refresh={() => setReread((n) => n + 1)} />
+              refresh={refreshCatalog} />
           ) : (
             <div className="card mcard">
               {catalogError ? <p role="alert">{t("The saved tool grant could not be verified.")}</p>

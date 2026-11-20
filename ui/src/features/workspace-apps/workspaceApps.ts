@@ -437,8 +437,10 @@ export const workspaceApps = {
     if (!value || typeof value !== "object" || !("requests" in value) || !Array.isArray(value.requests))
       throw new ApiError("Invalid tool access requests", 502);
     const rows = value.requests.map((row: unknown) => platformToolRequest(row, id));
-    if (rows.some((row: PlatformToolRequest) => row.state !== "pending" || row.bundle_digest !== digest))
+    if (rows.some((row: PlatformToolRequest) => row.state !== "pending"))
       throw new ApiError("Invalid tool access requests", 502);
+    if (rows.some((row: PlatformToolRequest) => row.bundle_digest !== digest))
+      throw new ApiError("App changed while loading tool access requests", 409, { code: "installation_stale" });
     return rows;
   },
   decidePlatformToolRequest: async (target: PlatformToolRequest, decision: "approve" | "deny") => {
