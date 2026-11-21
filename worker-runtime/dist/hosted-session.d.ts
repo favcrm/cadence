@@ -47,8 +47,9 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * operation id is bound to the text and scope it was first admitted with, so
      * a retry with the same id replays that operation and a retry that changes
      * either is refused before the engine runs.
+     * Only a host-admitted user message may declare `transcriptRole`.
      */
-    ask(prompt: string, operationId?: string, app?: AppScope): Promise<AskResult>;
+    ask(prompt: string, operationId?: string, app?: AppScope, transcriptRole?: "operator"): Promise<AskResult>;
     /** Map the engine's committed records, including durable input metadata, for the board. */
     transcript(includeThinking: boolean): Promise<ThreadEntry[]>;
     /**
@@ -83,8 +84,9 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * operation id is bound to the text and scope it was first admitted with, so
      * a retried send with the same id replays that operation and one that changes
      * either is refused before the engine is asked.
+     * Only a host-admitted user message may declare `transcriptRole`.
      */
-    submit(text: string, operationId: string, app?: AppScope): Promise<boolean>;
+    submit(text: string, operationId: string, app?: AppScope, transcriptRole?: "operator"): Promise<boolean>;
     /**
      * Bind one operation to the exact text and app scope it was admitted with,
      * and return the stored envelope. A changed text or scope throws here, before

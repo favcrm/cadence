@@ -109,7 +109,7 @@ afterEach(async () => {
 
 async function session(
   respond: (requests: readonly RequestRecord[]) => Response | Promise<Response>,
-  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean; backgroundTokens?: number } = {},
+  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean; backgroundTokens?: number; projectThread?: (entries: readonly ThreadEntry[]) => readonly ThreadEntry[] } = {},
 ) {
   const { HostedSession } = await import("../src/hosted-session.ts");
   const database = new Database(":memory:");
@@ -165,6 +165,7 @@ async function session(
           },
         }])],
       }],
+      projectThread: options.projectThread,
       authorizeTool: async () => {},
       toolRefusal: () => undefined,
     } as never,
@@ -207,12 +208,13 @@ async function session(
     }) as InstanceType<typeof HostedSession>).sessionSummary(),
     unavailableTranscript: (sessionId: string) => (Object.assign(Object.create(HostedSession.prototype), {
       ctx: { id, storage: { sql: { exec() { throw new Error("SQL unavailable"); } } } },
+      options: {},
     }) as InstanceType<typeof HostedSession>).sessionTranscript(sessionId, 0),
     async submit(content: string) {
       const id = `operation-${++operations}`;
       return conversation.submit({
         type: "input", requestId: id, content,
-        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id } },
+        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id, transcriptRole: "operator" } },
       }, BACKGROUND_CONTEXT);
     },
   };
@@ -292,13 +294,13 @@ describe("exact session transcripts", () => {
     const first = run.hosted.sessionSummary();
     if (first.state !== "observed") throw new Error("expected first session");
     for (let i = 0; i < 40; i++) await run.writeRecord({
-      kind: BOARD_MESSAGE_KIND, data: { messageId: `message-${i}` },
+      kind: BOARD_MESSAGE_KIND, data: { messageId: `message-${i}`, transcriptRole: "operator" },
       model: [{ role: "user", content: `first-${i}`, timestamp: 1000 }],
     });
     const page = run.hosted.sessionTranscript(first.session.sessionId, 0);
     expect(page?.nextCursor).toEqual(expect.any(Number));
     await run.writeRecord({
-      kind: BOARD_MESSAGE_KIND, data: { messageId: "late" },
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "late", transcriptRole: "operator" },
       model: [{ role: "user", content: "first-late", timestamp: 1000 }],
     });
     await run.reset();
@@ -340,6 +342,7 @@ describe("exact session transcripts", () => {
       [BOARD_MESSAGE_KIND, "routine:123", "private routine"],
       [BOARD_MESSAGE_KIND, "cred-resume:123", "private credential"],
       [BOARD_MESSAGE_KIND, "dispatch:ticket:1", "private dispatch instructions"],
+      [BOARD_MESSAGE_KIND, "01965bb9-3411-76a7-9cdd-f55c5b66373c", "private unmarked input"],
       ["pi.user", "internal", "private instruction"],
       ["pi.compaction", "compaction", "private summary"],
     ]) await run.writeRecord({
@@ -364,13 +367,26 @@ describe("exact session transcripts", () => {
     expect(JSON.stringify(messages)).not.toContain("private");
   });
 
+  it("applies the host projection before returning visible input text", async () => {
+    const run = await session(() => answer("answer"), {
+      projectThread: (entries) => entries.map((entry) =>
+        entry.role === "operator" ? { ...entry, text: "visible input" } : entry
+      ),
+    });
+    await (await run.submit("private preamble and visible input")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    expect(run.hosted.sessionTranscript(summary.session.sessionId, 0)?.messages.map((message) => message.text))
+      .toEqual(["visible input", "answer"]);
+  });
+
   it("pages at the response byte ceiling without splitting or dropping a record", async () => {
     const run = await session(() => answer("answer"));
     await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
     const summary = run.hosted.sessionSummary();
     if (summary.state !== "observed") throw new Error("expected session");
     for (const text of ["a".repeat(30_000), "b".repeat(30_000)]) await run.writeRecord({
-      kind: BOARD_MESSAGE_KIND, data: { messageId: text[0] },
+      kind: BOARD_MESSAGE_KIND, data: { messageId: text[0], transcriptRole: "operator" },
       model: [{ role: "user", content: text, timestamp: 1000 }],
     });
     const first = run.hosted.sessionTranscript(summary.session.sessionId, 0);
@@ -387,7 +403,7 @@ describe("exact session transcripts", () => {
     const summary = run.hosted.sessionSummary();
     if (summary.state !== "observed") throw new Error("expected session");
     await run.writeRecord({
-      kind: BOARD_MESSAGE_KIND, data: { messageId: "many" },
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "many", transcriptRole: "operator" },
       model: Array.from({ length: 101 }, () => ({ role: "user", content: "message", timestamp: 1000 })),
     });
     const first = run.hosted.sessionTranscript(summary.session.sessionId, 0);
@@ -402,7 +418,7 @@ describe("exact session transcripts", () => {
     const summary = run.hosted.sessionSummary();
     if (summary.state !== "observed") throw new Error("expected session");
     await run.writeRecord({
-      kind: BOARD_MESSAGE_KIND, data: { messageId: "large" },
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "large", transcriptRole: "operator" },
       model: [{ role: "user", content: "x".repeat(100_000), timestamp: 1000 }],
     });
     expect(run.hosted.sessionTranscript(summary.session.sessionId, 0)).toBeNull();

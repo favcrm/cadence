@@ -481,8 +481,10 @@ Transcript access is separate. The host resolves the indexed reference to an
 exact runtime generation and rechecks the existing conversation access on
 every page. `HostedSession.sessionTranscript(sessionId, after)` reads only
 visible message text inside the durable reset boundaries. It neither opens
-the engine nor logs content. An older host/runtime, missing boundary proof,
-or unavailable transcript never falls back to whole-conversation history.
+the engine nor logs content. The read uses the host's transcript projection
+and omits inputs without recorded visibility, including older input records
+that predate that marker. Missing proof or an older host/runtime never falls
+back to whole-conversation history.
 
 From `worker-runtime/`, using its pinned Bun version:
 

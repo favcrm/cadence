@@ -1,8 +1,12 @@
 import { ROOT_CONVERSATION_ID, type EntryRecord } from "@earendil-works/pi-durable";
-import { BOARD_MESSAGE_KIND } from "./contract.ts";
+import { BOARD_MESSAGE_KIND, type ThreadProjection } from "./contract.ts";
 import type { TaskSql } from "./identity.ts";
 import { readSessionBounds } from "./session-summary.ts";
-import { threadEntries } from "./transcript.ts";
+import { projectedThreadEntries } from "./transcript.ts";
+
+// The same allowlist governs page rows and accepted cursor anchors.
+const VISIBLE = `(json_extract(record, '$.kind') = 'pi.assistant' OR
+  (json_extract(record, '$.kind') = ? AND json_extract(record, '$.data.transcriptRole') = 'operator'))`;
 
 type TranscriptMessage = { role: "operator" | "agent"; text: string; created?: string };
 
@@ -20,6 +24,7 @@ export function readSessionTranscript(
   objectId: string,
   sessionId: string,
   after: number,
+  project?: ThreadProjection,
 ): { messages: TranscriptMessage[]; nextCursor: number | null } | null {
   if (!Number.isSafeInteger(after) || after < 0) return null;
   const bounds = readSessionBounds(sql, objectId, sessionId);
@@ -29,7 +34,7 @@ export function readSessionTranscript(
       if (after <= bounds.anchor || after > bounds.upper) return null;
       const cursor = sql.exec(
         `SELECT id FROM pi_entries WHERE conversation_id = ? AND id = ?
-           AND json_extract(record, '$.kind') IN (?, 'pi.assistant') LIMIT 1`,
+           AND ${VISIBLE} LIMIT 1`,
         ROOT_CONVERSATION_ID, after, BOARD_MESSAGE_KIND,
       ).toArray()[0];
       if (cursor === undefined) return null;
@@ -38,7 +43,7 @@ export function readSessionTranscript(
       `SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
          FROM pi_entries
         WHERE conversation_id = ? AND id > ? AND id <= ?
-          AND json_extract(record, '$.kind') IN (?, 'pi.assistant')
+          AND ${VISIBLE}
         ORDER BY id ASC LIMIT ?`,
       MAX_RECORD_BYTES, ROOT_CONVERSATION_ID, after || bounds.anchor,
       bounds.upper, BOARD_MESSAGE_KIND, PAGE_RECORDS + 1,
@@ -48,15 +53,14 @@ export function readSessionTranscript(
     for (const row of rows.slice(0, PAGE_RECORDS)) {
       if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || typeof row.record !== "string") return null;
       const record = JSON.parse(row.record) as EntryRecord;
-      // Only board-admitted inputs are user messages. Ordinary pi.user and
-      // compaction entries can contain runtime instructions or handoffs.
+      // An ID proves identity, not visibility. Only the host's trusted
+      // admission may mark a board input as user-visible.
       const data = record.data;
-      const messageId = data !== null && typeof data === "object" && !Array.isArray(data)
-        ? data.messageId : undefined;
-      const visibleInput = record.kind === BOARD_MESSAGE_KIND && typeof messageId === "string" &&
-        !messageId.startsWith("routine:") && !messageId.startsWith("cred-resume:") &&
-        !messageId.startsWith("dispatch:");
-      const entries = visibleInput || record.kind === "pi.assistant" ? threadEntries([record], false) : [];
+      const visibleInput = record.kind === BOARD_MESSAGE_KIND &&
+        data !== null && typeof data === "object" && !Array.isArray(data) &&
+        data.transcriptRole === "operator";
+      const entries = visibleInput || record.kind === "pi.assistant"
+        ? projectedThreadEntries([record], false, project) : [];
       const additions = entries.flatMap((entry): TranscriptMessage[] => {
         if (visibleInput && entry.role === "operator" && entry.kind === "message") {
           return [{ role: "operator" as const, text: entry.text, ...(entry.created ? { created: entry.created } : {}) }];

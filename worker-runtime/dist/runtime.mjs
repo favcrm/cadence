@@ -57050,12 +57050,14 @@ function readSessionBounds(sql, objectId, sessionId) {
 }
 
 // src/session-transcript.ts
+var VISIBLE = `(json_extract(record, '$.kind') = 'pi.assistant' OR
+  (json_extract(record, '$.kind') = ? AND json_extract(record, '$.data.transcriptRole') = 'operator'))`;
 var PAGE_RECORDS = 6;
 var MAX_RECORD_BYTES = 64 * 1024;
 var MAX_RESPONSE_BYTES = 48 * 1024;
 var MAX_MESSAGES = 100;
 var encoder4 = new TextEncoder;
-function readSessionTranscript(sql, objectId, sessionId, after) {
+function readSessionTranscript(sql, objectId, sessionId, after, project) {
   if (!Number.isSafeInteger(after) || after < 0)
     return null;
   const bounds = readSessionBounds(sql, objectId, sessionId);
@@ -57066,14 +57068,14 @@ function readSessionTranscript(sql, objectId, sessionId, after) {
       if (after <= bounds.anchor || after > bounds.upper)
         return null;
       const cursor = sql.exec(`SELECT id FROM pi_entries WHERE conversation_id = ? AND id = ?
-           AND json_extract(record, '$.kind') IN (?, 'pi.assistant') LIMIT 1`, ROOT_CONVERSATION_ID, after, BOARD_MESSAGE_KIND).toArray()[0];
+           AND ${VISIBLE} LIMIT 1`, ROOT_CONVERSATION_ID, after, BOARD_MESSAGE_KIND).toArray()[0];
       if (cursor === undefined)
         return null;
     }
     const rows = sql.exec(`SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
          FROM pi_entries
         WHERE conversation_id = ? AND id > ? AND id <= ?
-          AND json_extract(record, '$.kind') IN (?, 'pi.assistant')
+          AND ${VISIBLE}
         ORDER BY id ASC LIMIT ?`, MAX_RECORD_BYTES, ROOT_CONVERSATION_ID, after || bounds.anchor, bounds.upper, BOARD_MESSAGE_KIND, PAGE_RECORDS + 1).toArray();
     const messages = [];
     let processed = after;
@@ -57082,9 +57084,8 @@ function readSessionTranscript(sql, objectId, sessionId, after) {
         return null;
       const record = JSON.parse(row.record);
       const data = record.data;
-      const messageId = data !== null && typeof data === "object" && !Array.isArray(data) ? data.messageId : undefined;
-      const visibleInput = record.kind === BOARD_MESSAGE_KIND && typeof messageId === "string" && !messageId.startsWith("routine:") && !messageId.startsWith("cred-resume:") && !messageId.startsWith("dispatch:");
-      const entries = visibleInput || record.kind === "pi.assistant" ? threadEntries([record], false) : [];
+      const visibleInput = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && data.transcriptRole === "operator";
+      const entries = visibleInput || record.kind === "pi.assistant" ? projectedThreadEntries([record], false, project) : [];
       const additions = entries.flatMap((entry) => {
         if (visibleInput && entry.role === "operator" && entry.kind === "message") {
           return [{ role: "operator", text: entry.text, ...entry.created ? { created: entry.created } : {} }];
@@ -57442,12 +57443,12 @@ data: ${JSON.stringify(entry)}
       }
     });
   }
-  async ask(prompt, operationId, app) {
+  async ask(prompt, operationId, app, transcriptRole) {
     await this.requireIdentity();
     const envelope = await this.admitOperation(prompt, operationId, app);
     const result = await this.harness.prompt(envelope.text, {
       operationId: envelope.operationId,
-      entry: this.inputEntry(envelope)
+      entry: this.inputEntry(envelope, transcriptRole)
     });
     return {
       status: result.status,
@@ -57463,7 +57464,7 @@ data: ${JSON.stringify(entry)}
     return readSessionSummary(this.ctx.storage.sql, this.ctx.id.toString(), sessionId);
   }
   sessionTranscript(sessionId, after) {
-    return readSessionTranscript(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, after);
+    return readSessionTranscript(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, after, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
@@ -57476,12 +57477,12 @@ data: ${JSON.stringify(entry)}
     await this.harness.session().reset();
     this.loopGuard?.reset();
   }
-  async submit(text, operationId, app) {
+  async submit(text, operationId, app, transcriptRole) {
     await this.requireIdentity();
     const envelope = await this.admitOperation(text, operationId, app);
     const receipt = await this.harness.submit(envelope.text, {
       operationId: envelope.operationId,
-      entry: this.inputEntry(envelope)
+      entry: this.inputEntry(envelope, transcriptRole)
     });
     return receipt.accepted;
   }
@@ -57531,8 +57532,10 @@ data: ${JSON.stringify(entry)}
     }
     return null;
   }
-  inputEntry(envelope) {
+  inputEntry(envelope, transcriptRole) {
     const data = { messageId: envelope.operationId };
+    if (transcriptRole === "operator")
+      data.transcriptRole = transcriptRole;
     if (envelope.app !== undefined)
       data.app = envelope.app.contextId === undefined ? { installId: envelope.app.installId } : {
         installId: envelope.app.installId,
