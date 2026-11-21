@@ -162,7 +162,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
       }
     } catch (cause) {
       if (!current(serial, generation) || request !== sampleRequest.current) return;
-      setPreviewError(cause instanceof Error && cause.message === "receipt" ? "The sample receipt did not match the selected version, digest and row count. No preview is shown." : format === "pdf" ? "SAMPLE PDF is unavailable for this version. You can request a short HTML preview if supported." : "SAMPLE HTML is unavailable for this version.");
+      setPreviewError(cause instanceof Error && cause.message === "receipt" ? "The sample receipt did not match the selected version, digest and row count. No preview is shown." : format === "pdf" ? "Sample PDF is unavailable." : "SAMPLE HTML is unavailable for this version.");
       if (cause instanceof Error && cause.message !== "receipt" && cause.message !== "format") setPreviewDetail(cause.message);
     } finally {
       if (current(serial, generation) && request === sampleRequest.current) setPreviewBusy(false);
@@ -316,76 +316,100 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
   ) : undefined;
 
   const drawer = enabled && target ? <DrawerShell
-    kind="template-review" label={t("Template review")} kicker={t("Template approvals")} scrim="board" modal trapFocus
-    title={`${target.name} · v${target.version}`} subtitle={<code className="break-all">SHA-256 {target.digest}</code>}
+    kind="template-review" label={t("Template review")} kicker={t("Template review")} scrim="board" modal trapFocus
+    title={`${target.name} · v${target.version}`}
+    pills={view && <span className="s-status-pill" data-tone={view.template.status === "approved" ? "ok" : "warn"}>
+      {t(view.template.status === "approved" ? "Approved for reuse" : "Draft awaiting review")}
+    </span>}
     onClose={close}
-    tabs={[{ id: "review", label: t("Review"), panel: <div className="space-y-4">
+    tabs={[{ id: "review", label: t("Review"), panel: <div className="space-y-5">
       {loading && <p role="status">{t("Loading the exact template version…")}</p>}
       {error && <p role="alert" className="text-fail break-words">{t(error)} {detail}</p>}
       {error && !view && !busy && !loading && <Button size="sm" variant="secondary" onClick={() => open(target, openerRef.current)}>{t("Reload exact version")}</Button>}
       {notice && <p role="status">{t(notice)}</p>}
       {view && <>
-        <p><strong>{t("Status")}:</strong> {view.template.status === "approved" ? t("Approved for reuse") : t("Draft awaiting review")}</p>
-        <p className="text-label text-ink-400">{t("Approval covers this exact template and its rules for future drafts. It does not approve, issue or send a finished document.")}</p>
-        {view.template.based_on !== null && <p>{t("Based on")} v{view.template.based_on}</p>}
-        {view.template.approved_source && <p className="break-words"><strong>{t("Approval source")}:</strong> {view.template.approved_source}</p>}
-        <TemplateRules spec={view.spec} />
-        {history.length > 1 && <details><summary tabIndex={0}>{t("Version history")}</summary><ul className="mt-1 grid gap-1">{history.map((version) => <li key={version.version}>{version.version === target.version
-          ? <span aria-current="true">v{version.version} · {t(version.status === "approved" ? "Approved" : "Draft")}</span>
-          : <button type="button" disabled={busy} className="lnk" onClick={(event) => open(targetOf(version), event.currentTarget)}>v{version.version} · {t(version.status === "approved" ? "Approved" : "Draft")}</button>}</li>)}</ul></details>}
-        <section aria-label={t("SAMPLE preview")}>
-          <h4>{t("SAMPLE preview")}</h4>
-          <p className="text-label text-ink-400">{t("Placeholder values only; this is not a document to send.")}</p>
-          <div className="flex flex-wrap gap-2" role="group" aria-label={t("Sample length")}>
-            <Button size="sm" variant="secondary" aria-pressed={rows === 1} disabled={previewBusy || busy} onClick={() => void loadSample(target, 1, "pdf", selection.current, privateSessionGeneration())}>{t("Short sample")}</Button>
-            <Button size="sm" variant="secondary" aria-pressed={rows === 36} disabled={previewBusy || busy} onClick={() => void loadSample(target, 36, "pdf", selection.current, privateSessionGeneration())}>{t("Continuation sample (36 rows)")}</Button>
+        <section aria-labelledby="template-review-sample" className="space-y-3 rounded-lg border border-ink-700 bg-ink-900 p-4">
+          <div>
+            <h4 id="template-review-sample" className="font-semibold text-ink-100">{t("Sample preview")}</h4>
+            <p className="text-label text-ink-300">{t("Sample only. Do not send.")}</p>
           </div>
-          {previewBusy && <p role="status">{t("Rendering SAMPLE…")}</p>}
-          {previewError && <p role="alert" className="text-warn break-words">{t(previewError)} {previewDetail}</p>}
-          {previewError && <Button size="sm" variant="secondary" disabled={previewBusy || busy} onClick={() => void loadSample(target, 1, "html", selection.current, privateSessionGeneration())}>{t("Request short HTML preview")}</Button>}
-          {preview?.kind === "pdf" && <div className="flex flex-wrap gap-3 pt-2">
-            <a className="lnk" href={preview.url} target="_blank" rel="noopener noreferrer">{t("Open SAMPLE PDF in a new tab")}</a>
-            <a className="lnk" href={preview.url} download={`${target.name}-v${target.version}-sample.pdf`}>{t("Download SAMPLE PDF")}</a>
+          <div className="flex flex-wrap gap-2" role="group" aria-label={t("Sample length")}>
+            <Button className="max-sm:min-h-11" aria-pressed={rows === 1} disabled={previewBusy || busy} onClick={() => void loadSample(target, 1, "pdf", selection.current, privateSessionGeneration())}>
+              <span className={rows === 1 ? "underline underline-offset-4" : undefined}>{t("Short · 1 row")}</span>
+            </Button>
+            <Button className="max-sm:min-h-11" aria-pressed={rows === 36} disabled={previewBusy || busy} onClick={() => void loadSample(target, 36, "pdf", selection.current, privateSessionGeneration())}>
+              <span className={rows === 36 ? "underline underline-offset-4" : undefined}>{t("Continuation · 36 rows")}</span>
+            </Button>
+          </div>
+          <p role="status" className={previewBusy ? "text-label text-ink-300" : "sr-only"}>
+            {previewBusy ? t("Rendering sample…") : preview ? `${t("Verified sample rows")}: ${preview.rows}` : ""}
+          </p>
+          {previewError && <p role="alert" className="text-warn wrap-anywhere">{t(previewError)} {previewDetail}</p>}
+          {previewError && <Button className="max-sm:min-h-11" onClick={() => void loadSample(target, 1, "html", selection.current, privateSessionGeneration())} disabled={previewBusy || busy}>{t("Preview as HTML")}</Button>}
+          {preview?.kind === "pdf" && <div className="flex flex-wrap gap-2">
+            <a className="btn max-sm:min-h-11" href={preview.url} target="_blank" rel="noopener noreferrer" aria-label={t("Open sample PDF in a new tab")}>
+              {t("Open sample PDF")} <span aria-hidden="true">↗</span>
+            </a>
+            <a className="btn btn-ghost max-sm:min-h-11" href={preview.url} download={`${target.name}-v${target.version}-sample.pdf`} aria-label={t("Download SAMPLE PDF")}>{t("Download")}</a>
           </div>}
           {preview?.kind === "html" && <iframe title={`${t("SAMPLE HTML")} · ${target.name} v${target.version}`} srcDoc={htmlFrameDocument(preview.html)} sandbox="" referrerPolicy="no-referrer" className="w-full min-h-96" />}
-          {preview && <p className="text-micro text-ink-400">{t("Verified sample rows")}: {preview.rows}</p>}
         </section>
+        <CalculationRules calculation={view.spec.calculation} />
+        <details className="border-y border-ink-700">
+          <summary tabIndex={0} className="cursor-pointer py-3 font-medium text-ink-100">{t("Fields and version details")}</summary>
+          <div className="space-y-3 pb-3">
+            <h4 className="font-medium text-ink-100">{t("Fields")}</h4>
+            <ul className="grid gap-2 text-label">
+              {view.spec.fields.map((field) => <li className="wrap-anywhere" key={field.key}>
+                <span className="block font-medium text-ink-100">{field.label}</span>
+                <span className="text-ink-300"><code>{field.key}</code> · {t(field.kind)}{field.required ? ` · ${t("Required")}` : ""}</span>
+              </li>)}
+            </ul>
+            {history.length > 1 && <div>
+              <h4 className="font-medium text-ink-100">{t("Version history")}</h4>
+              <ul className="mt-1 grid gap-1 text-label">{history.map((version) => <li key={version.version}>{version.version === target.version
+                ? <span aria-current="true">v{version.version} · {t(version.status === "approved" ? "Approved" : "Draft")}</span>
+                : <button type="button" disabled={busy} className="lnk" onClick={(event) => open(targetOf(version), event.currentTarget)}>v{version.version} · {t(version.status === "approved" ? "Approved" : "Draft")}</button>}</li>)}</ul>
+            </div>}
+            <dl className="sdetail">
+              {view.template.based_on !== null && <div><dt>{t("Based on")}</dt><dd>v{view.template.based_on}</dd></div>}
+              {view.template.approved_source && <div><dt>{t("Approval source")}</dt><dd>{view.template.approved_source}</dd></div>}
+              <div><dt>SHA-256</dt><dd><code>{target.digest}</code></dd></div>
+            </dl>
+          </div>
+        </details>
         {needsApproval && !view.spec.calculation.confirmed && <p className="text-warn">{t("Confirm the calculation rules in a new draft before approving.")}</p>}
         {needsApproval && <Field
-          label={t("Approval source (who decided and where)")}
-          hint={t("Record your decision and where it was made; this is not approval of a finished document.")}
+          label={t("Approval source")}
+          hint={t("Who decided and where. Approval allows reuse only; no document is issued or sent.")}
           required
           disabled={busy || !view.spec.calculation.confirmed}
         >
-          {(control) => <input {...control} className="field w-full" name="template-approval-source" value={source} onChange={(event) => setSource(event.target.value)} />}
+          {(control) => <input {...control} className="field w-full max-sm:min-h-11" name="template-approval-source" value={source} onChange={(event) => setSource(event.target.value)} />}
         </Field>}
       </>}
     </div> }]}
-    foot={view && (onCompose || needsApproval) ? <div className="crm-drawer-actions flex flex-wrap gap-2">
-      {onCompose && <Button size="sm" variant="secondary" disabled={busy} onClick={() => compose("revise")}>{t("Ask agent to revise")}</Button>}
-      {onCompose && view.template.status === "approved" && <Button size="sm" variant="primary" disabled={busy} onClick={() => compose("use")}>{t("Use template")}</Button>}
-      {needsApproval && <Button size="sm" variant="primary" loading={busy} disabled={busy || !source.trim() || !view.spec.calculation.confirmed} onClick={() => void approve()}>{t("Approve")} v{target.version} {t("for reuse")}</Button>}
-    </div> : undefined}
+    secondary={view && onCompose && <Button variant="ghost" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("revise")}>{t("Ask agent to revise")}</Button>}
+    primary={needsApproval && view
+      ? <Button variant="primary" className="max-sm:min-h-11" loading={busy} disabled={!source.trim() || !view.spec.calculation.confirmed} onClick={() => void approve()}>{t("Approve")} v{target.version} {t("for reuse")}</Button>
+      : view?.template.status === "approved" && onCompose
+        ? <Button variant="primary" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("use")}>{t("Use template")}</Button>
+        : undefined}
   /> : null;
 
   return { rail, drawer, pendingCount: directory === null ? undefined : pendingCount, open, refresh };
 }
 
-function TemplateRules({ spec }: { spec: TemplateSpec }) {
+function CalculationRules({ calculation }: { calculation: TemplateSpec["calculation"] }) {
   const { locale, t } = useLocale();
   const percent = new Intl.NumberFormat(locale === "zh-TW" ? "zh-HK" : "en", { style: "percent", maximumFractionDigits: 2 });
-  const { currency, tax_rate_bps, discount_bps } = spec.calculation;
-  return <section aria-label={t("Schema and calculation rules")} className="space-y-2">
-    <h4 className="font-medium">{t("Schema and calculation rules")}</h4>
-    <dl className="grid grid-cols-3 gap-2 text-label">
-      <div><dt className="text-ink-400">{t("Currency")}</dt><dd>{currency}</dd></div>
-      <div><dt className="text-ink-400">{t("Tax")}</dt><dd>{percent.format(tax_rate_bps / 10_000)}</dd></div>
-      <div><dt className="text-ink-400">{t("Discount")}</dt><dd>{percent.format(discount_bps / 10_000)}</dd></div>
+  const { currency, tax_rate_bps, discount_bps } = calculation;
+  return <section aria-labelledby="template-review-calculation" className="space-y-2">
+    <h4 id="template-review-calculation" className="font-medium text-ink-100">{t("Calculation rules")}</h4>
+    <dl className="grid grid-cols-3 gap-3">
+      <div><dt className="text-label text-ink-300">{t("Currency")}</dt><dd className="font-medium">{currency}</dd></div>
+      <div><dt className="text-label text-ink-300">{t("Tax")}</dt><dd className="num font-medium">{percent.format(tax_rate_bps / 10_000)}</dd></div>
+      <div><dt className="text-label text-ink-300">{t("Discount")}</dt><dd className="num font-medium">{percent.format(discount_bps / 10_000)}</dd></div>
     </dl>
-    <ul className="grid gap-1 text-label">
-      {spec.fields.map((field) => <li className="break-words" key={field.key}>
-        {field.label} <code className="text-ink-400">{field.key}</code> · {t(field.kind)}{field.required ? ` · ${t("Required")}` : ""}
-      </li>)}
-    </ul>
   </section>;
 }

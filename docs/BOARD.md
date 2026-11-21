@@ -2645,16 +2645,16 @@ actions.
 Hosted quotation and invoice templates live in **Home → To do → Template
 approvals**, including on workspaces without the Wiki file lifecycle. From a
 saved Canvas draft, **Review template** opens the same review at that exact
-version. Review the fill-in fields and calculation rules with a short or
-continuation SAMPLE PDF in a new tab. The sample contains synthetic values
-only. Authoring packs still use the existing agent and CLI commands.
+version. The drawer leads with a short or continuation SAMPLE PDF in a new tab
+and the calculation rules. **Fields and version details** shows the fill-in
+fields, version history, full digest and any recorded approval source. Samples
+contain synthetic values only. Authoring packs still use the agent and CLI.
 
 Only the workspace owner can approve a version for reuse. That decision binds
 the version's content digest; it does not approve any future document. **Use
 template** adds a request for the approved version to the Home composer without
 sending it or overwriting the existing draft. This does not issue, number, or
-send an invoice. Old hosted `/settings/templates` links return to Home. Native
-boards keep the Templates settings page.
+send an invoice. **Settings → Templates** is available only on native boards.
 
 On a hosted board advertising `wiki_managed_files` (CAD-2477), **Wiki** is
 the shared library for durable files and knowledge. An assigned approver

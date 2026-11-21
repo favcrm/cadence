@@ -252,7 +252,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
   const loc = useMemo(() => currentLocation(), [href]);
-  const { route, view, project, openId, filters } = loc;
+  const { route: matchedRoute, view, project, openId, filters } = loc;
+  const hostedBoard = meta.hosted === true || meta.session?.origin === "public";
+  const route: Route = hostedBoard && matchedRoute.screen === "settings" && matchedRoute.section === "templates"
+    ? { screen: "notFound", path: window.location.pathname }
+    : matchedRoute;
   const screen = route.screen;
   useHomeUnread(screen === "home");
   const fullHeight = screen === "home" || screen === "agents" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
@@ -383,7 +387,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // also produces `Meta.wiki`); local boards use transfer jobs.
   const hosted = meta ? meta.hosted === true : undefined;
   const viewerSub = meta?.session?.user?.sub ?? null;
-  const hostedBoard = meta?.hosted === true || meta?.session?.origin === "public";
   const templateReviewEnabled = Boolean(hostedBoard && meta?.signed_in === true && meta.session?.origin === "public" && sessionAdmissible(meta.session) && viewerSub && !viewerSub.startsWith("operator-token:"));
   const templateReviewCanApprove = templateReviewEnabled && meta?.session?.user?.role === "operator" && meta?.operator === true && !readOnly;
   // Platform operator sessions do not own a private app-agent setting.
@@ -400,17 +403,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // makes no request for the rest of the session.
 
   // A board that says what Settings it serves never shows a page it doesn't.
-  const hostedTemplatesRedirect = route.screen === "settings" && route.section === "templates" && hostedBoard;
-  const settingsTarget = route.screen === "settings" && !hostedTemplatesRedirect ? settingsRedirect(route.section, meta) : null;
+  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
   useEffect(() => {
     if (settingsTarget) {
       const targetRoute: Route = { screen: "settings", section: settingsTarget };
       navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
     }
   }, [settingsTarget]);
-  useEffect(() => {
-    if (hostedTemplatesRedirect) navigate("/", { replace: true });
-  }, [hostedTemplatesRedirect]);
   const legacyDocumentsHref = managedFiles && route.screen === "documents"
     ? route.archived ? "/wiki?archived=1" : "/wiki"
     : null;
@@ -1748,7 +1747,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
-        {route.screen === "settings" && !hostedTemplatesRedirect && (
+        {route.screen === "settings" && (
           <SettingsLayout
             groups={settingsNavGroups({ ...meta, hosted: hostedBoard }).map((group) => ({
               label: group.label,
@@ -1783,7 +1782,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
             )}
             {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
-            {route.section === "templates" && !hostedBoard && (
+            {route.section === "templates" && (
               <Templates viewer={{ operator: viewer.operator, hosted: false }} />
             )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
