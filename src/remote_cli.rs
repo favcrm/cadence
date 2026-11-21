@@ -3255,6 +3255,18 @@ fn renew_credential_locked(
     Ok(cred)
 }
 
+fn two_factor_refusal_code(status: u16, code: Option<&str>) -> Option<&'static str> {
+    if status != 403 {
+        return None;
+    }
+    match code {
+        Some("two_factor_enrollment_required") => Some("two_factor_enrollment_required"),
+        Some("two_factor_verification_required") => Some("two_factor_verification_required"),
+        Some("two_factor_required") => Some("two_factor_required"),
+        _ => None,
+    }
+}
+
 /// CAD-1434: renewal's separate adapter. The issuer's renewal route answers
 /// `{error:"<code>"}` (AOS `cli-session.ts`), not the gateway envelope, so it
 /// has its own reader. Only the issuer's terminal refresh-grant refusals ask
@@ -3270,7 +3282,12 @@ fn renewal_refusal(
     let request = correlation
         .map(|c| format!(" (issuer request {})", c.request_id))
         .unwrap_or_default();
-    if renewal_session_ended(status, body) {
+    let raw_code = body.get("error").and_then(Value::as_str);
+    if let Some(code) = two_factor_refusal_code(status, raw_code) {
+        reject(format!(
+            "the workspace requires two-factor authentication ({code}) — complete two-factor setup or verification in the browser and run `cadence login` again{request}"
+        ))
+    } else if renewal_session_ended(status, body) {
         reject(format!(
             "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
         ))
@@ -3285,14 +3302,11 @@ fn renewal_refusal(
 /// The issuer's terminal refresh-grant refusals: the one proof a fresh login
 /// is the remedy for a renewal that did not complete.
 fn renewal_session_ended(status: u16, body: &Value) -> bool {
-    let code = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let code = body.get("error").and_then(Value::as_str);
     matches!(
-        (status, code),
+        (status, code.unwrap_or_default()),
         (401, "invalid_token") | (400, "invalid_grant")
-    )
+    ) || two_factor_refusal_code(status, code).is_some()
 }
 
 fn validate_renewal_response(
@@ -4664,6 +4678,13 @@ const TERMINAL_CODES: &[&str] = &[
     "lineage_terminal",
 ];
 
+/// HTTP 403 error codes emitted when workspace org-2FA policy blocks the session.
+const TWO_FACTOR_CODES: &[&str] = &[
+    "two_factor_enrollment_required",
+    "two_factor_verification_required",
+    "two_factor_required",
+];
+
 /// Read the safe `error.code` and `error.reason` (or legacy top-level `code`).
 /// Only lowercase, bounded tokens survive; anything else is dropped.
 fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
@@ -4789,6 +4810,9 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
             (_, Some(r)) if POLICY_REASONS.contains(&r) => Refusal::Authorization,
             (_, Some(_)) => Refusal::Uncertain, // envelope_invalid: not terminal, not policy
             (Some(c), None) if TERMINAL_CODES.contains(&c) => Refusal::Authentication,
+            (Some(c), None) if status == 403 && TWO_FACTOR_CODES.contains(&c) => {
+                Refusal::Authentication
+            }
             (Some("forbidden"), None) => Refusal::Authorization,
             // The container's path/scope refusal: authorization on 403 only.
             (Some(CONTAINER_SCOPE_CODE), None) if status == 403 => Refusal::Authorization,
@@ -4800,12 +4824,17 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
         },
         _ => Refusal::Unknown,
     };
-    // The shown reason: an allowlisted policy/envelope reason on 401/403, or the
+    // The shown reason: an allowlisted policy/envelope/2FA reason on 401/403, or the
     // safe `error.code` on a non-auth refusal (a payload-size or validation code).
     // Auth-class codes are never shown as a free reason.
     let shown = match status {
         400 | 409 | 413 | 422 => code.map(str::to_owned),
         403 if code == Some(CONTAINER_SCOPE_CODE) => Some(CONTAINER_SCOPE_CODE.to_owned()),
+        403 if category == Refusal::Authentication
+            && code.is_some_and(|c| TWO_FACTOR_CODES.contains(&c)) =>
+        {
+            code.map(str::to_owned)
+        }
         _ => known_reason.map(str::to_owned),
     };
     (category, shown)
@@ -4817,6 +4846,12 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
     let code = reason.map_or(String::new(), |r| format!(", reason {r}"));
     let category = refusal.category();
     match refusal {
+        Refusal::Authentication if reason.is_some_and(|r| TWO_FACTOR_CODES.contains(&r)) => {
+            format!(
+                "workspace requires two-factor authentication ({category}, HTTP {status}{code}) — \
+                 complete two-factor setup or verification in the browser, then run `cadence login` again"
+            )
+        }
         Refusal::Authentication => format!(
             "the remote session ended ({category}, HTTP {status}{code}) — run `cadence login` again once"
         ),

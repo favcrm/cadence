@@ -4270,6 +4270,7 @@ mod cad2009_device_token_uncertainty_acceptance {
         Pending,
         SlowDown,
         InvalidGrant,
+        TwoFactor(&'static str),
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -4421,6 +4422,14 @@ mod cad2009_device_token_uncertainty_acceptance {
             ),
             Reply::SlowDown => ("400 Bad Request", b"{\"error\":\"slow_down\"}".to_vec()),
             Reply::InvalidGrant => ("400 Bad Request", b"{\"error\":\"invalid_grant\"}".to_vec()),
+            Reply::TwoFactor(code) => (
+                "403 Forbidden",
+                serde_json::to_vec(&json!({
+                    "error": code,
+                    "error_description": "raw description"
+                }))
+                .unwrap(),
+            ),
         };
         // Early client closure after its response cap is expected.
         let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
@@ -4650,6 +4659,38 @@ mod cad2009_device_token_uncertainty_acceptance {
             assert!(requests.is_empty());
             assert!(runtime.waits.is_empty());
             assert_eq!(result.unwrap_err().kind(), "rejected");
+        }
+    }
+
+    #[test]
+    fn device_token_403_two_factor_refusal_surfaces_actionable_rejection_without_storing() {
+        for flow in [Flow::Login, Flow::BrowserEnrollment] {
+            for code in [
+                "two_factor_enrollment_required",
+                "two_factor_verification_required",
+                "two_factor_required",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path().join("two-factor");
+                let mut runtime = Runtime::new();
+                let (result, requests) = exercise(vec![Reply::TwoFactor(code)], flow, |issuer| {
+                    trust(&dir, issuer);
+                    run_flow(flow, issuer, &dir, &mut runtime)
+                });
+                assert_eq!(runtime.code_calls, 1);
+                assert_eq!(runtime.token_calls, 1);
+                assert_eq!(requests.len(), 1);
+                let err = result.unwrap_err();
+                assert_eq!(err.kind(), "rejected", "{code}");
+                let text = err.to_string();
+                assert!(text.contains("two-factor"), "{code}: {text}");
+                assert!(text.contains("cadence login"), "{code}: {text}");
+                assert!(text.contains(code), "{code}: {text}");
+                assert!(!text.contains("raw description"), "{code}: {text}");
+                assert!(!dir.join(RECORD).exists());
+                assert!(!dir.join("cli-acme.json").exists());
+                assert!(!dir.join(CONTINUITY_RECORD).exists());
+            }
         }
     }
 }

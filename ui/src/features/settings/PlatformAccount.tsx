@@ -174,6 +174,14 @@ export default function PlatformAccount() {
             {t("Member information is not available from this read-only connection.")}
             {manage && " "}{manage && t("Use Manage account to view and manage members.")}
           </p>
+          {manage && (
+            <p className="account-members-note">
+              {t("Password sign-in, two-factor authentication, and workspace 2FA policy are managed in Manage account.")}{" "}
+              <a href={manage} target="_blank" rel="noopener noreferrer">
+                {t("Account security settings")}<span className="sr-only"> {t("(opens in a new tab)")}</span>
+              </a>
+            </p>
+          )}
         </>
       )}
     </section>
