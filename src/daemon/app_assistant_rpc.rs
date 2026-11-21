@@ -1352,7 +1352,9 @@ impl Shared {
         let micros = quote["total_price_micros"]
             .as_u64()
             .ok_or_else(|| Error::rejected("reference-edit quote is missing its price"))?;
-        let model = crate::platform::agenticos_external::reviewed_image_model();
+        let model = crate::platform::agenticos_external::quote_image_model(&quote)
+            .map_err(Error::rejected)?
+            .to_owned();
         let reason = "Review one library image reference edit. The card freezes the source pin, instructions and model. The price shown is an estimate. Charged once. The source stays unchanged.";
         let grant = self.refine_grant(records, install, context)?;
         let parked = records
@@ -1558,6 +1560,9 @@ impl Shared {
             .pointer("/permission_request/preview")
             .ok_or_else(|| Error::rejected("assistant permission preview is unavailable"))?;
         let (asset_id, revision, sha256, instructions) = refine_input(input)?;
+        let approved_model =
+            crate::platform::agenticos_external::quote_image_model(&preview["quote"])
+                .map_err(Error::rejected)?;
         if op.pointer("/permission_request/preview_kind") != Some(&json!("media_refine"))
             || !op
                 .pointer("/permission_request/allow_always")
@@ -1567,7 +1572,7 @@ impl Shared {
             || preview["sha256"] != sha256
             || preview["instructions"] != instructions
             || preview["workflow"] != "refine-image"
-            || preview["model"] != crate::platform::agenticos_external::reviewed_image_model()
+            || preview["model"] != approved_model
             || preview["currency"] != "USD"
             || preview["allow_once"] != true
         {
@@ -1582,8 +1587,14 @@ impl Shared {
             ));
         }
         let (slot, live) = self.refine_quote(install, context, asset_id, revision, sha256)?;
-        // The live quote is the run's `max_charge_minor`; the estimate on the
-        // card is not compared with it (CAD-1852).
+        if crate::platform::agenticos_external::quote_image_model(&live).map_err(Error::rejected)?
+            != approved_model
+            || live["price_revision"] != preview["quote"]["price_revision"]
+        {
+            return Err(Error::rejected(
+                "the image model or price changed since the card was shown; request a new quote",
+            ));
+        }
         if slot != preview["slot"].as_str().unwrap_or("") {
             return Err(Error::rejected(
                 "the image tool changed since the card was shown",

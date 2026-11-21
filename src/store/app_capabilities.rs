@@ -119,6 +119,7 @@ pub(crate) struct AppCapabilityRecord<'a> {
     pub input_digest: &'a str,
     pub result: &'a Value,
     pub asset: Option<(&'a str, &'a [u8])>,
+    pub actual_charge_micros: Option<u64>,
 }
 
 pub(crate) struct AppCapabilityClaim<'a> {
@@ -346,6 +347,7 @@ impl Store {
             input_digest,
             result,
             asset,
+            actual_charge_micros,
         } = record;
         let record = AppCapabilityRecord {
             id,
@@ -359,6 +361,7 @@ impl Store {
             input_digest,
             result,
             asset,
+            actual_charge_micros,
         };
         let serialized = serde_json::to_vec(result)?;
         if serialized.len() > RESULT_BYTES {
@@ -480,11 +483,15 @@ impl Store {
                     // plus the private origin link, inside THIS tx —
                     // a provenance refusal rolls the receipt back too.
                     Self::app_media_record_origin_in(tx, &record)?;
+                    let mut event = json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest});
+                    if let Some(micros) = actual_charge_micros {
+                        event["actual_charge_micros"] = json!(micros);
+                    }
                     Self::event(
                         &tx,
                         Self::DAEMON_STREAM,
                         "app_capability_result_recorded",
-                        json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest}),
+                        event,
                     )?;
                     Self::app_capability_result_in(&tx, id)
         })

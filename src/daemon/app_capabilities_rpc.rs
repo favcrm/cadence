@@ -63,6 +63,52 @@ pub(crate) fn operator_price_refusal(message: &str) -> Option<&str> {
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }
 
+fn require_frozen_model_quote(
+    run: &Value,
+    slot: &str,
+    quote: &crate::platform::AppCapabilityQuote,
+) -> Result<()> {
+    let binding = &run["snapshot"]["capabilities"][slot]["config"];
+    let provider = binding["provider"].as_str();
+    let capability = binding["mapping"]["capability"].as_str();
+    let text = provider == Some(crate::platform::agenticos_external::PLATFORM)
+        && capability == Some("text.generate");
+    let image = matches!(
+        provider,
+        Some(
+            crate::platform::agenticos_external::PLATFORM
+                | crate::platform::account_media::PLATFORM
+        )
+    ) && capability == Some("media.generate");
+    if !text && !image {
+        return Ok(());
+    }
+    let saved = &run["snapshot"]["quotes"][slot];
+    if !saved.is_object() {
+        return Err(Error::rejected("the approved model quote is unavailable"));
+    }
+    if text {
+        if !saved["charge_protocol"].is_null() || quote.charge_protocol.is_some() {
+            return Err(Error::rejected(
+                crate::platform::agenticos_external::NATIVE_TEXT_WORKLOAD_REVIEW_REQUIRED,
+            ));
+        }
+        return Ok(());
+    }
+    let approved =
+        crate::platform::agenticos_external::quote_image_model(saved).map_err(Error::rejected)?;
+    let current = crate::platform::agenticos_external::typed_image_quote_model(quote)
+        .map_err(Error::rejected)?;
+    if approved != current
+        || saved["price_revision"].as_str() != Some(quote.price_revision.as_str())
+    {
+        return Err(Error::rejected(
+            "the image model or price changed since approval; request a new quote",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -316,6 +362,7 @@ impl Shared {
             if proof.config["provider"] != crate::platform::account_media::PLATFORM {
                 return Err(Error::rejected("account capability source changed"));
             }
+            require_frozen_model_quote(&run, slot, quote)?;
             self.recheck_app_capability_quote(&proof, quote)?;
             Ok((step, proof))
         };
@@ -495,6 +542,7 @@ impl Shared {
                         binding_digest: &proof.digest,
                         input_digest: &input_digest,
                         result: &output.result,
+                        actual_charge_micros: output.actual_charge_micros,
                         asset: output
                             .asset
                             .as_ref()
@@ -797,23 +845,34 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
-                // The next probe prices every frozen slot, not only the one
-                // the worker named. Lineage is offline and ignores non-account
-                // slots, so an unknown or mixed slot cannot skip it.
+                let config = &checked_run["snapshot"]["capabilities"][&slot]["config"];
                 self.account_frozen_lineage(&checked_run)?;
-                self.probe_app_run_prices(&checked_run)?;
-                let quote = self
-                    .prepare_app_run_quotes(&checked_run)?
-                    .remove(&slot)
-                    .ok_or_else(|| Error::rejected("run capability quote is absent"))??
-                    .fetch()?;
-                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
-                    == crate::platform::account_media::PLATFORM
-                {
+                let replaying_text = config["provider"]
+                    == crate::platform::agenticos_external::PLATFORM
+                    && config["mapping"]["capability"] == "text.generate"
+                    && self
+                        .store
+                        .app_capability_result_for_slot(&run_id, &slot)?
+                        .is_some();
+                let quote = if replaying_text {
+                    // A historical receipt does not depend on an old pricing door.
+                    None
+                } else {
+                    self.probe_app_run_prices(&checked_run)?;
+                    Some(
+                        self.prepare_app_run_quotes(&checked_run)?
+                            .remove(&slot)
+                            .ok_or_else(|| Error::rejected("run capability quote is absent"))??
+                            .fetch()?,
+                    )
+                };
+                if config["provider"] == crate::platform::account_media::PLATFORM {
                     return self.execute_account_run_capability(
                         &checked_run,
                         &slot,
-                        &quote,
+                        quote
+                            .as_ref()
+                            .ok_or_else(|| Error::rejected("run capability quote is absent"))?,
                         (input, &request),
                         Some((&alias, message, turn)),
                     );
@@ -839,15 +898,16 @@ impl Shared {
                     // CAD-1374: the sealed approving human bound at approval
                     // time. Null for a legacy approval (no human recorded).
                     let sealed_human = run["approval"]["human"].clone();
-                    // CAD-1141: price drift is accepted. The fresh quote is
-                    // the call's `max_charge_minor` ceiling (authority below);
-                    // the frozen snapshot itself must still be unchanged.
                     if run["snapshot_digest"] != checked_run["snapshot_digest"] {
                         return Err(Error::rejected(
                             "run snapshot digest changed since run approval",
                         ));
                     }
-                    self.recheck_app_capability_quote(&proof, &quote)?;
+                    if let Some(quote) = &quote {
+                        self.recheck_app_capability_quote(&proof, quote)?;
+                    } else {
+                        self.app_capability_credential(&proof.config)?;
+                    }
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
                     let tool = required_str(&config["mapping"], "tool")?;
@@ -886,6 +946,12 @@ impl Shared {
                         }
                         return Ok(std::ops::ControlFlow::Break(existing));
                     }
+                    // Price checks for a new dispatch must not invalidate a
+                    // retained receipt under the same authorized identity.
+                    let quote = quote
+                        .as_ref()
+                        .ok_or_else(|| Error::rejected("retained text receipt is unavailable"))?;
+                    require_frozen_model_quote(&run, &slot, quote)?;
                     let call_id = format!(
                         "app-call-{}",
                         uuid::Uuid::new_v5(
@@ -1046,6 +1112,7 @@ impl Shared {
                                 binding_digest: &proof.digest,
                                 input_digest: &input_digest,
                                 result: &output.result,
+                                actual_charge_micros: output.actual_charge_micros,
                                 asset: output.asset.as_ref().map(|asset| {
                                     (asset.media_type.as_str(), asset.bytes.as_slice())
                                 }),

@@ -1841,6 +1841,7 @@ impl Shared {
                             binding_digest: &proof.digest,
                             input_digest: &input_digest,
                             result: &output.result,
+                            actual_charge_micros: output.actual_charge_micros,
                             asset: output
                                 .asset
                                 .as_ref()

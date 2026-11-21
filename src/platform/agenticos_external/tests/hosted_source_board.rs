@@ -471,6 +471,9 @@ fn cad1302_caption_through_a_slot_named_writer_reaches_the_lease_door() {
     let calls = TEXT_CALLS.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0]["slug"], "generate_text");
+    assert_eq!(calls[0]["max_charge_minor"], 2000);
+    assert!(calls[0].get("text_quote").is_none());
+    assert!(calls[0].get("charge_protocol").is_none());
 }
 
 // ---------------------------------------------------------------------------

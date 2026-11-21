@@ -1026,6 +1026,10 @@ pub(crate) fn account_image_send(
     operation: crate::remote_cli::AccountImageOperation,
     deadline: Instant,
 ) -> Result<crate::remote_cli::AccountImageResponse> {
+    use crate::platform::agenticos_external::{
+        valid_model_id, LEGACY_IMAGE_MODEL, MAX_SAFE_JSON_INTEGER,
+    };
+    use crate::platform::valid_pricing_revision;
     use crate::remote_cli::{AccountImageOperation as Op, AccountImageResponse};
     const JSON_CAP: u64 = 256 * 1024;
     const ARTIFACT_CAP: u64 = 10 * 1024 * 1024;
@@ -1051,6 +1055,18 @@ pub(crate) fn account_image_send(
                 .as_object()
                 .ok_or_else(|| reject("account image input must be an object"))?;
             let reference_edit = object.contains_key("references");
+            // The platform checks that the submitted model and revision match
+            // its live quote. This relay only admits the two reviewed shapes.
+            let (quote_fields, model_ok) =
+                match (object.get("charge_protocol"), object.get("quote_revision")) {
+                    (None, None) => (0, input["model"] == LEGACY_IMAGE_MODEL),
+                    (Some(Value::String(protocol)), Some(Value::String(revision)))
+                        if protocol == "quote@2" && valid_pricing_revision(revision) =>
+                    {
+                        (2, input["model"].as_str().is_some_and(valid_model_id))
+                    }
+                    _ => (0, false),
+                };
             let reference_ok = !reference_edit
                 || (object["references"].as_array().is_some_and(|refs| {
                     refs.len() == 1
@@ -1064,17 +1080,17 @@ pub(crate) fn account_image_send(
                             })
                         })
                 }));
-            if object.len() != if reference_edit { 5 } else { 4 }
+            if object.len() != 4 + usize::from(reference_edit) + quote_fields
                 || !["model", "prompt", "aspectRatio", "max_charge_minor"]
                     .iter()
                     .all(|key| object.contains_key(*key))
                 || !reference_ok
-                || input["model"] != "openai/gpt-image-2.5"
+                || !model_ok
                 || input["prompt"].as_str().is_none_or(|p| p.trim().is_empty())
                 || input["aspectRatio"] != "1:1"
                 || input["max_charge_minor"]
                     .as_u64()
-                    .is_none_or(|n| !(1..=1_000_000_000).contains(&n))
+                    .is_none_or(|n| !(1..=MAX_SAFE_JSON_INTEGER).contains(&n))
                 || !(8..=128).contains(&idempotency_key.len())
                 || !idempotency_key
                     .bytes()

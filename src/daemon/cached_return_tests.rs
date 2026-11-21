@@ -215,6 +215,7 @@ fn seed_result(
             input_digest: &input_digest,
             result: &json!({"marker": MARKER}),
             asset: Some(("text/plain", b"marker-asset-bytes")),
+            actual_charge_micros: None,
         })
         .expect("seed result failed");
     rec["id"].as_str().unwrap_or(&id).to_string()

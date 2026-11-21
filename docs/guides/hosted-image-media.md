@@ -83,6 +83,15 @@ and honest uncertain outcomes remain unchanged. Existing operator and assigned
 managed-endpoint gates still apply. Hosted mode does not auto-approve bindings,
 runs, publication or any live operation.
 
+On the external and saved-account image doors, `quote@2` pins the
+server-selected model, pricing revision and expected `receiptSlug`. The relay
+accepts only the complete revision-bound submit shape or the original legacy
+shape, and never follows redirects. AgenticOS verifies the live quote; Cadence
+checks the frozen receipt identity on submit and poll, independent of the
+amount that settled. A server that advertises `quote@2` without a receipt
+identity is not ready for this client; legacy quotes without the marker keep
+their existing receipt validation.
+
 The upstream can retain up to 10 MiB, but Cadence intentionally accepts at most
 2 MiB and a fully decoded square image of at most 2048 pixels per side. Successful
 upstream generation can therefore exceed custody limits and fail to produce a
