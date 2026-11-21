@@ -1086,18 +1086,22 @@ hosted kickoff, the session's hosted CLI verbs are sent on an `agent` credential
 bound to its claim. A comment, an attachment and a review are recorded as the
 agent. `issue new`, `issue set` and `issue say` still record the member, as do
 `my_work` and the member's private artifacts. The board also refuses the
-owner-only writes: profile writes, team changes and `platform call`, even on an
-owner's assignment, and `team list` is refused for a managed agent. The client
+owner-only writes: profile writes, team changes and owner-only platform
+operations. `team list` is also refused for a managed agent. The client
 mints it on the member's login at first use and caches it 0600 beside the
 kickoff's `.bind` file, for at most 15 minutes; there is no refresh token, so
 renewal is another mint, and the file goes when the assignment ends.
 
 Stays on the member's login: claim, daemon reports and `agent report`; every
-wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
-`audit_verdict_project`). `artifact types` and `artifact submit`
-ride the agent credential like the other verbs. The credential carries the
-member's own subject, so the board's creator check still admits the member's
-files, and a reader or reviewer assignment's submit is refused by the board's
+wiki action; ordinary `artifact put`; and the audit verdicts (`audit_verdict`,
+`audit_verdict_project`). `artifact put --kind private-app-zip` instead uses
+the claim-bound agent's own credential, like its private app review request.
+If that credential is unavailable or refused, ZIP staging never retries as
+the member. A ZIP the member staged from their own shell remains theirs.
+`artifact types` and `artifact submit` ride the agent credential like the
+other verbs. The credential carries the member's subject, so the board's
+creator check still admits the member's files. A reader or reviewer
+assignment's submit is refused by the board's
 read-only guard. Not available to a managed agent session at all:
 `settings agents`, `master status` and `master resume`. They always refuse —
 owner-class settings authority is never delegated — and the refusal names the

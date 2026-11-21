@@ -6684,7 +6684,7 @@ fn cad2009_artifact_upload_answer(status: &'static str, answer: Value) -> Result
         file_name: "acceptance.txt",
         bytes: b"abc",
     };
-    let result = upload_artifact_in(&dir, &target, &upload, 2, |_| {
+    let result = upload_artifact_in(&dir, &target, &upload, 2, None, |_| {
         panic!("a final artifact receipt or refusal must never trigger a wake retry")
     });
     complete_tx.send(()).unwrap();
@@ -6695,6 +6695,264 @@ fn cad2009_artifact_upload_answer(status: &'static str, answer: Value) -> Result
         "authorize then exactly one upload, with no automatic replay"
     );
     result
+}
+
+#[test]
+fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    const AGENT: &str = "hct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const ASSIGNMENT: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
+    // A valid empty ZIP and its independently calculated SHA-256.
+    const ZIP: &[u8] =
+        b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const DIGEST: &str = "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85";
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        Human,
+        Cached,
+        MintUnavailable,
+        AgentRefused,
+        UploadRefused,
+    }
+
+    for case in [
+        Case::Human,
+        Case::Cached,
+        Case::MintUnavailable,
+        Case::AgentRefused,
+        Case::UploadRefused,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (target, _root, dir) = credentialed(&listener);
+        let slot = AgentSlot::new(
+            dir.join("synthetic.agent"),
+            &target,
+            ASSIGNMENT.into(),
+            CLAIM.into(),
+            1,
+        );
+        if matches!(
+            case,
+            Case::Cached | Case::AgentRefused | Case::UploadRefused
+        ) {
+            let cache = json!({
+                "version": "cadence-agent-credential.v1",
+                "assignment_id": ASSIGNMENT,
+                "claim_id": CLAIM,
+                "generation": 1,
+                "organization_id": ORG_ID,
+                "audience": target.endpoint,
+                "capabilities": ["cli.write"],
+                "access_token": AGENT,
+                "expires_at": now().unwrap() + 300,
+            });
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&slot.path)
+                .unwrap()
+                .write_all(cache.to_string().as_bytes())
+                .unwrap();
+        }
+        let worker = listener.try_clone().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut trail = Vec::new();
+            let count = if matches!(case, Case::Human | Case::Cached | Case::UploadRefused) {
+                2
+            } else {
+                1
+            };
+            for _ in 0..count {
+                let mut pending = libc::pollfd {
+                    fd: worker.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one initialized pollfd is supplied.
+                assert_eq!(unsafe { libc::poll(&mut pending, 1, 5000) }, 1);
+                let (mut socket, _) = worker.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap().to_string();
+                let mut length = 0_usize;
+                let mut bearer = String::new();
+                let mut envelope = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        } else if key.eq_ignore_ascii_case("authorization") {
+                            bearer = value.trim().trim_start_matches("Bearer ").to_string();
+                        } else if key.eq_ignore_ascii_case("x-cadence-cli-envelope") {
+                            envelope = value.trim().to_string();
+                        }
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                match path.as_str() {
+                    "/__platform/cli/authorize" => {
+                        let expected = if matches!(case, Case::Human) {
+                            BRIDGE
+                        } else {
+                            AGENT
+                        };
+                        assert_eq!(bearer, expected);
+                        let request: Value = serde_json::from_slice(&raw).unwrap();
+                        assert_eq!(request["requested_scopes"], json!(["cli.write"]));
+                        if matches!(case, Case::AgentRefused) {
+                            write_answer(
+                                &mut socket,
+                                "403 Forbidden",
+                                "",
+                                &json!({"ok": false, "error": {"code": "forbidden"}}),
+                            );
+                        } else {
+                            write_answer(
+                                &mut socket,
+                                "200 OK",
+                                "",
+                                &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                            );
+                        }
+                    }
+                    "/__platform/artifacts/upload" => {
+                        let expected = if matches!(case, Case::Human) {
+                            BRIDGE
+                        } else {
+                            AGENT
+                        };
+                        assert_eq!(bearer, expected);
+                        assert_eq!(envelope, "h.e.1");
+                        assert!(raw.windows(ZIP.len()).any(|part| part == ZIP));
+                        assert!(raw
+                            .windows(b"private-app-zip".len())
+                            .any(|part| part == b"private-app-zip"));
+                        if matches!(case, Case::UploadRefused) {
+                            write_answer(
+                                &mut socket,
+                                "403 Forbidden",
+                                "",
+                                &json!({"ok": false, "error": {"code": "human_session_required"}}),
+                            );
+                        } else {
+                            write_answer(
+                                &mut socket,
+                                "200 OK",
+                                "",
+                                &json!({"file": {"id": "art-A", "version": 1, "digest": DIGEST}}),
+                            );
+                        }
+                    }
+                    _ if path.ends_with("/agent-credential") => {
+                        assert_eq!(bearer, BRIDGE);
+                        assert!(matches!(case, Case::MintUnavailable));
+                        write_answer(
+                            &mut socket,
+                            "404 Not Found",
+                            "",
+                            &json!({"ok": false, "code": "not_found"}),
+                        );
+                    }
+                    _ => panic!("unexpected request: {path}"),
+                }
+                trail.push((path, bearer));
+            }
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            match worker.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("the client sent an unexpected extra request"),
+                Err(error) => panic!("checking for an extra request failed: {error}"),
+            }
+            trail
+        });
+        let upload = ArtifactUpload {
+            kind: "private-app-zip",
+            title: "Synthetic private app",
+            id: Some("art-A"),
+            issue: None,
+            label: None,
+            customer: None,
+            file_name: "app.zip",
+            bytes: ZIP,
+        };
+        let agent = (!matches!(case, Case::Human)).then_some(&slot);
+        let result = upload_artifact_in(&dir, &target, &upload, 5, agent, |_| {
+            panic!("private ZIP upload must not fall back or wake")
+        });
+        done_tx.send(()).unwrap();
+        let trail = server.join().unwrap();
+        match case {
+            Case::Human => {
+                assert_eq!(result.unwrap()["file"]["digest"], DIGEST);
+                assert_eq!(
+                    trail,
+                    vec![
+                        ("/__platform/cli/authorize".to_string(), BRIDGE.to_string()),
+                        (
+                            "/__platform/artifacts/upload".to_string(),
+                            BRIDGE.to_string()
+                        ),
+                    ]
+                );
+            }
+            Case::Cached => {
+                assert_eq!(result.unwrap()["file"]["digest"], DIGEST);
+                assert_eq!(
+                    trail,
+                    vec![
+                        ("/__platform/cli/authorize".to_string(), AGENT.to_string()),
+                        (
+                            "/__platform/artifacts/upload".to_string(),
+                            AGENT.to_string()
+                        ),
+                    ]
+                );
+            }
+            Case::MintUnavailable => {
+                assert!(result.is_err());
+                assert_eq!(trail.len(), 1);
+                assert!(trail[0].0.ends_with("/agent-credential"));
+                assert_eq!(trail[0].1, BRIDGE);
+            }
+            Case::AgentRefused => {
+                assert!(result.is_err());
+                assert_eq!(
+                    trail,
+                    vec![("/__platform/cli/authorize".to_string(), AGENT.to_string())]
+                );
+            }
+            Case::UploadRefused => {
+                assert!(result.is_err());
+                assert_eq!(
+                    trail,
+                    vec![
+                        ("/__platform/cli/authorize".to_string(), AGENT.to_string()),
+                        (
+                            "/__platform/artifacts/upload".to_string(),
+                            AGENT.to_string()
+                        ),
+                    ]
+                );
+            }
+        }
+    }
 }
 
 #[test]
