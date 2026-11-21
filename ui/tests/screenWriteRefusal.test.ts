@@ -131,6 +131,30 @@ async function main(): Promise<void> {
   try {
     assertScreenReadVerbsParity();
 
+    // CAD-2557: only a definite create rejection is safe for CRM to correct and retry.
+    for (const [verb, status, code, expected] of [
+      ["records.create", 400, "validation_failed", "validation_failed"],
+      ["records.create", 400, "failed", "failed"],
+      ["records.create", 500, "validation_failed", "failed"],
+      ["records.update", 400, "validation_failed", "failed"],
+    ] as const) {
+      const detail = "internal app record rule and value";
+      const fx = makeFixture(() => ({ status, json: { code, error: detail } }));
+      const result = await fx.services.call(verb, {});
+      const label = `${verb} with HTTP ${status} ${code}`;
+      if (result.ok) throw new Error(`${label}: expected refusal`);
+      assert.equal(result.refusal.code, expected, label);
+      assert.ok(!result.refusal.text.includes(detail), `${label}: raw text is private`);
+      assert.equal(fx.requests.length, 1, `${label}: never resubmit automatically`);
+    }
+    {
+      const fx = makeFixture(() => { throw new TypeError("connection dropped"); });
+      const result = await fx.services.call("records.create", {});
+      if (result.ok) throw new Error("dropped create response: expected refusal");
+      assert.equal(result.refusal.code, "failed", "dropped create response stays ambiguous");
+      assert.equal(fx.requests.length, 1, "never resubmit after a dropped response");
+    }
+
     // 1. owner_required 403 on write keeps mount active; subsequent reads still succeed.
     {
       const fx = makeFixture((_path, body) => {
