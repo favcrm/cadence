@@ -302,7 +302,7 @@ export function useInstructionsDoc(opts: {
     saveEnabledTools: (enabledTools) =>
       saveProfileField(
         (base) => profileBody(base, base.responsibilities, base.revision, base.skills, enabledTools),
-        (latest) => (latest.enabled_tools ?? []).join("\n") === enabledTools.join("\n"),
+        (latest) => [...(latest.enabled_tools ?? [])].sort().join("\n") === [...enabledTools].sort().join("\n"),
       ),
     discard: () => {
       if (phase !== "unconfirmed") {

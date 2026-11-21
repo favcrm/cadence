@@ -4,11 +4,11 @@ import type { StoredAgentProfile } from "../../lib/types";
  *  them (agenticos-v2 `OPT_IN_TOOL_GROUP_IDS`). Every other group is on unless
  *  `disabled_tools` lists it, so absence from `disabled_tools` must never read
  *  as "on" for one of these. */
-export const OPT_IN_TOOL_GROUPS: { id: string; label: string; line: string }[] = [
+export const OPT_IN_TOOL_GROUPS: { id: string; label: string; text: string }[] = [
   {
     id: "cadence_writes",
     label: "Cadence writes",
-    line: "Lets this agent create cards, comment and attach in its project, and edit only cards it created",
+    text: "Lets this agent create cards, comment and attach in its project, and edit only cards it created",
   },
 ];
 

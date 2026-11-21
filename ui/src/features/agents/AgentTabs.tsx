@@ -1353,7 +1353,10 @@ function SkillDrawer({
 function OptInTools({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [saving, setSaving] = useState<string | null>(null);
-  const profile = c.doc.kind === "hosted" && c.doc.read === "ready" ? c.doc.profile : null;
+  if (c.doc.kind !== "hosted") return null;
+  if (c.doc.read === "reading") return <Note>{t("Loading tools…")}</Note>;
+  if (c.doc.read === "failed") return <Note>{t("These tools couldn’t be read.")}</Note>;
+  const profile = c.doc.read === "ready" ? c.doc.profile : null;
   if (!profile) return null;
 
   async function toggle(group: string, on: boolean) {
@@ -1364,6 +1367,7 @@ function OptInTools({ c }: { c: TabContext }) {
     if (out.kind === "saved") c.toast("ok", `${t("Saved.")} ${t("It applies when a session next loads this profile.")}`);
     else if (out.kind === "conflict") c.toast("warn", t("Someone else changed this agent, so nothing was saved. Reload to see the current tools."));
     else if (out.kind === "unconfirmed") c.toast("warn", t("Not confirmed: the connection dropped. Reload to see what the board holds."));
+    else if (out.kind === "busy") c.toast("warn", t("Another save is still running. Try again in a moment."));
     else if (out.kind === "refused") c.toast("err", t(out.message));
   }
 
@@ -1376,7 +1380,7 @@ function OptInTools({ c }: { c: TabContext }) {
             <span className="sk-title">
               <b>{t(group.label)}</b>
             </span>
-            <span className="sk-desc">{t(group.line)}</span>
+            <span className="sk-desc">{t(group.text)}</span>
             <NativeToggle
               name={group.label}
               required={false}

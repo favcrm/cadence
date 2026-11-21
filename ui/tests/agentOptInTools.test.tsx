@@ -21,8 +21,10 @@ Object.assign(globalThis, {
 import React from "react";
 import { createRoot } from "react-dom/client";
 import AgentTabBody, { type TabContext } from "../src/features/agents/AgentTabs";
-import { profileBody } from "../src/features/agents/instructionsDoc";
+import { profileBody, type DocDeps } from "../src/features/agents/instructionsDoc";
 import { toolGroupOn } from "../src/features/agents/profileTools";
+import { useInstructionsDoc, type InstructionsDoc } from "../src/features/agents/useInstructionsDoc";
+import { ApiError } from "../src/lib/apiError";
 import type { StoredAgentProfile } from "../src/lib/types";
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -102,8 +104,54 @@ async function main() {
 
   await mount(profile({ enabled_tools: ["cadence_writes"] }), false);
   assert(sw() === null, "a non-owner gets no switch");
-  assert(host.textContent?.includes("Cadence writes") && host.textContent.includes("On"), "a non-owner still sees the state");
+  const state = host.querySelector('[data-work-panel="opt-in-tools"] .sk-switch');
+  assert(state?.getAttribute("data-state") === "on" && state.textContent === "On", "a non-owner still sees the state, read-only");
   assert(sent.length === 2, "a non-owner sends nothing");
+
+  // The real hook: body is the stored fields plus enabled_tools at the page's revision; a 409 is a conflict.
+  const writes: object[] = [];
+  let fail: Error | null = null;
+  const stored = profile({ disabled_tools: ["board"] });
+  let doc: InstructionsDoc | null = null;
+  const deps: DocDeps = {
+    readProfile: async () => stored,
+    writeProfile: async (_id, body) => {
+      writes.push(body);
+      if (fail) throw fail;
+      return { ...stored, revision: 4, enabled_tools: (body as { enabled_tools: string[] }).enabled_tools };
+    },
+    readNative: async () => null,
+    writeNative: async () => ({ applies: "next_turn" }),
+  };
+  function Harness() {
+    doc = useInstructionsDoc({
+      alias: "dev",
+      kind: "hosted",
+      profileId: "ap_1",
+      nativeServed: null,
+      writable: true,
+      onSaved: () => {},
+      toast: () => {},
+      deps,
+    });
+    return null;
+  }
+  await React.act(async () => {
+    root.render(React.createElement(Harness));
+  });
+  await React.act(async () => {
+    await new Promise((r) => setTimeout(r, 20));
+  });
+  let out = await React.act(async () => doc!.saveEnabledTools(["cadence_writes"]));
+  assert(out.kind === "saved", "the save lands");
+  assert(
+    JSON.stringify(writes[0]) ===
+      JSON.stringify({ name: "Dev", role: "dev", responsibilities: "Job text", skills: ["a"], status: "active", expectedRevision: 3, enabled_tools: ["cadence_writes"] }),
+    `body is the stored fields plus enabled_tools at the held revision: ${JSON.stringify(writes[0])}`,
+  );
+  fail = new ApiError("Reload the agent profile.", 409);
+  out = await React.act(async () => doc!.saveEnabledTools([]));
+  assert(out.kind === "conflict", "a 409 maps to conflict");
 
   root.unmount();
   console.log("agentOptInTools checks passed");
