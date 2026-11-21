@@ -32,3 +32,10 @@ export type {
 } from "./contract.ts";
 export { BOARD_MESSAGE_KIND, OPERATIONAL_SKILL_VERSION } from "./contract.ts";
 export { masterState, type MasterMetadata } from "./master.ts";
+
+import { RUNTIME_PROMPT } from "./profile.ts";
+
+/** Approximate tokens in the fixed board instructions shared by both assistant scopes. */
+export function estimateBuiltInInstructionsTokens(): number {
+  return Math.ceil(RUNTIME_PROMPT.length / 4);
+}

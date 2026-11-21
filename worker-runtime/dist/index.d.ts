@@ -8,3 +8,5 @@ export { HostedSession } from "./hosted-session.js";
 export type { AppScope, AskResult, AssistantIdentityContext, GenerationIdentity, HostedRunFailureCode, HostedSessionInspection, HostedSessionOptions, HostedSessionSummary, HostedState, MasterStatus, OperationReply, OperationSettlement, PendingOperation, RuntimeTool, RuntimeTools, ThreadContext, ThreadEntry, ThreadProjection, ToolContent, ToolContext, ToolInvocation, ToolResult, WorkspaceSkill, } from "./contract.js";
 export { BOARD_MESSAGE_KIND, OPERATIONAL_SKILL_VERSION } from "./contract.js";
 export { masterState, type MasterMetadata } from "./master.js";
+/** Approximate tokens in the fixed board instructions shared by both assistant scopes. */
+export declare function estimateBuiltInInstructionsTokens(): number;

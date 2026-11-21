@@ -466,6 +466,11 @@ it does not mark the session failed. AgenticOS owns tenant and agent
 labels, ticket/routine completion, and authorization for the summary index
 and any separate transcript lookup.
 
+`estimateBuiltInInstructionsTokens()` reports the approximate size of the
+runtime’s fixed board guidance shared by the company Master and personal
+assistants. It returns a count, not prompt text. Managed instructions and
+per-turn context are separate and are not included.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh
