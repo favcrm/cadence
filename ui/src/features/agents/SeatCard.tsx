@@ -101,7 +101,7 @@ export function PersonalSeat({ row, onOpen }: { row: PersonalAssistantRow; onOpe
       onClick={onOpen}
     >
       <AgentAvatar slug={agentLook("assistant", { look: row.look })} still size={44} />
-      <span className="min-w-0">
+      <span className="min-w-0 wrap-anywhere">
         <span className="t">
           {row.name} · {t("Your assistant")}
         </span>

@@ -77,6 +77,7 @@ export default function NeedsRail({
   overview,
   documentFollowUps,
   readOnly,
+  scopedHost = false,
   onOpenIssue,
   overviewHref,
   permissionsHref,
@@ -94,6 +95,7 @@ export default function NeedsRail({
   overview?: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   readOnly: boolean;
+  scopedHost?: boolean;
   onOpenIssue?: (id: string) => void;
   overviewHref?: string;
   /** Settings → Master permissions, where the standing "Always" rules live. */
@@ -343,7 +345,7 @@ export default function NeedsRail({
       {(waitingRoutines.length > 0 || routineProposals.length > 0 || routineStepHolds.length > 0) && (
         <ul className="todo-list" data-routine-needs>
           {routineStepHolds.map((run) => {
-            const alias = run.agent_alias ?? "master";
+            const alias = scopedHost ? run.agent_alias?.trim() || null : run.agent_alias ?? "master";
             const waitingStep =
               (run.checklist_state ?? run.checklist ?? []).find(
                 (s) => s.state === "waiting_approval",
@@ -383,25 +385,25 @@ export default function NeedsRail({
                       </Button>
                     </>
                   )}
-                  <Link
+                  {alias && <Link
                     href={`/agents/${encodeURIComponent(alias)}?tab=routines`}
                     className="btn btn-sm btn-secondary"
                     onClick={() => setDrawer(false)}
                   >
                     {t("Review")}
-                  </Link>
+                  </Link>}
                 </div>
               </li>
             );
           })}
           {routineProposals.map((p) => {
-            const alias =
-              typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : "master";
+            const explicitAlias = typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : null;
+            const alias = scopedHost ? explicitAlias?.trim() || null : explicitAlias ?? "master";
             const wikiPath = typeof p.payload?.path === "string" ? p.payload.path : null;
             const href =
               p.kind === "wiki_propose" && wikiPath
                 ? `/wiki/${wikiPath.replace(/^wiki:/, "")}`
-                : `/agents/${encodeURIComponent(alias)}?tab=routines`;
+                : alias ? `/agents/${encodeURIComponent(alias)}?tab=routines` : null;
             return (
               <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0">
                 <div className="min-w-0 flex-1">
@@ -434,13 +436,13 @@ export default function NeedsRail({
                       </Button>
                     </>
                   )}
-                  <Link
+                  {href && <Link
                     href={href}
                     className="btn btn-sm btn-secondary"
                     onClick={() => setDrawer(false)}
                   >
                     {t("Review")}
-                  </Link>
+                  </Link>}
                 </div>
               </li>
             );
@@ -476,6 +478,7 @@ export default function NeedsRail({
             key={n.key}
             need={n}
             readOnly={readOnly}
+            scopedHost={scopedHost}
             defaultOpen={i === firstPermission}
             doneText={marksFor(local, n).doneText}
             onReview={openDecision}

@@ -172,13 +172,15 @@ export default function Agents({
   // and mailboxes otherwise live in the sidebar's folded groups.
   const searching = searchTerm !== "";
   const filter: AgentFilter = searching ? "all" : "current";
-  const sidebarAgents = allAgents.filter((a) => agentMatchesSearch(a, query, issueIndexed));
+  const sidebarAgents = allAgents.filter((a) =>
+    agentMatchesSearch(a, query, issueIndexed, a === companyMaster ? a.name : undefined),
+  );
   const sidebarProfiles = idleProfiles.filter((p) => profileMatchesSearch(p, query));
   const shownProfiles = idleProfiles.filter(
     (p) => profileMatchesFilter(p, filter) && profileMatchesSearch(p, query),
   );
-  const agents = allAgents
-    .filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed))
+  const agents = sidebarAgents
+    .filter((a) => agentMatchesFilter(a, filter))
     .sort(
       (a, b) =>
         Number(b.alias === MASTER) - Number(a.alias === MASTER) ||

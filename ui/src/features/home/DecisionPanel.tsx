@@ -175,7 +175,7 @@ function Shell({
 
 const waiting = (need: HomeNeed, t: (s: string) => string) => `${t(ageWords(need.age))}${need.age < 60 ? "" : ` ${t("ago")}`}`;
 
-function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
+function PlanReview({ need, readOnly, hosted, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
   const epic = need.action.type === "plan" ? need.action.epic : "";
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
@@ -236,7 +236,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: De
       need={need}
       verb="Approve plan"
       title={title}
-      subtitle={`${t("Proposed by")} ${view?.proposedBy === "master" ? t("Master") : t("your team")} · ${waiting(need, t)}`}
+      subtitle={`${t("Proposed by")} ${view?.proposedBy === "master" ? t(hosted ? "an unverified proposer" : "Master") : t("your team")} · ${waiting(need, t)}`}
       body={body}
       foot={
         <Foot

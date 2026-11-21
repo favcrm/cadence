@@ -49,7 +49,7 @@ export interface StagedResult {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect" | "artifact_share";
+  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -512,32 +512,6 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "connected_effect") return parseConnectedEffect(base, row, result);
   if (row.tool === "custom_mcp_effect") return parseCustomMcpEffect(base, row, result);
   if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
-  if (row.tool === "artifact_share" && isRecord(row.input)) {
-    // The hosted approval and denial routes accept only this action ID format.
-    if (!/^[a-f0-9]{32}$/.test(id)) return null;
-    const { id: artifactId, version, title } = row.input;
-    if (typeof artifactId !== "string" || !/^art-[A-Za-z0-9]{1,40}$/.test(artifactId) ||
-        typeof version !== "number" || !Number.isSafeInteger(version) || version < 1 ||
-        typeof title !== "string" || !title.trim()) return null;
-    return {
-      ...base,
-      kind: "artifact_share",
-      title,
-      app: null,
-      target: { kind: "artifact", label: title, id: artifactId },
-      changes: [{ field: "version", label: "Version", kind: "added", after: String(version) }],
-      unchangedCount: 0,
-      changesComplete: true,
-      reason: null,
-      consent: null,
-      effects: [],
-      raw: rawText(row.input),
-      origin: parseOrigin(row.origin),
-      result,
-      recordLink: `/api/artifacts/${artifactId}/${version}`,
-      connected: null,
-    };
-  }
   return null;
 }
 
@@ -625,7 +599,6 @@ export function reasonText(reason: string, t: (english: string) => string): stri
 /** The row's own heading: a connected effect leads with its verb. */
 export function titleOf(write: StagedWrite, t: (english: string) => string): string {
   if (write.customMcp != null) return `${t("Run tool")} · ${write.title}`;
-  if (write.kind === "artifact_share") return `${t("Share an artifact")} · ${write.title}`;
   return write.connected === null ? write.title : `${t(write.connected.effect === "send" ? "Send" : "Draft")} · ${write.title}`;
 }
 

@@ -232,6 +232,18 @@ async function main() {
   assert(seats()[1].includes("Acme") && seats()[1].includes("Master · company, owners only"), "owner: Master follows, labelled");
   assert(sideRows().some((s) => s.includes("Master · company, owners only")), "owner: the sidebar row is labelled too");
   checkDirectory();
+  const ownerSearch = host.querySelector<HTMLInputElement>("#agents-search");
+  assert(ownerSearch, "owner: Agents offers search");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(ownerSearch, "ACME master");
+    ownerSearch.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert(seats().length === 1 && seats()[0].includes("Acme"), "owner: search matches the displayed Master name and alias");
+  assert(sideRows().slice(1).length === 1 && sideRows()[1].includes("Acme"), "owner: search finds Master in the sidebar by display name too");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(ownerSearch, "");
+    ownerSearch.dispatchEvent(new Event("input", { bubbles: true }));
+  });
   const priorReads = directoryReads;
   viewerSub = null;
   await render();

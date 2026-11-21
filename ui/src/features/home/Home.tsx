@@ -1571,7 +1571,7 @@ function MasterHome({
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
   const onAsk = (need: HomeNeed, lead?: string) => {
-    const draft = askDraft(need, lead);
+    const draft = askDraft(need, lead, hosted === false ? undefined : t("what should we do?"));
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
   const toggleRail = () => {
@@ -1634,6 +1634,7 @@ function MasterHome({
           templateRail={templateRail}
           templateCount={templateCount}
           readOnly={readOnly}
+          scopedHost={hosted !== false}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
           permissionsHref={permissionsHref}

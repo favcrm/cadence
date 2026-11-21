@@ -324,13 +324,11 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   });
   await settle(() => assert(text(host).includes("Live Recruit request"), "live Recruit snapshot refreshes its decisions"));
   assert(text(home.cards()[0]).includes("Home only"), "Recruit refresh leaves Home distinct");
-  const share = Array.from(host.querySelectorAll("[data-chat-staged]")).find((card) => text(card).includes("Hiring brief"));
-  assert(share && !text(host).includes("Malformed artifact"), "Recruit shows the saved artifact version, not malformed requests");
-  assert(!text(host).includes("Unreviewable share"), "Recruit omits a share the decision endpoint cannot address");
-  await click(labelled(share, "Review"));
-  await settle(() => assert(text(drawerEl()).includes("Approving shares this version with everyone in the workspace."), "artifact review names the effect before deciding"));
-  assert(drawerEl()?.querySelector("a[href='/api/artifacts/art-Brief/2']")?.textContent?.includes("Download this version"), "artifact review links to the exact authorized version");
-  assert(labelled(drawerEl()!, "Deny"), "the owner can decline to share");
+  assert(!text(host).includes("Hiring brief") && !text(host).includes("Malformed artifact") && !text(host).includes("Unreviewable share"), "Recruit omits artifact shares, including otherwise well-formed entries");
+  const live = Array.from(host.querySelectorAll("[data-chat-staged]")).find((card) => text(card).includes("Live Recruit request"));
+  assert(live, "the supported action remains available after refresh");
+  await click(labelled(live, "Review"));
+  await settle(() => assert(text(drawerEl()).includes("Live Recruit request"), "the refreshed supported action opens for review"));
   await React.act(async () => { root.unmount(); });
   host.remove();
   await home.done();

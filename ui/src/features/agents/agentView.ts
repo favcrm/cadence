@@ -195,10 +195,12 @@ export function agentMatchesSearch(
   a: Agent,
   query: string,
   index: IssueIndex,
+  displayName?: string | null,
 ): boolean {
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
   const text = [
     a.alias,
+    displayName,
     a.role,
     a.team_role,
     a.provider,

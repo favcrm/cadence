@@ -70,7 +70,7 @@ export default function MyAssistantPage({
         <AgentAvatar slug={agentLook(PERSONAL_ALIAS, { look })} still size={48} />
         <div className="min-w-0">
           <h1>{t("My assistant")}</h1>
-          <div className="ap-sub">
+          <div className="ap-sub wrap-anywhere">
             <span>
               {name} · {t("Your assistant")}
             </span>

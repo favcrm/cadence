@@ -272,8 +272,8 @@ export function ageLabel(secs: number): string {
 /** What "Ask master" seeds: the row's title as the draft's ask and its
  *  subject as the `refs` the send attaches. Never auto-sends — the
  *  operator reviews and presses Enter. */
-export function askDraft(need: HomeNeed, lead?: string): { text: string; refs: ThreadRef[] } {
-  return { text: lead ?? `${need.title} — what should we do?`, refs: needRefs(need) };
+export function askDraft(need: HomeNeed, lead?: string, question = "what should we do?"): { text: string; refs: ThreadRef[] } {
+  return { text: lead ?? `${need.title} — ${question}`, refs: needRefs(need) };
 }
 
 /** The row's subject as the `refs` a Master message carries. */

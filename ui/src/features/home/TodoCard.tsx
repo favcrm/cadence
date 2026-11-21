@@ -22,6 +22,8 @@ import { isolate } from "../decisions/stagedWrite";
 import { sendToMaster } from "./send";
 import { useTranslate } from "../../lib/locale";
 import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
+import { useAssistantActor } from "../assistant/AssistantIdentity";
+import { displayName } from "../assistant/identity";
 
 const ICON: Record<string, string[]> = {
   list: ["M9 5h10M9 12h10M9 19h10", "M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"],
@@ -127,6 +129,7 @@ function YesNo({
 export default function TodoCard({
   need,
   readOnly,
+  scopedHost,
   defaultOpen,
   doneText,
   onReview,
@@ -138,6 +141,7 @@ export default function TodoCard({
 }: {
   need: HomeNeed;
   readOnly: boolean;
+  scopedHost: boolean;
   defaultOpen: boolean;
   /** What the operator did, once they did it — the card greys out. */
   doneText: string | undefined;
@@ -151,6 +155,8 @@ export default function TodoCard({
 }) {
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
+  const actor = useAssistantActor();
+  const name = displayName(actor.read, actor.scope, t);
   const spec = kindSpec(need);
   const issueTitle = useIssueTitle(need);
   // The kind table's template is the fallback; "Fix it" always sends the
@@ -240,7 +246,7 @@ export default function TodoCard({
 
   const ask = (
     <button type="button" className="btn btn-sm btn-ghost" disabled={!!block} title={block ? t(READ_ONLY_COPY) : undefined} onClick={() => onAsk(need)}>
-      {t("Ask Master")}
+      {scopedHost ? t("Ask {name}").replace("{name}", () => name) : t("Ask Master")}
     </button>
   );
 
@@ -294,7 +300,7 @@ export default function TodoCard({
     } else {
       inside = (
         <div className="mt-2 space-y-2">
-          <p className="text-label text-ink-400">{t("Master can walk you through this and take it from there.")}</p>
+          <p className="text-label text-ink-400 wrap-anywhere">{scopedHost ? t("{name} can walk you through this and take it from there.").replace("{name}", () => name) : t("Master can walk you through this and take it from there.")}</p>
           <div className="flex flex-wrap gap-1.5">{ask}</div>
         </div>
       );

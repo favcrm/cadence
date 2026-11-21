@@ -819,8 +819,8 @@ Home shows decisions from your personal conversation; the workspace assistant's
 Recruit decisions stay in Recruit. A decision shows the assistant's display
 name and scope when the board verifies who staged it. Older records without
 provenance stay generic; a recorded CLI or MCP actor keeps its attribution.
-For a file share, the review links to the exact saved version. Approving makes
-that version available to everyone in the workspace.
+Home's Ask button names the assistant for that conversation and opens an
+unsent draft. It does not switch to the workspace assistant.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action
