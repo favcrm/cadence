@@ -219,11 +219,16 @@ async function main() {
   const search = host.querySelector<HTMLInputElement>("#agents-search");
   assert(search, "Agents offers search");
   await React.act(() => {
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(search, "MAYA");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(search, "PARK   MAYA");
     search.dispatchEvent(new Event("input", { bubbles: true }));
   });
   assert(seats().length === 1 && seats()[0].includes("Maya Park"), "Agents search matches teammate names without an empty-state message");
   assert(!host.textContent?.includes("No agents match"), "teammate match is a roster result");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(search, "assistant   NOVA");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert(seats().length === 1 && seats()[0].includes("Nova · Your assistant"), "personal name and alias match in either order");
 
   // An owner: My assistant first, then Master labelled company and owners-only (workspace name as the title).
   operator = true;
@@ -277,6 +282,9 @@ async function main() {
     "member: the gate says who Master is for",
   );
   assert(host.querySelector("textarea") === null, "member: no composer for the company Master");
+  await at("/agents/crm-action-review");
+  assert(host.textContent?.includes("Conversations with agents here are for the workspace operator."), "member: a hired agent receives the general chat refusal");
+  assert(!host.textContent?.includes("Chat with the company Master is for owners.") && host.querySelector("textarea") === null, "the Master refusal is private to the Master route, and the hired chat remains blocked");
 
   const priorMasterReads = masterReads;
   rosterLoading = true;

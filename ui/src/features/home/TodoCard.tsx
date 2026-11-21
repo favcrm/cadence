@@ -244,9 +244,10 @@ export default function TodoCard({
     activate();
   };
 
+  const askLabel = scopedHost ? t("Ask {name}").replace("{name}", () => name) : t("Ask Master");
   const ask = (
-    <button type="button" className="btn btn-sm btn-ghost" disabled={!!block} title={block ? t(READ_ONLY_COPY) : undefined} onClick={() => onAsk(need)}>
-      {scopedHost ? t("Ask {name}").replace("{name}", () => name) : t("Ask Master")}
+    <button type="button" className="btn btn-sm btn-ghost" disabled={!!block} title={block ? t(READ_ONLY_COPY) : askLabel} onClick={() => onAsk(need)}>
+      <span className="min-w-0 truncate">{askLabel}</span>
     </button>
   );
 

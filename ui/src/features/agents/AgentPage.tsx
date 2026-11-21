@@ -410,17 +410,11 @@ export default function AgentPage({
           }
       : !operator
         ? boardIsHosted
-          ? scopedRoster
-            ? {
-                title: t("Chat with the company Master is for owners. Your assistant is on Home."),
-                body: "",
-                extra: <Button href="/">{t("Open Home")}</Button>,
-              }
-            : {
-                title: t("Your assistant is on Home"),
-                body: t("Conversations with agents here are for the workspace operator."),
-                extra: <Button href="/">{t("Open Home")}</Button>,
-              }
+          ? {
+              title: t("Your assistant is on Home"),
+              body: t("Conversations with agents here are for the workspace operator."),
+              extra: <Button href="/">{t("Open Home")}</Button>,
+            }
           : {
               title: boardBlock ?? t("Conversations with agents are for the operator"),
               body: t("You can still see what this agent is working on."),

@@ -159,13 +159,16 @@ export default function Agents({
   }, [directoryViewer]);
   const teammateRows = directory && directory.viewer === directoryViewer ? directory.rows : [];
   const searchTerm = query.trim().toLowerCase();
+  const searchTerms = searchTerm ? searchTerm.split(/\s+/) : [];
+  const matchesName = (name: string) => {
+    const text = name.toLowerCase();
+    return searchTerms.every((term) => text.includes(term));
+  };
   const matchingTeammates = searchTerm
-    ? teammateRows.filter(({ name }) => (name || t("Teammate")).toLowerCase().includes(searchTerm))
+    ? teammateRows.filter(({ name }) => matchesName(name || t("Teammate")))
     : teammateRows;
   const companyMaster = allAgents.find((a) => isCompanyMaster(a, payload)) ?? null;
-  const personalMatches =
-    personal !== null &&
-    `${personal.name} ${PERSONAL_ALIAS}`.toLowerCase().includes(searchTerm);
+  const personalMatches = personal !== null && matchesName(`${personal.name} ${PERSONAL_ALIAS}`);
   const profiles = payload?.profiles ?? [];
   const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
   // The cards are the current team; a search reaches everyone. Stopped agents

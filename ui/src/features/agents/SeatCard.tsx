@@ -75,7 +75,7 @@ export default function SeatCard({
         still={lifecycle !== "active"}
         size={44}
       />
-      <span className="min-w-0">
+      <span className="min-w-0 wrap-anywhere">
         <span className="t">{title ?? a.alias}</span>
         <span className="s">{roleLine}</span>
       </span>
