@@ -1,6 +1,8 @@
 import { useContext, useState } from "react";
 import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
+import { routePath } from "../../lib/router";
+import { navigate } from "../../lib/useLocation";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "../settings/hostedConnect";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
@@ -11,8 +13,9 @@ import type { ThreadEntry } from "./thread";
  * CAD-2443: the host's `connect_ref` card. It carries a toolkit and a label,
  * never a URL: the owner's button starts the board's own hosted connect flow
  * (`POST /api/connection-providers/:toolkit/connect`) and opens the https
- * sign-in it returns in a new tab. A member, or a payload that does not
- * parse, sees the entry's text line instead.
+ * sign-in it returns in a new tab. Custom MCP cards route the owner to
+ * Settings > Connections to reconnect or configure that server. A member, or
+ * a payload that does not parse, sees the entry's text line instead.
  */
 export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; density?: CardDensity }) {
   const t = useTranslate();
@@ -26,8 +29,16 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   if (writeBlock !== null || operatorBlock !== null) {
     return <p className="text-micro text-ink-500 break-words chatcard-line" data-kind="connect_ref">· {plainText(entry.text, 500)}</p>;
   }
-  const label = t("Connect {label}").replace("{label}", () => model.label);
+  const isCustomMcp = model.toolkit === "custom_mcp";
+  const label = isCustomMcp
+    ? t("Reconnect {label}").replace("{label}", () => model.label)
+    : t("Connect {label}").replace("{label}", () => model.label);
   const connect = () => {
+    if (isCustomMcp) {
+      const dest = routePath({ screen: "settings", section: "connections" });
+      navigate(`${dest}?mcp_focus=${encodeURIComponent(model.label)}`);
+      return;
+    }
     if (busy) return;
     setBusy(true);
     setError(null);

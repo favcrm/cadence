@@ -5,7 +5,13 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
-import type { Connection, ConnectionProvider, ConnectionSite, HostedAccount } from "../../lib/types";
+import type {
+  Connection,
+  ConnectionProvider,
+  ConnectionSite,
+  CustomMcpConnectionSummary,
+  HostedAccount,
+} from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
@@ -54,6 +60,18 @@ import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
 import SettingsDrawer from "./SettingsDrawer";
+import {
+  CustomMcpConnectDrawer,
+  CustomMcpInspectDrawer,
+  type CustomMcpDrawerTab,
+} from "./CustomMcpDrawer";
+import {
+  customMcpAuthLabel,
+  customMcpReturn,
+  customMcpStatusView,
+  mcpFocusParam,
+  type CustomMcpReturn,
+} from "./customMcpView";
 import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
@@ -314,27 +332,101 @@ function ConnectionsIndex({
   const partialRes = viewer.operator && hostedBoard ? resources.connectionsPartial : null;
   const partialState = useMaybeResource(partialRes);
   const partial = partialState?.data?.partial === true;
+
+  // CAD-2556: Custom MCP servers (hosted workspaces only; older deployments returning 404 degrade quietly).
+  const [mcpRows, setMcpRows] = useState<CustomMcpConnectionSummary[]>([]);
+  const [mcpLoaded, setMcpLoaded] = useState(false);
+  const [mcpConnectOpen, setMcpConnectOpen] = useState(false);
+  const [openMcpId, setOpenMcpId] = useState<string | null>(null);
+  const [openMcpTab, setOpenMcpTab] = useState<CustomMcpDrawerTab>("tools");
+  const [mcpReturned, setMcpReturned] = useState<CustomMcpReturn | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : customMcpReturn(window.location.search),
+  );
+  const [mcpFocus, setMcpFocus] = useState<string | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : mcpFocusParam(window.location.search),
+  );
+  const mcpAutoOpened = useRef(false);
+
+  const loadCustomMcp = () => {
+    if (!hostedBoard || viewer.operator === null) return;
+    api
+      .customMcpList(true)
+      .then((res) => {
+        setMcpRows(res.connections ?? []);
+        setMcpLoaded(true);
+      })
+      .catch(() => {
+        setMcpLoaded(false);
+      });
+  };
+
+  useEffect(() => {
+    if (!hostedBoard || viewer.operator === null) return;
+    let alive = true;
+    api
+      .customMcpList(true)
+      .then((res) => {
+        if (!alive) return;
+        setMcpRows(res.connections ?? []);
+        setMcpLoaded(true);
+      })
+      .catch(() => {
+        if (alive) setMcpLoaded(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [hostedBoard, viewer.operator]);
+
   const refresh = () => {
     if (listRes) void listRes.refresh();
     if (providersRes) void providersRes.revalidate();
+    loadCustomMcp();
   };
-  const groups = serviceGroups(providers, rows);
+  const visibleRows = mcpLoaded ? rows.filter((row) => row.provider !== "custom_mcp") : rows;
+  const groups = serviceGroups(providers, visibleRows);
   const [openId, setOpenId] = useState<string | null>(null);
-  const open = rows.find((row) => row.id === openId) ?? null;
+  const open = visibleRows.find((row) => row.id === openId) ?? null;
+  const openMcp = mcpRows.find((row) => row.id === openMcpId) ?? null;
   // CAD-2428: a hosted connect returns here with `?aos_connect=…&toolkit=…`. The URL is read once,
   // then dropped so a reload does not repeat the banner; the account shown comes from the list.
   const [returned, setReturned] = useState(() =>
     typeof window === "undefined" ? null : hostedReturn(window.location.search),
   );
   useEffect(() => {
-    if (returned === null) return;
+    if (returned === null && mcpReturned === null && mcpFocus === null) return;
     navigate(
       window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash,
       { replace: true },
     );
-  }, [returned]);
+  }, [returned, mcpReturned, mcpFocus]);
+
+  useEffect(() => {
+    if (!mcpLoaded || mcpAutoOpened.current) return;
+    if (mcpReturned?.outcome === "connected" && mcpReturned.connectionId) {
+      const hit = mcpRows.find((row) => row.id === mcpReturned.connectionId);
+      if (hit) {
+        mcpAutoOpened.current = true;
+        setOpenMcpId(hit.id);
+        setOpenMcpTab(hit.status === "auth_expired" ? "auth" : "tools");
+      }
+      return;
+    }
+    if (mcpFocus !== null) {
+      const norm = mcpFocus.toLowerCase();
+      const hit = mcpRows.find((row) => row.name.toLowerCase() === norm || row.id === mcpFocus);
+      if (hit) {
+        mcpAutoOpened.current = true;
+        setOpenMcpId(hit.id);
+        setOpenMcpTab(hit.status === "auth_expired" ? "auth" : "tools");
+      }
+    }
+  }, [mcpLoaded, mcpRows, mcpReturned, mcpFocus]);
+
   const newRow =
-    returned?.outcome === "connected" && viewer.operator ? returnedRow(rows, returned.toolkit) : null;
+    returned?.outcome === "connected" && returned.toolkit !== "custom_mcp" && viewer.operator
+      ? returnedRow(visibleRows, returned.toolkit)
+      : null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -344,9 +436,18 @@ function ConnectionsIndex({
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
         {viewer.operator && (
-          <div className="flex flex-wrap gap-1 shrink-0 items-center">
+          <div className="flex flex-wrap gap-1.5 shrink-0 items-center">
             <StaleChip state={listState ?? emptyGate} />
             <StaleChip state={providersState ?? emptyGate} />
+            {canWrite && hostedBoard && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => setMcpConnectOpen(true)}
+              >
+                {t("+ Connect custom MCP server")}
+              </Button>
+            )}
             {canWrite && (
               <Link href={connectionAddHref()} className="settings-quiet">{t("+ Add")}</Link>
             )}
@@ -368,10 +469,50 @@ function ConnectionsIndex({
           )}
         </PageState>
       ) : !viewer.operator ? (
-        <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+        <div className="space-y-4 min-w-0">
+          <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+          {hostedBoard && mcpRows.length > 0 && (
+            <CustomMcpServerList
+              rows={mcpRows}
+              highlightId={null}
+              readOnly
+              onOpen={(row) => {
+                setOpenMcpTab("tools");
+                setOpenMcpId(row.id);
+              }}
+            />
+          )}
+          {hostedBoard && openMcp && (
+            <CustomMcpInspectDrawer
+              key={`${openMcp.id}:${openMcpTab}`}
+              connection={openMcp}
+              canWrite={false}
+              initialTab={openMcpTab}
+              onClose={() => setOpenMcpId(null)}
+              onUpdated={(next) =>
+                setMcpRows((cur) => cur.map((item) => (item.id === next.id ? next : item)))
+              }
+              onRevoked={(revokedId) => {
+                setOpenMcpId(null);
+                setMcpRows((cur) => cur.filter((item) => item.id !== revokedId));
+              }}
+            />
+          )}
+        </div>
       ) : (
         <>
-          {returned !== null && (
+          {mcpReturned !== null && (
+            <CustomMcpReturnBanner
+              returned={mcpReturned}
+              connection={
+                mcpReturned.connectionId
+                  ? mcpRows.find((row) => row.id === mcpReturned.connectionId) ?? null
+                  : null
+              }
+              onDismiss={() => setMcpReturned(null)}
+            />
+          )}
+          {returned !== null && returned.toolkit !== "custom_mcp" && (
             <HostedReturnBanner
               returned={returned}
               row={newRow}
@@ -403,25 +544,40 @@ function ConnectionsIndex({
             />
           )}
           {listState?.data && (
-            <div className="space-y-3 min-w-0">
+            <div className="space-y-4 min-w-0">
               {partial && (
                 <p className="text-label text-fail flex flex-wrap items-center gap-2 mb-3" role="alert" data-state="connections-partial">
                   {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
                   <Button size="sm" onClick={refresh}>{t("Retry")}</Button>
                 </p>
               )}
-              {rows.length === 0 && partial ? null : rows.length === 0 ? (
+              {visibleRows.length === 0 && mcpRows.length === 0 && partial ? null : visibleRows.length === 0 && mcpRows.length === 0 ? (
                 <section className="settings-rows px-4 py-6 text-center" aria-label={t("connections")}>
                   <p className="text-secondary text-ink-300">{t("No accounts connected")}</p>
                   <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>
                 </section>
               ) : (
-                <ConnectionsGroupedList
-                  rows={rows}
-                  groups={groups}
-                  highlightId={newRow?.id ?? null}
-                  onOpen={(id) => setOpenId(id)}
-                />
+                <>
+                  {visibleRows.length > 0 && (
+                    <ConnectionsGroupedList
+                      rows={visibleRows}
+                      groups={groups}
+                      highlightId={newRow?.id ?? null}
+                      onOpen={(id) => setOpenId(id)}
+                    />
+                  )}
+                  {hostedBoard && mcpRows.length > 0 && (
+                    <CustomMcpServerList
+                      rows={mcpRows}
+                      highlightId={mcpReturned?.outcome === "connected" ? mcpReturned.connectionId : null}
+                      readOnly={!canWrite}
+                      onOpen={(row) => {
+                        setOpenMcpTab(row.status === "auth_expired" ? "auth" : "tools");
+                        setOpenMcpId(row.id);
+                      }}
+                    />
+                  )}
+                </>
               )}
             </div>
           )}
@@ -459,9 +615,141 @@ function ConnectionsIndex({
               />
             </SettingsDrawer>
           )}
+          {hostedBoard && mcpConnectOpen && canWrite && (
+            <CustomMcpConnectDrawer
+              onClose={() => setMcpConnectOpen(false)}
+              onConnected={(created) => {
+                setMcpConnectOpen(false);
+                setMcpRows((cur) => [created, ...cur.filter((item) => item.id !== created.id)]);
+                setMcpLoaded(true);
+                setOpenMcpTab("tools");
+                setOpenMcpId(created.id);
+                refresh();
+              }}
+              onOAuthStarted={() => {
+                loadCustomMcp();
+              }}
+            />
+          )}
+          {hostedBoard && openMcp && (
+            <CustomMcpInspectDrawer
+              key={`${openMcp.id}:${openMcpTab}`}
+              connection={openMcp}
+              canWrite={canWrite}
+              initialTab={openMcpTab}
+              onClose={() => {
+                setOpenMcpId(null);
+                setMcpFocus(null);
+              }}
+              onUpdated={(next) => {
+                setMcpRows((cur) => cur.map((item) => (item.id === next.id ? next : item)));
+                if (listRes) void listRes.invalidate();
+              }}
+              onRevoked={(revokedId) => {
+                setOpenMcpId(null);
+                setMcpRows((cur) => cur.filter((item) => item.id !== revokedId));
+                refresh();
+              }}
+            />
+          )}
         </>
       )}
     </section>
+  );
+}
+
+function CustomMcpReturnBanner({
+  returned,
+  connection,
+  onDismiss,
+}: {
+  returned: CustomMcpReturn;
+  connection: CustomMcpConnectionSummary | null;
+  onDismiss: () => void;
+}) {
+  const t = useTranslate();
+  const ok = returned.outcome === "connected";
+  const label = connection?.name ?? t("Custom MCP server");
+  const text = ok
+    ? connection
+      ? t("{label} connected · {count} pinned tools ready for review.")
+          .replace("{label}", () => label)
+          .replace("{count}", String(connection.tools_summary.total))
+      : t("{label} sign-in finished — check your Custom MCP servers below.").replace("{label}", () => label)
+    : returned.outcome === "cancelled"
+      ? t("Custom MCP OAuth sign-in was cancelled. Nothing was changed.")
+      : t("Couldn't complete Custom MCP OAuth sign-in. Nothing was changed.");
+  return (
+    <div
+      className="card px-3 py-2 mb-3 flex flex-wrap items-center gap-2 min-w-0"
+      role={ok ? "status" : "alert"}
+      data-state={ok ? "hosted-connected" : "hosted-failed"}
+    >
+      <span className={`text-label break-words min-w-0 flex-1 ${ok ? "text-ok" : "text-fail"}`}>
+        {text}
+      </span>
+      <Button size="sm" variant="ghost" onClick={onDismiss}>{t("Dismiss")}</Button>
+    </div>
+  );
+}
+
+function CustomMcpServerList({
+  rows,
+  highlightId,
+  readOnly,
+  onOpen,
+}: {
+  rows: CustomMcpConnectionSummary[];
+  highlightId: string | null;
+  readOnly: boolean;
+  onOpen: (row: CustomMcpConnectionSummary) => void;
+}) {
+  const t = useTranslate();
+  return (
+    <div className="space-y-1.5 min-w-0" data-connections-group="custom-mcp">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="slabel">
+          {readOnly ? t("Shared Custom MCP servers (read-only)") : t("Custom MCP servers")}
+        </h2>
+      </div>
+      <ul className="settings-rows" aria-label={t("Custom MCP servers")}>
+        {rows.map((row) => {
+          const status = customMcpStatusView(row);
+          const statusClass =
+            status.tone === "ok"
+              ? "bg-ok/10 text-ok"
+              : status.tone === "warn"
+                ? "bg-warn/10 text-warn"
+                : status.tone === "fail"
+                  ? "bg-fail/10 text-fail"
+                  : "bg-ink-800 text-ink-400";
+          return (
+            <li key={row.id}>
+              <button
+                type="button"
+                className="settings-row"
+                data-record-id={row.id}
+                data-new={row.id === highlightId ? "true" : undefined}
+                onClick={() => onOpen(row)}
+              >
+                <span className="settings-row-text">
+                  <b>{row.name}</b>
+                  <small className="num">
+                    {row.endpoint_host} · {t(customMcpAuthLabel(row.auth_kind))} · {row.tools_summary.total} {t("tools")}
+                  </small>
+                </span>
+                <span className="conn-row-chips">
+                  <span className="chip bg-ink-800 text-ink-300">
+                    {t(visibilityBadge({ visibility: row.visibility }))}
+                  </span>
+                  <span className={`chip ${statusClass}`}>{t(status.label)}</span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 

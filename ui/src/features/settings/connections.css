@@ -206,3 +206,79 @@
   outline: 1px solid var(--color-accent);
   outline-offset: -1px;
 }
+
+/* CAD-2556: Custom MCP drawer panels, tool mode switches, and read-only Markdown blocks. */
+.custmcp-manual {
+  padding-top: 0.25rem;
+}
+
+.custmcp-tools {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.custmcp-tool {
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius, 0.375rem);
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  min-width: 0;
+}
+
+.custmcp-tool[data-drifted="true"] {
+  border-color: color-mix(in srgb, var(--color-warn) 50%, var(--color-ink-700));
+}
+
+.custmcp-mode-group {
+  display: inline-flex;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.custmcp-mode-btn {
+  padding: 0.25rem 0.55rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+  background: var(--color-ink-875);
+  border-right: 1px solid var(--color-ink-700);
+  cursor: pointer;
+}
+
+.custmcp-mode-btn:last-child {
+  border-right: 0;
+}
+
+.custmcp-mode-btn:hover:not(:disabled) {
+  color: var(--color-ink-100);
+}
+
+.custmcp-mode-btn[aria-checked="true"] {
+  background: color-mix(in srgb, var(--color-accent) 18%, var(--color-ink-850));
+  color: var(--color-ink-100);
+  font-weight: 500;
+}
+
+.custmcp-mode-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.custmcp-pre {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  max-height: 14rem;
+  overflow: auto;
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+  color: var(--color-ink-200);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-micro);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -5,7 +5,12 @@ import {
   type SkillSource,
 } from "agents/skills";
 import type { WorkspaceSkill } from "./contract.ts";
-import { companyOutputSkills, operationalSkills, runtimeHealthSkills } from "./profile.ts";
+import {
+  companyOutputSkills,
+  customMcpSkills,
+  operationalSkills,
+  runtimeHealthSkills,
+} from "./profile.ts";
 
 /**
  * CAD-2395: a workspace's approved skills, as the host serves them.
@@ -121,6 +126,7 @@ export async function runtimeSkillSources(
   return [
     operationalSkills,
     runtimeHealthSkills,
+    customMcpSkills,
     companyOutputSkills,
     ...(workspace === null ? [] : [workspace]),
   ];
