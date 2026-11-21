@@ -109,6 +109,23 @@ fn text(parts: &[TextPartV1]) -> crate::Result<String> {
     Ok(result)
 }
 
+/// AgenticOS's OpenAI-compatible gateway does not enforce constrained
+/// sampling (`strict` is ignored on the gateway). Match Pi 1.4's
+/// `resolveJsonSchemaStrictSampling`: a best-effort `json_schema` hint
+/// (`strict: "prefer"`) degrades to a plain function tool declaration, while
+/// `strict: "require"`, `grammar` constraints, or unknown shapes fail closed.
+fn admits_tool_constrained_sampling(value: Option<&Value>) -> bool {
+    match value {
+        None => true,
+        Some(Value::Object(map)) => {
+            map.len() == 2
+                && map.get("type").and_then(Value::as_str) == Some("json_schema")
+                && map.get("strict").and_then(Value::as_str) == Some("prefer")
+        }
+        Some(_) => false,
+    }
+}
+
 fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
     if turn.messages.is_empty()
         || turn.max_output_tokens == 0
@@ -172,7 +189,9 @@ fn request(turn: &GatewayTurn<'_>) -> crate::Result<Vec<u8>> {
     };
     let mut tools = Vec::with_capacity(declared.len());
     for tool in declared {
-        if tool.constrained_sampling.is_some() || !tool.parameters.is_object() {
+        if !admits_tool_constrained_sampling(tool.constrained_sampling.as_ref())
+            || !tool.parameters.is_object()
+        {
             return Err(unsupported());
         }
         tools.push(json!({
@@ -591,5 +610,74 @@ mod tests {
         assert!(matches!(result, ChildOutcome::Unknown { .. }));
         observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn gateway_accepts_prefer_json_schema_hint_and_refuses_required_or_grammar_constraints() {
+        let small = [user_message("Reply plainly".into())];
+        let read_params = json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string"}
+            }
+        });
+        let prefer = NativeToolV1::parse(&json!({
+            "name": "read",
+            "description": "Read a file",
+            "parameters": read_params,
+            "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+        }))
+        .unwrap();
+        let mut turn = fixture_turn(&GatewayTls::Production, &small);
+        turn.tool_choice = "auto";
+        turn.tools = std::slice::from_ref(&prefer);
+        let wire: Value = serde_json::from_slice(&request(&turn).unwrap()).unwrap();
+        assert_eq!(
+            wire["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": read_params
+                }
+            }])
+        );
+
+        let required = NativeToolV1::parse(&json!({
+            "name": "read",
+            "description": "Read a file",
+            "parameters": read_params,
+            "constrainedSampling": {"type": "json_schema", "strict": "require"}
+        }))
+        .unwrap();
+        turn.tools = std::slice::from_ref(&required);
+        assert_eq!(
+            request(&turn).unwrap_err().code(),
+            Some("unsupported_content")
+        );
+
+        let grammar = NativeToolV1::parse(&json!({
+            "name": "read",
+            "description": "Read a file",
+            "parameters": read_params,
+            "constrainedSampling": {
+                "type": "grammar",
+                "variants": {"openai_lark": "start: \"ok\""}
+            }
+        }))
+        .unwrap();
+        turn.tools = std::slice::from_ref(&grammar);
+        assert_eq!(
+            request(&turn).unwrap_err().code(),
+            Some("unsupported_content")
+        );
+
+        assert!(!admits_tool_constrained_sampling(Some(&json!({
+            "type": "json_schema",
+            "strict": "prefer",
+            "extra": true
+        }))));
     }
 }
