@@ -29,7 +29,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const { renderToStaticMarkup } = require("react-dom/server") as typeof import("react-dom/server");
 const { ThreadTurn } = require("../src/features/home/ThreadView") as typeof import("../src/features/home/ThreadView");
-const { threadItems } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+const { threadItems, threadRuns } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
 const fs = require("fs");
 const path = require("path");
 
@@ -71,6 +71,24 @@ assert(faded[0].style.getPropertyValue("--i") === "0" && faded[1].style.getPrope
 assert(!host.querySelector(".turn-image.turn-card-in"), "live: the image card is not faded");
 assert(host.innerHTML.indexOf("Done.") < host.innerHTML.indexOf("turn-card-in"), "live: the answer paints before the cards");
 await React.act(async () => root.unmount());
+
+// CAD-2552: a run of cards with no agent text is one turn, so it takes the same
+// rules: data cards wait while its turn runs, then fade in; history does not.
+const cardsOnly = [art(1, "art-a"), art(2, "art-b")];
+const grouped = threadRuns(items(cardsOnly));
+assert(grouped.length === 1 && grouped[0].turn, "a cards-only run is grouped into a turn");
+assert(!turn(cardsOnly, true).includes("art-a"), "cards-only: no data card while its turn runs");
+assert(!turn(cardsOnly, false).includes("turn-card-in") && turn(cardsOnly, false).includes("art-a"), "cards-only history: cards, no animation");
+const host2 = document.createElement("div");
+document.body.appendChild(host2);
+const root2 = createRoot(host2);
+const mount2 = async (running: boolean) =>
+  React.act(async () => { root2.render(React.createElement(ThreadTurn, { items: items(cardsOnly), running, onOpenIssue: () => undefined })); });
+await mount2(true);
+assert(!host2.innerHTML.includes("art-a"), "cards-only live: nothing while the turn runs");
+await mount2(false);
+assert(host2.querySelectorAll(".turn-card-in").length === 2, "cards-only live: both cards fade in when the turn ends");
+await React.act(async () => root2.unmount());
 
 // The stylesheet: 4px rise over 180ms, and reduced motion turns it off.
 const css: string = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
