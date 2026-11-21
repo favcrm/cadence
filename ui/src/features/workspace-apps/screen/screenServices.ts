@@ -82,6 +82,11 @@ function sanitized(value: unknown): unknown {
 }
 function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
+  // The hosted create either rejects validation before writing or rolls it back.
+  // Unknown outcomes must stay ambiguous so the screen cannot submit a duplicate.
+  if (operation === "records.create" && status === 400 && error instanceof ApiError && error.code === "validation_failed") {
+    return { code: "validation_failed", text: "The record was not created. Review its fields and try again." };
+  }
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
   }

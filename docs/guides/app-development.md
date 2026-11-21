@@ -126,6 +126,12 @@ Rules:
 - The app still validates its own PUSH payload and its own verb arguments; the
   kit is transport and lifecycle only.
 
+For `records.create`, the host forwards `validation_failed` only for the
+typed HTTP 400 response: it means no create was committed, so the app can
+keep the draft open for correction and resubmission. A generic rejection or
+missing response doesn't establish whether a record was created. Check fresh
+records before offering another create in those cases.
+
 ### Retained source reads
 
 A `screen-actions.v1` screen whose manifest declares the draft alias may read
