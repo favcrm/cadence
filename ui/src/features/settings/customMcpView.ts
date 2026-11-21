@@ -373,17 +373,17 @@ export function parseCustomHeadersInput(raw: string): {
     const name = line.slice(0, colon).trim();
     const value = line.slice(colon + 1).trim();
     if (!HEADER_NAME_RE.test(name) || name.length > 64) {
-      return { headers: [], error: `Invalid header name "${name}".` };
+      return { headers: [], error: "Invalid header name (use letters, digits, and hyphens only)." };
     }
     if (RESERVED_TRANSPORT_HEADERS.has(name.toLowerCase()) || name.toLowerCase().startsWith("x-forwarded-") || name.toLowerCase().startsWith("cf-") || name.toLowerCase().startsWith("x-agenticos-")) {
-      return { headers: [], error: `Header "${name}" cannot be overridden.` };
+      return { headers: [], error: "A reserved transport header cannot be overridden." };
     }
     if (!value || value.length > 4096) {
-      return { headers: [], error: `Header "${name}" must have a non-empty value.` };
+      return { headers: [], error: "Each header must have a non-empty value." };
     }
     const lower = name.toLowerCase();
     if (seen.has(lower)) {
-      return { headers: [], error: `Duplicate header "${name}".` };
+      return { headers: [], error: "Duplicate header names are not allowed." };
     }
     seen.add(lower);
     headers.push({ name, value });

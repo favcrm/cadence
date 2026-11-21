@@ -672,7 +672,10 @@ function CustomMcpReturnBanner({
   const label = connection?.name ?? t("Custom MCP server");
   const text = ok
     ? connection
-      ? t("{label} connected · {count} pinned tools ready for review.")
+      ? (connection.tools_summary.total === 1
+          ? t("{label} connected · 1 pinned tool ready for review.")
+          : t("{label} connected · {count} pinned tools ready for review.")
+        )
           .replace("{label}", () => label)
           .replace("{count}", String(connection.tools_summary.total))
       : t("{label} sign-in finished — check your Custom MCP servers below.").replace("{label}", () => label)
