@@ -1034,13 +1034,19 @@ pub(crate) fn agent_facts_by_uid_in(
     uid: &str,
 ) -> Result<Option<AgentFacts>> {
     conn.query_opt(
-        "SELECT role,model,effort FROM agents WHERE uid=?1",
+        "SELECT alias,role,model,effort FROM agents WHERE uid=?1",
         [uid],
         |row| {
+            let alias: String = row.get(0)?;
+            let stored_role: String = row.get(1)?;
             Ok(AgentFacts {
-                role: row.get(0)?,
-                model: row.get(1)?,
-                effort: row.get(2)?,
+                role: if alias == "master" {
+                    "master".to_string()
+                } else {
+                    stored_role
+                },
+                model: row.get(2)?,
+                effort: row.get(3)?,
             })
         },
     )
@@ -1092,5 +1098,88 @@ impl crate::store::Store {
 
     pub(crate) fn native_model_message(&self, message_id: &str) -> Result<Option<DurableMessage>> {
         self.read_tx(|conn| durable_message_in(&*conn, message_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::{NewAgent, Store};
+
+    #[test]
+    fn agent_facts_resolves_master_role_from_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workdir = dir.path().join("cwd");
+        std::fs::create_dir_all(&workdir).expect("create cwd");
+        let workdir_str = workdir.to_str().expect("utf8 path");
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).expect("open store");
+
+        store
+            .register_agent(&NewAgent {
+                alias: "master",
+                provider: "pi",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: workdir_str,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(r#"{"model":"agenticos/vendor-x/fixture-flash","effort":"off"}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .expect("register master");
+        store
+            .register_agent(&NewAgent {
+                alias: "worker-1",
+                provider: "pi",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: workdir_str,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(r#"{"model":"vendor-x/other","effort":"off"}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .expect("register worker-1");
+        store
+            .write_tx(|tx| {
+                tx.execute(
+                    "UPDATE agents SET model='agenticos/vendor-x/fixture-flash', effort='off' WHERE alias='master'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE agents SET model='vendor-x/other', effort='off' WHERE alias='worker-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("set agent model/effort");
+
+        let master_uid = store
+            .agent_uid_for_alias("master")
+            .expect("lookup master uid")
+            .expect("master uid present");
+        let worker_uid = store
+            .agent_uid_for_alias("worker-1")
+            .expect("lookup worker uid")
+            .expect("worker uid present");
+
+        let master = store
+            .native_model_agent(&master_uid)
+            .expect("read master facts")
+            .expect("master row present");
+        assert_eq!(master.role, "master");
+        assert_eq!(
+            master.model.as_deref(),
+            Some("agenticos/vendor-x/fixture-flash")
+        );
+        assert_eq!(master.effort.as_deref(), Some("off"));
+
+        let worker = store
+            .native_model_agent(&worker_uid)
+            .expect("read worker facts")
+            .expect("worker row present");
+        assert_eq!(worker.role, "worker");
+        assert_eq!(worker.model.as_deref(), Some("vendor-x/other"));
     }
 }

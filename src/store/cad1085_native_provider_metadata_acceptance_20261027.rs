@@ -10,7 +10,9 @@ use tempfile::TempDir;
 
 use crate::error::Result;
 use crate::pi_policy::PiPolicy;
-use crate::store::connection_dispatch::{require_model_provider_in, role_model_policy_in};
+use crate::store::connection_dispatch::{
+    require_model_provider_in, require_native_model_provider_in, role_model_policy_in,
+};
 use crate::store::Store;
 
 const MODEL: &str = "devin/cad1085-metadata-fixture-high";
@@ -155,4 +157,54 @@ fn cad1085_native_provider_metadata_same_id_reassignment_refused() {
 
     save_models(&store, json!([{"id": MODEL}]));
     expect_provider_refusal(&store, "metadata without a provider must refuse");
+}
+
+#[test]
+fn cad2576_native_model_provider_guard_accepts_full_or_bare_id_uniquely() {
+    let temp = TempDir::new().expect("temporary isolated store directory");
+    let store = Store::open(&temp.path().join("native-provider-guard.sqlite3"))
+        .expect("open a real migrated fixture Store");
+    let full = "agenticos/vendor-x/fixture-flash";
+    let bare = "vendor-x/fixture-flash";
+    let agenticos = "agenticos";
+
+    let check =
+        || store.read_tx(|conn| require_native_model_provider_in(&*conn, full, bare, agenticos));
+
+    // Accepts unique prefixed Settings > Agents row (`agenticos/<vendor>/<model>`).
+    save_models(&store, json!([{"id": full, "provider": agenticos}]));
+    check().expect("unique full prefixed model row must be accepted");
+
+    // Accepts unique bare catalog ID row (`<vendor>/<model>`).
+    save_models(&store, json!([{"id": bare, "provider": agenticos}]));
+    check().expect("unique bare model row must be accepted");
+
+    // Refuses reassigned provider on either form.
+    save_models(&store, json!([{"id": full, "provider": OTHER}]));
+    assert_eq!(
+        check().expect_err("reassigned provider must refuse").code(),
+        Some("operation_not_granted")
+    );
+
+    // Refuses ambiguous duplicate rows across prefixed and bare forms.
+    save_models(
+        &store,
+        json!([
+            {"id": full, "provider": agenticos},
+            {"id": bare, "provider": agenticos}
+        ]),
+    );
+    assert_eq!(
+        check()
+            .expect_err("duplicate prefixed + bare rows must refuse")
+            .code(),
+        Some("operation_not_granted")
+    );
+
+    // Refuses missing metadata.
+    save_models(&store, json!([]));
+    assert_eq!(
+        check().expect_err("missing metadata must refuse").code(),
+        Some("operation_not_granted")
+    );
 }
