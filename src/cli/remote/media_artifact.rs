@@ -1,19 +1,19 @@
 //! Remote platform media artifact download, atomic private spooling, and
 //! digest-verified publication.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use cadence_agent::fd_fs::{self, DirFd};
 use cadence_agent::remote_cli::{call_verb, RemoteAnswer, RemoteTarget};
 use cadence_agent::{Error, Result};
 use serde_json::{json, Map, Value};
@@ -90,8 +90,8 @@ where
 // inaccessible to other users. Both it and the destination directory stay
 // open: renaming a directory cannot substitute the verified file at publish.
 struct MediaArtifactSpool {
-    parent: File,
-    directory: File,
+    parent: DirFd,
+    directory: DirFd,
     directory_name: CString,
     file: Option<File>,
 }
@@ -102,43 +102,27 @@ impl MediaArtifactSpool {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let parent = File::open(parent_path)
+        let parent = DirFd::open_dir(parent_path)
             .map_err(|e| Error::rejected(format!("cannot open destination directory: {e}")))?;
         let directory_name = CString::new(format!(
             ".cadence-media-artifact-{}",
             uuid::Uuid::new_v4().simple()
         ))
         .expect("generated directory name contains no NUL");
-        // SAFETY: parent is open and directory_name is a single generated component.
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), directory_name.as_ptr(), 0o700) } != 0 {
-            return Err(Error::rejected(format!(
-                "cannot create private media artifact spool: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: open a directory relative to parent, without following a substitute symlink.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                directory_name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(Error::rejected(format!(
-                "cannot open private media artifact spool: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: fd was just returned by openat and is not owned elsewhere.
-        let directory = unsafe { File::from_raw_fd(fd) };
-        let metadata = directory
-            .metadata()
+        parent.mkdir(&directory_name, 0o700).map_err(|e| {
+            Error::rejected(format!("cannot create private media artifact spool: {e}"))
+        })?;
+        let directory = parent.open_child_dir(&directory_name).map_err(|e| {
+            Error::rejected(format!("cannot open private media artifact spool: {e}"))
+        })?;
+        let stat = directory
+            .stat()
             .map_err(|e| Error::rejected(format!("cannot inspect media artifact spool: {e}")))?;
         // A foreign user could have replaced the name between mkdirat and openat.
-        // SAFETY: `geteuid` is always safe to call and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        if metadata.uid() != euid || metadata.mode() & 0o077 != 0 {
+        let euid = fd_fs::geteuid();
+        #[allow(clippy::useless_conversion)]
+        let mode: u32 = stat.st_mode.into();
+        if stat.st_uid != euid || mode & 0o077 != 0 {
             return Err(Error::rejected(
                 "media artifact spool directory is not private",
             ));
@@ -149,23 +133,17 @@ impl MediaArtifactSpool {
             directory_name,
             file: None,
         };
-        // SAFETY: directory is private and pinned; O_EXCL refuses any existing name.
-        let fd = unsafe {
-            libc::openat(
-                spool.directory.as_raw_fd(),
-                c"artifact".as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        let file = spool
+            .directory
+            .open_file_nofollow(
+                c"artifact",
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
                 0o600,
             )
-        };
-        if fd < 0 {
-            return Err(Error::rejected(format!(
-                "cannot open private media artifact spool: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: fd was just returned by openat and is not owned elsewhere.
-        spool.file = Some(unsafe { File::from_raw_fd(fd) });
+            .map_err(|e| {
+                Error::rejected(format!("cannot open private media artifact spool: {e}"))
+            })?;
+        spool.file = Some(file);
         Ok(spool)
     }
 
@@ -174,9 +152,12 @@ impl MediaArtifactSpool {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        match (self.parent.metadata(), fs::metadata(parent)) {
+        match (
+            self.parent.stat(),
+            DirFd::open_dir(parent).and_then(|dir| dir.stat()),
+        ) {
             (Ok(pinned), Ok(current)) => {
-                pinned.dev() == current.dev() && pinned.ino() == current.ino()
+                pinned.st_dev == current.st_dev && pinned.st_ino == current.st_ino
             }
             _ => false,
         }
@@ -203,28 +184,14 @@ impl MediaArtifactSpool {
         }
         // Prefer a no-replace rename: some filesystems cannot make hard links.
         // Both directories are pinned and the source is private.
-        let renamed =
-            media_rename_noreplace(self.directory.as_raw_fd(), self.parent.as_raw_fd(), &leaf)
-                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
+        let renamed = self
+            .directory
+            .rename_child_to_noreplace(c"artifact", &self.parent, &leaf)
+            .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
         if !renamed {
-            // SAFETY: linkat refuses an existing destination and only resolves
-            // the source name inside our pinned private directory.
-            let rc = unsafe {
-                libc::linkat(
-                    self.directory.as_raw_fd(),
-                    c"artifact".as_ptr(),
-                    self.parent.as_raw_fd(),
-                    leaf.as_ptr(),
-                    0,
-                )
-            };
-            if rc != 0 {
-                return Err(Error::rejected(format!(
-                    "cannot create {}: {}",
-                    out.display(),
-                    io::Error::last_os_error()
-                )));
-            }
+            self.directory
+                .link_child_to(c"artifact", &self.parent, &leaf)
+                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
         }
         let same_file = match (
             self.file.as_ref().expect("opened spool").metadata(),
@@ -245,78 +212,15 @@ impl MediaArtifactSpool {
     }
 }
 
-fn media_rename_noreplace(source: RawFd, destination: RawFd, leaf: &CStr) -> io::Result<bool> {
-    #[cfg(target_os = "linux")]
-    // SAFETY: both descriptors are open directories and both names are valid C strings.
-    let rc = unsafe {
-        libc::renameat2(
-            source,
-            c"artifact".as_ptr(),
-            destination,
-            leaf.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(target_vendor = "apple")]
-    // SAFETY: both descriptors are open directories and both names are valid C strings.
-    let rc = unsafe {
-        libc::renameatx_np(
-            source,
-            c"artifact".as_ptr(),
-            destination,
-            leaf.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    {
-        if rc == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-        ) {
-            return Ok(false);
-        }
-        Err(error)
-    }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        let _ = (source, destination, leaf);
-        Ok(false)
-    }
-}
-
 impl Drop for MediaArtifactSpool {
     fn drop(&mut self) {
-        // SAFETY: this name is relative to the private directory we opened.
-        unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"artifact".as_ptr(), 0) };
+        let _ = self.directory.unlink_child(c"artifact");
         // Remove the directory only if its original name still identifies our
         // pinned directory. A renamed or substituted directory is left alone.
-        // SAFETY: `self.parent` is a live open directory fd and `directory_name`
-        // is a valid NUL-terminated single path component.
-        let fd = unsafe {
-            libc::openat(
-                self.parent.as_raw_fd(),
-                self.directory_name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: fd was just returned by openat and is not owned elsewhere.
-            let current = unsafe { File::from_raw_fd(fd) };
-            if let (Ok(a), Ok(b)) = (current.metadata(), self.directory.metadata()) {
-                if a.dev() == b.dev() && a.ino() == b.ino() {
-                    // SAFETY: removes only an empty directory at this basename.
-                    unsafe {
-                        libc::unlinkat(
-                            self.parent.as_raw_fd(),
-                            self.directory_name.as_ptr(),
-                            libc::AT_REMOVEDIR,
-                        )
-                    };
+        if let Ok(current) = self.parent.open_child_dir(&self.directory_name) {
+            if let (Ok(a), Ok(b)) = (current.stat(), self.directory.stat()) {
+                if a.st_dev == b.st_dev && a.st_ino == b.st_ino {
+                    let _ = self.parent.rmdir_child(&self.directory_name);
                 }
             }
         }
