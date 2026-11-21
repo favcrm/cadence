@@ -232,6 +232,11 @@ interrupted, no model was available, or the model could not write it. It never
 carries provider text. Sending the next message continues the conversation:
 the engine does not repeat the failed compaction for it.
 
+**Answer output limit.** This is separate from the context budget. When
+reasoning uses the full output budget before any answer text, Home shows a
+failed turn and suggests splitting the task. If the model wrote partial
+answer text, Home still shows it.
+
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns personal, workspace, company-agent or agent-profile context, and
