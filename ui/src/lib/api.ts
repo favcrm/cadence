@@ -37,6 +37,14 @@ import type {
   ConnectionsPayload,
   ConnectionVerificationPayload,
   CredentialRequest,
+  CustomMcpAuthKind,
+  CustomMcpConnectionPayload,
+  CustomMcpCreatePayload,
+  CustomMcpGuideImportPayload,
+  CustomMcpListPayload,
+  CustomMcpOAuthStartPayload,
+  CustomMcpRevokePayload,
+  CustomMcpToolMode,
   Health,
   ProjectTimeline,
   ProtectedEntry,
@@ -531,6 +539,22 @@ async function put<T>(path: string, body: object, operation?: PrivateOperation):
         ...sessionHeaders(),
       },
       body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+  });
+}
+
+/** A board delete whose response is its own JSON. */
+async function del<T>(path: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "DELETE",
+      headers: {
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
@@ -1442,6 +1466,69 @@ export const api = {
       `/api/connections/${encodeURIComponent(id)}/revoke`,
       {},
     ),
+  /** CAD-2556 / AOS-682: Custom MCP connectors on a hosted workspace. */
+  customMcpList: (details = true) =>
+    get<CustomMcpListPayload>(details ? "/api/connections/mcp" : "/api/connections/mcp?details=false"),
+  customMcpCreate: (body: {
+    name: string;
+    endpoint_url: string;
+    auth_kind?: CustomMcpAuthKind;
+    visibility?: "shared" | "personal";
+    bearer_token?: string;
+    custom_headers?: Array<{ name: string; value: string }>;
+    oauth_client?: { client_id: string; client_secret?: string; scopes?: string[] };
+    return_to?: string;
+  }) => post<CustomMcpCreatePayload>("/api/connections/mcp", body),
+  customMcpOAuthStart: (id: string, body?: { return_to?: string }) =>
+    post<CustomMcpOAuthStartPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/oauth/start`,
+      body ?? {},
+    ),
+  customMcpSync: (id: string) =>
+    post<CustomMcpConnectionPayload>(`/api/connections/mcp/${encodeURIComponent(id)}/sync`, {}),
+  customMcpUpdateTools: (
+    id: string,
+    tools: Array<{ tool_name: string; mode: CustomMcpToolMode }>,
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
+      { tools },
+    ),
+  customMcpAcceptDrift: (
+    id: string,
+    tools?: Array<{ tool_name: string; mode: CustomMcpToolMode }>,
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/accept-drift`,
+      tools ? { tools } : {},
+    ),
+  customMcpRotateAuth: (
+    id: string,
+    body: {
+      auth_kind: "bearer" | "header" | "none";
+      bearer_token?: string;
+      custom_headers?: Array<{ name: string; value: string }>;
+    },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/auth`,
+      body,
+    ),
+  customMcpUpdateGuide: (
+    id: string,
+    body: { markdown: string; source?: string | null },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/guide`,
+      body,
+    ),
+  customMcpImportGuide: (id: string, url: string) =>
+    post<CustomMcpGuideImportPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/guide/import`,
+      { url },
+    ),
+  customMcpRevoke: (id: string) =>
+    del<CustomMcpRevokePayload>(`/api/connections/mcp/${encodeURIComponent(id)}`),
   /**
    * `POST /api/connections/<id>/status` — the local configuration
    * check (operator-only). It inspects local configuration only: it

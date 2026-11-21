@@ -13,8 +13,8 @@ export const isPublishToolkit = (value: unknown): value is PublishToolkit =>
 
 export type ConnectOutcome = "connected" | "failed" | "cancelled";
 const OUTCOMES: readonly string[] = ["connected", "failed", "cancelled"];
-/** The params AgenticOS adds to `return_to`; both are removed after they are read. */
-const RETURN_PARAMS = ["aos_connect", "aos_publish", "toolkit"];
+/** The params AgenticOS adds to `return_to`; all are removed after they are read. */
+const RETURN_PARAMS = ["aos_connect", "aos_publish", "toolkit", "connection_id", "mcp_focus"];
 
 /** Where the operator comes back to. `native` is the host-drawn Settings page of this board
  *  (the native workspace's own callers). `screen` is the app's own screen — the one a

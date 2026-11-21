@@ -210,9 +210,14 @@ export function stagedActionId(entry: ThreadEntry): string | null {
   for (const value of candidates) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const result = value as Record<string, unknown>;
-    if (result.staged !== true) continue;
-    const id = str(result.actionId) ?? str(result.action_id);
-    if (id) return norm(id);
+    if (result.staged === true) {
+      const id = str(result.actionId) ?? str(result.action_id);
+      if (id) return norm(id);
+    }
+    if (result.sent === false && typeof result.note === "string") {
+      const id = str(result.action) ?? str(result.actionId) ?? str(result.action_id);
+      if (id) return norm(id);
+    }
   }
   return null;
 }
@@ -254,7 +259,7 @@ const cut = (s: string): string => (s.length > STAGED_VALUE_CHARS ? `${s.slice(0
 const BODY_ROLES = new Set(["body", "text", "message"]);
 
 export function stagedFields(write: StagedWrite): { fields: StagedField[]; more: number; body: string | null } {
-  const preview = write.connected?.preview;
+  const preview = write.connected?.preview ?? write.customMcp?.preview;
   // CAD-2463: a connected effect's message is the body, in full (the preview
   // already caps it at 2,000 characters); the card clamps it, not cuts it.
   const bodyField = preview?.fields.find((field) => BODY_ROLES.has(field.role)) ?? null;
@@ -283,9 +288,14 @@ export function bodyNeedsClamp(body: string): boolean {
   return body.split("\n").length > BODY_CLAMP_LINES || body.length > BODY_CLAMP_CHARS;
 }
 
-/** The sending account a connected effect names, if any. */
+/** The sending account or Custom MCP endpoint a staged effect names, if any. */
 export function stagedAccount(write: StagedWrite): string | null {
-  const account = write.connected?.preview?.account ?? write.connected?.account ?? null;
+  const account =
+    write.connected?.preview?.account ??
+    write.connected?.account ??
+    write.customMcp?.preview?.account ??
+    write.customMcp?.endpointHost ??
+    null;
   return account && account.trim() !== "" ? account.trim() : null;
 }
 
@@ -329,6 +339,11 @@ export function outsideDomainRecipients(write: StagedWrite): number {
  * uncertain result never reads as success.
  */
 export function stagedStatus(write: StagedWrite, outcome: StagedOutcome, railWord: string): string {
+  if (write.customMcp != null) {
+    if (outcome === "applied") return "Ran";
+    if (outcome === "failed") return "Couldn't run";
+    return railWord;
+  }
   const effect = write.connected?.effect;
   if (!effect) return railWord;
   if (outcome === "applied") return effect === "send" ? "Sent" : "Draft saved";

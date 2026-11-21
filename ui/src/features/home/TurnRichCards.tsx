@@ -148,9 +148,9 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
   const [fullBody, setFullBody] = useState(false);
   const view = stagedChipView(write);
   const { fields, more, body } = stagedFields(write);
-  const preview = write.connected?.preview;
+  const preview = write.connected?.preview ?? write.customMcp?.preview;
   const title = preview?.title ?? view.title;
-  const app = preview?.toolkitLabel ?? write.connected?.toolkit ?? view.app;
+  const app = preview?.toolkitLabel ?? write.customMcp?.connectionName ?? write.connected?.toolkit ?? view.app;
   const account = stagedAccount(write);
   const outside = outsideDomainRecipients(write);
   const status = stagedStatus(write, view.outcome, view.status);

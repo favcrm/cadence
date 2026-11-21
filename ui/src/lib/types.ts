@@ -1820,6 +1820,109 @@ export interface Connection {
   /** CAD-2428: hosted platform account details. Untrusted wire value — read it only through
    *  `hostedAccount` (connectionsView), which treats a malformed shape as absent. */
   hosted?: unknown;
+  /** AOS-682 / CAD-2556: additive Custom MCP metadata projected on `/api/connections`. */
+  custom_mcp?: unknown;
+}
+
+export type CustomMcpAuthKind = "auto" | "oauth" | "oauth_static" | "bearer" | "header" | "none";
+export type CustomMcpStoredAuthKind = "oauth" | "oauth_static" | "bearer" | "header" | "none";
+export type CustomMcpToolMode = "off" | "approval" | "read";
+export type CustomMcpStatus = "pending_oauth" | "active" | "auth_expired" | "needs_review" | "revoked";
+
+export interface CustomMcpToolPin {
+  tool_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  annotations: Record<string, unknown> | null;
+  tool_digest: string;
+  mode: CustomMcpToolMode;
+  drifted: boolean;
+  pending_description: string | null;
+  pending_tool_digest: string | null;
+  updated_at: number;
+}
+
+export interface CustomMcpToolsSummary {
+  total: number;
+  read: number;
+  approval: number;
+  off: number;
+  drifted: number;
+}
+
+export interface CustomMcpConnectionSummary {
+  id: string;
+  name: string;
+  endpoint_url: string;
+  endpoint_host: string;
+  auth_kind: CustomMcpStoredAuthKind;
+  auth_hint: string | null;
+  oauth_issuer: string | null;
+  oauth_scopes: string[];
+  oauth_account: string | null;
+  visibility: "shared" | "personal";
+  status: CustomMcpStatus;
+  snapshot_revision: number;
+  pending_revision: number | null;
+  server_name: string | null;
+  server_version: string | null;
+  server_instructions_digest: string | null;
+  has_server_instructions: boolean;
+  instructions_drifted: boolean;
+  has_agent_guide: boolean;
+  agent_guide_source: string | null;
+  last_synced_at: number | null;
+  last_used_at: number | null;
+  created_at: number;
+  updated_at: number;
+  connected_by_you?: boolean;
+  tools_summary: CustomMcpToolsSummary;
+  tools?: CustomMcpToolPin[];
+  server_instructions?: string | null;
+  pending_server_instructions?: string | null;
+  agent_guide_md?: string | null;
+}
+
+export interface CustomMcpListPayload {
+  connections: CustomMcpConnectionSummary[];
+}
+
+export interface CustomMcpOAuthDiscovery {
+  issuer: string | null;
+  authorization_host: string;
+  registration: "dcr" | "static";
+  scopes: string[];
+  resource_metadata_url: string | null;
+}
+
+export type CustomMcpCreatePayload =
+  | { mode: "connected"; connection: CustomMcpConnectionSummary }
+  | {
+      mode: "oauth_redirect";
+      authorization_url: string;
+      connection_id: string;
+      discovery?: CustomMcpOAuthDiscovery;
+    };
+
+export interface CustomMcpOAuthStartPayload {
+  authorization_url: string;
+  connection_id: string;
+  discovery?: CustomMcpOAuthDiscovery;
+}
+
+export interface CustomMcpConnectionPayload {
+  connection: CustomMcpConnectionSummary;
+}
+
+export interface CustomMcpGuideImportPayload {
+  markdown: string;
+  source_url: string;
+  bytes: number;
+}
+
+export interface CustomMcpRevokePayload {
+  id: string;
+  status: string;
 }
 
 /** CAD-2428: one published tool an account can run. draft/send always wait for approval. */
