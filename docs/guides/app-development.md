@@ -363,7 +363,10 @@ and bounds. The board then positions its dock over the measured pane without
 shortening the iframe. It sends `{v:2, op:"whatsapp-reply-inset", nomination, seq, px}`.
 `seq` increases within a nomination; `px` is the requested height, including
 bottom safe-area space, in whole CSS pixels from 0 to 512 (zero means hidden).
-Reserve it in the right conversation pane only, including room for its controls.
+Apply the clearance to the conversation's scroll content, not to the frame or
+the inbox rail. The WABA composer is a solid board-owned card over the pane;
+its bottom inset becomes trailing space in the message list so the latest
+message can scroll clear.
 After the inset and pinned scroll position are committed, echo `nomination`,
 `seq` and `px` in `{v:2, op:"whatsapp-reply-inset-ready", nomination, seq, px}`.
 The board only paints within confirmed space. Ignore old nominations and sequences.

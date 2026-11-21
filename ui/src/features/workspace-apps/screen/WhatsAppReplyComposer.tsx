@@ -227,14 +227,16 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     : attempt?.outcome === "accepted" ? (zh ? "WhatsApp 已接收，但未確認送達。" : "WhatsApp accepted the message; delivery isn’t confirmed.")
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
+  const status = note && <div className="wa-reply-status">
+    <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
+    {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
+  </div>;
 
   return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
-    {note && <div className="wa-reply-status">
-      <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
-      {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
-    </div>}
+    {!overlay && status}
     <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
+      {overlay && status}
       {(!overlay || recipient) && <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
