@@ -346,6 +346,31 @@ describe("board transcript identity", () => {
     ]);
   });
 
+  it("reports a terminal output limit when there is no visible answer", () => {
+    const reasoning: AssistantMessage["content"] = [
+      { type: "thinking", thinking: "Working through the request." },
+      { type: "text", text: " \n" },
+    ];
+    const failed = {
+      role: "agent",
+      kind: "turn_result",
+      text: "",
+      payload: {
+        status: "failed",
+        error: "The model reached its output limit before answering. Split the task and try again.",
+      },
+    };
+    for (const content of [[], reasoning]) {
+      const records = [input("1", "Draft the invoice"), assistant("2", content, "length")];
+      for (const includeThinking of [false, true]) {
+        const entries = threadEntries(records, includeThinking);
+        expect(entries.filter((entry) => entry.kind === "turn_result")).toEqual([
+          expect.objectContaining(failed),
+        ]);
+      }
+    }
+  });
+
   // Preserved from AgenticOS AOS-389; only test-runner/module imports move.
   describe("failed assistant turns", () => {
     const failed = (id: string, errorMessage?: string): EntryRecord => {

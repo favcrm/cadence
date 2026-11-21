@@ -56939,7 +56939,10 @@ function threadEntries(records, includeThinking, budgetProof, settledBudgetProof
           ...operator && payload !== undefined ? { payload } : {}
         });
       }
-      if (message.role === "assistant" && (terminalError(all, position) || message.stopReason === "error" && all[position + 1] === undefined && settledBudgetProof?.(record, message.errorMessage) === true)) {
+      if (!agent)
+        continue;
+      const outputLimitWithoutAnswer = message.stopReason === "length" && textCount === 0;
+      if (outputLimitWithoutAnswer || terminalError(all, position) || message.stopReason === "error" && all[position + 1] === undefined && settledBudgetProof?.(record, message.errorMessage) === true) {
         entries.push({
           seq: entries.length + 1,
           role: "agent",
@@ -56948,7 +56951,7 @@ function threadEntries(records, includeThinking, budgetProof, settledBudgetProof
           ...createdAt(message.timestamp),
           payload: {
             status: "failed",
-            error: budgetProof?.(record, message.errorMessage) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(message.errorMessage)
+            error: outputLimitWithoutAnswer ? "The model reached its output limit before answering. Split the task and try again." : budgetProof?.(record, message.errorMessage) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(message.errorMessage)
           }
         });
       }
