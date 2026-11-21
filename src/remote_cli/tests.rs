@@ -6709,6 +6709,7 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
     const ZIP: &[u8] =
         b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
     const DIGEST: &str = "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85";
+    const ARTIFACT_ID: &str = "art-0123456789abcdef0123456789abcdef";
 
     #[derive(Clone, Copy)]
     enum Case {
@@ -6790,7 +6791,7 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
                 let mut envelope = String::new();
                 loop {
                     line.clear();
-                    reader.read_line(&mut line).unwrap();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
                     if line == "\r\n" {
                         break;
                     }
@@ -6844,6 +6845,12 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
                         assert!(raw
                             .windows(b"private-app-zip".len())
                             .any(|part| part == b"private-app-zip"));
+                        for field in ["id", "issue", "label", "customer"] {
+                            let marker = format!("name=\"{field}\"");
+                            assert!(!raw
+                                .windows(marker.len())
+                                .any(|part| part == marker.as_bytes()));
+                        }
                         if matches!(case, Case::UploadRefused) {
                             write_answer(
                                 &mut socket,
@@ -6856,7 +6863,7 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
                                 &mut socket,
                                 "200 OK",
                                 "",
-                                &json!({"file": {"id": "art-A", "version": 1, "digest": DIGEST}}),
+                                &json!({"file": {"id": ARTIFACT_ID, "version": 1, "digest": DIGEST}}),
                             );
                         }
                     }
@@ -6885,7 +6892,7 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
         let upload = ArtifactUpload {
             kind: "private-app-zip",
             title: "Synthetic private app",
-            id: Some("art-A"),
+            id: None,
             issue: None,
             label: None,
             customer: None,
@@ -6900,7 +6907,9 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
         let trail = server.join().unwrap();
         match case {
             Case::Human => {
-                assert_eq!(result.unwrap()["file"]["digest"], DIGEST);
+                let receipt = result.unwrap();
+                assert_eq!(receipt["file"]["digest"], DIGEST);
+                assert_eq!(receipt["file"]["id"], ARTIFACT_ID);
                 assert_eq!(
                     trail,
                     vec![
@@ -6913,7 +6922,9 @@ fn cad2547_private_zip_upload_uses_the_paired_agent_and_never_falls_back() {
                 );
             }
             Case::Cached => {
-                assert_eq!(result.unwrap()["file"]["digest"], DIGEST);
+                let receipt = result.unwrap();
+                assert_eq!(receipt["file"]["digest"], DIGEST);
+                assert_eq!(receipt["file"]["id"], ARTIFACT_ID);
                 assert_eq!(
                     trail,
                     vec![
