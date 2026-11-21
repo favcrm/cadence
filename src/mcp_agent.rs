@@ -12,13 +12,15 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
 const TOOL_DEADLINE: Duration = Duration::from_secs(35);
+const PRIVATE_APP_WAKE_TIMEOUT_SECS: u64 = 60;
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
 pub fn run(state_dir: &Path) -> Result<i32> {
@@ -58,9 +60,14 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
-                let result = command_args(name, &args, &*list)
-                    .and_then(|argv| invoke(state_dir, &alias, &argv));
+                let result = if is_private_app_tool(name) {
+                    parse_private_app_call(name, &args)
+                        .and_then(|call| execute_private_app_call(state_dir, &alias, call))
+                } else {
+                    let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
+                    command_args(name, &args, &*list)
+                        .and_then(|argv| invoke(state_dir, &alias, &argv))
+                };
                 match result {
                     Ok(text) => json!({"jsonrpc":"2.0","id":id,"result":{
                         "content":[{"type":"text","text":text}]
@@ -109,7 +116,30 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
              "artifact_id":{"type":"string"},
              "message":{"type":"string"},
              "token":{"type":"string"}},
-             "required":["artifact_id","message","token"],"additionalProperties":false}}
+             "required":["artifact_id","message","token"],"additionalProperties":false}},
+        {"name":"private_app_prepare","description":"Stage a private app ZIP package (using kickoff package_ref or a tagged public GitHub release .zip URL) and request owner review or routine-policy preparation without installing it directly. Re-call with the same request_id if the outcome is uncertain.",
+         "inputSchema":{"type":"object","properties":{
+             "package_ref":{"type":"string","description":"Turn-assigned private app package reference from your kickoff."},
+             "url":{"type":"string","description":"Public tagged GitHub release .zip URL (https://github.com/...)."},
+             "install_id":{"type":"string","description":"Target installed private app id (install_...) when updating."},
+             "expected_digest":{"type":"string","description":"Expected current installed sha256:... digest when updating (requires install_id)."},
+             "expected_generation":{"type":"string","description":"Expected current catalog generation when updating (requires install_id)."},
+             "request_id":{"type":"string","description":"Optional idempotency key; deterministically derived when omitted."}},
+             "additionalProperties":false}},
+        {"name":"private_app_status","description":"Read the current state of your private app review request.",
+         "inputSchema":{"type":"object","properties":{
+             "id":{"type":"string","description":"Private app review ID (par_...)."}},
+             "required":["id"],"additionalProperties":false}},
+        {"name":"private_app_apply","description":"Apply a private app review under exact owner authorization or an active patch update policy. On an uncertain outcome, call private_app_reconcile with id before retrying.",
+         "inputSchema":{"type":"object","properties":{
+             "id":{"type":"string","description":"Private app review ID (par_...)."},
+             "digest":{"type":"string","description":"Reviewed app package sha256:... digest."},
+             "zip_sha256":{"type":"string","description":"Reviewed ZIP sha256:... digest."}},
+             "required":["id","digest","zip_sha256"],"additionalProperties":false}},
+        {"name":"private_app_reconcile","description":"Read the authoritative outcome of a private app review or apply without replaying it.",
+         "inputSchema":{"type":"object","properties":{
+             "id":{"type":"string","description":"Private app review ID (par_...)."}},
+             "required":["id"],"additionalProperties":false}}
     ]);
     if let Some(array) = tools.as_array_mut() {
         for tool in platform_tools {
@@ -151,12 +181,16 @@ struct PlatformTool {
     connected_read: bool,
 }
 
-const STATIC_TOOL_NAMES: [&str; 5] = [
+const STATIC_TOOL_NAMES: [&str; 9] = [
     "self",
     "wiki_search",
     "wiki_read",
     "issue_show",
     "app_run_artifact",
+    "private_app_prepare",
+    "private_app_status",
+    "private_app_apply",
+    "private_app_reconcile",
 ];
 
 /// MCP tool names allow only `[A-Za-z0-9_-]`; a platform slug such as
@@ -273,7 +307,6 @@ fn platform_tool_name(
     if used.insert(base.clone()) {
         return base;
     }
-    use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     digest.update(platform.as_bytes());
     digest.update(b"\0");
@@ -536,6 +569,608 @@ fn invoke(state_dir: &Path, alias: &str, argv: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrivateAppCall {
+    Prepare {
+        package_ref: Option<String>,
+        url: Option<String>,
+        install_id: Option<String>,
+        expected_digest: Option<String>,
+        expected_generation: Option<String>,
+        request_id: Option<String>,
+    },
+    Status {
+        id: String,
+    },
+    Apply {
+        id: String,
+        digest: String,
+        zip_sha256: String,
+    },
+    Reconcile {
+        id: String,
+    },
+}
+
+fn is_private_app_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "private_app_prepare"
+            | "private_app_status"
+            | "private_app_apply"
+            | "private_app_reconcile"
+    )
+}
+
+fn valid_package_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_github_zip_url(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 800
+        && value.starts_with("https://github.com/")
+        && value.ends_with(".zip")
+        && !value.bytes().any(|b| b <= 0x20 || b == 0x7f)
+}
+
+fn valid_install_id(value: &str) -> bool {
+    value.strip_prefix("install_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 120
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+fn valid_sha256_prefixed(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn valid_generation(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.chars().all(|c| !c.is_control())
+}
+
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+fn valid_review_id(value: &str) -> bool {
+    value.strip_prefix("par_").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn valid_artifact_id(value: &str) -> bool {
+    value.strip_prefix("art-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn optional_nonempty_str(object: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+        Some(_) => Err(Error::rejected(format!(
+            "tool argument '{key}' must be a non-empty string"
+        ))),
+    }
+}
+
+fn parse_private_app_call(name: &str, args: &Value) -> Result<PrivateAppCall> {
+    match name {
+        "private_app_prepare" => {
+            let object = fields(
+                args,
+                &[
+                    "package_ref",
+                    "url",
+                    "install_id",
+                    "expected_digest",
+                    "expected_generation",
+                    "request_id",
+                ],
+                &[],
+            )?;
+            let package_ref = optional_nonempty_str(object, "package_ref")?;
+            let url = optional_nonempty_str(object, "url")?;
+            if package_ref.is_some() == url.is_some() {
+                return Err(Error::rejected(
+                    "private_app_prepare requires exactly one of 'package_ref' or 'url'",
+                ));
+            }
+            if let Some(ref value) = package_ref {
+                if !valid_package_ref(value) {
+                    return Err(Error::rejected("tool argument 'package_ref' is invalid"));
+                }
+            }
+            if let Some(ref value) = url {
+                if !valid_github_zip_url(value) {
+                    return Err(Error::rejected(
+                        "tool argument 'url' must be a public https://github.com/.../*.zip URL",
+                    ));
+                }
+            }
+            let install_id = optional_nonempty_str(object, "install_id")?;
+            if let Some(ref value) = install_id {
+                if !valid_install_id(value) {
+                    return Err(Error::rejected("tool argument 'install_id' is invalid"));
+                }
+            }
+            let expected_digest = optional_nonempty_str(object, "expected_digest")?;
+            if let Some(ref value) = expected_digest {
+                if !valid_sha256_prefixed(value) {
+                    return Err(Error::rejected(
+                        "tool argument 'expected_digest' must be sha256:<64 hex>",
+                    ));
+                }
+            }
+            let expected_generation = optional_nonempty_str(object, "expected_generation")?;
+            if let Some(ref value) = expected_generation {
+                if !valid_generation(value) {
+                    return Err(Error::rejected(
+                        "tool argument 'expected_generation' is invalid",
+                    ));
+                }
+            }
+            if (expected_digest.is_some() || expected_generation.is_some()) && install_id.is_none()
+            {
+                return Err(Error::rejected(
+                    "expected_digest and expected_generation require install_id",
+                ));
+            }
+            let request_id = optional_nonempty_str(object, "request_id")?;
+            if let Some(ref value) = request_id {
+                if !valid_request_id(value) {
+                    return Err(Error::rejected("tool argument 'request_id' is invalid"));
+                }
+            }
+            Ok(PrivateAppCall::Prepare {
+                package_ref,
+                url,
+                install_id,
+                expected_digest,
+                expected_generation,
+                request_id,
+            })
+        }
+        "private_app_status" | "private_app_reconcile" => {
+            let object = fields(args, &["id"], &["id"])?;
+            let id = object["id"].as_str().unwrap();
+            if !valid_review_id(id) {
+                return Err(Error::rejected("tool argument 'id' must be par_<32 hex>"));
+            }
+            if name == "private_app_status" {
+                Ok(PrivateAppCall::Status { id: id.into() })
+            } else {
+                Ok(PrivateAppCall::Reconcile { id: id.into() })
+            }
+        }
+        "private_app_apply" => {
+            let object = fields(
+                args,
+                &["id", "digest", "zip_sha256"],
+                &["id", "digest", "zip_sha256"],
+            )?;
+            let id = object["id"].as_str().unwrap();
+            let digest = object["digest"].as_str().unwrap();
+            let zip_sha256 = object["zip_sha256"].as_str().unwrap();
+            if !valid_review_id(id) {
+                return Err(Error::rejected("tool argument 'id' must be par_<32 hex>"));
+            }
+            if !valid_sha256_prefixed(digest) {
+                return Err(Error::rejected(
+                    "tool argument 'digest' must be sha256:<64 hex>",
+                ));
+            }
+            if !valid_sha256_prefixed(zip_sha256) {
+                return Err(Error::rejected(
+                    "tool argument 'zip_sha256' must be sha256:<64 hex>",
+                ));
+            }
+            Ok(PrivateAppCall::Apply {
+                id: id.into(),
+                digest: digest.into(),
+                zip_sha256: zip_sha256.into(),
+            })
+        }
+        _ => Err(Error::rejected("unknown Cadence agent tool")),
+    }
+}
+
+fn deterministic_prepare_request_id(
+    source_kind: &str,
+    message_id: &str,
+    source_pin: &str,
+    install_id: Option<&str>,
+    expected_digest: Option<&str>,
+    expected_generation: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    for part in [
+        "cadence-private-app-prepare.v1",
+        source_kind,
+        message_id,
+        source_pin,
+        install_id.unwrap_or(""),
+        expected_digest.unwrap_or(""),
+        expected_generation.unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(5 + 32);
+    out.push_str("parq_");
+    for byte in &digest[..16] {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn merge_custody_pin(
+    arg: Option<String>,
+    custody: Option<&str>,
+    label: &str,
+) -> Result<Option<String>> {
+    match (arg, custody) {
+        (Some(arg), Some(pinned)) if arg != pinned => Err(Error::rejected(format!(
+            "tool argument '{label}' does not match the turn-assigned private app target"
+        ))),
+        (Some(arg), _) => Ok(Some(arg)),
+        (None, Some(pinned)) => Ok(Some(pinned.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn safe_error_token(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    })
+}
+
+fn private_app_conflict_error(op: &str, body: &Value) -> Error {
+    let code = safe_error_token(
+        body.pointer("/error/code")
+            .or_else(|| body.get("code"))
+            .and_then(Value::as_str),
+    );
+    let request_id = safe_error_token(body.pointer("/error/request_id").and_then(Value::as_str));
+    let msg = match (code, request_id) {
+        (Some(code), Some(req)) => format!("{op} conflicted ({code}, request {req})"),
+        (Some(code), None) => format!("{op} conflicted ({code})"),
+        (None, Some(req)) => format!("{op} conflicted (HTTP 409, request {req})"),
+        (None, None) => format!("{op} conflicted (HTTP 409)"),
+    };
+    Error::rejected(msg)
+}
+
+fn resolve_running_message_id(state_dir: &Path, alias: &str) -> Result<String> {
+    let identity = crate::client::rpc(state_dir, "agent_identity", json!({}))?;
+    if identity["alias"].as_str() != Some(alias) {
+        return Err(Error::rejected(
+            "Cadence MCP identity differs from endpoint",
+        ));
+    }
+    let running = identity["running"]
+        .as_array()
+        .ok_or_else(|| Error::rejected("Cadence MCP identity did not report running turns"))?;
+    if running.len() != 1 {
+        return Err(Error::rejected(
+            "private app operations require exactly one active held turn on this endpoint",
+        ));
+    }
+    let message_id = running[0]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::rejected("running turn identity is missing message id"))?;
+    Ok(message_id.to_string())
+}
+
+fn execute_private_app_call(state_dir: &Path, alias: &str, call: PrivateAppCall) -> Result<String> {
+    let message_id = resolve_running_message_id(state_dir, alias)?;
+    let binding =
+        crate::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?
+            .ok_or_else(|| Error::rejected("current turn has no active hosted kickoff binding"))?;
+    let cred_path =
+        crate::local_assignment::reporting::agent_credential_path(state_dir, &message_id)?;
+    let target = crate::remote_cli::RemoteTarget {
+        org: binding.org,
+        endpoint: binding.endpoint,
+        org_id: binding.organization_id,
+        identity: Some(crate::remote_cli::CliIdentityPin {
+            subject_id: binding.subject_id,
+            issuer: binding.issuer,
+        }),
+    };
+    let slot = crate::remote_cli::AgentSlot::new(
+        cred_path,
+        &target,
+        binding.assignment_id,
+        binding.claim_id,
+        binding.generation,
+    );
+    let auth_dir = crate::remote_auth::auth_dir(None).map_err(|_| {
+        Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    execute_private_app_call_with(
+        &auth_dir,
+        state_dir,
+        &message_id,
+        &target,
+        &slot,
+        call,
+        PRIVATE_APP_WAKE_TIMEOUT_SECS,
+    )
+}
+
+fn execute_private_app_call_with(
+    auth_dir: &Path,
+    state_dir: &Path,
+    message_id: &str,
+    target: &crate::remote_cli::RemoteTarget,
+    slot: &crate::remote_cli::AgentSlot,
+    call: PrivateAppCall,
+    wake_timeout: u64,
+) -> Result<String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::rejected("invalid private app wake timeout"))?;
+    match call {
+        PrivateAppCall::Prepare {
+            package_ref,
+            url,
+            mut install_id,
+            mut expected_digest,
+            mut expected_generation,
+            request_id,
+        } => {
+            let mut body = Map::new();
+            let req_id = if let Some(pkg_ref) = package_ref {
+                let (custody, bytes) =
+                    crate::local_assignment::reporting::read_private_app_package(
+                        state_dir, message_id, &pkg_ref,
+                    )?;
+                install_id =
+                    merge_custody_pin(install_id, custody.install_id.as_deref(), "install_id")?;
+                expected_digest = merge_custody_pin(
+                    expected_digest,
+                    custody.expected_digest.as_deref(),
+                    "expected_digest",
+                )?;
+                expected_generation = merge_custody_pin(
+                    expected_generation,
+                    custody.expected_generation.as_deref(),
+                    "expected_generation",
+                )?;
+                if (expected_digest.is_some() || expected_generation.is_some())
+                    && install_id.is_none()
+                {
+                    return Err(Error::rejected(
+                        "expected_digest and expected_generation require install_id",
+                    ));
+                }
+                let upload = crate::remote_cli::ArtifactUpload {
+                    kind: "private-app-zip",
+                    title: &custody.file_name,
+                    id: None,
+                    issue: None,
+                    label: None,
+                    customer: None,
+                    file_name: &custody.file_name,
+                    bytes: &bytes,
+                };
+                let uploaded = crate::remote_cli::upload_artifact_for_slot(
+                    auth_dir,
+                    target,
+                    &upload,
+                    wake_timeout,
+                    slot,
+                    |_| {},
+                )?;
+                let artifact_id = uploaded
+                    .pointer("/file/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| valid_artifact_id(id))
+                    .ok_or_else(|| {
+                        Error::unknown(
+                            "staged private app artifact receipt was malformed; inspect artifacts before retrying",
+                        )
+                    })?;
+                let uploaded_hex = uploaded
+                    .pointer("/file/digest")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::unknown(
+                            "staged private app artifact receipt omitted digest; inspect artifacts before retrying",
+                        )
+                    })?;
+                if format!("sha256:{uploaded_hex}") != custody.zip_sha256 {
+                    return Err(Error::unknown(
+                        "uploaded private app artifact digest did not match staged ZIP; inspect artifacts before retrying",
+                    ));
+                }
+                let req_id = request_id.unwrap_or_else(|| {
+                    deterministic_prepare_request_id(
+                        "artifact",
+                        message_id,
+                        &custody.zip_sha256,
+                        install_id.as_deref(),
+                        expected_digest.as_deref(),
+                        expected_generation.as_deref(),
+                    )
+                });
+                body.insert("request_id".into(), json!(req_id));
+                body.insert("artifact_id".into(), json!(artifact_id));
+                body.insert("zip_sha256".into(), json!(custody.zip_sha256));
+                req_id
+            } else {
+                let url = url.ok_or_else(|| {
+                    Error::rejected("private_app_prepare requires package_ref or url")
+                })?;
+                if (expected_digest.is_some() || expected_generation.is_some())
+                    && install_id.is_none()
+                {
+                    return Err(Error::rejected(
+                        "expected_digest and expected_generation require install_id",
+                    ));
+                }
+                let req_id = request_id.unwrap_or_else(|| {
+                    deterministic_prepare_request_id(
+                        "github",
+                        message_id,
+                        &url,
+                        install_id.as_deref(),
+                        expected_digest.as_deref(),
+                        expected_generation.as_deref(),
+                    )
+                });
+                body.insert("request_id".into(), json!(req_id));
+                body.insert("url".into(), json!(url));
+                req_id
+            };
+            if let Some(install_id) = install_id {
+                body.insert("install_id".into(), json!(install_id));
+            }
+            if let Some(expected_digest) = expected_digest {
+                body.insert("expected_digest".into(), json!(expected_digest));
+            }
+            if let Some(expected_generation) = expected_generation {
+                body.insert("expected_generation".into(), json!(expected_generation));
+            }
+            let mut arguments = Map::new();
+            arguments.insert("operation".into(), json!("call"));
+            arguments.insert("tool".into(), json!("private_app_review_request"));
+            arguments.insert("key".into(), json!(req_id));
+            arguments.insert("body".into(), Value::Object(body));
+            match crate::remote_cli::call_verb_for_slot(
+                auth_dir,
+                target,
+                "platform_call",
+                arguments,
+                deadline,
+                wake_timeout,
+                slot,
+                |_| {},
+            ) {
+                Ok(crate::remote_cli::RemoteAnswer::Ok(val)) => Ok(val.to_string()),
+                Ok(crate::remote_cli::RemoteAnswer::Conflict(body)) => {
+                    Err(private_app_conflict_error("private_app_prepare", &body))
+                }
+                Err(Error::OutcomeUnknown(_)) => Err(Error::unknown(format!(
+                    "private_app_prepare outcome is uncertain; call private_app_prepare again with exact request_id '{req_id}' before creating a new request"
+                ))),
+                Err(error) => Err(error),
+            }
+        }
+        PrivateAppCall::Status { id } => {
+            let mut arguments = Map::new();
+            arguments.insert("operation".into(), json!("call"));
+            arguments.insert("tool".into(), json!("private_app_review_status"));
+            arguments.insert("key".into(), json!(format!("status-{id}")));
+            arguments.insert("body".into(), json!({ "id": id }));
+            match crate::remote_cli::call_verb_for_slot(
+                auth_dir,
+                target,
+                "platform_call",
+                arguments,
+                deadline,
+                wake_timeout,
+                slot,
+                |_| {},
+            )? {
+                crate::remote_cli::RemoteAnswer::Ok(val) => Ok(val.to_string()),
+                crate::remote_cli::RemoteAnswer::Conflict(body) => {
+                    Err(private_app_conflict_error("private_app_status", &body))
+                }
+            }
+        }
+        PrivateAppCall::Reconcile { id } => {
+            let mut arguments = Map::new();
+            arguments.insert("operation".into(), json!("call"));
+            arguments.insert("tool".into(), json!("private_app_review_reconcile"));
+            arguments.insert("key".into(), json!(format!("reconcile-{id}")));
+            arguments.insert("body".into(), json!({ "id": id }));
+            match crate::remote_cli::call_verb_for_slot(
+                auth_dir,
+                target,
+                "platform_call",
+                arguments,
+                deadline,
+                wake_timeout,
+                slot,
+                |_| {},
+            )? {
+                crate::remote_cli::RemoteAnswer::Ok(val) => Ok(val.to_string()),
+                crate::remote_cli::RemoteAnswer::Conflict(body) => {
+                    Err(private_app_conflict_error("private_app_reconcile", &body))
+                }
+            }
+        }
+        PrivateAppCall::Apply {
+            id,
+            digest,
+            zip_sha256,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("operation".into(), json!("call"));
+            arguments.insert("tool".into(), json!("private_app_review_apply"));
+            arguments.insert("key".into(), json!(format!("apply-{id}")));
+            arguments.insert(
+                "body".into(),
+                json!({
+                    "id": id,
+                    "digest": digest,
+                    "zip_sha256": zip_sha256,
+                }),
+            );
+            match crate::remote_cli::call_verb_for_slot(
+                auth_dir,
+                target,
+                "platform_call",
+                arguments,
+                deadline,
+                wake_timeout,
+                slot,
+                |_| {},
+            ) {
+                Ok(crate::remote_cli::RemoteAnswer::Ok(val)) => Ok(val.to_string()),
+                Ok(crate::remote_cli::RemoteAnswer::Conflict(body)) => {
+                    Err(private_app_conflict_error("private_app_apply", &body))
+                }
+                Err(Error::OutcomeUnknown(_)) => Err(Error::unknown(format!(
+                    "private_app_apply outcome is uncertain; call private_app_reconcile with id '{id}' before retrying"
+                ))),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,9 +1338,9 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(argv, expected);
-        // The static five stay reachable, and the listing grows by one.
-        assert_eq!(tools(&[]).as_array().unwrap().len(), 5);
-        assert_eq!(tools(&generated).as_array().unwrap().len(), 6);
+        // The static nine stay reachable, and the listing grows by one.
+        assert_eq!(tools(&[]).as_array().unwrap().len(), 9);
+        assert_eq!(tools(&generated).as_array().unwrap().len(), 10);
         // A dotted tool slug survives as an MCP-safe name.
         assert_eq!(mcp_name_part("email.send"), "email_send");
         assert_eq!(mcp_name_part("account-images"), "account-images");
@@ -725,5 +1360,503 @@ mod tests {
         assert_ne!(names[0].0, names[1].0);
         assert_eq!(names[0].0, "a_b_c");
         assert!(names[1].0.starts_with("a_b_c_"), "{}", names[1].0);
+    }
+
+    #[test]
+    fn private_app_tools_validate_arguments_and_exclude_owner_controls() {
+        let valid_sha = format!("sha256:{}", "a".repeat(64));
+        let valid_par = format!("par_{}", "b".repeat(32));
+        for (name, args) in [
+            ("private_app_review_authorize", json!({"id": valid_par})),
+            (
+                "private_app_update_policy",
+                json!({"operation": "read", "install_id": "install_demo"}),
+            ),
+            ("private_app_prepare", json!({})),
+            (
+                "private_app_prepare",
+                json!({
+                    "package_ref": "pkg_1",
+                    "url": "https://github.com/org/repo/releases/download/v1/app.zip"
+                }),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "path": "/tmp/app.zip"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "file": "/tmp/app.zip"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "org": "other"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "alias": "other"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "provider": "codex"}),
+            ),
+            ("private_app_prepare", json!({"package_ref": "../escape"})),
+            (
+                "private_app_prepare",
+                json!({"url": "http://github.com/org/repo/releases/download/v1/app.zip"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"url": "https://evil.example/org/repo/app.zip"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"url": "https://github.com/org/repo/archive/v1.tar.gz"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "expected_digest": valid_sha}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "expected_generation": "gen_1"}),
+            ),
+            (
+                "private_app_prepare",
+                json!({"package_ref": "pkg_1", "install_id": "bad_id"}),
+            ),
+            ("private_app_status", json!({"id": "par_short"})),
+            ("private_app_reconcile", json!({"id": "par_short"})),
+            (
+                "private_app_apply",
+                json!({"id": valid_par, "digest": valid_sha}),
+            ),
+            (
+                "private_app_apply",
+                json!({"id": valid_par, "digest": "bad", "zip_sha256": valid_sha}),
+            ),
+        ] {
+            assert!(
+                parse_private_app_call(name, &args).is_err(),
+                "expected refusal for {name}: {args}"
+            );
+            assert!(command_args(name, &args, &[]).is_err());
+        }
+
+        let r1 = deterministic_prepare_request_id(
+            "artifact",
+            "msg_1",
+            &valid_sha,
+            Some("install_demo"),
+            Some(&valid_sha),
+            Some("g1"),
+        );
+        let r2 = deterministic_prepare_request_id(
+            "artifact",
+            "msg_1",
+            &valid_sha,
+            Some("install_demo"),
+            Some(&valid_sha),
+            Some("g1"),
+        );
+        let r3 = deterministic_prepare_request_id(
+            "artifact",
+            "msg_2",
+            &valid_sha,
+            Some("install_demo"),
+            Some(&valid_sha),
+            Some("g1"),
+        );
+        assert!(r1.starts_with("parq_") && r1.len() == 37);
+        assert_eq!(r1, r2);
+        assert_ne!(r1, r3);
+    }
+
+    #[test]
+    fn private_app_tools_loopback_end_to_end_and_uncertain_guidance() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!("cad2584-mcp-e2e-{}", uuid::Uuid::new_v4()));
+        let state_dir = root.join("state");
+        let auth_dir = root.join("auth");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&auth_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let zip_bytes = b"PK\x03\x04\x14\x00\x00\x00\x00\x00demo-private-app-zip-payload";
+        let mut zip_hasher = Sha256::new();
+        zip_hasher.update(zip_bytes);
+        let zip_hex = {
+            use std::fmt::Write as _;
+            let mut s = String::with_capacity(64);
+            for b in zip_hasher.finalize() {
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            s
+        };
+        let zip_sha256 = format!("sha256:{zip_hex}");
+        let pkg_digest = format!("sha256:{}", "d".repeat(64));
+        let expected_installed_digest = format!("sha256:{}", "e".repeat(64));
+        let review_id = format!("par_{}", "f".repeat(32));
+        let artifact_id = format!("art-{}", "1".repeat(32));
+        let message_id = "msg-cad2584-e2e";
+
+        let kickoff = crate::local_assignment::Kickoff {
+            alias: "updater",
+            issue_id: "CAD-2584",
+            assignment_id: "hla_test1",
+            worktree: "/tmp/wt",
+            message_id,
+            claim_id: "hlc_test1",
+            generation: 1,
+            organization_id: "org_1",
+            audience: &endpoint,
+            subject_id: Some("sub_12345"),
+            issuer: Some("https://auth.example"),
+        };
+        crate::local_assignment::reporting::store_kickoff_binding(
+            &state_dir,
+            "acme",
+            &endpoint,
+            &kickoff,
+            "update private app",
+        )
+        .unwrap();
+        crate::local_assignment::reporting::store_private_app_package(
+            &state_dir,
+            message_id,
+            "pkg_ref_1",
+            "app-update.zip",
+            zip_bytes,
+            Some("install_app1"),
+            Some(&expected_installed_digest),
+            Some("c1:g1"),
+        )
+        .unwrap();
+
+        let target = crate::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: endpoint.clone(),
+            org_id: "org_1".into(),
+            identity: Some(crate::remote_cli::CliIdentityPin {
+                subject_id: "sub_12345".into(),
+                issuer: "https://auth.example".into(),
+            }),
+        };
+        let cred_path =
+            crate::local_assignment::reporting::agent_credential_path(&state_dir, message_id)
+                .unwrap();
+        let slot = crate::remote_cli::AgentSlot::new(
+            cred_path.clone(),
+            &target,
+            "hla_test1".into(),
+            "hlc_test1".into(),
+            1,
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cached_cred = json!({
+            "version": "cadence-agent-credential.v1",
+            "assignment_id": "hla_test1",
+            "claim_id": "hlc_test1",
+            "generation": 1,
+            "organization_id": "org_1",
+            "audience": endpoint,
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "a".repeat(43)),
+            "expires_at": now + 600,
+        });
+        std::fs::write(&cred_path, cached_cred.to_string()).unwrap();
+        std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let fail_mode = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let fail_mode_srv = Arc::clone(&fail_mode);
+        let recorded_srv = Arc::clone(&recorded);
+        let review_id_srv = review_id.clone();
+        let artifact_id_srv = artifact_id.clone();
+        let zip_hex_srv = zip_hex.clone();
+        let pkg_digest_srv = pkg_digest.clone();
+        let zip_sha_srv = zip_sha256.clone();
+
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                }
+                let Some(hend) = header_end else { continue };
+                let headers = String::from_utf8_lossy(&buf[..hend]).to_string();
+                let first_line = headers.lines().next().unwrap_or("");
+                let path = first_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buf.len() < hend + content_len {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body_bytes = &buf[hend..hend + content_len];
+                let (status, resp_json): (u16, Value) = match path.as_str() {
+                    "/__platform/cli/authorize" => (
+                        200,
+                        json!({"version": "hosted-cadence-cli.v1", "envelope": "hdr.pay.sig"}),
+                    ),
+                    "/__platform/artifacts/upload" => (
+                        200,
+                        json!({"file": {"id": artifact_id_srv, "version": 1, "digest": zip_hex_srv}}),
+                    ),
+                    "/__platform/cli/call" => {
+                        let req: Value = serde_json::from_slice(body_bytes).unwrap();
+                        let args = req["arguments"].clone();
+                        let tool = args["tool"].as_str().unwrap_or("").to_string();
+                        recorded_srv
+                            .lock()
+                            .unwrap()
+                            .push((tool.clone(), args.clone()));
+                        let mode = fail_mode_srv.load(Ordering::SeqCst);
+                        if (mode == 1 && tool == "private_app_review_request")
+                            || (mode == 2 && tool == "private_app_review_apply")
+                        {
+                            (500, json!({"ok": false, "error": {"code": "internal"}}))
+                        } else if mode == 3 {
+                            (
+                                409,
+                                json!({"ok": false, "error": {"code": "installation_stale"}}),
+                            )
+                        } else {
+                            let data = match tool.as_str() {
+                                "private_app_review_request" => json!({
+                                    "id": review_id_srv,
+                                    "state": "pending",
+                                    "outcome": "awaiting_approval",
+                                    "digest": pkg_digest_srv,
+                                    "zip_sha256": zip_sha_srv,
+                                }),
+                                "private_app_review_status" => json!({
+                                    "id": review_id_srv,
+                                    "state": "pending",
+                                    "outcome": "authorized",
+                                }),
+                                "private_app_review_apply" => json!({
+                                    "id": review_id_srv,
+                                    "state": "installed",
+                                    "outcome": "applied",
+                                }),
+                                "private_app_review_reconcile" => json!({
+                                    "id": review_id_srv,
+                                    "state": "installed",
+                                    "outcome": "applied",
+                                }),
+                                _ => json!({}),
+                            };
+                            (200, json!({"ok": true, "data": data}))
+                        }
+                    }
+                    _ => (404, json!({"error": {"code": "not_found"}})),
+                };
+                let body_str = resp_json.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+                    body_str.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let expected_req_id = deterministic_prepare_request_id(
+            "artifact",
+            message_id,
+            &zip_sha256,
+            Some("install_app1"),
+            Some(&expected_installed_digest),
+            Some("c1:g1"),
+        );
+
+        let prepared: Value = serde_json::from_str(
+            &execute_private_app_call_with(
+                &auth_dir,
+                &state_dir,
+                message_id,
+                &target,
+                &slot,
+                parse_private_app_call("private_app_prepare", &json!({"package_ref": "pkg_ref_1"}))
+                    .unwrap(),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prepared["data"]["id"], review_id);
+
+        let status: Value = serde_json::from_str(
+            &execute_private_app_call_with(
+                &auth_dir,
+                &state_dir,
+                message_id,
+                &target,
+                &slot,
+                parse_private_app_call("private_app_status", &json!({"id": review_id})).unwrap(),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["data"]["outcome"], "authorized");
+
+        let applied: Value = serde_json::from_str(
+            &execute_private_app_call_with(
+                &auth_dir,
+                &state_dir,
+                message_id,
+                &target,
+                &slot,
+                parse_private_app_call(
+                    "private_app_apply",
+                    &json!({"id": review_id, "digest": pkg_digest, "zip_sha256": zip_sha256}),
+                )
+                .unwrap(),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied["data"]["outcome"], "applied");
+
+        // Uncertain prepare error names exact request_id for idempotent reconciliation.
+        fail_mode.store(1, Ordering::SeqCst);
+        let prep_err = execute_private_app_call_with(
+            &auth_dir,
+            &state_dir,
+            message_id,
+            &target,
+            &slot,
+            parse_private_app_call("private_app_prepare", &json!({"package_ref": "pkg_ref_1"}))
+                .unwrap(),
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(prep_err, Error::OutcomeUnknown(_)), "{prep_err:?}");
+        assert!(
+            prep_err.to_string().contains(&expected_req_id),
+            "{prep_err}"
+        );
+
+        // Uncertain apply error names private_app_reconcile + review id; reconcile succeeds as a read.
+        fail_mode.store(2, Ordering::SeqCst);
+        let apply_err = execute_private_app_call_with(
+            &auth_dir,
+            &state_dir,
+            message_id,
+            &target,
+            &slot,
+            parse_private_app_call(
+                "private_app_apply",
+                &json!({"id": review_id, "digest": pkg_digest, "zip_sha256": zip_sha256}),
+            )
+            .unwrap(),
+            10,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(apply_err, Error::OutcomeUnknown(_)),
+            "{apply_err:?}"
+        );
+        let apply_msg = apply_err.to_string();
+        assert!(
+            apply_msg.contains("private_app_reconcile") && apply_msg.contains(&review_id),
+            "{apply_msg}"
+        );
+
+        let reconciled: Value = serde_json::from_str(
+            &execute_private_app_call_with(
+                &auth_dir,
+                &state_dir,
+                message_id,
+                &target,
+                &slot,
+                parse_private_app_call("private_app_reconcile", &json!({"id": review_id})).unwrap(),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reconciled["data"]["outcome"], "applied");
+
+        // HTTP 409 conflicts fail closed as Rejected (never returned as Ok).
+        fail_mode.store(3, Ordering::SeqCst);
+        let conflict_err = execute_private_app_call_with(
+            &auth_dir,
+            &state_dir,
+            message_id,
+            &target,
+            &slot,
+            parse_private_app_call(
+                "private_app_apply",
+                &json!({"id": review_id, "digest": pkg_digest, "zip_sha256": zip_sha256}),
+            )
+            .unwrap(),
+            10,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(conflict_err, Error::Rejected(_)),
+            "{conflict_err:?}"
+        );
+        assert!(
+            conflict_err.to_string().contains("installation_stale"),
+            "{conflict_err}"
+        );
+
+        let log = recorded.lock().unwrap();
+        let req_call = log
+            .iter()
+            .find(|(tool, _)| tool == "private_app_review_request")
+            .unwrap();
+        assert_eq!(req_call.1["body"]["artifact_id"], artifact_id);
+        assert_eq!(req_call.1["body"]["zip_sha256"], zip_sha256);
+        assert_eq!(req_call.1["body"]["install_id"], "install_app1");
+        assert_eq!(
+            req_call.1["body"]["expected_digest"],
+            expected_installed_digest
+        );
+        assert_eq!(req_call.1["body"]["expected_generation"], "c1:g1");
+        assert_eq!(req_call.1["body"]["request_id"], expected_req_id);
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(handle);
     }
 }

@@ -16,6 +16,7 @@ import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
 import { AppAgentSettings } from "../workspace-apps/AppAgentSettings";
+import { PrivateAppUpdaterSettings } from "../workspace-apps/PrivateAppUpdaterSettings";
 import { CatalogBindings } from "../workspace-apps/CatalogBindings";
 import { declaredSlots, isCatalogSlot } from "../workspace-apps/bindingChoices";
 import "../workspace-apps/workspace-apps.css";
@@ -436,6 +437,10 @@ export default function ManageApp({
           (inst.state === undefined || inst.state === "active") &&
           (inst.approved === true || inst.approval?.state === "approved") &&
           <AppAgentSettings key={appAgentSession} installId={installId} installedDigest={inst.digest} busy={applying || removing || restoring} />}
+        {inst.source_kind === "private" && isOp && appAgentSession && !removed && !off && inst.install_id === installId &&
+          (inst.state === undefined || inst.state === "active") &&
+          (inst.approved === true || inst.approval?.state === "approved") &&
+          <PrivateAppUpdaterSettings key={`updater-${appAgentSession}`} installId={installId} installedDigest={inst.digest} busy={applying || removing || restoring} />}
         <div className="card mcard">
           <h3>{t("App package")}</h3>
           {inst.source_kind === "private" ? (

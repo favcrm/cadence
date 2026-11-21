@@ -91,6 +91,7 @@ pub mod peer;
 pub mod pi_policy;
 pub mod platform;
 pub(crate) mod printed_command;
+pub mod private_app_update;
 pub mod proc;
 pub(crate) mod project_policy;
 pub(crate) mod protected_pi_profile;
