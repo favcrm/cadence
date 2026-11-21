@@ -2,7 +2,7 @@
  * CAD-2186: the owner's decisions from `GET /api/assist/actions`, read into
  * one shape the To do rail and the detail share.
  *
- * Two staged kinds exist: `app_call` (a record write staged from the hosted
+ * Staged kinds: `cadence_cli` (AOS-679, a hosted Cadence CLI write), `app_call` (a record write staged from the hosted
  * CLI or chat) and `board_create_issue` (the assistant proposing an issue).
  * A row that does not parse is not renderable: it is dropped, never shown as
  * a decision and never read as success. A `app_call` row without the new
@@ -44,7 +44,7 @@ export interface StagedResult {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue" | "connected_effect";
+  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -67,6 +67,8 @@ export interface StagedWrite {
   decisionReason?: string | null;
   /** The record behind "Open record", when the API names a link. */
   recordLink: string | null;
+  /** `cadence_cli` (AOS-679): a hosted Cadence CLI write staged for the owner. Display text is made visible (see `visible`). */
+  cli?: { verb: string; summary: string | null; requestedBy: string | null };
   /** `connected_effect`: the draft or send a connected tool would make. */
   connected: {
     effect: "draft" | "send";
@@ -327,6 +329,67 @@ function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "created
   };
 }
 
+/**
+ * Bidi controls, zero-width and other invisible or control characters, shown
+ * as `[U+202E]` so a staged value cannot read differently from what it is.
+ * Newlines and tabs stay; display only, never applied to what runs.
+ */
+const HIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u2028-\u202E\u2060-\u206F\u2800\u3164\uFEFF\uFFA0\uFFF9-\uFFFB\u{1D173}-\u{1D17A}\u{E0000}-\u{E0FFF}]|\u034F|[\uFE00-\uFE0F]/gu;
+export const visible = (text: string): string =>
+  text.replace(HIDDEN, (c) => `[U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}]`);
+
+/**
+ * A staged Cadence CLI write (AOS-679). `changes` is the API's full list, one
+ * `added` entry per staged argument and per `set` pair; only an explicit
+ * `changes_complete: true` makes it reviewable. Otherwise no summary and no
+ * partial list is kept, and Approve stays off (`approvable`). A malformed row
+ * (no verb, or a change that does not parse) is dropped.
+ */
+function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+  const input = isRecord(row.input) ? row.input : {};
+  const verb = str(row.verb) ?? str(input.verb);
+  if (verb === null) return null;
+  const complete = row.changes_complete === true;
+  let changes: StagedChange[] = [];
+  if (complete) {
+    if (!Array.isArray(row.changes)) return null;
+    const parsed = row.changes.map(parseChange);
+    if (parsed.some((c) => c === null)) return null;
+    changes = (parsed as StagedChange[]).map((c) => ({
+      ...c,
+      field: visible(c.field),
+      label: visible(c.label),
+      ...(typeof c.before === "string" ? { before: visible(c.before) } : {}),
+      ...(typeof c.after === "string" ? { after: visible(c.after) } : {}),
+    }));
+  }
+  const origin = parseOrigin(row.origin);
+  const summary = complete ? str(row.summary) : null;
+  const requestedBy = str(row.requested_by);
+  return {
+    ...base,
+    kind: "cadence_cli",
+    title: visible(str(row.title) ?? `Cadence: ${verb}`),
+    app: null,
+    target: null,
+    changes,
+    unchangedCount: 0,
+    changesComplete: complete,
+    reason: null,
+    consent: null,
+    effects: [],
+    raw: visible(rawText(typeof row.args === "string" ? row.args : (input.args ?? ""))),
+    origin: origin === null ? null : { ...origin, label: visible(origin.label), via: visible(origin.via) },
+    result: result?.code === undefined ? result : { ...result, code: visible(result.code) },
+    recordLink: null,
+    cli: { verb: visible(verb), summary: summary === null ? null : visible(summary), requestedBy: requestedBy === null ? null : visible(requestedBy) },
+    connected: null,
+  };
+}
+
+/** Approve is offered only for a row whose whole request can be read. Deny is always safe. */
+export const approvable = (write: StagedWrite): boolean => write.kind !== "cadence_cli" || write.changesComplete;
+
 /** One list row → a decision, or null when it is not one we can show. */
 export function parseStagedRow(row: unknown): StagedWrite | null {
   if (!isRecord(row)) return null;
@@ -346,6 +409,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "app_call") return parseAppCall(base, row, result);
   if (row.tool === "board_create_issue") return parseCreateIssue(base, row, result);
   if (row.tool === "connected_effect") return parseConnectedEffect(base, row, result);
+  if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
   return null;
 }
 
@@ -401,6 +465,7 @@ const CONNECTED_REASONS: Readonly<Record<string, string>> = {
 
 export function failureReason(write: StagedWrite): string {
   const code = write.result?.code;
+  if (write.cli) return `refused (${code ?? "unknown"})`;
   if (write.connected !== null) return (code && CONNECTED_REASONS[code]) || `refused (${code ?? "unknown"})`;
   return (code && REASONS[code]) || "the reason is not recognised";
 }
@@ -421,6 +486,7 @@ const same: Say = (s) => s;
 
 /** `Atlas (agent)`, `Priya Nair (person)`; null when no origin is recorded (the assistant, in Home). */
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
+  if (write.cli) return write.cli.requestedBy ?? (write.origin?.label ?? null);
   const o = write.origin;
   if (o === null) return null;
   return `${o.label} (${o.kind === "agent" || o.kind === "person" ? t(o.kind) : o.kind})`;
