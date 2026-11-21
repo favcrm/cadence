@@ -317,6 +317,74 @@ check(!("audio_capture" in (noAudioHost.sent[0] as ScreenPush)), "audio_capture 
 noAudioOptIn.receive({ v: 2, op: "audio", id: "forged-aud", mode: "record" });
 check(noAudioOptIn.closed, "audio op without screen-audio.v1 opt-in closes mount");
 
+// Reply layout is presentation-only and follows the current compose nomination.
+function replyLayoutMount(options: { layout?: boolean; drawer?: boolean } = {}) {
+  const source = {} as Window;
+  const port = new Port();
+  const nominations: (number | null)[] = [];
+  const layouts: ([number, number] | null)[] = [];
+  let failed = 0;
+  const wabaReceipt = {
+    ...receipt, tag: "waba", action_token: "d".repeat(64), tools: [],
+    host_contract: "screen-records.v1" as const,
+    operations: ["whatsapp.conversations.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.reply.status"],
+  };
+  const wabaPush: ScreenPush = {
+    ...actingPush, v: 2, tag: "waba",
+    installation: { ...actingPush.installation, name: "waba" },
+  };
+  const actions = {
+    ...toolHost!,
+    onWhatsAppCompose: (_conversationId: string | null, nomination: number | null) => nominations.push(nomination),
+    onWhatsAppReplyLayout: (bounds: [number, number] | null) => layouts.push(bounds),
+  };
+  const channel = new ScreenChannel(source, wabaReceipt, wabaPush, () => {}, () => ++failed, () => {}, undefined, actions);
+  if (options.drawer) channel.surfaceRole = "drawer";
+  channel.receive({ source, origin: "null", data: { ...init, tag: "waba" }, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts: [
+    "screen.v2", "screen-records.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1",
+    ...(options.layout === false ? [] : ["screen-whatsapp-reply-layout.v1"]),
+  ] });
+  return { port, nominations, layouts, failed: () => failed };
+}
+const layout = replyLayoutMount();
+const layoutMessage = (nomination: number, bounds: unknown) => ({ v: 2, op: "whatsapp-reply-layout", nomination, bounds });
+check(!layout.port.closed, "admitted primary WABA negotiates reply layout");
+layout.port.receive(layoutMessage(1, [1000, 9000]));
+check(layout.layouts.length === 0 && !layout.port.closed, "layout before a nomination is ignored");
+layout.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+check(JSON.stringify(layout.nominations) === "[1]", "compose nominates the selected conversation");
+layout.port.receive(layoutMessage(1, [1000, 9000]));
+check(JSON.stringify(layout.layouts) === "[[1000,9000]]", "current nomination supplies viewport bounds");
+layout.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550002222@s.whatsapp.net" });
+layout.port.receive(layoutMessage(1, [0, 10000]));
+check(JSON.stringify(layout.layouts) === "[[1000,9000]]" && !layout.port.closed, "stale nomination cannot change layout");
+layout.port.receive(layoutMessage(2, null));
+check(JSON.stringify(layout.layouts) === "[[1000,9000],null]", "current nomination can explicitly replace the message pane");
+layout.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: null });
+layout.port.receive(layoutMessage(3, [0, 10000]));
+layout.port.receive(layoutMessage(2, [0, 10000]));
+check(JSON.stringify(layout.nominations) === "[1,2,3]" && JSON.stringify(layout.layouts) === "[[1000,9000],null]" && !layout.port.closed,
+  "clear increments the nomination and neither cleared nor stale geometry changes layout");
+for (const invalid of [
+  layoutMessage(1, [9000, 1000]), layoutMessage(1, [5000, 5000]),
+  layoutMessage(1, [-1, 10000]), layoutMessage(1, [0, 10001]),
+  layoutMessage(1, [0.5, 10000]), layoutMessage(1, [0, 10000, 10000]),
+  { ...layoutMessage(1, [0, 10000]), extra: true },
+]) {
+  const bad = replyLayoutMount();
+  bad.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+  bad.port.receive(invalid);
+  check(bad.port.closed && bad.failed() === 1 && bad.layouts.length === 0, `malformed reply layout closes: ${JSON.stringify(invalid)}`);
+}
+const noLayoutOptIn = replyLayoutMount({ layout: false });
+noLayoutOptIn.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+noLayoutOptIn.port.receive(layoutMessage(1, [0, 10000]));
+check(noLayoutOptIn.port.closed && noLayoutOptIn.layouts.length === 0, "unnegotiated reply layout closes without changing layout");
+const drawerLayout = replyLayoutMount({ drawer: true });
+drawerLayout.port.receive(layoutMessage(1, [0, 10000]));
+check(drawerLayout.port.closed && drawerLayout.layouts.length === 0, "drawer cannot negotiate or change reply layout");
+
 void (async () => {
   let activeSignals: AbortSignal[] = [];
   let releaseFirst: ((res: { ok: true; data: unknown }) => void) | null = null;

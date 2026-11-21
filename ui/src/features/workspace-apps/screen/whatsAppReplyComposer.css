@@ -1,10 +1,23 @@
+/* Only legacy packages need the board to infer the left rail. */
+[data-installed-app-screen]:has(> .wa-reply-dock:not([data-positioned])) {
+  container: wa-reply-surface / inline-size;
+}
+
 .wa-reply-dock {
   flex: none;
   min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 0.4rem;
-  padding: 0.4rem 0.75rem 0.75rem;
+  padding: 0.4rem 0.75rem max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.wa-reply-dock[hidden] { display: none; }
+
+/* Legacy WABA package: 19rem rail including gutter. A negotiated pane
+   supplies its actual edges and uses symmetric padding inside those edges. */
+@container wa-reply-surface (min-width: 48rem) {
+  .wa-reply-dock:not([data-positioned]) { padding-inline-start: 19.75rem; }
 }
 
 .wa-reply-dock > * {
@@ -15,7 +28,7 @@
 
 .wa-reply-card {
   border-radius: 1.125rem;
-  box-shadow: 0 3px 12px rgb(0 0 0 / 16%);
+  box-shadow: var(--board-composer-shadow);
 }
 
 .wa-reply-card textarea { box-sizing: border-box; }
