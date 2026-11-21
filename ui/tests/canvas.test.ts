@@ -173,7 +173,9 @@ const queued = threadItems({
 });
 const queuedParts = feedParts(queued, 0, "mA");
 equal([queuedParts.turn, queuedParts.working?.turn], ["mA", "mA"], "the running message owns the strip");
-resetCanvas();
+// CAD-2548: a running turn's card no longer opens a tab by itself, so the tab
+// is opened first (in this conversation); the landed put still updates it live.
+resetCanvas("c1", "home", "home");
 openArtifact({ id: "art-a", version: 1, kind: "md", title: "x", bytes: 5 });
 feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...queuedParts });
 equal(canvasSnapshot().tabs[0].turn, queuedParts.working?.turn, "the landed put matches the running turn, so no stale updating chip");
@@ -274,6 +276,28 @@ equal(
     "the feed is byte-identical from the grouped render",
   );
   resetCanvas();
-  feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...parts });
+  // CAD-2548: the drawer opens when the turn is no longer the one in flight.
+  feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...parts, working: null });
   equal(canvasSnapshot().tabs.map((t) => t.id), ["art-g"], "the grouped turn still opens its card");
+}
+
+// CAD-2548: a live card of the turn still in flight does not open the drawer;
+// the same card opens it once that turn is no longer the one running.
+{
+  const inFlight = (cards: FeedCard[], running: string | null) =>
+    feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", cards, working: running ? { turn: running, updating: [] } : null, turn: "m1" });
+  resetCanvas();
+  inFlight([card("art-w", 1, "m1")], "m1");
+  equal([canvasSnapshot().open, canvasSnapshot().tabs.length], [false, 0], "no drawer while the turn runs");
+  inFlight([card("art-w", 1, "m1")], "m1");
+  equal(canvasSnapshot().open, false, "still closed on the next render of the running turn");
+  inFlight([card("art-w", 1, "m1")], null);
+  equal([canvasSnapshot().open, canvasSnapshot().active], [true, "art-w"], "opens once the turn ends");
+  closeDrawer();
+  inFlight([card("art-w", 1, "m1"), card("art-x", 1, "m1")], null);
+  equal(canvasSnapshot().open, false, "once per turn: no second open");
+  // A queued follow-up running does not hold an earlier finished turn's card.
+  resetCanvas();
+  inFlight([card("art-q", 1, "m1")], "m2");
+  equal([canvasSnapshot().open, canvasSnapshot().active], [true, "art-q"], "a card of another turn is not held");
 }

@@ -107,7 +107,7 @@ check(items.filter((i) => i.type === "view").length === 2, "view_ref becomes a v
 
 // Auto-open: history never opens; a live card of an operator turn opens once per turn; a close sticks for the turn; no auto-open on the member chat.
 const live = (autoOpen: boolean | undefined, liveAfter: number, from: number) => {
-  const parts = feedParts(items.slice(0, from), liveAfter, "m1");
+  const parts = feedParts(items.slice(0, from), liveAfter, null);
   feedCanvas({ conversation: "c", surface: "home", composerKey: "k", autoOpen, ...parts });
 };
 resetCanvas("c", "k", "home");
@@ -159,10 +159,10 @@ const pane = { installId: "install_crm", contextId: "ctx_7", showHere: (route: u
 const hereHtml = renderToStaticMarkup(createElement(LocaleProvider, null, createElement(ViewScopeContext.Provider, { value: pane }, createElement(ViewCard, { entry: entryOf(valid) }))));
 check(hereHtml.includes("data-view-state=\"here\"") && hereHtml.includes("Shown in CRM") && hereHtml.includes("data-view-here") && !hereHtml.includes("data-view-open"), "same-app card reads Shown in <App>");
 resetCanvas("c", "k", "app");
-const herePart = feedParts(items.slice(0, 2), 0, "m1", pane);
+const herePart = feedParts(items.slice(0, 2), 0, null, pane);
 equal(herePart.views.map((v) => v.here), [true], "same-app card is marked here");
 feedCanvas({ conversation: "c", surface: "app", composerKey: "k", showHere: pane.showHere, ...herePart });
 equal([moves, canvasSnapshot().tabs.length, canvasSnapshot().open], [[{ section: "customers", view: "list", record_id: "cust-0001", segment_id: null }], 0, false], "live same-app card moves the page, no tab");
 resetCanvas("c", "k", "app");
-const otherPart = feedParts(items.slice(0, 2), 0, "m1", { installId: "other", contextId: "c", showHere: pane.showHere });
+const otherPart = feedParts(items.slice(0, 2), 0, null, { installId: "other", contextId: "c", showHere: pane.showHere });
 equal(otherPart.views.map((v) => v.here), [undefined], "another app's card keeps the canvas");
