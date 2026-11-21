@@ -14,9 +14,10 @@ export function routeParams(value: unknown): value is RouteParams {
 const URL_PARAM_PREFIX = "p.";
 /** The params a board URL names; absent when it names none (or a bad set: all dropped, never part-read). */
 export function paramsFromQuery(q: URLSearchParams): RouteParams | undefined {
-  const found: Record<string, string> = {};
-  for (const [key, value] of q) if (key.startsWith(URL_PARAM_PREFIX)) found[key.slice(URL_PARAM_PREFIX.length)] = value;
-  return Object.keys(found).length > 0 && routeParams(found) ? found : undefined;
+  const pairs: [string, string][] = [];
+  for (const [key, value] of q) if (key.startsWith(URL_PARAM_PREFIX)) pairs.push([key.slice(URL_PARAM_PREFIX.length), value]);
+  const found = Object.fromEntries(pairs); // own keys only: `__proto__` is a legal name
+  return pairs.length > 0 && routeParams(found) ? found : undefined;
 }
 /** Rewrites the query's `p.*` keys to exactly `params` (none clears them). */
 export function setQueryParams(q: URLSearchParams, params: RouteParams): void {
