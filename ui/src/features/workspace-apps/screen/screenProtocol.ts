@@ -55,6 +55,7 @@ export type ChildToHost =
   | { v: 2; op: "asset"; ref: string }
   | { v: 2; op: "whatsapp-compose"; conversation_id: string | null }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
+  | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
   | AudioRequest
   | AudioSessionRequest
   | CallRequest
@@ -1006,6 +1007,11 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       return { v: 2, op: "whatsapp-reply-layout", nomination: d.nomination, bounds: [bounds[0], bounds[1]] };
     }
     return null;
+  }
+  if (d.v === 2 && d.op === "whatsapp-reply-inset-ready" && Object.keys(d).sort().join() === "nomination,op,px,seq,v" &&
+      isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER) && isBoundedSafeInt(d.seq, 1, Number.MAX_SAFE_INTEGER) &&
+      isBoundedSafeInt(d.px, 0, WHATSAPP_REPLY_INSET_MAX)) {
+    return { v: 2, op: "whatsapp-reply-inset-ready", nomination: d.nomination, seq: d.seq, px: d.px };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {

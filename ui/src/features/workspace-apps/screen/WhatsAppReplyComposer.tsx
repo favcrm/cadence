@@ -12,7 +12,7 @@ export interface WhatsAppReplySelection {
   services: ReturnType<typeof recordServices>;
   current(): boolean;
   announceAvailability?(state: WhatsAppReplyAvailability): void;
-  announceInset?(px: number): void;
+  announceInset?(px: number): number | undefined;
   announce(dirty: boolean, refresh?: boolean): void;
 }
 
@@ -67,7 +67,7 @@ function recordedState(state: unknown): Outcome {
   return state === "sent" || state === "accepted" || state === "failed" ? state : "uncertain";
 }
 
-export default function WhatsAppReplyComposer({ selection, bounds }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null }) {
+export default function WhatsAppReplyComposer({ selection, bounds, inset }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null; inset?: { px: number; seq: number } }) {
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
   const [verification, setVerification] = useState<RecipientCheck>();
@@ -80,16 +80,33 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
   const pointer = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
   const dock = useRef<HTMLDivElement>(null);
-  const overlay = selection.announceInset !== undefined && bounds !== undefined;
+  const size = useRef({ measured: -1, room: 0, seq: undefined as number | undefined });
+  const overlay = selection.announceInset !== undefined;
+  const hidden = bounds === null || (overlay && bounds === undefined);
   useLayoutEffect(() => {
     const node = dock.current;
-    if (!overlay || !node || !selection.announceInset) return;
-    const publish = () => selection.announceInset?.(Math.min(WHATSAPP_REPLY_INSET_MAX, Math.ceil(node.getBoundingClientRect().height)));
+    const announce = selection.announceInset;
+    if (!announce || !node) return;
+    const state = size.current;
+    const publish = () => {
+      const height = node.getBoundingClientRect().height;
+      const px = Math.min(WHATSAPP_REPLY_INSET_MAX, Math.ceil(height));
+      if (px !== state.measured) {
+        state.measured = px;
+        // A shrink can already be in flight when the next grow arrives.
+        // Narrow the paint fence before the frame is allowed to reclaim room.
+        state.room = Math.min(state.room, px);
+        state.seq = announce(px);
+      }
+      if (inset && inset.seq === state.seq) state.room = inset.px;
+      node.dataset.inset = state.room === 0 ? "empty" : state.room < height ? "partial" : "full";
+      node.style.setProperty("--wa-reply-room", `${state.room}px`);
+    };
     publish();
     const observer = new ResizeObserver(publish);
     observer.observe(node, { box: "border-box" });
     return () => observer.disconnect();
-  }, [overlay, selection]);
+  }, [selection, inset, hidden]);
   const group = selection.conversationId.endsWith("@g.us");
   const recipient = verification?.recipient;
   const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
@@ -211,7 +228,7 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
 
-  return <div ref={dock} className="wa-reply-dock" hidden={bounds === null} data-positioned={bounds ? "" : undefined} data-overlay={overlay ? "" : undefined}
+  return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
     {note && <div className="wa-reply-status">
       <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>

@@ -20,6 +20,9 @@
   pointer-events: none;
 }
 
+.wa-reply-dock[data-overlay]:not([data-inset]), .wa-reply-dock[data-inset="empty"] { visibility: hidden; }
+.wa-reply-dock[data-inset="partial"] { clip-path: inset(max(0px, calc(100% - var(--wa-reply-room))) -1.5rem -1.5rem); }
+
 .wa-reply-dock[data-overlay] > * { pointer-events: auto; }
 .wa-reply-dock[data-overlay] .wa-reply-card { border-radius: 1rem; }
 
