@@ -166,8 +166,8 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
         null,
         React.createElement(Badge, { needs, owner: opts.decisions ?? true }),
         React.createElement(NeedsRail, {
-          overview, readOnly: opts.readOnly ?? false, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
-          onAsk: () => {}, onOpenDecision: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
+          overview, readOnly: opts.readOnly ?? false, onOpenIssue: () => {}, permissionsHref: "/settings/permissions",
+          onAsk: () => {}, onOpenDecision: () => {}, onAskAgent: () => {},
           decisions: opts.decisions ?? true,
         }),
       ),
@@ -487,14 +487,16 @@ listStatus = 200;
   assert(sent() === 1, "no retry of a failed write");
   assert(text(v.host.querySelector(".todo-note")).includes("did not apply: the record changed after it was staged"), "the plain reason");
   assert(v.host.querySelector(".dx-dot"), "a dot on Updates");
-  await click(labelled(v.host, "Updates"));
-  const line = v.host.querySelector("[data-fail]")!;
+  await click(v.host.querySelector<HTMLButtonElement>(".needbtn")!);
+  const rail = v.host.querySelector(".needsdrawer")!;
+  await click(labelled(rail, "Updates"));
+  const line = rail.querySelector("[data-fail]")!;
   assert(text(line).includes("Did not apply") && text(line).includes("the record changed after it was staged"), "the failed line says why");
   assert(!line.querySelector("pre"), "the code is under raw");
   await click(labelled(line, "Show raw"));
   assert(line.querySelector("pre")?.textContent?.includes("revision_conflict"), "code under raw");
   assert(!v.host.querySelector(".dx-dot"), "viewing Updates clears the dot");
-  await click(buttons(v.host).find((b) => b.textContent?.startsWith("To do")));
+  await click(buttons(rail).find((b) => b.textContent?.startsWith("To do")));
   assert(!v.host.querySelector(".dx-dot"), "and it stays cleared");
   onDecide = null;
   await v.done();

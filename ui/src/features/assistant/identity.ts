@@ -10,6 +10,8 @@
  *  coordinator; hosted panes use their conversation-bound actor projection.
  *  An alias or a display-name coincidence never chooses the profile. */
 
+import type { ResourceState } from "../../lib/cache";
+import type { AgentsPayload } from "../../lib/types";
 import { AVATAR_LOOKS, agentLook, type AvatarLook } from "../agents/AgentAvatar";
 import { MASTER } from "../home/master";
 
@@ -31,6 +33,26 @@ export type IdentityRead =
   | { state: "loading" }
   | { state: "unavailable" }
   | { state: "ready"; identity: IdentityRecord };
+
+/** Home links only when the board served the caller's own roster row.
+ *  A hired profile's alias never makes its route the personal profile. */
+export function personalAssistantProfileHref(
+  scope: AssistantScope | null,
+  read: IdentityRead,
+  roster: ResourceState<AgentsPayload>,
+): string | undefined {
+  if (scope !== "personal" || read.state !== "ready") return;
+  // The shared agents array can be empty while the personal row is present.
+  if (roster.error !== null || (roster.status !== "ok" && roster.status !== "empty")) return;
+  const payload = roster.data;
+  const row = payload && "personal_assistant" in payload ? payload.personal_assistant : null;
+  if (
+    row !== null && typeof row === "object" &&
+    "scope" in row && row.scope === "personal" &&
+    "opens" in row && row.opens === "home" &&
+    "name" in row && typeof row.name === "string"
+  ) return "/agents/assistant?tab=instructions";
+}
 
 export { AVATAR_LOOKS };
 export type { AvatarLook };

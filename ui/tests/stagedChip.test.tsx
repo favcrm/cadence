@@ -147,8 +147,8 @@ async function render(locale: "en" | "zh-TW" = "en") {
           StagedSourceContext.Provider,
           { value: homeDecisions },
           React.createElement(NeedsRail, {
-            overview, readOnly: false, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
-            onAsk: () => {}, onOpenDecision: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
+            overview, readOnly: false, onOpenIssue: () => {}, permissionsHref: "/settings/permissions",
+            onAsk: () => {}, onOpenDecision: () => {}, onAskAgent: () => {},
             decisions: true,
           }),
           React.createElement("div", { className: "answer", "data-answer": true }, React.createElement(Md, { text: ANSWER, idTokens: true })),

@@ -2164,7 +2164,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards from projects readable by the caller — same filters as `memory ls`; `memory_errors` includes load failures only for readable projects |
 | `GET /api/memories/:project/:slug` | one readable memory: frontmatter, body and evidence analysis; Wiki citations use the proven board caller's access. An unattributed or refused caller is refused rather than treated as anonymous; inaccessible and unknown memories share a generic `404`, `400` on grammar |
-| `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
+| `GET /api/overview` | the Home rail and Apps payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 | `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
 | `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
@@ -2439,11 +2439,10 @@ to I3+.
 
 ## Overview — needs-me + deploy drift
 
-The landing screen answers two questions at a glance: *what is waiting
-on a human or the PM right now, and with which command*, and *is what
-we merged actually running*. `GET /api/overview` derives the whole
-payload at read time — nothing is stored; `cadence overview [--json]
-[--watch <secs>]` renders the same data as an aligned terminal list.
+Home's rail answers what is waiting for the viewer. The former `/overview`
+page is retired; Home and Apps still use `GET /api/overview`, which derives
+its payload at read time. `cadence overview [--json] [--watch <secs>]` renders
+the same data as a terminal list.
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
@@ -3177,10 +3176,13 @@ installation and permission refusals, including host Pi-confinement defaults,
 without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
-`/overview` (the team overview: needs, drift, monitors, projects),
 `/projects[/:slug[/epics|/milestones|/context]]`, `/agents[/:alias]`, `/setup` and
-`/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
-and Home's rail links to the overview.
+`/settings[/memory]`; the nav shows Home, Projects, Agents and Settings.
+Home's desktop rail always shows To do and Updates; on narrow screens it opens
+as a dismissible drawer. Home About links to the active assistant's Instructions
+tab: the Master profile for a confirmed workspace actor with access, or My
+assistant when a signed-in personal actor has its own roster row. A missing
+personal row never falls back to Master.
 
 Threads notifications (CAD-1423) group received messages by authorized conversation
 in the header inbox. Unread respects both actually viewed thread messages and the
@@ -3189,6 +3191,9 @@ either cursor advances. Mark all read dismisses notifications without marking
 unviewed transcript messages read.
 All includes every eligible conversation, not a truncated first page. The bell's
 unread total covers that complete authorized history.
+Use Notification settings in the inbox to manage browser alerts.
+A successful preference save or browser-alert sync clears that operation's
+warning without hiding a failure in the other.
 
 Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
 sender is a still-registered agent carries a "Reply as you" action that

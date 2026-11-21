@@ -339,24 +339,6 @@ export const UNFENCE_CHOICES: readonly UnfenceChoice[] = [
   { status: "failed", blurb: "the turn died — record it failed", plain: "It failed" },
 ];
 
-/** The collapsed rail's persistence (per viewer; brief §1). */
-const RAIL_KEY = "cadence:needs-rail";
-
-export function readRailCollapsed(): boolean {
-  try {
-    return globalThis.localStorage?.getItem(RAIL_KEY) === "collapsed";
-  } catch {
-    return false;
-  }
-}
-
-export function writeRailCollapsed(collapsed: boolean): void {
-  try {
-    globalThis.localStorage?.setItem(RAIL_KEY, collapsed ? "collapsed" : "open");
-  } catch {
-    /* a viewer without storage just loses the preference */
-  }
-}
 
 // ---- CAD-1216: the To do kind table ----
 

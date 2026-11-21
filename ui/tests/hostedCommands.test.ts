@@ -1,4 +1,6 @@
 /** CAD-2027: a hosted board offers only what it can run, and says so plainly. */
+import type * as Navigation from "../screen-ui/src/navigation";
+import type * as HostNavigation from "../src/ui/hostNavigation";
 import { streamFixture } from "./streamFixture";
 import type * as HappyDOM from "happy-dom";
 import type * as ReactModule from "react";
@@ -28,6 +30,8 @@ const React = require<typeof ReactModule>("react");
 const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
+const { NavigationProvider } = require<typeof Navigation>("../screen-ui/src/navigation");
+const { hostNavigation } = require<typeof HostNavigation>("../src/ui/hostNavigation");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { AssistantAboutButton, AssistantActorProvider, useConversationActor } = require<typeof Identity>("../src/features/assistant/AssistantIdentity");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
@@ -67,13 +71,14 @@ async function main() {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host);
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };
-  const mount = async (hosted: boolean) => {
+  const mount = async (hosted: boolean, operator?: boolean) => {
     await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
-        readOnly: false, hosted, overview: resources.overview.get(),
-        onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-        overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
-      })));
+      root.render(React.createElement(LocaleProvider, null,
+        React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(Home, {
+          readOnly: false, hosted, operator, overview: resources.overview.get(),
+          onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+          permissionsHref: "/permissions", resolveAppPath: () => null,
+        }) })));
     });
     await settle();
     await React.act(async () => {
@@ -98,7 +103,7 @@ async function main() {
   };
   const menu = () => Array.from(host.querySelectorAll(".slashmenu [role=option]")).map((row) => row.textContent ?? "");
 
-  await mount(true);
+  await mount(true, true);
   assert(box() !== null, "the composer is on the page");
   assert(host.querySelector(".master-chips .chip-btn") === null, "a hosted board shows no model chip");
   assert(!requests.some((r) => r.includes("/api/master/models")), "a hosted chip reads no model list");
@@ -108,13 +113,16 @@ async function main() {
   await React.act(async () => { about.click(); });
   await settle();
   assert(document.body.querySelector("[data-assistant-model]")?.textContent?.includes("deepseek/flash"), "About shows the model");
+  assert(document.querySelector('.assistant-about[data-identity-state="ready"]'), "the identity fixture is ready");
+  assert(!document.querySelector(".assistant-about")?.textContent?.includes("View assistant profile"),
+    "a tenant response missing its actor projection never offers a profile link");
   await React.act(async () => {
     document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
   });
   await settle();
 
   await type("/");
-  assert(menu().length === 1 && menu()[0].includes("help"), `a hosted menu offers help alone (got ${menu().length})`);
+  assert(menu().length === 2 && menu().some((row) => row.includes("/help")) && menu().some((row) => row.includes("/skills")), "an unadvertised hosted menu offers only local Help and Skills");
 
   requests.length = 0;
   await type("/compact");
@@ -160,7 +168,7 @@ async function main() {
   assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
   assert(!help.includes("/compact") && !help.includes("/model") && !help.includes("/permissions"), "help lists only what this board can run");
-  assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
+  assert(help.includes("/skills") && help.includes("Browse approved workspace skills"), "help identifies the local skills browser");
 
   // A board that advertises a verb gets it in the menu and sends it.
   await React.act(async () => { root.render(null); });
@@ -169,7 +177,7 @@ async function main() {
   await React.act(async () => { resources.masterState.write(() => master as never); });
   await mount(true);
   await type("/");
-  assert(menu().length === 3, `a hosted menu offers what the board advertises (got ${menu().length})`);
+  assert(menu().length === 4 && menu().some((row) => row.includes("/new")) && menu().some((row) => row.includes("/stop")), "a hosted menu adds the server’s advertised verbs");
   requests.length = 0;
   await type("/new");
   await enter();
@@ -310,7 +318,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: null, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -321,7 +329,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: true, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -331,7 +339,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: false, operator: false, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();
@@ -342,7 +350,7 @@ async function main() {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: false, operator: true, overview: resources.overview.get(),
       onOpenIssue: () => undefined, onOpenDecision: () => undefined,
-      overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      permissionsHref: "/permissions", resolveAppPath: () => null,
     })));
   });
   await settle();

@@ -253,6 +253,6 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
     {notices.empty && <p className="px-4 py-6 text-label text-ink-400">{t("No agent activity yet. Ask the Assistant to plan the next job.")}</p>}
     {notices.unavailable && <p className="px-4 py-6 text-label text-warn">{t("Active assigned work could not be read.")}</p>}
     <ul>{agents.map((agent) => <AgentCard key={agent.alias} agent={agent} reports={reports.get(agent.alias) ?? []} onAsk={onAsk} onOpenIssue={onOpenIssue} />)}</ul>
-    {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">{t("Showing the 12 most recently active agents. See Team overview for everyone.")}</p>}
+    {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">{t("Showing the 12 most recently active agents.")} <Link href="/agents" className="lnk">{t("See all agents")}</Link></p>}
   </div>;
 }

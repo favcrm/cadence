@@ -1522,7 +1522,7 @@ async function mountChat() {
     await React.act(async () => {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
         readOnly: false, hosted, overview: resources.overview.get(), onOpenIssue: () => undefined,
-        onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+        onOpenDecision: () => undefined, permissionsHref: "/permissions", resolveAppPath: () => null,
       }), React.createElement(CanvasDrawer)));
     });
     for (let i = 0; i < 6; i++) await advance(1000);
@@ -1627,7 +1627,7 @@ for (const turn of [1, 4]) {
     await React.act(async () => {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
         readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
-        onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+        onOpenDecision: () => undefined, permissionsHref: "/permissions", resolveAppPath: () => null,
       }), React.createElement(CanvasDrawer)));
     });
     for (let i = 0; i < 4; i++) await advance(1000);
@@ -1673,7 +1673,7 @@ for (const turn of [1, 4]) {
   await React.act(async () => {
     root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
       readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
-      onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      onOpenDecision: () => undefined, permissionsHref: "/permissions", resolveAppPath: () => null,
     }), React.createElement(CanvasDrawer)));
   });
   for (let i = 0; i < 4; i++) await advance(1000);

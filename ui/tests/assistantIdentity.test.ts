@@ -4,9 +4,12 @@ import {
   messageLabel,
   messagePlaceholder,
   mutatePersonalProfile,
+  personalAssistantProfileHref,
   readConversationIdentity,
   readPersonalBootstrap,
 } from "../src/features/assistant/identity";
+import type { ResourceState } from "../src/lib/cache";
+import type { AgentsPayload } from "../src/lib/types";
 
 function ok(condition: boolean, message: string): void {
   if (!condition) throw new Error(`failed: ${message}`);
@@ -26,6 +29,33 @@ const translate = (text: string) => text === "Assistant" ? "助理" : text;
   }
   const actor = readConversationIdentity(home, "home-a");
   ok(actor.scope === "personal" && actor.read.state === "ready", "matching Home binds its personal actor");
+}
+
+{
+  const actor = readConversationIdentity(state({ scope: "personal", conversation_id: "home-a", identity: personal }), "home-a");
+  const agents = {
+    agents: [],
+    by_issue: {},
+    daemon: "reachable",
+    profiles: [],
+    refresh_error: false,
+    snapshot_age_secs: 0,
+    stale: false,
+    personal_assistant: { scope: "personal", opens: "home", name: "Poppy" },
+  } satisfies AgentsPayload & { personal_assistant: unknown };
+  const roster: ResourceState<AgentsPayload> = {
+    data: agents,
+    status: "empty",
+    asOf: 1,
+    inFlight: false,
+    error: null,
+  };
+  ok(personalAssistantProfileHref(actor.scope, actor.read, roster) === "/agents/assistant?tab=instructions",
+    "an empty shared roster can still link to the caller’s personal profile");
+  ok(personalAssistantProfileHref(actor.scope, actor.read, { ...roster, status: "stale" }) === undefined,
+    "a failed roster refresh does not offer the cached profile link");
+  ok(personalAssistantProfileHref(actor.scope, actor.read, { ...roster, error: "Roster refresh failed" }) === undefined,
+    "a shared-roster event does not restore the cached private link after a failed refresh");
 }
 
 // A present but invalid hosted projection may never fall back to a valid workspace profile.

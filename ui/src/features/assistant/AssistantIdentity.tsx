@@ -335,7 +335,7 @@ const LOOK_LABEL: Record<AvatarLook, string> = {
 
 /** The info control beside the actor's name. Opens the read-only details
  *  and (for the owning actor) the supported edit affordances. */
-export function AssistantAboutButton({ className = "" }: { className?: string }) {
+export function AssistantAboutButton({ className = "", profileHref }: { className?: string; profileHref?: string }) {
   const t = useTranslate();
   const actor = useAssistantActor();
   const [open, setOpen] = useState(false);
@@ -353,7 +353,7 @@ export function AssistantAboutButton({ className = "" }: { className?: string })
       >
         <IconInfo size={14} />
       </button>
-      {open && <AssistantAboutDialog actor={actor} onClose={() => setOpen(false)} />}
+      {open && <AssistantAboutDialog actor={actor} profileHref={profileHref} onClose={() => setOpen(false)} />}
     </>
   );
 }
@@ -367,7 +367,15 @@ function focusables(root: HTMLElement | null): HTMLElement[] {
   ).filter((el) => !el.matches(":disabled") && el.getAttribute("aria-hidden") !== "true");
 }
 
-function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; onClose: () => void }) {
+function AssistantAboutDialog({
+  actor,
+  profileHref,
+  onClose,
+}: {
+  actor: AssistantActorValue;
+  profileHref?: string;
+  onClose: () => void;
+}) {
   const model = actor.model;
   const t = useTranslate();
   const titleId = useId();
@@ -481,6 +489,8 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
             </div>
           )}
         </dl>
+
+        {profileHref && <Button href={profileHref}>{t("View assistant profile")}</Button>}
 
         {actor.scope === "personal" ? (
           <PersonalIdentityDetails actor={actor} identity={identity} />
