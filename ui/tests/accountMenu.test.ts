@@ -30,6 +30,7 @@ const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof impo
 const { default: Preferences } = require("../src/features/settings/Preferences") as { default: typeof PreferencesComponent };
 const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { sessionKey, setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
 
 function assert(condition: unknown, message: string): void {
@@ -106,6 +107,51 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   assert(panel(host), "a non-link click in the panel keeps it open");
   act(() => (host.querySelector("#footer-link") as HTMLElement).click());
   assert(!panel(host), "clicking a link in the footer closes the dialog");
+  done();
+}
+
+// CAD-2578: hosted AccountMenu shows a Security shortcut only when securityHref is supplied.
+{
+  const navigated: string[] = [];
+  const adapter = {
+    href: (path: string) => path,
+    navigate: (path: string) => { navigated.push(path); },
+    modifiedClicks: "browser" as const,
+  };
+  const { host, done } = mount(
+    createElement(NavigationProvider, {
+      adapter,
+      children: menu(signedIn, { settingsHref: "/settings/preferences", securityHref: "/settings/security" }),
+    }),
+  );
+  act(() => trigger(host).click());
+  const links = Array.from(panel(host).querySelectorAll("a[href]")) as HTMLAnchorElement[];
+  assert(
+    links.map((a) => [a.getAttribute("href"), a.textContent]).every((pair, i) =>
+      i === 0 ? pair[0] === "/settings/preferences" && pair[1] === "Settings"
+        : pair[0] === "/settings/security" && pair[1] === "Security",
+    ) && links.length === 2,
+    "Settings followed by Security link rendered in menu",
+  );
+  act(() => links[1].click());
+  assert(!panel(host), "clicking Security closes the menu");
+  assert(navigated[0] === "/settings/security", "clicking Security navigates to /settings/security");
+  done();
+}
+{
+  const adapter = {
+    href: (path: string) => path,
+    navigate: () => {},
+    modifiedClicks: "browser" as const,
+  };
+  const { host, done } = mount(
+    createElement(NavigationProvider, {
+      adapter,
+      children: menu(signedIn, { settingsHref: "/settings/preferences" }),
+    }),
+  );
+  act(() => trigger(host).click());
+  assert(!panel(host).querySelector('a[href="/settings/security"]'), "Security omitted without securityHref");
   done();
 }
 

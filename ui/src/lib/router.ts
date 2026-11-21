@@ -49,7 +49,7 @@ export type ProjectSection = "overview" | "timeline" | "issues" | "epics" | "mil
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
  *  moves it off a board whose `/api/meta` does not name it. */
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody" | "members" | "documents";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "security" | "general" | "custody" | "members" | "documents";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -315,6 +315,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "update") return { screen: "settings", section: "update" };
       if (a === "account") return { screen: "settings", section: "account" };
       if (a === "preferences") return { screen: "settings", section: "preferences" };
+      if (a === "security") return { screen: "settings", section: "security" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "email" };
       if (a === "general") return { screen: "settings", section: "general" };
@@ -416,6 +417,7 @@ export function routePath(route: Route): string {
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "preferences") return "/settings/preferences";
+      if (route.section === "security") return "/settings/security";
       if (route.section === "memory") return "/settings/memory";
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";

@@ -53,6 +53,7 @@ import HostedStatus from "./features/settings/HostedStatus";
 import AdvancedCustody from "./features/settings/AdvancedCustody";
 import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/settings/settingsNav";
 import Preferences from "./features/settings/Preferences";
+import Security from "./features/settings/Security";
 import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
@@ -1140,6 +1141,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           trigger="row"
           placement="above-start"
           settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+          securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
           footer={versionLine}
         />}
       />
@@ -1214,6 +1216,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div> : <div className="header-local-preferences contents"><LocalLanguage /><ThemeToggle /></div>}
           </div>
@@ -1275,6 +1278,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="row"
               placement="above-start"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div>}
             {meta?.signed_in !== true && <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-ink-700 pt-2">
@@ -1703,6 +1707,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Templates viewer={{ operator: viewer.operator, hosted: false }} />
             )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
+            {route.section === "security" && meta?.settings_sections?.includes("security") && (
+              <Security onSessionInvalidated={refresh} />
+            )}
             {route.section === "general" && <General documentPolicy={
               managedFiles && viewer.operator === true && !readOnly && viewerSub && !viewerSub.startsWith("operator-token:")
                 ? { hosted: documentsHosted, viewer, viewerSub }

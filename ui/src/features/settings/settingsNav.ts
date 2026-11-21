@@ -1,7 +1,7 @@
 import type { SettingsSection } from "../../lib/router";
 
 export type SettingsIcon =
-  | "preferences" | "connections" | "email" | "templates" | "general"
+  | "preferences" | "security" | "connections" | "email" | "templates" | "general"
   | "status" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
@@ -9,6 +9,8 @@ export type SettingsNavGroupSpec = { label: string; items: SettingsNavEntry[] };
 
 const ENTRIES = {
   preferences: { section: "preferences", label: "Preferences", icon: "preferences" },
+  /** CAD-2578: hosted only — offered when the board names `security` in its sections. */
+  security: { section: "security", label: "Security", icon: "security" },
   connections: { section: "connections", label: "Connections", icon: "connections" },
   email: { section: "email", label: "Email sending", icon: "email" },
   templates: { section: "templates", label: "Templates", icon: "templates" },
@@ -55,7 +57,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   const pick = (...names: (keyof typeof ENTRIES)[]) =>
     names.filter((name) => listed?.includes(name)).map((name) => ENTRIES[name]);
   return [
-    { label: "You", items: pick("preferences") },
+    { label: "You", items: pick("preferences", "security") },
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
@@ -68,7 +70,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
  * Sections only a hosted board can serve. A native board has no tenant member
  * list and no document lifecycle, so it neither offers nor mounts either.
  */
-const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents"];
+const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "security"];
 
 /**
  * Where a request for `section` should land instead, or null when it is fine.
