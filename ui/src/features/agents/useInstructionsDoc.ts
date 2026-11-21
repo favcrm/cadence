@@ -65,6 +65,8 @@ export interface InstructionsDoc {
   /** Hosted: save the profile's `skills` at the revision this page holds,
    *  keeping its stored text. A stale revision is never retried. */
   saveSkills: (skills: string[]) => Promise<SkillsOutcome>;
+  /** Hosted: save the profile's opt-in `enabled_tools` the same way. */
+  saveEnabledTools: (enabledTools: string[]) => Promise<SkillsOutcome>;
 }
 
 export function useInstructionsDoc(opts: {
@@ -202,6 +204,35 @@ export function useInstructionsDoc(opts: {
     [settle],
   );
 
+  /** Write one profile field at the revision this page holds. A stale
+   *  revision is never retried; a dropped answer is taken as saved only when a
+   *  read shows exactly this change on top of the page's revision. */
+  const saveProfileField = async (
+    body: (base: StoredAgentProfile) => object,
+    landed: (latest: StoredAgentProfile) => boolean,
+  ): Promise<SkillsOutcome> => {
+    if (!ready || kind !== "hosted" || !profile || busy.current) return { kind: "busy" };
+    busy.current = true;
+    const base = profile;
+    try {
+      setProfile(await deps.writeProfile(base.id, body(base)));
+      return { kind: "saved" };
+    } catch (error) {
+      const out = classifyFailure(error, "hosted");
+      if (out === "refused") return { kind: out, message: error instanceof Error ? error.message : String(error) };
+      if (out === "unconfirmed") {
+        const latest = await deps.readProfile(base.id).catch(() => null);
+        if (latest && latest.revision === base.revision + 1 && latest.responsibilities === base.responsibilities && landed(latest)) {
+          setProfile(latest);
+          return { kind: "saved" };
+        }
+      }
+      return { kind: out };
+    } finally {
+      busy.current = false;
+    }
+  };
+
   const text = draft ?? served ?? "";
   const ready = writable && kind !== null && state === "ready";
 
@@ -263,35 +294,16 @@ export function useInstructionsDoc(opts: {
       const job = ready ? checkJob() : null;
       if (job && sent.current) void run(job, sent.current.text, sent.current.base, true);
     },
-    saveSkills: async (skills) => {
-      if (!ready || kind !== "hosted" || !profile || busy.current) return { kind: "busy" };
-      busy.current = true;
-      const base = profile;
-      try {
-        setProfile(await deps.writeProfile(base.id, profileBody(base, base.responsibilities, base.revision, skills)));
-        return { kind: "saved" };
-      } catch (error) {
-        const out = classifyFailure(error, "hosted");
-        if (out === "refused") return { kind: out, message: error instanceof Error ? error.message : String(error) };
-        if (out === "unconfirmed") {
-          // The write may have landed: only a read that shows exactly this
-          // change on top of the page's revision is taken as ours.
-          const latest = await deps.readProfile(base.id).catch(() => null);
-          if (
-            latest &&
-            latest.revision === base.revision + 1 &&
-            latest.responsibilities === base.responsibilities &&
-            latest.skills.join("\n") === skills.join("\n")
-          ) {
-            setProfile(latest);
-            return { kind: "saved" };
-          }
-        }
-        return { kind: out };
-      } finally {
-        busy.current = false;
-      }
-    },
+    saveSkills: (skills) =>
+      saveProfileField(
+        (base) => profileBody(base, base.responsibilities, base.revision, skills),
+        (latest) => latest.skills.join("\n") === skills.join("\n"),
+      ),
+    saveEnabledTools: (enabledTools) =>
+      saveProfileField(
+        (base) => profileBody(base, base.responsibilities, base.revision, base.skills, enabledTools),
+        (latest) => (latest.enabled_tools ?? []).join("\n") === enabledTools.join("\n"),
+      ),
     discard: () => {
       if (phase !== "unconfirmed") {
         setDraftState(null);

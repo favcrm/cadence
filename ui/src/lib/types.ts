@@ -711,6 +711,10 @@ export interface StoredAgentProfile {
   created_by: string;
   catalogue: string | null;
   model: string;
+  /** AOS-495: tool groups switched off. Absent means none are. */
+  disabled_tools?: string[];
+  /** AOS-679: opt-in tool groups switched on. Absent means none are. */
+  enabled_tools?: string[];
 }
 
 /** `GET /api/workspace-skills` on a hosted board (agenticos-v2 AOS-626): one

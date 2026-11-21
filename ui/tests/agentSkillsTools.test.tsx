@@ -108,6 +108,7 @@ const STUB_DOC: InstructionsDoc = {
   check: () => {},
   discard: () => {},
   saveSkills: async () => ({ kind: "refused", message: "" }),
+  saveEnabledTools: async () => ({ kind: "refused", message: "" }),
 };
 
 function makeCtx(overrides: Partial<TabContext> = {}): TabContext {
