@@ -15,6 +15,8 @@ import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import type { ToastMsg } from "../../ui/Toast";
 import AgentPage from "./AgentPage";
+import AgentSessions from "./AgentSessions";
+import { useHref } from "../../lib/useLocation";
 import HireSheet from "./HireSheet";
 import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
 import AgentSidebar from "./AgentSidebar";
@@ -71,12 +73,14 @@ export default function Agents({
   operator,
   onRetryAccess,
   hostedBoard,
+  sessionsAllowed,
 }: {
   /** `true` alone lets the viewer read and send agent conversations, as on
    *  Threads. `null` is an unanswered check, not a non-operator. */
   operator: boolean | null;
   onRetryAccess: () => void;
   hostedBoard: boolean;
+  sessionsAllowed: boolean;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
@@ -92,6 +96,8 @@ export default function Agents({
   onRetry: () => void;
 }) {
   const t = useTranslate();
+  const href = useHref();
+  const sessionView = new URL(href, location.origin).searchParams.has("sessions");
   const [query, setQuery] = useState("");
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
@@ -185,6 +191,18 @@ export default function Agents({
     </div>
   );
 
+  if (sessionView) {
+    return shell(
+      sessionsAllowed ? (
+        <AgentSessions />
+      ) : (
+        <main className="agents-page px-4 pt-6">
+          <h1>{t("Session unavailable")}</h1>
+        </main>
+      ),
+    );
+  }
+
   if (open) {
     return shell(
       <AgentPage
@@ -255,6 +273,7 @@ export default function Agents({
           <p>{t("Your team. Recruit a ready-made role, or ask Master to find one.")}</p>
         </div>
         <div className="rc-acts">
+          {sessionsAllowed && <a href="/agents?sessions=list">{t("Agent sessions")}</a>}
           <Button onClick={askMaster}>{t("Ask Master")}</Button>
           <Button
             variant="primary"

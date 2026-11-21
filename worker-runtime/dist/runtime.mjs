@@ -57032,6 +57032,82 @@ function readSessionSummary(sql, objectId, sessionId) {
     return { state: "unknown" };
   }
 }
+function readSessionBounds(sql, objectId, sessionId) {
+  const summary = readSessionSummary(sql, objectId, sessionId);
+  if (summary.state !== "observed" || summary.session.sessionId !== sessionId)
+    return null;
+  try {
+    const anchor = Number(sessionId.slice(objectId.length + 1));
+    const boundary = resetBetween(sql, anchor + 1, MAX_ID, "ASC");
+    if (boundary === undefined)
+      return { anchor, upper: MAX_ID };
+    if (typeof boundary.id !== "number" || !Number.isSafeInteger(boundary.id) || boundary.id <= anchor)
+      return null;
+    return { anchor, upper: boundary.id - 1 };
+  } catch {
+    return null;
+  }
+}
+
+// src/session-transcript.ts
+var PAGE_RECORDS = 6;
+var MAX_RECORD_BYTES = 64 * 1024;
+var MAX_RESPONSE_BYTES = 48 * 1024;
+var MAX_MESSAGES = 100;
+var encoder4 = new TextEncoder;
+function readSessionTranscript(sql, objectId, sessionId, after) {
+  if (!Number.isSafeInteger(after) || after < 0)
+    return null;
+  const bounds = readSessionBounds(sql, objectId, sessionId);
+  if (bounds === null)
+    return null;
+  try {
+    if (after !== 0) {
+      if (after <= bounds.anchor || after > bounds.upper)
+        return null;
+      const cursor = sql.exec(`SELECT id FROM pi_entries WHERE conversation_id = ? AND id = ?
+           AND json_extract(record, '$.kind') IN (?, 'pi.assistant') LIMIT 1`, ROOT_CONVERSATION_ID, after, BOARD_MESSAGE_KIND).toArray()[0];
+      if (cursor === undefined)
+        return null;
+    }
+    const rows = sql.exec(`SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
+         FROM pi_entries
+        WHERE conversation_id = ? AND id > ? AND id <= ?
+          AND json_extract(record, '$.kind') IN (?, 'pi.assistant')
+        ORDER BY id ASC LIMIT ?`, MAX_RECORD_BYTES, ROOT_CONVERSATION_ID, after || bounds.anchor, bounds.upper, BOARD_MESSAGE_KIND, PAGE_RECORDS + 1).toArray();
+    const messages = [];
+    let processed = after;
+    for (const row of rows.slice(0, PAGE_RECORDS)) {
+      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || typeof row.record !== "string")
+        return null;
+      const record = JSON.parse(row.record);
+      const data = record.data;
+      const messageId = data !== null && typeof data === "object" && !Array.isArray(data) ? data.messageId : undefined;
+      const visibleInput = record.kind === BOARD_MESSAGE_KIND && typeof messageId === "string" && !messageId.startsWith("routine:") && !messageId.startsWith("cred-resume:") && !messageId.startsWith("dispatch:");
+      const entries = visibleInput || record.kind === "pi.assistant" ? threadEntries([record], false) : [];
+      const additions = entries.flatMap((entry) => {
+        if (visibleInput && entry.role === "operator" && entry.kind === "message") {
+          return [{ role: "operator", text: entry.text, ...entry.created ? { created: entry.created } : {} }];
+        }
+        if (record.kind === "pi.assistant" && entry.role === "agent" && (entry.kind === "assistant_text" || entry.kind === "turn_result") && entry.text) {
+          return [{ role: "agent", text: entry.text, ...entry.created ? { created: entry.created } : {} }];
+        }
+        return [];
+      });
+      const candidate = [...messages, ...additions];
+      if (candidate.length > MAX_MESSAGES || encoder4.encode(JSON.stringify({ messages: candidate, nextCursor: row.id })).byteLength > MAX_RESPONSE_BYTES) {
+        if (processed === after)
+          return null;
+        return { messages, nextCursor: processed };
+      }
+      messages.push(...additions);
+      processed = row.id;
+    }
+    return { messages, nextCursor: rows.length > PAGE_RECORDS ? processed : null };
+  } catch {
+    return null;
+  }
+}
 
 // src/hosted-session.ts
 var RESOLVED_MODEL_KEY = "tenant_resolved_model";
@@ -57385,6 +57461,9 @@ data: ${JSON.stringify(entry)}
   }
   sessionSummary(sessionId) {
     return readSessionSummary(this.ctx.storage.sql, this.ctx.id.toString(), sessionId);
+  }
+  sessionTranscript(sessionId, after) {
+    return readSessionTranscript(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, after);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

@@ -56,6 +56,15 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * the engine, submitting work or reading the transcript.
      */
     sessionSummary(sessionId?: string): HostedSessionInspection;
+    /** Read only the proven generation's committed, user-visible text. */
+    sessionTranscript(sessionId: string, after: number): {
+        messages: {
+            role: "operator" | "agent";
+            text: string;
+            created?: string;
+        }[];
+        nextCursor: number | null;
+    } | null;
     /** Stored runtime records, not expanded presentation entries. Read-only. */
     recordCount(): Promise<number>;
     /** Abort this instance; durable state is retained when it is reconstructed. */

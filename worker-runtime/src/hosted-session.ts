@@ -85,6 +85,7 @@ import { runtimeSkillSources } from "./workspace-skills.ts";
 import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import { readSessionSummary } from "./session-summary.ts";
+import { readSessionTranscript } from "./session-transcript.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
@@ -637,6 +638,19 @@ export class HostedSession<
       this.ctx.storage.sql as unknown as TaskSql,
       this.ctx.id.toString(),
       sessionId,
+    );
+  }
+
+  /** Read only the proven generation's committed, user-visible text. */
+  sessionTranscript(sessionId: string, after: number): {
+    messages: { role: "operator" | "agent"; text: string; created?: string }[];
+    nextCursor: number | null;
+  } | null {
+    return readSessionTranscript(
+      this.ctx.storage.sql as unknown as TaskSql,
+      this.ctx.id.toString(),
+      sessionId,
+      after,
     );
   }
 
