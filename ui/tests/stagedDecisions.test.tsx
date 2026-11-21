@@ -237,6 +237,23 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   assert(askedBy(mcp) === "MCP actor (agent)", "MCP origin wins over conflicting assistant metadata");
   const malformedOrigin = parseStagedRow(customer("unknown-origin", { origin: {}, proposer: personal }))!;
   assert(askedBy(malformedOrigin) === null, "malformed origin does not expose a potentially different proposer");
+  const homeCommand = {
+    id: "bafc1fc2e2520bcd5f76443f4b6702ea",
+    tool: "cadence_cli", status: "pending", createdAt: 1795239000000,
+    verb: "issue_new", title: "Cadence: issue new", requested_by: "Home assistant",
+    origin: { via: "home", kind: "agent", label: "Home assistant" },
+  };
+  const scopedCommand = parseStagedRow({ ...homeCommand, proposer: personal });
+  assert(scopedCommand && askedBy(scopedCommand) === `${personal.label} · Personal assistant`, "keyed Home command shows the verified personal proposer");
+  const legacyCommand = parseStagedRow(homeCommand);
+  assert(legacyCommand && askedBy(legacyCommand) === "Home assistant", "legacy Home command keeps its generic source");
+  for (const via of ["cli", "mcp"]) {
+    const external = parseStagedRow({
+      ...homeCommand, requested_by: "External agent", proposer: personal,
+      origin: { via, kind: "agent", label: "External agent" },
+    });
+    assert(external && external.proposer === null && askedBy(external) === "External agent", "external command attribution wins over conflicting proposer data");
+  }
 
   actions = fixture.personal.actions;
   const v = await render();

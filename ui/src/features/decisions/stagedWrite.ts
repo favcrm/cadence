@@ -459,10 +459,13 @@ function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" |
     }));
   }
   const origin = parseOrigin(row.origin);
+  const proposer =
+    origin?.via === "home" && origin.kind === "agent" ? parseProposer(row.proposer) : null;
   const summary = complete ? str(row.summary) : null;
   const requestedBy = str(row.requested_by);
   return {
     ...base,
+    proposer: proposer?.scope === "personal" ? { ...proposer, label: visible(proposer.label) } : null,
     kind: "cadence_cli",
     title: visible(str(row.title) ?? `Cadence: ${verb}`),
     app: null,
@@ -629,11 +632,15 @@ export function titleOf(write: StagedWrite, t: (english: string) => string): str
 type Say = (english: string) => string;
 const same: Say = (s) => s;
 
-/** Preserve the original actor when present; otherwise use the scoped assistant's display label. */
+/** External attribution is kept by the parser; a verified assistant label wins over a Home fallback. */
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
+  if (write.proposer) {
+    const { label, scope } = write.proposer;
+    return `${label} · ${t(scope === "workspace" ? "Workspace assistant" : "Personal assistant")}`;
+  }
   if (write.cli) return write.cli.requestedBy ?? (write.origin?.label ?? null);
   const o = write.origin;
-  if (o === null) return write.proposer ? `${write.proposer.label} · ${t(write.proposer.scope === "workspace" ? "Workspace assistant" : "Personal assistant")}` : null;
+  if (o === null) return null;
   return `${o.label} (${o.kind === "agent" || o.kind === "person" ? t(o.kind) : o.kind})`;
 }
 
