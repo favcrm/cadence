@@ -2315,15 +2315,16 @@ pub(super) mod tests {
             dir.join("hosted-assignments").join("msg-live.agent")
         );
         // ... and the verb path's first request is the mint, not a login authorize.
+        let mint_listener = listener.try_clone().unwrap();
         let board = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let (mut socket, _) = mint_listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let mut length = 0;
             loop {
                 let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
+                assert!(reader.read_line(&mut header).unwrap() > 0);
                 if header == "\r\n" {
                     break;
                 }
@@ -2361,6 +2362,125 @@ pub(super) mod tests {
             "the first request was {first}"
         );
         assert!(outcome.is_err());
+
+        // The public artifact entry point must use the slot that resolve bound,
+        // rather than authorizing or uploading this private ZIP as the member.
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let agent = format!("hct_{}", "A".repeat(43));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cache = json!({
+            "version": "cadence-agent-credential.v1",
+            "assignment_id": slot.assignment_id,
+            "claim_id": slot.claim_id,
+            "generation": slot.generation,
+            "organization_id": slot.org_id,
+            "audience": slot.endpoint,
+            "capabilities": ["cli.write"],
+            "access_token": agent,
+            "expires_at": now + 300,
+        });
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&slot.path)
+            .unwrap()
+            .write_all(cache.to_string().as_bytes())
+            .unwrap();
+        const ZIP: &[u8] =
+            b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        const DIGEST: &str = "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85";
+        const ARTIFACT_ID: &str = "art-0123456789abcdef0123456789abcdef";
+        let expected_agent = agent.clone();
+        let board = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            for _ in 0..2 {
+                let mut pollfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one initialized pollfd is supplied.
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 5000) }, 1);
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                let (mut length, mut bearer) = (0, String::new());
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        } else if key.eq_ignore_ascii_case("authorization") {
+                            bearer = value.trim().trim_start_matches("Bearer ").to_string();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(bearer, expected_agent);
+                let answer = if path == "/__platform/cli/authorize" {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(request["requested_scopes"], json!(["cli.write"]));
+                    json!({"version": "hosted-cadence-cli.v1", "envelope": "h.e.1"})
+                } else {
+                    assert_eq!(path, "/__platform/artifacts/upload");
+                    assert!(body.windows(ZIP.len()).any(|part| part == ZIP));
+                    assert!(body
+                        .windows(b"private-app-zip".len())
+                        .any(|part| part == b"private-app-zip"));
+                    for field in ["id", "issue", "label", "customer"] {
+                        let marker = format!("name=\"{field}\"");
+                        assert!(!body
+                            .windows(marker.len())
+                            .any(|part| part == marker.as_bytes()));
+                    }
+                    json!({"file": {"id": ARTIFACT_ID, "version": 1, "digest": DIGEST}})
+                };
+                let body = answer.to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                observed.push(path);
+            }
+            observed
+        });
+        let upload = cadence_agent::remote_cli::ArtifactUpload {
+            kind: "private-app-zip",
+            title: "Synthetic private app",
+            id: None,
+            issue: None,
+            label: None,
+            customer: None,
+            file_name: "app.zip",
+            bytes: ZIP,
+        };
+        let receipt = cadence_agent::remote_cli::upload_artifact(&target, &upload, 10, |_| {
+            panic!("a successful upload must not wake or fall back")
+        })
+        .unwrap();
+        assert_eq!(receipt["file"]["digest"], DIGEST);
+        assert_eq!(receipt["file"]["id"], ARTIFACT_ID);
+        assert_eq!(
+            board.join().unwrap(),
+            vec!["/__platform/cli/authorize", "/__platform/artifacts/upload"]
+        );
         cadence_agent::remote_cli::unbind_managed_session();
     }
 

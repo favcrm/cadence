@@ -3938,7 +3938,8 @@ pub fn upload_artifact(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    upload_artifact_in(&dir, target, upload, wake_timeout, note)
+    let agent = agent_credential::bound_session();
+    upload_artifact_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
 }
 
 /// Upload with an explicit credential directory, as in `upload_file_in`.
@@ -3947,6 +3948,7 @@ fn upload_artifact_in(
     target: &RemoteTarget,
     upload: &ArtifactUpload,
     wake_timeout: u64,
+    agent: Option<&AgentSlot>,
     note: impl Fn(&str),
 ) -> Result<Value> {
     let deadline = Instant::now()
@@ -3961,12 +3963,27 @@ fn upload_artifact_in(
             ),
         )
     };
+    // The tenant keys private ZIP custody to the same principal that requests
+    // its review. A human-staged ZIP is not readable by their agent.
+    let custody_agent = if upload.kind == "private-app-zip" && agent.is_some() {
+        Some(
+            agent_credential::applies(agent, target, Surface::Cli, "platform_call")
+                .ok_or_else(agent_credential::platform_agent_required)?,
+        )
+    } else {
+        None
+    };
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
     let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
     loop {
         request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
-        let cred = renewed_credential(dir, target, deadline)?;
+        let cred = match custody_agent {
+            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note, false)?
+                .map(|(credential, _)| credential)
+                .ok_or_else(agent_credential::platform_agent_required)?,
+            None => renewed_credential(dir, target, deadline)?,
+        };
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
             return Err(reject(
                 "artifact put needs the cli.write capability, which this remote login \
