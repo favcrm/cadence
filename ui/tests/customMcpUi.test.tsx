@@ -13,19 +13,20 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`customMcpUi: ${msg}`);
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let act: typeof reactAct;
-async function settle(fn: () => void, ms = 12000) {
-  const end = Date.now() + ms;
-  for (;;) {
+// act drains React effects and their promise continuations without timers.
+const drain = () => act(async () => { await Promise.resolve(); });
+async function settle(fn: () => void) {
+  for (let turn = 0; turn < 40; turn++) {
+    await drain();
     try {
       fn();
       return;
-    } catch (e) {
-      if (Date.now() > end) throw e;
-      await act(async () => sleep(20));
+    } catch {
+      /* drain another microtask/effect turn */
     }
   }
+  fn();
 }
 
 async function main() {
@@ -326,6 +327,11 @@ async function main() {
   // Close drawer, then open Connect drawer -> human-readable auth summary & 3-step OAuth discovery preview.
   const closeBtn = host.querySelector('[data-drawer="custom-mcp"] button[aria-label*="Close"]') as HTMLButtonElement;
   await act(async () => closeBtn.click());
+  const closingDrawer = host.querySelector('[data-drawer="custom-mcp"][data-closing]');
+  assert(closingDrawer, "inspect drawer enters closing state");
+  await act(async () => {
+    closingDrawer.dispatchEvent(new win.Event("transitionend", { bubbles: true }));
+  });
   await settle(() => assert(!host.querySelector('[data-drawer="custom-mcp"]'), "inspect drawer closes"));
 
   const addMcpBtn = Array.from(host.querySelectorAll("button")).find((el) =>
@@ -449,8 +455,4 @@ async function main() {
   console.log("customMcpUi: ok");
 }
 
-void main().catch((e) => {
-  setTimeout(() => {
-    throw e;
-  });
-});
+void main();
