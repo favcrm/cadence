@@ -14,6 +14,7 @@ const FILES = [
   "src/features/agents/AgentTabs.tsx",
   "src/features/agents/SkillPanels.tsx",
   "src/features/agents/workspaceSkills.ts",
+  "src/features/agents/profileTools.ts",
 ];
 
 const LITERAL = /"((?:[^"\\]|\\.)*)"/g;

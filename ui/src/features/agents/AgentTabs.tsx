@@ -58,6 +58,7 @@ import {
   type ProfileSkillOutcome,
   type SkillDeps,
 } from "./workspaceSkills";
+import { OPT_IN_TOOL_GROUPS, toolGroupOn, withEnabledGroup } from "./profileTools";
 
 export interface TabContext {
   alias: string;
@@ -1347,6 +1348,54 @@ function SkillDrawer({
   );
 }
 
+/** AOS-679: opt-in tool groups on a hosted profile. State is `enabled_tools`;
+ *  only the owner (`writable`) can change it, everyone else reads it. */
+function OptInTools({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  const [saving, setSaving] = useState<string | null>(null);
+  if (c.doc.kind !== "hosted") return null;
+  if (c.doc.read === "reading") return <Note>{t("Loading tools…")}</Note>;
+  if (c.doc.read === "failed") return <Note>{t("These tools couldn’t be read.")}</Note>;
+  const profile = c.doc.read === "ready" ? c.doc.profile : null;
+  if (!profile) return null;
+
+  async function toggle(group: string, on: boolean) {
+    if (!profile || saving) return;
+    setSaving(group);
+    const out = await c.doc.saveEnabledTools(withEnabledGroup(profile, group, on));
+    setSaving(null);
+    if (out.kind === "saved") c.toast("ok", `${t("Saved.")} ${t("It applies when a session next loads this profile.")}`);
+    else if (out.kind === "conflict") c.toast("warn", t("Someone else changed this agent, so nothing was saved. Reload to see the current tools."));
+    else if (out.kind === "unconfirmed") c.toast("warn", t("Not confirmed: the connection dropped. Reload to see what the board holds."));
+    else if (out.kind === "busy") c.toast("warn", t("Another save is still running. Try again in a moment."));
+    else if (out.kind === "refused") c.toast("err", t(out.message));
+  }
+
+  return (
+    <div className="sk-list" data-work-panel="opt-in-tools">
+      {OPT_IN_TOOL_GROUPS.map((group) => {
+        const on = toolGroupOn(profile, group.id);
+        return (
+          <div key={group.id} className="sk-card">
+            <span className="sk-title">
+              <b>{t(group.label)}</b>
+            </span>
+            <span className="sk-desc">{t(group.text)}</span>
+            <NativeToggle
+              name={group.label}
+              required={false}
+              enabled={on}
+              canToggle={c.writable}
+              pending={saving !== null}
+              onToggle={() => void toggle(group.id, !on)}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Tools({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [open, setOpen] = useState<string | null>(null);
@@ -1432,6 +1481,7 @@ function Tools({ c }: { c: TabContext }) {
         </Rows>
       )}
       <RoleRead c={c} />
+      <OptInTools c={c} />
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(openNative ? openNative.description : line(open))}</p>

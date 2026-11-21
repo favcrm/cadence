@@ -81,7 +81,13 @@ export function isDirty(kind: DocKind, draft: string | null, served: string): bo
 
 /** The hosted update body: exactly the keys the board accepts, from the profile
  *  as it was read. `model` is left out so the stored one stays. */
-export function profileBody(from: StoredAgentProfile, text: string, expectedRevision: number, skills = from.skills): object {
+export function profileBody(
+  from: StoredAgentProfile,
+  text: string,
+  expectedRevision: number,
+  skills = from.skills,
+  enabledTools?: string[],
+): object {
   return {
     name: from.name,
     role: from.role,
@@ -89,6 +95,8 @@ export function profileBody(from: StoredAgentProfile, text: string, expectedRevi
     skills,
     status: from.status,
     expectedRevision,
+    // AOS-679: sent only when changed; absent keeps the stored opt-in groups.
+    ...(enabledTools === undefined ? {} : { enabled_tools: enabledTools }),
   };
 }
 
