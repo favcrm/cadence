@@ -58,8 +58,9 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
     if (!(event.relatedTarget instanceof Element) || !event.relatedTarget.closest("[data-rail-label]")) setTip(null);
   };
   return (
+    // Keep `<aside>` unclipped (`min-w-0`, never `overflow-x-hidden`) so the 16rem AccountMenu dialog overflows cleanly past the 208px/64px sidebar border; `.sidebar-scroll` owns horizontal clipping.
     <aside id="desktop-sidebar" data-account-open={accountOpen || undefined} data-sidebar-rail={collapsed || undefined}
-      className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col overflow-x-hidden border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1`}
+      className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen min-w-0 flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1`}
       onMouseOver={(event) => showTip(event.target)} onMouseOut={hideTip}
       onFocus={(event) => showTip(event.target)} onBlur={hideTip}>
       <div className="sidebar-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden" onScroll={() => setTip(null)}>
@@ -86,7 +87,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
       </div>
       <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">
         {signedIn === true ? account : (
-          <div className="px-2 leading-9">{signedIn === false ? t("not signed in · read only") : "…"}</div>
+          <div className="px-2 leading-9 truncate">{signedIn === false ? t("not signed in · read only") : "…"}</div>
         )}
       </div>
       {tip && createPortal(<span className="sidebar-tooltip" role="tooltip" style={{ top: tip.top, left: tip.left }}>{tip.text}</span>, document.body)}
