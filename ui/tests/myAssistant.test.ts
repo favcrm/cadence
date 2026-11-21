@@ -88,8 +88,10 @@ let masterReads = 0;
 let threadReads: string[] = [];
 let directoryReads = 0;
 let directoryAvailable = true;
+const routineListAliases: (string | null)[] = [];
 globalThis.fetch = async (input) => {
-  const path = new URL(String(input), "http://localhost").pathname;
+  const url = new URL(String(input), "http://localhost");
+  const path = url.pathname;
   if (path === "/api/team/members") {
     directoryReads += 1;
     if (!directoryAvailable) return json({ error: "unavailable" }, 503);
@@ -110,10 +112,12 @@ globalThis.fetch = async (input) => {
     return json({ entries: [], cursor: 0, more_before: false });
   }
   if (path === "/api/routines") {
+    routineListAliases.push(url.searchParams.get("agent"));
     return json({ routines: [], staged_proposals: [
       { id: "omitted", state: "pending", title: "Alias omitted", kind: "routine_propose", payload: {}, proposed_by: "assistant" },
       { id: "padded", state: "pending", title: "Alias padded", kind: "routine_propose", payload: { agent_alias: " master " }, proposed_by: "assistant" },
       { id: "null", state: "pending", title: "Alias null", kind: "routine_propose", payload: { agent_alias: null }, proposed_by: "assistant" },
+      { id: "saved-assistant", state: "pending", title: "Saved assistant routine draft", kind: "routine_propose", payload: { agent_alias: "assistant" }, proposed_by: "assistant" },
       { id: "other", state: "pending", title: "Another runtime’s routine", kind: "routine_propose", payload: { agent_alias: "worker" }, proposed_by: "master" },
     ] });
   }
@@ -149,10 +153,10 @@ let rosterLoading = false;
 /** Reads the route from the real URL, as the app does. */
 function route() {
   const r = readLocation(location.pathname, location.search).route;
-  return r.screen === "agents" ? r : { alias: null, profileId: undefined, tab: undefined };
+  return r.screen === "agents" ? r : { alias: null, profileId: undefined, tab: undefined, routineAgent: undefined };
 }
 async function render() {
-  const { alias: open, profileId: openProfileId, tab = "overview" } = route();
+  const { alias: open, profileId: openProfileId, tab = "overview", routineAgent } = route();
   const viewer = { viewerSub: hostedBoard ? viewerSub : null };
   await React.act(() =>
     root.render(
@@ -172,6 +176,7 @@ async function render() {
         issues: loaded([]),
         open,
         tab,
+        routineAgent,
         recruit: false,
         ask: false,
         onAsk: () => {},
@@ -343,7 +348,7 @@ async function main() {
   assert(routineDraftReviewHref({ ...draft, proposed_by: "master" }, hostedRoster()) === "/agents/master?tab=routines", "the usual hosted draft without an alias still opens Master Routines for review");
   assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: "master" } }, hostedRoster()) === "/agents/master?tab=routines", "the explicit execution target takes precedence over the saved fallback");
   assert(routineReviewHref(null, roster()) === "/agents/master?tab=routines", "a legacy hosted proposal without an alias keeps its review destination");
-  assert(routineReviewHref(null, hostedRoster()) === null && routineReviewHref("assistant", hostedRoster()) === null, "scoped Home does not guess a routine destination");
+  assert(routineReviewHref(null, hostedRoster()) === null, "scoped Home does not guess a missing routine target");
   const unresolvedDraft = routineDraftReviewHref(draft, hostedRoster());
   assert(unresolvedDraft === "/agents/master?tab=routines", "an alias-less draft without a hired target still opens review");
   assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: " master " } }, hostedRoster()) === unresolvedDraft, "draft navigation normalizes the explicit alias");
@@ -362,6 +367,17 @@ async function main() {
   await render();
   assert(host.querySelector("h1")?.textContent === "assistant", "an older API: /agents/assistant is the hired profile");
   profiles = [];
+  payload = hostedRoster();
+  const savedRoutine = routineReviewHref("assistant", payload);
+  assert(savedRoutine === "/agents/master?tab=routines&routineAgent=assistant", "a stored routine still has a Review destination when the profile is missing");
+  const privateReadsBeforeRoutine = memberStateReads;
+  await at(savedRoutine);
+  assert(routineListAliases.at(-1) === "assistant" && host.querySelector("[data-routines-tab]")?.textContent?.includes("Saved assistant routine draft"), "Review opens the list for the stored alias rather than Master’s list");
+  assert(memberStateReads === privateReadsBeforeRoutine, "workspace routine review does not open the caller’s private assistant");
+  operator = false;
+  const approvalsReads = routineListAliases.length;
+  await at(savedRoutine);
+  assert(routineListAliases.length === approvalsReads && host.textContent?.includes("Chat with the company Master is for owners."), "the stored-alias Review route never gives members access or reads routines");
 
   // An older API (no scope, no personal_assistant) renders as today, Master shown to everyone.
   payload = roster();

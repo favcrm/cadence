@@ -821,10 +821,13 @@ the owner's queue, and the workspace assistant's Recruit decisions stay in
 Recruit. A decision shows the assistant's display name and scope when the board
 verifies who staged it. Older records without provenance stay generic; a
 recorded CLI or MCP actor keeps its attribution.
+The regular Home navigation returns to the default Home view.
 Home's Ask button names the assistant for that conversation and opens an
 unsent draft. It does not switch to the workspace assistant.
 Routine Review opens the recorded agent's Routines tab. If a hired agent
 shares the personal assistant's URL alias, Review opens the hired profile by ID.
+If the profile is absent, Review opens the owner-only Routines tab filtered
+to the saved alias. It does not open My assistant.
 If a draft has no explicit alias and its target cannot be opened, Review shows
 it in Master Routines without changing the draft's execution target.
 

@@ -293,7 +293,8 @@ export function routineReviewHref(alias: string | null | undefined, roster?: Age
   if (!name) return null;
   if (name !== PERSONAL_ALIAS) return `${routePath({ screen: "agents", alias: name })}?tab=routines`;
   const profileId = roster?.profiles?.find((profile) => profile.alias === name)?.id;
-  return profileId ? `${routePath({ screen: "agents", alias: null, profileId })}?tab=routines` : null;
+  if (profileId) return `${routePath({ screen: "agents", alias: null, profileId })}?tab=routines`;
+  return roster === null ? null : `${routePath({ screen: "agents", alias: MASTER })}?tab=routines&routineAgent=${PERSONAL_ALIAS}`;
 }
 
 export function routineDraftReviewHref(
@@ -311,8 +312,11 @@ export function routineDraftReviewHref(
   }
   if (alias != null && explicitAlias === null) return null;
   if (explicitAlias !== null) return routineReviewHref(explicitAlias, roster);
-  // Alias-less drafts are also listed in Master Routines. Prefer their
-  // effective target when it has a destination, without attributing a proposer.
+  // Alias-less drafts can be reviewed in Master Routines if the effective
+  // target has no profile.
+  if (draft.proposed_by === PERSONAL_ALIAS && !roster.profiles?.some((profile) => profile.alias === PERSONAL_ALIAS)) {
+    return routineReviewHref(MASTER, roster);
+  }
   return routineReviewHref(draft.proposed_by, roster) ?? routineReviewHref(MASTER, roster);
 }
 

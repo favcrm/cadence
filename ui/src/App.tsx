@@ -1375,6 +1375,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "home" && (
           <Home
             readOnly={readOnly}
+            privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             credentialRequestsEnabled={credentialRequestsOn}
             viewerSub={meta?.session?.user?.sub ?? null}
@@ -1671,6 +1672,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             open={route.alias}
             openProfileId={route.profileId}
             tab={route.tab ?? "overview"}
+            routineAgent={route.routineAgent}
             recruit={route.recruit === true}
             ask={route.ask === true}
             onAsk={() =>

@@ -71,6 +71,7 @@ export default function Agents({
   open,
   openProfileId,
   tab,
+  routineAgent,
   recruit,
   ask,
   onAsk,
@@ -96,6 +97,7 @@ export default function Agents({
   open: string | null;
   openProfileId?: string;
   tab: AgentTab;
+  routineAgent?: typeof PERSONAL_ALIAS;
   recruit: boolean;
   ask: boolean;
   onAsk: () => void;
@@ -330,6 +332,7 @@ export default function Agents({
         profiles={profiles}
         selectedProfile={selectedProfile}
         tab={tab}
+        routineAgent={scopedRoster && open === MASTER && operator === true ? routineAgent : undefined}
         onTab={onTab}
         onBack={() => setOpen(null)}
         onOpenIssue={onOpenIssue}

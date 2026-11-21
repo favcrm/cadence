@@ -757,6 +757,7 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
+  privateChat = false,
   hosted = null,
   viewerSub = null,
   viewerIsMember = false,
@@ -776,6 +777,7 @@ export default function Home({
   templateReviewCanApprove = false,
 }: {
   readOnly: boolean;
+  privateChat?: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
   templateReviewEnabled?: boolean;
@@ -821,8 +823,7 @@ export default function Home({
   // sign-in) never enters it — those keep the Master workspace, exactly
   // like a standalone board. On a hosted board a member lands on their own
   // assistant by default; an owner reaches theirs only through the query.
-  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
-  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || privateChat);
   const composerKey = memberChat && viewerSub !== null ? `member-assist:${memberScope(sessionId, viewerSub)}` : "home";
   const onCompose = useCallback((text: string) => {
     if (readOnly) return;

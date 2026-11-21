@@ -71,6 +71,7 @@ export default function AgentPage({
   profiles,
   selectedProfile,
   tab,
+  routineAgent,
   onTab,
   onBack,
   onOpenIssue,
@@ -94,6 +95,7 @@ export default function AgentPage({
   profiles: HiredProfile[];
   selectedProfile?: HiredProfile;
   tab: AgentTab;
+  routineAgent?: "assistant";
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
   onOpenIssue: (id: string) => void;
@@ -570,7 +572,14 @@ export default function AgentPage({
             ))}
           </nav>
           <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
-            <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
+            {section === "routines" && routineAgent ? (
+              <>
+                <p className="text-label text-ink-400">{t("Agent")}: {routineAgent}</p>
+                <AgentTabBody key={`routine:${routineAgent}`} tab={section} c={{ ...ctx, alias: routineAgent }} />
+              </>
+            ) : (
+              <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
+            )}
           </div>
           {(gear || tab === "settings") && (
             <SettingsDrawer
