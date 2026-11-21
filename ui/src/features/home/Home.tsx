@@ -58,6 +58,7 @@ import { useDockHeight } from "./useDockHeight";
 import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
 import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
+import PrivateAppReviewCards from "./PrivateAppReviewCards";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
@@ -1779,6 +1780,7 @@ function MasterHome({
             {appHandoffConversation !== undefined && (
               <AppHandoffCards key={appHandoffConversation} conversation={appHandoffConversation} revision={lastSeq(thread.data) ?? 0} />
             )}
+            <PrivateAppReviewCards enabled={decisions && !effectiveReadOnly && hosted === true} revision={lastSeq(thread.data) ?? 0} />
             {cmds.map((c) => (
               <CmdCard
                 key={c.id}

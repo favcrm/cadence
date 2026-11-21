@@ -588,7 +588,11 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
                 Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 Some("call") => match arguments.get("tool").and_then(Value::as_str) {
-                    Some("app_describe") => Effect::Read,
+                    Some(
+                        "app_describe"
+                        | "private_app_review_status"
+                        | "private_app_review_reconcile",
+                    ) => Effect::Read,
                     Some("app_call") => mutation(RECONCILE_APP_ACTION),
                     _ => cli_effect(verb),
                 },
@@ -3956,6 +3960,17 @@ pub fn upload_artifact(
     upload_artifact_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
 }
 
+pub(crate) fn upload_artifact_for_slot(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    agent: &AgentSlot,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    upload_artifact_in(dir, target, upload, wake_timeout, Some(agent), note)
+}
+
 /// Upload with an explicit credential directory, as in `upload_file_in`.
 fn upload_artifact_in(
     dir: &Path,
@@ -5968,6 +5983,31 @@ pub fn call_verb(
         &dir,
         true,
         session.as_deref(),
+        note,
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_verb_for_slot(
+    dir: &Path,
+    target: &RemoteTarget,
+    verb: &str,
+    arguments: Map<String, Value>,
+    deadline: Instant,
+    wake_timeout: u64,
+    agent: &AgentSlot,
+    note: impl Fn(&str),
+) -> Result<RemoteAnswer> {
+    call_verb_until_retry(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        dir,
+        true,
+        Some(agent),
         note,
         std::thread::sleep,
     )
