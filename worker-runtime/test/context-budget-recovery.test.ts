@@ -109,7 +109,7 @@ afterEach(async () => {
 
 async function session(
   respond: (requests: readonly RequestRecord[]) => Response | Promise<Response>,
-  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean; backgroundTokens?: number } = {},
+  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number; put?: boolean; backgroundTokens?: number; projectThread?: (entries: readonly ThreadEntry[]) => readonly ThreadEntry[] } = {},
 ) {
   const { HostedSession } = await import("../src/hosted-session.ts");
   const database = new Database(":memory:");
@@ -165,6 +165,7 @@ async function session(
           },
         }])],
       }],
+      projectThread: options.projectThread,
       authorizeTool: async () => {},
       toolRefusal: () => undefined,
     } as never,
@@ -198,14 +199,22 @@ async function session(
   return {
     hosted, requests, toolExecutions: () => toolExecutions,
     reset: () => conversation.reset(undefined, BACKGROUND_CONTEXT),
+    async writeRecord(entry: Record<string, unknown>) {
+      const operation = await conversation.submit({ type: "write", entry } as never, BACKGROUND_CONTEXT);
+      await operation.wait(BACKGROUND_CONTEXT);
+    },
     inspectReconstructed: (readSql: typeof sql = sql) => (Object.assign(Object.create(HostedSession.prototype), {
       ctx: { id, storage: { sql: readSql } },
     }) as InstanceType<typeof HostedSession>).sessionSummary(),
+    unavailableTranscript: (sessionId: string) => (Object.assign(Object.create(HostedSession.prototype), {
+      ctx: { id, storage: { sql: { exec() { throw new Error("SQL unavailable"); } } } },
+      options: {},
+    }) as InstanceType<typeof HostedSession>).sessionTranscript(sessionId, 0),
     async submit(content: string) {
       const id = `operation-${++operations}`;
       return conversation.submit({
         type: "input", requestId: id, content,
-        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id } },
+        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id, transcriptRole: "operator" } },
       }, BACKGROUND_CONTEXT);
     },
   };
@@ -275,6 +284,145 @@ describe("hosted session summaries", () => {
     await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
     expect(run.requests).toHaveLength(1);
     expect(run.hosted.sessionSummary().state).toBe("observed");
+  });
+});
+
+describe("exact session transcripts", () => {
+  it("reads only the requested generation across consecutive resets and rejects foreign cursors", async () => {
+    const run = await session(() => answer("visible answer"));
+    await (await run.submit("first generation")).wait(BACKGROUND_CONTEXT);
+    const first = run.hosted.sessionSummary();
+    if (first.state !== "observed") throw new Error("expected first session");
+    for (let i = 0; i < 40; i++) await run.writeRecord({
+      kind: BOARD_MESSAGE_KIND, data: { messageId: `message-${i}`, transcriptRole: "operator" },
+      model: [{ role: "user", content: `first-${i}`, timestamp: 1000 }],
+    });
+    const page = run.hosted.sessionTranscript(first.session.sessionId, 0);
+    expect(page?.nextCursor).toEqual(expect.any(Number));
+    await run.writeRecord({
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "late", transcriptRole: "operator" },
+      model: [{ role: "user", content: "first-late", timestamp: 1000 }],
+    });
+    await run.reset();
+    const empty = run.hosted.sessionSummary();
+    if (empty.state !== "observed") throw new Error("expected empty generation");
+    await run.reset();
+    await (await run.submit("second generation")).wait(BACKGROUND_CONTEXT);
+    const second = run.hosted.sessionSummary();
+    if (second.state !== "observed") throw new Error("expected second session");
+
+    const all = [...page!.messages];
+    let cursor = page!.nextCursor;
+    while (cursor !== null) {
+      const next = run.hosted.sessionTranscript(first.session.sessionId, cursor);
+      expect(next).not.toBeNull();
+      all.push(...next!.messages);
+      cursor = next!.nextCursor;
+    }
+    expect(all.map((message) => message.text)).toEqual([
+      "first generation", "visible answer", ...Array.from({ length: 40 }, (_, i) => `first-${i}`), "first-late",
+    ]);
+    expect(run.hosted.sessionTranscript(empty.session.sessionId, 0)).toEqual({ messages: [], nextCursor: null });
+    expect(run.hosted.sessionTranscript(second.session.sessionId, 0)?.messages.map((m) => m.text))
+      .toEqual(["second generation", "visible answer"]);
+    expect(run.hosted.sessionTranscript(second.session.sessionId, page!.nextCursor!)).toBeNull();
+    expect(run.hosted.sessionTranscript(first.session.sessionId, Number.MAX_SAFE_INTEGER)).toBeNull();
+    expect(run.hosted.sessionTranscript("foreign:0", 0)).toBeNull();
+    expect(run.hosted.sessionTranscript("test-object-id:999999", 0)).toBeNull();
+    expect(run.hosted.sessionTranscript(first.session.sessionId, -1)).toBeNull();
+    expect(run.requests).toHaveLength(2);
+  });
+
+  it("excludes internal prompts, reasoning, tool payloads and compaction while retaining visible text", async () => {
+    const run = await session(() => answer("answer"));
+    await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    for (const [kind, id, text] of [
+      [BOARD_MESSAGE_KIND, "routine:123", "private routine"],
+      [BOARD_MESSAGE_KIND, "cred-resume:123", "private credential"],
+      [BOARD_MESSAGE_KIND, "dispatch:ticket:1", "private dispatch instructions"],
+      [BOARD_MESSAGE_KIND, "01965bb9-3411-76a7-9cdd-f55c5b66373c", "private unmarked input"],
+      ["pi.user", "internal", "private instruction"],
+      ["pi.compaction", "compaction", "private summary"],
+    ]) await run.writeRecord({
+      kind, data: { messageId: id }, model: [{ role: "user", content: text, timestamp: 1000 }],
+    });
+    await run.writeRecord({
+      kind: "pi.assistant",
+      model: [{ role: "assistant", timestamp: 1000, stopReason: "stop", usage: {},
+        content: [{ type: "thinking", thinking: "private thinking" },
+          { type: "toolCall", id: "tool", name: "private", arguments: { secret: "private tool" } },
+          { type: "text", text: "visible reply" }] }],
+    });
+    const messages: { role: string; text: string }[] = [];
+    let cursor: number | null = 0;
+    while (cursor !== null) {
+      const page = run.hosted.sessionTranscript(summary.session.sessionId, cursor);
+      expect(page).not.toBeNull();
+      messages.push(...page!.messages);
+      cursor = page!.nextCursor;
+    }
+    expect(messages.map((message) => message.text)).toEqual(["question", "answer", "visible reply"]);
+    expect(JSON.stringify(messages)).not.toContain("private");
+  });
+
+  it("applies the host projection before returning visible input text", async () => {
+    const run = await session(() => answer("answer"), {
+      projectThread: (entries) => entries.map((entry) =>
+        entry.role === "operator" ? { ...entry, text: "visible input" } : entry
+      ),
+    });
+    await (await run.submit("private preamble and visible input")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    expect(run.hosted.sessionTranscript(summary.session.sessionId, 0)?.messages.map((message) => message.text))
+      .toEqual(["visible input", "answer"]);
+  });
+
+  it("pages at the response byte ceiling without splitting or dropping a record", async () => {
+    const run = await session(() => answer("answer"));
+    await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    for (const text of ["a".repeat(30_000), "b".repeat(30_000)]) await run.writeRecord({
+      kind: BOARD_MESSAGE_KIND, data: { messageId: text[0], transcriptRole: "operator" },
+      model: [{ role: "user", content: text, timestamp: 1000 }],
+    });
+    const first = run.hosted.sessionTranscript(summary.session.sessionId, 0);
+    expect(first?.messages.map((message) => message.text)).toEqual(["question", "answer", "a".repeat(30_000)]);
+    expect(first?.nextCursor).toEqual(expect.any(Number));
+    const second = run.hosted.sessionTranscript(summary.session.sessionId, first!.nextCursor!);
+    expect(second?.messages.map((message) => message.text)).toEqual(["b".repeat(30_000)]);
+    expect(second?.nextCursor).toBeNull();
+  });
+
+  it("refuses an atomic record that would exceed the message ceiling", async () => {
+    const run = await session(() => answer("answer"));
+    await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    await run.writeRecord({
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "many", transcriptRole: "operator" },
+      model: Array.from({ length: 101 }, () => ({ role: "user", content: "message", timestamp: 1000 })),
+    });
+    const first = run.hosted.sessionTranscript(summary.session.sessionId, 0);
+    expect(first?.messages.map((message) => message.text)).toEqual(["question", "answer"]);
+    expect(first?.nextCursor).toEqual(expect.any(Number));
+    expect(run.hosted.sessionTranscript(summary.session.sessionId, first!.nextCursor!)).toBeNull();
+  });
+
+  it("refuses oversized records and unavailable storage without silently dropping content", async () => {
+    const run = await session(() => answer("answer"));
+    await (await run.submit("question")).wait(BACKGROUND_CONTEXT);
+    const summary = run.hosted.sessionSummary();
+    if (summary.state !== "observed") throw new Error("expected session");
+    await run.writeRecord({
+      kind: BOARD_MESSAGE_KIND, data: { messageId: "large", transcriptRole: "operator" },
+      model: [{ role: "user", content: "x".repeat(100_000), timestamp: 1000 }],
+    });
+    expect(run.hosted.sessionTranscript(summary.session.sessionId, 0)).toBeNull();
+    expect(run.unavailableTranscript(summary.session.sessionId)).toBeNull();
   });
 });
 

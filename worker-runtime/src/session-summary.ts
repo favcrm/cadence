@@ -111,3 +111,22 @@ export function readSessionSummary(sql: TaskSql, objectId: string, sessionId?: s
     return { state: "unknown" };
   }
 }
+
+/** Resolve the same proven generation and reset bounds used by the summary. */
+export function readSessionBounds(
+  sql: TaskSql,
+  objectId: string,
+  sessionId: string,
+): { anchor: number; upper: number } | null {
+  const summary = readSessionSummary(sql, objectId, sessionId);
+  if (summary.state !== "observed" || summary.session.sessionId !== sessionId) return null;
+  try {
+    const anchor = Number(sessionId.slice(objectId.length + 1));
+    const boundary = resetBetween(sql, anchor + 1, MAX_ID, "ASC");
+    if (boundary === undefined) return { anchor, upper: MAX_ID };
+    if (typeof boundary.id !== "number" || !Number.isSafeInteger(boundary.id) || boundary.id <= anchor) return null;
+    return { anchor, upper: boundary.id - 1 };
+  } catch {
+    return null;
+  }
+}

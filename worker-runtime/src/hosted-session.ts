@@ -85,6 +85,7 @@ import { runtimeSkillSources } from "./workspace-skills.ts";
 import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import { readSessionSummary } from "./session-summary.ts";
+import { readSessionTranscript } from "./session-transcript.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
@@ -588,17 +589,19 @@ export class HostedSession<
    * operation id is bound to the text and scope it was first admitted with, so
    * a retry with the same id replays that operation and a retry that changes
    * either is refused before the engine runs.
+   * Only a host-admitted user message may declare `transcriptRole`.
    */
   async ask(
     prompt: string,
     operationId?: string,
     app?: AppScope,
+    transcriptRole?: "operator",
   ): Promise<AskResult> {
     await this.requireIdentity();
     const envelope = await this.admitOperation(prompt, operationId, app);
     const result = await this.harness.prompt(envelope.text, {
       operationId: envelope.operationId,
-      entry: this.inputEntry(envelope),
+      entry: this.inputEntry(envelope, transcriptRole),
     });
     return {
       status: result.status,
@@ -640,6 +643,20 @@ export class HostedSession<
     );
   }
 
+  /** Read only the proven generation's committed, user-visible text. */
+  sessionTranscript(sessionId: string, after: number): {
+    messages: { role: "operator" | "agent"; text: string; created?: string }[];
+    nextCursor: number | null;
+  } | null {
+    return readSessionTranscript(
+      this.ctx.storage.sql as unknown as TaskSql,
+      this.ctx.id.toString(),
+      sessionId,
+      after,
+      this.options.projectThread,
+    );
+  }
+
   /** Stored runtime records, not expanded presentation entries. Read-only. */
   async recordCount(): Promise<number> {
     return (await this.harness.session().messages()).length;
@@ -669,17 +686,19 @@ export class HostedSession<
    * operation id is bound to the text and scope it was first admitted with, so
    * a retried send with the same id replays that operation and one that changes
    * either is refused before the engine is asked.
+   * Only a host-admitted user message may declare `transcriptRole`.
    */
   async submit(
     text: string,
     operationId: string,
     app?: AppScope,
+    transcriptRole?: "operator",
   ): Promise<boolean> {
     await this.requireIdentity();
     const envelope = await this.admitOperation(text, operationId, app);
     const receipt = await this.harness.submit(envelope.text, {
       operationId: envelope.operationId,
-      entry: this.inputEntry(envelope),
+      entry: this.inputEntry(envelope, transcriptRole),
     });
     return receipt.accepted;
   }
@@ -806,11 +825,12 @@ export class HostedSession<
    * and the admitted app scope travel with the entry, so the transcript, a
    * rebuilt object and a replayed retry all read the same envelope.
    */
-  private inputEntry(envelope: OperationEnvelope): {
+  private inputEntry(envelope: OperationEnvelope, transcriptRole: "operator" | undefined): {
     kind: string;
     data: JsonObject;
   } {
     const data: JsonObject = { messageId: envelope.operationId };
+    if (transcriptRole === "operator") data.transcriptRole = transcriptRole;
     if (envelope.app !== undefined)
       data.app =
         envelope.app.contextId === undefined
