@@ -347,32 +347,23 @@ function ConnectionsIndex({
   );
   const mcpAutoOpened = useRef(false);
 
-  const loadCustomMcp = () => {
+  const loadCustomMcp = (stillMounted?: () => boolean) => {
     if (!hostedBoard || viewer.operator === null) return;
     api
       .customMcpList(true)
       .then((res) => {
+        if (stillMounted && !stillMounted()) return;
         setMcpRows(res.connections ?? []);
         setMcpLoaded(true);
       })
       .catch(() => {
-        setMcpLoaded(false);
+        if (!stillMounted || stillMounted()) setMcpLoaded(false);
       });
   };
 
   useEffect(() => {
-    if (!hostedBoard || viewer.operator === null) return;
     let alive = true;
-    api
-      .customMcpList(true)
-      .then((res) => {
-        if (!alive) return;
-        setMcpRows(res.connections ?? []);
-        setMcpLoaded(true);
-      })
-      .catch(() => {
-        if (alive) setMcpLoaded(false);
-      });
+    loadCustomMcp(() => alive);
     return () => {
       alive = false;
     };

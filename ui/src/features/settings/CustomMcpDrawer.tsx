@@ -34,15 +34,30 @@ export type CustomMcpDrawerTab = "tools" | "guide" | "policies" | "auth";
 
 function statusChipClass(tone: "ok" | "warn" | "fail" | "muted"): string {
   switch (tone) {
-    case "ok":
-      return "custmcp-chip-ok";
-    case "warn":
-      return "custmcp-chip-warn";
-    case "fail":
-      return "custmcp-chip-fail";
-    case "muted":
-      return "bg-ink-800 text-ink-400";
+    case "ok": return "custmcp-chip-ok";
+    case "warn": return "custmcp-chip-warn";
+    case "fail": return "custmcp-chip-fail";
+    case "muted": return "bg-ink-800 text-ink-400";
   }
+}
+
+function MetaRow({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex flex-wrap gap-x-2">
+      <dt className="text-ink-500">{label}</dt>
+      <dd className={mono ? "num text-ink-200 break-all" : "text-ink-200"}>{value}</dd>
+    </div>
+  );
+}
+
+function PolicyRadio({ checked, disabled, title, sub, onClick }: {
+  checked: boolean; disabled: boolean; title: string; sub: string; onClick: () => void;
+}) {
+  return (
+    <button type="button" role="radio" aria-checked={checked} disabled={disabled} className="conn-policy-opt" onClick={onClick}>
+      <b>{title}</b><small>{sub}</small>
+    </button>
+  );
 }
 
 /**
@@ -175,151 +190,56 @@ export function CustomMcpConnectDrawer({
   return (
     <SettingsDrawer title={t("Connect custom MCP server")} onClose={onClose}>
       <div className="custmcp-steps" aria-label={t("Setup steps")}>
-        <span className="custmcp-step" data-active={!discoveryStep ? "true" : undefined}>
-          {t("1. Endpoint")}
-        </span>
-        <span className="custmcp-step" data-active={discoveryStep ? "true" : undefined}>
-          {t("2. Discovery & Consent")}
-        </span>
+        <span className="custmcp-step" data-active={!discoveryStep ? "true" : undefined}>{t("1. Endpoint")}</span>
+        <span className="custmcp-step" data-active={discoveryStep ? "true" : undefined}>{t("2. Discovery & Consent")}</span>
         <span className="custmcp-step">{t("3. Pinned Tools")}</span>
       </div>
-
       <p className="text-label text-ink-400 break-words">
         {t("Connect a remote Streamable HTTP (https://) MCP server. Auto OAuth 2.1 + PKCE discovers metadata automatically; tools stay pinned and start in safe Approval or Off mode.")}
       </p>
-
       {discoveryStep ? (
         <div className="rounded border border-accent/40 bg-accent/10 p-3 space-y-2.5" role="status" data-mcp-discovery-preview>
-          <p className="text-label font-medium text-ink-100">
-            {t("OAuth discovery verified")}
-          </p>
+          <p className="text-label font-medium text-ink-100">{t("OAuth discovery verified")}</p>
           <dl className="text-micro space-y-1 text-ink-300">
-            <div className="flex flex-wrap gap-x-2">
-              <dt className="text-ink-500">{t("Authorization host")}</dt>
-              <dd className="num text-ink-100 break-all">{previewHost}</dd>
-            </div>
-            {discoveryStep.discovery?.issuer && (
-              <div className="flex flex-wrap gap-x-2">
-                <dt className="text-ink-500">{t("OAuth issuer")}</dt>
-                <dd className="num text-ink-200 break-all">{discoveryStep.discovery.issuer}</dd>
-              </div>
-            )}
-            <div className="flex flex-wrap gap-x-2">
-              <dt className="text-ink-500">{t("Client registration")}</dt>
-              <dd className="text-ink-200">
-                {discoveryStep.discovery?.registration === "static"
-                  ? t("Static pre-registered OAuth client")
-                  : t("Dynamic Client Registration (RFC 7591)")}
-              </dd>
-            </div>
-            {discoveryStep.discovery?.resource_metadata_url && (
-              <div className="flex flex-wrap gap-x-2">
-                <dt className="text-ink-500">{t("Resource metadata")}</dt>
-                <dd className="num text-ink-300 break-all">{discoveryStep.discovery.resource_metadata_url}</dd>
-              </div>
-            )}
-            {discoveryStep.discovery && discoveryStep.discovery.scopes.length > 0 && (
-              <div className="flex flex-wrap gap-x-2">
-                <dt className="text-ink-500">{t("Scopes")}</dt>
-                <dd className="num text-ink-200 break-words">{discoveryStep.discovery.scopes.join(" ")}</dd>
-              </div>
-            )}
+            <MetaRow label={t("Authorization host")} value={previewHost} />
+            {discoveryStep.discovery?.issuer && <MetaRow label={t("OAuth issuer")} value={discoveryStep.discovery.issuer} />}
+            <MetaRow label={t("Client registration")} mono={false} value={discoveryStep.discovery?.registration === "static" ? t("Static pre-registered OAuth client") : t("Dynamic Client Registration (RFC 7591)")} />
+            {discoveryStep.discovery?.resource_metadata_url && <MetaRow label={t("Resource metadata")} value={discoveryStep.discovery.resource_metadata_url} />}
+            {discoveryStep.discovery && discoveryStep.discovery.scopes.length > 0 && <MetaRow label={t("Scopes")} value={discoveryStep.discovery.scopes.join(" ")} />}
           </dl>
           <p className="text-micro text-ink-300 break-words">
             {t("Approve access at the provider. You will return to Settings → Connections to review pinned tools.")}
           </p>
           <div className="flex flex-wrap gap-2">
-            <a href={discoveryStep.authorizationUrl} className="btn btn-primary btn-sm">
-              {t("Continue to OAuth sign-in →")}
-            </a>
-            <Button size="sm" variant="ghost" onClick={() => setDiscoveryStep(null)}>
-              {t("Back")}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={onClose}>
-              {t("Close")}
-            </Button>
+            <a href={discoveryStep.authorizationUrl} className="btn btn-primary btn-sm">{t("Continue to OAuth sign-in →")}</a>
+            <Button size="sm" variant="ghost" onClick={() => setDiscoveryStep(null)}>{t("Back")}</Button>
+            <Button size="sm" variant="ghost" onClick={onClose}>{t("Close")}</Button>
           </div>
         </div>
       ) : (
-        <form
-          className="space-y-3 min-w-0"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void submit();
-          }}
-        >
+        <form className="space-y-3 min-w-0" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
           <div>
-            <label htmlFor={`${baseId}-name`} className="text-label font-medium text-ink-200">
-              {t("Server name")}
-            </label>
-            <input
-              id={`${baseId}-name`}
-              type="text"
-              maxLength={80}
-              required
-              autoComplete="off"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Acme Billing MCP"
-              className="field w-full mt-1"
-              disabled={busy}
-            />
+            <label htmlFor={`${baseId}-name`} className="text-label font-medium text-ink-200">{t("Server name")}</label>
+            <input id={`${baseId}-name`} type="text" maxLength={80} required autoComplete="off" value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Billing MCP" className="field w-full mt-1" disabled={busy} />
           </div>
-
           <div>
-            <label htmlFor={`${baseId}-url`} className="text-label font-medium text-ink-200">
-              {t("MCP endpoint URL")}
-            </label>
+            <label htmlFor={`${baseId}-url`} className="text-label font-medium text-ink-200">{t("MCP endpoint URL")}</label>
             <input
-              id={`${baseId}-url`}
-              type="url"
-              required
-              autoComplete="off"
-              spellCheck={false}
-              value={endpointUrl}
-              onChange={(e) => {
-                setEndpointUrl(e.target.value);
-                if (!urlTouched) setUrlTouched(true);
-              }}
-              placeholder="https://mcp.example.com/v1/mcp"
-              className="field w-full mt-1 num"
-              disabled={busy}
+              id={`${baseId}-url`} type="url" required autoComplete="off" spellCheck={false} value={endpointUrl}
+              onChange={(e) => { setEndpointUrl(e.target.value); if (!urlTouched) setUrlTouched(true); }}
+              placeholder="https://mcp.example.com/v1/mcp" className="field w-full mt-1 num" disabled={busy}
             />
             {urlTouched && endpointUrl.trim() !== "" && urlError !== null && (
-              <p className="text-micro text-fail mt-1 break-words" role="alert">
-                {t(urlError)}
-              </p>
+              <p className="text-micro text-fail mt-1 break-words" role="alert">{t(urlError)}</p>
             )}
           </div>
-
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
             <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this server")}>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={visibility === "shared"}
-                disabled={busy}
-                className="conn-policy-opt"
-                onClick={() => setVisibility("shared")}
-              >
-                <b>{t("Shared with company")}</b>
-                <small>{t("All workspace members and approved agents can use enabled tools.")}</small>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={visibility === "personal"}
-                disabled={busy}
-                className="conn-policy-opt"
-                onClick={() => setVisibility("personal")}
-              >
-                <b>{t("Just me (Personal)")}</b>
-                <small>{t("Only your own turns can access this server.")}</small>
-              </button>
+              <PolicyRadio checked={visibility === "shared"} disabled={busy} title={t("Shared with company")} sub={t("All workspace members and approved agents can use enabled tools.")} onClick={() => setVisibility("shared")} />
+              <PolicyRadio checked={visibility === "personal"} disabled={busy} title={t("Just me (Personal)")} sub={t("Only your own turns can access this server.")} onClick={() => setVisibility("personal")} />
             </div>
           </div>
-
           <details className="custmcp-manual" open={authKind !== "auto"}>
             <summary className="text-label font-medium text-ink-300 cursor-pointer select-none">
               {t("Authentication mode")}: <span className="text-ink-200">{t(customMcpAuthOptionLabel(authKind))}</span>
@@ -335,110 +255,40 @@ export function CustomMcpConnectDrawer({
                     { id: "none", label: "No auth", hint: "Public read-only HTTPS server" },
                   ] as const
                 ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={authKind === opt.id}
-                    disabled={busy}
-                    className="conn-policy-opt"
-                    onClick={() => setAuthKind(opt.id)}
-                  >
+                  <button key={opt.id} type="button" role="radio" aria-checked={authKind === opt.id} disabled={busy} className="conn-policy-opt" onClick={() => setAuthKind(opt.id)}>
                     <b>{t(opt.label)}</b>
                     <small>{t(opt.hint)}</small>
                   </button>
                 ))}
               </div>
-
               {authKind === "bearer" && (
                 <div>
-                  <label htmlFor={`${baseId}-bearer`} className="text-label text-ink-300">
-                    {t("Bearer token")}
-                  </label>
-                  <input
-                    id={`${baseId}-bearer`}
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={bearerToken}
-                    onChange={(e) => setBearerToken(e.target.value)}
-                    placeholder="sk_live_..."
-                    className="field w-full mt-1 num"
-                    disabled={busy}
-                  />
+                  <label htmlFor={`${baseId}-bearer`} className="text-label text-ink-300">{t("Bearer token")}</label>
+                  <input id={`${baseId}-bearer`} type="password" autoComplete="off" spellCheck={false} value={bearerToken} onChange={(e) => setBearerToken(e.target.value)} placeholder="sk_live_..." className="field w-full mt-1 num" disabled={busy} />
                 </div>
               )}
-
               {authKind === "header" && (
                 <div>
-                  <label htmlFor={`${baseId}-headers`} className="text-label text-ink-300">
-                    {t("Custom HTTP headers (one Header: Value per line)")}
-                  </label>
-                  <textarea
-                    id={`${baseId}-headers`}
-                    rows={3}
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={customHeadersText}
-                    onChange={(e) => setCustomHeadersText(e.target.value)}
-                    placeholder={"X-API-Key: ...\nX-Tenant-Id: acme"}
-                    className="field w-full mt-1 num"
-                    disabled={busy}
-                  />
+                  <label htmlFor={`${baseId}-headers`} className="text-label text-ink-300">{t("Custom HTTP headers (one Header: Value per line)")}</label>
+                  <textarea id={`${baseId}-headers`} rows={3} autoComplete="off" spellCheck={false} value={customHeadersText} onChange={(e) => setCustomHeadersText(e.target.value)} placeholder={"X-API-Key: ...\nX-Tenant-Id: acme"} className="field w-full mt-1 num" disabled={busy} />
                 </div>
               )}
-
               {authKind === "oauth_static" && (
                 <div className="space-y-2">
                   <div>
-                    <label htmlFor={`${baseId}-cid`} className="text-label text-ink-300">
-                      {t("OAuth Client ID")}
-                    </label>
-                    <input
-                      id={`${baseId}-cid`}
-                      type="text"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={oauthClientId}
-                      onChange={(e) => setOauthClientId(e.target.value)}
-                      className="field w-full mt-1 num"
-                      disabled={busy}
-                    />
+                    <label htmlFor={`${baseId}-cid`} className="text-label text-ink-300">{t("OAuth Client ID")}</label>
+                    <input id={`${baseId}-cid`} type="text" autoComplete="off" spellCheck={false} value={oauthClientId} onChange={(e) => setOauthClientId(e.target.value)} className="field w-full mt-1 num" disabled={busy} />
                   </div>
                   <div>
-                    <label htmlFor={`${baseId}-csec`} className="text-label text-ink-300">
-                      {t("OAuth Client Secret (optional)")}
-                    </label>
-                    <input
-                      id={`${baseId}-csec`}
-                      type="password"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={oauthClientSecret}
-                      onChange={(e) => setOauthClientSecret(e.target.value)}
-                      className="field w-full mt-1 num"
-                      disabled={busy}
-                    />
+                    <label htmlFor={`${baseId}-csec`} className="text-label text-ink-300">{t("OAuth Client Secret (optional)")}</label>
+                    <input id={`${baseId}-csec`} type="password" autoComplete="off" spellCheck={false} value={oauthClientSecret} onChange={(e) => setOauthClientSecret(e.target.value)} className="field w-full mt-1 num" disabled={busy} />
                   </div>
                   <div>
-                    <label htmlFor={`${baseId}-scopes`} className="text-label text-ink-300">
-                      {t("Scopes (optional, space-separated)")}
-                    </label>
-                    <input
-                      id={`${baseId}-scopes`}
-                      type="text"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={oauthScopesText}
-                      onChange={(e) => setOauthScopesText(e.target.value)}
-                      placeholder="mcp:read mcp:write"
-                      className="field w-full mt-1 num"
-                      disabled={busy}
-                    />
+                    <label htmlFor={`${baseId}-scopes`} className="text-label text-ink-300">{t("Scopes (optional, space-separated)")}</label>
+                    <input id={`${baseId}-scopes`} type="text" autoComplete="off" spellCheck={false} value={oauthScopesText} onChange={(e) => setOauthScopesText(e.target.value)} placeholder="mcp:read mcp:write" className="field w-full mt-1 num" disabled={busy} />
                   </div>
                 </div>
               )}
-
               {(authKind === "bearer" || authKind === "header" || authKind === "oauth_static") && (
                 <p className="text-micro text-ink-500 break-words">
                   {t("Credentials are encrypted at rest inside Cadence custody and cleared from this browser immediately after saving.")}
@@ -446,24 +296,12 @@ export function CustomMcpConnectDrawer({
               )}
             </div>
           </details>
-
-          {error && (
-            <p className="text-label text-fail break-words" role="alert">
-              {t(error)}
-            </p>
-          )}
-
+          {error && <p className="text-label text-fail break-words" role="alert">{t(error)}</p>}
           <div className="conn-actions flex flex-wrap gap-2">
             <Button variant="primary" type="submit" loading={busy}>
-              {busy
-                ? t("Connecting…")
-                : authKind === "auto" || authKind === "oauth" || authKind === "oauth_static"
-                  ? t("Connect via OAuth →")
-                  : t("Connect & discover tools")}
+              {busy ? t("Connecting…") : authKind === "auto" || authKind === "oauth" || authKind === "oauth_static" ? t("Connect via OAuth →") : t("Connect & discover tools")}
             </Button>
-            <Button variant="ghost" onClick={onClose} disabled={busy}>
-              {t("Cancel")}
-            </Button>
+            <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
           </div>
         </form>
       )}
@@ -601,14 +439,12 @@ export function CustomMcpInspectDrawer({
   const returnTo =
     typeof window !== "undefined" ? `${window.location.origin}/settings/connections` : undefined;
 
-  const syncTools = async () => {
+  const runAction = async (key: string, fn: () => Promise<void>) => {
     if (!canEdit || busyAction) return;
-    setBusyAction("sync");
+    setBusyAction(key);
     setFeedback(null);
     try {
-      const res = await api.customMcpSync(connection.id);
-      onUpdated(res.connection);
-      setFeedback({ ok: true, text: t("Tool snapshot synced from remote MCP server.") });
+      await fn();
     } catch (e: unknown) {
       setFeedback({ ok: false, text: customMcpErrorText(e) });
     } finally {
@@ -616,137 +452,79 @@ export function CustomMcpInspectDrawer({
     }
   };
 
-  const saveToolModes = async () => {
-    if (!canEdit || busyAction || changedTools.length === 0) return;
-    setBusyAction("tools");
-    setFeedback(null);
-    try {
+  const syncTools = () => runAction("sync", async () => {
+    const res = await api.customMcpSync(connection.id);
+    onUpdated(res.connection);
+    setFeedback({ ok: true, text: t("Tool snapshot synced from remote MCP server.") });
+  });
+
+  const saveToolModes = () => {
+    if (changedTools.length === 0) return;
+    return runAction("tools", async () => {
       const res = await api.customMcpUpdateTools(connection.id, changedTools);
       onUpdated(res.connection);
       setFeedback({ ok: true, text: t("Tool permissions saved.") });
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
+    });
   };
 
-  const acceptDrift = async () => {
-    if (!canEdit || busyAction) return;
-    setBusyAction("drift");
-    setFeedback(null);
-    try {
-      const res = await api.customMcpAcceptDrift(
-        connection.id,
-        changedTools.length > 0 ? changedTools : undefined,
-      );
-      onUpdated(res.connection);
-      setFeedback({ ok: true, text: t("Pending changes accepted into a new pinned revision.") });
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
-  };
+  const acceptDrift = () => runAction("drift", async () => {
+    const res = await api.customMcpAcceptDrift(connection.id, changedTools.length > 0 ? changedTools : undefined);
+    onUpdated(res.connection);
+    setFeedback({ ok: true, text: t("Pending changes accepted into a new pinned revision.") });
+  });
 
-  const reconnectOAuth = async () => {
-    if (!canEdit || busyAction) return;
-    setBusyAction("oauth");
-    setFeedback(null);
-    try {
-      const res = await api.customMcpOAuthStart(connection.id, returnTo ? { return_to: returnTo } : {});
-      const safeUrl = customMcpAuthorizationUrl(res);
-      if (safeUrl === null) {
-        setFeedback({ ok: false, text: t("Server did not return a valid https:// authorization URL.") });
-        return;
-      }
-      if (typeof window !== "undefined") window.location.assign(safeUrl);
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const importGuide = async () => {
-    if (!canEdit || busyAction) return;
-    const urlErr = validateCustomMcpUrlInput(importUrl);
-    if (urlErr !== null) {
-      setFeedback({ ok: false, text: t(urlErr) });
+  const reconnectOAuth = () => runAction("oauth", async () => {
+    const res = await api.customMcpOAuthStart(connection.id, returnTo ? { return_to: returnTo } : {});
+    const safeUrl = customMcpAuthorizationUrl(res);
+    if (safeUrl === null) {
+      setFeedback({ ok: false, text: t("Server did not return a valid https:// authorization URL.") });
       return;
     }
-    setBusyAction("import-guide");
-    setFeedback(null);
-    try {
+    if (typeof window !== "undefined") window.location.assign(safeUrl);
+  });
+
+  const importGuide = () => {
+    const urlErr = validateCustomMcpUrlInput(importUrl);
+    if (urlErr !== null) {
+      if (canEdit && !busyAction) setFeedback({ ok: false, text: t(urlErr) });
+      return;
+    }
+    return runAction("import-guide", async () => {
       const res = await api.customMcpImportGuide(connection.id, importUrl.trim());
       setGuideDraft(res.markdown);
       setGuideSource(res.source_url);
-      setFeedback({
-        ok: true,
-        text: t("Imported Markdown draft for review — click Save agent guide to apply."),
-      });
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
+      setFeedback({ ok: true, text: t("Imported Markdown draft for review — click Save agent guide to apply.") });
+    });
   };
 
-  const saveGuide = async () => {
-    if (!canEdit || busyAction) return;
-    setBusyAction("save-guide");
-    setFeedback(null);
-    try {
-      const res = await api.customMcpUpdateGuide(connection.id, {
-        markdown: guideDraft,
-        source: guideSource,
-      });
-      onUpdated(res.connection);
-      setFeedback({ ok: true, text: t("Workspace Agent Guide saved.") });
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
-  };
+  const saveGuide = () => runAction("save-guide", async () => {
+    const res = await api.customMcpUpdateGuide(connection.id, { markdown: guideDraft, source: guideSource });
+    onUpdated(res.connection);
+    setFeedback({ ok: true, text: t("Workspace Agent Guide saved.") });
+  });
 
-  const savePolicy = async () => {
-    if (!canEdit || busyAction) return;
-    setBusyAction("policy");
-    setFeedback(null);
+  const savePolicy = () => runAction("policy", async () => {
     const effectiveExt = visDraft === "shared" ? extDraft : false;
-    try {
-      const res = await routinesApi.connectionPolicySet(connection.id, {
-        visibility: visDraft,
-        write_mode: writeModeDraft,
-        allow_external_triggers: effectiveExt,
-        allowed_agents: agentsDraft,
-      });
-      const nextVis = res.policy.visibility === "personal" ? "personal" : "shared";
-      const nextWm = res.policy.write_mode === "read_only" ? "read_only" : "ask_approval";
-      const nextExt = Boolean(res.policy.allow_external_triggers);
-      const nextAg = Array.isArray(res.policy.allowed_agents) ? res.policy.allowed_agents : [];
-      setBaseVis(nextVis);
-      setVisDraft(nextVis);
-      setBaseWriteMode(nextWm);
-      setWriteModeDraft(nextWm);
-      setBaseExt(nextExt);
-      setExtDraft(nextExt);
-      setBaseAgents(nextAg);
-      setAgentsDraft(nextAg);
-      onUpdated({ ...connection, visibility: nextVis });
-      setFeedback({ ok: true, text: t("Access settings saved.") });
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-    } finally {
-      setBusyAction(null);
-    }
-  };
+    const res = await routinesApi.connectionPolicySet(connection.id, {
+      visibility: visDraft,
+      write_mode: writeModeDraft,
+      allow_external_triggers: effectiveExt,
+      allowed_agents: agentsDraft,
+    });
+    const nextVis = res.policy.visibility === "personal" ? "personal" : "shared";
+    const nextWm = res.policy.write_mode === "read_only" ? "read_only" : "ask_approval";
+    const nextExt = Boolean(res.policy.allow_external_triggers);
+    const nextAg = Array.isArray(res.policy.allowed_agents) ? res.policy.allowed_agents : [];
+    setBaseVis(nextVis); setVisDraft(nextVis);
+    setBaseWriteMode(nextWm); setWriteModeDraft(nextWm);
+    setBaseExt(nextExt); setExtDraft(nextExt);
+    setBaseAgents(nextAg); setAgentsDraft(nextAg);
+    onUpdated({ ...connection, visibility: nextVis });
+    setFeedback({ ok: true, text: t("Access settings saved.") });
+  });
 
   const toggleAllowedAgent = (alias: string) => {
-    setAgentsDraft((prev) =>
-      prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias],
-    );
+    setAgentsDraft((prev) => (prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias]));
   };
 
   const submitRotate = async () => {
@@ -783,185 +561,104 @@ export function CustomMcpInspectDrawer({
     }
   };
 
-  const submitRevoke = async () => {
+  const submitRevoke = () => {
     if (!canEdit || !revokeArmed || busyAction) return;
     setBusyAction("revoke");
     setFeedback(null);
-    try {
-      await api.customMcpRevoke(connection.id);
-      onRevoked(connection.id);
-    } catch (e: unknown) {
-      setFeedback({ ok: false, text: customMcpErrorText(e) });
-      setBusyAction(null);
-    }
+    void api.customMcpRevoke(connection.id)
+      .then(() => onRevoked(connection.id))
+      .catch((e: unknown) => {
+        setFeedback({ ok: false, text: customMcpErrorText(e) });
+        setBusyAction(null);
+      });
   };
 
-  const okBanner = feedback?.ok ? (
-    <div className="custmcp-ok-banner" role="status">
-      {feedback.text}
-    </div>
-  ) : null;
+  const okBanner = feedback?.ok ? <div className="custmcp-ok-banner" role="status">{feedback.text}</div> : null;
 
   const toolsPanel = (
     <div className="space-y-3 min-w-0">
       {okBanner}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-ink-700 bg-ink-850 px-3 py-2">
         <dl className="text-micro text-ink-300 space-y-0.5 min-w-0">
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-ink-500">{t("Endpoint")}</dt>
-            <dd className="num break-all text-ink-200">{connection.endpoint_url}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-ink-500">{t("Snapshot")}</dt>
-            <dd className="num text-ink-200">
-              v{connection.snapshot_revision}
-              {connection.server_name ? ` · ${connection.server_name}` : ""}
-              {connection.server_version ? ` (${connection.server_version})` : ""}
-            </dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-ink-500">{t("Last synced")}</dt>
-            <dd className="num text-ink-300">{customMcpSyncedText(connection.last_synced_at)}</dd>
-          </div>
+          <MetaRow label={t("Endpoint")} value={connection.endpoint_url} />
+          <MetaRow label={t("Snapshot")} value={`v${connection.snapshot_revision}${connection.server_name ? ` · ${connection.server_name}` : ""}${connection.server_version ? ` (${connection.server_version})` : ""}`} />
+          <MetaRow label={t("Last synced")} value={customMcpSyncedText(connection.last_synced_at)} />
         </dl>
         {canEdit && (
-          <Button
-            size="sm"
-            variant="secondary"
-            loading={busyAction === "sync"}
-            disabled={busyAction !== null}
-            icon={<IconRefresh size={13} />}
-            onClick={() => void syncTools()}
-          >
+          <Button size="sm" variant="secondary" loading={busyAction === "sync"} disabled={busyAction !== null} icon={<IconRefresh size={13} />} onClick={() => void syncTools()}>
             {busyAction === "sync" ? t("Syncing…") : t("Sync tools")}
           </Button>
         )}
       </div>
-
       {connection.status === "auth_expired" && (
         <div className="rounded border border-fail/40 bg-fail/10 px-3 py-2 space-y-1.5" role="alert">
-          <p className="text-label font-medium text-fail">
-            {t("Authorization expired")}
-          </p>
+          <p className="text-label font-medium text-fail">{t("Authorization expired")}</p>
           <p className="text-micro text-ink-200 break-words">
             {t("The remote server rejected the stored credentials. Reconnect or rotate credentials before running tools.")}
           </p>
           {canEdit && (
             <div className="flex flex-wrap gap-2 pt-1">
               {isOAuth ? (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  loading={busyAction === "oauth"}
-                  onClick={() => void reconnectOAuth()}
-                >
-                  {t("Reconnect via OAuth")}
-                </Button>
+                <Button size="sm" variant="primary" loading={busyAction === "oauth"} onClick={() => void reconnectOAuth()}>{t("Reconnect via OAuth")}</Button>
               ) : (
-                <Button size="sm" variant="primary" onClick={() => setTab("auth")}>
-                  {t("Update credentials")}
-                </Button>
+                <Button size="sm" variant="primary" onClick={() => setTab("auth")}>{t("Update credentials")}</Button>
               )}
             </div>
           )}
         </div>
       )}
-
       {hasDrift && (
         <div className="rounded border border-warn/40 bg-warn/10 px-3 py-2 space-y-1.5" role="status">
           <div className="flex items-center gap-1.5 text-label font-medium text-warn">
-            <IconWarning size={14} />
-            <span>{t("Server contract drift detected")}</span>
+            <IconWarning size={14} /><span>{t("Server contract drift detected")}</span>
           </div>
           <p className="text-micro text-ink-200 break-words">
             {t("Changed tools and server instructions are held back until an owner reviews them. Previously auto-read tools that changed have failed closed to Ask approval.")}
           </p>
           {canEdit && (
-            <Button
-              size="sm"
-              variant="primary"
-              loading={busyAction === "drift"}
-              disabled={busyAction !== null}
-              onClick={() => void acceptDrift()}
-            >
+            <Button size="sm" variant="primary" loading={busyAction === "drift"} disabled={busyAction !== null} onClick={() => void acceptDrift()}>
               {busyAction === "drift" ? t("Accepting…") : t("Accept drift & pin revision")}
             </Button>
           )}
         </div>
       )}
-
       {tools.length === 0 ? (
-        <p className="text-label text-ink-400">
-          {t("No tools are currently pinned for this server. Run Sync tools after sign-in finishes.")}
-        </p>
+        <p className="text-label text-ink-400">{t("No tools are currently pinned for this server. Run Sync tools after sign-in finishes.")}</p>
       ) : (
         <ul className="custmcp-tools" aria-label={t("Pinned MCP tools")}>
           {tools.map((pin) => {
             const currentMode = modeDraft[pin.tool_name] ?? pin.mode;
             const params = schemaParamSummary(pin.input_schema);
             return (
-              <li
-                key={pin.tool_name}
-                className="custmcp-tool"
-                data-drifted={pin.drifted ? "true" : undefined}
-              >
+              <li key={pin.tool_name} className="custmcp-tool" data-drifted={pin.drifted ? "true" : undefined}>
                 <div className="flex flex-wrap items-start justify-between gap-2 min-w-0">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-                      <code className="num text-label font-medium text-ink-100 break-all">
-                        {pin.tool_name}
-                      </code>
-                      {isToolReadOnlyHint(pin) && (
-                        <span className="chip bg-ink-800 text-ink-300">{t("Read-only hint")}</span>
-                      )}
-                      {isToolDestructiveHint(pin) && (
-                        <span className="chip custmcp-chip-warn">{t("Destructive hint")}</span>
-                      )}
-                      {pin.drifted && (
-                        <span className="chip custmcp-chip-warn">{t("Drifted")}</span>
-                      )}
+                      <code className="num text-label font-medium text-ink-100 break-all">{pin.tool_name}</code>
+                      {isToolReadOnlyHint(pin) && <span className="chip bg-ink-800 text-ink-300">{t("Read-only hint")}</span>}
+                      {isToolDestructiveHint(pin) && <span className="chip custmcp-chip-warn">{t("Destructive hint")}</span>}
+                      {pin.drifted && <span className="chip custmcp-chip-warn">{t("Drifted")}</span>}
                     </div>
-                    {pin.description && (
-                      <p className="text-micro text-ink-400 mt-1 break-words">{pin.description}</p>
-                    )}
+                    {pin.description && <p className="text-micro text-ink-400 mt-1 break-words">{pin.description}</p>}
                     {pin.drifted && pin.pending_description !== null && (
-                      <p className="text-micro text-warn mt-1 break-words">
-                        {t("Pending description")}: {pin.pending_description}
-                      </p>
+                      <p className="text-micro text-warn mt-1 break-words">{t("Pending description")}: {pin.pending_description}</p>
                     )}
-                    {params.length > 0 && (
-                      <p className="text-micro text-ink-500 mt-1 num break-words">
-                        {t("Args")}: {params.join(", ")}
-                      </p>
-                    )}
+                    {params.length > 0 && <p className="text-micro text-ink-500 mt-1 num break-words">{t("Args")}: {params.join(", ")}</p>}
                   </div>
-
                   {canEdit ? (
-                    <div
-                      className="custmcp-mode-group"
-                      role="radiogroup"
-                      aria-label={`${pin.tool_name} ${t("mode")}`}
-                    >
+                    <div className="custmcp-mode-group" role="radiogroup" aria-label={`${pin.tool_name} ${t("mode")}`}>
                       {(["off", "approval", "read"] as const).map((modeOpt) => (
                         <button
-                          key={modeOpt}
-                          type="button"
-                          role="radio"
-                          aria-checked={currentMode === modeOpt}
-                          disabled={busyAction !== null}
-                          className="custmcp-mode-btn"
-                          onClick={() =>
-                            setModeDraft((cur) => ({ ...cur, [pin.tool_name]: modeOpt }))
-                          }
+                          key={modeOpt} type="button" role="radio" aria-checked={currentMode === modeOpt}
+                          disabled={busyAction !== null} className="custmcp-mode-btn"
+                          onClick={() => setModeDraft((cur) => ({ ...cur, [pin.tool_name]: modeOpt }))}
                         >
                           {t(customMcpToolModeLabel(modeOpt))}
                         </button>
                       ))}
                     </div>
                   ) : (
-                    <span className="chip bg-ink-800 text-ink-300 shrink-0">
-                      {t(customMcpToolModeLabel(pin.mode))}
-                    </span>
+                    <span className="chip bg-ink-800 text-ink-300 shrink-0">{t(customMcpToolModeLabel(pin.mode))}</span>
                   )}
                 </div>
               </li>
@@ -969,26 +666,12 @@ export function CustomMcpInspectDrawer({
           })}
         </ul>
       )}
-
       {canEdit && toolsDirty && (
         <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-ink-700">
-          <Button
-            size="sm"
-            variant="primary"
-            loading={busyAction === "tools"}
-            disabled={busyAction !== null}
-            onClick={() => void saveToolModes()}
-          >
+          <Button size="sm" variant="primary" loading={busyAction === "tools"} disabled={busyAction !== null} onClick={() => void saveToolModes()}>
             {busyAction === "tools" ? t("Saving…") : t("Save tool modes")}
           </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={busyAction !== null}
-            onClick={() =>
-              setModeDraft(Object.fromEntries(tools.map((pin) => [pin.tool_name, pin.mode])))
-            }
-          >
+          <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => setModeDraft(Object.fromEntries(tools.map((pin) => [pin.tool_name, pin.mode])))}>
             {t("Reset")}
           </Button>
         </div>
@@ -1008,30 +691,21 @@ export function CustomMcpInspectDrawer({
           {t("Captured automatically when syncing tools and passed to agents on-demand inside an untrusted data wrapper.")}
         </p>
         {connection.server_instructions?.trim() ? (
-          <pre className="custmcp-pre" tabIndex={0}>
-            {connection.server_instructions}
-          </pre>
+          <pre className="custmcp-pre" tabIndex={0}>{connection.server_instructions}</pre>
         ) : (
           <p className="text-label text-ink-400">{t("This server did not report initialize.instructions.")}</p>
         )}
         {connection.instructions_drifted && (
           <div className="rounded border border-warn/40 bg-warn/10 p-2.5 space-y-1">
-            <p className="text-micro font-medium text-warn">
-              {t("Pending upstream instructions (not yet pinned)")}
-            </p>
-            <pre className="custmcp-pre" tabIndex={0}>
-              {connection.pending_server_instructions ?? t("(cleared upstream)")}
-            </pre>
+            <p className="text-micro font-medium text-warn">{t("Pending upstream instructions (not yet pinned)")}</p>
+            <pre className="custmcp-pre" tabIndex={0}>{connection.pending_server_instructions ?? t("(cleared upstream)")}</pre>
           </div>
         )}
       </section>
-
       <section className="space-y-2 border-t border-ink-700 pt-3 min-w-0">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h4 className="slabel">{t("Workspace Agent Guide (Owner-reviewed Markdown)")}</h4>
-          {guideSource && (
-            <span className="text-micro text-ink-500 num break-all">{guideSource}</span>
-          )}
+          {guideSource && <span className="text-micro text-ink-500 num break-all">{guideSource}</span>}
         </div>
         <p className="text-micro text-ink-400 break-words">
           {t("Optional owner-approved usage rules (workflow order, field defaults, or imported llms.txt notes) returned alongside find_tools({ id }).")}
@@ -1040,66 +714,35 @@ export function CustomMcpInspectDrawer({
           <>
             <div className="flex flex-wrap gap-2">
               <input
-                type="url"
-                value={importUrl}
-                onChange={(e) => setImportUrl(e.target.value)}
-                placeholder="https://docs.example.com/llms.txt"
-                aria-label={t("Import Markdown from URL")}
-                className="field flex-1 min-w-[12rem] num"
-                disabled={busyAction !== null}
+                type="url" value={importUrl} onChange={(e) => setImportUrl(e.target.value)}
+                placeholder="https://docs.example.com/llms.txt" aria-label={t("Import Markdown from URL")}
+                className="field flex-1 min-w-[12rem] num" disabled={busyAction !== null}
               />
-              <Button
-                size="sm"
-                variant="secondary"
-                loading={busyAction === "import-guide"}
-                disabled={busyAction !== null || importUrl.trim() === ""}
-                onClick={() => void importGuide()}
-              >
+              <Button size="sm" variant="secondary" loading={busyAction === "import-guide"} disabled={busyAction !== null || importUrl.trim() === ""} onClick={() => void importGuide()}>
                 {busyAction === "import-guide" ? t("Importing…") : t("Import llms.txt / Docs")}
               </Button>
             </div>
             <textarea
-              rows={8}
-              maxLength={32768}
-              value={guideDraft}
-              onChange={(e) => setGuideDraft(e.target.value)}
+              rows={8} maxLength={32768} value={guideDraft} onChange={(e) => setGuideDraft(e.target.value)}
               placeholder="# Usage notes for agents&#10;- Call search_customers before create_invoice..."
-              aria-label={t("Workspace Agent Guide Markdown")}
-              className="field w-full num"
-              disabled={busyAction !== null}
+              aria-label={t("Workspace Agent Guide Markdown")} className="field w-full num" disabled={busyAction !== null}
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-micro text-ink-500 num">{guideDraft.length} / 32768</span>
               <div className="flex flex-wrap gap-2">
                 {guideDraft !== "" && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={busyAction !== null}
-                    onClick={() => {
-                      setGuideDraft("");
-                      setGuideSource(null);
-                    }}
-                  >
+                  <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setGuideDraft(""); setGuideSource(null); }}>
                     {t("Clear draft")}
                   </Button>
                 )}
-                <Button
-                  size="sm"
-                  variant="primary"
-                  loading={busyAction === "save-guide"}
-                  disabled={busyAction !== null || !guideDirty}
-                  onClick={() => void saveGuide()}
-                >
+                <Button size="sm" variant="primary" loading={busyAction === "save-guide"} disabled={busyAction !== null || !guideDirty} onClick={() => void saveGuide()}>
                   {busyAction === "save-guide" ? t("Saving…") : t("Save agent guide")}
                 </Button>
               </div>
             </div>
           </>
         ) : connection.agent_guide_md?.trim() ? (
-          <pre className="custmcp-pre" tabIndex={0}>
-            {connection.agent_guide_md}
-          </pre>
+          <pre className="custmcp-pre" tabIndex={0}>{connection.agent_guide_md}</pre>
         ) : (
           <p className="text-label text-ink-400">{t("No workspace agent guide saved.")}</p>
         )}
@@ -1110,9 +753,7 @@ export function CustomMcpInspectDrawer({
   const rosterAgents = agentsState?.data?.agents ?? [];
   const effectiveExt = visDraft === "shared" ? extDraft : false;
   const policyDirty =
-    visDraft !== baseVis ||
-    writeModeDraft !== baseWriteMode ||
-    effectiveExt !== baseExt ||
+    visDraft !== baseVis || writeModeDraft !== baseWriteMode || effectiveExt !== baseExt ||
     [...agentsDraft].sort().join(",") !== [...baseAgents].sort().join(",");
 
   const policiesPanel = (
@@ -1122,53 +763,24 @@ export function CustomMcpInspectDrawer({
         <div className="conn-policy" data-mcp-policy-readonly>
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
-            <p className="text-label text-ink-200">
-              {t(connection.visibility === "shared" ? "Shared with company" : "Personal")}
-            </p>
-            <p className="text-micro text-ink-400 break-words">
-              {t("Everyone in the workspace and allowed agents can use enabled read tools.")}
-            </p>
+            <p className="text-label text-ink-200">{t(connection.visibility === "shared" ? "Shared with company" : "Personal")}</p>
+            <p className="text-micro text-ink-400 break-words">{t("Everyone in the workspace and allowed agents can use enabled read tools.")}</p>
           </div>
           <div className="conn-policy-group">
             <span className="slabel">{t("Action safety")}</span>
-            <p className="text-micro text-ink-400 break-words">
-              {t("Only workspace owners can approve writes or change routine and agent policies.")}
-            </p>
+            <p className="text-micro text-ink-400 break-words">{t("Only workspace owners can approve writes or change routine and agent policies.")}</p>
           </div>
         </div>
       ) : (
         <div className="conn-policy" data-connection-policy>
-          {!policyLoaded && (
-            <p className="text-micro text-ink-500">{t("Loading access policies…")}</p>
-          )}
+          {!policyLoaded && <p className="text-micro text-ink-500">{t("Loading access policies…")}</p>}
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
             <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this server")}>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={visDraft === "shared"}
-                disabled={busyAction !== null}
-                className="conn-policy-opt"
-                onClick={() => setVisDraft("shared")}
-              >
-                <b>{t("Shared with workspace")}</b>
-                <small>{t("Team members and assigned routines can use this connection.")}</small>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={visDraft === "personal"}
-                disabled={busyAction !== null}
-                className="conn-policy-opt"
-                onClick={() => setVisDraft("personal")}
-              >
-                <b>{t("Just me (Personal)")}</b>
-                <small>{t("Only your turns and routines pinned to this account can use it.")}</small>
-              </button>
+              <PolicyRadio checked={visDraft === "shared"} disabled={busyAction !== null} title={t("Shared with workspace")} sub={t("Team members and assigned routines can use this connection.")} onClick={() => setVisDraft("shared")} />
+              <PolicyRadio checked={visDraft === "personal"} disabled={busyAction !== null} title={t("Just me (Personal)")} sub={t("Only your turns and routines pinned to this account can use it.")} onClick={() => setVisDraft("personal")} />
             </div>
           </div>
-
           {rosterAgents.length > 0 && (
             <div className="conn-policy-group">
               <span className="slabel">{t("Agent access")}</span>
@@ -1181,18 +793,8 @@ export function CustomMcpInspectDrawer({
                 {rosterAgents.map((agentRow) => {
                   const checked = agentsDraft.includes(agentRow.alias);
                   return (
-                    <button
-                      key={agentRow.alias}
-                      type="button"
-                      role="checkbox"
-                      aria-checked={checked}
-                      disabled={busyAction !== null}
-                      className="conn-policy-toggle"
-                      onClick={() => toggleAllowedAgent(agentRow.alias)}
-                    >
-                      <span className="conn-policy-box" aria-hidden>
-                        {checked ? "✓" : ""}
-                      </span>
+                    <button key={agentRow.alias} type="button" role="checkbox" aria-checked={checked} disabled={busyAction !== null} className="conn-policy-toggle" onClick={() => toggleAllowedAgent(agentRow.alias)}>
+                      <span className="conn-policy-box" aria-hidden>{checked ? "✓" : ""}</span>
                       <span className="min-w-0 break-words num">{agentRow.alias}</span>
                     </button>
                   );
@@ -1200,65 +802,25 @@ export function CustomMcpInspectDrawer({
               </div>
             </div>
           )}
-
           <div className="conn-policy-group">
             <span className="slabel">{t("Action safety")}</span>
             <div className="conn-policy-grid" role="radiogroup" aria-label={t("Action safety")}>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={writeModeDraft === "ask_approval"}
-                disabled={busyAction !== null}
-                className="conn-policy-opt"
-                onClick={() => setWriteModeDraft("ask_approval")}
-              >
-                <b>{t("Ask for approval first")}</b>
-                <small>{t("Drafts and external writes wait for approval.")}</small>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={writeModeDraft === "read_only"}
-                disabled={busyAction !== null}
-                className="conn-policy-opt"
-                onClick={() => setWriteModeDraft("read_only")}
-              >
-                <b>{t("Read only")}</b>
-                <small>{t("Agents can read data; external writes are blocked.")}</small>
-              </button>
+              <PolicyRadio checked={writeModeDraft === "ask_approval"} disabled={busyAction !== null} title={t("Ask for approval first")} sub={t("Drafts and external writes wait for approval.")} onClick={() => setWriteModeDraft("ask_approval")} />
+              <PolicyRadio checked={writeModeDraft === "read_only"} disabled={busyAction !== null} title={t("Read only")} sub={t("Agents can read data; external writes are blocked.")} onClick={() => setWriteModeDraft("read_only")} />
             </div>
           </div>
-
           {visDraft === "shared" && (
             <div className="conn-policy-group">
               <span className="slabel">{t("Incoming triggers")}</span>
-              <button
-                type="button"
-                role="checkbox"
-                aria-checked={extDraft}
-                disabled={busyAction !== null}
-                className="conn-policy-toggle"
-                onClick={() => setExtDraft((v) => !v)}
-              >
-                <span className="conn-policy-box" aria-hidden>
-                  {extDraft ? "✓" : ""}
-                </span>
-                <span className="min-w-0 break-words">
-                  {t("Allow incoming emails or webhooks to trigger actions")}
-                </span>
+              <button type="button" role="checkbox" aria-checked={extDraft} disabled={busyAction !== null} className="conn-policy-toggle" onClick={() => setExtDraft((v) => !v)}>
+                <span className="conn-policy-box" aria-hidden>{extDraft ? "✓" : ""}</span>
+                <span className="min-w-0 break-words">{t("Allow incoming emails or webhooks to trigger actions")}</span>
               </button>
             </div>
           )}
-
           {policyDirty && (
             <div>
-              <Button
-                size="sm"
-                variant="primary"
-                loading={busyAction === "policy"}
-                disabled={busyAction !== null}
-                onClick={() => void savePolicy()}
-              >
+              <Button size="sm" variant="primary" loading={busyAction === "policy"} disabled={busyAction !== null} onClick={() => void savePolicy()}>
                 {busyAction === "policy" ? t("Saving…") : t("Save access settings")}
               </Button>
             </div>
@@ -1274,157 +836,70 @@ export function CustomMcpInspectDrawer({
       <div className="space-y-1.5">
         <span className="slabel">{t("Authentication")}</span>
         <dl className="text-label space-y-1">
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-ink-500">{t("Mode")}</dt>
-            <dd className="text-ink-200">{t(customMcpAuthLabel(connection.auth_kind))}</dd>
-          </div>
-          {connection.auth_hint && (
-            <div className="flex flex-wrap gap-x-2">
-              <dt className="text-ink-500">{t("Credential / headers")}</dt>
-              <dd className="num text-ink-300 break-all">{connection.auth_hint}</dd>
-            </div>
-          )}
-          {connection.oauth_issuer && (
-            <div className="flex flex-wrap gap-x-2">
-              <dt className="text-ink-500">{t("OAuth issuer")}</dt>
-              <dd className="num text-ink-300 break-all">{connection.oauth_issuer}</dd>
-            </div>
-          )}
-          {connection.oauth_scopes.length > 0 && (
-            <div className="flex flex-wrap gap-x-2">
-              <dt className="text-ink-500">{t("Scopes")}</dt>
-              <dd className="num text-ink-300 break-words">{connection.oauth_scopes.join(" ")}</dd>
-            </div>
-          )}
+          <MetaRow label={t("Mode")} value={t(customMcpAuthLabel(connection.auth_kind))} mono={false} />
+          {connection.auth_hint && <MetaRow label={t("Credential / headers")} value={connection.auth_hint} />}
+          {connection.oauth_issuer && <MetaRow label={t("OAuth issuer")} value={connection.oauth_issuer} />}
+          {connection.oauth_scopes.length > 0 && <MetaRow label={t("Scopes")} value={connection.oauth_scopes.join(" ")} />}
         </dl>
       </div>
-
       {canEdit && (
         <div className="border-t border-ink-700 pt-3 space-y-2.5">
           {isOAuth ? (
             <div className="space-y-2">
-              <p className="text-label text-ink-300 break-words">
-                {t("Re-authorize with the remote MCP server via OAuth 2.1 + PKCE.")}
-              </p>
-              <Button
-                size="sm"
-                variant="primary"
-                loading={busyAction === "oauth"}
-                disabled={busyAction !== null}
-                onClick={() => void reconnectOAuth()}
-              >
+              <p className="text-label text-ink-300 break-words">{t("Re-authorize with the remote MCP server via OAuth 2.1 + PKCE.")}</p>
+              <Button size="sm" variant="primary" loading={busyAction === "oauth"} disabled={busyAction !== null} onClick={() => void reconnectOAuth()}>
                 {t("Reconnect via OAuth")}
               </Button>
             </div>
           ) : (
-            <form
-              className="space-y-2.5"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void submitRotate();
-              }}
-            >
+            <form className="space-y-2.5" onSubmit={(e) => { e.preventDefault(); void submitRotate(); }}>
               <span className="slabel">{t("Rotate credentials")}</span>
               <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label={t("Credential type")}>
                 {(["bearer", "header", "none"] as const).map((kindOpt) => (
-                  <button
-                    key={kindOpt}
-                    type="button"
-                    role="radio"
-                    aria-checked={rotateKind === kindOpt}
-                    disabled={busyAction !== null}
-                    className="conn-policy-opt flex-1"
-                    onClick={() => setRotateKind(kindOpt)}
-                  >
+                  <button key={kindOpt} type="button" role="radio" aria-checked={rotateKind === kindOpt} disabled={busyAction !== null} className="conn-policy-opt flex-1" onClick={() => setRotateKind(kindOpt)}>
                     <b>{kindOpt === "bearer" ? t("Bearer token") : kindOpt === "header" ? t("Custom headers") : t("No auth")}</b>
                   </button>
                 ))}
               </div>
               {rotateKind === "bearer" && (
                 <input
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={rotateToken}
-                  onChange={(e) => setRotateToken(e.target.value)}
-                  placeholder={t("New Bearer token")}
-                  aria-label={t("New Bearer token")}
-                  className="field w-full num"
-                  disabled={busyAction !== null}
+                  type="password" autoComplete="off" spellCheck={false} value={rotateToken}
+                  onChange={(e) => setRotateToken(e.target.value)} placeholder={t("New Bearer token")}
+                  aria-label={t("New Bearer token")} className="field w-full num" disabled={busyAction !== null}
                 />
               )}
               {rotateKind === "header" && (
                 <textarea
-                  rows={3}
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={rotateHeadersText}
-                  onChange={(e) => setRotateHeadersText(e.target.value)}
-                  placeholder={"X-API-Key: ..."}
-                  aria-label={t("Replacement HTTP headers")}
-                  className="field w-full num"
-                  disabled={busyAction !== null}
+                  rows={3} autoComplete="off" spellCheck={false} value={rotateHeadersText}
+                  onChange={(e) => setRotateHeadersText(e.target.value)} placeholder={"X-API-Key: ..."}
+                  aria-label={t("Replacement HTTP headers")} className="field w-full num" disabled={busyAction !== null}
                 />
               )}
-              <Button
-                size="sm"
-                variant="secondary"
-                type="submit"
-                loading={busyAction === "rotate"}
-                disabled={busyAction !== null}
-              >
+              <Button size="sm" variant="secondary" type="submit" loading={busyAction === "rotate"} disabled={busyAction !== null}>
                 {busyAction === "rotate" ? t("Updating…") : t("Update credentials")}
               </Button>
             </form>
           )}
         </div>
       )}
-
       {canEdit && (
         <div className="border-t border-ink-700 pt-3 space-y-2">
           {!revokeOpen ? (
-            <Button
-              size="sm"
-              variant="danger"
-              disabled={busyAction !== null}
-              onClick={() => setRevokeOpen(true)}
-            >
-              {t("Disconnect server…")}
-            </Button>
+            <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t("Disconnect server…")}</Button>
           ) : (
             <div className="space-y-2">
               <p className="text-label text-ink-200 break-words">
                 {t("Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
               </p>
               <label className="flex items-start gap-2 text-label text-ink-300">
-                <input
-                  type="checkbox"
-                  checked={revokeArmed}
-                  onChange={(e) => setRevokeArmed(e.target.checked)}
-                  disabled={busyAction !== null}
-                  className="mt-0.5"
-                />
+                <input type="checkbox" checked={revokeArmed} onChange={(e) => setRevokeArmed(e.target.checked)} disabled={busyAction !== null} className="mt-0.5" />
                 <span>{t("I understand disconnecting disables all tools from this server.")}</span>
               </label>
               <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="danger"
-                  loading={busyAction === "revoke"}
-                  disabled={!revokeArmed || busyAction !== null}
-                  onClick={() => void submitRevoke()}
-                >
+                <Button size="sm" variant="danger" loading={busyAction === "revoke"} disabled={!revokeArmed || busyAction !== null} onClick={() => void submitRevoke()}>
                   {busyAction === "revoke" ? t("Disconnecting…") : t("Disconnect")}
                 </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busyAction !== null}
-                  onClick={() => {
-                    setRevokeOpen(false);
-                    setRevokeArmed(false);
-                  }}
-                >
+                <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setRevokeOpen(false); setRevokeArmed(false); }}>
                   {t("Cancel")}
                 </Button>
               </div>
@@ -1446,32 +921,16 @@ export function CustomMcpInspectDrawer({
 
   return (
     <DrawerShell
-      kind="custom-mcp"
-      label={connection.name}
-      kicker={t("Custom MCP server")}
-      title={connection.name}
-      subtitle={connection.endpoint_host}
+      kind="custom-mcp" label={connection.name} kicker={t("Custom MCP server")} title={connection.name} subtitle={connection.endpoint_host}
       pills={
         <>
-          <span className={`chip ${statusChipClass(statusView.tone)}`}>
-            {statusView.tone === "ok" && <IconCheck size={11} />}
-            {t(statusView.label)}
-          </span>
-          <span className="chip bg-ink-800 text-ink-300">
-            <IconLock size={11} />
-            {t(customMcpAuthLabel(connection.auth_kind))}
-          </span>
-          <span className="chip bg-ink-800 text-ink-300">
-            {t(visibilityBadge({ visibility: connection.visibility }))}
-          </span>
+          <span className={`chip ${statusChipClass(statusView.tone)}`}>{statusView.tone === "ok" && <IconCheck size={11} />}{t(statusView.label)}</span>
+          <span className="chip bg-ink-800 text-ink-300"><IconLock size={11} />{t(customMcpAuthLabel(connection.auth_kind))}</span>
+          <span className="chip bg-ink-800 text-ink-300">{t(visibilityBadge({ visibility: connection.visibility }))}</span>
         </>
       }
-      warning={warningText}
-      tabs={tabs}
-      tab={tab}
-      onTab={(nextId) => {
-        if (nextId === "tools" || nextId === "guide" || nextId === "policies" || nextId === "auth") setTab(nextId);
-      }}
+      warning={warningText} tabs={tabs} tab={tab}
+      onTab={(nextId) => { if (nextId === "tools" || nextId === "guide" || nextId === "policies" || nextId === "auth") setTab(nextId); }}
       note={canEdit ? undefined : t("Read-only view — only workspace owners can edit or disconnect Custom MCP servers.")}
       onClose={onClose}
     />

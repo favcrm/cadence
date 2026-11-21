@@ -159,26 +159,13 @@ equal(
 // 4. Staged custom_mcp_effect row parsing, turn matching, card display & failure codes.
 const ACTION_ID = "a1b2c3d4e5f678901234567890abcdef";
 const rawRow = {
-  id: ACTION_ID,
-  tool: "custom_mcp_effect",
-  status: "pending",
-  createdAt: 1_795_000_000_000,
+  id: ACTION_ID, tool: "custom_mcp_effect", status: "pending", createdAt: 1_795_000_000_000,
   input: {
-    connection_id: "conn_mcp_abcdefgh",
-    connection_name: "Acme Billing",
-    endpoint_host: "mcp.acme.example",
-    tool: "create_invoice",
-    snapshot_revision: 2,
-    args: JSON.stringify({ customer_id: "cus_1", amount: 2500 }),
+    connection_id: "conn_mcp_abcdefgh", connection_name: "Acme Billing", endpoint_host: "mcp.acme.example",
+    tool: "create_invoice", snapshot_revision: 2, args: JSON.stringify({ customer_id: "cus_1", amount: 2500 }),
     preview: {
-      title: "create_invoice",
-      toolkit_label: "Acme Billing",
-      account: "mcp.acme.example",
-      kind: "fields",
-      fields: [
-        { role: "target", label: "customer_id", value: "cus_1" },
-        { role: "amount", label: "amount", value: "2500" },
-      ],
+      title: "create_invoice", toolkit_label: "Acme Billing", account: "mcp.acme.example", kind: "fields",
+      fields: [{ role: "target", label: "customer_id", value: "cus_1" }, { role: "amount", label: "amount", value: "2500" }],
     },
   },
 };
@@ -199,64 +186,29 @@ equal(outcomeOf(driftFailed), "failed", "ok:false is failed");
 equal(stagedStatus(driftFailed, "failed", "Did not apply"), "Couldn't run", "failed reads Couldn't run");
 assert(failureReason(driftFailed).includes("changed since it was staged"), "stale_revision failure explained");
 
-// Reject malformed custom_mcp_effect (e.g., missing snapshot_revision or invalid args JSON).
 equal(parseStagedRow({ ...rawRow, input: { ...rawRow.input, snapshot_revision: 0 } }), null, "zero snapshot_revision refused");
 equal(parseStagedRow({ ...rawRow, input: { ...rawRow.input, args: "{bad json" } }), null, "invalid args JSON refused");
 
-// Match `{ action, sent: false, note }` emitted by use_tool(custom_mcp) in turnCards.
 const matched = stagedInTurn(
-  [
-    {
-      seq: 1,
-      role: "agent",
-      kind: "tool_result",
-      text: JSON.stringify({ action: ACTION_ID, sent: false, note: "Staged, not sent." }),
-      message: "m1",
-      payload: null,
-    },
-  ],
+  [{ seq: 1, role: "agent", kind: "tool_result", text: JSON.stringify({ action: ACTION_ID, sent: false, note: "Staged, not sent." }), message: "m1", payload: null }],
   [parsed],
 );
 equal(matched.map((m) => m.id), [ACTION_ID], "stagedInTurn matches custom_mcp sent:false action receipt");
 
-// 5. Chat Cards (record_ref + connect_ref with toolkit: custom_mcp).
 const recordEntry: ThreadEntry = {
-  seq: 2,
-  role: "agent",
-  kind: "record_ref",
-  text: "Acme Billing: 1 result (mcp.acme.example)",
-  message: "m1",
+  seq: 2, role: "agent", kind: "record_ref", text: "Acme Billing: 1 result (mcp.acme.example)", message: "m1",
   payload: {
-    v: 1,
-    toolkit: "custom_mcp",
-    tool: "list_invoices",
-    items: [{ id: "inv_101", status: "open" }],
-    fields: [
-      { key: "id", label: "id", type: "string", untrusted: true },
-      { key: "status", label: "status", type: "string", untrusted: true },
-    ],
-    view: "table",
-    truncated: false,
-    tool_label: "list_invoices",
-    toolkit_label: "Acme Billing",
-    account: "mcp.acme.example",
-    total: 1,
+    v: 1, toolkit: "custom_mcp", tool: "list_invoices", items: [{ id: "inv_101", status: "open" }],
+    fields: [{ key: "id", label: "id", type: "string", untrusted: true }, { key: "status", label: "status", type: "string", untrusted: true }],
+    view: "table", truncated: false, tool_label: "list_invoices", toolkit_label: "Acme Billing", account: "mcp.acme.example", total: 1,
   },
 };
 const parsedRecord = parseRecordRef(recordEntry);
 assert(parsedRecord !== null && parsedRecord.toolkit === "custom_mcp", "custom_mcp record_ref parses");
-equal(
-  recordLayout(parsedRecord),
-  { view: "table", pairs: [{ label: "id", value: "inv_101" }, { label: "status", value: "open" }] },
-  "custom_mcp table layout renders cleanly",
-);
+equal(recordLayout(parsedRecord), { view: "table", pairs: [{ label: "id", value: "inv_101" }, { label: "status", value: "open" }] }, "custom_mcp table layout renders cleanly");
 
 const connectEntry: ThreadEntry = {
-  seq: 3,
-  role: "agent",
-  kind: "connect_ref",
-  text: "Acme Billing needs reconnection.",
-  message: "m1",
+  seq: 3, role: "agent", kind: "connect_ref", text: "Acme Billing needs reconnection.", message: "m1",
   payload: { v: 1, toolkit: "custom_mcp", toolkit_label: "Acme Billing" },
 };
 equal(parseConnectRef(connectEntry), { toolkit: "custom_mcp", label: "Acme Billing" }, "custom_mcp connect_ref parses");
