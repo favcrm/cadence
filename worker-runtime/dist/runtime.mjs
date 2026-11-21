@@ -57588,9 +57588,14 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
     return this.resolvedModel ?? await this.ctx.storage.get(RESOLVED_MODEL_KEY) ?? this.options.modelAlias;
   }
 }
+// src/index.ts
+function estimateBuiltInInstructionsTokens() {
+  return Math.ceil(RUNTIME_PROMPT.length / 4);
+}
 export {
   BOARD_MESSAGE_KIND,
   HostedSession,
   OPERATIONAL_SKILL_VERSION,
+  estimateBuiltInInstructionsTokens,
   masterState
 };
