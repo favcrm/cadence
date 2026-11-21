@@ -1,15 +1,18 @@
 //! Internal text sink. The broker holds the release mutex through this commit;
 //! no SQL lock survives the checked claim or the provider's read-back.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use super::{sha256_hex, LocalAdapter, BODY_CAP, TITLE_CAP};
 use crate::contract_fixture::Verified;
+use crate::fd_fs::DirFd;
 use crate::platform::{AppArtifactError, PlatformAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::ffi::CString;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 const INPUT_CAP: usize = 64 * 1024;
@@ -104,32 +107,33 @@ pub(super) fn preview(account: &str, input: &Value) -> String {
     }
 }
 
-fn name(value: &[u8]) -> Result<std::ffi::CString, String> {
-    std::ffi::CString::new(value).map_err(|_| "invalid outbox component".into())
+fn name(value: &[u8]) -> Result<CString, String> {
+    CString::new(value).map_err(|_| "invalid outbox component".into())
 }
 
-fn child(parent: &File, component: &[u8], create: bool) -> Result<File, String> {
+fn child(parent: &DirFd, component: &[u8], create: bool) -> Result<DirFd, String> {
     let component = name(component)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), flags) };
-    if fd < 0 && create && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) };
-        if result != 0
-            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err("cannot create private app outbox directory".into());
+    let mut dir = parent.open_child_dir(&component);
+    if let Err(ref error) = dir {
+        if create && error.kind() == ErrorKind::NotFound {
+            if let Err(mkdir_err) = parent.mkdir(&component, 0o700) {
+                if mkdir_err.kind() != ErrorKind::AlreadyExists {
+                    return Err("cannot create private app outbox directory".into());
+                }
+            }
+            dir = parent.open_child_dir(&component);
         }
-        fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), flags) };
     }
-    if fd < 0 {
-        return Err("app outbox directory is unavailable or symlinked".into());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    dir.map_err(|_| "app outbox directory is unavailable or symlinked".into())
 }
 
-fn bucket(path: &Path, create: bool) -> Result<File, String> {
-    let mut directory = File::open(if path.is_absolute() { "/" } else { "." })
-        .map_err(|_| "cannot open outbox root".to_string())?;
+fn bucket(path: &Path, create: bool) -> Result<DirFd, String> {
+    let mut directory = if path.is_absolute() {
+        DirFd::open_root()
+    } else {
+        DirFd::open_dir(Path::new("."))
+    }
+    .map_err(|_| "cannot open outbox root".to_string())?;
     for component in path.components() {
         match component {
             Component::RootDir | Component::CurDir => {}
@@ -140,16 +144,16 @@ fn bucket(path: &Path, create: bool) -> Result<File, String> {
         }
     }
     let metadata = directory
-        .metadata()
+        .stat()
         .map_err(|_| "cannot inspect app outbox".to_string())?;
-    if metadata.mode() & 0o022 != 0 {
+    if metadata.st_mode & 0o022 != 0 {
         return Err("app outbox is writable by other principals".into());
     }
     let directory = child(&directory, APP_BUCKET.as_bytes(), create)?;
     if directory
-        .metadata()
+        .stat()
         .map_err(|_| "cannot inspect app bucket".to_string())?
-        .mode()
+        .st_mode
         & 0o022
         != 0
     {
@@ -158,19 +162,11 @@ fn bucket(path: &Path, create: bool) -> Result<File, String> {
     Ok(directory)
 }
 
-fn read_file_limited(parent: &File, component: &str, limit: usize) -> Result<Vec<u8>, String> {
+fn read_file_limited(parent: &DirFd, component: &str, limit: usize) -> Result<Vec<u8>, String> {
     let component = name(component.as_bytes())?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            component.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err("app outbox record is unavailable".into());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = parent
+        .open_readonly_nofollow(&component)
+        .map_err(|_| "app outbox record is unavailable".to_string())?;
     if !file
         .metadata()
         .map_err(|_| "cannot inspect app record".to_string())?
@@ -188,7 +184,7 @@ fn read_file_limited(parent: &File, component: &str, limit: usize) -> Result<Vec
     Ok(bytes)
 }
 
-fn read_file(parent: &File, component: &str) -> Result<Vec<u8>, String> {
+fn read_file(parent: &DirFd, component: &str) -> Result<Vec<u8>, String> {
     read_file_limited(parent, component, 128 * 1024)
 }
 
@@ -218,20 +214,15 @@ fn pinned_asset(
     Ok(Some((receipt, bytes)))
 }
 
-fn write_file(parent: &File, component: &str, bytes: &[u8]) -> Result<(), String> {
+fn write_file(parent: &DirFd, component: &str, bytes: &[u8]) -> Result<(), String> {
     let component = name(component.as_bytes())?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            component.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    let mut file = parent
+        .open_file_nofollow(
+            &component,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )
-    };
-    if fd < 0 {
-        return Err("cannot create app outbox record".into());
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+        .map_err(|_| "cannot create app outbox record".to_string())?;
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| "cannot commit app outbox record".into())
@@ -295,10 +286,16 @@ pub(super) fn execute(
     let result = json!({"schema":1,"scope":{"kind":"app_artifact","install_id":text.provenance["install_id"],"context_id":text.provenance["context_id"]},
         "platform_ref":format!("outbox/{APP_BUCKET}/{effect_id}"),"board_url":board_url,"url":board_url,
         "path":adapter.outbox.join(APP_BUCKET).join(effect_id).display().to_string(),"attachments":usize::from(binary.is_some())});
-    let attachments=binary.as_ref().map_or_else(Vec::new,|(_,bytes)| vec![json!({
-        "name":"asset.bin","sha256":sha256_hex(bytes),"media_type":text.asset.as_ref().unwrap().media_type,
-        "size":bytes.len(),"receipt_id":text.asset.as_ref().unwrap().receipt_id
-    })]);
+    let attachments = match (&binary, &text.asset) {
+        (Some((_, bytes)), Some(asset)) => vec![json!({
+            "name": "asset.bin",
+            "sha256": sha256_hex(bytes),
+            "media_type": asset.media_type,
+            "size": bytes.len(),
+            "receipt_id": asset.receipt_id,
+        })],
+        _ => Vec::new(),
+    };
     let index = json!({"schema":1,"effect_id":effect_id,"scope":result["scope"],"project":null,"title":text.title,
         "provenance":text.provenance,"authority_digest":permit.authority_digest,"input_digest":input_digest,
         "input_sha256":sha256_hex(input.to_string().as_bytes()),"post_sha256":sha256_hex(post.as_bytes()),
@@ -319,17 +316,9 @@ pub(super) fn execute(
             .map_err(|_| "cannot sync app item".to_string())?;
         let source = name(temporary.as_bytes())?;
         let destination = name(effect_id.as_bytes())?;
-        if unsafe {
-            libc::renameat(
-                parent.as_raw_fd(),
-                source.as_ptr(),
-                parent.as_raw_fd(),
-                destination.as_ptr(),
-            )
-        } != 0
-        {
-            return Err("cannot atomically land app outbox item".into());
-        }
+        parent
+            .rename_child(&source, &destination)
+            .map_err(|_| "cannot atomically land app outbox item".to_string())?;
         committed = true;
         parent
             .sync_all()
@@ -343,24 +332,16 @@ pub(super) fn execute(
         }
         if let Ok(directory) = child(&item, b"attachments", false) {
             let component = name(b"asset.bin")?;
-            unsafe {
-                libc::unlinkat(directory.as_raw_fd(), component.as_ptr(), 0);
-            }
+            let _ = directory.unlink_child(&component);
             let component = name(b"attachments")?;
-            unsafe {
-                libc::unlinkat(item.as_raw_fd(), component.as_ptr(), libc::AT_REMOVEDIR);
-            }
+            let _ = item.rmdir_child(&component);
         }
         for component in ["post.md", "index.json"] {
             let component = name(component.as_bytes())?;
-            unsafe {
-                libc::unlinkat(item.as_raw_fd(), component.as_ptr(), 0);
-            }
+            let _ = item.unlink_child(&component);
         }
         let temporary = name(temporary.as_bytes())?;
-        unsafe {
-            libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR);
-        }
+        let _ = parent.rmdir_child(&temporary);
         return Err(AppArtifactError::Refused(error));
     }
     Ok(result)
@@ -420,7 +401,7 @@ pub(super) fn read_back(adapter: &LocalAdapter, input: &Value) -> Verified {
     }
 }
 
-fn asset_intact(item: &File, index: &Value, binary: Option<&(Value, Vec<u8>)>) -> bool {
+fn asset_intact(item: &DirFd, index: &Value, binary: Option<&(Value, Vec<u8>)>) -> bool {
     match binary {
         None => index["attachments"] == json!([]) && child(item, b"attachments", false).is_err(),
         Some((receipt, bytes)) => {
