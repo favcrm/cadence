@@ -31,6 +31,7 @@ const announced = new Map<string, number>();
 
 /** Private inbox poll: authorized, private state only. Never shared SSE. */
 const INBOX_POLL_MS = 15000;
+const BROWSER_SYNC_ERROR = "Could not sync browser alerts. Your threads still load.";
 
 const DEVICE_KEY = "cadence.push.device";
 
@@ -69,6 +70,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
   const generation = useRef(0);
+  const latestPreferenceSave = useRef(0);
   // Last verified human. Kept across auth epochs so a switch to another account is caught on its first valid feed.
   const known = useRef<string | null>(null);
   const popover = useRef<HTMLDialogElement | null>(null);
@@ -136,6 +138,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             if (active && generation.current === epoch) {
               linked = true;
               setDeviceId(localStorage.getItem(DEVICE_KEY));
+              setBrowserAlertNotice((notice) => notice === BROWSER_SYNC_ERROR ? null : notice);
             }
           })
           .catch((e: unknown) => {
@@ -146,7 +149,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
               throw e;
             }
             if (active && generation.current === epoch) {
-              setBrowserAlertNotice("Could not sync browser alerts. Your threads still load.");
+              setBrowserAlertNotice(BROWSER_SYNC_ERROR);
             }
           })
           .finally(() => {
@@ -324,10 +327,17 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
   const savePrefs = (next: NotificationPreferences) => {
     const mine = generation.current;
+    const save = ++latestPreferenceSave.current;
+    const isCurrent = () => generation.current === mine && latestPreferenceSave.current === save;
     setInbox((cur) => (cur ? { ...cur, preferences: next } : cur));
-    void setNotificationPreferences(next).catch(() => {
-      if (generation.current === mine) setPreferenceNotice("Could not save notification settings.");
-    });
+    void setNotificationPreferences(next).then(
+      () => {
+        if (isCurrent()) setPreferenceNotice(null);
+      },
+      () => {
+        if (isCurrent()) setPreferenceNotice("Could not save notification settings.");
+      },
+    );
   };
 
   const toggleMute = (group: NotificationGroup) => {

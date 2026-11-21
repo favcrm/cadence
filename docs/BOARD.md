@@ -3192,6 +3192,8 @@ unviewed transcript messages read.
 All includes every eligible conversation, not a truncated first page. The bell's
 unread total covers that complete authorized history.
 Use Notification settings in the inbox to manage browser alerts.
+A successful preference save or browser-alert sync clears that operation's
+warning without hiding a failure in the other.
 
 Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
 sender is a still-registered agent carries a "Reply as you" action that

@@ -77,11 +77,40 @@ async function main(): Promise<void> {
     preferences: { dm: true, mention: true, sound: false, preview: true, quiet: "off", zone: "UTC" },
     push: { available: false, public_key: null },
   };
+  const feeds: Array<() => void> = [];
+  win.setInterval = (handler, timeout, ...args) => {
+    if (typeof handler === "function" && timeout === 15_000) feeds.push(() => handler(...args));
+    return feeds.length;
+  };
+  const registration = {
+    pushManager: { getSubscription: async () => ({ endpoint: "https://push.invalid/subscription", unsubscribe: async () => true }) },
+    getNotifications: async () => [],
+  };
+  Object.defineProperties(win, {
+    isSecureContext: { configurable: true, value: true },
+    PushManager: { configurable: true, value: class {} },
+    Notification: { configurable: true, value: class {} },
+  });
+  Object.defineProperty(win.navigator, "serviceWorker", {
+    configurable: true,
+    value: { getRegistration: async () => registration, addEventListener() {}, removeEventListener() {} },
+  });
+  let rebinds = 0;
+  const pendingSaves: Array<(status: number) => void> = [];
+  const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
+    status, headers: { "Content-Type": "application/json" },
+  });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input: RequestInfo | URL) => {
     const path = new URL(input instanceof Request ? input.url : String(input), "http://localhost").pathname;
-    if (path === "/api/human-threads/notifications") {
-      return new Response(JSON.stringify(emptyFeed), { headers: { "Content-Type": "application/json" } });
+    if (path === "/api/human-threads/notifications") return json(emptyFeed);
+    if (path === "/api/human-threads/push/subscriptions/rebind") {
+      return ++rebinds === 1 ? json({ error: "temporarily unavailable" }, 503) : json({ device_id: null });
+    }
+    if (path === "/api/human-threads/notifications/preferences") {
+      const { promise, resolve } = Promise.withResolvers<Response>();
+      pendingSaves.push((status) => resolve(json({}, status)));
+      return promise;
     }
     throw new Error(`Unexpected request ${path}`);
   };
@@ -139,6 +168,30 @@ async function main(): Promise<void> {
     const allTab = Array.from(popover().querySelectorAll("button")).find((b) => b.textContent === "All") as HTMLButtonElement;
     await React.act(async () => { allTab.click(); });
     assert(popover().textContent?.includes("No conversations yet.") && popover().textContent?.includes("Direct messages and mentions will appear here."), "All tab renders distinct empty state copy");
+
+    // Each recovery clears only its own warning; late saves cannot bring one back.
+    const syncError = "Could not sync browser alerts. Your threads still load.";
+    const saveError = "Could not save notification settings.";
+    const settings = host.querySelector<HTMLDialogElement>("dialog.notification-settings")!;
+    const settingsTrigger = popover().querySelector<HTMLButtonElement>('button[aria-label="Notification settings"]')!;
+    await React.act(async () => { bell().click(); settingsTrigger.click(); });
+    assert(settings.open && settings.textContent?.includes(syncError), "failed push rebind is shown in Settings");
+    const preference = settings.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    await React.act(async () => { preference.click(); });
+    await settle(() => pendingSaves.length === 1, "the preference save is sent");
+    await React.act(async () => { pendingSaves[0]!(503); });
+    assert(settings.textContent?.includes(saveError) && settings.textContent.includes(syncError), "both independent failures are visible");
+    await React.act(async () => { feeds[0]!(); });
+    await settle(() => rebinds === 2, "the next inbox poll retries the rebind");
+    assert(!settings.textContent?.includes(syncError), "successful rebind removes its warning");
+    assert(settings.textContent?.includes(saveError), "successful rebind does not clear a preference failure");
+    await React.act(async () => { preference.click(); });
+    await React.act(async () => { preference.click(); });
+    await settle(() => pendingSaves.length === 3, "two more preference saves are sent");
+    await React.act(async () => { pendingSaves[2]!(200); });
+    assert(!settings.textContent?.includes(saveError), "successful latest save removes its warning");
+    await React.act(async () => { pendingSaves[1]!(503); });
+    assert(!settings.textContent?.includes(saveError), "late failure from older save cannot restore its warning");
 
     // Traditional Chinese (zh-TW) localization renders translated UI strings.
     await React.act(async () => {
