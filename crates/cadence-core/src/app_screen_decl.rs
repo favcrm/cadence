@@ -675,6 +675,176 @@ impl ScreenNavigation {
         Ok(())
     }
 }
+/// Most views one screen may declare.
+pub const MAX_VIEWS: usize = 20;
+/// Most params one view may declare.
+pub const MAX_VIEW_PARAMS: usize = 6;
+/// Most values one `enum` param may list.
+const MAX_VIEW_ENUM_VALUES: usize = 20;
+/// Longest declared enum value and longest route/card param value, UTF-16 units.
+pub const MAX_VIEW_PARAM_VALUE: usize = 200;
+/// Longest view label, UTF-16 units (the `view_ref` card's `view_label` bound).
+const MAX_VIEW_LABEL: usize = 60;
+
+/// CAD-2555: one declared app view — a named, parameterised place in a
+/// screen ("Profit and loss" for a date range). A declaration only; it grants
+/// nothing, and the host re-checks every route and card against it.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenView {
+    pub id: String,
+    /// Locale → label; at least one locale.
+    #[serde(deserialize_with = "unique_view_label")]
+    pub label: BTreeMap<String, String>,
+    /// A declared navigation section.
+    pub section: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "unique_view_params"
+    )]
+    pub params: BTreeMap<String, ScreenViewParam>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenViewParamType {
+    Date,
+    String,
+    Enum,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenViewParam {
+    #[serde(rename = "type")]
+    pub kind: ScreenViewParamType,
+    /// `enum` only: the allowed values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A route/card param name: `[a-z_]{1,24}`.
+pub fn valid_view_param_name(name: &str) -> bool {
+    (1..=24).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+/// A route/card param value: plain text, `1..=200` UTF-16 units, no control
+/// characters. Types, dates and enums are the declaration's to check.
+pub fn valid_view_param_value(value: &str) -> bool {
+    let units = value.encode_utf16().count();
+    (1..=MAX_VIEW_PARAM_VALUE).contains(&units)
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+fn unique_view_label<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<BTreeMap<String, String>, D::Error> {
+    unique_btreemap(d, "view label locale")
+}
+
+fn unique_view_params<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<BTreeMap<String, ScreenViewParam>, D::Error> {
+    unique_btreemap(d, "view param")
+}
+
+/// The declared views of one screen, validated against its navigation.
+fn validate_views(views: &[ScreenView], nav: Option<&ScreenNavigation>) -> Result<()> {
+    let Some(nav) = nav else {
+        return Err(Error::rejected("views require navigation"));
+    };
+    if views.is_empty() || views.len() > MAX_VIEWS {
+        return Err(Error::rejected(format!(
+            "views require 1..={MAX_VIEWS} entries"
+        )));
+    }
+    let has_disallowed_ctrl = |s: &str| {
+        s.chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    };
+    let mut seen = HashSet::new();
+    for view in views {
+        let id = view.id.as_bytes();
+        if id.is_empty()
+            || id.len() > 32
+            || !id
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+            || !seen.insert(view.id.as_str())
+        {
+            return Err(Error::rejected("invalid or duplicate view id"));
+        }
+        if view.label.is_empty() || view.label.len() > MAX_I18N_LOCALES {
+            return Err(Error::rejected("view label requires 1..=8 locales"));
+        }
+        for (locale, label) in &view.label {
+            if !valid_locale_tag(locale)
+                || label.trim().is_empty()
+                || label.encode_utf16().count() > MAX_VIEW_LABEL
+                || has_disallowed_ctrl(label)
+            {
+                return Err(Error::rejected("invalid view label locale or text"));
+            }
+        }
+        if !nav.sections.iter().any(|s| s.id == view.section) {
+            return Err(Error::rejected("view section is not declared"));
+        }
+        // The route's record id grammar (`[a-z0-9_-]{1,64}`).
+        if let Some(record) = &view.record_id {
+            if record.is_empty()
+                || record.len() > 64
+                || !record.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
+                })
+            {
+                return Err(Error::rejected("invalid view record_id"));
+            }
+        }
+        if view.params.len() > MAX_VIEW_PARAMS {
+            return Err(Error::rejected(format!(
+                "a view declares at most {MAX_VIEW_PARAMS} params"
+            )));
+        }
+        for (name, param) in &view.params {
+            if !valid_view_param_name(name) {
+                return Err(Error::rejected("invalid view param name"));
+            }
+            match (param.kind, &param.values) {
+                (ScreenViewParamType::Enum, Some(values)) => {
+                    let mut distinct = HashSet::new();
+                    if values.is_empty()
+                        || values.len() > MAX_VIEW_ENUM_VALUES
+                        || !values
+                            .iter()
+                            .all(|v| valid_view_param_value(v) && distinct.insert(v.as_str()))
+                    {
+                        return Err(Error::rejected("invalid view enum values"));
+                    }
+                }
+                (ScreenViewParamType::Enum, None) => {
+                    return Err(Error::rejected("an enum view param requires values"));
+                }
+                (_, Some(_)) => {
+                    return Err(Error::rejected("only an enum view param declares values"));
+                }
+                (_, None) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The one entry point — pinned, and it must be a declared, supplied
 /// asset.
 const ENTRY: &str = "client.js";
@@ -729,6 +899,7 @@ pub struct IntegrityCheckedScreen {
     /// value is only ever produced by the native-vocabulary admissions.
     operations: Vec<ScreenOperation>,
     navigation: Option<ScreenNavigation>,
+    views: Option<Vec<ScreenView>>,
     startup: Option<Vec<String>>,
 }
 
@@ -763,6 +934,10 @@ impl IntegrityCheckedScreen {
     }
     pub fn navigation(&self) -> Option<&ScreenNavigation> {
         self.navigation.as_ref()
+    }
+    /// The declared app views (CAD-2555); `None` when the screen declares none.
+    pub fn views(&self) -> Option<&[ScreenView]> {
+        self.views.as_deref()
     }
     /// Explicit execution order, records-v2 only; absence keeps all leaves
     /// except the entry inert. Integrity evidence, never execution authority.
@@ -872,6 +1047,9 @@ struct RawDecl<O> {
     operations: O,
     #[serde(default)]
     navigation: Option<ScreenNavigation>,
+    /// CAD-2555: optional declared app views; need `navigation`.
+    #[serde(default)]
+    views: Option<Vec<ScreenView>>,
     #[serde(default)]
     startup: Option<Vec<String>>,
 }
@@ -961,6 +1139,7 @@ impl DeclaredOperations for Vec<ScreenOperation> {
             tools: decl.tools,
             operations: decl.operations,
             navigation: decl.navigation,
+            views: decl.views,
             startup: decl.startup,
         }
     }
@@ -1203,11 +1382,13 @@ where
     // new fields are records-contract-only, not a silent old-schema widening.
     if decl.host_contract.as_deref() != Some(HOST_CONTRACT_RECORDS)
         && value.as_object().is_some_and(|fields| {
-            fields.contains_key("operations") || fields.contains_key("navigation")
+            ["operations", "navigation", "views"]
+                .iter()
+                .any(|key| fields.contains_key(*key))
         })
     {
         return Err(Error::rejected(
-            "operations/navigation require screen-records.v1",
+            "operations/navigation/views require screen-records.v1",
         ));
     }
     if value.get("startup").is_some() && decl.startup.is_none() {
@@ -1481,9 +1662,12 @@ where
         if let Some(nav) = &decl.navigation {
             nav.validate()?;
         }
-    } else if !decl.operations.is_empty() || decl.navigation.is_some() {
+        if let Some(views) = &decl.views {
+            validate_views(views, decl.navigation.as_ref())?;
+        }
+    } else if !decl.operations.is_empty() || decl.navigation.is_some() || decl.views.is_some() {
         return Err(Error::rejected(
-            "operations/navigation require screen-records.v1",
+            "operations/navigation/views require screen-records.v1",
         ));
     }
     // `tools` is a bounded alias→slot map (≤8, matching the app
@@ -2211,5 +2395,116 @@ mod tests {
             &bodies
         )
         .is_err());
+    }
+    /// CAD-2555: a records-contract manifest with navigation sections
+    /// `customers` and `reports`, and `views` spliced in verbatim.
+    fn views_manifest(views: &str) -> String {
+        format!(
+            r#"{{"contract":"app-screens/v2","app":"crm","entry":"client.js","assets":[{{"name":"client.js","media_type":"text/javascript","size":{},"sha256":"{}"}}],"provenance":{{"source_digest":"{}","sdk_digest":"{}","toolchain_digest":"{}"}},"host_contract":"screen-records.v1","may":[],"navigation":{{"section_query":"section","default_section":"customers","sections":[{{"id":"customers","label":"Customers"}},{{"id":"reports","label":"Reports"}}]}},"views":{views}}}"#,
+            BODY.len(),
+            digest(BODY),
+            digest("source"),
+            digest("sdk"),
+            digest("toolchain"),
+        )
+    }
+
+    const PNL: &str = r#"{"id":"pnl","label":{"en":"Profit and loss","zh-TW":"損益表"},"section":"reports","record_id":"pnl","params":{"from":{"type":"date"},"to":{"type":"date"},"basis":{"type":"enum","values":["cash","accrual"],"required":true},"note":{"type":"string"}}}"#;
+
+    #[test]
+    fn views_are_parsed_with_their_labels_and_typed_params() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let checked = validate_map(&views_manifest(&format!("[{PNL}]")), &bodies).unwrap();
+        let view = &checked.views().unwrap()[0];
+        assert_eq!(view.id, "pnl");
+        assert_eq!(view.label["zh-TW"], "損益表");
+        assert_eq!(view.section, "reports");
+        assert_eq!(view.record_id.as_deref(), Some("pnl"));
+        assert_eq!(view.params["from"].kind, ScreenViewParamType::Date);
+        assert_eq!(view.params["note"].kind, ScreenViewParamType::String);
+        assert!(view.params["basis"].required);
+        assert_eq!(
+            view.params["basis"].values.as_deref(),
+            Some(&["cash".to_string(), "accrual".to_string()][..])
+        );
+        assert!(!view.params["from"].required);
+        // A screen without `views` still validates and reports none.
+        let bare = views_manifest("[]").replacen(r#","views":[]"#, "", 1);
+        assert!(validate_map(&bare, &bodies).unwrap().views().is_none());
+    }
+
+    #[test]
+    fn route_param_grammar_matches_the_card_and_the_route() {
+        assert!(
+            valid_view_param_name("as_at")
+                && !valid_view_param_name("From")
+                && !valid_view_param_name("")
+        );
+        assert!(!valid_view_param_name(&"a".repeat(25)) && valid_view_param_name(&"a".repeat(24)));
+        assert!(valid_view_param_value("2026-07-01") && valid_view_param_value(&"x".repeat(200)));
+        assert!(!valid_view_param_value("") && !valid_view_param_value(&"x".repeat(201)));
+        assert!(!valid_view_param_value("a\u{7}b") && !valid_view_param_value("a\u{2028}b"));
+    }
+
+    #[test]
+    fn views_refuse_every_invalid_declaration() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let ok = |view: &str| validate_map(&views_manifest(&format!("[{view}]")), &bodies);
+        assert!(ok(r#"{"id":"v","label":{"en":"V"},"section":"reports"}"#).is_ok());
+        let too_many_params = (0..=MAX_VIEW_PARAMS)
+            .map(|i| format!(r#""p{}":{{"type":"string"}}"#, "x".repeat(i + 1)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bad = [
+            r#"{"id":"V","label":{"en":"V"},"section":"reports"}"#, // id grammar
+            r#"{"id":"","label":{"en":"V"},"section":"reports"}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"nope"}"#, // undeclared section
+            r#"{"id":"v","label":{},"section":"reports"}"#,      // no label
+            r#"{"id":"v","label":{"en":"  "},"section":"reports"}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","record_id":"Bad Id"}"#, // record id grammar
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","extra":1}"#, // unknown key
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"From":{"type":"date"}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"number"}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"date","values":["x"]}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum"}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":[]}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x","x"]}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"date","extra":1}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"date"},"a":{"type":"date"}}}"#,
+            r#"{"id":"v","label":{"en":"V","en":"W"},"section":"reports"}"#,
+        ];
+        for view in bad {
+            assert!(ok(view).is_err(), "{view}");
+        }
+        assert!(ok(&format!(r#"{{"id":"v","label":{{"en":"V"}},"section":"reports","params":{{{too_many_params}}}}}"#)).is_err());
+        let long_enum = (0..=20)
+            .map(|i| format!(r#""v{i}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(ok(&format!(r#"{{"id":"v","label":{{"en":"V"}},"section":"reports","params":{{"a":{{"type":"enum","values":[{long_enum}]}}}}}}"#)).is_err());
+        // Whole-list rules: empty, duplicate ids, more than 20.
+        assert!(validate_map(&views_manifest("[]"), &bodies).is_err());
+        let one = r#"{"id":"v","label":{"en":"V"},"section":"reports"}"#;
+        assert!(validate_map(&views_manifest(&format!("[{one},{one}]")), &bodies).is_err());
+        let views = |count: usize| {
+            let list = (0..count)
+                .map(|i| format!(r#"{{"id":"v{i}","label":{{"en":"V"}},"section":"reports"}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            validate_map(&views_manifest(&format!("[{list}]")), &bodies)
+        };
+        assert!(views(MAX_VIEWS).is_ok());
+        assert!(views(MAX_VIEWS + 1).is_err());
+    }
+
+    #[test]
+    fn views_need_the_records_contract_and_navigation() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let manifest = views_manifest(r#"[{"id":"v","label":{"en":"V"},"section":"reports"}]"#);
+        let no_nav = manifest.replacen("\"navigation\"", "\"navigation_unused\"", 1);
+        assert!(validate_map(&no_nav, &bodies).is_err());
+        let v1_like = manifest.replacen("\"screen-records.v1\"", "\"screen-actions.v1\"", 1);
+        assert!(validate_map(&v1_like, &bodies).is_err());
+        assert!(validate_facts_asset_integrity(&v1_like, &BTreeMap::new()).is_err());
     }
 }

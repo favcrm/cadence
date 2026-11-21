@@ -1,9 +1,10 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
-import { useTranslate } from "../../lib/locale";
+import { useLocaleTag, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import { appViewId, sameRoute } from "../canvas/appView";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
+import { paramsLine } from "../canvas/viewParams";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, viewHere, type ViewScope } from "./chatCards";
 import type { ThreadEntry } from "./thread";
@@ -64,6 +65,7 @@ export function viewState(probe: Probe["status"], openable: boolean, place: View
 
 export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; density?: CardDensity }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   const scope = useContext(ViewScopeContext);
   const canvas = useCanvas();
   const model = parseViewRef(entry);
@@ -85,7 +87,9 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
     missing: { text: t("Not found"), tone: "muted" as const },
     closed: undefined,
   }[state];
-  const place = model.recordId === null ? model.section : `${model.section} / ${model.recordId}`;
+  // A declared view names its place by its label (CAD-2555) and shows its params on a line of their own.
+  const place = model.viewLabel ?? (model.recordId === null ? model.section : `${model.section} / ${model.recordId}`);
+  const params = paramsLine(model.params, locale);
   return (
     <TurnCard
       kind="view"
@@ -114,6 +118,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
       <p className="text-label text-ink-300 viewcard-place" title={`${model.appLabel} · ${place}`}>
         {model.appLabel} · {place}
       </p>
+      {params === "" ? null : <p className="text-label text-ink-300 viewcard-place" data-view-params title={params}>{params}</p>}
     </TurnCard>
   );
 }

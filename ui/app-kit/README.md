@@ -197,6 +197,64 @@ as "Edits are disabled on this board", and use compact padding. The host shows
 "Open in <App> to edit" itself. `openDrawer` is unchanged: only a `drawer`
 mount refuses it.
 
+### Declaring views
+
+An app that wants chat to open one of its places ("show me Q3's P&L") declares
+it as a view in `screens.json`, next to `navigation` (records contract only).
+A view names a navigation section, optionally a record, and the params it takes:
+
+```jsonc
+"views": [
+  { "id": "pnl", "label": { "en": "Profit and loss", "zh-TW": "損益表" },
+    "section": "reports", "record_id": "pnl",
+    "params": { "from": { "type": "date" }, "to": { "type": "date" } } },
+  { "id": "balance_sheet", "label": { "en": "Balance sheet" },
+    "section": "reports", "record_id": "balance_sheet",
+    "params": { "as_at": { "type": "date", "required": true } } }
+]
+```
+
+- `id` is `[a-z0-9_-]{1,32}` and unique; at most 20 views. `label` has 1 to 8
+  locales, each up to 60 characters. `section` must be a declared navigation
+  section; `record_id` is optional (`[a-z0-9_-]{1,64}`).
+- `params` holds at most 6 entries, named `[a-z_]{1,24}`. A param is `{ "type":
+  "date" }` (`YYYY-MM-DD`), `{ "type": "string" }` (plain text, up to 200
+  characters) or `{ "type": "enum", "values": [...] }` (up to 20 strings). Add
+  `"required": true` to refuse a call without it; every param is optional
+  otherwise.
+- Unknown keys, an undeclared section, a repeated id or param, or a value over
+  a limit refuse the whole declaration at install.
+
+Declaring a view grants nothing. The host that opens one checks the params
+against it before it writes the chat card.
+
+### Route params (`screen-route-params.v1`)
+
+A view's params reach the app on the route. Add `screen-route-params.v1` to
+`accepts` (it needs `screen-records.v1`), or `routeParams: true` on a bridge
+that also has `records: true` and a `route`. Then:
+
+- the route the host pushes carries `params` (a frozen name-to-string object,
+  `{}` when none): `bridge.getSnapshot().route.params`;
+- `patchRoute({ params })` may send params. A patch with `params` replaces the
+  whole set (`{ params: {} }` clears it); a patch without it leaves them as
+  they were, so send `params` on every patch that should change them. Add
+  nothing to `calls`: `params` is allowed for `screen.route.patch` by the opt-in;
+- the full-page board URL carries them as `p.<name>=<value>` (for example
+  `?crm=reports&p.from=2026-07-01&p.to=2026-09-30`), so a reload or a shared
+  link opens the same place; the canvas tab keeps them in its own route. The host
+  drops `p.*` when the section changes through the app's own navigation.
+
+A frame that did not opt in is pushed the route exactly as before, and a
+`screen.route.patch` with `params` from it closes the mount. Values are plain
+text (1 to 200 characters, no control characters); the app validates dates and
+enums itself, as the host only keeps the set bounded.
+
+To adopt: bump `@cadence/app-kit` to 0.8.0, declare the views, pass
+`routeParams: true` (or add the capability to `accepts`), read
+`route.params` where the app reads `route.section`, and write `params` in the
+patches that follow a filter change. An app that does none of this is unchanged.
+
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
 

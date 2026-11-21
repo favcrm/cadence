@@ -31,6 +31,10 @@ export const SCREEN_AUDIO_V2 = "screen-audio.v2";
 export const HOST_DRAWER_VERBS = Object.freeze(["screen.drawer.open", "screen.drawer.close", "screen.drawer.context"]);
 export const ROUTABLE_ID = /^[a-z0-9_-]{1,64}$/;
 export const ROUTE_RECORD_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** CAD-2555 — a declared view's route params: at most 6, `[a-z_]{1,24}` names, plain-text values of 1-200 characters. */
+const ROUTE_PARAMS_MAX = 6;
+const ROUTE_PARAM_NAME = /^[a-z_]{1,24}$/;
+const ROUTE_PARAM_VALUE = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029]{1,200}$/;
 
 const BOOT_ID = "cadence-screen-boot";
 const BOOT_KEYS = ["bridge_nonce", "generation", "parent_origin", "tag"];
@@ -335,14 +339,14 @@ export function createScreenReceiver(options = {}) {
   if (expectedTag !== undefined && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
     throw new TypeError("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   }
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-canvas.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-canvas.v1", "screen-route-params.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-canvas.v1, screen-records.v1, screen-locale.v1, screen-audio.v1 or screen-audio.v2");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-canvas.v1, screen-route-params.v1, screen-records.v1, screen-locale.v1, screen-audio.v1 or screen-audio.v2");
   }
   if (accepts.includes(SCREEN_AUDIO_V1) && accepts.includes(SCREEN_AUDIO_V2)) {
     throw new TypeError("accepts cannot combine screen-audio.v1 and screen-audio.v2");
@@ -376,6 +380,11 @@ export function createScreenReceiver(options = {}) {
   if (recordsAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-records.v1 needs screen.v2");
   }
+  // CAD-2555 — a declared view's params ride on the route a records screen is pushed.
+  const routeParamsAccepted = accepts.includes("screen-route-params.v1");
+  if (routeParamsAccepted && !recordsAccepted) {
+    throw new TypeError("screen-route-params.v1 needs screen-records.v1");
+  }
   const localeAccepted = accepts.includes("screen-locale.v1");
   if (localeAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-locale.v1 needs screen.v2");
@@ -399,6 +408,7 @@ export function createScreenReceiver(options = {}) {
     ...(surfacesAccepted ? ["screen-surfaces.v1"] : []),
     ...(canvasAccepted ? ["screen-canvas.v1"] : []),
     ...(recordsAccepted ? ["screen-records.v1"] : []),
+    ...(routeParamsAccepted ? ["screen-route-params.v1"] : []),
     ...(localeAccepted ? ["screen-locale.v1"] : []),
     ...(audioAccepted ? [SCREEN_AUDIO_V1] : []),
     ...(audioV2Accepted ? [SCREEN_AUDIO_V2] : [])];
@@ -1046,7 +1056,7 @@ export function createScreenReceiver(options = {}) {
 /** Domain-agnostic reactive `screen.v2` bridge (`subscribe` + `getState`). */
 export function createScreenBridge(options = {}) {
   const {
-    tag, appName, records = false, actions = false, media = false, surfaces = false, canvas = false,
+    tag, appName, records = false, actions = false, media = false, surfaces = false, canvas = false, routeParams = false,
     presentation = false, locale = false, audio = false, calls: suppliedCalls = {}, slots: suppliedSlots = {}, catalog = false, argBytes = ACTION_ARGS_BYTES,
     singleFlight = [], writeVerbs = [], route: routeConfig, observations: observationVerbs = [],
     pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, sandboxForms = false, createError,
@@ -1094,6 +1104,7 @@ export function createScreenBridge(options = {}) {
     if (!routeConfig.sections.includes(defaultSection)) fail("route.defaultSection must be listed in route.sections");
     parsedRouteConfig = { sections: [...routeConfig.sections], defaultSection, views: [...views], defaultView: views[0] };
   }
+  if (typeof routeParams !== "boolean" || (routeParams && (!records || !parsedRouteConfig))) fail("routeParams needs a records screen with a route");
 
   const declaredOperations = Object.freeze([...new Set([...Object.keys(calls), ...Object.keys(slots)])]);
   const declaredSet = new Set(declaredOperations);
@@ -1115,6 +1126,7 @@ export function createScreenBridge(options = {}) {
     ...(surfaces ? ["screen-surfaces.v1"] : []),
     ...(canvas ? ["screen-canvas.v1"] : []),
     ...(records ? ["screen-records.v1"] : []),
+    ...(routeParams ? ["screen-route-params.v1"] : []),
     ...(locale ? ["screen-locale.v1"] : []),
     ...negotiatedAudio,
   ];
@@ -1157,21 +1169,26 @@ export function createScreenBridge(options = {}) {
     notify();
   };
 
+  // CAD-2555 — `params` is `{}` for a frame that opted in and none when it did not.
+  const validParams = (value) => isPlain(value) && Object.keys(value).length <= ROUTE_PARAMS_MAX &&
+    Object.entries(value).every(([name, v]) => ROUTE_PARAM_NAME.test(name) && typeof v === "string" && ROUTE_PARAM_VALUE.test(v));
   const parseRoute = (value) => {
     if (!parsedRouteConfig) return null;
-    const fallback = Object.freeze({
+    const withParams = (route, params) => Object.freeze(routeParams ? { ...route, params: Object.freeze({ ...params }) } : route);
+    const fallback = withParams({
       section: parsedRouteConfig.defaultSection, view: parsedRouteConfig.defaultView, record_id: null, segment_id: null,
-    });
+    }, {});
     if (value === undefined) return fallback;
-    if (!isPlain(value) || !exactKeys(value, ["section", "view", "record_id", "segment_id"])) {
+    if (!isPlain(value) || !exactKeys(value, routeParams ? ["section", "view", "record_id", "segment_id", "params"] : ["section", "view", "record_id", "segment_id"]) ||
+        (value.params !== undefined && !validParams(value.params))) {
       throw invalidBridge("Invalid screen route projection");
     }
-    return Object.freeze({
+    return withParams({
       section: parsedRouteConfig.sections.includes(value.section) ? value.section : parsedRouteConfig.defaultSection,
       view: parsedRouteConfig.views.includes(value.view) ? value.view : parsedRouteConfig.defaultView,
       record_id: typeof value.record_id === "string" && ROUTE_RECORD_ID.test(value.record_id) ? value.record_id : null,
       segment_id: typeof value.segment_id === "string" && ROUTE_RECORD_ID.test(value.segment_id) ? value.segment_id : null,
-    });
+    }, value.params ?? {});
   };
 
   const can = (verb, actionList) => {
@@ -1560,7 +1577,9 @@ export function createScreenBridge(options = {}) {
       if (patch.record_id !== undefined && patch.record_id !== null && (typeof patch.record_id !== "string" || !ROUTABLE_ID.test(patch.record_id))) return;
       if (patch.segment_id !== undefined && patch.segment_id !== null && (typeof patch.segment_id !== "string" || !ROUTABLE_ID.test(patch.segment_id))) return;
       if (patch.replace !== undefined && typeof patch.replace !== "boolean") return;
-      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true, extraFields: ["replace"] }).catch(() => undefined);
+      // CAD-2555 — `params` replaces the page's whole set (`{}` clears it); only a frame that opted in may send it.
+      if (patch.params !== undefined && (!routeParams || !validParams(patch.params))) return;
+      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true, extraFields: routeParams ? ["replace", "params"] : ["replace"] }).catch(() => undefined);
     },
     ownLeaveState() {
       const snap = currentState.snapshot;

@@ -8,9 +8,13 @@ import {
   patchAppViewRoute,
   resetCanvas,
 } from "../src/features/canvas/canvasStore";
-import { appViewId, appViewRef } from "../src/features/canvas/appView";
+import { appViewId, appViewRef, applyRoutePatch, sameRoute } from "../src/features/canvas/appView";
+import { paramsLine } from "../src/features/canvas/viewParams";
+import { appSectionHref } from "../src/features/app-shell/appNav";
+import { stripAppRouteParams } from "../src/lib/router";
+import { setQueryParams } from "../src/features/workspace-apps/screen/routeParams";
 import { resourceAppView } from "../src/features/app-shell/assistantResourceNavigation";
-import { frameRoute } from "../src/features/workspace-apps/screen/screenRoute";
+import { frameRoute, parseRoutePatch, routeFromHref } from "../src/features/workspace-apps/screen/screenRoute";
 import { readOnlyReceipt, READ_ONLY_OPERATIONS } from "../src/features/workspace-apps/screen/screenReadOnly";
 import type { MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { SCREEN_READ_VERBS } from "../src/features/workspace-apps/screen/screenServices";
@@ -108,3 +112,38 @@ const aggregateReceipt = { ...receipt, operations: ["records.aggregate", "record
 equal(readOnlyReceipt(aggregateReceipt).operations, ["records.aggregate", "records.list"], "records.aggregate is kept, writes still dropped");
 equal([...READ_ONLY_OPERATIONS].sort(), [...SCREEN_READ_VERBS].sort(), "canvas read-only set matches the screen read set");
 equal(receipt.operations?.length, 8, "the original receipt is not mutated");
+
+// CAD-2555: a route's params. A route without them has its old shape; the board URL carries them as `p.<name>`.
+const paramsRoute = { section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } };
+equal(appViewRef(ref("pnl", { route: paramsRoute }))?.route, paramsRoute, "a route with params is a reference");
+equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params: {} } }))?.route.params, undefined, "empty params are no params");
+for (const params of [[], "x", { From: "a" }, { from: "" }, { from: "x".repeat(201) }, { from: "a\u0007" }, { from: 1 }, Object.fromEntries("abcdefg".split("").map((k) => [k, "x"]))]) {
+  equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params } })), null, `refused params ${JSON.stringify(params)?.slice(0, 40)}`);
+}
+const reportsNav = { section_query: "crm", default_section: "customers", sections: [{ id: "customers", label: "Customers" }, { id: "reports", label: "Reports" }] };
+const paramsHref = "/apps/crm?crm=reports&record=pnl&p.from=2026-07-01&p.to=2026-09-30";
+equal(routeFromHref(reportsNav, "crm", paramsHref), paramsRoute, "p.* in the board URL is the route's params");
+equal(routeFromHref(reportsNav, "crm", "/apps/crm?crm=reports").params, undefined, "no p.* is no params key");
+equal(routeFromHref(reportsNav, "crm", "/apps/crm?crm=reports&p.from=ok&p.To=bad").params, undefined, "a bad set is dropped whole");
+equal(parseRoutePatch({ section: "reports", params: { from: "2026-07-01" } }, reportsNav), { section: "reports", params: { from: "2026-07-01" } }, "a patch may carry params");
+equal(parseRoutePatch({ params: { From: "2026-07-01" } }, reportsNav), null, "a patch with a bad param name is refused");
+equal(parseRoutePatch({ params: ["x"] }, reportsNav), null, "a patch with non-object params is refused");
+equal(parseRoutePatch({ params: { a: 1 } }, reportsNav), null, "a patch with a non-string param is refused");
+// The round trip: URL -> route -> patch -> URL.
+const q = new URLSearchParams("crm=reports&record=pnl&p.from=2026-07-01&p.to=2026-09-30&keep=1");
+setQueryParams(q, { from: "2026-10-01" });
+equal(q.toString(), "crm=reports&record=pnl&keep=1&p.from=2026-10-01", "a patch replaces the page's p.* and leaves other keys");
+setQueryParams(q, {});
+equal(q.toString(), "crm=reports&record=pnl&keep=1", "empty params clear p.*");
+equal(appSectionHref("/apps/crm?crm=reports&p.from=2026-07-01&p.to=2026-09-30", reportsNav, "customers"), "/apps/crm", "section navigation drops the old page's params");
+equal(new URLSearchParams(stripAppRouteParams("p.from=2026-07-01&record=pnl&project=p1")).toString(), "project=p1", "leaving the app drops p.* but not host keys");
+equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: { from: "2026-07-01", to: "2026-09-30" } } as never), true, "same params are the same route");
+equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: { from: "2026-07-01", to: "2026-09-29" } } as never), false, "another value is another route");
+equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: undefined } as never), false, "params against none is another route");
+equal(applyRoutePatch(paramsRoute as never, { record_id: "x" }).params, paramsRoute.params, "a patch without params keeps them");
+equal(paramsLine({ from: "2026-07-01", to: "2026-09-30" }, "en"), "1 Jul – 30 Sep 2026", "two days read as a range");
+equal(paramsLine({ from: "2026-07-01", to: "2027-02-03" }, "en"), "1 Jul 2026 – 3 Feb 2027", "a range across years names both");
+equal(paramsLine({ as_at: "2026-09-30" }, "en"), "30 Sep 2026", "one day reads as a day");
+equal(paramsLine({ from: "2026-07-01", to: "2026-09-30" }, "zh-TW"), "7月1日 – 2026年9月30日", "zh-TW drops a repeated year like en");
+equal(paramsLine({ basis: "cash", as_at: "2026-02-30" }, "en"), "cash · 2026-02-30", "other values show as written, in order");
+equal(paramsLine(undefined, "en"), "", "no params, no line");

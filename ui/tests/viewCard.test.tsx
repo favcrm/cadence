@@ -166,3 +166,39 @@ equal([moves, canvasSnapshot().tabs.length, canvasSnapshot().open], [[{ section:
 resetCanvas("c", "k", "app");
 const otherPart = feedParts(items.slice(0, 2), 0, null, { installId: "other", contextId: "c", showHere: pane.showHere });
 equal(otherPart.views.map((v) => v.here), [undefined], "another app's card keeps the canvas");
+
+// CAD-2555: a declared view with params (agenticos-v2 AOS-681 fixtures, copied verbatim).
+resetCanvas("c", "k", "app");
+const withParams = read("view-ref-params");
+const paramsModel = parseViewRef(entryOf(withParams));
+equal(paramsModel, { app: "books", appLabel: "Books", installId: "install_books", screenTag: "books", section: "reports", recordId: "pnl", title: "Profit and loss", view: "pnl", viewLabel: "Profit and loss", params: { from: "2026-01-01", to: "2026-03-31" } }, "view-ref-params fixture parses");
+equal(parseViewRef(entryOf(valid)), model, "a card without the new keys keeps its exact model");
+for (const { case: name, entry } of read("view-ref-params-invalid") as { case: string; entry: Record<string, unknown> }[]) {
+  equal(parseViewRef(entryOf(entry)), null, `invalid params fixture is rejected: ${name}`);
+}
+const viewOnly = JSON.parse(JSON.stringify(withParams));
+delete viewOnly.payload.params;
+delete viewOnly.payload.view_label;
+equal([parseViewRef(entryOf(viewOnly))?.view, parseViewRef(entryOf(viewOnly))?.params], ["pnl", undefined], "view alone is enough");
+const emptyParams = JSON.parse(JSON.stringify(withParams));
+emptyParams.payload.params = {};
+equal(parseViewRef(entryOf(emptyParams))?.params, {}, "an empty params object is accepted");
+const paramsRef = viewCardAppView(paramsModel!);
+equal([paramsRef?.route, paramsRef?.viewLabel], [{ section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-01-01", to: "2026-03-31" } }, "Profit and loss"], "the card's route and label carry the view");
+const paramsHtml = render(withParams);
+check(paramsHtml.includes("Books · Profit and loss") && paramsHtml.includes("data-view-params") && paramsHtml.includes("1 Jan – 31 Mar 2026"), "the card shows the view label and a compact params line");
+check(!render(valid).includes("data-view-params"), "a card without params has no params line");
+// The tab opens with the params in its route, and the same view with other params resets it.
+openAppView(paramsRef);
+const paramsTab = appViewId(paramsRef!);
+equal(canvasSnapshot().tabs[0].app?.route.params, { from: "2026-01-01", to: "2026-03-31" }, "the canvas route carries the params");
+patchAppViewRoute(paramsTab, { params: { from: "2026-04-01", to: "2026-06-30" } });
+equal(canvasSnapshot().tabs[0].app?.route.params, { from: "2026-04-01", to: "2026-06-30" }, "a patch replaces the params");
+equal(canvasSnapshot().tabs[0].app?.route.section, "reports", "and keeps the rest of the route");
+patchAppViewRoute(paramsTab, { record_id: "pnl", segment_id: null });
+equal(canvasSnapshot().tabs[0].app?.route.params, { from: "2026-04-01", to: "2026-06-30" }, "a patch without params keeps them");
+check(render(withParams).includes("data-view-state=\"moved\""), "a tab whose params moved reads Opened");
+openAppView(paramsRef);
+equal(canvasSnapshot().tabs[0].app?.route.params, { from: "2026-01-01", to: "2026-03-31" }, "the card resets the tab's params");
+patchAppViewRoute(paramsTab, { params: {} });
+check(canvasSnapshot().tabs[0].app?.route.params === undefined, "empty params clear them");

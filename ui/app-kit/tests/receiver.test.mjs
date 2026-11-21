@@ -1684,3 +1684,71 @@ test("catalogue status rejects invalid and invented settlement shapes", async ()
     assert.equal(bridge.getState().status, "error");
   }
 });
+
+test("screen-route-params.v1: opt-in, route params and patchRoute params (CAD-2555)", async () => {
+  // The receiver: advertised at ready, and only with records.
+  const accepts = ["screen.v2", "screen-records.v1", "screen-route-params.v1"];
+  const { inbox } = connect({ accepts });
+  await waitFor(() => inbox[0], "the ready message");
+  assert.deepEqual(inbox[0].accepts, accepts);
+  assert.throws(() => connect({ accepts: ["screen.v2", "screen-route-params.v1"] }), /needs screen-records\.v1/);
+
+  const options = {
+    tag: "notes", records: true, surfaces: true, routeParams: true,
+    calls: { "screen.route.patch": ["section", "view", "record_id"] },
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  };
+  assert.throws(() => createScreenBridge({ ...options, route: undefined }), /routeParams needs a records screen with a route/);
+  assert.throws(() => createScreenBridge({ ...options, records: false }), /routeParams needs a records screen with a route/);
+  const bridge = createScreenBridge(options);
+  const { host, inbox: sent } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(sent[0].accepts, ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-route-params.v1"]);
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({
+    actions: ["screen.route.patch"],
+    route: { section: "open", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } },
+  }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  assert.deepEqual(bridge.getSnapshot().route.params, { from: "2026-07-01", to: "2026-09-30" });
+  assert.throws(() => { bridge.getSnapshot().route.params.from = "x"; }, TypeError, "route params are frozen");
+
+  // patchRoute sends params; a bad set is dropped before it is sent.
+  const patches = () => sent.filter((m) => m.op === "call" && m.verb === "screen.route.patch");
+  bridge.patchRoute({ params: { From: "2026-07-01" } });
+  bridge.patchRoute({ params: { from: "" } });
+  bridge.patchRoute({ params: ["x"] });
+  await tick();
+  assert.equal(patches().length, 0);
+  bridge.patchRoute({ section: "open", params: { from: "2026-10-01" } });
+  const msg = await waitFor(() => patches()[0], "route patch with params");
+  assert.deepEqual(msg.args, { section: "open", params: { from: "2026-10-01" } });
+  host.postMessage({ v: 2, op: "reply", id: msg.id, ok: true, data: {} });
+  await tick();
+
+  // A route push without params reads as `{}`; a malformed one is refused.
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null } }));
+  await waitFor(() => Object.keys(bridge.getSnapshot().route.params).length === 0, "params cleared");
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null, params: { From: "x" } } }));
+  await waitFor(() => bridge.getState().status === "error", "malformed params refused");
+});
+
+test("a bridge without routeParams never sees params and cannot send them (CAD-2555)", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", records: true, surfaces: true,
+    calls: { "screen.route.patch": ["section", "view", "record_id"] },
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0].accepts, ["screen.v2", "screen-surfaces.v1", "screen-records.v1"]);
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ actions: ["screen.route.patch"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  assert.deepEqual(bridge.getSnapshot().route, { section: "open", view: "list", record_id: "rec_1", segment_id: null });
+  bridge.patchRoute({ params: { from: "2026-07-01" } });
+  await tick();
+  assert.equal(inbox.filter((m) => m.verb === "screen.route.patch").length, 0);
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null, params: { from: "2026-07-01" } } }));
+  await waitFor(() => bridge.getState().status === "error", "an unrequested params key is refused");
+});
