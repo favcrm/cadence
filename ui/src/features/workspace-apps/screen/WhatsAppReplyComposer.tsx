@@ -235,7 +235,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? {
       marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%`,
-      maxBlockSize: overlay ? `min(55%, ${WHATSAPP_REPLY_INSET_MAX}px)` : undefined,
+      // Leave room for the heading and a readable transcript when the keyboard is open.
+      maxBlockSize: overlay ? `min(55%, ${WHATSAPP_REPLY_INSET_MAX}px, max(5rem, 100% - 12rem))` : undefined,
     } : undefined}>
     {!overlay && status}
     <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
