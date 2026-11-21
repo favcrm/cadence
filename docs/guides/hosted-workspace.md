@@ -518,6 +518,13 @@ the address that received it, choose **Join company** to accept, then choose
 opens that workspace's board. Nothing on this path creates a credential,
 registers an agent or installs a CLI.
 
+In **Agents**, members can open their own assistant; workspace owners can also
+open the workspace Master. The teammate directory shows who has an assistant
+without linking to their private profile or instructions. In **Instructions →
+Context**, built-in and managed instructions have separate estimates. A board
+that does not report a built-in estimate shows **Not counted**; the built-in text
+is not displayed.
+
 If the browser cannot join, the cause changes the next step:
 
 - **Wrong account** — sign out and sign in with the address that received the
@@ -807,6 +814,22 @@ explicit handle; do not change it merely because an outcome is uncertain.
 For a staged write, the receipt's status is the outcome: `pending` awaits an
 owner, `applied` was written, and `denied` or `failed` exits nonzero while
 keeping the receipt on stdout.
+
+The workspace owner can review decisions from their personal conversation on
+Home, including when they open it from My assistant. Other members do not get
+the owner's queue, and the workspace assistant's Recruit decisions stay in
+Recruit. A decision shows the assistant's display name and scope when the board
+verifies who staged it. Older records without provenance stay generic; a
+recorded CLI or MCP actor keeps its attribution.
+The regular Home navigation returns to the default Home view.
+Home's Ask button names the assistant for that conversation and opens an
+unsent draft. It does not switch to the workspace assistant.
+Routine Review opens the recorded agent's Routines tab. If a hired agent
+shares the personal assistant's URL alias, Review opens the hired profile by ID.
+If the profile is absent, Review opens the owner-only Routines tab filtered
+to the saved alias. It does not open My assistant.
+If a draft has no explicit alias and its target cannot be opened, Review shows
+it in Master Routines without changing the draft's execution target.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action

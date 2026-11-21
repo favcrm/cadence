@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
+import type { AgentTab } from "./features/agents/agentTabModel";
 import "./features/agents/recruit.css";
 import Apps from "./features/apps/Apps";
 import { installationAppHref } from "./features/apps/appViewModel";
@@ -903,7 +904,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     else openWorkItem(id, "home", outcome.next);
   }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
-    (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
+    (alias: string | null, tab?: AgentTab, profileId?: string) =>
+      update((c) => ({ ...c, route: { screen: "agents", alias, profileId, ...(tab && tab !== "overview" ? { tab } : {}) } })),
     [],
   );
   // CAD-561: the draining banner. Cheap (the daemon's own view), polled
@@ -1373,6 +1375,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "home" && (
           <Home
             readOnly={readOnly}
+            privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             credentialRequestsEnabled={credentialRequestsOn}
             viewerSub={meta?.session?.user?.sub ?? null}
@@ -1663,10 +1666,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             operator={access.operator}
             onRetryAccess={retryAccess}
             hostedBoard={meta.hosted === true}
+            viewerSub={meta.signed_in && viewerSub && !viewerSub.startsWith("operator-token:") ? viewerSub : null}
             state={agentsState}
             issues={issuesState}
             open={route.alias}
+            openProfileId={route.profileId}
             tab={route.tab ?? "overview"}
+            routineAgent={route.routineAgent}
             recruit={route.recruit === true}
             ask={route.ask === true}
             onAsk={() =>
@@ -1677,7 +1683,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onTab={(tab) =>
               update((c) => ({
                 ...c,
-                route: { screen: "agents", alias: route.alias, ...(tab === "overview" ? {} : { tab }) },
+                route: { ...route, tab: tab === "overview" ? undefined : tab },
               }))
             }
             onRecruit={(on) =>

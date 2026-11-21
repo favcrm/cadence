@@ -1,4 +1,7 @@
-import type { NeedsMe, ThreadRef } from "../../lib/types";
+import type { AgentsPayload, NeedsMe, StagedRoutineProposal, ThreadRef } from "../../lib/types";
+import { routePath } from "../../lib/router";
+import { hasScopedAssistantRoster, PERSONAL_ALIAS } from "../agents/personalAssistant";
+import { MASTER } from "./master";
 import { sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
@@ -272,13 +275,49 @@ export function ageLabel(secs: number): string {
 /** What "Ask master" seeds: the row's title as the draft's ask and its
  *  subject as the `refs` the send attaches. Never auto-sends — the
  *  operator reviews and presses Enter. */
-export function askDraft(need: HomeNeed, lead?: string): { text: string; refs: ThreadRef[] } {
-  return { text: lead ?? `${need.title} — what should we do?`, refs: needRefs(need) };
+export function askDraft(need: HomeNeed, lead?: string, question = "what should we do?"): { text: string; refs: ThreadRef[] } {
+  return { text: lead ?? `${need.title} — ${question}`, refs: needRefs(need) };
 }
 
 /** The row's subject as the `refs` a Master message carries. */
 export function needRefs(need: HomeNeed): ThreadRef[] {
   return need.subject ? [{ kind: need.subject.kind, id: need.subject.id }] : [];
+}
+
+/** A review destination does not identify the proposer. Until a hosted roster
+ * answers, do not guess whether the personal alias still belongs to a job. */
+export function routineReviewHref(alias: string | null | undefined, roster?: AgentsPayload | null): string | null {
+  const scoped = roster === null || (roster !== undefined && hasScopedAssistantRoster(roster));
+  if (!scoped) return `${routePath({ screen: "agents", alias: alias ?? MASTER })}?tab=routines`;
+  const name = alias?.trim();
+  if (!name) return null;
+  if (name !== PERSONAL_ALIAS) return `${routePath({ screen: "agents", alias: name })}?tab=routines`;
+  const profileId = roster?.profiles?.find((profile) => profile.alias === name)?.id;
+  if (profileId) return `${routePath({ screen: "agents", alias: null, profileId })}?tab=routines`;
+  return roster === null ? null : `${routePath({ screen: "agents", alias: MASTER })}?tab=routines&routineAgent=${PERSONAL_ALIAS}`;
+}
+
+export function routineDraftReviewHref(
+  draft: Pick<StagedRoutineProposal, "kind" | "payload" | "proposed_by">,
+  roster?: AgentsPayload | null,
+): string | null {
+  const alias = draft.payload?.agent_alias;
+  const wikiPath = draft.payload?.path;
+  if (draft.kind === "wiki_propose" && typeof wikiPath === "string" && wikiPath) {
+    return `/wiki/${wikiPath.replace(/^wiki:/, "")}`;
+  }
+  const explicitAlias = typeof alias === "string" ? alias : null;
+  if (draft.kind !== "routine_propose" || roster == null || !hasScopedAssistantRoster(roster)) {
+    return routineReviewHref(explicitAlias, roster);
+  }
+  if (alias != null && explicitAlias === null) return null;
+  if (explicitAlias !== null) return routineReviewHref(explicitAlias, roster);
+  // Alias-less drafts can be reviewed in Master Routines if the effective
+  // target has no profile.
+  if (draft.proposed_by === PERSONAL_ALIAS && !roster.profiles?.some((profile) => profile.alias === PERSONAL_ALIAS)) {
+    return routineReviewHref(MASTER, roster);
+  }
+  return routineReviewHref(draft.proposed_by, roster) ?? routineReviewHref(MASTER, roster);
 }
 
 /**

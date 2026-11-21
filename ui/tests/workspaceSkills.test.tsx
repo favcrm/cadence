@@ -159,7 +159,7 @@ async function main() {
   const toast = (kind: string, text: string) => toasts.push([kind, text]);
   const lastToast = () => toasts[toasts.length - 1]?.[1] ?? "";
 
-  function Harness({ writable }: { writable: boolean }) {
+  function Harness({ writable, scopedRoster }: { writable: boolean; scopedRoster: boolean }) {
     const doc = useInstructionsDoc({
       alias: "ads-agent", kind: "hosted", profileId: "ap_1", nativeServed: null, writable, onSaved: () => {}, toast: toast as never, deps: docDeps,
     });
@@ -167,7 +167,7 @@ async function main() {
       NavigationProvider,
       {
         adapter: { navigate: () => {}, href: (h: string) => h, modifiedClicks: "browser" },
-        children: React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps, profiles: docDeps }),
+        children: React.createElement(WorkspaceSkills, { doc, writable, toast: toast as never, deps: skillDeps, profiles: docDeps, scopedRoster }),
       },
     );
   }
@@ -176,10 +176,10 @@ async function main() {
   document.body.appendChild(host);
   let root = createRoot(host);
   const flush = async () => { await React.act(async () => { await new Promise((r) => setTimeout(r, 20)); }); };
-  const mount = async (writable: boolean) => {
+  const mount = async (writable: boolean, scopedRoster = false) => {
     await React.act(async () => { root.unmount(); });
     root = createRoot(host);
-    await React.act(async () => { root.render(React.createElement(Harness, { writable })); });
+    await React.act(async () => { root.render(React.createElement(Harness, { writable, scopedRoster })); });
     await flush();
   };
   const all = () => document.body.textContent ?? "";
@@ -592,6 +592,16 @@ async function main() {
   await click(button("Undo"), "Undo on this agent");
   assert((profileWrites[profileWrites.length - 1] as { skills: string[] }).skills.includes("weekly-report"), "Undo turns it back on for this agent");
   await closeDrawer();
+
+  reset();
+  library[0]!.used_by = library[0]!.used_by!.map((user) => user.profile_id === "ap_2" ? { ...user, name: "assistant" } : user);
+  await mount(true, true);
+  await click(row("weekly-report"), "the scoped weekly-report row");
+  await click(tabButton(/Used by/), "the scoped Used by tab");
+  assert(document.body.querySelector("a[href='/agents/profile/ap_2?tab=skills']")?.textContent === "assistant", "a hired assistant links to its profile Skills, not the personal alias");
+  await click(menuTrigger("assistant"), "the hired assistant menu");
+  await click(items()[0], "open the hired assistant");
+  assert(window.location.pathname === "/agents/profile/ap_2" && window.location.search === "?tab=skills", "the row action opens the same profile Skills route");
 
   await React.act(async () => { root.unmount(); });
   console.log("workspaceSkills checks passed");

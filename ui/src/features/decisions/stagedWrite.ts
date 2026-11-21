@@ -31,6 +31,11 @@ export interface StagedOrigin {
   actor?: string;
 }
 
+export interface StagedProposer {
+  scope: "workspace" | "personal";
+  label: string;
+}
+
 export interface StagedResult {
   ok: boolean;
   created?: boolean;
@@ -62,6 +67,7 @@ export interface StagedWrite {
   /** The exact stored call, shown only under Show raw. */
   raw: string;
   origin: StagedOrigin | null;
+  proposer: StagedProposer | null;
   result: StagedResult | null;
   /** Optional owner note recorded when denying a request. */
   decisionReason?: string | null;
@@ -164,6 +170,12 @@ function parseOrigin(v: unknown): StagedOrigin | null {
   return { via, kind, label, ...(str(v.actor) ? { actor: str(v.actor)! } : {}) };
 }
 
+function parseProposer(v: unknown): StagedProposer | null {
+  if (!isRecord(v) || (v.scope !== "workspace" && v.scope !== "personal")) return null;
+  const label = str(v.label);
+  return label === null ? null : { scope: v.scope, label };
+}
+
 function parseResult(v: unknown): StagedResult | null | "invalid" {
   if (v === undefined || v === null) return null;
   if (!isRecord(v) || typeof v.ok !== "boolean") return "invalid";
@@ -209,7 +221,7 @@ export function rawText(args: unknown): string {
   }
 }
 
-function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : {};
   const origin = parseOrigin(row.origin);
   const title = str(row.title);
@@ -267,7 +279,7 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
   };
 }
 
-function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : null;
   const title = input ? str(input.title)?.trim() ?? null : null;
   if (input === null || title === null) return null;
@@ -302,7 +314,7 @@ function parseCreateIssue(base: Pick<StagedWrite, "id" | "status" | "createdAt" 
 }
 
 /** A connected tool's staged draft or send. Any malformed part drops the row: it is never approvable. */
-function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : null;
   if (input === null) return null;
   const slug = str(input.slug);
@@ -344,7 +356,7 @@ function parseConnectedEffect(base: Pick<StagedWrite, "id" | "status" | "created
 
 /** CAD-2556: a staged Custom MCP tool call pinned to a snapshot revision. */
 function parseCustomMcpEffect(
-  base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">,
+  base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">,
   row: Record<string, unknown>,
   result: StagedResult | null,
 ): StagedWrite | null {
@@ -428,7 +440,7 @@ export const visible = (text: string): string =>
  * partial list is kept, and Approve stays off (`approvable`). A malformed row
  * (no verb, or a change that does not parse) is dropped.
  */
-function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : {};
   const verb = str(row.verb) ?? str(input.verb);
   if (verb === null) return null;
@@ -447,10 +459,13 @@ function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" |
     }));
   }
   const origin = parseOrigin(row.origin);
+  const proposer =
+    origin?.via === "home" && origin.kind === "agent" ? parseProposer(row.proposer) : null;
   const summary = complete ? str(row.summary) : null;
   const requestedBy = str(row.requested_by);
   return {
     ...base,
+    proposer: proposer?.scope === "personal" ? { ...proposer, label: visible(proposer.label) } : null,
     kind: "cadence_cli",
     title: visible(str(row.title) ?? `Cadence: ${verb}`),
     app: null,
@@ -489,6 +504,8 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
     createdAt: row.createdAt,
     decidedAt: typeof row.decidedAt === "number" && Number.isFinite(row.decidedAt) ? row.decidedAt : null,
     decisionReason: str(row.decision_reason),
+    // An explicit origin identifies the original CLI/MCP actor, not the assistant.
+    proposer: row.origin == null ? parseProposer(row.proposer) : null,
   };
   if (row.tool === "app_call") return parseAppCall(base, row, result);
   if (row.tool === "board_create_issue") return parseCreateIssue(base, row, result);
@@ -588,8 +605,12 @@ export function titleOf(write: StagedWrite, t: (english: string) => string): str
 type Say = (english: string) => string;
 const same: Say = (s) => s;
 
-/** `Atlas (agent)`, `Priya Nair (person)`; null when no origin is recorded (the assistant, in Home). */
+/** External attribution is kept by the parser; a verified assistant label wins over a Home fallback. */
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
+  if (write.proposer) {
+    const { label, scope } = write.proposer;
+    return `${label} · ${t(scope === "workspace" ? "Workspace assistant" : "Personal assistant")}`;
+  }
   if (write.cli) return write.cli.requestedBy ?? (write.origin?.label ?? null);
   const o = write.origin;
   if (o === null) return null;

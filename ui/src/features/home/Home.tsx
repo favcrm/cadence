@@ -757,6 +757,7 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
+  privateChat = false,
   hosted = null,
   viewerSub = null,
   viewerIsMember = false,
@@ -776,6 +777,7 @@ export default function Home({
   templateReviewCanApprove = false,
 }: {
   readOnly: boolean;
+  privateChat?: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
   templateReviewEnabled?: boolean;
@@ -821,8 +823,7 @@ export default function Home({
   // sign-in) never enters it — those keep the Master workspace, exactly
   // like a standalone board. On a hosted board a member lands on their own
   // assistant by default; an owner reaches theirs only through the query.
-  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
-  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || privateChat);
   const composerKey = memberChat && viewerSub !== null ? `member-assist:${memberScope(sessionId, viewerSub)}` : "home";
   const onCompose = useCallback((text: string) => {
     if (readOnly) return;
@@ -852,6 +853,7 @@ export default function Home({
           scope={scope}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
+          decisions={decisions && operator === true && !viewerIsMember}
           documentFollowUps={documentFollowUps}
           templateRail={review.rail}
           templateCount={review.pendingCount}
@@ -1571,7 +1573,7 @@ function MasterHome({
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
   const onAsk = (need: HomeNeed, lead?: string) => {
-    const draft = askDraft(need, lead);
+    const draft = askDraft(need, lead, hosted === false ? undefined : t("what should we do?"));
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
   const toggleRail = () => {
@@ -1634,6 +1636,8 @@ function MasterHome({
           templateRail={templateRail}
           templateCount={templateCount}
           readOnly={readOnly}
+          scopedHost={hosted !== false}
+          hostedRoster={hosted === false ? undefined : agents.data ?? null}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
           permissionsHref={permissionsHref}

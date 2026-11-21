@@ -1,0 +1,37 @@
+{
+  "personal": {
+    "actions": [
+      {
+        "id": "9e722bd50b4145e7047d55624353e8eb",
+        "tool": "board_create_issue",
+        "input": { "title": "Call the supplier", "project": "demo", "priority": "P3" },
+        "createdAt": 1795239000000,
+        "status": "pending",
+        "proposer": { "scope": "personal", "label": "Private assistant name" }
+      },
+      {
+        "id": "f7554af98e4dbca721c940937b5c0787",
+        "tool": "board_create_issue",
+        "input": { "title": "Check the outstanding request", "project": "demo", "priority": "P3" },
+        "createdAt": 1795238999000,
+        "status": "pending"
+      }
+    ]
+  },
+  "workspace": {
+    "actions": [
+      {
+        "id": "82133ca5160bf2de955ef99744651520",
+        "tool": "board_create_issue",
+        "input": { "title": "Review the team roster", "project": "demo", "priority": "P3" },
+        "createdAt": 1795239001000,
+        "status": "pending",
+        "proposer": { "scope": "workspace", "label": "Company assistant" }
+      }
+    ]
+  },
+  "crossMemberRefusal": {
+    "status": 404,
+    "body": { "ok": false, "error": { "code": "not_found", "message": "Unknown conversation." } }
+  }
+}

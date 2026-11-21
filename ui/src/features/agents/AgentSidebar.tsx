@@ -1,10 +1,11 @@
 import type { KeyboardEvent, ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
-import type { Agent, HiredProfile } from "../../lib/types";
+import type { Agent, HiredProfile, PersonalAssistantRow } from "../../lib/types";
 import { IconSearch } from "../../ui/icons";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { seatStatus } from "./SeatCard";
 import { agentCategory, agentOrder, liveClaimState } from "./agentView";
+import { MASTER_LABEL, PERSONAL_ALIAS } from "./personalAssistant";
 
 /** The list's groups, in the order they read. Stopped and Mailboxes fold. */
 const GROUPS: { id: string; label: string; folded?: boolean }[] = [
@@ -31,37 +32,53 @@ function groupOf(a: Agent): string {
 export default function AgentSidebar({
   agents,
   profiles,
+  personal,
+  companyMaster,
   profileStatus,
   open,
+  openProfileId,
   query,
+  hasTeammateMatches,
   onQuery,
   onOpen,
+  onOpenProfile,
+  onOpenPersonal,
   onOverview,
   onRecruit,
 }: {
   agents: Agent[];
   profiles: HiredProfile[];
+  /** CAD-2353: the caller's own assistant, listed first when the roster has one. */
+  personal: PersonalAssistantRow | null;
+  /** The company Master's row, labelled; `null` keeps the row as it was. */
+  companyMaster: Agent | null;
   /** A profile's one status line, as its card reads it. */
   profileStatus: (profile: HiredProfile) => string;
   open: string | null;
+  openProfileId?: string;
   query: string;
+  hasTeammateMatches: boolean;
   onQuery: (query: string) => void;
   onOpen: (alias: string) => void;
+  onOpenProfile: (profile: HiredProfile) => void;
+  onOpenPersonal: (() => void) | null;
   onOverview: () => void;
   onRecruit: () => void;
 }) {
   const t = useTranslate();
-  const row = (alias: string, face: ReactNode, status: string) => (
+  const row = (alias: string, face: ReactNode, status: string, title?: string, profile?: HiredProfile) => (
     <button
-      key={alias}
+      key={profile?.id ?? alias}
       type="button"
       className="ag-side-row"
-      aria-current={open === alias ? "page" : undefined}
-      onClick={() => onOpen(alias)}
+      aria-current={(openProfileId
+        ? profile?.id === openProfileId
+        : open === alias && !(onOpenPersonal && alias === PERSONAL_ALIAS)) ? "page" : undefined}
+      onClick={() => profile ? onOpenProfile(profile) : onOpen(alias)}
     >
       {face}
       <span className="min-w-0">
-        <span className="t">{alias}</span>
+        <span className="t">{title ?? alias}</span>
         <span className="s" title={status}>
           {status}
         </span>
@@ -82,13 +99,20 @@ export default function AgentSidebar({
                 size={28}
                 still
               />,
-              seatStatus(a, t).text,
+              a === companyMaster ? t(MASTER_LABEL) : seatStatus(a, t).text,
+              a === companyMaster ? (a.name ?? undefined) : undefined,
             ),
           ),
         ...profiles
           .filter((p) => profileGroup(p) === group.id)
           .map((p) =>
-            row(p.alias, <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />, profileStatus(p)),
+            row(
+              p.alias,
+              <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />,
+              profileStatus(p),
+              undefined,
+              p,
+            ),
           ),
       ];
     return { ...group, rows };
@@ -123,11 +147,27 @@ export default function AgentSidebar({
         <button
           type="button"
           className="ag-side-row plain"
-          aria-current={open === null ? "page" : undefined}
+          aria-current={open === null && !openProfileId ? "page" : undefined}
           onClick={onOverview}
         >
           <span className="t">{t("Overview")}</span>
         </button>
+        {personal && onOpenPersonal && (
+          <button
+            type="button"
+            className="ag-side-row"
+            aria-current={open === PERSONAL_ALIAS ? "page" : undefined}
+            onClick={onOpenPersonal}
+          >
+            <AgentAvatar slug={agentLook(PERSONAL_ALIAS, { look: personal.look })} size={28} still />
+            <span className="min-w-0">
+              <span className="t">
+                {personal.name} · {t("Your assistant")}
+              </span>
+              <span className="s">{t("Chats on Home")}</span>
+            </span>
+          </button>
+        )}
         {groups.map((group) =>
           group.folded ? (
             <details key={group.id} open={query.trim() !== "" || group.rows.some((r) => r.key === open)}>
@@ -147,7 +187,7 @@ export default function AgentSidebar({
             </div>
           ),
         )}
-        {groups.length === 0 && query.trim() !== "" && (
+        {!personal && groups.length === 0 && query.trim() !== "" && !hasTeammateMatches && (
           <p className="ag-side-none" role="status">
             {t("No agents match “{query}”.").replace("{query}", () => query)}{" "}
             <button type="button" className="lnk" onClick={() => onQuery("")}>

@@ -23,6 +23,19 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
 }
 
+{
+  const search = "?chat=assistant";
+  const home = readLocation("/", search);
+  equal(locationHref({ ...home, openId: "CAD-1" }, search, home.route), "/?chat=assistant&issue=CAD-1", "a Home detail preserves the private chat mode");
+  const agents = { screen: "agents", alias: null } as const;
+  equal(locationHref(goTo(home, agents), search, home.route), "/agents", "the private Home selector doesn't leave Home");
+  equal(locationHref(goTo(home, { screen: "home" }), search, home.route), "/", "normal Home navigation restores the default pane");
+  const query = "?tab=routines&routineAgent=assistant";
+  const review = readLocation("/agents/master", query);
+  equal(locationHref(review, query), "/agents/master?tab=routines&routineAgent=assistant", "the owner routine filter round-trips");
+  equal(locationHref(readLocation("/agents/assistant", query), query), "/agents/assistant?tab=routines", "the filter cannot override the personal assistant route");
+}
+
 // Every MVP route matches and prints back to the same path.
 const paths: [string, Route][] = [
   ["/", { screen: "home" }],

@@ -208,6 +208,8 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   const d = askDraft(need);
   equal(d.text, "PR #187 has had no verdict for 24 days — what should we do?", "draft text");
   equal(d.refs, [{ kind: "pr", id: "acme/app#187" }], "subject → ref");
+  equal(askDraft(need, undefined, "我們應該怎樣做？").text, "PR #187 has had no verdict for 24 days — 我們應該怎樣做？", "localized draft question");
+  equal(askDraft(need, "Custom draft", "我們應該怎樣做？").text, "Custom draft", "explicit draft remains unchanged");
 
   const [plain] = homeNeeds([row({ kind: "approval", audience: "operator", title: "pick one", age: 1 })]);
   equal(askDraft(plain).refs, [], "no subject → no refs");

@@ -69,7 +69,9 @@ export default function AgentPage({
   observed,
   roles,
   profiles,
+  selectedProfile,
   tab,
+  routineAgent,
   onTab,
   onBack,
   onOpenIssue,
@@ -82,6 +84,8 @@ export default function AgentPage({
   operator,
   onRetryAccess,
   hostedBoard,
+  scopedRoster = false,
+  companyMaster,
   hiredWork,
   onToast,
 }: {
@@ -89,7 +93,9 @@ export default function AgentPage({
   observed?: Agent;
   roles: RolesState;
   profiles: HiredProfile[];
+  selectedProfile?: HiredProfile;
   tab: AgentTab;
+  routineAgent?: "assistant";
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
   onOpenIssue: (id: string) => void;
@@ -105,6 +111,9 @@ export default function AgentPage({
   operator: boolean | null;
   onRetryAccess: () => void;
   hostedBoard: boolean;
+  scopedRoster?: boolean;
+  /** CAD-2353: this is the company Master. It has no chat yet, so an owner's page for it is the page. */
+  companyMaster: boolean;
   /** What a runtime-less profile's card names, if anything. */
   hiredWork: ProfileWork | null;
   onToast: (kind: ToastMsg["kind"], text: string) => void;
@@ -119,9 +128,10 @@ export default function AgentPage({
 
   // The gear opens over the current section; `?tab=settings` opens over Instructions.
   const [gear, setGear] = useState(false);
-  const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
-  const chat = tab === "overview";
-  const leave = chat ? onBack : () => onTab("overview");
+  const hired = selectedProfile ?? (observed ? undefined : profiles.find((p) => p.alias === alias));
+  const masterPage = companyMaster && operator === true;
+  const chat = tab === "overview" && !masterPage;
+  const leave = chat || masterPage ? onBack : () => onTab("overview");
   // Leaving for the chat closes the gear, so coming back doesn't reopen it.
   useEffect(() => {
     if (chat) setGear(false);
@@ -234,6 +244,8 @@ export default function AgentPage({
     served,
     master: alias === MASTER,
     profileBound: params?.profile !== undefined,
+    // CAD-2354: an owner on the company Master's page edits its text.
+    own: masterPage ? "workspace" : null,
   });
   const doc = useInstructionsDoc({
     alias,
@@ -258,6 +270,7 @@ export default function AgentPage({
     role,
     hosted,
     hostedBoard: hostedBoard || hosted,
+    scopedRoster,
     resume,
     onOpenIssue,
     hired,
@@ -505,11 +518,11 @@ export default function AgentPage({
     : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
         .filter(Boolean)
         .join(" · ");
-  const section = tab === "settings" ? "instructions" : tab;
+  const section = tab === "settings" || tab === "overview" ? "instructions" : tab;
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <button type="button" className="rc-back" onClick={leave}>
-        ← {t("Chat")}
+        ← {masterPage ? t("Agents") : t("Chat")}
       </button>
       <header className="ap-hero">
         <AgentAvatar
@@ -559,7 +572,14 @@ export default function AgentPage({
             ))}
           </nav>
           <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
-            <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
+            {section === "routines" && routineAgent ? (
+              <>
+                <p className="text-label text-ink-400">{t("Agent")}: {routineAgent}</p>
+                <AgentTabBody key={`routine:${routineAgent}`} tab={section} c={{ ...ctx, alias: routineAgent }} />
+              </>
+            ) : (
+              <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
+            )}
           </div>
           {(gear || tab === "settings") && (
             <SettingsDrawer

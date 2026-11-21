@@ -139,7 +139,7 @@ async function main() {
   assert(area().value === "# Ads\n\nMine.", "the draft is kept");
   assert(button("Discard mine, use theirs") && button("Save mine") && !button("Save"), "use theirs or save mine");
   assert(primaries() === 1, "still one primary");
-  assert(toasts.some(([, text]) => /changed this/.test(text)), "a toast says so");
+  assert(host.querySelector("[role=alert]")?.textContent?.includes("Your draft is kept"), "the editor announces the conflict next to the recovery actions");
   writeFails = null;
   await click("Save mine");
   assert((writes.length as number) === 2 && writes[1]!.expectedRevision === 4 && writes[1]!.responsibilities === "# Ads\n\nMine.", "save mine rides their revision with my text");

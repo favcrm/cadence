@@ -14,6 +14,7 @@ export {};
  */
 import type { Overview } from "../src/lib/types";
 import type { ResourceState } from "../src/lib/cache";
+import type * as StagedWriteModule from "../src/features/decisions/stagedWrite";
 
 declare function require(name: string): any;
 
@@ -41,10 +42,10 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
 const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
+const RecruitChat = (require("../src/features/agents/RecruitChat") as typeof import("../src/features/agents/RecruitChat")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
-
+const { parseStagedRow, parseStagedList, askedBy, sourceLine, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof StagedWriteModule;
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
 const customer = (id: string, extra: Record<string, unknown> = {}) => ({
@@ -73,6 +74,8 @@ let actions: unknown[] = [];
 const scopedActions = new Map<string, Array<{ id: string; status: string; [key: string]: unknown }>>();
 let listStatus = 200;
 let listCalls = 0;
+const listScopes: (string | null)[] = [];
+let recruitStream: ReadableStreamDefaultController<Uint8Array> | null = null;
 const posts: { path: string; body: any }[] = [];
 let decideStatus: Record<string, number> = {};
 let decideThrows: Record<string, boolean> = {};
@@ -88,6 +91,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (url.pathname === "/api/assist/actions") {
     listCalls++;
     await listHold;
+    listScopes.push(url.searchParams.get("conversation"));
     const conversation = url.searchParams.get("conversation");
     return listStatus === 200 ? json({ actions: conversation === null ? actions : scopedActions.get(conversation) ?? [] }) : json({ error: { code: "x" } }, listStatus);
   }
@@ -106,6 +110,11 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     if (status === 200) record();
     return json(status === 200 ? { ok: true } : { error: { code: "refused" } }, status);
   }
+  if (url.pathname === "/api/threads/master/conversations") return json({ conversation: { id: "recruit-conversation" } });
+  if (url.pathname === "/api/threads/master/stream") {
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) { recruitStream = controller; } }), { headers: { "Content-Type": "text/event-stream" } });
+  }
+  if (url.pathname === "/api/threads/master") return json({ thread: null, entries: [] });
   return json({});
 }) as typeof fetch;
 
@@ -190,6 +199,141 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   assert(!c.hasAttribute("data-open") && text(c) === text(v.cards()[0]) && !c.querySelector("dl, pre"), "nothing expands in the rail");
   assert(!document.querySelector('.crm-drawer[data-drawer="review"]'), "not the issue-backed drawer");
   await v.done();
+}
+
+// AOS-660: fixture mirrored byte-for-byte from AgenticOS packages/contracts/fixtures.
+{
+  const fixture = JSON.parse(require("fs").readFileSync(
+    `${require("process").cwd()}/../tests/fixtures/agenticos/assistant-action-proposers.json`, "utf8",
+  )) as {
+    personal: { actions: Array<{ id: string; status: string; proposer?: { scope: "personal"; label: string }; [key: string]: unknown }> };
+    workspace: { actions: Array<{ id: string; status: string; proposer: { scope: "workspace"; label: string }; [key: string]: unknown }> };
+  };
+  const personal = fixture.personal.actions[0]!.proposer!;
+  const workspace = fixture.workspace.actions[0]!.proposer;
+  const personalRows = parseStagedList(fixture.personal);
+  const workspaceRows = parseStagedList(fixture.workspace);
+  assert(personalRows?.length === 2 && workspaceRows?.length === 1, "complete producer lists parse");
+  for (const [row, proposer] of [[personalRows[0]!, personal], [workspaceRows[0]!, workspace]] as const) {
+    const attribution = `${proposer.label} · ${proposer.scope === "workspace" ? "Workspace assistant" : "Personal assistant"}`;
+    assert(row.proposer?.scope === proposer.scope && askedBy(row) === attribution, "scoped proposer parses");
+    assert(sourceLine(row).includes(attribution), "rail uses the same attribution");
+  }
+  assert(personalRows[1]!.proposer === null && askedBy(personalRows[1]!) === null, "legacy producer row has unknown proposer");
+  const issue = parseStagedRow({ ...issueRow("issue"), proposer: workspace })!;
+  assert(askedBy(issue) === `${workspace.label} · Workspace assistant`, "issue proposal carries scoped attribution");
+  const connected = parseStagedRow({
+    id: "connected", tool: "connected_effect", status: "pending", createdAt: 1, proposer: personal,
+    input: { slug: "gmail_send", toolkit: "gmail", account: "a@b.test", connection_id: "c", effect: "send", args: "{}" },
+  })!;
+  assert(askedBy(connected) === `${personal.label} · Personal assistant`, "connected effect carries scoped attribution");
+  for (const proposer of [undefined, null, {}, { scope: "other", label: "Wrong" }, { scope: "personal", label: "  " }, { scope: "workspace", label: 42 }]) {
+    const row = parseStagedRow(customer("unknown", { origin: null, proposer }))!;
+    assert(row.proposer === null && askedBy(row) === null && sourceLine(row) === "CRM", "invalid or absent proposer is unknown");
+  }
+  const cli = parseStagedRow(customer("cli", { proposer: personal }))!;
+  assert(cli.proposer === null && askedBy(cli) === "Atlas (agent)", "CLI origin wins over conflicting assistant metadata");
+  const mcp = parseStagedRow(customer("mcp", { origin: { via: "mcp", kind: "agent", label: "MCP actor" }, proposer: workspace }))!;
+  assert(askedBy(mcp) === "MCP actor (agent)", "MCP origin wins over conflicting assistant metadata");
+  const malformedOrigin = parseStagedRow(customer("unknown-origin", { origin: {}, proposer: personal }))!;
+  assert(askedBy(malformedOrigin) === null, "malformed origin does not expose a potentially different proposer");
+  const homeCommand = {
+    id: "bafc1fc2e2520bcd5f76443f4b6702ea",
+    tool: "cadence_cli", status: "pending", createdAt: 1795239000000,
+    verb: "issue_new", title: "Cadence: issue new", requested_by: "Home assistant",
+    origin: { via: "home", kind: "agent", label: "Home assistant" },
+  };
+  const scopedCommand = parseStagedRow({ ...homeCommand, proposer: personal });
+  assert(scopedCommand && askedBy(scopedCommand) === `${personal.label} · Personal assistant`, "keyed Home command shows the verified personal proposer");
+  const legacyCommand = parseStagedRow(homeCommand);
+  assert(legacyCommand && askedBy(legacyCommand) === "Home assistant", "legacy Home command keeps its generic source");
+  for (const via of ["cli", "mcp"]) {
+    const external = parseStagedRow({
+      ...homeCommand, requested_by: "External agent", proposer: personal,
+      origin: { via, kind: "agent", label: "External agent" },
+    });
+    assert(external && external.proposer === null && askedBy(external) === "External agent", "external command attribution wins over conflicting proposer data");
+  }
+
+  actions = fixture.personal.actions;
+  const v = await render();
+  await settle(() => assert(v.cards().length === 2, "personal and legacy cards render"));
+  const personalCard = v.cards().find((card) => text(card.querySelector(".todo-title")).includes("Call the supplier"));
+  const legacyCard = v.cards().find((card) => text(card.querySelector(".todo-title")).includes("Check the outstanding request"));
+  assert(personalCard && legacyCard, "both issue proposals render");
+  assert(text(personalCard.querySelector(".todo-meta")).includes(`${personal.label} · Personal assistant`), "personal proposer and scope on Home");
+  assert(!text(legacyCard).includes(personal.label) && !text(legacyCard).includes(workspace.label), "legacy card does not guess a proposer");
+  await click(labelled(legacyCard, "Review"));
+  await settle(() => assert(drawerEl() && !text(drawerEl()!.querySelector(".dx-asked")).includes(personal.label), "legacy detail does not infer a proposer"));
+  await click(labelled(drawerEl()!, "Not now"));
+  await settle(() => assert(text(drawerEl()).includes("Call the supplier"), "scoped detail opens next"));
+  assert(text(drawerEl()!.querySelector(".dx-asked")).includes(`${personal.label} · Personal assistant`), "detail shows personal proposer and scope");
+  await click(labelled(drawerEl()!, "Overview"));
+  assert(text(drawerEl()).includes(personal.label) && text(drawerEl()).includes("Call the supplier"), "overview shows proposer and issue preview");
+  await v.done();
+}
+
+// Recruit must use its server-proven conversation, never Home's unqualified queue.
+{
+  const fixture = JSON.parse(require("fs").readFileSync(
+    `${require("process").cwd()}/../tests/fixtures/agenticos/assistant-action-proposers.json`, "utf8",
+  )) as { personal: { actions: Array<{ id: string; proposer: { scope: "personal"; label: string } }> }; workspace: { actions: Array<{ id: string; proposer: { scope: "workspace"; label: string } }> } };
+  const personal = fixture.personal.actions[0]!;
+  const workspace = fixture.workspace.actions[0]!;
+  const sharedLabel = personal.proposer.label;
+  actions = [customer(personal.id, { origin: null, proposer: personal.proposer, title: "Home only" })];
+  scopedActions.set("recruit-conversation", [customer(workspace.id, {
+    origin: null, proposer: { ...workspace.proposer, label: sharedLabel }, title: "Recruit only",
+  })]);
+  listScopes.length = 0;
+  const home = await render();
+  await settle(() => assert(text(home.cards()[0]).includes("Home only"), "Home loads its own action"));
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const show = (showDecisions: boolean) => React.createElement(RecruitChat, { hireBlock: null, onBack: () => {}, showDecisions });
+  await React.act(async () => { root.render(show(false)); });
+  await settle(() => assert(host.querySelector("[data-chat-panel]"), "server-proven Recruit chat opens"));
+  assert(!listScopes.includes("recruit-conversation"), "old native route does not request hosted decisions");
+  await React.act(async () => { root.render(show(true)); });
+  await settle(() => assert(text(host).includes("Recruit only"), "Recruit loads its scoped action"));
+  assert(listScopes.includes("recruit-conversation") && !text(host).includes("Home only"), "Recruit uses only its conversation");
+  assert(text(home.cards()[0]).includes(`${sharedLabel} · Personal assistant`), "Home identifies personal scope");
+  assert(text(host.querySelector("[data-chat-staged]")).includes(`${sharedLabel} · Workspace assistant`), "Recruit identifies workspace scope despite identical names");
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(text(drawerEl()?.querySelector(".dx-asked") ?? null).includes(`${sharedLabel} · Workspace assistant`), "Recruit review identifies workspace proposer"));
+  await click(labelled(drawerEl()!, "Not now"));
+  const pendingShare = {
+    id: "ab0123456789abcdef0123456789abcd", tool: "artifact_share", status: "pending", createdAt: Date.now() - AGO,
+    input: { id: "art-Brief", version: 2, title: "Hiring brief" },
+    proposer: workspace.proposer,
+  };
+  scopedActions.set("recruit-conversation", [
+    customer("live-recruit", { origin: null, proposer: workspace.proposer, title: "Live Recruit request" }),
+    pendingShare,
+    { ...pendingShare, id: "cd0123456789abcdef0123456789abcd", input: { ...pendingShare.input, title: "Malformed artifact", version: 0 } },
+    { ...pendingShare, id: "bad-action-id", input: { ...pendingShare.input, title: "Unreviewable share" } },
+  ]);
+  await settle(() => assert(recruitStream, "Recruit stream opened"));
+  const snapshot = {
+    session: { id: "recruit-conversation" },
+    actor_identity: { scope: "workspace", conversation_id: "recruit-conversation", identity: { name: sharedLabel, tone: null, look: "robot", revision: 1 } },
+  };
+  await React.act(async () => {
+    recruitStream!.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify(snapshot)}\n\n`));
+  });
+  await settle(() => assert(text(host).includes("Live Recruit request"), "live Recruit snapshot refreshes its decisions"));
+  assert(text(home.cards()[0]).includes("Home only"), "Recruit refresh leaves Home distinct");
+  assert(!text(host).includes("Hiring brief") && !text(host).includes("Malformed artifact") && !text(host).includes("Unreviewable share"), "Recruit omits artifact shares, including otherwise well-formed entries");
+  const live = Array.from(host.querySelectorAll("[data-chat-staged]")).find((card) => text(card).includes("Live Recruit request"));
+  assert(live, "the supported action remains available after refresh");
+  await click(labelled(live, "Review"));
+  await settle(() => assert(text(drawerEl()).includes("Live Recruit request"), "the refreshed supported action opens for review"));
+  await React.act(async () => { root.unmount(); });
+  host.remove();
+  await home.done();
+  scopedActions.clear();
+  recruitStream = null;
 }
 
 // ---- 2. a board with no route, a refused viewer, or no ownership stays as it is ----

@@ -75,7 +75,7 @@ export type ConnectionPage =
   | { kind: "detail"; id: string };
 
 export type Route =
-  | { screen: "home" }
+  | { screen: "home"; privateChat?: true }
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
@@ -85,7 +85,7 @@ export type Route =
   | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
   | { screen: "workspaceAppKey"; appKey: string }
-  | { screen: "agents"; alias: string | null; tab?: AgentTab; recruit?: boolean; ask?: boolean }
+  | { screen: "agents"; alias: string | null; profileId?: string; tab?: AgentTab; routineAgent?: "assistant"; recruit?: boolean; ask?: boolean }
   | { screen: "threads" }
   /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
   | { screen: "myWork"; view?: MyWorkView }
@@ -301,6 +301,10 @@ export function matchRoute(pathname: string): Route {
       const alias = segment(a);
       if (alias) return { screen: "agents", alias };
     }
+    if (head === "agents" && a === "profile" && b && !rest.length) {
+      const profileId = segment(b);
+      if (profileId && /^ap_[A-Za-z0-9_-]+$/.test(profileId)) return { screen: "agents", alias: null, profileId };
+    }
     if (head === "threads" && !a) return { screen: "threads" };
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
@@ -387,7 +391,9 @@ export function routePath(route: Route): string {
     case "appsManage":
       return `/apps/manage/${encodeURIComponent(route.installId)}`;
     case "agents":
-      return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
+      return route.profileId
+        ? `/agents/profile/${encodeURIComponent(route.profileId)}`
+        : route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "threads":
       return "/threads";
     case "wiki": {
@@ -477,14 +483,16 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
+  if (route.screen === "home" && q.get("chat") === "assistant") route = { ...route, privateChat: true };
   if (route.screen === "agents") {
     const tab = parseAgentTab(q.get("tab"));
+    const detail = route.alias !== null || route.profileId !== undefined;
     route = {
-      screen: "agents",
-      alias: route.alias,
-      ...(route.alias && tab !== "overview" ? { tab } : {}),
-      ...(!route.alias && q.get("recruit") === "1" ? { recruit: true } : {}),
-      ...(!route.alias && q.get("ask") === "1" ? { ask: true } : {}),
+      ...route,
+      ...(detail && tab !== "overview" ? { tab } : {}),
+      ...(route.alias === "master" && tab === "routines" && q.get("routineAgent") === "assistant" ? { routineAgent: "assistant" } : {}),
+      ...(!detail && q.get("recruit") === "1" ? { recruit: true } : {}),
+      ...(!detail && q.get("ask") === "1" ? { ask: true } : {}),
     };
   }
   if (route.screen === "myWork") {
@@ -619,11 +627,12 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // must carry it across the delete below. Only a Threads → Threads move
   // keeps it: another screen's `?project=` is that screen's filter.
   const threadsProject = from?.screen === "threads" && loc.route.screen === "threads" ? q.get("project") : null;
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "file", "version"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "file", "version", "routineAgent"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  if (!isAppRoute(route) || from?.screen === "home") q.delete("chat");
   // CAD-2286: Documents owns `archived` and `stage` and drops them elsewhere,
   // except on a mounted app route, whose own query may use either name. Leaving
   // Documents for an app route drops them too: there they are still Documents'.
@@ -644,10 +653,13 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
     const issueSearch = q.toString();
     return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
   }
+  if (route.screen === "home" && route.privateChat) q.set("chat", "assistant");
   if (route.screen === "agents") {
-    if (route.alias && route.tab) q.set("tab", route.tab);
-    if (!route.alias && route.recruit) q.set("recruit", "1");
-    if (!route.alias && route.ask) q.set("ask", "1");
+    const detail = route.alias !== null || route.profileId !== undefined;
+    if (detail && route.tab) q.set("tab", route.tab);
+    if (route.alias === "master" && route.tab === "routines" && route.routineAgent) q.set("routineAgent", route.routineAgent);
+    if (!detail && route.recruit) q.set("recruit", "1");
+    if (!detail && route.ask) q.set("ask", "1");
   }
   if (route.screen === "projects") {
     if (route.section === "issues") {

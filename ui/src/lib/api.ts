@@ -334,6 +334,17 @@ export interface MemberAssistProfileRequest {
   action: MemberAssistProfileAction;
   name?: string;
   look?: AvatarLook;
+  /** CAD-2354: the member's own instructions; blank clears, omitted keeps. */
+  instructions?: string;
+}
+
+/** CAD-2354: `POST /api/master/instructions` (owners) and
+ *  `POST /api/member-assistant/instructions` (the caller). The workspace
+ *  revision is a decimal string, the personal one a number. */
+export interface InstructionsRead<R> {
+  instructions: string | null;
+  revision: R;
+  built_in_instruction_tokens?: number;
 }
 
 export interface MemberAssistProfileResult extends MemberAssistState {
@@ -349,6 +360,8 @@ export interface MasterIdentityUpdate {
   name?: string;
   tone?: string;
   look?: AvatarLook;
+  /** CAD-2354: the company instructions; blank clears, omitted keeps. */
+  instructions?: string;
 }
 
 /** The committed result and when it takes effect for the coordinator. */
@@ -1079,6 +1092,10 @@ export const api = {
    *  actor-bound personal identity and bootstrap lifecycle update. */
   memberAssistProfileUpdate: (body: MemberAssistProfileRequest) =>
     post<MemberAssistProfileResult>(`/api/member-assistant/profile`, body),
+  /** CAD-2354: `POST /api/member-assistant/instructions` — the caller's own
+   *  instructions and the revision to write at. A board without it answers 404/405. */
+  memberAssistInstructions: () =>
+    post<InstructionsRead<number>>(`/api/member-assistant/instructions`, {}),
   /** `POST /api/member-assistant/history` — a page of the member's bound
    *  conversation. Positions are opaque; the binding owns the thread. */
   memberAssistHistory: (page: {
@@ -1836,6 +1853,9 @@ export const api = {
    *  save from the request alone. */
   masterIdentityUpdate: (body: MasterIdentityUpdate) =>
     post<MasterIdentityUpdateResult>("/api/master/identity", body),
+  /** CAD-2354: `POST /api/master/instructions` — the company Master's
+   *  instructions, owners only (403 otherwise). */
+  masterInstructions: () => post<InstructionsRead<string>>("/api/master/instructions", {}),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
   masterCommand: (command: string, arg?: string, wait?: number, message?: string, conversation?: string) =>

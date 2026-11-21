@@ -121,7 +121,7 @@ function ApprovalsTab({
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
   const update = write.target !== null && write.changesComplete;
   const heading = update ? t("Changes compared with the current record") : write.connected !== null || write.customMcp != null || write.cli ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
-  const name = write.origin?.label ?? t("The assistant");
+  const name = write.origin?.label ?? write.proposer?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
   const sent = update ? null : sentFields(write);
@@ -266,7 +266,7 @@ function ApprovalsTab({
 }
 
 function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: StagedDomain; via: string; t: Say }) {
-  const name = write.origin?.label ?? t("The assistant");
+  const name = write.origin?.label ?? write.proposer?.label ?? t("The assistant");
   const originText = askedBy(write, t) ?? t("the assistant");
   return (
     <div className="wi-panel dx-panel">
