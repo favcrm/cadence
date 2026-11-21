@@ -471,12 +471,6 @@ runtime’s fixed board guidance shared by the company Master and personal
 assistants. It returns a count, not prompt text. Managed instructions and
 per-turn context are separate and are not included.
 
-On the hosted Agents page, **Agent sessions** opens the tenant's observed
-session index for a current workspace owner. Search by tenant, agent, or
-reference; **Inspect** opens an exact session. Unknown, expired and
-unauthorized references all show an unavailable state. **Copy summary**
-copies diagnostic metadata, not the transcript.
-
 Transcript access is separate. The host resolves the indexed reference to an
 exact runtime generation and rechecks the existing conversation access on
 every page. `HostedSession.sessionTranscript(sessionId, after)` reads only
