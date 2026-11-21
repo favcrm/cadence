@@ -309,6 +309,7 @@ export function routineDraftReviewHref(
   if (draft.kind !== "routine_propose" || roster == null || !hasScopedAssistantRoster(roster)) {
     return routineReviewHref(explicitAlias, roster);
   }
+  if (alias != null && explicitAlias === null) return null;
   if (explicitAlias !== null) return routineReviewHref(explicitAlias, roster);
   // Alias-less drafts are also listed in Master Routines. Prefer their
   // effective target when it has a destination, without attributing a proposer.

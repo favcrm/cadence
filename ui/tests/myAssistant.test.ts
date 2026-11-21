@@ -347,6 +347,7 @@ async function main() {
   const unresolvedDraft = routineDraftReviewHref(draft, hostedRoster());
   assert(unresolvedDraft === "/agents/master?tab=routines", "an alias-less draft without a hired target still opens review");
   assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: " master " } }, hostedRoster()) === unresolvedDraft, "draft navigation normalizes the explicit alias");
+  assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: 42 } }, hostedRoster()) === null, "a malformed explicit alias does not get the omitted-alias fallback");
   await at(unresolvedDraft);
   const routineTab = host.querySelector("[data-routines-tab]")?.textContent;
   assert(routineTab?.includes("Alias omitted") && routineTab.includes("Alias padded") && routineTab.includes("Alias null") && !routineTab.includes("Another runtime’s routine"), "the destination displays the routed drafts and does not mix in other explicit aliases");
