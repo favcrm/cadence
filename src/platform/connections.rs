@@ -66,6 +66,19 @@ fn hosted_board_host_account(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// Canonical AgenticOS workspace ID grammar: `ws_` followed by a canonical
+/// lowercase hyphenated RFC 4122 UUID.
+pub(crate) fn is_canonical_agenticos_workspace_id(value: &str) -> bool {
+    value
+        .strip_prefix("ws_")
+        .and_then(|suffix| {
+            uuid::Uuid::parse_str(suffix)
+                .ok()
+                .filter(|id| id.to_string() == suffix)
+        })
+        .is_some()
+}
+
 /// AgenticOS workspace records are minted as `ws_<UUID>`. The generic
 /// issuer ID schema is broader, but this connection account is a workspace,
 /// not an arbitrary hosted actor ID.
@@ -85,12 +98,7 @@ pub fn provider_account_identifier(provider: &str, value: &str) -> Result<String
     if provider != crate::platform::agenticos_external::PLATFORM {
         return crate::proto::identifier(value, "Account");
     }
-    let id = value.strip_prefix("ws_").and_then(|suffix| {
-        uuid::Uuid::parse_str(suffix)
-            .ok()
-            .filter(|id| id.to_string() == suffix)
-    });
-    if id.is_none() {
+    if !is_canonical_agenticos_workspace_id(value) {
         return Err(Error::rejected(
             "AgenticOS external account must be a canonical workspace ID",
         ));
@@ -389,5 +397,42 @@ mod tests {
                 .unwrap()
                 .builtin_accounts
         );
+    }
+
+    #[test]
+    fn canonical_agenticos_workspace_id_keeps_business_connections_unchanged() {
+        let workspace = "ws_11111111-2222-4333-8444-555555555555";
+        assert!(super::is_canonical_agenticos_workspace_id(workspace));
+        for invalid in [
+            "ws_11111111-2222-4333-8444-555555555555".to_uppercase(),
+            "ws_example".to_string(),
+            "ws_not-a-uuid".to_string(),
+            "11111111-2222-4333-8444-555555555555".to_string(),
+            "hosted".to_string(),
+            "foo_bar".to_string(),
+        ] {
+            assert!(
+                !super::is_canonical_agenticos_workspace_id(&invalid),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            super::provider_account_identifier(
+                crate::platform::agenticos_external::PLATFORM,
+                workspace,
+            )
+            .unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::provider_account_identifier(crate::platform::agenticos::PLATFORM, "hosted")
+                .unwrap(),
+            "hosted"
+        );
+        assert!(super::provider_account_identifier(
+            crate::platform::agenticos::PLATFORM,
+            workspace
+        )
+        .is_err());
     }
 }
