@@ -838,20 +838,19 @@ pub fn render_frame_html(
     )
 }
 
-/// Revalidate public, caller-constructible package bytes before selecting
-/// scripts. The declaration alone supplies explicit order; absent startup
-/// retains entry-only execution, regardless of the map's file order.
-pub fn render_package_frame_html(
+/// Render an already-validated package without repeating declaration
+/// validation or script/style end-token scans (CAD-2534).
+pub(crate) fn render_checked_package_frame_html(
     csp_nonce: &str,
     tag: &str,
     bridge_nonce: &str,
     generation: u64,
-    package: &crate::issue::app_screen_pkg::ScreenPackage,
+    checked: &crate::issue::app_screen_decl::IntegrityCheckedScreen,
+    assets: &std::collections::BTreeMap<String, String>,
     parent_origin: &str,
 ) -> Result<String> {
-    let checked = crate::issue::app_screen_decl::validate_map(&package.manifest, &package.assets)?;
     let mut styles = Vec::new();
-    for (name, body) in &package.assets {
+    for (name, body) in assets {
         if name.ends_with(".js") {
             check_script_text(body)?;
         } else if name.ends_with(".css") {
@@ -866,11 +865,19 @@ pub fn render_package_frame_html(
     let scripts: Vec<&str> = match checked.startup() {
         Some(order) => order
             .iter()
-            .map(|name| package.assets[name].as_str())
-            .collect(),
-        None => vec![package.assets[checked.entry()].as_str()],
+            .map(|name| {
+                assets
+                    .get(name)
+                    .map(String::as_str)
+                    .ok_or_else(|| Error::rejected("screen script asset missing"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![assets
+            .get(checked.entry())
+            .map(String::as_str)
+            .ok_or_else(|| Error::rejected("screen entry asset missing"))?],
     };
-    render_frame_document(
+    assemble_frame_document(
         csp_nonce,
         tag,
         bridge_nonce,
@@ -880,7 +887,58 @@ pub fn render_package_frame_html(
     )
 }
 
+/// Revalidate public, caller-constructible package bytes before selecting
+/// scripts. The declaration alone supplies explicit order; absent startup
+/// retains entry-only execution, regardless of the map's file order.
+#[cfg(test)]
+pub fn render_package_frame_html(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    package: &crate::issue::app_screen_pkg::ScreenPackage,
+    parent_origin: &str,
+) -> Result<String> {
+    let checked = crate::issue::app_screen_decl::validate_map(&package.manifest, &package.assets)?;
+    render_checked_package_frame_html(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        &checked,
+        &package.assets,
+        parent_origin,
+    )
+}
+
 fn render_frame_document(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    assets: (&[&str], &[&str]),
+    parent_origin: &str,
+) -> Result<String> {
+    let (styles, scripts) = assets;
+    for css in styles {
+        check_style_text(css)?;
+    }
+    for js in scripts {
+        check_script_text(js)?;
+    }
+    assemble_frame_document(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        (styles, scripts),
+        parent_origin,
+    )
+}
+
+/// Assemble the static frame document; callers must have verified `styles` and
+/// `scripts` with [`check_style_text`] and [`check_script_text`] first.
+fn assemble_frame_document(
     csp_nonce: &str,
     tag: &str,
     bridge_nonce: &str,
@@ -948,7 +1006,7 @@ fn render_frame_document(
     html.push_str("</style>");
     for css in styles {
         html.push_str("<style>");
-        html.push_str(check_style_text(css)?);
+        html.push_str(css);
         html.push_str("</style>");
     }
     html.push_str("</head><body><div id=\"root\"></div>");
@@ -956,7 +1014,7 @@ fn render_frame_document(
         html.push_str("<script nonce=\"");
         html.push_str(&csp_nonce);
         html.push_str("\">");
-        html.push_str(check_script_text(js)?);
+        html.push_str(js);
         html.push_str("</script>");
     }
     html.push_str("</body></html>");
@@ -1137,5 +1195,96 @@ mod tests {
         let mut keys: Vec<_> = boot.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["bridge_nonce", "generation", "parent_origin", "tag"]);
+    }
+
+    #[test]
+    fn cad2534_checked_frame_render_matches_package_render_and_blocks_breakout() {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        let digest = |text: &str| format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+        let js = "console.log('ok');";
+        let css = ".ok{color:inherit}";
+        let manifest = json!({
+            "contract": "app-screens/v2",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [
+                {"name": "client.js", "media_type": "text/javascript", "size": js.len(), "sha256": digest(js)},
+                {"name": "styles.css", "media_type": "text/css", "size": css.len(), "sha256": digest(css)},
+            ],
+            "provenance": {
+                "source_digest": digest("src"),
+                "sdk_digest": digest("sdk"),
+                "toolchain_digest": digest("tc"),
+            },
+            "host_contract": "screen-records.v1",
+            "may": [],
+            "operations": [],
+        })
+        .to_string();
+        let assets = BTreeMap::from([
+            ("client.js".to_string(), js.to_string()),
+            ("styles.css".to_string(), css.to_string()),
+        ]);
+        let checked = crate::issue::app_screen_decl::validate_map(&manifest, &assets).unwrap();
+        let pkg = crate::issue::app_screen_pkg::ScreenPackage {
+            tag: "main".to_string(),
+            manifest,
+            assets: assets.clone(),
+            app: checked.app().to_string(),
+            remote_images: checked.remote_images().to_vec(),
+            contract: checked.contract().to_string(),
+            may: checked.may().to_vec(),
+            tools: checked.tools().clone(),
+            host_contract: checked.host_contract().map(str::to_string),
+            operations: checked.operations().to_vec(),
+            navigation: checked.navigation().cloned(),
+        };
+        let from_checked = render_checked_package_frame_html(
+            "cspnonce",
+            "main",
+            &"b".repeat(64),
+            7,
+            &checked,
+            &assets,
+            "http://h",
+        )
+        .unwrap();
+        let from_package =
+            render_package_frame_html("cspnonce", "main", &"b".repeat(64), 7, &pkg, "http://h")
+                .unwrap();
+        assert_eq!(from_checked, from_package);
+
+        let bad_js = "var x='</script>';";
+        let bad_css = "body{content:'</style>'}";
+        for (bad_assets, why) in [
+            (
+                BTreeMap::from([
+                    ("client.js".to_string(), bad_js.to_string()),
+                    ("styles.css".to_string(), css.to_string()),
+                ]),
+                "forbidden HTML-script end token",
+            ),
+            (
+                BTreeMap::from([
+                    ("client.js".to_string(), js.to_string()),
+                    ("styles.css".to_string(), bad_css.to_string()),
+                ]),
+                "forbidden </style end token",
+            ),
+        ] {
+            let err = render_checked_package_frame_html(
+                "cspnonce",
+                "main",
+                &"b".repeat(64),
+                7,
+                &checked,
+                &bad_assets,
+                "http://h",
+            )
+            .expect_err("breakout asset must still be rejected");
+            assert!(err.to_string().contains(why), "unexpected error: {err}");
+        }
     }
 }

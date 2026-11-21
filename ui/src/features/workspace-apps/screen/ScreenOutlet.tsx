@@ -25,6 +25,7 @@ import { readOnlyReceipt } from "./screenReadOnly";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
+import AppLoadingSurface from "../AppLoadingSurface";
 import WhatsAppReplyComposer, { type WhatsAppReplySelection } from "./WhatsAppReplyComposer";
 
 /** The pane renderer: the outlet's typed failure and a retry that re-mounts
@@ -47,13 +48,15 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
   loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
+  /** Called once a verified mount receipt lands (`null` when retired or failed). */
+  onMounted?: (info: { hostContract: string | null } | null) => void;
   /** Refresh retained tool receipts after a successful invoke, without remounting. */
   onToolInvoked?: () => Promise<void>;
   onRoute?: (patch: RoutePatch, navigation: ScreenNavigation) => void;
@@ -109,8 +112,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const presentationLocale = useRef(locale);
   presentationLocale.current = locale;
   const href = useHref();
-  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route });
-  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route };
+  const navigationCallbacks = useRef({ onMounted, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route });
+  navigationCallbacks.current = { onMounted, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href, route };
   const mounted = useRef<MountReceipt | null>(null);
   const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : { ...p, presentation_locale: presentationLocale.current };
   const container = useRef<HTMLDivElement>(null);
@@ -314,7 +317,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
-    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); inlineAudio?.dispose(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
+    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); inlineAudio?.dispose(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onMounted?.(null); navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -351,6 +354,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         }
         if (!isCurrent() || !container.current) return;
         mounted.current = receipt;
+        navigationCallbacks.current.onMounted?.({ hostContract: receipt.host_contract ?? null });
         if (receipt.host_contract === "screen-records.v1") {
           admitDisplaySession(receipt.display_session_key!);
           setRemoteImages(receipt.remote_images ?? []);
@@ -546,6 +550,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       inlineAudio?.dispose();
       services?.retire();
       mounted.current = null;
+      navigationCallbacks.current.onMounted?.(null);
       navigationCallbacks.current.onNavigation?.(null);
       controller.abort();
       clearTimeout(timer);
@@ -584,8 +589,30 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;
   return <>
-    <div data-installed-app-screen="" aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "flex" : "none", flexDirection: "column" }}>
-      <div style={{ position: "relative", flex: "1 1 0%", minHeight: 0 }}><div ref={container} style={{ position: "absolute", inset: 0 }} /></div>
+    <div data-installed-app-screen="" aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "fallback" ? "none" : "flex", flexDirection: "column" }}>
+      <div style={{ position: "relative", flex: "1 1 0%", minHeight: 0 }}>
+        <div
+          ref={container}
+          className="wa-screen-frame-container"
+          aria-hidden={state !== "ready" || undefined}
+          inert={state !== "ready"}
+          style={{
+            position: "absolute",
+            inset: 0,
+            opacity: state === "ready" ? 1 : 0,
+            pointerEvents: state === "ready" ? "auto" : "none",
+            transition: "opacity 140ms ease-out",
+          }}
+        />
+        {/* CAD-1137 / CAD-2534: quiet layout-neutral overlay with 120ms reveal grace delay. */}
+        {state === "loading" && (
+          <AppLoadingSurface
+            className="wa-screen-loading-overlay"
+            label={t("Loading installed app…")}
+            variant={surfaceRole === "drawer" ? "drawer" : route ? "canvas" : "page"}
+          />
+        )}
+      </div>
       {whatsappReply?.selection.current() && <WhatsAppReplyComposer key={whatsappReply.revision} selection={whatsappReply.selection} />}
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
@@ -601,26 +628,6 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         onResolve={audioModal.resolve}
       />,
       document.body,
-    )}
-    {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
-    {state === "loading" && (
-      <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label={t("Loading installed app")} style={{ padding: "0.5rem 0.25rem" }}>
-        <span className="sr-only">{t("Loading installed app…")}</span>
-        <div className="wa-skel-tabs">
-          {[3, 3.5, 4.5, 3.5].map((w, i) => (
-            <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />
-          ))}
-        </div>
-        <div className="wa-skel-board">
-          {[0, 1, 2, 3].map((i) => (
-            <div key={i} className="wa-skel-lane">
-              <span className="wa-skel wa-skel-pulse" style={{ width: "45%", height: "0.8rem" }} />
-              <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
-              <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
-            </div>
-          ))}
-        </div>
-      </div>
     )}
     {state === "fallback" && (failure && renderFailure ? renderFailure(failure, retry) : fallback)}
     {/* CAD-1777 — the primary keeps its normal flow; its drawer child is a

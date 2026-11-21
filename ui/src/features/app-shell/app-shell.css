@@ -93,7 +93,8 @@
    and the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006),
    keeping the shell's outer page padding consistent across all apps. */
 .app-shell-outlet:has(> [data-installed-app-screen]),
-.app-shell-outlet:has(> [aria-label="Installed app screen"]) {
+.app-shell-outlet:has(> [aria-label="Installed app screen"]),
+.app-shell-outlet:has(> .wa-loading-surface) {
   display: flex;
   flex-direction: column;
 }

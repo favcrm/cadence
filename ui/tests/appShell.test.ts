@@ -312,6 +312,16 @@ assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render i
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell").length,
+  1,
+  "CAD-2534: cold shell mount fetches installation detail once without Round-2 re-fetch",
+);
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell/contexts").length,
+  1,
+  "CAD-2534: cold shell mount fetches contexts once without Round-2 re-fetch",
+);
 
 // The header disclosure changes visibility without replacing either pane.
 const toggle = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
@@ -737,6 +747,17 @@ Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable
 // context ID is a 400 on every poll).
 assert(reads.some((p) => p.includes("/assistant/")), "the assistant panel did read with a context");
 assert(!reads.some((p) => /\/assistant\/[a-z]+\?context_id=(&|$)/.test(p)), "no assistant read is sent with an empty context");
+
+// CAD-2534: prefetchAppScope and concurrent readAppScopeFresh coalesce into one in-flight pair.
+const { prefetchAppScope, readAppScopeFresh } = require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+reads.length = 0;
+prefetchAppScope("install-second");
+const [prefetchedDetail, prefetchedContexts] = await readAppScopeFresh("install-second");
+equal(prefetchedDetail.install_id, "install-second", "coalesced scope read resolves installation");
+equal(prefetchedContexts.length, 1, "coalesced scope read resolves contexts");
+equal(reads.filter((p) => p === "/api/app-installations/install-second").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 detail request");
+equal(reads.filter((p) => p === "/api/app-installations/install-second/contexts").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 contexts request");
+
 console.log("app shell checks passed");
 }
 void main();
