@@ -821,6 +821,8 @@ name and scope when the board verifies who staged it. Older records without
 provenance stay generic; a recorded CLI or MCP actor keeps its attribution.
 Home's Ask button names the assistant for that conversation and opens an
 unsent draft. It does not switch to the workspace assistant.
+Routine Review opens the recorded agent's Routines tab. If a hired agent
+shares the personal assistant's URL alias, Review opens the hired profile by ID.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action

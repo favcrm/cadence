@@ -49,6 +49,7 @@ const Agents = (
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { locationHref, readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
+const { routineReviewHref } = require("../src/features/home/needs") as typeof import("../src/features/home/needs");
 const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
@@ -325,6 +326,12 @@ async function main() {
   assert(host.querySelectorAll("[aria-current='page']").length === 1 && host.querySelector("[aria-current='page']")?.textContent?.startsWith("assistant"), "only the hired profile row is current");
   await at("/agents/profile/ap_1?tab=instructions");
   assert(host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Instructions" && aliasReads === 0, "a hired profile ID deep link keeps the requested tab");
+  const routineHref = routineReviewHref("assistant", { ...payload, profiles } as AgentsPayload);
+  assert(routineHref === "/agents/profile/ap_1?tab=routines", "Home routine review opens the hired assistant by ID, not the private assistant");
+  await at(routineHref);
+  assert(host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Routines" && aliasReads === 0, "hired routine review opens the Routines tab without an alias detail read");
+  assert(routineReviewHref(null, roster()) === "/agents/master?tab=routines", "a legacy hosted proposal without an alias keeps its review destination");
+  assert(routineReviewHref(null, hostedRoster()) === null && routineReviewHref("assistant", hostedRoster()) === null, "scoped Home does not guess a routine destination");
   await at("/agents");
   await click([...host.querySelectorAll(".ag-side-row")].find((row) => row.textContent?.startsWith("assistant")));
   assert(String(location.pathname) === "/agents/profile/ap_1", "the hired sidebar row opens the same ID route");

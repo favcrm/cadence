@@ -12,7 +12,7 @@ import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
 import SeatCard, { PersonalSeat, TeammateSeat } from "./SeatCard";
 import MyAssistantPage from "./MyAssistantPage";
-import { isCompanyMaster, masterShownTo, MASTER_LABEL, PERSONAL_ALIAS, personalOf } from "./personalAssistant";
+import { hasScopedAssistantRoster, isCompanyMaster, masterShownTo, MASTER_LABEL, PERSONAL_ALIAS, personalOf } from "./personalAssistant";
 import { MASTER } from "../home/master";
 import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
@@ -123,10 +123,7 @@ export default function Agents({
   const roster = payload?.agents ?? [];
   const allAgents = roster.filter((a) => masterShownTo(a, payload, hostedBoard, operator));
   const personal = personalOf(payload);
-  const scopedRoster =
-    hostedBoard &&
-    ((payload != null && Object.hasOwn(payload, "personal_assistant")) ||
-      roster.some((a) => isCompanyMaster(a, payload)));
+  const scopedRoster = hostedBoard && payload != null && hasScopedAssistantRoster(payload);
   const directoryViewer = scopedRoster && !open && !openProfileId && !ask && !recruit ? viewerSub ?? null : null;
   const [directory, setDirectory] = useState<{
     viewer: string;

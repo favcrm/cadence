@@ -1635,6 +1635,7 @@ function MasterHome({
           templateCount={templateCount}
           readOnly={readOnly}
           scopedHost={hosted !== false}
+          hostedRoster={hosted === false ? undefined : agents.data ?? null}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
           permissionsHref={permissionsHref}

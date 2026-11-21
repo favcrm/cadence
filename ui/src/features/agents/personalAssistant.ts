@@ -17,6 +17,10 @@ export function isCompanyMaster(a: Agent, payload: AgentsPayload | null | undefi
   return a.alias === MASTER && (a.scope === "workspace" || personalOf(payload) !== null);
 }
 
+export function hasScopedAssistantRoster(payload: AgentsPayload): boolean {
+  return Object.hasOwn(payload, "personal_assistant") || payload.agents.some((a) => isCompanyMaster(a, payload));
+}
+
 /** The company Master is for owners: on a hosted board a roster that names the
  *  personal assistant does not list it to anyone else (an unanswered access
  *  check is not an owner). Native boards and older APIs keep every row. */

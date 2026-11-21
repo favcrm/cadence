@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
-import type { Agent, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
-import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
+import type { Agent, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
+import { kindSpec, metaLine, routineReviewHref, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
@@ -78,6 +78,7 @@ export default function NeedsRail({
   documentFollowUps,
   readOnly,
   scopedHost = false,
+  hostedRoster,
   onOpenIssue,
   overviewHref,
   permissionsHref,
@@ -96,6 +97,7 @@ export default function NeedsRail({
   documentFollowUps?: DocumentFollowUpState;
   readOnly: boolean;
   scopedHost?: boolean;
+  hostedRoster?: AgentsPayload | null;
   onOpenIssue?: (id: string) => void;
   overviewHref?: string;
   /** Settings → Master permissions, where the standing "Always" rules live. */
@@ -345,7 +347,7 @@ export default function NeedsRail({
       {(waitingRoutines.length > 0 || routineProposals.length > 0 || routineStepHolds.length > 0) && (
         <ul className="todo-list" data-routine-needs>
           {routineStepHolds.map((run) => {
-            const alias = scopedHost ? run.agent_alias?.trim() || null : run.agent_alias ?? "master";
+            const href = routineReviewHref(run.agent_alias, hostedRoster);
             const waitingStep =
               (run.checklist_state ?? run.checklist ?? []).find(
                 (s) => s.state === "waiting_approval",
@@ -385,8 +387,8 @@ export default function NeedsRail({
                       </Button>
                     </>
                   )}
-                  {alias && <Link
-                    href={`/agents/${encodeURIComponent(alias)}?tab=routines`}
+                  {href && <Link
+                    href={href}
                     className="btn btn-sm btn-secondary"
                     onClick={() => setDrawer(false)}
                   >
@@ -398,12 +400,11 @@ export default function NeedsRail({
           })}
           {routineProposals.map((p) => {
             const explicitAlias = typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : null;
-            const alias = scopedHost ? explicitAlias?.trim() || null : explicitAlias ?? "master";
             const wikiPath = typeof p.payload?.path === "string" ? p.payload.path : null;
             const href =
               p.kind === "wiki_propose" && wikiPath
                 ? `/wiki/${wikiPath.replace(/^wiki:/, "")}`
-                : alias ? `/agents/${encodeURIComponent(alias)}?tab=routines` : null;
+                : routineReviewHref(explicitAlias, hostedRoster);
             return (
               <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0">
                 <div className="min-w-0 flex-1">
@@ -447,29 +448,32 @@ export default function NeedsRail({
               </li>
             );
           })}
-          {waitingRoutines.map((r) => (
-            <li key={r.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
-              <div className="min-w-0">
-                <span className="block text-label font-medium text-ink-100 truncate">
-                  {r.name}
-                </span>
-                <span className="block text-micro text-ink-400 truncate">
-                  {r.status === "repoint_required"
-                    ? t("Choose thread")
-                    : r.approval_drift && (r.approved_rev !== null || r.approved_sha256 !== null)
-                      ? t("Playbook or script updated — approve to run")
-                      : t("Approve routine before first run")}
-                </span>
-              </div>
-              <Link
-                href={`/agents/${encodeURIComponent(r.agent_alias)}?tab=routines`}
-                className="btn btn-sm btn-secondary shrink-0"
-                onClick={() => setDrawer(false)}
-              >
-                {t("Review")}
-              </Link>
-            </li>
-          ))}
+          {waitingRoutines.map((r) => {
+            const href = routineReviewHref(r.agent_alias, hostedRoster);
+            return (
+              <li key={r.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
+                <div className="min-w-0">
+                  <span className="block text-label font-medium text-ink-100 truncate">
+                    {r.name}
+                  </span>
+                  <span className="block text-micro text-ink-400 truncate">
+                    {r.status === "repoint_required"
+                      ? t("Choose thread")
+                      : r.approval_drift && (r.approved_rev !== null || r.approved_sha256 !== null)
+                        ? t("Playbook or script updated — approve to run")
+                        : t("Approve routine before first run")}
+                  </span>
+                </div>
+                {href && <Link
+                  href={href}
+                  className="btn btn-sm btn-secondary shrink-0"
+                  onClick={() => setDrawer(false)}
+                >
+                  {t("Review")}
+                </Link>}
+              </li>
+            );
+          })}
         </ul>
       )}
       <ul className="todo-list">
