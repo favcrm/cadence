@@ -3,7 +3,7 @@ import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { object, type recordServices } from "./screenServices";
-import type { WhatsAppReplyAvailability, WhatsAppReplyBounds } from "./screenProtocol";
+import { WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
 export interface WhatsAppReplySelection {
@@ -12,6 +12,7 @@ export interface WhatsAppReplySelection {
   services: ReturnType<typeof recordServices>;
   current(): boolean;
   announceAvailability?(state: WhatsAppReplyAvailability): void;
+  announceInset?(px: number): void;
   announce(dirty: boolean, refresh?: boolean): void;
 }
 
@@ -78,6 +79,17 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
   const running = useRef(false);
   const pointer = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
+  const dock = useRef<HTMLDivElement>(null);
+  const overlay = selection.announceInset !== undefined && bounds !== undefined;
+  useLayoutEffect(() => {
+    const node = dock.current;
+    if (!overlay || !node || !selection.announceInset) return;
+    const publish = () => selection.announceInset?.(Math.min(WHATSAPP_REPLY_INSET_MAX, Math.ceil(node.getBoundingClientRect().height)));
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(node, { box: "border-box" });
+    return () => observer.disconnect();
+  }, [overlay, selection]);
   const group = selection.conversationId.endsWith("@g.us");
   const recipient = verification?.recipient;
   const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
@@ -199,21 +211,24 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
 
-  return <div className="wa-reply-dock" hidden={bounds === null} data-positioned={bounds ? "" : undefined}
+  return <div ref={dock} className="wa-reply-dock" hidden={bounds === null} data-positioned={bounds ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
     {note && <div className="wa-reply-status">
       <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
       {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
     </div>}
     <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
-      <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
+      {(!overlay || recipient) && <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
           : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
           : availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…")
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
-      </p>
-      <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"} placeholder={zh ? "輸入回覆…" : "Write a reply…"}
+      </p>}
+      <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"}
+        placeholder={overlay && availability !== "verified"
+          ? (availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…") : (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation"))
+          : (zh ? "輸入回覆…" : "Write a reply…")}
         value={text} rows={1} maxLength={4096} readOnly={readOnly}
         onChange={e => setText(e.target.value)} onKeyDown={e => {
           if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;

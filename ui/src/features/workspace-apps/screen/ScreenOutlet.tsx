@@ -388,6 +388,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               announceAvailability: nomination === null ? undefined : state => {
                 if (currentSelection()) owned?.whatsappReplyAvailability(nomination, state);
               },
+              announceInset: nomination !== null && owned.whatsappReplyOverlay ? px => {
+                if (currentSelection()) owned?.whatsappReplyInset(nomination, px);
+              } : undefined,
               announce: (dirty, refresh = false) => {
                 if (!currentSelection()) return;
                 const changed = composerUnsaved !== dirty;
@@ -414,6 +417,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         if (composeServices) {
           mountQuery.set("wa_compose_availability", "1");
           mountQuery.set("wa_compose_layout", "1");
+          mountQuery.set("wa_compose_overlay", "1");
         }
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can

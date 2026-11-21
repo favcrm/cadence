@@ -318,7 +318,7 @@ noAudioOptIn.receive({ v: 2, op: "audio", id: "forged-aud", mode: "record" });
 check(noAudioOptIn.closed, "audio op without screen-audio.v1 opt-in closes mount");
 
 // Reply layout is presentation-only and follows the current compose nomination.
-function replyLayoutMount(options: { layout?: boolean; drawer?: boolean } = {}) {
+function replyLayoutMount(options: { layout?: boolean; drawer?: boolean; overlay?: boolean } = {}) {
   const source = {} as Window;
   const port = new Port();
   const nominations: (number | null)[] = [];
@@ -343,9 +343,9 @@ function replyLayoutMount(options: { layout?: boolean; drawer?: boolean } = {}) 
   channel.receive({ source, origin: "null", data: { ...init, tag: "waba" }, ports: [port as unknown as MessagePort] });
   port.receive({ v: 1, op: "ready", accepts: [
     "screen.v2", "screen-records.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1",
-    ...(options.layout === false ? [] : ["screen-whatsapp-reply-layout.v1"]),
+    ...(options.layout === false ? [] : [options.overlay ? "screen-whatsapp-reply-layout.v2" : "screen-whatsapp-reply-layout.v1"]),
   ] });
-  return { port, nominations, layouts, failed: () => failed };
+  return { channel, port, nominations, layouts, failed: () => failed };
 }
 const layout = replyLayoutMount();
 const layoutMessage = (nomination: number, bounds: unknown) => ({ v: 2, op: "whatsapp-reply-layout", nomination, bounds });
@@ -384,6 +384,60 @@ check(noLayoutOptIn.port.closed && noLayoutOptIn.layouts.length === 0, "unnegoti
 const drawerLayout = replyLayoutMount({ drawer: true });
 drawerLayout.port.receive(layoutMessage(1, [0, 10000]));
 check(drawerLayout.port.closed && drawerLayout.layouts.length === 0, "drawer cannot negotiate or change reply layout");
+
+// CAD-2542: the overlay inset flows only from the board to the current v2
+// primary compose frame; it never grants the child a new operation.
+const overlay = replyLayoutMount({ overlay: true });
+const insetMessages = (port: Port) => port.sent.filter(message =>
+  message !== null && typeof message === "object" && "op" in message && message.op === "whatsapp-reply-inset");
+check(!overlay.port.closed, "primary WABA negotiates reply layout v2");
+overlay.channel.whatsappReplyInset(1, 80);
+check(insetMessages(overlay.port).length === 0, "inset before a selection is ignored");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+overlay.port.receive(layoutMessage(1, [1000, 9000]));
+check(JSON.stringify(overlay.layouts) === "[[1000,9000]]", "v2 still delivers current child layout bounds");
+overlay.channel.whatsappReplyInset(1, 80);
+overlay.channel.whatsappReplyInset(1, 80);
+overlay.channel.whatsappReplyInset(1, 0);
+overlay.channel.whatsappReplyInset(1, 512);
+check(JSON.stringify(insetMessages(overlay.port)) === JSON.stringify([
+  { v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 80 },
+  { v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 0 },
+  { v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 512 },
+]), "v2 sends only changed valid insets, including hidden and maximum");
+for (const px of [-1, 513, 1.5, NaN, Infinity]) overlay.channel.whatsappReplyInset(1, px);
+overlay.channel.whatsappReplyInset(2, 42);
+check(insetMessages(overlay.port).length === 3, "invalid insets and wrong nominations are ignored");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550002222@s.whatsapp.net" });
+overlay.channel.whatsappReplyInset(1, 42);
+check(insetMessages(overlay.port).length === 3, "stale selection receives no inset");
+overlay.channel.whatsappReplyInset(2, 80);
+check(JSON.stringify(insetMessages(overlay.port)[3]) === JSON.stringify({ v: 2, op: "whatsapp-reply-inset", nomination: 2, px: 80 }),
+  "current replacement selection receives an inset");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: null });
+overlay.channel.whatsappReplyInset(2, 42);
+overlay.channel.whatsappReplyInset(3, 42);
+check(insetMessages(overlay.port).length === 4, "cleared selection and previous selection receive no inset");
+
+const v1Inset = replyLayoutMount();
+v1Inset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+v1Inset.channel.whatsappReplyInset(1, 80);
+check(insetMessages(v1Inset.port).length === 0, "v1 layout client never receives overlay insets");
+const drawerInset = replyLayoutMount({ overlay: true, drawer: true });
+drawerInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+drawerInset.channel.whatsappReplyInset(1, 80);
+check(insetMessages(drawerInset.port).length === 0, "drawer never receives overlay insets");
+const retiredInset = replyLayoutMount({ overlay: true });
+retiredInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+retiredInset.channel.update({ ...push, context_id: "other" });
+retiredInset.channel.whatsappReplyInset(1, 80);
+check(retiredInset.port.closed && insetMessages(retiredInset.port).length === 0, "retired frame never receives an inset");
+const forgedInset = replyLayoutMount({ overlay: true });
+forgedInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+check(!parseChild({ v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 80 }), "child inset op is not a valid child message");
+forgedInset.port.receive({ v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 80 });
+check(forgedInset.port.closed && forgedInset.failed() === 1 && forgedInset.layouts.length === 0 && insetMessages(forgedInset.port).length === 0,
+  "child cannot send or route a board-only inset");
 
 void (async () => {
   let activeSignals: AbortSignal[] = [];

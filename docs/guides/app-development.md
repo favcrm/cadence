@@ -357,7 +357,17 @@ right edges of the message pane, relative to the iframe viewport. Use `null`
 when details replace the pane. An old nomination cannot change the layout.
 Unnegotiated or malformed messages close the port. This hint only positions
 or hides the existing dock; it changes no draft, recipient, or send rights.
-The dock remains below the iframe, with a rail-based layout for older bundles.
+If the mount also offers `wa_compose_overlay=1`, the bundle may select
+`screen-whatsapp-reply-layout.v2` **instead** of v1 (one capability slot).
+The child bounds and rules are unchanged. After measured bounds arrive, the
+board places the same dock over the conversation's bottom edge without
+shortening the iframe. For the current selection it sends
+`{v:2, op:"whatsapp-reply-inset", nomination, px}`, where `px` is the
+integer height occupied by the dock, including bottom safe-area space, from
+0 to 512 CSS pixels. Zero means hidden. Apply it within the right conversation
+pane so its history and footer actions clear the dock without shrinking the
+Inbox rail. Ignore old nominations. A v1 or unnegotiated dock stays below
+the iframe and never sends an inset.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is

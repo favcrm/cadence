@@ -12,6 +12,17 @@
   padding: 0.4rem 0.75rem max(0.75rem, env(safe-area-inset-bottom));
 }
 
+.wa-reply-dock[data-overlay] {
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 1;
+  padding: 0 0.75rem max(0.5rem, env(safe-area-inset-bottom));
+  pointer-events: none;
+}
+
+.wa-reply-dock[data-overlay] > * { pointer-events: auto; }
+.wa-reply-dock[data-overlay] .wa-reply-card { border-radius: 1rem; }
+
 .wa-reply-dock[hidden] { display: none; }
 
 /* Legacy WABA package: 19rem rail including gutter. A negotiated pane
