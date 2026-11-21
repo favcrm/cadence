@@ -49,7 +49,7 @@ const Agents = (
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { locationHref, readLocation } = require("../src/lib/router") as typeof import("../src/lib/router");
-const { routineReviewHref } = require("../src/features/home/needs") as typeof import("../src/features/home/needs");
+const { routineDraftReviewHref, routineReviewHref } = require("../src/features/home/needs") as typeof import("../src/features/home/needs");
 const { allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
@@ -330,6 +330,10 @@ async function main() {
   assert(routineHref === "/agents/profile/ap_1?tab=routines", "Home routine review opens the hired assistant by ID, not the private assistant");
   await at(routineHref);
   assert(host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Routines" && aliasReads === 0, "hired routine review opens the Routines tab without an alias detail read");
+  const draft = { kind: "routine_propose", payload: {}, proposed_by: "assistant" };
+  assert(routineDraftReviewHref(draft, { ...payload, profiles } as AgentsPayload) === routineHref, "a hosted draft without an explicit alias reviews its effective hired target");
+  assert(routineDraftReviewHref({ ...draft, proposed_by: "master" }, hostedRoster()) === "/agents/master?tab=routines", "the usual hosted draft without an alias still opens Master Routines for review");
+  assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: "master" } }, hostedRoster()) === "/agents/master?tab=routines", "the explicit execution target takes precedence over the saved fallback");
   assert(routineReviewHref(null, roster()) === "/agents/master?tab=routines", "a legacy hosted proposal without an alias keeps its review destination");
   assert(routineReviewHref(null, hostedRoster()) === null && routineReviewHref("assistant", hostedRoster()) === null, "scoped Home does not guess a routine destination");
   await at("/agents");

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
-import { kindSpec, metaLine, routineReviewHref, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
+import { kindSpec, metaLine, routineDraftReviewHref, routineReviewHref, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
@@ -241,8 +241,9 @@ export default function NeedsRail({
     routineProposals.length +
     routineStepHolds.length +
     pendingDocuments.length + (templateCount ?? 0);
-  const countKnown = (Boolean(overviewData) || (privateHome && (documentFollowUps?.status === "ready" || templateCount !== undefined))) &&
-    (templateRail == null || templateCount !== undefined);
+  const countKnown = (Boolean(overviewData) || (privateHome && (
+    documentFollowUps?.status === "ready" || templateCount !== undefined || (decisionsOn && staged.phase === "ready")
+  ))) && (templateRail == null || templateCount !== undefined);
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
@@ -320,10 +321,10 @@ export default function NeedsRail({
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
       {/* An unread or failed decision list is not an empty list. */}
-      {overviewData && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
+      {(overviewData || privateHome) && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {overviewData && cards.length === 0 && decisionsOn && staged.phase === "error" && (
+      {(overviewData || privateHome) && cards.length === 0 && decisionsOn && staged.phase === "error" && (
         <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
       {countKnown && count === 0 && cards.length === 0 && documentFollowUps?.status !== "unavailable" && documentFollowUps?.status !== "loading" && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
@@ -399,12 +400,7 @@ export default function NeedsRail({
             );
           })}
           {routineProposals.map((p) => {
-            const explicitAlias = typeof p.payload?.agent_alias === "string" ? p.payload.agent_alias : null;
-            const wikiPath = typeof p.payload?.path === "string" ? p.payload.path : null;
-            const href =
-              p.kind === "wiki_propose" && wikiPath
-                ? `/wiki/${wikiPath.replace(/^wiki:/, "")}`
-                : routineReviewHref(explicitAlias, hostedRoster);
+            const href = routineDraftReviewHref(p, hostedRoster);
             return (
               <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0">
                 <div className="min-w-0 flex-1">

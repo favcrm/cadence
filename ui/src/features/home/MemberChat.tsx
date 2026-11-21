@@ -10,6 +10,8 @@ import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
 import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
+import { homeDecisions } from "../decisions/useDecisions";
+import { StagedSourceContext } from "../../ui/StagedChip";
 import { readRailCollapsed, writeRailCollapsed } from "./needs";
 import { useDockHeight } from "./useDockHeight";
 import {
@@ -90,6 +92,7 @@ export default function MemberChat({
   scope,
   readOnly,
   onOpenIssue,
+  decisions = false,
   documentFollowUps,
   templateRail,
   templateCount,
@@ -98,6 +101,7 @@ export default function MemberChat({
   scope: string;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
+  decisions?: boolean;
   documentFollowUps?: DocumentFollowUpState;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
@@ -408,11 +412,13 @@ export default function MemberChat({
   const empty = loaded && history.error === undefined && items.length === 0;
   const showBootstrapCard =
     !readOnly && surface?.bootstrap === "pending" && identity.state === "ready";
+  const hasRail = decisions || documentFollowUps != null || templateRail != null;
 
   return (
     <AssistantActorProvider actor={actor}>
+    <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
     <main className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)] ${
-      !documentFollowUps ? "" : railCollapsed
+      !hasRail ? "" : railCollapsed
         ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
         : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
     }`}>
@@ -539,13 +545,14 @@ export default function MemberChat({
           </div>
         </div>
       </section>
-      {(documentFollowUps || templateRail) && (
+      {hasRail && (
         <aside className="absolute rail:static min-w-0 rail:h-full rail:min-h-0">
           <NeedsRail
             documentFollowUps={documentFollowUps}
             templateRail={templateRail}
             templateCount={templateCount}
             readOnly={readOnly}
+            decisions={decisions}
             collapsed={railCollapsed}
             onToggleCollapse={() => {
               writeRailCollapsed(!railCollapsed);
@@ -555,6 +562,7 @@ export default function MemberChat({
         </aside>
       )}
     </main>
+    </StagedSourceContext.Provider>
     </AssistantActorProvider>
   );
 }

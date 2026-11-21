@@ -815,10 +815,12 @@ For a staged write, the receipt's status is the outcome: `pending` awaits an
 owner, `applied` was written, and `denied` or `failed` exits nonzero while
 keeping the receipt on stdout.
 
-Home shows decisions from your personal conversation; the workspace assistant's
-Recruit decisions stay in Recruit. A decision shows the assistant's display
-name and scope when the board verifies who staged it. Older records without
-provenance stay generic; a recorded CLI or MCP actor keeps its attribution.
+The workspace owner can review decisions from their personal conversation on
+Home, including when they open it from My assistant. Other members do not get
+the owner's queue, and the workspace assistant's Recruit decisions stay in
+Recruit. A decision shows the assistant's display name and scope when the board
+verifies who staged it. Older records without provenance stay generic; a
+recorded CLI or MCP actor keeps its attribution.
 Home's Ask button names the assistant for that conversation and opens an
 unsent draft. It does not switch to the workspace assistant.
 Routine Review opens the recorded agent's Routines tab. If a hired agent

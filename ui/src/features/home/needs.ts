@@ -1,4 +1,4 @@
-import type { AgentsPayload, NeedsMe, ThreadRef } from "../../lib/types";
+import type { AgentsPayload, NeedsMe, StagedRoutineProposal, ThreadRef } from "../../lib/types";
 import { routePath } from "../../lib/router";
 import { hasScopedAssistantRoster, PERSONAL_ALIAS } from "../agents/personalAssistant";
 import { MASTER } from "./master";
@@ -294,6 +294,23 @@ export function routineReviewHref(alias: string | null | undefined, roster?: Age
   if (name !== PERSONAL_ALIAS) return `${routePath({ screen: "agents", alias: name })}?tab=routines`;
   const profileId = roster?.profiles?.find((profile) => profile.alias === name)?.id;
   return profileId ? `${routePath({ screen: "agents", alias: null, profileId })}?tab=routines` : null;
+}
+
+export function routineDraftReviewHref(
+  draft: Pick<StagedRoutineProposal, "kind" | "payload" | "proposed_by">,
+  roster?: AgentsPayload | null,
+): string | null {
+  const alias = draft.payload?.agent_alias;
+  const wikiPath = draft.payload?.path;
+  if (draft.kind === "wiki_propose" && typeof wikiPath === "string" && wikiPath) {
+    return `/wiki/${wikiPath.replace(/^wiki:/, "")}`;
+  }
+  // The hosted routine store uses proposed_by as its execution target when
+  // the draft omits agent_alias. That fallback proves no actor identity.
+  const fallback = draft.kind === "routine_propose" && roster != null && hasScopedAssistantRoster(roster)
+    ? draft.proposed_by || MASTER
+    : null;
+  return routineReviewHref(typeof alias === "string" ? alias : fallback, roster);
 }
 
 /**

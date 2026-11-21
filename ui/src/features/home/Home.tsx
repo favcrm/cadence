@@ -852,6 +852,7 @@ export default function Home({
           scope={scope}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
+          decisions={decisions && operator === true && !viewerIsMember}
           documentFollowUps={documentFollowUps}
           templateRail={review.rail}
           templateCount={review.pendingCount}
