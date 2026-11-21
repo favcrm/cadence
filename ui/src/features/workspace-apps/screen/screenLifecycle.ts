@@ -5,7 +5,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
-import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
@@ -66,6 +66,7 @@ export interface ScreenActions {
   onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
   onWhatsAppCompose?(conversationId: string | null, nomination: number | null): void;
   onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
+  onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -253,6 +254,7 @@ export abstract class FrameChannel {
   protected leave(_unsaved: boolean): void { this.close(true); }
   protected whatsappCompose(_conversationId: string | null): void { this.close(true); }
   protected whatsappReplyLayout(_nomination: number, _bounds: WhatsAppReplyBounds | null): void { this.close(true); }
+  protected whatsappReplyInsetReady(_nomination: number, _seq: number, _px: number): void { this.close(true); }
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
   protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
@@ -304,6 +306,10 @@ export abstract class FrameChannel {
       if (child.op === "whatsapp-reply-layout") {
         if (!this.ready) { this.close(true); return; }
         this.whatsappReplyLayout(child.nomination, child.bounds);
+      }
+      if (child.op === "whatsapp-reply-inset-ready") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappReplyInsetReady(child.nomination, child.seq, child.px);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -365,6 +371,11 @@ export class ScreenChannel extends FrameChannel {
   private wantsWhatsAppCompose = false;
   private wantsReplyAvailability = false;
   private wantsReplyLayout = false;
+  private wantsReplyOverlay = false;
+  private replyInset: number | undefined;
+  private replyInsetSeq = 0;
+  private replyInsetAcknowledged = false;
+  get whatsappReplyOverlay(): boolean { return this.wantsReplyOverlay; }
   private whatsappSelected = false;
   // Both ends count the existing selections (including clears) on the ordered port.
   private whatsappNomination = 0;
@@ -426,11 +437,20 @@ export class ScreenChannel extends FrameChannel {
   protected whatsappCompose(conversationId: string | null): void {
     if (!this.wantsWhatsAppCompose || !this.actions?.onWhatsAppCompose) { this.close(true); return; }
     this.whatsappSelected = conversationId !== null;
+    this.replyInset = undefined;
+    this.replyInsetSeq = 0;
     this.actions.onWhatsAppCompose(conversationId, this.wantsReplyAvailability ? ++this.whatsappNomination : null);
   }
   protected whatsappReplyLayout(nomination: number, bounds: WhatsAppReplyBounds | null): void {
     if (!this.wantsReplyLayout || !this.actions?.onWhatsAppReplyLayout) { this.close(true); return; }
     if (this.whatsappSelected && nomination === this.whatsappNomination) this.actions.onWhatsAppReplyLayout(bounds);
+  }
+  protected whatsappReplyInsetReady(nomination: number, seq: number, px: number): void {
+    if (!this.wantsReplyOverlay || !this.actions?.onWhatsAppReplyInsetApplied) { this.close(true); return; }
+    if (!this.whatsappSelected || nomination !== this.whatsappNomination ||
+        seq !== this.replyInsetSeq || px !== this.replyInset || this.replyInsetAcknowledged) return;
+    this.replyInsetAcknowledged = true;
+    this.actions.onWhatsAppReplyInsetApplied(px, seq);
   }
   whatsappComposeState(dirty: boolean, refresh: boolean): void {
     if (!this.closed && this.ready && this.wantsWhatsAppCompose)
@@ -439,6 +459,16 @@ export class ScreenChannel extends FrameChannel {
   whatsappReplyAvailability(nomination: number, state: WhatsAppReplyAvailability): void {
     if (!this.closed && this.ready && this.wantsReplyAvailability && nomination === this.whatsappNomination)
       this.port?.postMessage({ v: 2, op: "whatsapp-reply-availability", nomination, state });
+  }
+  whatsappReplyInset(nomination: number, px: number): number | undefined {
+    if (this.closed || !this.ready || !this.port || !this.wantsReplyOverlay || !this.whatsappSelected ||
+        nomination !== this.whatsappNomination || !Number.isSafeInteger(px) || px < 0 || px > WHATSAPP_REPLY_INSET_MAX) return;
+    if (px !== this.replyInset) {
+      this.replyInset = px;
+      this.replyInsetAcknowledged = false;
+      this.port.postMessage({ v: 2, op: "whatsapp-reply-inset", nomination, seq: ++this.replyInsetSeq, px });
+    }
+    return this.replyInsetSeq;
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
@@ -751,7 +781,8 @@ export class ScreenChannel extends FrameChannel {
     this.wantsWhatsAppCompose = wantsWhatsAppCompose;
     this.wantsReplyAvailability = accepts.includes(SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1);
     if (this.wantsReplyAvailability && !wantsWhatsAppCompose) return false;
-    this.wantsReplyLayout = accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1);
+    this.wantsReplyOverlay = accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2);
+    this.wantsReplyLayout = this.wantsReplyOverlay || accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1);
     if (this.wantsReplyLayout && (!this.wantsReplyAvailability || !this.actions?.onWhatsAppReplyLayout)) return false;
     this.records = records;
     this.wantsLocale = wantsLocale;

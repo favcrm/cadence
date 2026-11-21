@@ -318,11 +318,12 @@ noAudioOptIn.receive({ v: 2, op: "audio", id: "forged-aud", mode: "record" });
 check(noAudioOptIn.closed, "audio op without screen-audio.v1 opt-in closes mount");
 
 // Reply layout is presentation-only and follows the current compose nomination.
-function replyLayoutMount(options: { layout?: boolean; drawer?: boolean } = {}) {
+function replyLayoutMount(options: { layout?: boolean; drawer?: boolean; overlay?: boolean } = {}) {
   const source = {} as Window;
   const port = new Port();
   const nominations: (number | null)[] = [];
   const layouts: ([number, number] | null)[] = [];
+  const appliedInsets: number[] = [];
   let failed = 0;
   const wabaReceipt = {
     ...receipt, tag: "waba", action_token: "d".repeat(64), tools: [],
@@ -337,15 +338,16 @@ function replyLayoutMount(options: { layout?: boolean; drawer?: boolean } = {}) 
     ...toolHost!,
     onWhatsAppCompose: (_conversationId: string | null, nomination: number | null) => nominations.push(nomination),
     onWhatsAppReplyLayout: (bounds: [number, number] | null) => layouts.push(bounds),
+    onWhatsAppReplyInsetApplied: (px: number) => appliedInsets.push(px),
   };
   const channel = new ScreenChannel(source, wabaReceipt, wabaPush, () => {}, () => ++failed, () => {}, undefined, actions);
   if (options.drawer) channel.surfaceRole = "drawer";
   channel.receive({ source, origin: "null", data: { ...init, tag: "waba" }, ports: [port as unknown as MessagePort] });
   port.receive({ v: 1, op: "ready", accepts: [
     "screen.v2", "screen-records.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1",
-    ...(options.layout === false ? [] : ["screen-whatsapp-reply-layout.v1"]),
+    ...(options.layout === false ? [] : [options.overlay ? "screen-whatsapp-reply-layout.v2" : "screen-whatsapp-reply-layout.v1"]),
   ] });
-  return { port, nominations, layouts, failed: () => failed };
+  return { channel, port, nominations, layouts, appliedInsets, failed: () => failed };
 }
 const layout = replyLayoutMount();
 const layoutMessage = (nomination: number, bounds: unknown) => ({ v: 2, op: "whatsapp-reply-layout", nomination, bounds });
@@ -384,6 +386,129 @@ check(noLayoutOptIn.port.closed && noLayoutOptIn.layouts.length === 0, "unnegoti
 const drawerLayout = replyLayoutMount({ drawer: true });
 drawerLayout.port.receive(layoutMessage(1, [0, 10000]));
 check(drawerLayout.port.closed && drawerLayout.layouts.length === 0, "drawer cannot negotiate or change reply layout");
+
+// CAD-2542: the overlay inset flows to the current v2 primary compose frame,
+// which acknowledges only the latest inset it has applied.
+const overlay = replyLayoutMount({ overlay: true });
+const insetMessages = (port: Port) => port.sent.filter(message =>
+  message !== null && typeof message === "object" && "op" in message && message.op === "whatsapp-reply-inset");
+check(!overlay.port.closed, "primary WABA negotiates reply layout v2");
+overlay.channel.whatsappReplyInset(1, 80);
+check(insetMessages(overlay.port).length === 0, "inset before a selection is ignored");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+overlay.port.receive(layoutMessage(1, [1000, 9000]));
+check(JSON.stringify(overlay.layouts) === "[[1000,9000]]", "v2 still delivers current child layout bounds");
+overlay.channel.whatsappReplyInset(1, 80);
+overlay.channel.whatsappReplyInset(1, 80);
+overlay.channel.whatsappReplyInset(1, 0);
+overlay.channel.whatsappReplyInset(1, 512);
+check(JSON.stringify(insetMessages(overlay.port).map(message => {
+  const inset = message as { nomination: number; px: number; seq: number };
+  return [inset.nomination, inset.px, inset.seq];
+})) === JSON.stringify([[1, 80, 1], [1, 0, 2], [1, 512, 3]]),
+  "v2 sends only changed valid insets with increasing sequence numbers");
+for (const px of [-1, 513, 1.5, NaN, Infinity]) overlay.channel.whatsappReplyInset(1, px);
+overlay.channel.whatsappReplyInset(2, 42);
+check(insetMessages(overlay.port).length === 3, "invalid insets and wrong nominations are ignored");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550002222@s.whatsapp.net" });
+overlay.channel.whatsappReplyInset(1, 42);
+check(insetMessages(overlay.port).length === 3, "stale selection receives no inset");
+overlay.channel.whatsappReplyInset(2, 80);
+const replacementInset = insetMessages(overlay.port)[3] as { nomination: number; px: number; seq: number };
+check(replacementInset.nomination === 2 && replacementInset.px === 80 && replacementInset.seq === 1,
+  "current replacement selection receives an inset with a reset sequence");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: null });
+overlay.channel.whatsappReplyInset(2, 42);
+overlay.channel.whatsappReplyInset(3, 42);
+check(insetMessages(overlay.port).length === 4, "cleared selection and previous selection receive no inset");
+
+const v1Inset = replyLayoutMount();
+v1Inset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+v1Inset.channel.whatsappReplyInset(1, 80);
+check(insetMessages(v1Inset.port).length === 0, "v1 layout client never receives overlay insets");
+const drawerInset = replyLayoutMount({ overlay: true, drawer: true });
+drawerInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+drawerInset.channel.whatsappReplyInset(1, 80);
+check(insetMessages(drawerInset.port).length === 0, "drawer never receives overlay insets");
+const retiredInset = replyLayoutMount({ overlay: true });
+retiredInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+retiredInset.channel.update({ ...push, context_id: "other" });
+retiredInset.channel.whatsappReplyInset(1, 80);
+check(retiredInset.port.closed && insetMessages(retiredInset.port).length === 0, "retired frame never receives an inset");
+const forgedInset = replyLayoutMount({ overlay: true });
+forgedInset.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+check(!parseChild({ v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 80 }), "child inset op is not a valid child message");
+forgedInset.port.receive({ v: 2, op: "whatsapp-reply-inset", nomination: 1, px: 80 });
+check(forgedInset.port.closed && forgedInset.failed() === 1 && forgedInset.layouts.length === 0 && insetMessages(forgedInset.port).length === 0,
+  "child cannot send or route a board-only inset");
+
+const insetReady = (nomination: number, px: number, seq = 1) => ({ v: 2, op: "whatsapp-reply-inset-ready", nomination, px, seq });
+const acknowledged = replyLayoutMount({ overlay: true });
+acknowledged.port.receive(insetReady(1, 80));
+check(!acknowledged.port.closed && acknowledged.appliedInsets.length === 0, "ack before selection and host inset is ignored");
+acknowledged.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+acknowledged.port.receive(insetReady(1, 80));
+check(acknowledged.appliedInsets.length === 0, "ack before host inset is ignored");
+acknowledged.channel.whatsappReplyInset(1, 80);
+acknowledged.port.receive(insetReady(1, 81, 1));
+check(!acknowledged.port.closed && acknowledged.appliedInsets.length === 0, "wrong current inset does not stage an acknowledgement");
+acknowledged.channel.whatsappReplyInset(1, 81);
+check(acknowledged.appliedInsets.length === 0, "sending a previously acknowledged wrong value does not apply it");
+acknowledged.port.receive(insetReady(1, 81, 2));
+acknowledged.port.receive(insetReady(1, 81, 2));
+check(JSON.stringify(acknowledged.appliedInsets) === "[81]", "matching latest inset is applied once, including after a previously wrong ack");
+acknowledged.channel.whatsappReplyInset(1, 0);
+acknowledged.port.receive(insetReady(1, 0, 3));
+acknowledged.channel.whatsappReplyInset(1, 512);
+acknowledged.port.receive(insetReady(1, 512, 4));
+check(JSON.stringify(acknowledged.appliedInsets) === "[81,0,512]", "zero and maximum insets can be acknowledged");
+acknowledged.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550002222@s.whatsapp.net" });
+acknowledged.channel.whatsappReplyInset(2, 80);
+acknowledged.port.receive(insetReady(1, 80));
+check(!acknowledged.port.closed && JSON.stringify(acknowledged.appliedInsets) === "[81,0,512]", "stale nomination does not stage an acknowledgement");
+acknowledged.port.receive(insetReady(2, 80));
+check(JSON.stringify(acknowledged.appliedInsets) === "[81,0,512,80]", "current nomination can acknowledge the same value after a stale ack");
+acknowledged.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: null });
+acknowledged.port.receive(insetReady(2, 80));
+acknowledged.port.receive(insetReady(3, 80));
+check(!acknowledged.port.closed && JSON.stringify(acknowledged.appliedInsets) === "[81,0,512,80]", "cleared selection cannot apply an inset");
+
+const repeatedHeight = replyLayoutMount({ overlay: true });
+repeatedHeight.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+repeatedHeight.channel.whatsappReplyInset(1, 225);
+repeatedHeight.port.receive(insetReady(1, 225, 1));
+repeatedHeight.channel.whatsappReplyInset(1, 141);
+repeatedHeight.port.receive(insetReady(1, 141, 2));
+repeatedHeight.channel.whatsappReplyInset(1, 225);
+repeatedHeight.port.receive(insetReady(1, 225, 1));
+check(!repeatedHeight.port.closed && JSON.stringify(repeatedHeight.appliedInsets) === "[225,141]",
+  "a stale sequence cannot acknowledge a repeated height after a shrink");
+repeatedHeight.port.receive(insetReady(1, 225, 3));
+check(JSON.stringify(repeatedHeight.appliedInsets) === "[225,141,225]",
+  "the current sequence acknowledges the repeated height");
+
+for (const invalid of [
+  { ...insetReady(1, 80), extra: true },
+  { v: 2, op: "whatsapp-reply-inset-ready", nomination: 1 },
+  { v: 2, op: "whatsapp-reply-inset-ready", px: 80 },
+  { v: 2, op: "whatsapp-reply-inset-ready", nomination: 1, px: 80 },
+  { ...insetReady(1, 80), v: 1 },
+  ...[-1, 513, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "80", null].map(px => ({ ...insetReady(1, 80), px })),
+  ...[-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1", null].map(nomination => ({ ...insetReady(1, 80), nomination })),
+  ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1", null].map(seq => ({ ...insetReady(1, 80), seq })),
+]) {
+  const bad = replyLayoutMount({ overlay: true });
+  bad.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+  bad.channel.whatsappReplyInset(1, 80);
+  check(!parseChild(invalid), `malformed inset ack does not parse: ${JSON.stringify(invalid)}`);
+  bad.port.receive(invalid);
+  check(bad.port.closed && bad.failed() === 1 && bad.appliedInsets.length === 0, `malformed inset ack closes: ${JSON.stringify(invalid)}`);
+}
+const v1InsetReady = replyLayoutMount();
+v1InsetReady.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "15550001111@s.whatsapp.net" });
+v1InsetReady.port.receive(insetReady(1, 80));
+check(v1InsetReady.port.closed && v1InsetReady.failed() === 1 && v1InsetReady.appliedInsets.length === 0,
+  "v1 reply layout closes on an unsupported inset acknowledgement");
 
 void (async () => {
   let activeSignals: AbortSignal[] = [];

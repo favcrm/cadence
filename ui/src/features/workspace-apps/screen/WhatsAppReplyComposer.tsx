@@ -3,7 +3,7 @@ import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { object, type recordServices } from "./screenServices";
-import type { WhatsAppReplyAvailability, WhatsAppReplyBounds } from "./screenProtocol";
+import { WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
 export interface WhatsAppReplySelection {
@@ -12,6 +12,7 @@ export interface WhatsAppReplySelection {
   services: ReturnType<typeof recordServices>;
   current(): boolean;
   announceAvailability?(state: WhatsAppReplyAvailability): void;
+  announceInset?(px: number): number | undefined;
   announce(dirty: boolean, refresh?: boolean): void;
 }
 
@@ -66,7 +67,7 @@ function recordedState(state: unknown): Outcome {
   return state === "sent" || state === "accepted" || state === "failed" ? state : "uncertain";
 }
 
-export default function WhatsAppReplyComposer({ selection, bounds }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null }) {
+export default function WhatsAppReplyComposer({ selection, bounds, inset }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null; inset?: { px: number; seq: number } }) {
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
   const [verification, setVerification] = useState<RecipientCheck>();
@@ -78,6 +79,34 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
   const running = useRef(false);
   const pointer = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
+  const dock = useRef<HTMLDivElement>(null);
+  const size = useRef({ measured: -1, room: 0, seq: undefined as number | undefined });
+  const overlay = selection.announceInset !== undefined;
+  const hidden = bounds === null || (overlay && bounds === undefined);
+  useLayoutEffect(() => {
+    const node = dock.current;
+    const announce = selection.announceInset;
+    if (!announce || !node) return;
+    const state = size.current;
+    const publish = () => {
+      const height = node.getBoundingClientRect().height;
+      const px = Math.min(WHATSAPP_REPLY_INSET_MAX, Math.ceil(height));
+      if (px !== state.measured) {
+        state.measured = px;
+        // A shrink can already be in flight when the next grow arrives.
+        // Narrow the paint fence before the frame is allowed to reclaim room.
+        state.room = Math.min(state.room, px);
+        state.seq = announce(px);
+      }
+      if (inset && inset.seq === state.seq) state.room = inset.px;
+      node.dataset.inset = state.room === 0 ? "empty" : state.room < height ? "partial" : "full";
+      node.style.setProperty("--wa-reply-room", `${state.room}px`);
+    };
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(node, { box: "border-box" });
+    return () => observer.disconnect();
+  }, [selection, inset, hidden]);
   const group = selection.conversationId.endsWith("@g.us");
   const recipient = verification?.recipient;
   const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
@@ -198,22 +227,31 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
     : attempt?.outcome === "accepted" ? (zh ? "WhatsApp 已接收，但未確認送達。" : "WhatsApp accepted the message; delivery isn’t confirmed.")
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
+  const status = note && <div className="wa-reply-status">
+    <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
+    {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
+  </div>;
 
-  return <div className="wa-reply-dock" hidden={bounds === null} data-positioned={bounds ? "" : undefined}
-    style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
-    {note && <div className="wa-reply-status">
-      <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
-      {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
-    </div>}
+  return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
+    style={bounds ? {
+      marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%`,
+      // Leave room for the heading and a readable transcript when the keyboard is open.
+      maxBlockSize: overlay ? `min(55%, ${WHATSAPP_REPLY_INSET_MAX}px, max(5rem, 100% - 12rem))` : undefined,
+    } : undefined}>
+    {!overlay && status}
     <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
-      <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
+      {overlay && status}
+      {(!overlay || recipient) && <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
           : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
           : availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…")
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
-      </p>
-      <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"} placeholder={zh ? "輸入回覆…" : "Write a reply…"}
+      </p>}
+      <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"}
+        placeholder={overlay && availability !== "verified"
+          ? (availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…") : (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation"))
+          : (zh ? "輸入回覆…" : "Write a reply…")}
         value={text} rows={1} maxLength={4096} readOnly={readOnly}
         onChange={e => setText(e.target.value)} onKeyDown={e => {
           if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -223,7 +261,9 @@ export default function WhatsAppReplyComposer({ selection, bounds }: { selection
       <div className="app-chat-composer-tools wa-reply-tools">
         {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
-        {(!readOnly || busy) && <span className="wa-reply-hint" aria-live="polite">{busy ? (zh ? "處理中…" : "Working…") : (zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line")}</span>}
+        <span className="wa-reply-hint" aria-live="polite">
+          {busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
+        </span>
         <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
           onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
           onClick={e => {

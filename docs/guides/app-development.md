@@ -357,7 +357,20 @@ right edges of the message pane, relative to the iframe viewport. Use `null`
 when details replace the pane. An old nomination cannot change the layout.
 Unnegotiated or malformed messages close the port. This hint only positions
 or hides the existing dock; it changes no draft, recipient, or send rights.
-The dock remains below the iframe, with a rail-based layout for older bundles.
+If the mount also offers `wa_compose_inset_ack=1`, the bundle may select
+`screen-whatsapp-reply-layout.v2` instead of v1, using the same layout nomination
+and bounds. The board then positions its dock over the measured pane without
+shortening the iframe. It sends `{v:2, op:"whatsapp-reply-inset", nomination, seq, px}`.
+`seq` increases within a nomination; `px` is the requested height, including
+bottom safe-area space, in whole CSS pixels from 0 to 512 (zero means hidden).
+Apply the clearance to the conversation's scroll content, not to the frame or
+the inbox rail. The WABA composer is a solid board-owned card over the pane;
+its bottom inset becomes trailing space in the message list so the latest
+message can scroll clear.
+After the inset and pinned scroll position are committed, echo `nomination`,
+`seq` and `px` in `{v:2, op:"whatsapp-reply-inset-ready", nomination, seq, px}`.
+The board only paints within confirmed space. Ignore old nominations and sequences.
+A v1 or unnegotiated dock stays below the iframe and never sends an inset.
 
 Do not ship two bridge protocols for one app. A local adapter around app-kit is
 fine when it carries app-specific policy; a second MessagePort implementation is

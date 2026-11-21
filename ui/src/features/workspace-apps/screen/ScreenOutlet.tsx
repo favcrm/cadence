@@ -133,6 +133,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     revision: number;
     selection: WhatsAppReplySelection;
     bounds?: WhatsAppReplyBounds | null;
+    inset?: { px: number; seq: number };
   } | null>(null);
   const whatsappRevision = useRef(0);
   const [link, setLink] = useState<string | null>(null);
@@ -388,6 +389,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               announceAvailability: nomination === null ? undefined : state => {
                 if (currentSelection()) owned?.whatsappReplyAvailability(nomination, state);
               },
+              announceInset: nomination !== null && owned.whatsappReplyOverlay ? px => {
+                return currentSelection() ? owned?.whatsappReplyInset(nomination, px) : undefined;
+              } : undefined,
               announce: (dirty, refresh = false) => {
                 if (!currentSelection()) return;
                 const changed = composerUnsaved !== dirty;
@@ -414,6 +418,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         if (composeServices) {
           mountQuery.set("wa_compose_availability", "1");
           mountQuery.set("wa_compose_layout", "1");
+          mountQuery.set("wa_compose_inset_ack", "1");
         }
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
@@ -483,6 +488,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 if (!selectedWhatsApp || !composeCurrent()) return;
                 const revision = whatsappRevision.current;
                 setWhatsAppReply(reply => reply?.revision === revision ? { ...reply, bounds } : reply);
+              },
+              onWhatsAppReplyInsetApplied: (px, seq) => {
+                if (!selectedWhatsApp || !composeCurrent()) return;
+                const revision = whatsappRevision.current;
+                setWhatsAppReply(reply => reply?.revision === revision ? { ...reply, inset: { px, seq } } : reply);
               },
             } : {}),
             onScreenDrawer: onScreenDrawer
@@ -628,7 +638,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         )}
       </div>
       {whatsappReply?.selection.current() && <WhatsAppReplyComposer key={whatsappReply.revision}
-        selection={whatsappReply.selection} bounds={whatsappReply.bounds} />}
+        selection={whatsappReply.selection} bounds={whatsappReply.bounds} inset={whatsappReply.inset} />}
       <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}

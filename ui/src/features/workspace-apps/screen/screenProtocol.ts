@@ -55,6 +55,7 @@ export type ChildToHost =
   | { v: 2; op: "asset"; ref: string }
   | { v: 2; op: "whatsapp-compose"; conversation_id: string | null }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
+  | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
   | AudioRequest
   | AudioSessionRequest
   | CallRequest
@@ -236,6 +237,9 @@ export const SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 = "screen-whatsapp-reply-avai
 export type WhatsAppReplyAvailability = "checking" | "blocked" | "verified";
 /** Presentation-only: physical left/right edges in basis points of the iframe width. */
 export const SCREEN_WHATSAPP_REPLY_LAYOUT_V1 = "screen-whatsapp-reply-layout.v1";
+/** Same bounds, with the host dock over the pane and a measured bottom inset returned to the frame. */
+export const SCREEN_WHATSAPP_REPLY_LAYOUT_V2 = "screen-whatsapp-reply-layout.v2";
+export const WHATSAPP_REPLY_INSET_MAX = 512;
 export type WhatsAppReplyBounds = [left: number, right: number];
 const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.us)$/;
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
@@ -506,7 +510,7 @@ export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -917,7 +921,8 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1)
+    !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -1002,6 +1007,11 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       return { v: 2, op: "whatsapp-reply-layout", nomination: d.nomination, bounds: [bounds[0], bounds[1]] };
     }
     return null;
+  }
+  if (d.v === 2 && d.op === "whatsapp-reply-inset-ready" && Object.keys(d).sort().join() === "nomination,op,px,seq,v" &&
+      isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER) && isBoundedSafeInt(d.seq, 1, Number.MAX_SAFE_INTEGER) &&
+      isBoundedSafeInt(d.px, 0, WHATSAPP_REPLY_INSET_MAX)) {
+    return { v: 2, op: "whatsapp-reply-inset-ready", nomination: d.nomination, seq: d.seq, px: d.px };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {

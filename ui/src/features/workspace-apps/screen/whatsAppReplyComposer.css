@@ -1,5 +1,5 @@
-/* Only legacy packages need the board to infer the left rail. */
-[data-installed-app-screen]:has(> .wa-reply-dock:not([data-positioned])) {
+/* The overlay uses the outlet width for its gutters; only legacy infers the rail. */
+[data-installed-app-screen]:has(> .wa-reply-dock:is([data-overlay], :not([data-positioned]))) {
   container: wa-reply-surface / inline-size;
 }
 
@@ -10,6 +10,54 @@
   grid-template-columns: minmax(0, 1fr);
   gap: 0.4rem;
   padding: 0.4rem 0.75rem max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.wa-reply-dock[data-overlay] {
+  position: absolute;
+  inset: auto;
+  inset-inline: 0;
+  inset-block-end: 0;
+  z-index: 1;
+  grid-template-rows: minmax(0, 1fr);
+  padding: 0 clamp(0.75rem, 2.75cqi, 1.75rem) max(0.75rem, env(safe-area-inset-bottom));
+  pointer-events: none;
+}
+
+.wa-reply-dock[data-overlay]:not([data-inset]), .wa-reply-dock[data-inset="empty"] { visibility: hidden; }
+.wa-reply-dock[data-overlay] { clip-path: inset(max(-1.5rem, calc(100% - var(--wa-reply-room, 0px))) -1.5rem -1.5rem); }
+
+.wa-reply-dock[data-overlay] > * { pointer-events: auto; }
+.wa-reply-dock[data-overlay] .app-chat-composer.wa-reply-card {
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  gap: 0.2rem;
+  padding: 0.625rem 0.75rem 0.5rem 0.875rem;
+  border: 1px solid color-mix(in srgb, var(--color-ink-400) 24%, transparent);
+  border-radius: 1rem;
+  background-color: var(--color-ink-850);
+  box-shadow: none;
+}
+.wa-reply-dock[data-overlay] .app-chat-composer.wa-reply-card:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 75%, transparent);
+}
+.wa-reply-dock[data-overlay] .wa-reply-to,
+.wa-reply-dock[data-overlay] .wa-reply-hint { font-size: var(--text-micro); }
+.wa-reply-dock[data-overlay] .app-chat-box {
+  min-block-size: 2rem;
+  max-block-size: min(9rem, 25dvb);
+  padding: 0.2rem 0;
+  overscroll-behavior: contain;
+  font-size: inherit;
+}
+.wa-reply-dock[data-overlay] .wa-reply-tools { flex-wrap: wrap; gap: 0.25rem 0.55rem; }
+.wa-reply-dock[data-overlay] .wa-reply-send { margin-inline-start: auto; }
+@container wa-reply-surface (width < 48rem) {
+  .wa-reply-dock[data-overlay] .wa-reply-send { inline-size: 2.75rem; }
+  .wa-reply-dock[data-overlay] .wa-reply-shortcut { display: none; }
+}
+@media (pointer: coarse) {
+  .wa-reply-dock[data-overlay] .wa-reply-send { inline-size: 2.75rem; }
 }
 
 .wa-reply-dock[hidden] { display: none; }
