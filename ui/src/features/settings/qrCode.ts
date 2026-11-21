@@ -440,7 +440,6 @@ export function encodeQrMatrix(text: string): QrMatrix | null {
   const codewords = interleaveBlocks(data, chosen.spec);
   placeCodewords(modules, reserved, codewords);
 
-  let bestMask = 0;
   let bestScore = Infinity;
   let bestGrid = modules;
 
@@ -451,13 +450,10 @@ export function encodeQrMatrix(text: string): QrMatrix | null {
     const score = penaltyScore(candidate);
     if (score < bestScore) {
       bestScore = score;
-      bestMask = maskId;
       bestGrid = candidate;
     }
   }
 
-  // Keep format mask index unambiguous if unused variable warning checked
-  void bestMask;
   return { size, modules: bestGrid };
 }
 

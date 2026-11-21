@@ -75,6 +75,14 @@ function downloadBackupCodes(codes: string[], heading: string): void {
   URL.revokeObjectURL(url);
 }
 
+function isRequiredWorkspace(entry: unknown): entry is RequiredWorkspace {
+  return isRecord(entry) && typeof entry.id === "string" && typeof entry.name === "string";
+}
+
+function replaceToken(template: string, token: string, value: string): string {
+  return template.replace(token, () => value);
+}
+
 function parseSecurityState(payload: unknown): AccountSecurityState {
   if (
     !isRecord(payload) ||
@@ -86,9 +94,7 @@ function parseSecurityState(payload: unknown): AccountSecurityState {
     throw new Error("unexpected security state");
   }
   const rawWorkspaces = Array.isArray(payload.requiredByWorkspaces) ? payload.requiredByWorkspaces : [];
-  const requiredByWorkspaces: RequiredWorkspace[] = rawWorkspaces
-    .filter((entry): entry is Record<string, unknown> => isRecord(entry) && typeof entry.id === "string" && typeof entry.name === "string")
-    .map((entry) => ({ id: entry.id as string, name: entry.name as string }));
+  const requiredByWorkspaces: RequiredWorkspace[] = rawWorkspaces.filter(isRequiredWorkspace);
   return {
     email: payload.email,
     hasPassword: payload.hasPassword,
@@ -113,6 +119,8 @@ function translateSecurityError(error: unknown, t: Translate, fallback: string):
       return t("Two-factor authentication is already enabled.");
     case "two_factor_not_enabled":
       return t("Two-factor authentication is not enabled.");
+    case "two_factor_not_started":
+      return t("Two-factor setup expired. Start again.");
     case "two_factor_required_by_org":
       return t("Two-factor authentication is required by workspace policy and cannot be disabled.");
     case "rate_limited":
@@ -207,6 +215,7 @@ export default function Security({
 
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showToast = useCallback((kind: ToastMsg["kind"], text: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ kind, text });
@@ -216,6 +225,7 @@ export default function Security({
   useEffect(() => {
     return () => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
+      if (copyTimer.current) clearTimeout(copyTimer.current);
     };
   }, []);
 
@@ -264,10 +274,12 @@ export default function Security({
   useEffect(() => {
     return onPrivateSessionReset(() => {
       clearSecrets();
+      setState(null);
+      setLoadError(null);
+      setToast(null);
       setReauthNotice(false);
-      void load();
     });
-  }, [clearSecrets, load]);
+  }, [clearSecrets]);
 
   const copyText = async (value: string, target: "secret" | "codes") => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
@@ -277,7 +289,8 @@ export default function Security({
     try {
       await navigator.clipboard.writeText(value);
       setCopiedTarget(target);
-      setTimeout(() => setCopiedTarget((cur) => (cur === target ? null : cur)), 2000);
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopiedTarget((cur) => (cur === target ? null : cur)), 2000);
     } catch {
       showToast("warn", t("Copy unavailable. Select and copy manually."));
     }
@@ -332,10 +345,12 @@ export default function Security({
         if (reauthRequired) {
           setReauthNotice(true);
           onSessionInvalidated?.();
-        } else if (revoked > 0) {
+        } else if (revoked === 1) {
+          showToast("ok", t("Password changed. Signed out 1 other session."));
+        } else if (revoked > 1) {
           showToast(
             "ok",
-            t("Password changed. Signed out {count} other sessions.").replace("{count}", String(revoked)),
+            replaceToken(t("Password changed. Signed out {count} other sessions."), "{count}", String(revoked)),
           );
         } else {
           showToast("ok", t("Password changed."));
@@ -361,7 +376,7 @@ export default function Security({
     try {
       const res = await postSecurity("/api/account/security/password/reset-email", {});
       const targetEmail = isRecord(res) && typeof res.email === "string" ? res.email : state?.email ?? "";
-      setResetNotice(t("Reset link sent to {email}.").replace("{email}", targetEmail));
+      setResetNotice(replaceToken(t("Reset link sent to {email}."), "{email}", targetEmail));
     } catch (failure) {
       setResetError(translateSecurityError(failure, t, "Could not send password reset email."));
     } finally {
@@ -499,7 +514,7 @@ export default function Security({
   const qrMatrix = setup ? encodeQrMatrix(setup.totpURI) : null;
   const manualSecret = setup ? extractSecret(setup.totpURI) : "";
   const orgLocked = (state?.requiredByWorkspaces.length ?? 0) > 0;
-  const requiredNames = state?.requiredByWorkspaces.map((w) => w.name).join(", ") ?? "";
+  const requiredNames = state?.requiredByWorkspaces.map((w) => w.name || w.id).join(", ") ?? "";
 
   return (
     <main className="px-4 lg:px-8 py-5 min-w-0 max-w-3xl">
@@ -524,7 +539,7 @@ export default function Security({
 
       {!loading && loadError && !state && (
         <div className="mt-7 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-ink-700 p-5">
-          <p className="security-error">{loadError}</p>
+          <p role="alert" className="security-error">{loadError}</p>
           <Button onClick={() => void load()}>{t("Retry")}</Button>
         </div>
       )}
@@ -553,7 +568,6 @@ export default function Security({
               </div>
               {!pwOpen && (
                 <Button
-                  aria-expanded={false}
                   onClick={() => {
                     setPwError(null);
                     setResetNotice(null);
@@ -597,6 +611,7 @@ export default function Security({
                         type="button"
                         className="security-toggle-pw"
                         onClick={() => setShowPw((v) => !v)}
+                        aria-pressed={showPw}
                         aria-label={t(showPw ? "Hide password" : "Show password")}
                       >
                         {t(showPw ? "Hide" : "Show")}
@@ -624,6 +639,7 @@ export default function Security({
                       <button
                         type="button"
                         className="security-link-btn"
+                        aria-pressed={showPw}
                         onClick={() => setShowPw((v) => !v)}
                       >
                         {t(showPw ? "Hide password" : "Show password")}
@@ -707,10 +723,13 @@ export default function Security({
                   </span>
                   {state.twoFactorEnabled && (
                     <span className="text-label text-ink-400">
-                      {t("{count} backup codes remaining").replace(
-                        "{count}",
-                        String(state.backupCodesRemaining),
-                      )}
+                      {state.backupCodesRemaining === 1
+                        ? t("1 backup code remaining")
+                        : replaceToken(
+                            t("{count} backup codes remaining"),
+                            "{count}",
+                            String(state.backupCodesRemaining),
+                          )}
                     </span>
                   )}
                 </div>
@@ -719,7 +738,7 @@ export default function Security({
                 </p>
                 {orgLocked && (
                   <p className="mt-1.5 text-label text-ink-300">
-                    {t("Required by workspace policy ({names}).").replace("{names}", requiredNames)}
+                    {replaceToken(t("Required by workspace policy ({names})."), "{names}", requiredNames)}
                   </p>
                 )}
               </div>
@@ -735,6 +754,7 @@ export default function Security({
                   <Button
                     onClick={() => {
                       setTfaError(null);
+                      setRevealedCodes(null);
                       setTfaPassword("");
                       setTfaPanel("regen");
                     }}
@@ -746,12 +766,13 @@ export default function Security({
                     disabled={orgLocked}
                     title={
                       orgLocked
-                        ? t("Required by workspace policy ({names}).").replace("{names}", requiredNames)
+                        ? replaceToken(t("Required by workspace policy ({names})."), "{names}", requiredNames)
                         : undefined
                     }
                     onClick={() => {
                       if (orgLocked) return;
                       setTfaError(null);
+                      setRevealedCodes(null);
                       setTfaPassword("");
                       setTfaPanel("disable");
                     }}
@@ -761,6 +782,12 @@ export default function Security({
                 </div>
               )}
             </div>
+
+            {tfaPanel === "none" && tfaError && (
+              <p role="alert" className="security-error mt-3">
+                {tfaError}
+              </p>
+            )}
 
             {tfaPanel === "enable-password" && (
               <form

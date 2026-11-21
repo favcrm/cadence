@@ -21,7 +21,7 @@ export default function AccountMenu({
   trigger: "avatar" | "row";
   placement: "below-end" | "above-start";
   settingsHref?: string;
-  securityHref?: string | undefined;
+  securityHref?: string;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
   /** Reports the dialog's open state (the sidebar raises itself while it is open). */

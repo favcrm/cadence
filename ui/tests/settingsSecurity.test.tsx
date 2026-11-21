@@ -125,7 +125,8 @@ async function main() {
       });
     };
     const { host, unmount } = await mount();
-    ok(host.textContent?.includes("Account security settings are personal to a signed-in user."), "operator refusal mapped cleanly");
+    const loadAlert = host.querySelector('[role="alert"]');
+    ok(loadAlert?.textContent?.includes("Account security settings are personal to a signed-in user."), "operator refusal mapped cleanly with role=alert");
     const retry = buttonByText(host, "Retry");
     ok(retry, "Retry button present");
     act(() => { retry.click(); });
@@ -148,6 +149,7 @@ async function main() {
     const totpURI = "otpauth://totp/AgenticOS:otp.user%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=AgenticOS&digits=6&period=30";
     const backupCodes = Array.from({ length: 10 }, (_, i) => `abcde-0000${i}`);
 
+    let enableAttempts = 0;
     routeHandler = (method, path, body) => {
       if (method === "GET" && path === "/api/account/security") return json(state);
       if (path === "/api/account/security/password/set") {
@@ -155,6 +157,8 @@ async function main() {
         return json({ hasPassword: true });
       }
       if (path === "/api/account/security/two-factor/enable") {
+        enableAttempts += 1;
+        if (enableAttempts === 1) return fail(429, "rate_limited");
         return json({ totpURI, backupCodes });
       }
       if (path === "/api/account/security/two-factor/verify") {
@@ -169,10 +173,16 @@ async function main() {
 
     const { host, unmount } = await mount();
 
-    // Enable 2FA directly without password prompt because !hasPassword
+    // Passwordless 2FA enable failure surfaces visible alert while tfaPanel stays "none"
     const enableBtn = buttonByText(host, "Enable two-factor authentication");
     ok(enableBtn, "Enable 2FA button rendered");
     act(() => { enableBtn.click(); });
+    await flush();
+    const rateAlert = host.querySelector('[role="alert"]');
+    ok(rateAlert?.textContent?.includes("Too many attempts. Please wait a moment and try again."), "passwordless 2FA enable error rendered in DOM");
+
+    // Retry Enable 2FA directly without password prompt because !hasPassword
+    act(() => { buttonByText(host, "Enable two-factor authentication")!.click(); });
     await flush();
 
     const enableCall = calls.find((c) => c.path === "/api/account/security/two-factor/enable");
@@ -201,6 +211,7 @@ async function main() {
     // Set password -> mismatch guard -> success
     const setPwToggle = buttonByText(host, "Set password");
     ok(setPwToggle, "Set password toggle rendered");
+    ok(!setPwToggle.hasAttribute("aria-expanded"), "Button does not emit dead aria-expanded attribute");
     act(() => { setPwToggle.click(); });
     await flush();
     const inputs = host.querySelectorAll('input[type="password"]');
@@ -286,29 +297,33 @@ async function main() {
     await flush();
     ok(host.textContent?.includes("zzzzz-10000"), "regenerated codes rendered");
 
-    // Session reset scrubs visible backup codes / inputs
-    act(() => { resetPrivateSession(); });
-    allowPrivateReads();
-    await flush();
-    ok(!host.textContent?.includes("zzzzz-10000"), "session reset clears sensitive backup code state");
-
-    // Disable 2FA flow
+    // Disable 2FA flow clears revealed codes and updates UI state
     act(() => { buttonByText(host, "Disable")!.click(); });
     await flush();
+    ok(!host.textContent?.includes("zzzzz-10000"), "opening Disable clears prior revealed backup codes");
     const disableInput = host.querySelector('input[type="password"]') as HTMLInputElement;
     setInput(disableInput, "pw-ok-123");
     submitForm(disableInput.closest("form")!);
     await flush();
     ok(host.textContent?.includes("Not enabled"), "2FA disabled updates UI state");
+
+    // Session reset scrubs visible state cleanly without triggering spurious reads while paused
+    act(() => { resetPrivateSession(); });
+    await flush();
+    ok(!host.textContent?.includes("owner@example.com"), "session reset clears account state while paused");
+    ok(!host.textContent?.includes("Session verification required"), "session reset does not trigger fetch while paused");
+    allowPrivateReads();
     unmount();
 
-    // Workspace policy locks Disable button
+    // Workspace policy locks Disable button (with id fallback for empty name)
     state.twoFactorEnabled = true;
-    state.requiredByWorkspaces = [{ id: "ws_1", name: "Acme Corp" }];
+    state.backupCodesRemaining = 1;
+    state.requiredByWorkspaces = [{ id: "ws_1", name: "Acme Corp" }, { id: "ws_fallback", name: "" }];
     const lockedMount = await mount();
     const disableLocked = buttonByText(lockedMount.host, "Disable");
     ok(disableLocked?.disabled === true, "Disable button locked by org policy");
-    ok(lockedMount.host.textContent?.includes("Acme Corp"), "workspace name displayed");
+    ok(lockedMount.host.textContent?.includes("Acme Corp, ws_fallback"), "workspace name and id fallback displayed");
+    ok(lockedMount.host.textContent?.includes("1 backup code remaining"), "singular backup code grammar rendered");
     lockedMount.unmount();
   }
 
