@@ -1,6 +1,7 @@
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
 import type {
+  CustomMcpAuthKind,
   CustomMcpConnectionSummary,
   CustomMcpStoredAuthKind,
   CustomMcpToolMode,
@@ -8,24 +9,27 @@ import type {
 } from "../../lib/types";
 
 /**
- * Pure presentation, validation, and return-param helpers for Custom MCP
- * connectors (CAD-2556), matching `agenticos-v2` AOS-682 contracts.
+ * Pure presentation, allowlist-of-shapes UX validation, and return-param helpers
+ * for Custom MCP connectors (CAD-2556). Note: client checks are advisory UX only;
+ * `agenticos-v2` validates SSRF and headers authoritatively server-side.
  */
 
 const CONNECTION_ID_RE = /^conn_mcp_[A-Za-z0-9_-]{8,64}$/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const FORBIDDEN_HOST_SUFFIXES = [
-  ".localhost",
-  ".local",
-  ".internal",
-  ".home.arpa",
-  ".localdomain",
-  ".corp",
-  ".lan",
-  ".cadencecloud.app",
-  ".agenticos.hk",
-] as const;
-const FORBIDDEN_EXACT_HOSTS = new Set([
+const DNS_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const INTERNAL_TLDS = new Set([
+  "localhost",
+  "local",
+  "internal",
+  "arpa",
+  "localdomain",
+  "corp",
+  "lan",
+  "home",
+  "intranet",
+  "private",
+]);
+const RESERVED_EXACT_HOSTS = new Set([
   "localhost",
   "ip6-localhost",
   "ip6-loopback",
@@ -35,24 +39,48 @@ const FORBIDDEN_EXACT_HOSTS = new Set([
   "agenticos.hk",
   "tenant-board-control.internal",
 ]);
-const FORBIDDEN_CUSTOM_HEADERS = new Set([
+const PLATFORM_DOMAIN_SUFFIXES = [".cadencecloud.app", ".agenticos.hk"] as const;
+const RESERVED_TRANSPORT_HEADERS = new Set([
   "host",
   "content-length",
   "transfer-encoding",
   "connection",
+  "keep-alive",
   "proxy-authorization",
   "te",
   "trailer",
   "upgrade",
+  "cookie",
+  "cookie2",
+  "origin",
+  "referer",
+  "authorization",
 ]);
 
-function isBlockedIpv4(host: string): boolean {
-  if (/^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) return true;
-  const parts = host.split(".");
-  if (parts.length !== 4 || parts.some((p) => !/^\d{1,3}$/.test(p))) return false;
+function rawAuthorityHost(httpsUrlText: string): string {
+  const afterScheme = httpsUrlText.slice("https://".length);
+  const authority = afterScheme.split(/[/?#]/, 1)[0] ?? "";
+  const hostPort = authority.includes("@") ? (authority.split("@").pop() ?? "") : authority;
+  if (hostPort.startsWith("[")) {
+    const close = hostPort.indexOf("]");
+    return close === -1 ? hostPort : hostPort.slice(0, close + 1);
+  }
+  return hostPort.split(":", 1)[0] ?? "";
+}
+
+function parseStrictIpv4Literal(host: string): number[] | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return null;
+  const parts = m.slice(1);
+  if (parts.some((p) => p.length > 1 && p.startsWith("0"))) return null;
   const nums = parts.map(Number);
-  if (nums.some((n) => n < 0 || n > 255)) return true;
-  const [a, b, c] = nums;
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return nums;
+}
+
+function isBlockedIpv4Tuple(parts: readonly number[]): boolean {
+  const [a, b, c] = parts;
+  if (a === undefined || b === undefined || c === undefined) return true;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 100 && b >= 64 && b <= 127) return true;
   if (a === 169 && b === 254) return true;
@@ -66,26 +94,88 @@ function isBlockedIpv4(host: string): boolean {
   return a >= 224;
 }
 
-function isBlockedIpv6(raw: string): boolean {
-  const host = raw.split("%")[0].toLowerCase();
-  if (host === "::" || host === "::1" || host === "0:0:0:0:0:0:0:1" || host === "0:0:0:0:0:0:0:0") {
-    return true;
-  }
-  if (host.startsWith("fc") || host.startsWith("fd")) return true;
-  if (host.startsWith("fe8") || host.startsWith("fe9") || host.startsWith("fea") || host.startsWith("feb")) {
-    return true;
-  }
-  if (host.startsWith("fec") || host.startsWith("ff") || host.startsWith("2001:db8:")) return true;
-  if (host.includes("::ffff:")) return true;
-  return false;
+function expandIpv6Words(rawHost: string): number[] | null {
+  const host = rawHost.split("%")[0].toLowerCase();
+  const halves = host.split("::");
+  if (halves.length > 2) return null;
+
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const tokens = side.split(":");
+    const words: number[] = [];
+    for (let i = 0; i < tokens.length; i += 1) {
+      const token = tokens[i];
+      if (token.includes(".")) {
+        if (i !== tokens.length - 1) return null;
+        const v4 = parseStrictIpv4Literal(token);
+        if (!v4) return null;
+        words.push(((v4[0] << 8) | v4[1]) >>> 0, ((v4[2] << 8) | v4[3]) >>> 0);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(token)) return null;
+        words.push(Number.parseInt(token, 16));
+      }
+    }
+    return words;
+  };
+
+  const left = parseSide(halves[0] ?? "");
+  const right = halves.length === 2 ? parseSide(halves[1] ?? "") : [];
+  if (!left || !right) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const fill = 8 - (left.length + right.length);
+  if (fill < 1) return null;
+  return [...left, ...Array.from({ length: fill }, () => 0), ...right];
 }
 
-/** Client-side UX pre-check matching `validateCustomMcpEndpoint` (server remains authoritative). */
+function ipv4FromWords(words: readonly number[], startIndex: number): number[] {
+  const hi = words[startIndex] ?? 0;
+  const lo = words[startIndex + 1] ?? 0;
+  return [(hi >>> 8) & 0xff, hi & 0xff, (lo >>> 8) & 0xff, lo & 0xff];
+}
+
+function isPublicIpv6(raw: string): boolean {
+  const words = expandIpv6Words(raw);
+  if (!words) return false;
+  const allZero = (from: number, to: number) => words.slice(from, to).every((w) => w === 0);
+  if (allZero(0, 8)) return false;
+  if (allZero(0, 7) && words[7] === 1) return false;
+  if (allZero(0, 5) && (words[5] === 0 || words[5] === 0xffff)) {
+    return !isBlockedIpv4Tuple(ipv4FromWords(words, 6));
+  }
+  if (allZero(0, 4) && words[4] === 0xffff && words[5] === 0) {
+    return !isBlockedIpv4Tuple(ipv4FromWords(words, 6));
+  }
+  if (words[0] === 0x0064 && words[1] === 0xff9b) {
+    if (words[2] === 1) return false;
+    return allZero(2, 6) ? !isBlockedIpv4Tuple(ipv4FromWords(words, 6)) : false;
+  }
+  if (words[0] === 0x2002) return !isBlockedIpv4Tuple(ipv4FromWords(words, 1));
+  if (words[0] === 0x2001 && words[1] === 0) return false;
+  if (words[0] === 0x2001 && words[1] === 0x0db8) return false;
+  if (words[0] === 0x0100 && allZero(1, 4)) return false;
+  if ((words[0] & 0xfe00) === 0xfc00) return false;
+  if ((words[0] & 0xffc0) === 0xfe80 || (words[0] & 0xffc0) === 0xfec0) return false;
+  if ((words[0] & 0xff00) === 0xff00) return false;
+  return (words[0] & 0xe000) === 0x2000;
+}
+
+/** Allowlist-of-shapes UX pre-check matching `validateCustomMcpEndpoint` (server remains authoritative). */
 export function validateCustomMcpUrlInput(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return "Enter the server's https:// MCP endpoint URL.";
   if (trimmed.length > 2048 || /[\u0000-\u0020\u007f]/.test(trimmed)) {
     return "Endpoint URL is invalid.";
+  }
+  if (/^https:\/\//i.test(trimmed)) {
+    const rawHost = rawAuthorityHost(trimmed).replace(/\.+$/, "").toLowerCase();
+    if (
+      rawHost &&
+      !rawHost.startsWith("[") &&
+      ((/^[0-9.]+$/.test(rawHost) && parseStrictIpv4Literal(rawHost) === null) ||
+        /^0x[0-9a-f]+$/i.test(rawHost.split(".").pop() ?? ""))
+    ) {
+      return "Loopback, private, or non-canonical IPv4 endpoints are blocked.";
+    }
   }
   let url: URL;
   try {
@@ -102,20 +192,31 @@ export function validateCustomMcpUrlInput(raw: string): string | null {
   const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.+$/, "").toLowerCase();
   if (!host) return "Endpoint URL must name a host.";
   if (
-    FORBIDDEN_EXACT_HOSTS.has(host) ||
-    FORBIDDEN_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
+    RESERVED_EXACT_HOSTS.has(host) ||
+    PLATFORM_DOMAIN_SUFFIXES.some((suffix) => host.endsWith(suffix))
   ) {
     return "Internal or platform hosts are blocked.";
   }
   if (host.includes(":")) {
-    if (isBlockedIpv6(host)) return "Private or reserved IPv6 endpoints are blocked.";
+    if (!isPublicIpv6(host)) return "Private or reserved IPv6 endpoints are blocked.";
     return null;
   }
-  if (isBlockedIpv4(host)) {
-    return "Loopback, private, or reserved IPv4 endpoints are blocked.";
+  if (parseStrictIpv4Literal(host) || /^[0-9.]+$/.test(host)) {
+    const ipv4 = parseStrictIpv4Literal(host);
+    if (!ipv4 || isBlockedIpv4Tuple(ipv4)) {
+      return "Loopback, private, or reserved IPv4 endpoints are blocked.";
+    }
+    return null;
   }
-  if (!host.includes(".")) {
-    return "Single-label internal hostnames are blocked.";
+  const labels = host.split(".");
+  const tld = labels[labels.length - 1] ?? "";
+  if (
+    labels.length < 2 ||
+    !labels.every((label) => DNS_LABEL_RE.test(label)) ||
+    /^[0-9]+$/.test(tld) ||
+    INTERNAL_TLDS.has(tld)
+  ) {
+    return "Internal or invalid endpoint hostnames are blocked.";
   }
   return null;
 }
@@ -153,6 +254,23 @@ export function customMcpReturn(search: string): CustomMcpReturn | null {
 export function mcpFocusParam(search: string): string | null {
   const raw = new URLSearchParams(search).get("mcp_focus")?.trim() ?? "";
   return raw ? raw.slice(0, 200) : null;
+}
+
+export function customMcpAuthOptionLabel(authKind: CustomMcpAuthKind): string {
+  switch (authKind) {
+    case "auto":
+      return "Auto MCP OAuth 2.1 + PKCE";
+    case "oauth":
+      return "OAuth 2.1";
+    case "oauth_static":
+      return "OAuth client ID";
+    case "bearer":
+      return "Bearer token";
+    case "header":
+      return "Custom headers";
+    case "none":
+      return "No auth";
+  }
 }
 
 export function customMcpAuthLabel(authKind: CustomMcpStoredAuthKind): string {
@@ -257,7 +375,7 @@ export function parseCustomHeadersInput(raw: string): {
     if (!HEADER_NAME_RE.test(name) || name.length > 64) {
       return { headers: [], error: `Invalid header name "${name}".` };
     }
-    if (FORBIDDEN_CUSTOM_HEADERS.has(name.toLowerCase())) {
+    if (RESERVED_TRANSPORT_HEADERS.has(name.toLowerCase()) || name.toLowerCase().startsWith("x-forwarded-") || name.toLowerCase().startsWith("cf-") || name.toLowerCase().startsWith("x-agenticos-")) {
       return { headers: [], error: `Header "${name}" cannot be overridden.` };
     }
     if (!value || value.length > 4096) {
@@ -291,6 +409,8 @@ const CUSTOM_MCP_ERROR_COPY: Record<string, string> = {
   guide_fetch_failed: "Could not fetch the Agent Guide URL.",
   validation_failed: "Check the entered fields and try again.",
   not_found: "That Custom MCP connection no longer exists.",
+  limit_exceeded: "Maximum number of Custom MCP servers reached for this workspace.",
+  invalid_schema: "The remote server returned an invalid tool schema.",
   mcp_upstream_error: "The remote Custom MCP server reported an error.",
   capability_unavailable: "Custom MCP operation could not be completed.",
 };

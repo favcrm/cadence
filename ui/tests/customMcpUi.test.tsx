@@ -169,14 +169,33 @@ async function main() {
     },
   ];
 
+  const policyCalls: string[] = [];
   const innerFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
-    if (url.endsWith("/api/connections/mcp")) {
+    const method = init?.method ?? "GET";
+    if (url.endsWith("/api/connections/mcp") && method === "GET") {
       return new Response(JSON.stringify({ connections: [sampleMcp] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
+    }
+    if (url.endsWith("/api/connections/mcp") && method === "POST") {
+      return new Response(
+        JSON.stringify({
+          mode: "oauth_redirect",
+          authorization_url: "https://auth.acme.example/authorize?state=xyz",
+          connection_id: "conn_mcp_new_1",
+          discovery: {
+            issuer: "https://auth.acme.example",
+            authorization_host: "auth.acme.example",
+            registration: "dcr",
+            scopes: ["mcp:read"],
+            resource_metadata_url: "https://mcp.acme.example/.well-known/oauth-protected-resource",
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
     }
     if (url.endsWith("/api/connections")) {
       return new Response(JSON.stringify({ connections: platformRows }), {
@@ -190,7 +209,35 @@ async function main() {
         headers: { "Content-Type": "application/json" },
       });
     }
-    return new Response(JSON.stringify({}), {
+    if (url.endsWith("/api/agents")) {
+      return new Response(JSON.stringify({ agents: [{ alias: "nova" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.endsWith(`/api/connections/${sampleMcp.id}/policy`)) {
+      policyCalls.push(`${method} ${url}`);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          policy: {
+            connection_id: sampleMcp.id,
+            provider: "custom_mcp",
+            visibility: method === "POST" ? "personal" : "shared",
+            owner_user_id: method === "POST" ? "usr_1" : null,
+            is_default: false,
+            write_mode: "ask_approval",
+            allow_external_triggers: false,
+            allowed_agents: ["nova"],
+            policy_revision: 1,
+            updated: 1,
+            updated_at: 1,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -217,12 +264,17 @@ async function main() {
       "owner sees Custom MCP server row",
     );
     assert(
+      host.querySelector('[data-connections-group="custom-mcp"]')?.textContent?.includes("1 tool") &&
+        !host.querySelector('[data-connections-group="custom-mcp"]')?.textContent?.includes("1 tools"),
+      "singular tool count rendered as '1 tool'",
+    );
+    assert(
       host.querySelectorAll('[data-connections-group="shared"] [data-record-id="conn_mcp_billing_1"]').length === 0,
       "custom_mcp row deduplicated from platform list",
     );
   });
 
-  // Open Inspect drawer -> Pinned Tools -> Instructions & Guide -> Auth & Access.
+  // Open Inspect drawer -> Pinned Tools -> Instructions & Guide -> Policies -> Auth & Access.
   const mcpBtn = host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement;
   assert(mcpBtn, "MCP row button exists");
   await act(async () => mcpBtn.click());
@@ -244,7 +296,34 @@ async function main() {
     );
   });
 
-  // Close drawer, then open Connect drawer.
+  const policiesTab = Array.from(host.querySelectorAll('[role="tab"]')).find((el) =>
+    el.textContent?.includes("Policies"),
+  ) as HTMLButtonElement | undefined;
+  assert(policiesTab, "Policies tab renders");
+  await act(async () => policiesTab.click());
+  await settle(() => {
+    assert(
+      host.querySelector('[data-connection-policy]') !== null &&
+        text().includes("Action safety") &&
+        text().includes("nova"),
+      "owner Policies tab shows connection policy & allowed agents",
+    );
+  });
+  const readOnlyOpt = Array.from(host.querySelectorAll('[data-connection-policy] [role="radio"]')).find((el) =>
+    el.textContent?.includes("Read only"),
+  ) as HTMLButtonElement | undefined;
+  assert(readOnlyOpt, "Read only policy radio exists");
+  await act(async () => readOnlyOpt.click());
+  const savePolicyBtn = Array.from(host.querySelectorAll('[data-connection-policy] button')).find((el) =>
+    el.textContent?.includes("Save access settings"),
+  ) as HTMLButtonElement | undefined;
+  assert(savePolicyBtn, "Save access settings button renders after change");
+  await act(async () => savePolicyBtn.click());
+  await settle(() => {
+    assert(host.querySelector('.custmcp-ok-banner')?.textContent?.includes("Access settings saved"), "green ok banner shown instead of warning");
+  });
+
+  // Close drawer, then open Connect drawer -> human-readable auth summary & 3-step OAuth discovery preview.
   const closeBtn = host.querySelector('[data-drawer="custom-mcp"] button[aria-label*="Close"]') as HTMLButtonElement;
   await act(async () => closeBtn.click());
   await settle(() => assert(!host.querySelector('[data-drawer="custom-mcp"]'), "inspect drawer closes"));
@@ -255,10 +334,51 @@ async function main() {
   await act(async () => addMcpBtn.click());
   await settle(() => {
     assert(text().includes("Connect custom MCP server"), "connect drawer opens");
-    assert(text().includes("Auto MCP OAuth 2.1"), "auto OAuth default shown");
+    assert(text().includes("1. Endpoint") && text().includes("2. Discovery & Consent"), "3-step connect indicator shown");
+    assert(text().includes("Auto MCP OAuth 2.1 + PKCE"), "auto OAuth default shown");
   });
 
-  // 2. Non-owner member read-only view on hosted board.
+  // Selecting OAuth client ID displays human label in <summary>, never raw "oauth_static".
+  const oauthStaticOpt = Array.from(host.querySelectorAll('[role="radio"]')).find((el) =>
+    el.textContent?.includes("OAuth client ID"),
+  ) as HTMLButtonElement;
+  await act(async () => oauthStaticOpt.click());
+  await settle(() => {
+    const summary = host.querySelector('.custmcp-manual summary')?.textContent ?? "";
+    assert(summary.includes("OAuth client ID") && !summary.includes("oauth_static"), "summary uses human label, not raw enum");
+  });
+  const autoOpt = Array.from(host.querySelectorAll('[role="radio"]')).find((el) =>
+    el.textContent?.includes("Auto MCP OAuth 2.1"),
+  ) as HTMLButtonElement;
+  await act(async () => autoOpt.click());
+  const nameInput = host.querySelector('input[placeholder="Acme Billing MCP"]') as HTMLInputElement;
+  const urlInput = host.querySelector('input[type="url"]') as HTMLInputElement;
+  const setNativeValue = (el: HTMLInputElement, val: string) => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!;
+    desc.set!.call(el, val);
+    el.dispatchEvent(new win.Event("input", { bubbles: true }));
+  };
+  await act(async () => {
+    setNativeValue(nameInput, "Acme OAuth");
+    setNativeValue(urlInput, "https://mcp.acme.example/v1/mcp");
+  });
+  const form = host.querySelector("form") as HTMLFormElement;
+  await act(async () => {
+    form.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true }));
+  });
+  await settle(() => {
+    const preview = host.querySelector("[data-mcp-discovery-preview]");
+    assert(
+      preview &&
+        preview.textContent?.includes("auth.acme.example") &&
+        preview.textContent?.includes("Dynamic Client Registration") &&
+        preview.textContent?.includes("Continue to OAuth sign-in"),
+      "Step 2 RFC 9728 / DCR discovery preview shown before redirect",
+    );
+  });
+
+  // 2. Non-owner member read-only view on hosted board (no policy mutations / fetches).
+  policyCalls.length = 0;
   await act(async () => {
     root.render(
       React.createElement(Connections, {
@@ -279,6 +399,49 @@ async function main() {
     const drawer = host.querySelector('[data-drawer="custom-mcp"]');
     assert(drawer && drawer.textContent?.includes("Read-only view"), "member opens read-only inspect drawer");
     assert(drawer.querySelectorAll('.custmcp-mode-btn').length === 0, "member has no tool mode mutation buttons");
+  });
+  const memberPoliciesTab = Array.from(host.querySelectorAll('[role="tab"]')).find((el) =>
+    el.textContent?.includes("Policies"),
+  ) as HTMLButtonElement;
+  await act(async () => memberPoliciesTab.click());
+  await settle(() => {
+    assert(host.querySelector('[data-mcp-policy-readonly]') !== null, "member sees read-only Policies summary");
+    assert(policyCalls.length === 0, "member never calls owner-only /policy endpoint");
+  });
+
+  // 3. ConnectCard shows "Continue reply" on ?aos_connect=connected&toolkit=custom_mcp return.
+  const { ConnectCard } = require("../src/features/home/ConnectCard") as typeof import("../src/features/home/ConnectCard");
+  win.history.replaceState(
+    {},
+    "",
+    "/home?aos_connect=connected&toolkit=custom_mcp&connection_id=conn_mcp_billing_1",
+  );
+  await act(async () => {
+    root.render(
+      React.createElement(
+        PageLocale,
+        null,
+        React.createElement(ConnectCard, {
+          entry: {
+            seq: 10,
+            role: "agent",
+            kind: "connect_ref",
+            text: "Acme Billing OAuth expired; reconnect to continue.",
+            message: "msg_1",
+            payload: { v: 1, toolkit: "custom_mcp", toolkit_label: "Acme Billing" },
+          },
+        }),
+      ),
+    );
+  });
+  await settle(() => {
+    const contBtn = host.querySelector('[data-continue-mcp="Acme Billing"]') as HTMLButtonElement | null;
+    assert(contBtn && contBtn.textContent?.includes("Continue reply"), "ConnectCard renders Continue reply after OAuth callback return");
+  });
+  const contBtn = host.querySelector('[data-continue-mcp="Acme Billing"]') as HTMLButtonElement;
+  await act(async () => contBtn.click());
+  await settle(() => {
+    assert(text().includes("Reply resumed"), "Continue reply sends turn and updates card to Reply resumed");
   });
 
   globalThis.fetch = innerFetch;

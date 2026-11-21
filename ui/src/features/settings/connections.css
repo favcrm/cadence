@@ -282,3 +282,49 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.custmcp-chip-ok {
+  background: color-mix(in srgb, var(--color-ok) 12%, transparent);
+  color: color-mix(in srgb, var(--color-ok) 78%, var(--color-ink-100));
+}
+
+.custmcp-chip-warn {
+  background: color-mix(in srgb, var(--color-warn) 12%, transparent);
+  color: color-mix(in srgb, var(--color-warn) 78%, var(--color-ink-100));
+}
+
+.custmcp-chip-fail {
+  background: color-mix(in srgb, var(--color-fail) 12%, transparent);
+  color: color-mix(in srgb, var(--color-fail) 78%, var(--color-ink-100));
+}
+
+.custmcp-ok-banner {
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--color-ok) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-ok) 12%, transparent);
+  color: color-mix(in srgb, var(--color-ok) 78%, var(--color-ink-100));
+  font-size: var(--text-label);
+}
+
+.custmcp-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.custmcp-step {
+  font-size: var(--text-micro);
+  padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+  border: 1px solid var(--color-ink-700);
+  color: var(--color-ink-400);
+}
+
+.custmcp-step[data-active="true"] {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-ink-100);
+  font-weight: 500;
+}

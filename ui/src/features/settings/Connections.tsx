@@ -717,12 +717,16 @@ function CustomMcpServerList({
           const status = customMcpStatusView(row);
           const statusClass =
             status.tone === "ok"
-              ? "bg-ok/10 text-ok"
+              ? "custmcp-chip-ok"
               : status.tone === "warn"
-                ? "bg-warn/10 text-warn"
+                ? "custmcp-chip-warn"
                 : status.tone === "fail"
-                  ? "bg-fail/10 text-fail"
+                  ? "custmcp-chip-fail"
                   : "bg-ink-800 text-ink-400";
+          const toolCountLabel =
+            row.tools_summary.total === 1
+              ? t("{n} tool").replace("{n}", "1")
+              : t("{n} tools").replace("{n}", String(row.tools_summary.total));
           return (
             <li key={row.id}>
               <button
@@ -735,7 +739,7 @@ function CustomMcpServerList({
                 <span className="settings-row-text">
                   <b>{row.name}</b>
                   <small className="num">
-                    {row.endpoint_host} · {t(customMcpAuthLabel(row.auth_kind))} · {row.tools_summary.total} {t("tools")}
+                    {row.endpoint_host} · {t(customMcpAuthLabel(row.auth_kind))} · {toolCountLabel}
                   </small>
                 </span>
                 <span className="conn-row-chips">

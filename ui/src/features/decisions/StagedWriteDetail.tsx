@@ -137,24 +137,16 @@ function ApprovalsTab({
         </p>
       )}
       {state}
-      {write.connected !== null && write.status === "pending" && write.result === null && (
+      {(write.connected !== null || write.customMcp != null) && write.status === "pending" && write.result === null && (
         <p className="rv-note m-0">
-          {t(write.connected.effect === "send" ? "Approving sends this once. Nothing has been sent yet." : "Approving drafts this once. Nothing has been drafted yet.")}
+          {write.customMcp != null
+            ? t("Approving runs this pinned Custom MCP tool once on {host} (snapshot v{rev}). Nothing has run yet.")
+                .replace("{host}", () => write.customMcp!.endpointHost)
+                .replace("{rev}", String(write.customMcp.snapshotRevision))
+            : t(write.connected!.effect === "send" ? "Approving sends this once. Nothing has been sent yet." : "Approving drafts this once. Nothing has been drafted yet.")}
         </p>
       )}
-      {write.connected !== null && write.status === "pending" && write.result?.ok === false && (
-        <p className="issue-peek-note warn m-0" role="status">
-          {t("The last approval attempt did not finish: {reason}. It is still waiting; check before approving again.").replace("{reason}", reasonText(failureReason(write), t))}
-        </p>
-      )}
-      {write.customMcp != null && write.status === "pending" && write.result === null && (
-        <p className="rv-note m-0">
-          {t("Approving runs this pinned Custom MCP tool once on {host} (snapshot v{rev}). Nothing has run yet.")
-            .replace("{host}", () => write.customMcp!.endpointHost)
-            .replace("{rev}", String(write.customMcp.snapshotRevision))}
-        </p>
-      )}
-      {write.customMcp != null && write.status === "pending" && write.result?.ok === false && (
+      {(write.connected !== null || write.customMcp != null) && write.status === "pending" && write.result?.ok === false && (
         <p className="issue-peek-note warn m-0" role="status">
           {t("The last approval attempt did not finish: {reason}. It is still waiting; check before approving again.").replace("{reason}", reasonText(failureReason(write), t))}
         </p>

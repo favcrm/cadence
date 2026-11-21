@@ -17,6 +17,7 @@ import {
 import { serviceLabel } from "../src/features/settings/connectionsView";
 import {
   customMcpAuthLabel,
+  customMcpAuthOptionLabel,
   customMcpAuthorizationUrl,
   customMcpErrorText,
   customMcpReturn,
@@ -51,6 +52,14 @@ assert(validateCustomMcpUrlInput("https://127.0.0.1/mcp") !== null, "loopback v4
 assert(validateCustomMcpUrlInput("https://10.0.0.5/mcp") !== null, "rfc1918 rejected");
 assert(validateCustomMcpUrlInput("https://169.254.169.254/latest") !== null, "link-local rejected");
 assert(validateCustomMcpUrlInput("https://[::1]/mcp") !== null, "loopback v6 rejected");
+assert(validateCustomMcpUrlInput("https://[::ffff:127.0.0.1]/mcp") !== null, "mapped v4 rejected");
+assert(validateCustomMcpUrlInput("https://[64:ff9b::127.0.0.1]/mcp") !== null, "nat64 private v4 rejected");
+assert(validateCustomMcpUrlInput("https://[2002:7f00:1::]/mcp") !== null, "6to4 loopback rejected");
+assert(validateCustomMcpUrlInput("https://127.1/mcp") !== null, "shorthand loopback rejected");
+assert(validateCustomMcpUrlInput("https://0177.0.0.1/mcp") !== null, "octal loopback rejected");
+assert(validateCustomMcpUrlInput("https://2130706433/mcp") !== null, "decimal loopback rejected");
+assert(validateCustomMcpUrlInput("https://0x7f000001/mcp") !== null, "hex loopback rejected");
+assert(validateCustomMcpUrlInput("https://[2606:4700:4700::1111]/mcp") === null, "public v6 accepted");
 assert(validateCustomMcpUrlInput("https://api.fav-limited.cadencecloud.app/mcp") !== null, "platform origin rejected");
 assert(validateCustomMcpUrlInput("https://mcp-internal/tools") !== null, "single-label host rejected");
 
@@ -132,6 +141,8 @@ const summaryBase: CustomMcpConnectionSummary = {
   tools_summary: { total: 3, read: 1, approval: 1, off: 1, drifted: 1 },
 };
 equal(customMcpAuthLabel("oauth"), "OAuth 2.1", "auth label");
+equal(customMcpAuthOptionLabel("oauth_static"), "OAuth client ID", "auth option label");
+equal(customMcpAuthOptionLabel("bearer"), "Bearer token", "auth bearer option label");
 equal(customMcpToolModeLabel("approval"), "Ask approval", "mode label");
 const statusView = customMcpStatusView(summaryBase);
 assert(statusView.tone === "warn" && statusView.detail.includes("1 tool drifted") && statusView.detail.includes("server instructions changed"), "drift status summary");

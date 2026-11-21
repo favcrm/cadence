@@ -1887,13 +1887,27 @@ export interface CustomMcpListPayload {
   connections: CustomMcpConnectionSummary[];
 }
 
+export interface CustomMcpOAuthDiscovery {
+  issuer: string | null;
+  authorization_host: string;
+  registration: "dcr" | "static";
+  scopes: string[];
+  resource_metadata_url: string | null;
+}
+
 export type CustomMcpCreatePayload =
   | { mode: "connected"; connection: CustomMcpConnectionSummary }
-  | { mode: "oauth_redirect"; authorization_url: string; connection_id: string };
+  | {
+      mode: "oauth_redirect";
+      authorization_url: string;
+      connection_id: string;
+      discovery?: CustomMcpOAuthDiscovery;
+    };
 
 export interface CustomMcpOAuthStartPayload {
   authorization_url: string;
   connection_id: string;
+  discovery?: CustomMcpOAuthDiscovery;
 }
 
 export interface CustomMcpConnectionPayload {

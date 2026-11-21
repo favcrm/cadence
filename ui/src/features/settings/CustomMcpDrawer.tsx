@@ -1,17 +1,22 @@
 import { useEffect, useId, useState } from "react";
 import { api } from "../../lib/api";
+import { routinesApi } from "../agents/routinesApi";
 import { useTranslate } from "../../lib/locale";
+import { resources } from "../../lib/resources";
+import { useMaybeResource } from "../../lib/useResource";
 import type {
   CustomMcpAuthKind,
   CustomMcpConnectionSummary,
+  CustomMcpOAuthDiscovery,
   CustomMcpToolMode,
 } from "../../lib/types";
 import Button from "../../ui/Button";
 import { IconCheck, IconLock, IconRefresh, IconWarning } from "../../ui/icons";
 import DrawerShell, { type DrawerTab } from "../app-shell/shared/DrawerShell";
-import { visibilityBadge, visibilityConfirmed } from "./connectionsView";
+import { visibilityBadge } from "./connectionsView";
 import {
   customMcpAuthLabel,
+  customMcpAuthOptionLabel,
   customMcpAuthorizationUrl,
   customMcpErrorText,
   customMcpStatusView,
@@ -25,16 +30,16 @@ import {
 } from "./customMcpView";
 import SettingsDrawer from "./SettingsDrawer";
 
-export type CustomMcpDrawerTab = "tools" | "guide" | "auth";
+export type CustomMcpDrawerTab = "tools" | "guide" | "policies" | "auth";
 
 function statusChipClass(tone: "ok" | "warn" | "fail" | "muted"): string {
   switch (tone) {
     case "ok":
-      return "bg-ok/10 text-ok";
+      return "custmcp-chip-ok";
     case "warn":
-      return "bg-warn/10 text-warn";
+      return "custmcp-chip-warn";
     case "fail":
-      return "bg-fail/10 text-fail";
+      return "custmcp-chip-fail";
     case "muted":
       return "bg-ink-800 text-ink-400";
   }
@@ -68,7 +73,11 @@ export function CustomMcpConnectDrawer({
   const [oauthScopesText, setOauthScopesText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [redirectUrl, setRedirectUrl] = useState<string | null>(null);
+  const [discoveryStep, setDiscoveryStep] = useState<{
+    authorizationUrl: string;
+    connectionId: string;
+    discovery?: CustomMcpOAuthDiscovery;
+  } | null>(null);
 
   const urlError = validateCustomMcpUrlInput(endpointUrl);
 
@@ -140,10 +149,11 @@ export function CustomMcpConnectDrawer({
           return;
         }
         onOAuthStarted(reply.connection_id);
-        setRedirectUrl(safeUrl);
-        if (typeof window !== "undefined") {
-          window.location.assign(safeUrl);
-        }
+        setDiscoveryStep({
+          authorizationUrl: safeUrl,
+          connectionId: reply.connection_id,
+          ...(reply.discovery ? { discovery: reply.discovery } : {}),
+        });
         return;
       }
       onConnected(reply.connection);
@@ -158,24 +168,73 @@ export function CustomMcpConnectDrawer({
     }
   };
 
+  const previewHost =
+    discoveryStep?.discovery?.authorization_host ??
+    (discoveryStep ? new URL(discoveryStep.authorizationUrl).host : "");
+
   return (
     <SettingsDrawer title={t("Connect custom MCP server")} onClose={onClose}>
+      <div className="custmcp-steps" aria-label={t("Setup steps")}>
+        <span className="custmcp-step" data-active={!discoveryStep ? "true" : undefined}>
+          {t("1. Endpoint")}
+        </span>
+        <span className="custmcp-step" data-active={discoveryStep ? "true" : undefined}>
+          {t("2. Discovery & Consent")}
+        </span>
+        <span className="custmcp-step">{t("3. Pinned Tools")}</span>
+      </div>
+
       <p className="text-label text-ink-400 break-words">
         {t("Connect a remote Streamable HTTP (https://) MCP server. Auto OAuth 2.1 + PKCE discovers metadata automatically; tools stay pinned and start in safe Approval or Off mode.")}
       </p>
 
-      {redirectUrl ? (
-        <div className="rounded border border-accent/40 bg-accent/10 p-3 space-y-2" role="status">
+      {discoveryStep ? (
+        <div className="rounded border border-accent/40 bg-accent/10 p-3 space-y-2.5" role="status" data-mcp-discovery-preview>
           <p className="text-label font-medium text-ink-100">
-            {t("Continue to OAuth sign-in")}
+            {t("OAuth discovery verified")}
           </p>
+          <dl className="text-micro space-y-1 text-ink-300">
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Authorization host")}</dt>
+              <dd className="num text-ink-100 break-all">{previewHost}</dd>
+            </div>
+            {discoveryStep.discovery?.issuer && (
+              <div className="flex flex-wrap gap-x-2">
+                <dt className="text-ink-500">{t("OAuth issuer")}</dt>
+                <dd className="num text-ink-200 break-all">{discoveryStep.discovery.issuer}</dd>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Client registration")}</dt>
+              <dd className="text-ink-200">
+                {discoveryStep.discovery?.registration === "static"
+                  ? t("Static pre-registered OAuth client")
+                  : t("Dynamic Client Registration (RFC 7591)")}
+              </dd>
+            </div>
+            {discoveryStep.discovery?.resource_metadata_url && (
+              <div className="flex flex-wrap gap-x-2">
+                <dt className="text-ink-500">{t("Resource metadata")}</dt>
+                <dd className="num text-ink-300 break-all">{discoveryStep.discovery.resource_metadata_url}</dd>
+              </div>
+            )}
+            {discoveryStep.discovery && discoveryStep.discovery.scopes.length > 0 && (
+              <div className="flex flex-wrap gap-x-2">
+                <dt className="text-ink-500">{t("Scopes")}</dt>
+                <dd className="num text-ink-200 break-words">{discoveryStep.discovery.scopes.join(" ")}</dd>
+              </div>
+            )}
+          </dl>
           <p className="text-micro text-ink-300 break-words">
             {t("Approve access at the provider. You will return to Settings → Connections to review pinned tools.")}
           </p>
           <div className="flex flex-wrap gap-2">
-            <a href={redirectUrl} className="btn btn-primary btn-sm">
-              {t("Continue to sign-in →")}
+            <a href={discoveryStep.authorizationUrl} className="btn btn-primary btn-sm">
+              {t("Continue to OAuth sign-in →")}
             </a>
+            <Button size="sm" variant="ghost" onClick={() => setDiscoveryStep(null)}>
+              {t("Back")}
+            </Button>
             <Button size="sm" variant="ghost" onClick={onClose}>
               {t("Close")}
             </Button>
@@ -263,7 +322,7 @@ export function CustomMcpConnectDrawer({
 
           <details className="custmcp-manual" open={authKind !== "auto"}>
             <summary className="text-label font-medium text-ink-300 cursor-pointer select-none">
-              {t("Authentication mode")}: <span className="text-ink-200">{authKind === "auto" ? t("Auto MCP OAuth 2.1 + PKCE") : t(authKind)}</span>
+              {t("Authentication mode")}: <span className="text-ink-200">{t(customMcpAuthOptionLabel(authKind))}</span>
             </summary>
             <div className="mt-2.5 space-y-2.5">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5" role="radiogroup" aria-label={t("Authentication mode")}>
@@ -454,6 +513,62 @@ export function CustomMcpInspectDrawer({
   const [revokeOpen, setRevokeOpen] = useState(false);
   const [revokeArmed, setRevokeArmed] = useState(false);
 
+  // Routine & agent policy draft (for Policies tab).
+  const agentsState = useMaybeResource(canEdit ? resources.agents : null);
+  useEffect(() => {
+    if (canEdit && tab === "policies") {
+      void resources.agents.revalidate();
+    }
+  }, [canEdit, tab]);
+  const [policyLoaded, setPolicyLoaded] = useState(!canEdit);
+  const [baseVis, setBaseVis] = useState<"shared" | "personal">(connection.visibility);
+  const [baseWriteMode, setBaseWriteMode] = useState<"ask_approval" | "read_only">("ask_approval");
+  const [baseExt, setBaseExt] = useState(false);
+  const [baseAgents, setBaseAgents] = useState<string[]>([]);
+  const [visDraft, setVisDraft] = useState<"shared" | "personal">(connection.visibility);
+  const [writeModeDraft, setWriteModeDraft] = useState<"ask_approval" | "read_only">("ask_approval");
+  const [extDraft, setExtDraft] = useState(false);
+  const [agentsDraft, setAgentsDraft] = useState<string[]>([]);
+
+  useEffect(() => {
+    setVisDraft(connection.visibility);
+    setBaseVis(connection.visibility);
+  }, [connection.id, connection.visibility]);
+
+  useEffect(() => {
+    if (!canEdit) {
+      setPolicyLoaded(true);
+      return;
+    }
+    let alive = true;
+    setPolicyLoaded(false);
+    routinesApi
+      .connectionPolicy(connection.id)
+      .then((res) => {
+        if (!alive) return;
+        const p = res.policy;
+        const vis = p.visibility === "personal" ? "personal" : "shared";
+        const wm = p.write_mode === "read_only" ? "read_only" : "ask_approval";
+        const ext = Boolean(p.allow_external_triggers);
+        const ag = Array.isArray(p.allowed_agents) ? p.allowed_agents : [];
+        setBaseVis(vis);
+        setVisDraft(vis);
+        setBaseWriteMode(wm);
+        setWriteModeDraft(wm);
+        setBaseExt(ext);
+        setExtDraft(ext);
+        setBaseAgents(ag);
+        setAgentsDraft(ag);
+        setPolicyLoaded(true);
+      })
+      .catch(() => {
+        if (alive) setPolicyLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [canEdit, connection.id]);
+
   useEffect(() => {
     setModeDraft(
       Object.fromEntries((connection.tools ?? []).map((pin) => [pin.tool_name, pin.mode])),
@@ -595,30 +710,43 @@ export function CustomMcpInspectDrawer({
     }
   };
 
-  const toggleVisibility = async () => {
+  const savePolicy = async () => {
     if (!canEdit || busyAction) return;
-    const next = connection.visibility === "shared" ? "personal" : "shared";
-    setBusyAction("visibility");
+    setBusyAction("policy");
     setFeedback(null);
+    const effectiveExt = visDraft === "shared" ? extDraft : false;
     try {
-      const res = await api.connectionVisibility(connection.id, { visibility: next });
-      if (!visibilityConfirmed(res, next)) {
-        setFeedback({ ok: false, text: t("Could not confirm visibility change.") });
-        return;
-      }
-      onUpdated({ ...connection, visibility: next });
-      setFeedback({
-        ok: true,
-        text:
-          next === "shared"
-            ? t("Server is now shared with the workspace.")
-            : t("Server is now personal to you."),
+      const res = await routinesApi.connectionPolicySet(connection.id, {
+        visibility: visDraft,
+        write_mode: writeModeDraft,
+        allow_external_triggers: effectiveExt,
+        allowed_agents: agentsDraft,
       });
+      const nextVis = res.policy.visibility === "personal" ? "personal" : "shared";
+      const nextWm = res.policy.write_mode === "read_only" ? "read_only" : "ask_approval";
+      const nextExt = Boolean(res.policy.allow_external_triggers);
+      const nextAg = Array.isArray(res.policy.allowed_agents) ? res.policy.allowed_agents : [];
+      setBaseVis(nextVis);
+      setVisDraft(nextVis);
+      setBaseWriteMode(nextWm);
+      setWriteModeDraft(nextWm);
+      setBaseExt(nextExt);
+      setExtDraft(nextExt);
+      setBaseAgents(nextAg);
+      setAgentsDraft(nextAg);
+      onUpdated({ ...connection, visibility: nextVis });
+      setFeedback({ ok: true, text: t("Access settings saved.") });
     } catch (e: unknown) {
       setFeedback({ ok: false, text: customMcpErrorText(e) });
     } finally {
       setBusyAction(null);
     }
+  };
+
+  const toggleAllowedAgent = (alias: string) => {
+    setAgentsDraft((prev) =>
+      prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias],
+    );
   };
 
   const submitRotate = async () => {
@@ -668,8 +796,15 @@ export function CustomMcpInspectDrawer({
     }
   };
 
+  const okBanner = feedback?.ok ? (
+    <div className="custmcp-ok-banner" role="status">
+      {feedback.text}
+    </div>
+  ) : null;
+
   const toolsPanel = (
     <div className="space-y-3 min-w-0">
+      {okBanner}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-ink-700 bg-ink-850 px-3 py-2">
         <dl className="text-micro text-ink-300 space-y-0.5 min-w-0">
           <div className="flex flex-wrap gap-x-2">
@@ -780,10 +915,10 @@ export function CustomMcpInspectDrawer({
                         <span className="chip bg-ink-800 text-ink-300">{t("Read-only hint")}</span>
                       )}
                       {isToolDestructiveHint(pin) && (
-                        <span className="chip bg-warn/10 text-warn">{t("Destructive hint")}</span>
+                        <span className="chip custmcp-chip-warn">{t("Destructive hint")}</span>
                       )}
                       {pin.drifted && (
-                        <span className="chip bg-warn/10 text-warn">{t("Drifted")}</span>
+                        <span className="chip custmcp-chip-warn">{t("Drifted")}</span>
                       )}
                     </div>
                     {pin.description && (
@@ -863,6 +998,7 @@ export function CustomMcpInspectDrawer({
 
   const guidePanel = (
     <div className="space-y-4 min-w-0">
+      {okBanner}
       <section className="space-y-1.5 min-w-0">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h4 className="slabel">{t("Pinned server instructions (initialize.instructions)")}</h4>
@@ -971,8 +1107,170 @@ export function CustomMcpInspectDrawer({
     </div>
   );
 
+  const rosterAgents = agentsState?.data?.agents ?? [];
+  const effectiveExt = visDraft === "shared" ? extDraft : false;
+  const policyDirty =
+    visDraft !== baseVis ||
+    writeModeDraft !== baseWriteMode ||
+    effectiveExt !== baseExt ||
+    [...agentsDraft].sort().join(",") !== [...baseAgents].sort().join(",");
+
+  const policiesPanel = (
+    <div className="space-y-4 min-w-0">
+      {okBanner}
+      {!canEdit ? (
+        <div className="conn-policy" data-mcp-policy-readonly>
+          <div className="conn-policy-group">
+            <span className="slabel">{t("Who can use this server")}</span>
+            <p className="text-label text-ink-200">
+              {t(connection.visibility === "shared" ? "Shared with company" : "Personal")}
+            </p>
+            <p className="text-micro text-ink-400 break-words">
+              {t("Everyone in the workspace and allowed agents can use enabled read tools.")}
+            </p>
+          </div>
+          <div className="conn-policy-group">
+            <span className="slabel">{t("Action safety")}</span>
+            <p className="text-micro text-ink-400 break-words">
+              {t("Only workspace owners can approve writes or change routine and agent policies.")}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="conn-policy" data-connection-policy>
+          {!policyLoaded && (
+            <p className="text-micro text-ink-500">{t("Loading access policies…")}</p>
+          )}
+          <div className="conn-policy-group">
+            <span className="slabel">{t("Who can use this server")}</span>
+            <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this server")}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={visDraft === "shared"}
+                disabled={busyAction !== null}
+                className="conn-policy-opt"
+                onClick={() => setVisDraft("shared")}
+              >
+                <b>{t("Shared with workspace")}</b>
+                <small>{t("Team members and assigned routines can use this connection.")}</small>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={visDraft === "personal"}
+                disabled={busyAction !== null}
+                className="conn-policy-opt"
+                onClick={() => setVisDraft("personal")}
+              >
+                <b>{t("Just me (Personal)")}</b>
+                <small>{t("Only your turns and routines pinned to this account can use it.")}</small>
+              </button>
+            </div>
+          </div>
+
+          {rosterAgents.length > 0 && (
+            <div className="conn-policy-group">
+              <span className="slabel">{t("Agent access")}</span>
+              <p className="text-micro text-ink-400 break-words">
+                {visDraft === "shared"
+                  ? t("All workspace agents may call this shared MCP server. Restrict access by switching to Personal or configuring agent permissions below.")
+                  : t("Only your turns can use this server. Specific agents can be restricted below.")}
+              </p>
+              <div className="space-y-1">
+                {rosterAgents.map((agentRow) => {
+                  const checked = agentsDraft.includes(agentRow.alias);
+                  return (
+                    <button
+                      key={agentRow.alias}
+                      type="button"
+                      role="checkbox"
+                      aria-checked={checked}
+                      disabled={busyAction !== null}
+                      className="conn-policy-toggle"
+                      onClick={() => toggleAllowedAgent(agentRow.alias)}
+                    >
+                      <span className="conn-policy-box" aria-hidden>
+                        {checked ? "✓" : ""}
+                      </span>
+                      <span className="min-w-0 break-words num">{agentRow.alias}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className="conn-policy-group">
+            <span className="slabel">{t("Action safety")}</span>
+            <div className="conn-policy-grid" role="radiogroup" aria-label={t("Action safety")}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={writeModeDraft === "ask_approval"}
+                disabled={busyAction !== null}
+                className="conn-policy-opt"
+                onClick={() => setWriteModeDraft("ask_approval")}
+              >
+                <b>{t("Ask for approval first")}</b>
+                <small>{t("Drafts and external writes wait for approval.")}</small>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={writeModeDraft === "read_only"}
+                disabled={busyAction !== null}
+                className="conn-policy-opt"
+                onClick={() => setWriteModeDraft("read_only")}
+              >
+                <b>{t("Read only")}</b>
+                <small>{t("Agents can read data; external writes are blocked.")}</small>
+              </button>
+            </div>
+          </div>
+
+          {visDraft === "shared" && (
+            <div className="conn-policy-group">
+              <span className="slabel">{t("Incoming triggers")}</span>
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={extDraft}
+                disabled={busyAction !== null}
+                className="conn-policy-toggle"
+                onClick={() => setExtDraft((v) => !v)}
+              >
+                <span className="conn-policy-box" aria-hidden>
+                  {extDraft ? "✓" : ""}
+                </span>
+                <span className="min-w-0 break-words">
+                  {t("Allow incoming emails or webhooks to trigger actions")}
+                </span>
+              </button>
+            </div>
+          )}
+
+          {policyDirty && (
+            <div>
+              <Button
+                size="sm"
+                variant="primary"
+                loading={busyAction === "policy"}
+                disabled={busyAction !== null}
+                onClick={() => void savePolicy()}
+              >
+                {busyAction === "policy" ? t("Saving…") : t("Save access settings")}
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   const authPanel = (
     <div className="space-y-4 min-w-0">
+      {okBanner}
       <div className="space-y-1.5">
         <span className="slabel">{t("Authentication")}</span>
         <dl className="text-label space-y-1">
@@ -999,34 +1297,6 @@ export function CustomMcpInspectDrawer({
             </div>
           )}
         </dl>
-      </div>
-
-      <div className="conn-policy-group">
-        <span className="slabel">{t("Who can use this server")}</span>
-        {canEdit ? (
-          <button
-            type="button"
-            role="switch"
-            aria-checked={connection.visibility === "shared"}
-            disabled={busyAction !== null}
-            className="conn-policy-toggle"
-            onClick={() => void toggleVisibility()}
-          >
-            <span className="conn-policy-box" aria-hidden>
-              {connection.visibility === "shared" ? "✓" : ""}
-            </span>
-            <span className="min-w-0 break-words">
-              <b>{t("Shared with company")}</b>
-              <small className="block text-micro text-ink-400">
-                {t("Everyone in the workspace can view shared read tools. Only owners can approve writes or change settings.")}
-              </small>
-            </span>
-          </button>
-        ) : (
-          <p className="text-label text-ink-300">
-            {t(connection.visibility === "shared" ? "Shared with company" : "Personal")}
-          </p>
-        )}
       </div>
 
       {canEdit && (
@@ -1168,6 +1438,7 @@ export function CustomMcpInspectDrawer({
   const tabs: DrawerTab[] = [
     { id: "tools", label: `${t("Pinned Tools")} (${tools.length})`, panel: toolsPanel },
     { id: "guide", label: t("Instructions & Guide"), panel: guidePanel },
+    { id: "policies", label: t("Policies"), panel: policiesPanel },
     { id: "auth", label: t("Auth & Access"), panel: authPanel },
   ];
 
@@ -1195,14 +1466,11 @@ export function CustomMcpInspectDrawer({
           </span>
         </>
       }
-      warning={
-        warningText ??
-        (feedback?.ok ? feedback.text : undefined)
-      }
+      warning={warningText}
       tabs={tabs}
       tab={tab}
       onTab={(nextId) => {
-        if (nextId === "tools" || nextId === "guide" || nextId === "auth") setTab(nextId);
+        if (nextId === "tools" || nextId === "guide" || nextId === "policies" || nextId === "auth") setTab(nextId);
       }}
       note={canEdit ? undefined : t("Read-only view — only workspace owners can edit or disconnect Custom MCP servers.")}
       onClose={onClose}
