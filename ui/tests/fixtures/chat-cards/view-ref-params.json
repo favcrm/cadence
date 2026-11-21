@@ -1,0 +1,18 @@
+{
+  "role": "agent",
+  "kind": "view_ref",
+  "text": "Opened Profit and loss in the canvas (Books · reports)",
+  "payload": {
+    "v": 1,
+    "app": "books",
+    "app_label": "Books",
+    "install_id": "install_books",
+    "screen_tag": "books",
+    "section": "reports",
+    "record_id": "pnl",
+    "title": "Profit and loss",
+    "view": "pnl",
+    "view_label": "Profit and loss",
+    "params": { "from": "2026-01-01", "to": "2026-03-31" }
+  }
+}

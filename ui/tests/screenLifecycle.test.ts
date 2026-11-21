@@ -607,3 +607,34 @@ void (async () => {
 
   console.log("screen lifecycle adversarial checks pass");
 })();
+
+// CAD-2555: route params reach only a frame that opted into screen-route-params.v1,
+// and only such a frame may send them back on screen.route.patch.
+function routeMount(accepts: string[]) {
+  const source = {} as Window; const port = new Port();
+  const calls: { verb: string; args: unknown }[] = [];
+  const host = { ...toolHost!, call: async (verb: string, args: unknown) => { calls.push({ verb, args }); return { ok: true }; } } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+  const routeReceipt = { ...receipt, action_token: "d".repeat(64), tools: [], host_contract: "screen-records.v1" as const, operations: ["screen.route.patch"] };
+  const routePush: ScreenPush = { ...actingPush, v: 2, route: { section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } } };
+  const channel = new ScreenChannel(source, routeReceipt, routePush, () => {}, () => {}, () => {}, undefined, host);
+  channel.receive({ source, origin: "null", data: init, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts });
+  return { port, calls };
+}
+const patchCall = (id: string, args: Record<string, unknown>) => ({ v: 2, op: "call", id, verb: "screen.route.patch", args });
+const capableRoute = routeMount(["screen.v2", "screen-records.v1", "screen-route-params.v1"]);
+check(JSON.stringify((capableRoute.port.sent[0] as ScreenPush).route) === JSON.stringify({ section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } }),
+  "a screen-route-params.v1 frame is pushed the route with its params");
+capableRoute.port.receive(patchCall("p1", { params: { from: "2026-10-01" } }));
+check(!capableRoute.port.closed && capableRoute.calls.length === 1, "a capable frame may patch params");
+const oldRoute = routeMount(["screen.v2", "screen-records.v1"]);
+check(JSON.stringify((oldRoute.port.sent[0] as ScreenPush).route) === JSON.stringify({ section: "reports", view: "list", record_id: "pnl", segment_id: null }),
+  "a frame without it is pushed the route exactly as before");
+oldRoute.port.receive(patchCall("p2", { section: "reports" }));
+check(!oldRoute.port.closed && oldRoute.calls.length === 1, "an old frame still patches its route");
+oldRoute.port.receive(patchCall("p3", { params: { from: "2026-10-01" } }));
+check(oldRoute.port.closed && oldRoute.calls.length === 1, "an old frame may not send params");
+check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1", "screen-route-params.v1"] }), "the capability parses at ready");
+const nonRecords = mount(); nonRecords.channel.receive(nonRecords.event);
+nonRecords.port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-route-params.v1"] });
+check(nonRecords.port.closed, "route params without a records screen close the mount");

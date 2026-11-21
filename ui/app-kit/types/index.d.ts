@@ -47,6 +47,7 @@ export type ScreenCapability =
   | "screen-presentation.v1"
   | "screen-surfaces.v1"
   | "screen-canvas.v1"
+  | "screen-route-params.v1"
   | "screen-records.v1"
   | "screen-locale.v1"
   | "screen-audio.v1"
@@ -173,6 +174,8 @@ export interface ScreenRoute<Section extends string = string, View extends strin
   view: View;
   record_id: string | null;
   segment_id: string | null;
+  /** A declared view's params (name -> plain text). Present, `{}` when none, only after the `routeParams` / `screen-route-params.v1` opt-in. */
+  readonly params?: Readonly<Record<string, string>>;
 }
 
 export interface ScreenRoutePatch<Section extends string = string, View extends string = "list" | "new"> {
@@ -180,6 +183,8 @@ export interface ScreenRoutePatch<Section extends string = string, View extends 
   view?: View;
   record_id?: string | null;
   segment_id?: string | null;
+  /** Replaces the page's whole param set (`{}` clears it). Needs the `routeParams` opt-in. */
+  params?: Readonly<Record<string, string>>;
   replace?: boolean;
 }
 
@@ -253,6 +258,8 @@ export interface ScreenBridgeOptions<
   surfaces?: boolean;
   /** Opt into `canvas` / `readOnly` from the host (needs `surfaces`). */
   canvas?: boolean;
+  /** Opt into `params` on the route and on `patchRoute` (needs `records` and `route`). */
+  routeParams?: boolean;
   presentation?: boolean;
   locale?: boolean;
   audio?: boolean | "v1" | "v2";

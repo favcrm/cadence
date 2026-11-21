@@ -32,6 +32,7 @@ import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/scree
 import RunLauncher from "./RunLauncher";
 import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
 import { displayI18nFromListing, localizedAppTitle, localizedSectionLabel, parseAppDisplayI18n, type AppDisplayI18n } from "../workspace-apps/appLocale";
+import { setQueryParams } from "../workspace-apps/screen/routeParams";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -642,6 +643,8 @@ export default function AppShell({
         for (const [field, parameter] of [["record_id", "record"], ["segment_id", "segment"]] as const) {
           if (safe[field] !== undefined) { if (safe[field] === null) q.delete(parameter); else q.set(parameter, safe[field]); }
         }
+        // CAD-2555 — a patch that carries `params` replaces the page's whole set (`{}` clears it).
+        if (safe.params !== undefined) setQueryParams(q, safe.params);
       }
       if (patch.clearContractPreview) {
         q.delete("contract-preview");
@@ -1185,7 +1188,8 @@ export default function AppShell({
   // route patch the full-page app writes to the board URL, never a canvas tab.
   const showRoute = useCallback(
     (route: RoutePatch) => {
-      if (effectiveNavigation) writeQuery({ screenRoute: { patch: route, navigation: effectiveNavigation } });
+      // A card names its whole place, so it replaces the page's params too (CAD-2555).
+      if (effectiveNavigation) writeQuery({ screenRoute: { patch: { ...route, params: route.params ?? {} }, navigation: effectiveNavigation } });
     },
     [effectiveNavigation, writeQuery],
   );

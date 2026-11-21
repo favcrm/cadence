@@ -1,4 +1,5 @@
 import { appViewRef, type AppViewRef } from "../canvas/appView";
+import { routeParams, withParams, type RouteParams } from "../workspace-apps/screen/routeParams";
 import { recordViewId, type RecordViewRef } from "../canvas/recordView";
 import type { ThreadEntry } from "./thread";
 
@@ -573,6 +574,7 @@ const VIEW_APP = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const VIEW_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const VIEW_TAG = /^[A-Za-z0-9_-]{1,64}$/;
 const VIEW_SECTION = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const VIEW_DECLARED = /^[a-z0-9_-]{1,32}$/;
 const NO_CONTROLS = /^[^\u0000-\u001f\u007f-\u009f]*$/;
 
 export interface ViewCardModel {
@@ -583,6 +585,10 @@ export interface ViewCardModel {
   section: string;
   recordId: string | null;
   title: string;
+  /** CAD-2555 — a declared app view: its id, label and params (grammar only; the host checked the declaration). */
+  view?: string;
+  viewLabel?: string;
+  params?: RouteParams;
 }
 
 const plainField = (v: unknown, max: number): v is string =>
@@ -593,15 +599,24 @@ export function parseViewRef(entry: ThreadEntry): ViewCardModel | null {
   const p = payloadOf(entry, "view_ref");
   if (!p) return null;
   const hasRecord = Object.prototype.hasOwnProperty.call(p, "record_id");
-  if (!exactKeys(p, ["v", "app", "app_label", "install_id", "screen_tag", "section", "title", ...(hasRecord ? ["record_id"] : [])])) return null;
-  const { app, app_label, install_id, screen_tag, section, record_id, title } = p;
+  const optional = ["view", "view_label", "params"].filter((key) => Object.prototype.hasOwnProperty.call(p, key));
+  if (!exactKeys(p, ["v", "app", "app_label", "install_id", "screen_tag", "section", "title", ...(hasRecord ? ["record_id"] : []), ...optional])) return null;
+  const { app, app_label, install_id, screen_tag, section, record_id, title, view, view_label, params } = p;
   if (typeof app !== "string" || !VIEW_APP.test(app)) return null;
   if (!plainField(app_label, 60) || !plainField(title, 120)) return null;
   if (typeof install_id !== "string" || !VIEW_ID.test(install_id)) return null;
   if (typeof screen_tag !== "string" || !VIEW_TAG.test(screen_tag)) return null;
   if (typeof section !== "string" || !VIEW_SECTION.test(section)) return null;
   if (hasRecord && record_id !== null && (typeof record_id !== "string" || !VIEW_ID.test(record_id))) return null;
-  return { app, appLabel: app_label, installId: install_id, screenTag: screen_tag, section, recordId: typeof record_id === "string" ? record_id : null, title };
+  if (optional.includes("view") && (typeof view !== "string" || !VIEW_DECLARED.test(view))) return null;
+  if (optional.includes("view_label") && !plainField(view_label, 60)) return null;
+  if (optional.includes("params") && !routeParams(params)) return null;
+  return {
+    app, appLabel: app_label, installId: install_id, screenTag: screen_tag, section, recordId: typeof record_id === "string" ? record_id : null, title,
+    ...(optional.includes("view") ? { view: view as string } : {}),
+    ...(optional.includes("view_label") ? { viewLabel: view_label as string } : {}),
+    ...(optional.includes("params") ? { params: params as RouteParams } : {}),
+  };
 }
 
 /** Where a card opens its tab: the app pane's own context when the card is for that install, else the install's default. */
@@ -624,9 +639,10 @@ export function viewCardAppView(model: ViewCardModel, scope: ViewScope = HOME_VI
     installId: model.installId,
     tag: model.screenTag,
     contextId,
-    route: { section: model.section, view: "list", record_id: model.recordId, segment_id: null },
+    route: { section: model.section, view: "list", record_id: model.recordId, segment_id: null, ...withParams(model.params) },
     title: model.title,
     appLabel: model.appLabel,
+    ...(model.viewLabel ? { viewLabel: model.viewLabel } : {}),
     // A placeholder: the tab builds the real link from the installation it reads.
     fromCard: true,
     href: `/apps/${model.app}`,

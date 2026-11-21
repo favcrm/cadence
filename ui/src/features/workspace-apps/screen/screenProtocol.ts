@@ -219,7 +219,11 @@ export type SlotVerb = (typeof SLOT_VERBS)[number] | RecordSlotVerb;
 export interface ScreenSectionI18n { label: string }
 export interface ScreenSection { id: string; label: string; i18n?: Record<string, ScreenSectionI18n> }
 export interface ScreenNavigation { section_query: string; default_section: string; sections: ScreenSection[] }
-export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
+export interface ScreenRoute {
+  section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null;
+  /** CAD-2555 — a declared view's params (name → plain text). Sent only to a frame that opted into `screen-route-params.v1`; absent when none. */
+  params?: Record<string, string>;
+}
 export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
 /** Host-selected presentation locale only (`"en" | "zh-TW"`); never an operation or permission. */
@@ -493,12 +497,16 @@ export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
  *  canvas (role `canvas`) and that the mount is read-only (`readOnly`). It
  *  rides on `screen-surfaces.v1`; a frame without it is told `primary`. */
 export const SCREEN_CANVAS_V1 = "screen-canvas.v1";
+/** CAD-2555 — the child opts in to `params` on the route it is pushed and on
+ *  its `screen.route.patch` calls (a declared app view's params). A frame
+ *  without it is pushed the route exactly as before and may not send `params`. */
+export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
 /** CAD-1365 — the media catalog/curation channel a media-contract
  *  screen's child opts into alongside `screen.v2`. Opting in grants
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -909,7 +917,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }

@@ -1,0 +1,288 @@
+[
+  {
+    "case": "view id with bad grammar",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "P&L",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": "2026-01-01",
+          "to": "2026-03-31"
+        }
+      }
+    }
+  },
+  {
+    "case": "view id too long",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": "2026-01-01",
+          "to": "2026-03-31"
+        }
+      }
+    }
+  },
+  {
+    "case": "view_label too long",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "params": {
+          "from": "2026-01-01",
+          "to": "2026-03-31"
+        }
+      }
+    }
+  },
+  {
+    "case": "view_label empty",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "",
+        "params": {
+          "from": "2026-01-01",
+          "to": "2026-03-31"
+        }
+      }
+    }
+  },
+  {
+    "case": "params not an object",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": ["2026-01-01"]
+      }
+    }
+  },
+  {
+    "case": "param value not a string",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": 20260101
+        }
+      }
+    }
+  },
+  {
+    "case": "param value too long",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    }
+  },
+  {
+    "case": "param value with control character",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": "2026-01-01\u0007"
+        }
+      }
+    }
+  },
+  {
+    "case": "param name with bad grammar",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "From": "2026-01-01"
+        }
+      }
+    }
+  },
+  {
+    "case": "param name too long",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "aaaaaaaaaaaaaaaaaaaaaaaaa": "x"
+        }
+      }
+    }
+  },
+  {
+    "case": "more than six params",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "a": "x",
+          "b": "x",
+          "c": "x",
+          "d": "x",
+          "e": "x",
+          "f": "x",
+          "g": "x"
+        }
+      }
+    }
+  },
+  {
+    "case": "unknown payload key",
+    "entry": {
+      "role": "agent",
+      "kind": "view_ref",
+      "text": "Opened Profit and loss in the canvas (Books · reports)",
+      "payload": {
+        "v": 1,
+        "app": "books",
+        "app_label": "Books",
+        "install_id": "install_books",
+        "screen_tag": "books",
+        "section": "reports",
+        "record_id": "pnl",
+        "title": "Profit and loss",
+        "view": "pnl",
+        "view_label": "Profit and loss",
+        "params": {
+          "from": "2026-01-01",
+          "to": "2026-03-31"
+        },
+        "extra": "x"
+      }
+    }
+  }
+]

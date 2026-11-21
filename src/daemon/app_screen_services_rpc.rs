@@ -328,7 +328,25 @@ args!(WaBrief {
     conversation_id: String,
     guidance: String
 });
-args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
+args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, params: Option<Value>, replace: Option<bool> });
+/// CAD-2555: a route patch's `params` — an object of at most six plain-text
+/// values under `[a-z_]{1,24}` names. Types, dates and enums are the app's
+/// declared view's to check; the shell only keeps the set bounded and plain.
+fn check_route_params(params: &Value) -> Result<()> {
+    use crate::issue::app_screen_decl as decl;
+    let ok = params.as_object().is_some_and(|map| {
+        map.len() <= decl::MAX_VIEW_PARAMS
+            && map.iter().all(|(name, value)| {
+                decl::valid_view_param_name(name)
+                    && value.as_str().is_some_and(decl::valid_view_param_value)
+            })
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::rejected("invalid route params"))
+    }
+}
 // CAD-1662: Works content. Bounds follow the store's grammar; the daemon
 // re-validates every field, these structs only close the shape.
 args!(WorksId { id: String });
@@ -462,6 +480,9 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
                 .map_err(|_| Error::rejected("unsupported route patch"))?;
             if value.get("replace").is_some_and(|flag| !flag.is_boolean()) {
                 return Err(Error::rejected("route replace must be a boolean"));
+            }
+            if let Some(params) = value.get("params") {
+                check_route_params(params)?;
             }
             Ok(value.clone())
         }
@@ -1738,6 +1759,9 @@ impl Shared {
         fields.remove("context_id");
         match proof.operation {
             ScreenRoutePatch => {
+                if let Some(params) = args.get("params") {
+                    check_route_params(params)?;
+                }
                 if let Some(view) = args.get("view").filter(|v| !v.is_null()) {
                     if !matches!(view.as_str(), Some("list" | "new")) {
                         return Err(Error::rejected("unsupported screen view"));
@@ -1929,5 +1953,68 @@ impl Shared {
             );
         }
         response(result)
+    }
+}
+
+#[cfg(test)]
+mod route_patch_params_tests {
+    use super::*;
+
+    #[test]
+    fn route_patch_params_refusals() {
+        let patch = |params: Value| json!({ "section": "a", "params": params });
+        let many: serde_json::Map<String, Value> = (0..7)
+            .map(|i| (format!("k{}", "a".repeat(i)), json!("v")))
+            .collect();
+        let six: serde_json::Map<String, Value> = (0..6)
+            .map(|i| (format!("k{}", "a".repeat(i)), json!("v")))
+            .collect();
+        let long_name = "a".repeat(25);
+        let ok_name = "a".repeat(24);
+        let ok_value = "x".repeat(200);
+        let long_value = "x".repeat(201);
+
+        let accepted = [
+            json!({ "section": "a" }),
+            json!({ "section": "a", "view": "v", "record_id": "r", "segment_id": "s", "replace": true }),
+            patch(json!({})),
+            patch(json!({ "q": "hello world", "sort_by": "name" })),
+            patch(json!({ ok_name.clone(): ok_value })),
+            patch(Value::Object(six)),
+        ];
+        for args in &accepted {
+            assert!(
+                call_args(ScreenOperation::ScreenRoutePatch, args).is_ok(),
+                "should accept {args}"
+            );
+        }
+
+        let refused = [
+            ("too many entries", patch(Value::Object(many))),
+            ("uppercase name", patch(json!({ "Q": "v" }))),
+            ("digit name", patch(json!({ "q1": "v" }))),
+            ("dash name", patch(json!({ "a-b": "v" }))),
+            ("empty name", patch(json!({ "": "v" }))),
+            ("overlong name", patch(json!({ long_name: "v" }))),
+            ("empty value", patch(json!({ "q": "" }))),
+            ("overlong value", patch(json!({ "q": long_value }))),
+            ("newline in value", patch(json!({ "q": "a\nb" }))),
+            ("nul in value", patch(json!({ "q": "a\u{0}b" }))),
+            ("number value", patch(json!({ "q": 1 }))),
+            ("bool value", patch(json!({ "q": true }))),
+            ("null value", patch(json!({ "q": null }))),
+            ("object value", patch(json!({ "q": {} }))),
+            ("array value", patch(json!({ "q": ["a"] }))),
+            ("params array", patch(json!(["a"]))),
+            ("params string", patch(json!("q=v"))),
+            ("params null", patch(Value::Null)),
+            ("unknown key", json!({ "section": "a", "bogus": "x" })),
+        ];
+        for (case, args) in &refused {
+            assert!(
+                call_args(ScreenOperation::ScreenRoutePatch, args).is_err(),
+                "should refuse {case}: {args}"
+            );
+        }
     }
 }

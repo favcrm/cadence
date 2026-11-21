@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { ApiError } from "../../lib/api";
-import { useTranslate } from "../../lib/locale";
+import { useLocaleTag, useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
 import { IconClose } from "../../ui/icons";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
@@ -17,6 +17,8 @@ import AppLoadingSurface from "../workspace-apps/AppLoadingSurface";
 import { readAppScopeFresh, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
+import { setQueryParams } from "../workspace-apps/screen/routeParams";
+import { paramsLine } from "./viewParams";
 
 type Load =
   | { status: "loading" }
@@ -55,6 +57,8 @@ function installationHref(installation: Installation, app: AppViewRef): string |
   if (path === null || sectionQuery === undefined || !SECTION_QUERY.test(sectionQuery)) return null;
   const query = new URLSearchParams({ install: app.installId, ctx: app.contextId, [sectionQuery]: app.route.section });
   if (app.route.record_id !== null) query.set("record", app.route.record_id);
+  // The tab's own params travel to the full page as `p.<name>` (CAD-2555).
+  setQueryParams(query, app.route.params ?? {});
   return `${path}?${query.toString()}`;
 }
 
@@ -74,6 +78,7 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
   onClose: () => void;
 }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   const [attempt, setAttempt] = useState(0);
   const load = useAppScope(app.installId, attempt);
   // No access (the scope refused, or the frame's own mount did): the tab offers no way into the app.
@@ -83,7 +88,12 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
   // The frame's own navigation stays on this tab; it never reaches the board URL.
   const onRoute = useCallback((patch: RoutePatch) => patchAppViewRoute(tab.id, patch), [tab.id]);
   const href = app.fromCard === true ? (load.status === "ready" ? installationHref(load.installation, app) : null) : app.href;
-  const place = app.route.record_id ? `${app.route.section} / ${app.route.record_id}` : app.route.section;
+  // A declared view is named by its label, then its params (CAD-2555); the tab's current route, so a frame that moved shows where it is.
+  const [openedSection, openedRecord] = tab.id.split(":").slice(-2);
+  const onOpenedView = app.route.section === openedSection && (app.route.record_id ?? "") === openedRecord;
+  const where = (onOpenedView ? app.viewLabel : undefined) ?? (app.route.record_id ? `${app.route.section} / ${app.route.record_id}` : app.route.section);
+  const params = paramsLine(app.route.params, locale);
+  const place = params === "" ? where : `${where} · ${params}`;
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>
     state.kind === "refused" && isNoAccess(state.status) ? <FrameDenied onDenied={() => setFrameDenied(true)}>{denied}</FrameDenied> : (

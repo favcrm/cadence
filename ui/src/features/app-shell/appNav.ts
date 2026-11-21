@@ -7,6 +7,7 @@ import {
   type TranslateFn,
 } from "../workspace-apps/appLocale";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import { setQueryParams } from "../workspace-apps/screen/routeParams";
 
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
@@ -75,6 +76,8 @@ export function appSectionHref(base: string, navigation: ScreenNavigation | null
   query.delete("appview");
   query.delete("record");
   query.delete("segment");
+  // CAD-2555: a declared view's params belong to the page they were set on.
+  setQueryParams(query, {});
   const next = query.toString();
   return path + (next ? `?${next}` : "");
 }

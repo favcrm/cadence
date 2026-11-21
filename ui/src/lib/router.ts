@@ -541,6 +541,12 @@ const DOCUMENTS_PARAMS = ["archived", "stage"] as const;
  *  the app page's alone and never follow the operator elsewhere. */
 const APP_ROUTE_PARAMS = ["crm", "record", "ctx", "appview", "segment", "conversation", "install", "drawer", "drawer_size"] as const;
 
+/** CAD-2555: the page's declared-view params (`p.<name>`) are app-owned too. */
+function deleteAppRouteParams(q: URLSearchParams): void {
+  for (const key of [...q.keys()]) if (key.startsWith("p.")) q.delete(key);
+  for (const key of APP_ROUTE_PARAMS) q.delete(key);
+}
+
 /** Query keys owned by host screens so an app key matching one is never stripped as app state. */
 const HOST_QUERY_KEYS = new Set<string>([
   "tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page",
@@ -583,7 +589,7 @@ export function appNavigationSearch(
 ): string {
   if (!isAppRoute(from) || sameAppRoute(from, to)) return search;
   const q = new URLSearchParams(search);
-  for (const key of APP_ROUTE_PARAMS) q.delete(key);
+  deleteAppRouteParams(q);
   if (from.screen === "workspaceAppKey" && !HOST_QUERY_KEYS.has(from.appKey)) {
     q.delete(from.appKey);
   }
@@ -594,7 +600,7 @@ export function appNavigationSearch(
 /** Strip app-owned query parameters unconditionally before entering another app. */
 export function stripAppRouteParams(search: string, extraSectionQuery?: SectionQueryInput): string {
   const q = new URLSearchParams(search);
-  for (const key of APP_ROUTE_PARAMS) q.delete(key);
+  deleteAppRouteParams(q);
   deleteSectionQueries(q, extraSectionQuery);
   return q.toString();
 }
@@ -628,7 +634,7 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // route and never follow the user to /settings, /threads, or another app.
   const leavingApp = !isAppRoute(route) || (from !== null && isAppRoute(from) && !sameAppRoute(from, route));
   if (leavingApp) {
-    for (const key of APP_ROUTE_PARAMS) q.delete(key);
+    deleteAppRouteParams(q);
     if (from?.screen === "workspaceAppKey" && !HOST_QUERY_KEYS.has(from.appKey)) {
       q.delete(from.appKey);
     }

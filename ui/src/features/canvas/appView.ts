@@ -5,6 +5,7 @@
  * decides what it may see.
  */
 import type { ScreenRoute } from "../workspace-apps/screen/screenProtocol";
+import { routeParams, withParams } from "../workspace-apps/screen/routeParams";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 
 export interface AppViewRef {
@@ -17,6 +18,8 @@ export interface AppViewRef {
   title: string;
   /** The app's display label when the opener knows it; the tab names the app from this while the install cannot be read. */
   appLabel?: string;
+  /** A declared view's label (CAD-2555); the header names the place from it. */
+  viewLabel?: string;
   /** Set by a view card: its `href` is only a placeholder, and the tab builds the
    *  full-page link from the installation it reads (canonical key and section query). */
   fromCard?: true;
@@ -37,16 +40,17 @@ const nullableFrameId = (value: unknown): value is string | null => value === nu
 /** A validated reference, or null: a malformed one opens no tab. */
 export function appViewRef(input: unknown): AppViewRef | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
-  const { installId, tag, contextId, route, title, href, appLabel, fromCard } = input as Record<string, unknown>;
+  const { installId, tag, contextId, route, title, href, appLabel, viewLabel, fromCard } = input as Record<string, unknown>;
   if (typeof installId !== "string" || !HOST_ID.test(installId)) return null;
   if (typeof tag !== "string" || !SCREEN_TAG.test(tag)) return null;
   if (typeof contextId !== "string" || (contextId !== "" && !HOST_ID.test(contextId))) return null;
   if (typeof title !== "string" || title.trim() === "" || title.length > 200) return null;
   if (typeof href !== "string" || !APP_HREF.test(href) || href.includes("..")) return null;
   if (typeof route !== "object" || route === null || Array.isArray(route)) return null;
-  const { section, view, record_id, segment_id } = route as Record<string, unknown>;
+  const { section, view, record_id, segment_id, params } = route as Record<string, unknown>;
   if (!frameId(section) || (view !== "list" && view !== "new") || !nullableFrameId(record_id) || !nullableFrameId(segment_id)) return null;
-  return { installId, tag, contextId, route: { section, view, record_id, segment_id }, title: title.trim(), ...(typeof appLabel === "string" && appLabel.trim() !== "" && appLabel.length <= 60 ? { appLabel: appLabel.trim() } : {}), ...(fromCard === true ? { fromCard } : {}), href };
+  if (params !== undefined && !routeParams(params)) return null;
+  return { installId, tag, contextId, route: { section, view, record_id, segment_id, ...withParams(params) }, title: title.trim(), ...(typeof viewLabel === "string" && viewLabel.trim() !== "" && viewLabel.length <= 60 ? { viewLabel: viewLabel.trim() } : {}), ...(typeof appLabel === "string" && appLabel.trim() !== "" && appLabel.length <= 60 ? { appLabel: appLabel.trim() } : {}), ...(fromCard === true ? { fromCard } : {}), href };
 }
 
 /** One tab per install, screen and record; opening it again focuses it. The
@@ -66,7 +70,10 @@ export function appViewTitle(id: string, openedTitle: string, route: ScreenRoute
 }
 
 export function sameRoute(a: ScreenRoute, b: ScreenRoute): boolean {
-  return a.section === b.section && a.view === b.view && a.record_id === b.record_id && a.segment_id === b.segment_id;
+  const ap = Object.entries(a.params ?? {});
+  const bp = b.params ?? {};
+  return a.section === b.section && a.view === b.view && a.record_id === b.record_id && a.segment_id === b.segment_id &&
+    ap.length === Object.keys(bp).length && ap.every(([name, value]) => bp[name] === value);
 }
 
 /** A route patch from inside the frame, applied to the tab's own route.
@@ -77,5 +84,7 @@ export function applyRoutePatch(route: ScreenRoute, patch: RoutePatch): ScreenRo
     view: patch.view ?? route.view,
     record_id: patch.record_id === undefined ? route.record_id : patch.record_id,
     segment_id: patch.segment_id === undefined ? route.segment_id : patch.segment_id,
+    // A patch's `params` replace the whole set; one without leaves it as it was.
+    ...withParams(patch.params ?? route.params),
   };
 }

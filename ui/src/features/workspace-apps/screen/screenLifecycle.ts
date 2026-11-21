@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, SCREEN_CANVAS_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, SCREEN_CANVAS_V1, SCREEN_ROUTE_PARAMS_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ScreenSection,
   type ScreenSectionI18n,
@@ -360,6 +360,8 @@ export class ScreenChannel extends FrameChannel {
   private wantsPresentation = false;
   private wantsSurfaces = false;
   private wantsCanvas = false;
+  /** CAD-2555 — the frame opted into `params` on its route (`screen-route-params.v1`). */
+  private wantsRouteParams = false;
   private wantsWhatsAppCompose = false;
   private wantsReplyAvailability = false;
   private wantsReplyLayout = false;
@@ -510,6 +512,8 @@ export class ScreenChannel extends FrameChannel {
   protected call(request: CallRequest): void {
     const actions = this.actions;
     if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    // CAD-2555 — route params are the capability's alone: a frame that did not opt in never sends them.
+    if (!this.wantsRouteParams && request.verb === "screen.route.patch" && Object.hasOwn(request.args, "params")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
     // CAD-1777 / CAD-1932 — a drawer request is host-local UI, never a
     // records operation or an app action: a capable frame (records or not)
@@ -736,6 +740,9 @@ export class ScreenChannel extends FrameChannel {
     const wantsAudioV2 = accepts.includes(SCREEN_AUDIO_V2);
     if (wantsAudio && wantsAudioV2) return false;
     if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
+    // CAD-2555 — the route (and so its params) exists only on a records screen.
+    const wantsRouteParams = accepts.includes(SCREEN_ROUTE_PARAMS_V1);
+    if (wantsRouteParams && !records) return false;
     if ((wantsAudio || wantsAudioV2) && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     const wantsWhatsAppCompose = accepts.includes(SCREEN_WHATSAPP_COMPOSE_V1);
@@ -748,6 +755,7 @@ export class ScreenChannel extends FrameChannel {
     if (this.wantsReplyLayout && (!this.wantsReplyAvailability || !this.actions?.onWhatsAppReplyLayout)) return false;
     this.records = records;
     this.wantsLocale = wantsLocale;
+    this.wantsRouteParams = wantsRouteParams;
     this.wantsAudio = wantsAudio;
     this.wantsAudioV2 = wantsAudioV2;
     this.shape = shape;
@@ -842,6 +850,8 @@ export class ScreenChannel extends FrameChannel {
     }
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
     if (!this.wantsLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    // CAD-2555 — a frame without `screen-route-params.v1` is pushed the route exactly as before.
+    if (!this.wantsRouteParams && projection.route?.params) { const { params: _params, ...route } = projection.route; projection.route = route; }
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;
