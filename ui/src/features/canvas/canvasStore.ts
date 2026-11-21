@@ -7,7 +7,9 @@
  * - the drawer opens by itself only for the FIRST artifact of a turn the
  *   operator started, and only when that artifact arrives live, and only on a
  *   host that has not turned auto-open off (`FeedInput.autoOpen`: the member
- *   chat does, so the drawer never covers the chat on a phone);
+ *   chat does, so the drawer never covers the chat on a phone), and only
+ *   once that turn is no longer the one in flight (CAD-2548: the thread shows
+ *   its cards with the answer, so the drawer waits for it too);
  * - a drawer the operator closed stays closed for the rest of that turn;
  * - the drawer closes when the conversation changes;
  * - opening an artifact already open focuses its tab; closing the active
@@ -265,16 +267,19 @@ export function feedCanvas(input: FeedInput): void {
   let open = state.open;
   let active = state.active;
   let focused = false;
+  // CAD-2548: a live card of the turn still in flight waits for that turn to
+  // end (the thread paints its cards with the answer); it is not "seen" yet.
+  const held = (x: { live: boolean; turn: string | null }) => x.live && x.turn !== null && x.turn === (input.working?.turn ?? null);
   for (const card of input.cards) {
     if (seen.has(card.key)) continue;
-    seen.add(card.key);
+    if (!held(card)) seen.add(card.key);
     const { ref } = card;
     // A card only ever updates a tab that is already open. A tab is added by
     // opening a card, or by the one auto-open per operator turn (CAD-651).
     if (tabs.some((t) => t.id === ref.id)) {
       tabs = tabs.map((t) => (t.id === ref.id && !t.app ? withVersion(t, ref, card.turn) : t));
     }
-    if (input.autoOpen !== false && card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
+    if (input.autoOpen !== false && card.live && !held(card) && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
       if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
       open = true;
@@ -283,7 +288,7 @@ export function feedCanvas(input: FeedInput): void {
     }
   }
   for (const view of input.views ?? []) {
-    if (seen.has(view.key)) continue;
+    if (seen.has(view.key) || held(view)) continue;
     seen.add(view.key);
     if (input.autoOpen === false || !view.live || !view.operatorTurn || !view.turn || autoOpened.has(view.turn) || closedTurns.has(view.turn)) continue;
     autoOpened.add(view.turn);
@@ -298,7 +303,7 @@ export function feedCanvas(input: FeedInput): void {
     focused = true;
   }
   for (const record of input.records ?? []) {
-    if (seen.has(record.key)) continue;
+    if (seen.has(record.key) || held(record)) continue;
     seen.add(record.key);
     if (input.autoOpen === false || !record.live || !record.operatorTurn || !record.turn || autoOpened.has(record.turn) || closedTurns.has(record.turn)) continue;
     autoOpened.add(record.turn);

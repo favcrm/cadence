@@ -1,4 +1,4 @@
-import { useContext, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
@@ -1231,6 +1231,14 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
+  // CAD-2548: data cards (record, view, connect, artifact) wait for the
+  // answer like TurnSources and TurnStagedCards. Image and video job cards
+  // show their own progress and forms are unchanged, so both stay live.
+  const dataCards: ThreadItem[] = artifacts.filter((item) => item.type === "record" || item.type === "view" || item.type === "connect" || item.type === "artifact");
+  const shownCards = streaming ? artifacts.filter((item) => !dataCards.includes(item)) : artifacts;
+  const sawStreaming = useRef(false);
+  if (streaming) sawStreaming.current = true;
+  const fade = sawStreaming.current;
   // The assistant's actual in-flight words (CAD-2228), replaced frame by
   // frame. It paints only while this turn is still generating and has no
   // committed answer, and it is never presented as a stored reply.
@@ -1325,25 +1333,29 @@ export function ThreadTurn({
         />
       )}
       {!streaming && <TurnStagedCards toolEntries={toolEntries} density={density} />}
-      {artifacts.length > 0 && (
+      {shownCards.length > 0 && (
         <div className="turn-artifacts">
-          {artifacts.map((item) =>
-            item.type === "form" ? (
+          {shownCards.map((item) => {
+            // CAD-2548: a card that appears when a live turn's answer commits
+            // fades in, staggered; history never mounts in the streaming state.
+            const fadeIndex = fade ? dataCards.indexOf(item) : -1;
+            const fadeProps = fadeIndex < 0 ? {} : { className: "turn-card-in", style: { "--i": fadeIndex } as CSSProperties };
+            return item.type === "form" ? (
               <div key={item.key} data-item-key={item.key}>
                 <AgentForm entry={item.entry} status={item.status} density={density} />
               </div>
             ) : item.type === "connect" ? (
-              <div key={item.key} data-item-key={item.key}><ConnectCard entry={item.entry} density={density} /></div>
+              <div key={item.key} data-item-key={item.key} {...fadeProps}><ConnectCard entry={item.entry} density={density} /></div>
             ) : item.type === "record" ? (
-              <div key={item.key} data-item-key={item.key}><RecordCard entry={item.entry} density={density} /></div>
+              <div key={item.key} data-item-key={item.key} {...fadeProps}><RecordCard entry={item.entry} density={density} /></div>
             ) : item.type === "view" ? (
-              <div key={item.key} data-item-key={item.key}><ViewCard entry={item.entry} density={density} /></div>
+              <div key={item.key} data-item-key={item.key} {...fadeProps}><ViewCard entry={item.entry} density={density} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
-              <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
+              <div key={item.key} data-item-key={item.key} {...(item.type === "artifact" ? fadeProps : { className: "turn-image" })}>
                 {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} density={density} />}
               </div>
-            ) : null,
-          )}
+            ) : null;
+          })}
         </div>
       )}
       {after}

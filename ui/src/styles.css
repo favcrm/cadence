@@ -1510,6 +1510,24 @@ textarea.agentform-input { height: auto; width: 100%; }
   }
 }
 
+/* CAD-2548: cards that appear with a live turn's committed answer. */
+.turn-card-in {
+  animation: card-in .18s ease-out both;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-card-in { animation: none; }
+}
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
 @keyframes msg-in {
   from {
     opacity: 0;

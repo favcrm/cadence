@@ -132,13 +132,13 @@ const items = threadItems(mergePage(null, { thread: { id: "t" }, entries: [
   { seq: 3, role: "agent", kind: "record_ref", message: "m1", ...two },
 ] }));
 resetCanvas("c", "k", "home");
-feedCanvas({ conversation: "c", surface: "home", composerKey: "k", ...feedParts(items, 0, "m1") });
+feedCanvas({ conversation: "c", surface: "home", composerKey: "k", ...feedParts(items, 0, null) });
 equal([canvasSnapshot().tabs.map((t) => t.id), canvasSnapshot().open], [["record:e2"], true], "a live card opens its tab once per turn");
 resetCanvas("c", "k", "home");
-feedCanvas({ conversation: "c", surface: "home", composerKey: "k", ...feedParts(items, 3, "m1") });
+feedCanvas({ conversation: "c", surface: "home", composerKey: "k", ...feedParts(items, 3, null) });
 equal([canvasSnapshot().tabs.length, canvasSnapshot().open], [0, false], "history never opens a tab");
 resetCanvas("c", "k", "home");
-feedCanvas({ conversation: "c", surface: "home", composerKey: "k", autoOpen: false, ...feedParts(items, 0, "m1") });
+feedCanvas({ conversation: "c", surface: "home", composerKey: "k", autoOpen: false, ...feedParts(items, 0, null) });
 equal([canvasSnapshot().tabs.length, canvasSnapshot().open], [0, false], "the member chat never auto-opens");
 
 // ---- the reader ----
