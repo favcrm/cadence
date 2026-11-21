@@ -233,7 +233,10 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   </div>;
 
   return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
-    style={bounds ? { marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%` } : undefined}>
+    style={bounds ? {
+      marginLeft: `${bounds[0] / 100}%`, marginRight: `${(10000 - bounds[1]) / 100}%`,
+      maxBlockSize: overlay ? `min(55%, ${WHATSAPP_REPLY_INSET_MAX}px)` : undefined,
+    } : undefined}>
     {!overlay && status}
     <form className="app-chat-composer wa-reply-card" aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
       {overlay && status}
@@ -257,7 +260,9 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       <div className="app-chat-composer-tools wa-reply-tools">
         {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
-        {(!readOnly || busy) && <span className="wa-reply-hint" aria-live="polite">{busy ? (zh ? "處理中…" : "Working…") : (zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line")}</span>}
+        <span className="wa-reply-hint" aria-live="polite">
+          {busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
+        </span>
         <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
           onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
           onClick={e => {
