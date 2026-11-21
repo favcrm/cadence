@@ -617,6 +617,17 @@ persistence, and **replaying `platform call` will start and charge a new call
 when the original request was not recorded**. To deliberately run the same
 input again after a recorded call, pass a fresh `--request <handle>`.
 
+Private app activation uses a different receipt. If `private_app_review_apply`
+has an uncertain outcome, use the same workspace, agent and review ID:
+
+```sh
+cadence --org acme platform call private_app_review_reconcile --input '{"id":"par_0123456789abcdef0123456789abcdef"}'
+```
+
+This reads the saved activation receipt without applying the app. The
+`platform status --request` ledger does not cover private app reviews. The
+workspace must already support the server-side private review lifecycle.
+
 When the workspace has a qualified Search Console tool and an existing
 connection, a read names that connection explicitly. The same connection and
 input are needed to derive and verify its status:

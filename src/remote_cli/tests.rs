@@ -9663,6 +9663,38 @@ mod agent_credential_refusals {
             );
         }
     }
+
+    #[test]
+    fn private_app_apply_reconciles_by_review_instead_of_payment_receipt() {
+        for (status, code, unknown) in [
+            (503, "operation_uncertain", true),
+            (403, "approval_required", false),
+        ] {
+            let r = rig(8, move |route, _| {
+                (route == "call")
+                    .then(|| Reply::Json(status, json!({"ok": false, "error": {"code": code}})))
+            });
+            let args = json!({
+                "operation": "call",
+                "tool": "private_app_review_apply",
+                "key": "a-separate-transport-key",
+                "body": {
+                    "id": "par_0123456789abcdef0123456789abcdef",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                    "zip_sha256": format!("sha256:{}", "b".repeat(64)),
+                },
+            });
+            let err = r.send(None, "platform_call", args).unwrap_err();
+            assert_eq!(err.kind() == "unknown", unknown, "{err}");
+            assert_eq!(
+                err.to_string().contains("private_app_review_reconcile"),
+                unknown,
+                "{err}"
+            );
+            assert!(!err.to_string().contains("platform status"), "{err}");
+            assert_eq!(r.trail(), ["authorize:login", "call:login"]);
+        }
+    }
 }
 
 const SKILL_VERBS: [&str; 7] = [
