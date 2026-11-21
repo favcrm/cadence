@@ -440,7 +440,7 @@ export const visible = (text: string): string =>
  * partial list is kept, and Approve stays off (`approvable`). A malformed row
  * (no verb, or a change that does not parse) is dropped.
  */
-function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : {};
   const verb = str(row.verb) ?? str(input.verb);
   if (verb === null) return null;
