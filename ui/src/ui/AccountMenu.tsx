@@ -12,6 +12,7 @@ export default function AccountMenu({
   trigger,
   placement,
   settingsHref,
+  securityHref,
   footer,
   onOpenChange,
 }: {
@@ -20,6 +21,7 @@ export default function AccountMenu({
   trigger: "avatar" | "row";
   placement: "below-end" | "above-start";
   settingsHref?: string;
+  securityHref?: string | undefined;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
   /** Reports the dialog's open state (the sidebar raises itself while it is open). */
@@ -143,6 +145,11 @@ export default function AccountMenu({
           {settingsHref && (
             <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
               {t("Settings")}
+            </Link>
+          )}
+          {securityHref && (
+            <Link href={securityHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
+              {t("Security")}
             </Link>
           )}
           <button type="button" disabled={busy} onClick={signOut} className="block w-full rounded-md px-2.5 py-2 text-left text-secondary text-ink-200 hover:bg-ink-800 disabled:opacity-60">
