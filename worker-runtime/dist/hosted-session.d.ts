@@ -28,6 +28,7 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     private readonly operationScopes;
     private readonly contextBudgetProofs;
     private readonly modelTaskContext;
+    private readonly loopGuard;
     /** The app scope of the operation that owns one tool call, read from the engine. */
     private readonly toolAppScope;
     private readonly harness;
