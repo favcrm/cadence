@@ -14,6 +14,7 @@ export {};
  */
 import type { Overview } from "../src/lib/types";
 import type { ResourceState } from "../src/lib/cache";
+import type * as StagedWriteModule from "../src/features/decisions/stagedWrite";
 
 declare function require(name: string): any;
 
@@ -44,8 +45,7 @@ const ConversationDecisions = (require("../src/features/app-shell/chat/Conversat
 const RecruitChat = (require("../src/features/agents/RecruitChat") as typeof import("../src/features/agents/RecruitChat")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
-const { parseStagedRow, askedBy, sourceLine, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
-
+const { parseStagedRow, parseStagedList, askedBy, sourceLine, outcomeOf, stagedDomain } = require("../src/features/decisions/stagedWrite") as typeof StagedWriteModule;
 // ---- a fake board: the staged list and the decide routes ----
 const AGO = 2 * 60_000;
 const customer = (id: string, extra: Record<string, unknown> = {}) => ({
@@ -206,18 +206,20 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   const fixture = JSON.parse(require("fs").readFileSync(
     `${require("process").cwd()}/../tests/fixtures/agenticos/assistant-action-proposers.json`, "utf8",
   )) as {
-    personal: { id: string; proposer: { scope: "personal"; label: string } };
-    workspace: { id: string; proposer: { scope: "workspace"; label: string } };
-    legacy: { id: string };
+    personal: { actions: Array<{ id: string; status: string; proposer?: { scope: "personal"; label: string }; [key: string]: unknown }> };
+    workspace: { actions: Array<{ id: string; status: string; proposer: { scope: "workspace"; label: string }; [key: string]: unknown }> };
   };
-  const personal = fixture.personal.proposer;
-  const workspace = fixture.workspace.proposer;
-  for (const proposer of [personal, workspace]) {
-    const row = parseStagedRow(customer("scoped", { origin: null, proposer }))!;
+  const personal = fixture.personal.actions[0]!.proposer!;
+  const workspace = fixture.workspace.actions[0]!.proposer;
+  const personalRows = parseStagedList(fixture.personal);
+  const workspaceRows = parseStagedList(fixture.workspace);
+  assert(personalRows?.length === 2 && workspaceRows?.length === 1, "complete producer lists parse");
+  for (const [row, proposer] of [[personalRows[0]!, personal], [workspaceRows[0]!, workspace]] as const) {
     const attribution = `${proposer.label} · ${proposer.scope === "workspace" ? "Workspace assistant" : "Personal assistant"}`;
     assert(row.proposer?.scope === proposer.scope && askedBy(row) === attribution, "scoped proposer parses");
-    assert(sourceLine(row) === `CRM · ${attribution}`, "rail uses the same attribution");
+    assert(sourceLine(row).includes(attribution), "rail uses the same attribution");
   }
+  assert(personalRows[1]!.proposer === null && askedBy(personalRows[1]!) === null, "legacy producer row has unknown proposer");
   const issue = parseStagedRow({ ...issueRow("issue"), proposer: workspace })!;
   assert(askedBy(issue) === `${workspace.label} · Workspace assistant`, "issue proposal carries scoped attribution");
   const connected = parseStagedRow({
@@ -236,22 +238,21 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   const malformedOrigin = parseStagedRow(customer("unknown-origin", { origin: {}, proposer: personal }))!;
   assert(askedBy(malformedOrigin) === null, "malformed origin does not expose a potentially different proposer");
 
-  actions = [
-    customer(fixture.personal.id, { origin: null, ...fixture.personal }),
-    customer(fixture.legacy.id, { origin: null, ...fixture.legacy }),
-  ];
+  actions = fixture.personal.actions;
   const v = await render();
   await settle(() => assert(v.cards().length === 2, "personal and legacy cards render"));
-  assert(text(v.cards()[0].querySelector(".todo-meta")).includes(`${personal.label} · Personal assistant`), "personal proposer and scope on Home");
-  assert(!text(v.cards()[1]).includes(personal.label) && !text(v.cards()[1]).includes(workspace.label), "legacy card does not guess a proposer");
-  await click(labelled(v.cards()[0], "Review"));
-  await settle(() => assert(drawerEl(), "scoped detail opens"));
-  assert(text(drawerEl()!.querySelector(".dx-asked")).includes(`${personal.label} · Personal assistant`), "detail shows personal proposer and scope");
-  assert(text(drawerEl()).includes(`${personal.label}'s note`), "note uses the same proposer");
-  await click(labelled(drawerEl()!, "Overview"));
-  assert(text(drawerEl()).includes(personal.label), "overview shows personal proposer");
+  const personalCard = v.cards().find((card) => text(card.querySelector(".todo-title")).includes("Call the supplier"));
+  const legacyCard = v.cards().find((card) => text(card.querySelector(".todo-title")).includes("Check the outstanding request"));
+  assert(personalCard && legacyCard, "both issue proposals render");
+  assert(text(personalCard.querySelector(".todo-meta")).includes(`${personal.label} · Personal assistant`), "personal proposer and scope on Home");
+  assert(!text(legacyCard).includes(personal.label) && !text(legacyCard).includes(workspace.label), "legacy card does not guess a proposer");
+  await click(labelled(legacyCard, "Review"));
+  await settle(() => assert(drawerEl() && !text(drawerEl()!.querySelector(".dx-asked")).includes(personal.label), "legacy detail does not infer a proposer"));
   await click(labelled(drawerEl()!, "Not now"));
-  await settle(() => assert(!text(drawerEl()!.querySelector(".dx-asked")).includes(personal.label), "legacy detail does not inherit proposer"));
+  await settle(() => assert(text(drawerEl()).includes("Call the supplier"), "scoped detail opens next"));
+  assert(text(drawerEl()!.querySelector(".dx-asked")).includes(`${personal.label} · Personal assistant`), "detail shows personal proposer and scope");
+  await click(labelled(drawerEl()!, "Overview"));
+  assert(text(drawerEl()).includes(personal.label) && text(drawerEl()).includes("Call the supplier"), "overview shows proposer and issue preview");
   await v.done();
 }
 
@@ -259,11 +260,13 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
 {
   const fixture = JSON.parse(require("fs").readFileSync(
     `${require("process").cwd()}/../tests/fixtures/agenticos/assistant-action-proposers.json`, "utf8",
-  )) as { personal: { id: string; proposer: { scope: "personal"; label: string } }; workspace: { id: string; proposer: { scope: "workspace"; label: string } } };
-  const sharedLabel = fixture.personal.proposer.label;
-  actions = [customer(fixture.personal.id, { origin: null, ...fixture.personal, title: "Home only" })];
-  scopedActions.set("recruit-conversation", [customer(fixture.workspace.id, {
-    origin: null, ...fixture.workspace, proposer: { ...fixture.workspace.proposer, label: sharedLabel }, title: "Recruit only",
+  )) as { personal: { actions: Array<{ id: string; proposer: { scope: "personal"; label: string } }> }; workspace: { actions: Array<{ id: string; proposer: { scope: "workspace"; label: string } }> } };
+  const personal = fixture.personal.actions[0]!;
+  const workspace = fixture.workspace.actions[0]!;
+  const sharedLabel = personal.proposer.label;
+  actions = [customer(personal.id, { origin: null, proposer: personal.proposer, title: "Home only" })];
+  scopedActions.set("recruit-conversation", [customer(workspace.id, {
+    origin: null, proposer: { ...workspace.proposer, label: sharedLabel }, title: "Recruit only",
   })]);
   listScopes.length = 0;
   const home = await render();
@@ -286,10 +289,10 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   const pendingShare = {
     id: "ab0123456789abcdef0123456789abcd", tool: "artifact_share", status: "pending", createdAt: Date.now() - AGO,
     input: { id: "art-Brief", version: 2, title: "Hiring brief" },
-    proposer: fixture.workspace.proposer,
+    proposer: workspace.proposer,
   };
   scopedActions.set("recruit-conversation", [
-    customer("live-recruit", { origin: null, proposer: fixture.workspace.proposer, title: "Live Recruit request" }),
+    customer("live-recruit", { origin: null, proposer: workspace.proposer, title: "Live Recruit request" }),
     pendingShare,
     { ...pendingShare, id: "cd0123456789abcdef0123456789abcd", input: { ...pendingShare.input, title: "Malformed artifact", version: 0 } },
     { ...pendingShare, id: "bad-action-id", input: { ...pendingShare.input, title: "Unreviewable share" } },

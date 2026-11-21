@@ -73,6 +73,29 @@ async function main() {
   }
 
   // The seam: each route's own revision type and body.
+  const fs = require("fs") as { readFileSync(path: string, encoding: string): string };
+  const nodeProcess = require("process") as { cwd(): string };
+  const fixture = JSON.parse(fs.readFileSync(
+    `${nodeProcess.cwd()}/../tests/fixtures/agenticos/assistant-instruction-estimates.json`, "utf8",
+  )) as {
+    workspace: { instructions: string; revision: string; built_in_instruction_tokens: number };
+    personal: { instructions: string; revision: number; built_in_instruction_tokens: number };
+    legacyWorkspace: { instructions: string; revision: string };
+    legacyPersonal: { instructions: string; revision: number };
+  };
+  api.masterInstructions = async () => fixture.workspace;
+  api.memberAssistInstructions = async () => fixture.personal;
+  const currentWorkspace = await hook.liveOwnDeps.read("workspace");
+  const currentPersonal = await hook.liveOwnDeps.read("personal");
+  assert(currentWorkspace.text === "Be brief.\nAnswer in English." && currentWorkspace.revision === "41" && currentWorkspace.builtInInstructionTokens === 127, "producer workspace read preserves string revision and estimate");
+  assert(currentPersonal.text === "Call me Sam." && currentPersonal.revision === 7 && currentPersonal.builtInInstructionTokens === 127, "producer personal read preserves number revision and estimate");
+  api.masterInstructions = async () => fixture.legacyWorkspace;
+  api.memberAssistInstructions = async () => fixture.legacyPersonal;
+  const legacyWorkspace = await hook.liveOwnDeps.read("workspace");
+  const legacyPersonal = await hook.liveOwnDeps.read("personal");
+  assert(legacyWorkspace.text === "Be brief.\nAnswer in English." && legacyWorkspace.revision === "41" && legacyWorkspace.builtInInstructionTokens === undefined, "legacy workspace omits estimate");
+  assert(legacyPersonal.text === "Call me Sam." && legacyPersonal.revision === 7 && legacyPersonal.builtInInstructionTokens === undefined, "legacy personal omits estimate");
+
   const calls: [string, unknown][] = [];
   api.masterInstructions = async () => ({ instructions: "Company text", revision: "41", built_in_instruction_tokens: 123 });
   api.masterState = async () => { throw new Error("instructions do not require a Master-state read"); };
