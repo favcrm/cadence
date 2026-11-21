@@ -1663,16 +1663,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             operator={access.operator}
             onRetryAccess={retryAccess}
             hostedBoard={meta.hosted === true}
-            sessionsAllowed={Boolean(
-              hostedBoard &&
-              meta.signed_in === true &&
-              meta.session?.origin === "public" &&
-              sessionAdmissible(meta.session) &&
-              viewerSub &&
-              !viewerSub.startsWith("operator-token:") &&
-              meta.session?.user?.role === "operator" &&
-              meta.operator === true,
-            )}
             state={agentsState}
             issues={issuesState}
             open={route.alias}

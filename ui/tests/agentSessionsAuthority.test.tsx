@@ -12,12 +12,10 @@ function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
 
-/** CAD-2507 independent acceptance: a member cannot mount the diagnostics
- * route even if the operator bit is true and the backend would return data. */
+/** CAD-2562: neither tenant role can mount or fetch the retired explorer. */
 async function main() {
   const ref = "as_0123456789abcdef0123456789abcdef";
   const direct = `/agents?sessions=${ref}`;
-  const detailPath = `/api/agent-sessions/${ref}`;
   const { Window } = require("happy-dom") as typeof HappyDom;
   const win = new Window({ url: `https://fav-limited.cadencecloud.app${direct}` });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage", "localStorage"] as const)
@@ -49,13 +47,7 @@ async function main() {
     const url = new URL(path, location.origin);
     if (url.pathname.startsWith("/api/agent-sessions")) {
       diagnostics.push(url.pathname + url.search);
-      if (url.pathname === detailPath) return json({ session: {
-        session_ref: ref, tenant_name: "Acceptance Tenant", agent_id: "agent-acceptance",
-        agent_name: "Acceptance Agent", source: "web", status: "completed",
-        started_at: null, last_activity_at: null, ended_at: null, duration_ms: null,
-      } });
-      if (url.pathname === `${detailPath}/transcript`) return json({ messages: [], next_cursor: null });
-      return json({ error: "not found" }, 404);
+      return json({ error: "unexpected diagnostics request" }, 500);
     }
     if (url.pathname.endsWith("/stream")) return streamFixture(path);
     if (url.pathname === "/api/meta") return json({ hosted: true, read_only: false, operator: true, signed_in: true, actor: `${role} (ui)`, session: {
@@ -91,25 +83,21 @@ async function main() {
     return root;
   }
 
-  const memberRoot = await mount();
-  await settle(() => host.textContent?.includes("Session unavailable") === true, "member sees neutral session unavailable");
-  // Flush effects after the refusal has painted; count every request, including aborted ones.
-  for (let n = 0; n < 5; n++) await flush();
-  assert(diagnostics.length === 0, `member must not request diagnostics: ${diagnostics.join(", ")}`);
-  assert(!host.textContent?.includes("Acceptance Agent"), "member never sees the fixture summary");
-  assert(location.pathname + location.search === direct, "member remains on the exact direct URL");
-  await React.act(async () => { memberRoot.unmount(); });
-
-  role = "operator";
-  win.sessionStorage.clear();
-  win.localStorage.clear();
-  history.replaceState(null, "", direct);
-  const operatorRoot = await mount();
-  await settle(() => host.textContent?.includes("Acceptance Agent") === true, "human operator sees authorized summary");
-  assert(diagnostics.includes(detailPath), "operator requests the exact session detail endpoint");
-  await settle(() => diagnostics.includes(`${detailPath}/transcript`), "operator requests the exact transcript endpoint");
-  assert(host.textContent?.includes(ref) && host.textContent?.includes("Acceptance Tenant"), "summary identifies the exact session and tenant");
-  assert(location.pathname + location.search === direct, "operator uses the same direct URL");
-  await React.act(async () => { operatorRoot.unmount(); });
+  for (const currentRole of ["member", "operator"] as const) {
+    role = currentRole;
+    for (const url of ["/agents", "/agents?sessions=list", direct]) {
+      win.sessionStorage.clear();
+      win.localStorage.clear();
+      history.replaceState(null, "", url);
+      const root = await mount();
+      await settle(() => host.querySelector("h1")?.textContent?.includes("Agents") === true, `${currentRole} sees normal Agents at ${url}`);
+      for (let n = 0; n < 5; n++) await flush();
+      assert(diagnostics.length === 0, `${currentRole} must not request diagnostics at ${url}: ${diagnostics.join(", ")}`);
+      assert(!host.textContent?.includes("Agent sessions"), `${currentRole} sees no sessions navigation at ${url}`);
+      assert(!host.textContent?.includes("Session unavailable"), `${currentRole} sees no retired session view at ${url}`);
+      assert(!host.textContent?.includes("Transcript"), `${currentRole} sees no transcript at ${url}`);
+      await React.act(async () => { root.unmount(); });
+    }
+  }
 }
 void main().catch((error: unknown) => { console.error(error); process.exit(1); });
