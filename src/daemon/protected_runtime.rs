@@ -49,14 +49,16 @@ use crate::protected_runtime::{
     attestation, CurrentEligibility, LocalProfile, RootOwnerClient, RuntimeStatus,
 };
 use cadence_core::connection_dispatch::ledger::{CheckpointAckV1, CheckpointV1, LedgerRecordV1};
-use cadence_core::connection_dispatch::primitives::{Counter, Digest, Revision};
+use cadence_core::connection_dispatch::primitives::{Counter, Digest, Ident, Revision};
 
 use crate::store::{
     connection_dispatch::{BootAuthority, ExternalFloorV1},
     Store,
 };
 
-use super::protected_connections::{OwnerEligibility, ProtectedOwnerClient};
+use super::protected_connections::{
+    OwnerEligibility, ProfileRegistryManifest, ProtectedOwnerClient,
+};
 use super::supervisor_grant::{BrokerFenceListener, BrokerFenceTarget, GrantCore, GrantListener};
 use super::Shared;
 
@@ -1632,6 +1634,20 @@ impl ProtectedOwnerClient for ProtectedRuntimeCoordinator {
             supervisor_generation: evidence.supervisor_generation,
             fenced: evidence.fenced,
         })
+    }
+
+    fn profile_registry_manifest(&self) -> Result<Option<ProfileRegistryManifest>> {
+        let registry = self.profile.registry();
+        Ok(Some(ProfileRegistryManifest {
+            manifest_id: Ident::try_from(registry.manifest_id.clone())
+                .map_err(|_| Error::internal("profile manifest id is not canonical"))?,
+            manifest_revision: Revision::new(registry.manifest_revision)
+                .map_err(|_| Error::internal("profile manifest revision is not canonical"))?,
+            manifest_digest: Digest::try_from(registry.registry_digest.clone())
+                .map_err(|_| Error::internal("profile registry digest is not canonical"))?,
+            policy_digest: Digest::try_from(registry.policy_digest.clone())
+                .map_err(|_| Error::internal("profile policy digest is not canonical"))?,
+        }))
     }
 }
 

@@ -1188,21 +1188,49 @@ pub(crate) fn role_model_policy_in(
 /// An ID allowlist cannot prove its configured provider: settings may reassign
 /// the same ID without changing scope. Missing/ambiguous metadata is not
 /// permission to select a native route.
+#[cfg(test)]
 pub(crate) fn require_model_provider_in(
     conn: &impl StoreConn,
     model_id: &str,
     expected_provider: &str,
 ) -> Result<()> {
-    let (count, provider): (i64, Option<String>) = conn
-        .query_row(
-            "SELECT count(*),min(json_extract(m.value,'$.provider')) \
+    require_native_model_provider_in(conn, model_id, model_id, expected_provider)
+}
+
+/// Match either the configured model ID (`provider/id`) or its stripped catalog
+/// ID (`id`) uniquely for `expected_provider`. Settings > Agents stores
+/// `agenticos/<vendor>/<model>`, while native turn checks pass both forms.
+pub(crate) fn require_native_model_provider_in(
+    conn: &impl StoreConn,
+    model_id: &str,
+    bare_model_id: &str,
+    expected_provider: &str,
+) -> Result<()> {
+    let (count, min_provider, max_provider): (i64, Option<String>, Option<String>) = if model_id
+        == bare_model_id
+    {
+        conn.query_row(
+            "SELECT count(*),min(json_extract(m.value,'$.provider')),max(json_extract(m.value,'$.provider')) \
              FROM model_defaults d,json_each(d.document,'$.agent_settings.models') m \
              WHERE d.id=1 AND json_extract(m.value,'$.id')=?1",
             [model_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(sql_error)?;
-    if count != 1 || provider.as_deref() != Some(expected_provider) {
+        .map_err(sql_error)?
+    } else {
+        conn.query_row(
+            "SELECT count(*),min(json_extract(m.value,'$.provider')),max(json_extract(m.value,'$.provider')) \
+             FROM model_defaults d,json_each(d.document,'$.agent_settings.models') m \
+             WHERE d.id=1 AND json_extract(m.value,'$.id') IN (?1,?2)",
+            rusqlite::params![model_id, bare_model_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(sql_error)?
+    };
+    if count != 1
+        || min_provider.as_deref() != Some(expected_provider)
+        || max_provider.as_deref() != Some(expected_provider)
+    {
         return Err(Error::invalid(
             "operation_not_granted",
             "the configured model provider does not match the native route",
@@ -2392,6 +2420,163 @@ pub(crate) struct LoadedSnapshot {
     pub authorization_revision: Revision,
 }
 
+pub(crate) struct ProfileSnapshotIssueFactsV1 {
+    pub snapshot_id: UuidV1,
+    pub loaded_receipt_id: UuidV1,
+    pub now_ms: EpochMs,
+    pub agent_uid: AgentUid,
+    pub session_binding_id: UuidV1,
+    pub runtime_generation: Revision,
+    pub enrollment_id: UuidV1,
+    pub observed_registry_digest: Digest,
+    pub manifest_id: Ident,
+    pub manifest_revision: Revision,
+    pub manifest_digest: Digest,
+    pub policy_digest: Digest,
+}
+
+fn persist_issued_snapshot_in(
+    tx: &WriteTxn<'_>,
+    workspace_id: &str,
+    authorization_revision: Revision,
+    snapshot: &SnapshotV1,
+    receipt: &LoadedReceiptV1,
+) -> Result<()> {
+    let runtime_generation = snapshot.requester.runtime_generation.get() as i64;
+    let issued = snapshot.issued_at_ms.get() as i64;
+    let expires = snapshot.expires_at_ms.get() as i64;
+    tx.execute_raw(
+        "INSERT INTO connection_snapshots(
+           snapshot_id,workspace_id,custody_domain,agent_uid,session_binding_id,
+           runtime_generation,authorization_revision,manifest_id,manifest_revision,
+           manifest_digest,policy_digest,observed_registry_digest,enrollment_id,
+           snapshot_json,issued_ms,expires_ms)
+         VALUES(?1,?2,'local',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+        rusqlite::params![
+            snapshot.snapshot_id.as_str(),
+            workspace_id,
+            snapshot.requester.agent_uid.as_str(),
+            snapshot.requester.session_binding_id.as_str(),
+            runtime_generation,
+            authorization_revision.get() as i64,
+            snapshot.manifest_id.as_str(),
+            snapshot.manifest_revision.get() as i64,
+            snapshot.manifest_digest.as_str(),
+            snapshot.policy_digest.as_str(),
+            receipt.observed_registry_digest.as_str(),
+            receipt.enrollment_id.as_str(),
+            serde_json::to_string(snapshot).map_err(|_| refused())?,
+            issued,
+            expires,
+        ],
+    )
+    .map_err(sql_error)?;
+    tx.execute_raw(
+        "INSERT INTO connection_loaded_receipts(
+           loaded_receipt_id,snapshot_id,workspace_id,manifest_digest,
+           observed_registry_digest,runtime_generation,enrollment_id,receipt_json,
+           issued_ms,expires_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![
+            receipt.loaded_receipt_id.as_str(),
+            receipt.snapshot_id.as_str(),
+            workspace_id,
+            receipt.manifest_digest.as_str(),
+            receipt.observed_registry_digest.as_str(),
+            runtime_generation,
+            receipt.enrollment_id.as_str(),
+            serde_json::to_string(receipt).map_err(|_| refused())?,
+            issued,
+            expires,
+        ],
+    )
+    .map_err(sql_error)?;
+    tx.execute_raw(
+        "UPDATE connection_metadata SET admission_clock_ms=?1 \
+         WHERE singleton=1 AND admission_clock_ms<?1",
+        rusqlite::params![issued],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+/// Issue an empty-capability profile snapshot for native-model turns when the
+/// workspace has no active business Connection policies yet.
+pub(crate) fn issue_profile_snapshot_in(
+    tx: &WriteTxn<'_>,
+    facts: &ProfileSnapshotIssueFactsV1,
+) -> Result<IssuedSnapshotV1> {
+    require_clean_journal_in(tx)?;
+    let _ = seal_authority_changes_in(tx)?;
+    let authority = authority_in(tx)?;
+    if !authority.enabled || !authority.ever_enabled || authority.fenced {
+        return Err(Error::invalid(
+            "runtime_unqualified",
+            "protected Connections are not enabled on this store",
+        ));
+    }
+    if facts.now_ms.get() < authority.clock_floor_ms.get() {
+        return Err(Error::invalid(
+            "clock_regression",
+            "the durable admission clock floor is ahead of the request",
+        ));
+    }
+    let has_active_policy: i64 = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM connection_operation_policies WHERE state='active')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_active_policy != 0 {
+        return Err(Error::invalid(
+            "capability_unavailable",
+            "the capability is not available",
+        ));
+    }
+    let issued = std::cmp::max(facts.now_ms.get(), authority.clock_floor_ms.get());
+    let expires = issued
+        .checked_add(SNAPSHOT_LIFETIME_MS)
+        .ok_or_else(|| Error::invalid("clock_regression", "the clock is unusable"))?;
+    let snapshot = SnapshotV1 {
+        v: 1,
+        snapshot_id: facts.snapshot_id.clone(),
+        requester: RequesterV1 {
+            agent_uid: facts.agent_uid.clone(),
+            session_binding_id: facts.session_binding_id.clone(),
+            runtime_generation: facts.runtime_generation,
+        },
+        manifest_id: facts.manifest_id.clone(),
+        manifest_revision: facts.manifest_revision,
+        manifest_digest: facts.manifest_digest.clone(),
+        policy_digest: facts.policy_digest.clone(),
+        connection_bindings: Vec::new(),
+        capabilities: Vec::new(),
+        issued_at_ms: EpochMs::new(issued).map_err(|_| int_refusal())?,
+        expires_at_ms: EpochMs::new(expires).map_err(|_| int_refusal())?,
+    };
+    cadence_core::connection_dispatch::dto::validate_snapshot_v1(&snapshot).map_err(coded)?;
+    let receipt = LoadedReceiptV1 {
+        v: 1,
+        loaded_receipt_id: facts.loaded_receipt_id.clone(),
+        snapshot_id: snapshot.snapshot_id.clone(),
+        manifest_digest: snapshot.manifest_digest.clone(),
+        observed_registry_digest: facts.observed_registry_digest.clone(),
+        runtime_generation: facts.runtime_generation,
+        enrollment_id: facts.enrollment_id.clone(),
+        issued_at_ms: snapshot.issued_at_ms,
+        expires_at_ms: snapshot.expires_at_ms,
+    };
+    cadence_core::connection_dispatch::dto::validate_loaded_receipt_v1(&receipt, &snapshot)
+        .map_err(coded)?;
+    persist_issued_snapshot_in(
+        tx,
+        &authority.workspace_id,
+        authority.authorization_revision,
+        &snapshot,
+        &receipt,
+    )?;
+    Ok(IssuedSnapshotV1 { snapshot, receipt })
+}
+
 pub(crate) fn issue_snapshot_in(
     tx: &WriteTxn<'_>,
     facts: &SnapshotIssueFactsV1,
@@ -2505,58 +2690,13 @@ pub(crate) fn issue_snapshot_in(
     };
     cadence_core::connection_dispatch::dto::validate_loaded_receipt_v1(&receipt, &snapshot)
         .map_err(coded)?;
-    tx.execute_raw(
-        "INSERT INTO connection_snapshots(
-           snapshot_id,workspace_id,custody_domain,agent_uid,session_binding_id,
-           runtime_generation,authorization_revision,manifest_id,manifest_revision,
-           manifest_digest,policy_digest,observed_registry_digest,enrollment_id,
-           snapshot_json,issued_ms,expires_ms)
-         VALUES(?1,?2,'local',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-        rusqlite::params![
-            snapshot.snapshot_id.as_str(),
-            authority.workspace_id,
-            snapshot.requester.agent_uid.as_str(),
-            snapshot.requester.session_binding_id.as_str(),
-            facts.runtime_generation.get() as i64,
-            authority.authorization_revision.get() as i64,
-            snapshot.manifest_id.as_str(),
-            snapshot.manifest_revision.get() as i64,
-            snapshot.manifest_digest.as_str(),
-            snapshot.policy_digest.as_str(),
-            receipt.observed_registry_digest.as_str(),
-            receipt.enrollment_id.as_str(),
-            serde_json::to_string(&snapshot).map_err(|_| refused())?,
-            issued as i64,
-            expires as i64,
-        ],
-    )
-    .map_err(sql_error)?;
-    tx.execute_raw(
-        "INSERT INTO connection_loaded_receipts(
-           loaded_receipt_id,snapshot_id,workspace_id,manifest_digest,
-           observed_registry_digest,runtime_generation,enrollment_id,receipt_json,
-           issued_ms,expires_ms)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        rusqlite::params![
-            receipt.loaded_receipt_id.as_str(),
-            receipt.snapshot_id.as_str(),
-            authority.workspace_id,
-            receipt.manifest_digest.as_str(),
-            receipt.observed_registry_digest.as_str(),
-            facts.runtime_generation.get() as i64,
-            receipt.enrollment_id.as_str(),
-            serde_json::to_string(&receipt).map_err(|_| refused())?,
-            issued as i64,
-            expires as i64,
-        ],
-    )
-    .map_err(sql_error)?;
-    tx.execute_raw(
-        "UPDATE connection_metadata SET admission_clock_ms=?1 \
-         WHERE singleton=1 AND admission_clock_ms<?1",
-        rusqlite::params![issued as i64],
-    )
-    .map_err(sql_error)?;
+    persist_issued_snapshot_in(
+        tx,
+        &authority.workspace_id,
+        authority.authorization_revision,
+        &snapshot,
+        &receipt,
+    )?;
     Ok(IssuedSnapshotV1 { snapshot, receipt })
 }
 
@@ -3051,6 +3191,19 @@ impl Store {
         })
     }
 
+    /// Issue one immutable profile snapshot plus its contained loaded receipt
+    /// for native-model turns when no active business policy exists yet.
+    pub(crate) fn protected_issue_profile_snapshot(
+        &self,
+        facts: ProfileSnapshotIssueFactsV1,
+    ) -> Result<IssuedSnapshotV1> {
+        self.require_admission_open()?;
+        self.write_tx(move |tx| {
+            self.require_admission_open()?;
+            issue_profile_snapshot_in(tx, &facts)
+        })
+    }
+
     /// Load exactly the issued selector pair a caller named.
     pub(crate) fn protected_load_snapshot(
         &self,
@@ -3115,6 +3268,19 @@ impl Store {
                 Some(digest) => Ok(Some(approved_manifest_id_in(&*conn, &digest)?)),
                 None => Ok(None),
             }
+        })
+    }
+
+    pub(crate) fn protected_has_active_policy(&self) -> Result<bool> {
+        self.read_tx(|conn| {
+            let active: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_operation_policies WHERE state='active')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            Ok(active != 0)
         })
     }
 
@@ -3636,3 +3802,89 @@ mod checkpoint_ordering_acceptance_20261027;
 #[cfg(test)]
 #[path = "protected_side_store_acceptance_20261027.rs"]
 mod protected_side_store_acceptance_20261027;
+
+#[cfg(test)]
+mod cad2576_profile_snapshot_tests {
+    use super::*;
+
+    fn profile_facts() -> ProfileSnapshotIssueFactsV1 {
+        let sha =
+            |c: char| Digest::try_from(format!("sha256:{}", c.to_string().repeat(64))).unwrap();
+        ProfileSnapshotIssueFactsV1 {
+            snapshot_id: UuidV1::try_from(uuid::Uuid::new_v4().to_string()).unwrap(),
+            loaded_receipt_id: UuidV1::try_from(uuid::Uuid::new_v4().to_string()).unwrap(),
+            now_ms: EpochMs::new(now_ms().unwrap() as u64).unwrap(),
+            agent_uid: AgentUid::try_from(format!("agt-{}", "a".repeat(32))).unwrap(),
+            session_binding_id: UuidV1::try_from(uuid::Uuid::new_v4().to_string()).unwrap(),
+            runtime_generation: Revision::new(1).unwrap(),
+            enrollment_id: UuidV1::try_from(uuid::Uuid::new_v4().to_string()).unwrap(),
+            observed_registry_digest: sha('1'),
+            manifest_id: Ident::try_from("protected-local-1".to_string()).unwrap(),
+            manifest_revision: Revision::new(1).unwrap(),
+            manifest_digest: sha('2'),
+            policy_digest: sha('3'),
+        }
+    }
+
+    #[test]
+    fn profile_snapshot_issues_without_policies_and_refuses_when_disabled_or_policy_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).expect("open store");
+
+        // Disabled store refuses.
+        let disabled = store
+            .protected_issue_profile_snapshot(profile_facts())
+            .expect_err("disabled store must refuse profile snapshot");
+        assert_eq!(disabled.code(), Some("runtime_unqualified"));
+
+        // Enable protected Connections with zero business policies/credentials.
+        store
+            .write_tx(|tx| {
+                tx.execute(
+                    "UPDATE connection_dispatch_config SET enabled=1,ever_enabled=1,fenced=0 WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("enable dispatch config");
+        assert!(!store.protected_has_active_policy().unwrap());
+
+        let facts = profile_facts();
+        let agent_uid = facts.agent_uid.as_str().to_string();
+        let issued = store
+            .protected_issue_profile_snapshot(facts)
+            .expect("empty-policy store must issue profile snapshot");
+        assert!(issued.snapshot.connection_bindings.is_empty());
+        assert!(issued.snapshot.capabilities.is_empty());
+        assert_eq!(issued.snapshot.manifest_id.as_str(), "protected-local-1");
+
+        let loaded = store
+            .protected_current_snapshot(&agent_uid, 1, issued.snapshot.issued_at_ms.get() + 1)
+            .expect("read current snapshot")
+            .expect("snapshot must be stored");
+        assert_eq!(loaded.snapshot.snapshot_id, issued.snapshot.snapshot_id);
+        assert_eq!(
+            loaded.receipt.loaded_receipt_id,
+            issued.receipt.loaded_receipt_id
+        );
+
+        // Once an active business policy exists, profile snapshot issuance refuses fail-closed.
+        let policy_digest = format!("sha256:{}", "9".repeat(64));
+        store
+            .write_tx(|tx| {
+                tx.execute(
+                    "INSERT INTO connection_operation_policies(\
+                     connection_id,credential_revision,policy_revision,policy_digest,policy_json,state) \
+                     VALUES('conn-fixture',1,1,?1,'{}','active')",
+                    [&policy_digest],
+                )?;
+                Ok(())
+            })
+            .expect("insert active policy row");
+        assert!(store.protected_has_active_policy().unwrap());
+        let blocked = store
+            .protected_issue_profile_snapshot(profile_facts())
+            .expect_err("active business policy must refuse profile snapshot fallback");
+        assert_eq!(blocked.code(), Some("capability_unavailable"));
+    }
+}

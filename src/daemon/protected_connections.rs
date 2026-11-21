@@ -59,7 +59,7 @@ use crate::error::{Error, Result};
 use crate::protected_runtime::ops::{OpsMethod, RuntimeCaller};
 use crate::store::connection_dispatch::{
     effect_operation_binding, AdmissionFactsV1, CommitOutcome, IssuedSnapshotV1, LoadedSnapshot,
-    SnapshotIssueFactsV1,
+    ProfileSnapshotIssueFactsV1, SnapshotIssueFactsV1,
 };
 
 /// How long one provider call may take once the permit exists.
@@ -137,6 +137,14 @@ pub(crate) struct ManagementEvidence {
     pub fenced: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProfileRegistryManifest {
+    pub manifest_id: Ident,
+    pub manifest_revision: Revision,
+    pub manifest_digest: Digest,
+    pub policy_digest: Digest,
+}
+
 /// The measured coordinator's runtime and guest-independent management
 /// evidence. Restore-watermark transport is installed once on the Store.
 /// A transport failure is an `Err`, never an epoch value.
@@ -148,6 +156,11 @@ pub(crate) trait ProtectedOwnerClient: Send + Sync {
     /// Boot-time profile/owner evidence for initialize/unlock/lock and
     /// manifest/policy/grant management. It needs no agent runtime.
     fn management_evidence(&self) -> Result<ManagementEvidence>;
+    /// Profile-level pinned registry manifest for native-model turns when no
+    /// business Connection policy exists yet.
+    fn profile_registry_manifest(&self) -> Result<Option<ProfileRegistryManifest>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +236,33 @@ impl ProtectedConnections {
         Ok(evidence)
     }
 
+    fn manifest_is_current(&self, shared: &Shared, loaded: &LoadedSnapshot) -> Result<bool> {
+        if let Some(manifest) = shared
+            .store
+            .protected_manifest(loaded.snapshot.manifest_id.as_str())?
+        {
+            return Ok(manifest.material_digest == loaded.snapshot.manifest_digest
+                && manifest.revision == loaded.snapshot.manifest_revision);
+        }
+        if loaded.snapshot.connection_bindings.is_empty()
+            && loaded.snapshot.capabilities.is_empty()
+            && !shared.store.protected_has_active_policy()?
+        {
+            if let Some(profile) = self
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.profile_registry_manifest().transpose())
+                .transpose()?
+            {
+                return Ok(loaded.snapshot.manifest_id == profile.manifest_id
+                    && loaded.snapshot.manifest_revision == profile.manifest_revision
+                    && loaded.snapshot.manifest_digest == profile.manifest_digest
+                    && loaded.snapshot.policy_digest == profile.policy_digest);
+            }
+        }
+        Ok(false)
+    }
+
     /// The current immutable material held for one stable agent, without a
     /// live socket caller. Used only to revalidate an already-issued bundle;
     /// it refuses rather than issuing without live owner evidence.
@@ -257,17 +297,7 @@ impl ProtectedConnections {
                 "the protected authorization changed",
             ));
         }
-        let manifest_current = match shared
-            .store
-            .protected_manifest(loaded.snapshot.manifest_id.as_str())?
-        {
-            Some(manifest) => {
-                manifest.material_digest == loaded.snapshot.manifest_digest
-                    && manifest.revision == loaded.snapshot.manifest_revision
-            }
-            None => false,
-        };
-        if !manifest_current {
+        if !self.manifest_is_current(&shared, &loaded)? {
             return Err(Error::invalid(
                 "loaded_state_mismatch",
                 "the approved manifest changed",
@@ -434,7 +464,8 @@ impl ProtectedConnections {
 
     /// The CURRENT immutable snapshot/receipt for one exact runtime subject.
     /// Reuses a still-current issued pair, otherwise issues from the single
-    /// approved manifest reachable by that agent. Never accepts a caller id.
+    /// approved manifest reachable by that agent (or from the pinned profile
+    /// registry when no active business policy exists). Never accepts a caller id.
     pub(crate) fn current_material(
         &self,
         caller: &RuntimeCaller,
@@ -448,28 +479,26 @@ impl ProtectedConnections {
             now.get(),
         )? {
             let authority = shared.store.protected_authority()?;
-            let manifest_current = match shared
-                .store
-                .protected_manifest(loaded.snapshot.manifest_id.as_str())?
-            {
-                Some(manifest) => {
-                    manifest.material_digest == loaded.snapshot.manifest_digest
-                        && manifest.revision == loaded.snapshot.manifest_revision
-                }
-                None => false,
-            };
-            if loaded.authorization_revision == authority.authorization_revision && manifest_current
+            if loaded.authorization_revision == authority.authorization_revision
+                && self.manifest_is_current(&shared, &loaded)?
             {
                 return Ok((loaded.snapshot, loaded.receipt));
             }
         }
-        let manifest_id = shared
-            .store
-            .protected_single_approved_manifest()?
-            .ok_or_else(|| {
-                Error::invalid("capability_unavailable", "the capability is not available")
-            })?;
-        let issued = self.issue_material(caller, &eligibility, manifest_id)?;
+        let issued = match shared.store.protected_single_approved_manifest()? {
+            Some(manifest_id) => self.issue_material(caller, &eligibility, manifest_id)?,
+            None => {
+                let profile = self
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| owner.profile_registry_manifest().transpose())
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::invalid("capability_unavailable", "the capability is not available")
+                    })?;
+                self.issue_profile_material(caller, &eligibility, profile)?
+            }
+        };
         Ok((issued.snapshot, issued.receipt))
     }
 
@@ -491,6 +520,31 @@ impl ProtectedConnections {
             observed_registry_digest: eligibility.observed_registry_digest.clone(),
             manifest_id,
         })
+    }
+
+    fn issue_profile_material(
+        &self,
+        caller: &RuntimeCaller,
+        eligibility: &OwnerEligibility,
+        profile: ProfileRegistryManifest,
+    ) -> Result<IssuedSnapshotV1> {
+        let shared = self.shared()?;
+        shared
+            .store
+            .protected_issue_profile_snapshot(ProfileSnapshotIssueFactsV1 {
+                snapshot_id: random_uuid()?,
+                loaded_receipt_id: random_uuid()?,
+                now_ms: now_epoch_ms()?,
+                agent_uid: agent_uid_of(caller)?,
+                session_binding_id: random_uuid()?,
+                runtime_generation: eligibility.runtime_generation,
+                enrollment_id: eligibility.enrollment_id.clone(),
+                observed_registry_digest: eligibility.observed_registry_digest.clone(),
+                manifest_id: profile.manifest_id,
+                manifest_revision: profile.manifest_revision,
+                manifest_digest: profile.manifest_digest,
+                policy_digest: profile.policy_digest,
+            })
     }
 
     /// Load EXACTLY the issued selector pair the caller named and require it to

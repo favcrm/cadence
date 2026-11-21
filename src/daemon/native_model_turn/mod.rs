@@ -492,8 +492,9 @@ impl NativeModelBroker {
                     "the configured native model is not allowed for this role",
                 ));
             }
-            crate::store::connection_dispatch::require_model_provider_in(
+            crate::store::connection_dispatch::require_native_model_provider_in(
                 tx,
+                model_id.as_str(),
                 catalog_model_id(model_id.as_str(), &route.provider),
                 &route.provider,
             )?;
@@ -972,8 +973,9 @@ impl NativeModelBroker {
                     "the configured model is not allowed for this role",
                 ));
             }
-            crate::store::connection_dispatch::require_model_provider_in(
+            crate::store::connection_dispatch::require_native_model_provider_in(
                 tx,
+                model_id.as_str(),
                 catalog_model_id(model_id.as_str(), &route.provider),
                 &route.provider,
             )?;
