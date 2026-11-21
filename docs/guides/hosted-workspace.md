@@ -825,6 +825,8 @@ Home's Ask button names the assistant for that conversation and opens an
 unsent draft. It does not switch to the workspace assistant.
 Routine Review opens the recorded agent's Routines tab. If a hired agent
 shares the personal assistant's URL alias, Review opens the hired profile by ID.
+If a draft has no explicit alias and its target cannot be opened, Review shows
+it in Master Routines without changing the draft's execution target.
 
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action

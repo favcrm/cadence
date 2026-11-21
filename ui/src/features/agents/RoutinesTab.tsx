@@ -175,13 +175,13 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     [routines],
   );
   const agentProposals = useMemo(
-    () =>
-      proposals.filter(
-        (p) =>
-          p.state === "pending" &&
-          (p.payload?.agent_alias === undefined || p.payload?.agent_alias === c.alias),
-      ),
-    [proposals, c.alias],
+    () => proposals.filter((p) => {
+      if (p.state !== "pending") return false;
+      const alias = p.payload?.agent_alias;
+      if (!c.scopedRoster) return alias === undefined || alias === c.alias;
+      return alias == null || (typeof alias === "string" && alias.trim() === c.alias);
+    }),
+    [proposals, c.alias, c.scopedRoster],
   );
 
   if (!c.operator) {

@@ -305,12 +305,14 @@ export function routineDraftReviewHref(
   if (draft.kind === "wiki_propose" && typeof wikiPath === "string" && wikiPath) {
     return `/wiki/${wikiPath.replace(/^wiki:/, "")}`;
   }
-  // The hosted routine store uses proposed_by as its execution target when
-  // the draft omits agent_alias. That fallback proves no actor identity.
-  const fallback = draft.kind === "routine_propose" && roster != null && hasScopedAssistantRoster(roster)
-    ? draft.proposed_by || MASTER
-    : null;
-  return routineReviewHref(typeof alias === "string" ? alias : fallback, roster);
+  const explicitAlias = typeof alias === "string" ? alias : null;
+  if (draft.kind !== "routine_propose" || roster == null || !hasScopedAssistantRoster(roster)) {
+    return routineReviewHref(explicitAlias, roster);
+  }
+  if (explicitAlias !== null) return routineReviewHref(explicitAlias, roster);
+  // Alias-less drafts are also listed in Master Routines. Prefer their
+  // effective target when it has a destination, without attributing a proposer.
+  return routineReviewHref(draft.proposed_by, roster) ?? routineReviewHref(MASTER, roster);
 }
 
 /**

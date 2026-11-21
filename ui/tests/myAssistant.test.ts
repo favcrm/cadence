@@ -109,6 +109,14 @@ globalThis.fetch = async (input) => {
     threadReads.push(path);
     return json({ entries: [], cursor: 0, more_before: false });
   }
+  if (path === "/api/routines") {
+    return json({ routines: [], staged_proposals: [
+      { id: "omitted", state: "pending", title: "Alias omitted", kind: "routine_propose", payload: {}, proposed_by: "assistant" },
+      { id: "padded", state: "pending", title: "Alias padded", kind: "routine_propose", payload: { agent_alias: " master " }, proposed_by: "assistant" },
+      { id: "null", state: "pending", title: "Alias null", kind: "routine_propose", payload: { agent_alias: null }, proposed_by: "assistant" },
+      { id: "other", state: "pending", title: "Another runtime’s routine", kind: "routine_propose", payload: { agent_alias: "worker" }, proposed_by: "master" },
+    ] });
+  }
   if (path.startsWith("/api/agents/")) {
     const alias = decodeURIComponent(path.split("/").pop()!);
     if (alias === "assistant") aliasReads += 1;
@@ -336,6 +344,12 @@ async function main() {
   assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: "master" } }, hostedRoster()) === "/agents/master?tab=routines", "the explicit execution target takes precedence over the saved fallback");
   assert(routineReviewHref(null, roster()) === "/agents/master?tab=routines", "a legacy hosted proposal without an alias keeps its review destination");
   assert(routineReviewHref(null, hostedRoster()) === null && routineReviewHref("assistant", hostedRoster()) === null, "scoped Home does not guess a routine destination");
+  const unresolvedDraft = routineDraftReviewHref(draft, hostedRoster());
+  assert(unresolvedDraft === "/agents/master?tab=routines", "an alias-less draft without a hired target still opens review");
+  assert(routineDraftReviewHref({ ...draft, payload: { agent_alias: " master " } }, hostedRoster()) === unresolvedDraft, "draft navigation normalizes the explicit alias");
+  await at(unresolvedDraft);
+  const routineTab = host.querySelector("[data-routines-tab]")?.textContent;
+  assert(routineTab?.includes("Alias omitted") && routineTab.includes("Alias padded") && routineTab.includes("Alias null") && !routineTab.includes("Another runtime’s routine"), "the destination displays the routed drafts and does not mix in other explicit aliases");
   await at("/agents");
   await click([...host.querySelectorAll(".ag-side-row")].find((row) => row.textContent?.startsWith("assistant")));
   assert(String(location.pathname) === "/agents/profile/ap_1", "the hired sidebar row opens the same ID route");
