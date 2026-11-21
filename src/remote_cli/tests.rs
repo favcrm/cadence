@@ -2329,6 +2329,43 @@ fn a_renewal_refusal_uses_the_issuer_shape_not_the_gateway_envelope() {
 }
 
 #[test]
+fn two_factor_refusals_classify_as_authentication_across_gateway_and_renewal() {
+    for code in [
+        "two_factor_enrollment_required",
+        "two_factor_verification_required",
+        "two_factor_required",
+    ] {
+        // Gateway 403 payload emitted by agenticos-v2 twoFactorRequiredResponse.
+        let body = json!({
+            "ok": false,
+            "error": {"code": code, "message": "raw server text"},
+            "details": {"code": code, "workspaceId": "ws_real"}
+        });
+        let (refusal, reason) = decode_refusal(403, Some(&body));
+        assert_eq!(refusal, Refusal::Authentication, "{code}");
+        assert_eq!(reason.as_deref(), Some(code), "{code}");
+        let msg = refusal_message(refusal, reason.as_deref(), 403);
+        assert!(msg.contains("two-factor"), "{code}: {msg}");
+        assert!(msg.contains("cadence login"), "{code}: {msg}");
+        assert!(!msg.contains("raw server text"), "{code}: {msg}");
+
+        // The same code outside HTTP 403 must not trigger the 2FA bypass.
+        assert_eq!(
+            decode_refusal(401, Some(&body)).0,
+            Refusal::Unknown,
+            "{code}"
+        );
+
+        // Issuer renewal 403 {error:"<code>"} is also treated as terminal 2FA re-auth.
+        let renew_body = json!({"error": code});
+        assert!(renewal_session_ended(403, &renew_body), "{code}");
+        let renew_msg = renewal_refusal(403, &renew_body, None).to_string();
+        assert!(renew_msg.contains("two-factor"), "{code}: {renew_msg}");
+        assert!(renew_msg.contains("cadence login"), "{code}: {renew_msg}");
+    }
+}
+
+#[test]
 fn a_team_commit_uncertainty_is_an_unknown_outcome_not_a_refusal() {
     let answer = classify(
         503,

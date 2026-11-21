@@ -2176,6 +2176,18 @@ fn device_token_unknown(dir: &Path, org: Option<&str>) -> Error {
     ))
 }
 
+fn device_token_two_factor_refusal(code: &str, org: Option<&str>) -> Error {
+    let target = org.unwrap_or("the workspace");
+    match code {
+        "two_factor_enrollment_required" | "two_factor_required" => reject(&format!(
+            "{target} requires two-factor authentication — enroll an authenticator app in Account security and run `cadence login` again ({code})"
+        )),
+        _ => reject(&format!(
+            "{target} requires a two-factor verified session — complete two-factor verification in the browser and run `cadence login` again ({code})"
+        )),
+    }
+}
+
 fn post_public_with_access(
     issuer: &str,
     path: &str,
@@ -2431,6 +2443,14 @@ fn enroll_browser_with(
             (400, Some("invalid_grant" | "invalid_request")) => {
                 return Err(reject("Hosted browser grant refused"))
             }
+            (
+                403,
+                Some(
+                    code @ ("two_factor_enrollment_required"
+                    | "two_factor_verification_required"
+                    | "two_factor_required"),
+                ),
+            ) => return Err(device_token_two_factor_refusal(code, Some(org))),
             _ => return Err(device_token_unknown(dir, Some(org))),
         }
     };
@@ -3239,6 +3259,14 @@ fn login_device_flow_with(
             (400, Some("invalid_grant" | "invalid_request")) => {
                 return Err(reject("Hosted browser grant refused"))
             }
+            (
+                403,
+                Some(
+                    code @ ("two_factor_enrollment_required"
+                    | "two_factor_verification_required"
+                    | "two_factor_required"),
+                ),
+            ) => return Err(device_token_two_factor_refusal(code, org.or(hint))),
             _ => return Err(device_token_unknown(dir, org.or(hint))),
         }
     };
