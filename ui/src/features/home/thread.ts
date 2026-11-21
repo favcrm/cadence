@@ -532,7 +532,8 @@ export type ThreadRun =
  * the answer and its artifact cards are one turn while they stay contiguous.
  * A terminal `answer` closes the turn: a further reasoning/commentary/tool
  * item starts the next one, while artifact cards may still follow it. A run
- * of artifact cards with no agent text is not a turn (no head, no trace).
+ * of cards with no agent text is a turn too (CAD-2552), so its data cards wait
+ * for the turn to finish and fade in like any other turn's.
  */
 export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   const runs: ThreadRun[] = [];
@@ -540,11 +541,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   let runMessage: string | null = null;
   const flush = () => {
     if (run.length === 0) return;
-    if (run.some((item) => !isCardItem(item))) {
-      runs.push({ turn: true, key: run[0].key, items: run, message: runMessage });
-    } else {
-      for (const item of run) runs.push({ turn: false, key: item.key, item });
-    }
+    runs.push({ turn: true, key: run[0].key, items: run, message: runMessage });
     run = [];
     runMessage = null;
   };

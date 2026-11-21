@@ -530,7 +530,7 @@ main().catch((e) => {
       ],
     }),
   );
-  equal(threadRuns(cards).map((r) => r.turn), [false], "an artifact-only run is not a turn");
+  equal(threadRuns(cards).map((r) => r.turn), [true], "an artifact-only run is a turn too (CAD-2552)");
   // A hire proposal stays in its render run so Home can keep the existing
   // flat card row instead of inventing a trace-only turn.
   const hired = threadItems(

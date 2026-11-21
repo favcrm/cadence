@@ -632,7 +632,7 @@ for (const sheet of [false, true]) {
   equal(items.map((i) => i.type), ["operator", "tools", "image", "answer"], "an image entry is held until the tool run ends, then is its own item");
   const runs = thread.threadRuns(items);
   equal(runs.map((r) => (r.turn ? r.items.map((i) => i.type) : r.item.type)), ["operator", ["tools", "image", "answer"]], "the image belongs to its turn");
-  equal(thread.threadRuns(thread.threadItems({ entries: [entries[2]], pending: [] } as any)).map((r) => r.turn), [false], "an image with no agent text is not a turn");
+  equal(thread.threadRuns(thread.threadItems({ entries: [entries[2]], pending: [] } as any)).map((r) => r.turn), [true], "an image with no agent text is a turn too (CAD-2552)");
   // A board that never receives an image entry groups exactly as before.
   const plain = thread.threadItems({ entries: entries.filter((e) => e.kind !== "image_job"), pending: [] } as any);
   equal(plain.map((i) => i.type), ["operator", "tools", "answer"], "without image entries nothing changes");
