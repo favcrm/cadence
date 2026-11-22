@@ -18,6 +18,7 @@
 .crm-drawer[data-closing] {
   transform: translateX(102%);
   transition: transform 0.2s cubic-bezier(0.4, 0, 1, 1);
+  pointer-events: none;
 }
 @keyframes crm-drawer-in {
   from { transform: translateX(100%); }
@@ -48,6 +49,7 @@
 .s-drawer-scrim[data-closing],
 .crm-drawer-scrim[data-closing] {
   opacity: 0;
+  pointer-events: none;
 }
 
 .s-drawer,

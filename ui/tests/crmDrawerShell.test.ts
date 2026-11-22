@@ -245,6 +245,11 @@ async function main() {
   await click(Array.from(childPanel.querySelectorAll("button")).find((b) => b.textContent === "Unlock"));
   await key("Escape");
   assert(childPanel.hasAttribute("data-closing") && !parentPanel.hasAttribute("data-closing"), "Escape closes only top child drawer");
+  assert(
+    childPanel.previousElementSibling?.hasAttribute("data-closing") &&
+      !parentPanel.previousElementSibling?.hasAttribute("data-closing"),
+    "Escape marks only top child scrim closing",
+  );
   await React.act(async () => { await sleep(320); });
   assert(childClosed() === 1 && parentClosed() === 0, "only child unmounted on first Escape");
   assert(!parentPanel.hasAttribute("data-receded") && !parentPanel.hasAttribute("inert"), "parent clears receded and inert after child closes");
@@ -262,6 +267,14 @@ async function main() {
   assert(/\.crm-drawer\s*\{[^}]*\banimation:\s*none;\s*transition:\s*none;/.test(css), "drawer honours reduced motion");
   assert(/\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css) || /\.crm-field \.select,\s*\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css), "selects shrink to their column");
   assert(/\.crm-field-row \{\s*align-items: end;/.test(css), "hinted fields align with their row");
+  assert(
+    /\.s-drawer\[data-closing\],\s*\.crm-drawer\[data-closing\]\s*\{[^}]*\bpointer-events:\s*none;/.test(css),
+    "closing drawer stops intercepting pointer events",
+  );
+  assert(
+    /\.s-drawer-scrim\[data-closing\],\s*\.crm-drawer-scrim\[data-closing\]\s*\{[^}]*\bpointer-events:\s*none;/.test(css),
+    "closing scrim stops intercepting pointer events",
+  );
 
   console.log("crm drawer shell checks passed");
 }
