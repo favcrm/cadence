@@ -260,6 +260,10 @@ async function main() {
 
   let tempApiStatus = 200;
   let tempApiCalls = 0;
+  let resolveSearchFetch: (() => void) | null = null;
+  const searchFetched = new Promise<void>((resolve) => {
+    resolveSearchFetch = resolve;
+  });
   const postedActions: string[] = [];
   const jsonRes = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -282,6 +286,7 @@ async function main() {
       if (tempApiStatus !== 200) return jsonRes({ error: { code: "not_found" } }, tempApiStatus);
       const status = url.searchParams.get("status") ?? "all";
       const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+      if (q === "confirm api schema") resolveSearchFetch?.();
       const limit = Number(url.searchParams.get("limit") ?? "20");
       const offset = Number(url.searchParams.get("offset") ?? "0");
       const counts = {
@@ -513,17 +518,40 @@ async function main() {
     assert(document.querySelector("[data-drawer-status]")?.textContent?.includes("Closed"), "drawer status flips to Closed");
   });
 
-  // 4. Search filtering
+  // 4. Search filtering (event-driven debounce flush + fetch notification)
   await act(async () => {
     (document.querySelector('[data-temp-filter="all"]') as HTMLButtonElement).click();
   });
-  await act(async () => {
-    const search = document.querySelector('input[type="search"]') as HTMLInputElement;
-    const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!;
-    setter.call(search, "Confirm API schema");
-    search.dispatchEvent(new win.Event("input", { bubbles: true }));
-    await new Promise((r) => setTimeout(r, 200));
-  });
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const pendingTimers = new Map<unknown, () => void>();
+  let nextTimerId = 1;
+  (globalThis as Record<string, unknown>).setTimeout = ((fn: () => void) => {
+    const id = nextTimerId++;
+    pendingTimers.set(id, fn);
+    return id;
+  }) as unknown as typeof setTimeout;
+  (globalThis as Record<string, unknown>).clearTimeout = ((id: unknown) => {
+    pendingTimers.delete(id);
+  }) as unknown as typeof clearTimeout;
+  try {
+    await act(async () => {
+      const search = document.querySelector('input[type="search"]') as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(search, "Confirm API schema");
+      search.dispatchEvent(new win.Event("input", { bubbles: true }));
+    });
+    assert(pendingTimers.size > 0, "search input schedules debounce timer");
+    await act(async () => {
+      const callbacks = Array.from(pendingTimers.values());
+      pendingTimers.clear();
+      for (const cb of callbacks) cb();
+    });
+    await searchFetched;
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
   await settle(() => {
     assert(host.querySelectorAll("[data-channel-id]").length === 1, "search filters to matching room");
     assert(text().includes("Confirm API schema contract draft"), "matching room title shown");
