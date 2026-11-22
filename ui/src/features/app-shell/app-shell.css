@@ -1290,12 +1290,6 @@ button.sentchip:focus-visible {
   border-radius: 0.375rem;
   background: var(--color-ink-900);
 }
-/* Inline private app handoff cards in Home: no outer bordered dock wrapper. */
-.app-handoff-list {
-  display: grid;
-  gap: 0.5rem;
-  min-width: 0;
-}
 .app-assistant-section-head,
 .app-assistant-card-head {
   display: flex;
