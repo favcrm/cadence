@@ -3,9 +3,9 @@
 //! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
 //! *here*, before a request is ever built. Operator-only daemon verbs never
 //! map.
-//! `issue project policy` is `project_policy`; `project new` is
-//! `project_new` and `issue project ls` is `project_ls` on a hosted org,
-//! while `issue project add`/`set-remote` stay local.
+//! `issue project policy` is `project_policy_read` (bare) or `project_policy`
+//! (with `--visibility`); `project new` is `project_new` and `issue project ls`
+//! is `project_ls` on a hosted org, while `issue project add`/`set-remote` stay local.
 
 mod blob_cat;
 mod document_template;
@@ -754,16 +754,24 @@ fn verb_for(
                             visibility,
                             grants,
                             clear_grants,
+                            json: _,
                         },
                 },
         } => {
             match cadence_agent::issue::cli::resolve_project_policy_request(
+                key,
                 *visibility,
                 grants,
                 *clear_grants,
             )
-            .map_err(|err| Error::usage(format!("{err}; nothing was sent")))?
-            {
+            .map_err(|err| {
+                let msg = format!("{err}; nothing was sent");
+                if err.kind() == "rejected" {
+                    Error::rejected(msg)
+                } else {
+                    Error::usage(msg)
+                }
+            })? {
                 None => {
                     args.insert("project".into(), json!(key));
                     "project_policy_read"
@@ -5429,28 +5437,44 @@ mod read_contract_tests {
             "{set_remote}"
         );
 
-        let policy = |visibility, grants: Vec<String>, clear_grants| {
+        let policy_with_key = |key: &str, visibility, grants: Vec<String>, clear_grants| {
             outcome(&Commands::Issue {
                 action: IssueAction::Project {
                     action: ProjectAction::Policy {
-                        key: "atlas".into(),
+                        key: key.into(),
                         visibility,
                         grants,
                         clear_grants,
+                        json: false,
                     },
                 },
             })
+        };
+        let policy = |visibility, grants: Vec<String>, clear_grants| {
+            policy_with_key("atlas", visibility, grants, clear_grants)
         };
         assert_eq!(
             policy(None, Vec::new(), false).unwrap(),
             ("project_policy_read", json!({"project": "atlas"}))
         );
+        for err in [
+            policy_with_key("../escape", None, Vec::new(), false).unwrap_err(),
+            policy_with_key("ATLAS", None, Vec::new(), false).unwrap_err(),
+            policy_with_key("", None, Vec::new(), false).unwrap_err(),
+        ] {
+            assert!(err.contains("nothing was sent"), "{err}");
+        }
         let err = policy(None, vec!["users/alex".into()], false).unwrap_err();
         assert!(
             err.contains("--visibility") && err.contains("nothing was sent"),
             "{err}"
         );
         let err = policy(None, Vec::new(), true).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(None, vec!["users/alex".into()], true).unwrap_err();
         assert!(
             err.contains("--visibility") && err.contains("nothing was sent"),
             "{err}"
@@ -5465,9 +5489,41 @@ mod read_contract_tests {
             err.contains("--clear-grants") && err.contains("nothing was sent"),
             "{err}"
         );
+        for blank in ["", "   "] {
+            let err = policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                vec![blank.into()],
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("non-empty") && err.contains("nothing was sent"),
+                "{err}"
+            );
+        }
         let err = policy(
             Some(cadence_agent::issue::cli::PolicyVisibility::Private),
             vec!["operator".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot be combined") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+            Vec::new(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--clear-grants") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+            vec!["users/alex".into()],
             true,
         )
         .unwrap_err();
@@ -5515,6 +5571,44 @@ mod read_contract_tests {
                 json!({"project": "atlas", "visibility": "workspace-visible", "grants": []}),
             )
         );
+        // End-to-end Clap argv parsing for CAD-2650 policy read, --json parity, and guarded writes.
+        let argv = |parts: &[&str]| {
+            cad2083_argv(&parts.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            argv(&["issue", "project", "policy", "atlas"]).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        assert_eq!(
+            argv(&["issue", "project", "policy", "atlas", "--json"]).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "project",
+                "policy",
+                "atlas",
+                "--visibility",
+                "private",
+                "--clear-grants",
+            ])
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "private", "grants": []}),
+            )
+        );
+        assert!(argv(&[
+            "issue",
+            "project",
+            "policy",
+            "atlas",
+            "--visibility",
+            "workspace-visible",
+            "--clear-grants",
+        ])
+        .is_err());
     }
 
     /// CAD-1568: `cadence send`/`message send` become `message_send` with

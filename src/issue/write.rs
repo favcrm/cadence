@@ -213,6 +213,24 @@ mod tests {
         assert!(clean(&pm));
 
         let mut loaded = project::load(&yaml_path).unwrap();
+        loaded.policy = Some(project::ProjectPolicy {
+            version: 2,
+            visibility: project::Visibility::Private,
+            members: vec![project::Grant::parse("users/mia").unwrap()],
+        });
+        std::fs::write(&yaml_path, serde_yaml::to_string(&loaded).unwrap()).unwrap();
+        let private_read = read_project_policy(&pm, key).unwrap();
+        assert_eq!(
+            private_read,
+            json!({
+                "state": "ok",
+                "project": key,
+                "visibility": "private",
+                "grants": ["users/mia"],
+                "version": 2,
+            })
+        );
+
         loaded.policy = None;
         let yaml = serde_yaml::to_string(&loaded).unwrap();
         std::fs::write(&yaml_path, yaml).unwrap();
@@ -227,6 +245,20 @@ mod tests {
                 "version": null,
             })
         );
+
+        assert!(read_project_policy(&pm, "absent").is_err());
+        assert!(read_project_policy(&pm, "../escape").is_err());
+
+        std::fs::write(&yaml_path, "policy:\n  visibility: [unclosed\n").unwrap();
+        assert!(read_project_policy(&pm, key).is_err());
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&yaml_path).unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::os::unix::fs::symlink(outside.path(), &yaml_path).unwrap();
+            assert!(read_project_policy(&pm, key).is_err());
+        }
     }
 
     /// CAD-908: a created file is whole, a collision renames, and no

@@ -342,10 +342,7 @@ pub fn read_project_policy(pm: &Pm, key: &str) -> Result<Value> {
         Some(policy) => Ok(json!({
             "state": "ok",
             "project": key,
-            "visibility": match policy.visibility {
-                project::Visibility::WorkspaceVisible => "workspace-visible",
-                project::Visibility::Private => "private",
-            },
+            "visibility": policy.visibility.as_str(),
             "grants": policy.members,
             "version": policy.version,
         })),

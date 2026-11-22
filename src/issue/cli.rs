@@ -927,6 +927,9 @@ pub enum ProjectAction {
         /// Confirm clearing all grants when setting `--visibility private` with no `--grant`.
         #[arg(long = "clear-grants")]
         clear_grants: bool,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Record a hosted org's delivery inputs for a project (CAD-1946): its
     /// GitHub repos and, optionally, its `delivery:` policy section. A
@@ -1012,17 +1015,19 @@ impl PolicyVisibility {
     }
 }
 
-/// Validate `issue project policy` flags cleanly before either local execution
-/// or remote RPC encoding (CAD-2650).
+/// Validate `issue project policy` key and flags cleanly before either local
+/// execution (`open_pm`) or remote RPC encoding (CAD-2650).
 ///
 /// Returns `Ok(None)` when bare `issue project policy <KEY>` should perform a
 /// read-only lookup, `Ok(Some(visibility))` for a guarded write, and
-/// `Err(Error::usage(...))` for partial or ambiguous write flags.
+/// `Err(...)` for malformed keys, blank grants, or partial/ambiguous write flags.
 pub fn resolve_project_policy_request(
+    key: &str,
     visibility: Option<PolicyVisibility>,
     grants: &[String],
     clear_grants: bool,
 ) -> Result<Option<PolicyVisibility>> {
+    model::check_key(key)?;
     match visibility {
         None => {
             if !grants.is_empty() || clear_grants {
@@ -1034,9 +1039,19 @@ pub fn resolve_project_policy_request(
             Ok(None)
         }
         Some(vis) => {
+            if grants.iter().any(|grant| grant.trim().is_empty()) {
+                return Err(Error::usage(
+                    "`--grant` values must be non-empty (`users/<handle>`, `agents/<profile_id>`, or `operator`)",
+                ));
+            }
             if !grants.is_empty() && clear_grants {
                 return Err(Error::usage(
                     "`--grant` and `--clear-grants` cannot be combined",
+                ));
+            }
+            if vis != PolicyVisibility::Private && clear_grants {
+                return Err(Error::usage(
+                    "`--clear-grants` applies only when setting `--visibility private`",
                 ));
             }
             if vis == PolicyVisibility::Private && grants.is_empty() && !clear_grants {
@@ -1139,26 +1154,68 @@ mod tests {
     #[test]
     fn project_policy_request_defaults_to_read_and_guards_writes() {
         assert_eq!(
-            resolve_project_policy_request(None, &[], false).unwrap(),
+            resolve_project_policy_request("atlas", None, &[], false).unwrap(),
             None
         );
-        assert!(resolve_project_policy_request(None, &["users/alex".into()], false).is_err());
-        assert!(resolve_project_policy_request(None, &[], true).is_err());
+        assert!(resolve_project_policy_request("../escape", None, &[], false).is_err());
+        assert!(resolve_project_policy_request("ATLAS", None, &[], false).is_err());
         assert!(
-            resolve_project_policy_request(Some(PolicyVisibility::Private), &[], false).is_err()
+            resolve_project_policy_request("atlas", None, &["users/alex".into()], false).is_err()
+        );
+        assert!(resolve_project_policy_request("atlas", None, &[], true).is_err());
+        assert!(
+            resolve_project_policy_request("atlas", None, &["users/alex".into()], true).is_err()
         );
         assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &[],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &["".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &["   ".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
             Some(PolicyVisibility::Private),
             &["operator".into()],
             true
         )
         .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::WorkspaceVisible),
+            &[],
+            true
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::WorkspaceVisible),
+            &["users/alex".into()],
+            true
+        )
+        .is_err());
         assert_eq!(
-            resolve_project_policy_request(Some(PolicyVisibility::Private), &[], true).unwrap(),
+            resolve_project_policy_request("atlas", Some(PolicyVisibility::Private), &[], true)
+                .unwrap(),
             Some(PolicyVisibility::Private)
         );
         assert_eq!(
             resolve_project_policy_request(
+                "atlas",
                 Some(PolicyVisibility::Private),
                 &["agents/ap_11111111-1111-4111-8111-111111111111".into()],
                 false
@@ -1167,9 +1224,31 @@ mod tests {
             Some(PolicyVisibility::Private)
         );
         assert_eq!(
-            resolve_project_policy_request(Some(PolicyVisibility::WorkspaceVisible), &[], false)
-                .unwrap(),
+            resolve_project_policy_request(
+                "atlas",
+                Some(PolicyVisibility::WorkspaceVisible),
+                &[],
+                false
+            )
+            .unwrap(),
             Some(PolicyVisibility::WorkspaceVisible)
         );
+
+        // Local CLI runner rejects invalid flags/keys before calling `open_pm()`.
+        let err = run(
+            &IssueAction::Project {
+                action: ProjectAction::Policy {
+                    key: "atlas".into(),
+                    visibility: Some(PolicyVisibility::WorkspaceVisible),
+                    grants: Vec::new(),
+                    clear_grants: true,
+                    json: false,
+                },
+            },
+            std::path::Path::new("/nonexistent-state-dir"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "usage");
+        assert!(err.to_string().contains("--clear-grants"), "{err}");
     }
 }
