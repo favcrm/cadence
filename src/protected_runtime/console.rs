@@ -46,8 +46,9 @@ const MAX_HELLO_BYTES: usize = 512;
 const MAX_STDERR_BYTES: u64 = 8 * 1024 * 1024;
 /// How long the owner waits for the supervisor to attach after `open_console`.
 const ATTACH_DEADLINE: Duration = Duration::from_secs(30);
-/// Console read/write deadlines on the supervisor side. A silent peer is a
-/// closed attachment, never an unbounded wait.
+/// Console write deadline on both sides, and mid-frame read deadline once the
+/// first byte of a frame arrives. Waiting between frames has no read deadline
+/// so idle protected agents and long model turns do not disconnect.
 const CONSOLE_IO_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Write one owner -> supervisor console frame.
@@ -66,16 +67,33 @@ pub(crate) fn write_channel(stream: &mut UnixStream, channel: u8, payload: &[u8]
         .map_err(|_| Error::unknown("owned console attachment closed"))
 }
 
-/// Read one owner -> supervisor console frame.
+/// Read one owner -> supervisor console frame, waiting without deadline between
+/// frames and bounding mid-frame stalls with `CONSOLE_IO_DEADLINE`.
 pub(crate) fn read_channel(stream: &mut UnixStream) -> Result<(u8, Vec<u8>)> {
+    read_channel_with_frame_deadline(stream, CONSOLE_IO_DEADLINE)
+}
+
+fn read_channel_with_frame_deadline(
+    stream: &mut UnixStream,
+    frame_deadline: Duration,
+) -> Result<(u8, Vec<u8>)> {
+    stream
+        .set_read_timeout(None)
+        .map_err(|_| Error::rejected("console read deadline cannot be cleared"))?;
     let mut header = [0u8; 5];
     stream
-        .read_exact(&mut header)
+        .read_exact(&mut header[..1])
         .map_err(|_| Error::unknown("owned console attachment closed"))?;
     let channel = header[0];
     if !matches!(channel, CHANNEL_STDOUT | CHANNEL_STDERR) {
         return Err(Error::rejected("console frame names an unknown channel"));
     }
+    stream
+        .set_read_timeout(Some(frame_deadline))
+        .map_err(|_| Error::rejected("console read deadline unavailable"))?;
+    stream
+        .read_exact(&mut header[1..])
+        .map_err(|_| Error::unknown("owned console attachment closed"))?;
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if len > MAX_CONSOLE_PAYLOAD {
         return Err(Error::rejected("console frame exceeds the payload bound"));
@@ -84,6 +102,9 @@ pub(crate) fn read_channel(stream: &mut UnixStream) -> Result<(u8, Vec<u8>)> {
     stream
         .read_exact(&mut payload)
         .map_err(|_| Error::unknown("owned console attachment closed"))?;
+    stream
+        .set_read_timeout(None)
+        .map_err(|_| Error::rejected("console read deadline cannot be cleared"))?;
     Ok((channel, payload))
 }
 
@@ -371,7 +392,9 @@ impl OwnerConsole {
 
     pub(crate) fn close(&mut self) {
         self.writer.store(true, Ordering::SeqCst);
-        self.close_stdin();
+        if let Some(stream) = self.stdin.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(stream) = self.stdout.take() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -459,8 +482,8 @@ pub(crate) fn connect(
         .write_all(&payload)
         .map_err(|_| Error::unknown("owned console hello was refused"))?;
     console
-        .set_read_timeout(Some(CONSOLE_IO_DEADLINE))
-        .map_err(|_| Error::rejected("console read deadline unavailable"))?;
+        .set_read_timeout(None)
+        .map_err(|_| Error::rejected("console read deadline cannot be cleared"))?;
     let reader_stream = console
         .try_clone()
         .map_err(|_| Error::internal("console reader cannot be cloned"))?;
@@ -579,5 +602,55 @@ mod tests {
         validate_path(run, "rt-1", &path).unwrap();
         assert!(validate_path(run, "rt-2", &path).is_err());
         assert!(validate_path(run, "../escape", &path).is_err());
+    }
+
+    #[test]
+    fn connect_clears_read_timeout_and_delivers_stdout_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (hello_tx, hello_rx) = std::sync::mpsc::channel();
+        let (send_tx, send_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let raw = read_line(&mut conn, MAX_HELLO_BYTES).unwrap();
+            let hello: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(hello["runtime_id"], "rt-1");
+            assert_eq!(hello["generation"], 4);
+            assert_eq!(hello["token"], "tok-1");
+            hello_tx.send(()).unwrap();
+            send_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            write_channel(&mut conn, CHANNEL_STDOUT, b"ready\n").unwrap();
+        });
+
+        let console = connect(&path, "tok-1", "rt-1", 4, 42, None).unwrap();
+        hello_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut parts = console.into_parts().unwrap();
+        assert_eq!(parts.pid, 42);
+        assert!(parts.stdin.read_timeout().unwrap().is_none());
+        assert_eq!(
+            parts.stdin.write_timeout().unwrap(),
+            Some(CONSOLE_IO_DEADLINE)
+        );
+
+        send_tx.send(()).unwrap();
+        let mut buf = [0u8; 6];
+        parts.stdout.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ready\n");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn read_channel_bounds_stalled_partial_frame_and_clears_timeout_after_complete_frame() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        write_channel(&mut a, CHANNEL_STDOUT, b"ok").unwrap();
+        assert_eq!(
+            read_channel_with_frame_deadline(&mut b, Duration::from_millis(50)).unwrap(),
+            (CHANNEL_STDOUT, b"ok".to_vec())
+        );
+        assert!(b.read_timeout().unwrap().is_none());
+
+        a.write_all(&[CHANNEL_STDOUT]).unwrap();
+        assert!(read_channel_with_frame_deadline(&mut b, Duration::from_millis(50)).is_err());
     }
 }
