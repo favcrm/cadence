@@ -14,6 +14,7 @@ import AppShell, { type ActiveInstallation, type AppShellHeaderTargets } from ".
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { useCanvasChrome } from "./features/canvas/canvasChrome";
 import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
 import { parseAppDisplayI18n } from "./features/workspace-apps/appLocale";
 import { parseNavigation } from "./features/workspace-apps/screen/screenLifecycle";
@@ -347,7 +348,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const { collapsed: sidebarCollapsed } = useSidebarPrefs();
+  // A full-width canvas folds the sidebar to its rail without touching the person's own preference (CAD-2657).
+  const { collapsed: sidebarPref } = useSidebarPrefs();
+  const canvasFull = useCanvasChrome().full;
+  const sidebarCollapsed = sidebarPref || canvasFull;
   const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
   const setSidebarCollapsed = (collapsed: boolean) => {
     updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));

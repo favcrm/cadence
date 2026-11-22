@@ -490,16 +490,17 @@ export function writeWidth(px: number): void {
 export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
 export const CHAT_MIN = 320;
-/** What the chat keeps when the canvas is expanded: a narrow strip. The chat
- *  panel is inset 32px, so 96px leaves about 64px of it showing. */
-export const CHAT_STRIP = 96;
 const SIDEBAR = 208;
+/** The board's folded sidebar (styles.css), which stays beside a Home canvas that is expanded. */
+export const SIDEBAR_RAIL = 64;
 
 export interface DrawerLayout {
   mode: CanvasMode;
   width: number;
   /** App canvases end before the right-docked assistant. Home stays flush right. */
   right?: number;
+  /** Expanded beyond the workspace: the canvas covers the chat, which keeps a rail of its own. */
+  full?: true;
 }
 
 /**
@@ -521,11 +522,10 @@ export function drawerLayout(
     if (room < MIN_WIDTH) return { mode: "sheet", width: viewport };
     return { mode: "cover", width: expanded ? room : Math.min(want, room), right: Math.max(0, viewport - workspace.right) };
   }
+  // Expanded (CAD-2657): the canvas takes the whole window beside the folded
+  // sidebar; its own left rail holds the chat.
+  if (expanded) return { mode: "cover", width: viewport - (viewport >= 1024 ? SIDEBAR_RAIL : 0), full: true };
   const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
-  if (expanded) {
-    const room = main - CHAT_STRIP;
-    return room < MIN_WIDTH ? { mode: "sheet", width: viewport } : { mode: "cover", width: room };
-  }
   const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;
   if (main - want >= need) return { mode: "push", width: want };
   // Without an app workspace, retain the page-based cap.

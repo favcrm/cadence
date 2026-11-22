@@ -209,6 +209,8 @@ check(cardParamsHtml.includes("viewcard-params") && /data-view-params="true" tit
 const readCss = (path: string): string => require("fs").readFileSync(`${process.cwd()}/src/${path}`, "utf8");
 const rule = (css: string, selector: string): string => css.slice(css.indexOf(selector)).split("}")[0];
 check(rule(readCss("styles.css"), ".viewcard-params {").includes("-webkit-line-clamp: 2"), "card params clamp to two lines");
-check(rule(readCss("features/canvas/canvas.css"), ".cv-title > .cv-appview-params {").includes("-webkit-line-clamp: 2"), "tab params clamp to two lines");
-check(rule(readCss("features/canvas/canvas.css"), ".cv-title > .cv-appview-sub {").includes("white-space: nowrap"), "the tab's app line stays on one line");
-check(rule(readCss("features/canvas/canvas.css"), ".cv-appview-open {").includes("display: block"), "the Open in link is a block so its long label ends in an ellipsis");
+// CAD-2657 keeps those guarantees on the header row: each chip, the title and the "Open in" label are one line that ends in an ellipsis.
+const canvasCss = readCss("features/canvas/canvas.css");
+check(rule(canvasCss, ".cv-chip {").includes("white-space: nowrap") && rule(canvasCss, ".cv-chip {").includes("text-overflow: ellipsis"), "a chip stays on one line and ends in an ellipsis");
+check(rule(canvasCss, ".cv-vtitle {").includes("white-space: nowrap") && rule(canvasCss, ".cv-vtitle {").includes("text-overflow: ellipsis"), "the title stays on one line and ends in an ellipsis");
+check(rule(canvasCss, ".cv-open {").includes("max-width: 40%") && rule(canvasCss, ".cv-open-label {").includes("text-overflow: ellipsis"), "a long app name ends in an ellipsis inside the Open in button");
