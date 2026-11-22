@@ -56,6 +56,7 @@ export type ChildToHost =
   | { v: 2; op: "whatsapp-compose"; conversation_id: string | null }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
   | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
+  | WhatsAppMediaRequest
   | AudioRequest
   | AudioSessionRequest
   | CallRequest
@@ -242,6 +243,37 @@ export const SCREEN_WHATSAPP_REPLY_LAYOUT_V2 = "screen-whatsapp-reply-layout.v2"
 export const WHATSAPP_REPLY_INSET_MAX = 512;
 export type WhatsAppReplyBounds = [left: number, right: number];
 const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.us)$/;
+/** Bounded inbound WhatsApp media download bridge (`screen-whatsapp-media.v1`). */
+export const SCREEN_WHATSAPP_MEDIA_V1 = "screen-whatsapp-media.v1";
+export const LINKED_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+export const LINKED_MEDIA_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export interface WhatsAppMediaRequest {
+  v: 2;
+  op: "whatsapp-media";
+  id: string;
+  conversation_id: string;
+  message_id: string;
+}
+export type WhatsAppMediaReply =
+  | {
+      v: 2;
+      op: "whatsapp-media-reply";
+      id: string;
+      ok: true;
+      bytes: ArrayBuffer;
+      mime_type: string;
+      file_name: string | null;
+      sha256: string;
+    }
+  | { v: 2; op: "whatsapp-media-reply"; id: string; ok: false; refusal: ActionRefusal };
+export function validLinkedMediaId(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) return false;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 32 || code === 127) return false;
+  }
+  return true;
+}
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
 /** Headless inline host-mediated audio capture/upload session streaming (`screen-audio.v2`). */
@@ -510,7 +542,7 @@ export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -844,7 +876,7 @@ export interface ScreenPush {
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -918,11 +950,11 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 8 &&
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
     !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -1012,6 +1044,23 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER) && isBoundedSafeInt(d.seq, 1, Number.MAX_SAFE_INTEGER) &&
       isBoundedSafeInt(d.px, 0, WHATSAPP_REPLY_INSET_MAX)) {
     return { v: 2, op: "whatsapp-reply-inset-ready", nomination: d.nomination, seq: d.seq, px: d.px };
+  }
+  if (
+    d.v === 2 &&
+    d.op === "whatsapp-media" &&
+    Object.keys(d).sort().join() === "conversation_id,id,message_id,op,v" &&
+    typeof d.id === "string" &&
+    ACTION_ID.test(d.id) &&
+    validLinkedMediaId(d.conversation_id) &&
+    validLinkedMediaId(d.message_id)
+  ) {
+    return {
+      v: 2,
+      op: "whatsapp-media",
+      id: d.id,
+      conversation_id: d.conversation_id,
+      message_id: d.message_id,
+    };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {

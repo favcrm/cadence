@@ -5,7 +5,8 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
-import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import type { WhatsAppMediaDownloadResult } from "./screenServices";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
@@ -67,6 +68,7 @@ export interface ScreenActions {
   onWhatsAppCompose?(conversationId: string | null, nomination: number | null): void;
   onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
   onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
+  onWhatsAppMediaDownload?(conversationId: string, messageId: string, signal: AbortSignal): Promise<WhatsAppMediaDownloadResult>;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -255,6 +257,7 @@ export abstract class FrameChannel {
   protected whatsappCompose(_conversationId: string | null): void { this.close(true); }
   protected whatsappReplyLayout(_nomination: number, _bounds: WhatsAppReplyBounds | null): void { this.close(true); }
   protected whatsappReplyInsetReady(_nomination: number, _seq: number, _px: number): void { this.close(true); }
+  protected whatsappMedia(_request: WhatsAppMediaRequest): void { this.close(true); }
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
   protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
@@ -311,6 +314,10 @@ export abstract class FrameChannel {
         if (!this.ready) { this.close(true); return; }
         this.whatsappReplyInsetReady(child.nomination, child.seq, child.px);
       }
+      if (child.op === "whatsapp-media") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappMedia(child);
+      }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
         if (child.op === "call") this.call(child);
@@ -342,6 +349,11 @@ const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish
 export function admitsWhatsAppComposer(receipt: MountReceipt): boolean {
   return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
     ["whatsapp.conversations.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.reply.status"].every(verb => receipt.operations?.includes(verb));
+}
+
+export function admitsWhatsAppMediaDownload(receipt: MountReceipt): boolean {
+  return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
+    !!receipt.operations?.includes("whatsapp.messages");
 }
 
 export class ScreenChannel extends FrameChannel {
@@ -630,6 +642,53 @@ export class ScreenChannel extends FrameChannel {
   private audioBusy = false;
   private audioRetire: AbortController | null = null;
   private audioSessionRetire = new Set<AbortController>();
+  private wantsWhatsAppMedia = false;
+  private whatsappMediaRetire = new Set<AbortController>();
+  protected whatsappMedia(request: WhatsAppMediaRequest): void {
+    const download = this.actions?.onWhatsAppMediaDownload;
+    if (!this.wantsWhatsAppMedia || !download) {
+      this.close(true);
+      return;
+    }
+    const reply = (message: WhatsAppMediaReply, transfer: Transferable[] = []) => {
+      if (!this.closed) this.port?.postMessage(message, transfer);
+    };
+    if (this.whatsappMediaRetire.size >= 4) {
+      reply({
+        v: 2,
+        op: "whatsapp-media-reply",
+        id: request.id,
+        ok: false,
+        refusal: { code: "busy", text: "Too many downloads in progress." },
+      });
+      return;
+    }
+    const retire = new AbortController();
+    this.whatsappMediaRetire.add(retire);
+    void download(request.conversation_id, request.message_id, retire.signal)
+      .catch((): WhatsAppMediaDownloadResult => ({ ok: false, refusal: { code: "failed", text: "Download failed." } }))
+      .then(result => {
+        this.whatsappMediaRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          reply({ v: 2, op: "whatsapp-media-reply", id: request.id, ok: false, refusal: result.refusal });
+          return;
+        }
+        reply(
+          {
+            v: 2,
+            op: "whatsapp-media-reply",
+            id: request.id,
+            ok: true,
+            bytes: result.bytes,
+            mime_type: result.mimeType,
+            file_name: result.fileName,
+            sha256: result.sha256,
+          },
+          [result.bytes],
+        );
+      });
+  }
   sendAudioSessionEvent(state: ScreenAudioSessionSnapshot): void {
     if (this.closed || !this.ready || this.shape !== "v2" || !this.wantsAudioV2) return;
     const parsed = parseScreenAudioSessionSnapshot(state);
@@ -752,6 +811,8 @@ export class ScreenChannel extends FrameChannel {
     this.callRetire = [];
     for (const retire of this.audioSessionRetire) retire.abort();
     this.audioSessionRetire.clear();
+    for (const retire of this.whatsappMediaRetire) retire.abort();
+    this.whatsappMediaRetire.clear();
     this.actions?.disposeAudioSession?.();
     this.audioRetire?.abort();
     this.audioRetire = null;
@@ -784,6 +845,10 @@ export class ScreenChannel extends FrameChannel {
     this.wantsReplyOverlay = accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2);
     this.wantsReplyLayout = this.wantsReplyOverlay || accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1);
     if (this.wantsReplyLayout && (!this.wantsReplyAvailability || !this.actions?.onWhatsAppReplyLayout)) return false;
+    const wantsWhatsAppMedia = accepts.includes(SCREEN_WHATSAPP_MEDIA_V1);
+    if (wantsWhatsAppMedia && (!records || !admitsWhatsAppMediaDownload(this.receipt) ||
+        this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppMediaDownload)) return false;
+    this.wantsWhatsAppMedia = wantsWhatsAppMedia;
     this.records = records;
     this.wantsLocale = wantsLocale;
     this.wantsRouteParams = wantsRouteParams;

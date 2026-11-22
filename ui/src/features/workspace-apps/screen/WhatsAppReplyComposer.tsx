@@ -2,9 +2,20 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
-import { object, type recordServices } from "./screenServices";
-import { WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import { formatMediaBytes, object, type LinkedStagedAttachment, type recordServices } from "./screenServices";
+import { LINKED_MEDIA_MAX_BYTES, LINKED_MEDIA_MAX_IMAGE_BYTES, WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
+
+const ATTACH_ACCEPT = [
+  "image/jpeg", "image/png", "image/webp",
+  "video/mp4", "video/webm",
+  "audio/mpeg", "audio/ogg", "audio/mp4", "audio/aac", "audio/wav", "audio/webm",
+  "application/pdf", "text/plain", "text/csv",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".jpg,.jpeg,.png,.webp,.mp4,.webm,.mp3,.ogg,.m4a,.aac,.wav,.pdf,.txt,.csv,.docx,.xlsx,.pptx",
+].join(",");
 
 export interface WhatsAppReplySelection {
   conversationId: string;
@@ -76,11 +87,20 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const [busy, setBusy] = useState(false);
   const [staleRecipient, setStaleRecipient] = useState(false);
   const [attempt, setAttempt] = useState<{ effectId: string | null; outcome: Outcome } | null>(null);
+  const [attachment, setAttachment] = useState<LinkedStagedAttachment | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [staging, setStaging] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const running = useRef(false);
   const pointer = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   const dock = useRef<HTMLDivElement>(null);
   const size = useRef({ measured: -1, room: 0, seq: undefined as number | undefined });
+  const stagedIdRef = useRef<string | null>(null);
+  const previewUrlRef = useRef<string | null>(null);
+  const latestSelection = useRef(selection);
+  latestSelection.current = selection;
   const overlay = selection.announceInset !== undefined;
   const hidden = bounds === null || (overlay && bounds === undefined);
   useLayoutEffect(() => {
@@ -112,7 +132,39 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
   const locked = attempt?.outcome === "uncertain";
   const readOnly = busy || locked || availability !== "verified";
-  const disabled = readOnly || !text.trim();
+  const isAudio = attachment?.kind === "audio";
+  const audioHasCaption = isAudio && text !== "";
+  const textareaReadOnly = readOnly || (isAudio && text === "");
+  const disabled = readOnly || staging || audioHasCaption || (!text.trim() && !attachment);
+
+  function replacePreview(next: string | null) {
+    if (previewUrlRef.current && typeof URL.revokeObjectURL === "function") {
+      URL.revokeObjectURL(previewUrlRef.current);
+    }
+    previewUrlRef.current = next;
+    setPreviewUrl(next);
+  }
+
+  function clearAttachment(deleteServer = true) {
+    const currentId = stagedIdRef.current ?? attachment?.attachment_id ?? null;
+    stagedIdRef.current = null;
+    setAttachment(null);
+    setAttachError(null);
+    replacePreview(null);
+    if (fileInput.current) fileInput.current.value = "";
+    if (deleteServer && currentId) {
+      void latestSelection.current.services.deleteStagedWhatsAppMedia(currentId);
+    }
+  }
+
+  useEffect(() => () => {
+    if (previewUrlRef.current && typeof URL.revokeObjectURL === "function") {
+      URL.revokeObjectURL(previewUrlRef.current);
+    }
+    if (stagedIdRef.current) {
+      void latestSelection.current.services.deleteStagedWhatsAppMedia(stagedIdRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -145,9 +197,62 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       box.style.height = "auto";
       box.style.height = `${box.scrollHeight}px`;
     }
-  }, [bounds, text, recipient]);
-  useLayoutEffect(() => { selection.announce(!!text || busy); }, [selection, text, busy]);
+  }, [bounds, text, recipient, attachment]);
+  useLayoutEffect(() => { selection.announce(!!text || !!attachment || busy || staging); }, [selection, text, attachment, busy, staging]);
   useEffect(() => { selection.announceAvailability?.(availability); }, [selection, availability]);
+
+  async function pickFile(file: File | undefined) {
+    if (!file || readOnly || staging || attachment || !selection.current()) return;
+    if (fileInput.current) fileInput.current.value = "";
+    if (file.size < 1) {
+      setAttachError(zh ? "請選擇非空白檔案。" : "Select a non-empty file.");
+      return;
+    }
+    if (file.type.startsWith("image/") && file.size > LINKED_MEDIA_MAX_IMAGE_BYTES) {
+      setAttachError(zh ? "圖片大小不得超過 5 MB。" : "Images must be 5 MB or smaller.");
+      return;
+    }
+    if (file.size > LINKED_MEDIA_MAX_BYTES) {
+      setAttachError(zh ? "檔案大小不得超過 10 MB。" : "Files must be 10 MB or smaller.");
+      return;
+    }
+    setStaging(true);
+    setAttachError(null);
+    const res = await selection.services.stageWhatsAppMedia(file);
+    if (!selection.current()) {
+      if (res.ok) void selection.services.deleteStagedWhatsAppMedia(res.data.attachment_id);
+      return;
+    }
+    if (!res.ok) {
+      const code = res.refusal.code;
+      setAttachError(
+        code === "unsupported_host" ? (zh ? "此工作區主機尚未支援附件上傳。" : "Attachment uploads are not supported on this workspace host yet.")
+          : code === "payload_too_large" ? (zh ? "所選檔案超過大小限制。" : "That attachment exceeds the size limit.")
+          : code === "unsupported_media_type" ? (zh ? "WhatsApp 回覆不支援此檔案格式。" : "That file type is not supported for WhatsApp replies.")
+          : res.refusal.text,
+      );
+      setStaging(false);
+      return;
+    }
+    if (res.data.kind === "image") {
+      const content = await selection.services.readStagedWhatsAppMedia(res.data.attachment_id);
+      if (!selection.current()) {
+        void selection.services.deleteStagedWhatsAppMedia(res.data.attachment_id);
+        return;
+      }
+      if (content.ok && typeof URL.createObjectURL === "function") {
+        replacePreview(URL.createObjectURL(content.blob));
+      }
+    }
+    stagedIdRef.current = res.data.attachment_id;
+    setAttachment(res.data);
+    setStaging(false);
+  }
+
+  function handleStaleAttachment() {
+    clearAttachment(false);
+    setAttachError(zh ? "附件已過期或變更，請重新附加後再傳送。" : "The attached file expired or changed. Re-attach it before sending.");
+  }
 
   async function send() {
     if (disabled || !recipient || running.current || !selection.current()) return;
@@ -157,14 +262,30 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     running.current = true;
     setBusy(true);
     setAttempt(null);
-    const args = { provider, conversation_id: selection.conversationId, text };
+    setAttachError(null);
+    const activeAttachment = attachment;
+    const draftText = activeAttachment?.kind === "audio" ? "" : text;
+    const args: Record<string, unknown> = {
+      provider,
+      conversation_id: selection.conversationId,
+      text: draftText,
+      ...(activeAttachment ? { attachments: [{ attachment_id: activeAttachment.attachment_id, sha256: activeAttachment.sha256 }] } : {}),
+    };
     let effectId: string | null = null;
     let submitted = false;
+    let staleAttachmentHandled = false;
     let outcome: Outcome = "unsent";
     try {
       const prepared = await selection.services.call("whatsapp.reply.prepare", args);
       if (!selection.current()) return;
-      if (!prepared.ok || !object(prepared.data) || prepared.data.decision !== "prepared" ||
+      if (!prepared.ok) {
+        if (activeAttachment && (prepared.refusal.code === "facts_changed" || prepared.refusal.code === "not_found")) {
+          staleAttachmentHandled = true;
+          handleStaleAttachment();
+        }
+        return;
+      }
+      if (!object(prepared.data) || prepared.data.decision !== "prepared" ||
           typeof prepared.data.effect_id !== "string" || !EFFECT.test(prepared.data.effect_id)) return;
       effectId = prepared.data.effect_id;
       // Re-read the exact account epoch after prepare. Since a re-pair changes
@@ -179,7 +300,13 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         else setStaleRecipient(true);
         return;
       }
-      if (!("run" in plan)) return;
+      if (!("run" in plan)) {
+        if (activeAttachment && (plan.code === "facts_changed" || plan.code === "not_found")) {
+          staleAttachmentHandled = true;
+          handleStaleAttachment();
+        }
+        return;
+      }
       const receipts = replyRecovery.get(key);
       if (receipts?.pending) { effectId = receipts.pending; outcome = "uncertain"; return; }
       // Retain the effect before starting confirm; navigation could win the response race.
@@ -188,6 +315,12 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       // Only reached from the original trusted click or Enter, never a port callback.
       submitted = true;
       const result = await plan.run();
+      if (!result.ok && activeAttachment && (result.refusal.code === "facts_changed" || result.refusal.code === "not_found")) {
+        outcome = "failed";
+        staleAttachmentHandled = true;
+        handleStaleAttachment();
+        return;
+      }
       const state = result.ok && object(result.data) && object(result.data.reply) ? result.data.reply.state : null;
       outcome = state === "failed" || state === "accepted" || state === "sent" ? state : "uncertain";
     } catch {
@@ -197,10 +330,17 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       if (submitted && effectId) settleReceipt(key, effectId, outcome, group);
       if (selection.current()) {
         const mayHaveSent = submitted && (outcome === "sent" || outcome === "accepted" || outcome === "uncertain");
-        setAttempt({ effectId, outcome });
-        if (mayHaveSent) setText("");
+        if (!staleAttachmentHandled) setAttempt({ effectId, outcome });
+        if (mayHaveSent) {
+          setText("");
+          if (activeAttachment) {
+            stagedIdRef.current = null;
+            setAttachment(null);
+            replacePreview(null);
+          }
+        }
         setBusy(false);
-        selection.announce(!mayHaveSent && !!text, submitted);
+        selection.announce(!mayHaveSent && (!!text || (!!attachment && !staleAttachmentHandled)), submitted);
       }
     }
   }
@@ -219,18 +359,28 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     settleReceipt(receiptKey(selection, recipient), effectId, outcome, group);
     setAttempt({ effectId, outcome });
     setBusy(false);
-    selection.announce(!!text, true);
+    selection.announce(!!text || !!attachment, true);
   }
 
+  const audioNote = audioHasCaption
+    ? (zh ? "音訊回覆不可包含說明文字。請清除文字或移除音訊。" : "Audio replies can’t include a caption. Clear the text or remove the audio.")
+    : null;
   const note = staleRecipient ? (zh ? "未有傳送。請清除草稿並重新開啟對話，以再次核對收件人。" : "Nothing sent. Clear the draft and reopen the conversation to verify the recipient again.")
-    : attempt?.outcome === "sent" ? (group ? (zh ? "WhatsApp 已接收群組訊息。" : "WhatsApp accepted the group message.") : (zh ? "已確認送達。" : "Delivery confirmed."))
+    : attachError ?? audioNote
+    ?? (attempt?.outcome === "sent" ? (group ? (zh ? "WhatsApp 已接收群組訊息。" : "WhatsApp accepted the group message.") : (zh ? "已確認送達。" : "Delivery confirmed."))
     : attempt?.outcome === "accepted" ? (zh ? "WhatsApp 已接收，但未確認送達。" : "WhatsApp accepted the message; delivery isn’t confirmed.")
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
-    : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null;
+    : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null);
   const status = note && <div className="wa-reply-status">
-    <p role={staleRecipient || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
-    {(locked || attempt?.outcome === "accepted" && !group) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
+    <p role={staleRecipient || !!attachError || audioHasCaption || attempt?.outcome === "uncertain" || attempt?.outcome === "failed" ? "alert" : "status"}>{note}</p>
+    {(!attachError && !audioHasCaption && (locked || attempt?.outcome === "accepted" && !group)) && <Button size="sm" disabled={busy} onClick={() => { void check(); }}>{zh ? "檢查狀態" : "Check status"}</Button>}
   </div>;
+
+  const attBadge = attachment
+    ? attachment.kind === "document"
+      ? attachment.mime_type === "application/pdf" ? "PDF" : "DOC"
+      : attachment.kind.toUpperCase()
+    : "";
 
   return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? {
@@ -248,21 +398,41 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           : availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…")
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
       </p>}
+      {attachment && <div className="wa-reply-attachment">
+        {previewUrl
+          ? <img className="wa-reply-thumb" src={previewUrl} alt={attachment.file_name ?? attachment.kind} />
+          : <span className="wa-reply-badge" aria-hidden="true">{attBadge}</span>}
+        <span className="wa-reply-att-meta">
+          <span className="wa-reply-att-name">{attachment.file_name ?? (zh ? attachment.kind : attachment.kind)}</span>
+          <span className="wa-reply-att-size">{formatMediaBytes(attachment.byte_length)}</span>
+        </span>
+        {!busy && !locked && <button type="button" className="wa-reply-att-remove" aria-label={zh ? "移除附件" : "Remove attachment"}
+          onClick={() => clearAttachment(true)}>×</button>}
+      </div>}
       <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"}
-        placeholder={overlay && availability !== "verified"
+        placeholder={isAudio && text === ""
+          ? (zh ? "音訊回覆不可包含說明文字" : "Audio replies can’t include a caption")
+          : overlay && availability !== "verified"
           ? (availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…") : (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation"))
           : (zh ? "輸入回覆…" : "Write a reply…")}
-        value={text} rows={1} maxLength={4096} readOnly={readOnly}
+        value={text} rows={1} maxLength={4096} readOnly={textareaReadOnly}
         onChange={e => setText(e.target.value)} onKeyDown={e => {
           if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;
           e.preventDefault();
           if (e.nativeEvent.isTrusted && !e.repeat) void send();
         }} />
+      <input ref={fileInput} type="file" hidden accept={ATTACH_ACCEPT}
+        onChange={e => { void pickFile(e.target.files?.[0]); }} />
       <div className="app-chat-composer-tools wa-reply-tools">
-        {text && !busy && !locked && <Button size="sm" variant="ghost" onClick={() => { setText(""); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
+        <button type="button" className="wa-reply-attach" aria-label={zh ? "附加檔案" : "Attach file"}
+          disabled={readOnly || staging || !!attachment}
+          onClick={() => fileInput.current?.click()}>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+        </button>
+        {(text || attachment) && !busy && !locked && !staging && <Button size="sm" variant="ghost" onClick={() => { setText(""); clearAttachment(true); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
         <span className="wa-reply-hint" aria-live="polite">
-          {busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
+          {staging ? (zh ? "正在上傳附件…" : "Uploading attachment…") : busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
         </span>
         <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
           onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
