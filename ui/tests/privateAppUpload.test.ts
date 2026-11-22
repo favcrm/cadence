@@ -257,6 +257,32 @@ async function main() {
     const authorized = await authorizeHostedPrivateReview(listed.reviews[0]!);
     equal(authorized.authorizedBy, "owner_1");
 
+    responses = [
+      { status: 409, body: { error: { code: "review_closed", message: "Review closed." } } },
+      { status: 200, body: agentReceipt },
+    ];
+    await rejected(
+      authorizeHostedPrivateReview(listed.reviews[0]!),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "a 409 review_closed with a still-pending readback must refuse fail-closed",
+    );
+
+    calls = [];
+    responses = [
+      { status: 409, body: { error: { code: "review_closed", message: "Review closed." } } },
+      { status: 200, body: { ok: true, data: { ...agentReceipt.data, state: "installed", applied_install_id: "install_app1" } } },
+    ];
+    const closedAuth = await authorizeHostedPrivateReview(listed.reviews[0]!);
+    equal(closedAuth.state, "installed");
+    equal(calls.map(({ init }) => init.method ?? "GET").join(" "), "POST GET");
+
+    responses = [{ status: 200, body: agentReceipt }];
+    await rejected(
+      authorizeHostedPrivateReview(listed.reviews[0]!),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "a 200 authorize response without authorized_by must refuse fail-closed",
+    );
+
     const grantedPolicy = {
       id: "pol_1",
       install_id: "install_app1",

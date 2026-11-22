@@ -339,7 +339,11 @@ export async function authorizeHostedPrivateReview(request: HostedPrivateReview)
     const receipt = reconcile ? await getHostedPrivateReview(request.id) : parseHostedReview(body, request.id, operation.generation);
     operation.assertCurrent();
     if (receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
-    if (receipt.state === "pending" && reconcile && code !== "review_closed") throw refusal();
+    if (reconcile) {
+      if (receipt.state === "pending") throw code === "review_closed" ? invalid() : refusal();
+      return receipt;
+    }
+    if (receipt.state !== "pending" || !receipt.authorizedBy) throw invalid();
     return receipt;
   });
 }
