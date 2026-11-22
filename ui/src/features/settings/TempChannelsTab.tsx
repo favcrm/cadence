@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
-import { useTranslate } from "../../lib/locale";
+import { useLocaleTag, useTranslate, type Locale } from "../../lib/locale";
 import type {
   TempChannelAuditCounts,
   TempChannelAuditDetailPayload,
@@ -23,6 +23,16 @@ import {
 } from "./tempChannelsView";
 
 const PAGE_SIZE = 20;
+
+function translateStatus(
+  label: string,
+  locale: Locale,
+  t: (text: string) => string,
+): string {
+  // Keep global "Open" ("開啟") intact for action buttons while translating channel state accurately.
+  if (label === "Open") return locale === "zh-TW" ? "開放中" : "Open";
+  return t(label);
+}
 
 function chipToneClass(tone: "ok" | "warn" | "fail" | "muted"): string {
   switch (tone) {
@@ -47,6 +57,7 @@ export default function TempChannelsTab({
   onCountsChange?: (counts: TempChannelAuditCounts) => void;
 }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   const [filter, setFilter] = useState<TempChannelAuditStatusFilter>("all");
   const [searchInput, setSearchInput] = useState("");
   const [searchApplied, setSearchApplied] = useState("");
@@ -63,6 +74,7 @@ export default function TempChannelsTab({
   const [unavailable, setUnavailable] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(initialOpenId);
+  const [openPurpose, setOpenPurpose] = useState<{ id: string; purpose: string } | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
   const onCountsRef = useRef(onCountsChange);
   onCountsRef.current = onCountsChange;
@@ -159,12 +171,14 @@ export default function TempChannelsTab({
 
   const filterButtons: { key: TempChannelAuditStatusFilter; label: string; count: number }[] = [
     { key: "all", label: t("All"), count: counts.all },
-    { key: "open", label: t("Open"), count: counts.open },
+    { key: "open", label: translateStatus("Open", locale, t), count: counts.open },
     { key: "needs_human", label: t("Needs human"), count: counts.needs_human },
     { key: "ended", label: t("Closed / Expired"), count: counts.ended },
   ];
   const hasFilters = filter !== "all" || searchApplied !== "";
   const openSummary = rows.find((item) => item.id === openId) ?? null;
+  const resolvedOpenPurpose =
+    openSummary?.purpose ?? (openPurpose?.id === openId ? openPurpose.purpose : null);
 
   return (
     <div className="space-y-3 min-w-0" data-temp-channels-tab>
@@ -175,8 +189,13 @@ export default function TempChannelsTab({
             {t("User-triggered ephemeral relays created via chat or Workspace MCP. Inspect external peer messages, override triage decisions, or close active rooms immediately.")}
           </p>
         </div>
-        <Button size="sm" variant="ghost" disabled={loading} onClick={refreshAll}>
-          <IconRefresh size={14} />
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={<IconRefresh size={14} />}
+          disabled={loading}
+          onClick={refreshAll}
+        >
           {t("Refresh")}
         </Button>
       </div>
@@ -282,12 +301,14 @@ export default function TempChannelsTab({
                       <small className="num">
                         {shortTempChannelId(item.id)} · {creatorText}
                         {item.host_label ? ` · ${t("Host")}: ${item.host_label}` : ""} ·{" "}
-                        {t("Peer")}: {peerText} · {tempChannelCountsSummary(item)} ·{" "}
-                        {formatChannelExpiry(item)}
+                        {t("Peer")}: {peerText} · {tempChannelCountsSummary(item, t)} ·{" "}
+                        {formatChannelExpiry(item, undefined, t)}
                       </small>
                     </span>
                     <span className="conn-row-chips">
-                      <span className={`chip ${chipToneClass(badge.tone)}`}>{t(badge.label)}</span>
+                      <span className={`chip ${chipToneClass(badge.tone)}`}>
+                        {translateStatus(badge.label, locale, t)}
+                      </span>
                       <span className="settings-quiet">{t("Inspect")}</span>
                     </span>
                   </button>
@@ -317,13 +338,17 @@ export default function TempChannelsTab({
       {openId !== null && (
         <SettingsDrawer
           key={openId}
-          title={openSummary?.purpose ?? shortTempChannelId(openId)}
-          onClose={() => setOpenId(null)}
+          title={resolvedOpenPurpose ?? shortTempChannelId(openId)}
+          onClose={() => {
+            setOpenId(null);
+            setOpenPurpose(null);
+          }}
         >
           <TempChannelInspectDrawerContent
             channelId={openId}
             canWrite={canWrite}
             onChanged={refreshAll}
+            onLoadedPurpose={(purpose) => setOpenPurpose({ id: openId, purpose })}
           />
         </SettingsDrawer>
       )}
@@ -335,20 +360,33 @@ function TempChannelInspectDrawerContent({
   channelId,
   canWrite,
   onChanged,
+  onLoadedPurpose,
 }: {
   channelId: string;
   canWrite: boolean;
   onChanged: () => void;
+  onLoadedPurpose?: (purpose: string) => void;
 }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   const [detail, setDetail] = useState<TempChannelAuditDetailPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [rotatedPrompt, setRotatedPrompt] = useState<string | null>(null);
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  const onLoadedPurposeRef = useRef(onLoadedPurpose);
+  onLoadedPurposeRef.current = onLoadedPurpose;
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -358,11 +396,16 @@ function TempChannelInspectDrawerContent({
     setConfirmClose(false);
     setNotice(null);
     setRotatedPrompt(null);
+    setCopiedPrompt(false);
 
     void api
       .tempChannelDetail(channelId, controller.signal)
       .then((res) => {
-        if (active) setDetail(res);
+        if (!active) return;
+        setDetail(res);
+        if (res.snapshot?.channel?.purpose) {
+          onLoadedPurposeRef.current?.(res.snapshot.channel.purpose);
+        }
       })
       .catch((e: unknown) => {
         if (!active || (e instanceof DOMException && e.name === "AbortError")) return;
@@ -465,6 +508,7 @@ function TempChannelInspectDrawerContent({
       .tempChannelRotatePeer(ch.id)
       .then((res) => {
         setRotatedPrompt(res.peer_prompt);
+        setCopiedPrompt(false);
         setNotice(t("Peer invite rotated; previous peer token revoked and lock reset."));
         return api.tempChannelDetail(ch.id).then((fresh) => {
           setDetail(fresh);
@@ -515,7 +559,7 @@ function TempChannelInspectDrawerContent({
     <div className="space-y-3 min-w-0" data-temp-channel-drawer={ch.id}>
       <div className="flex flex-wrap items-center gap-2">
         <span className={`chip ${chipToneClass(badge.tone)}`} data-drawer-status>
-          {t(badge.label)}
+          {translateStatus(badge.label, locale, t)}
         </span>
         <span className="num text-micro text-ink-500 break-all">{ch.id}</span>
       </div>
@@ -588,9 +632,12 @@ function TempChannelInspectDrawerContent({
                 if (typeof navigator !== "undefined" && navigator.clipboard) {
                   void navigator.clipboard.writeText(rotatedPrompt).catch(() => {});
                 }
+                setCopiedPrompt(true);
+                if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+                copyTimerRef.current = setTimeout(() => setCopiedPrompt(false), 2000);
               }}
             >
-              {t("Copy new peer prompt")}
+              {copiedPrompt ? t("Copied") : t("Copy new peer prompt")}
             </Button>
           </div>
           <pre className="custmcp-pre" tabIndex={0}>
@@ -606,7 +653,7 @@ function TempChannelInspectDrawerContent({
         </div>
         <div>
           <dt>{t("Lifetime")}</dt>
-          <dd>{formatChannelExpiry(ch)}</dd>
+          <dd>{formatChannelExpiry(ch, undefined, t)}</dd>
         </div>
         <div>
           <dt>{t("Host session")}</dt>

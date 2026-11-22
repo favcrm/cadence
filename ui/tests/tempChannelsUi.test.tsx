@@ -76,7 +76,8 @@ async function main() {
   act = React.act;
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const { default: ConnectionsView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
-  const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  const { LocaleProvider: PageLocale, translateUiText } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  const { formatChannelExpiry, tempChannelCountsSummary } = require("../src/features/settings/tempChannelsView") as typeof import("../src/features/settings/tempChannelsView");
   const Connections = (props: import("react").ComponentProps<typeof ConnectionsView>) =>
     React.createElement(PageLocale, null, React.createElement(ConnectionsView, props));
 
@@ -429,6 +430,13 @@ async function main() {
     assert(document.getElementById("conn-tab-temp-channels")?.getAttribute("aria-selected") === "true", "ArrowRight selects Temp channels tab");
     assert(host.querySelectorAll("[data-channel-id]").length === 20, "renders first 20 rooms");
     assert(text().includes("Showing 20 of 22 channels"), "footer shows 20 of 22");
+    const refreshBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Refresh"),
+    ) as HTMLButtonElement | undefined;
+    assert(
+      Boolean(refreshBtn?.querySelector(".btn-icon")) && refreshBtn?.querySelector(".btn-label")?.textContent === "Refresh",
+      "Refresh uses Button icon prop without stacking icon inside .btn-label",
+    );
   });
 
   const loadOlderBtn = Array.from(document.querySelectorAll("button")).find((b) =>
@@ -474,6 +482,14 @@ async function main() {
   await settle(() => {
     assert(postedActions.includes(`rotate-peer:${billingId}`), "posted /rotate-peer");
     assert(text().includes("New peer prompt (copy once)") && text().includes("tch_peer_rotated_test_token"), "displays rotated prompt once");
+  });
+
+  const copyPromptBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes("Copy new peer prompt"),
+  ) as HTMLButtonElement;
+  await act(async () => copyPromptBtn.click());
+  await settle(() => {
+    assert(copyPromptBtn.textContent === "Copied", "copy button shows Copied feedback");
   });
 
   const closeBtn = Array.from(document.querySelectorAll("button")).find((b) =>
@@ -543,6 +559,27 @@ async function main() {
     assert(document.getElementById("conn-tab-temp-channels") === null, "native board omits Temp channels tab");
     assert(tempApiCalls === callsBeforeNative, "native board makes 0 temp-channels requests");
   });
+
+  // 8. Page-2 deep-link resolves room purpose in drawer title & zh-TW copy coverage
+  tempApiStatus = 200;
+  const page2Id = `tch_${String(29).padStart(32, "0")}`;
+  win.history.replaceState({}, "", `/settings/connections?tab=temp-channels&channel=${page2Id}`);
+  await act(async () => {
+    root.render(React.createElement(Connections, { key: "deep-p2", viewer: { operator: true, readOnly: false }, hostedBoard: true }));
+  });
+  await settle(() => {
+    assert(document.querySelector(`[data-temp-channel-drawer="${page2Id}"]`) !== null, "deep-linked page-2 drawer renders");
+    assert(text().includes("Archived relay check #20"), "deep-linked page-2 drawer updates title to channel purpose");
+  });
+
+  const zhT = (s: string) => translateUiText(s, "zh-TW");
+  assert(zhT("Connected services") === "已連接服務", "zh-TW Connected services");
+  assert(zhT("Temp channels") === "臨時通道", "zh-TW Temp channels");
+  assert(zhT("{n} needs human") === "{n} 項需人工處理", "zh-TW needs human badge");
+  assert(zhT("Mark handled") === "標記為已處理", "zh-TW Mark handled");
+  assert(zhT("Untrusted external agent data") === "不受信任的外部代理資料", "zh-TW Untrusted notice");
+  assert(tempChannelCountsSummary({ ...rooms[1], message_count: 3, max_messages: 15 }, zhT) === "3/15 則訊息", "zh-TW counts summary");
+  assert(formatChannelExpiry(rooms[1], now, zhT) === "剩餘 15 分鐘", "zh-TW expiry countdown");
 
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());

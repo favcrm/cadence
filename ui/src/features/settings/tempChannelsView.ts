@@ -58,23 +58,37 @@ export function triageStatusView(status: TempChannelTriageStatus): {
   }
 }
 
-export function formatChannelExpiry(ch: TempChannelSummary, nowMs = Date.now()): string {
+export function formatChannelExpiry(
+  ch: TempChannelSummary,
+  nowMs = Date.now(),
+  t: (s: string) => string = (s) => s,
+): string {
   if (ch.status === "closed") {
     const when = ch.closed_at ?? ch.expires_at;
-    return `Closed · ${fmtTime(new Date(when).toISOString())}`;
+    return t("Closed · {time}").replace("{time}", fmtTime(new Date(when).toISOString()));
   }
   if (ch.status === "expired") {
-    return `Expired · ${fmtTime(new Date(ch.closed_at ?? ch.expires_at).toISOString())}`;
+    return t("Expired · {time}").replace(
+      "{time}",
+      fmtTime(new Date(ch.closed_at ?? ch.expires_at).toISOString()),
+    );
   }
   const diffMs = ch.expires_at - nowMs;
-  if (diffMs <= 0) return "Expiring…";
+  if (diffMs <= 0) return t("Expiring…");
   const mins = Math.max(1, Math.ceil(diffMs / 60_000));
-  if (mins < 60) return `${mins}m left`;
+  if (mins < 60) return t("{m}m left").replace("{m}", String(mins));
   const hrs = Math.floor(mins / 60);
   const rem = mins % 60;
-  return rem === 0 ? `${hrs}h left` : `${hrs}h ${rem}m left`;
+  return rem === 0
+    ? t("{h}h left").replace("{h}", String(hrs))
+    : t("{h}h {m}m left").replace("{h}", String(hrs)).replace("{m}", String(rem));
 }
 
-export function tempChannelCountsSummary(item: TempChannelAuditItem): string {
-  return `${item.message_count}/${item.max_messages} msgs`;
+export function tempChannelCountsSummary(
+  item: TempChannelAuditItem,
+  t: (s: string) => string = (s) => s,
+): string {
+  return t("{count}/{max} msgs")
+    .replace("{count}", String(item.message_count))
+    .replace("{max}", String(item.max_messages));
 }
