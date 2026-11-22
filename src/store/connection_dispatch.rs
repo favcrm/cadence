@@ -1032,6 +1032,7 @@ pub(crate) struct ConnectionRow {
     pub credential_revision: i64,
     pub custody: String,
     pub exchange: String,
+    pub scopes: Vec<String>,
 }
 
 pub(crate) fn connection_row_in(
@@ -1039,10 +1040,12 @@ pub(crate) fn connection_row_in(
     connection_id: &str,
 ) -> Result<Option<ConnectionRow>> {
     conn.query_opt(
-        "SELECT connection_id,account,platform,credential_revision,custody,exchange \
+        "SELECT connection_id,account,platform,credential_revision,custody,exchange,scopes \
          FROM platform_credentials WHERE connection_id=?1",
         [connection_id],
         |row| {
+            let scopes_raw: String = row.get(6)?;
+            let scopes = serde_json::from_str::<Vec<String>>(&scopes_raw).unwrap_or_default();
             Ok(ConnectionRow {
                 connection_id: row.get(0)?,
                 account: row.get(1)?,
@@ -1050,6 +1053,7 @@ pub(crate) fn connection_row_in(
                 credential_revision: row.get(3)?,
                 custody: row.get(4)?,
                 exchange: row.get(5)?,
+                scopes,
             })
         },
     )
@@ -1484,6 +1488,7 @@ fn provider_kind_of(platform: &str) -> Result<ProviderKindV1> {
     match platform {
         "smtp" => Ok(ProviderKindV1::Smtp),
         "openrouter" => Ok(ProviderKindV1::Openrouter),
+        "agenticos-provider" => Ok(ProviderKindV1::AgenticosProvider),
         _ => Err(Error::invalid(
             "capability_unavailable",
             "the Connection does not use a reviewed protected provider",

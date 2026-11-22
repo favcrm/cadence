@@ -68,6 +68,69 @@
     "cost"
   ],
   "$defs": {
+    "AgenticosReadPriceV1": {
+      "type": "object",
+      "properties": {
+        "amount": {
+          "type": "string"
+        },
+        "currency": {
+          "$ref": "#/$defs/CurrencyV1"
+        },
+        "scale": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "amount",
+        "currency",
+        "scale"
+      ]
+    },
+    "AgenticosReadResultKindV1": {
+      "type": "string",
+      "enum": [
+        "agenticos.read@1"
+      ]
+    },
+    "AgenticosReadResultV1": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/AgenticosReadResultKindV1"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgenticosReadPriceV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repeated": {
+          "type": "boolean"
+        },
+        "result_json": {
+          "type": "string"
+        },
+        "slug": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "slug",
+        "repeated",
+        "result_json"
+      ]
+    },
     "Counter": {
       "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
       "type": "string"
@@ -134,6 +197,10 @@
         "ledger_mismatch"
       ]
     },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
     "ModelId": {
       "description": "An explicitly named model id; whitespace and control bytes refuse.",
       "type": "string"
@@ -196,6 +263,9 @@
         },
         {
           "$ref": "#/$defs/SmtpVerifiedV1"
+        },
+        {
+          "$ref": "#/$defs/AgenticosReadResultV1"
         }
       ]
     },

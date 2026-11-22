@@ -47,7 +47,6 @@
   ],
   "$defs": {
     "AgentOperationV1": {
-      "description": "The agent-invokable union: three tags, `smtp.verify@1` impossible.",
       "anyOf": [
         {
           "$ref": "#/$defs/TextGenerateV1"
@@ -57,7 +56,55 @@
         },
         {
           "$ref": "#/$defs/NativeSmtpTestV1"
+        },
+        {
+          "$ref": "#/$defs/AgenticosSearchConsoleReportV1"
         }
+      ]
+    },
+    "AgenticosSearchConsoleReportKindV1": {
+      "type": "string",
+      "enum": [
+        "agenticos.search_console_report@1"
+      ]
+    },
+    "AgenticosSearchConsoleReportV1": {
+      "type": "object",
+      "properties": {
+        "dimensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SearchConsoleDimensionV1"
+          }
+        },
+        "end_date": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AgenticosSearchConsoleReportKindV1"
+        },
+        "row_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "site_url": {
+          "type": "string"
+        },
+        "start_date": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "site_url",
+        "start_date",
+        "end_date"
       ]
     },
     "Ident": {
@@ -118,6 +165,18 @@
     "Revision": {
       "description": "Positive canonical decimal revision (0 refuses).",
       "type": "string"
+    },
+    "SearchConsoleDimensionV1": {
+      "description": "The agent-invokable union: three tags, `smtp.verify@1` impossible.",
+      "type": "string",
+      "enum": [
+        "query",
+        "page",
+        "country",
+        "device",
+        "date",
+        "searchAppearance"
+      ]
     },
     "SmtpSendKindV1": {
       "type": "string",

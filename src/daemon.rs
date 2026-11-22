@@ -959,6 +959,12 @@ pub struct Shared {
     /// is operator test configuration, not a caller-controlled
     /// bypass: certificate verification still runs on every send.
     smtp_test_ca: Option<Vec<u8>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    agenticos_provider_fixture_origin: Option<String>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
     #[cfg(all(
@@ -1525,6 +1531,8 @@ impl Shared {
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
+            #[cfg(any(test, feature = "test-seam"))]
+            agenticos_provider_fixture_origin: opts.agenticos_provider_fixture_origin.clone(),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             protected: std::sync::OnceLock::new(),
             #[cfg(all(
@@ -6615,6 +6623,8 @@ pub struct ServeOptions {
     /// certificates against the platform roots alone. Never read
     /// from RPC, PM or the environment.
     pub smtp_test_ca_pem: Option<Vec<u8>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    pub agenticos_provider_fixture_origin: Option<String>,
     /// CAD-538: the hosted lifecycle — `Some` is verbatim (a `Hosted`
     /// with `lease` unset is explicitly off, which is how tests pin
     /// it); `None` reads the tracker's `hosted:` table in pm.yaml.

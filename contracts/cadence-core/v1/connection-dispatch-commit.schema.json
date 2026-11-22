@@ -391,7 +391,8 @@
         "text.generate@1",
         "smtp.send@1",
         "smtp.test_send@1",
-        "smtp.verify@1"
+        "smtp.verify@1",
+        "agenticos.search_console_report@1"
       ]
     },
     "ParameterPolicyV1": {
@@ -408,7 +409,8 @@
       "type": "string",
       "enum": [
         "smtp",
-        "openrouter"
+        "openrouter",
+        "agenticos-provider"
       ]
     },
     "QuotePriceV1": {

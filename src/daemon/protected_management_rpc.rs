@@ -194,7 +194,7 @@ fn action(shared: &Arc<Shared>, params: &Value) -> Result<Value> {
     result
 }
 
-fn execute(
+pub(super) fn execute(
     shared: &Arc<Shared>,
     action: &str,
     params: &Value,
@@ -335,6 +335,47 @@ fn execute(
                     "invalid_request",
                     "the policy digest does not match the approved document",
                 ));
+            }
+            let connection = shared.store.protected_connection_row(&connection_id)?;
+            let is_agenticos_connection = connection
+                .as_ref()
+                .is_some_and(|c| c.platform == crate::platform::agenticos_provider::PLATFORM);
+            let touches_agenticos_read = policy.allowed_operations.contains(
+                &cadence_core::connection_dispatch::dto::OperationKindV1::AgenticosSearchConsoleReport,
+            ) || policy.agenticos_read.is_some();
+            if is_agenticos_connection || touches_agenticos_read {
+                let connection = connection
+                    .ok_or_else(|| Error::invalid("not_found", "the selector is unavailable"))?;
+                if connection.platform != crate::platform::agenticos_provider::PLATFORM
+                    || connection.scopes
+                        != [crate::platform::agenticos_provider::SCOPE_DEDICATED_READ]
+                {
+                    return Err(Error::invalid(
+                        "operation_not_granted",
+                        "the Connection does not grant this operation",
+                    ));
+                }
+                if policy.allowed_operations
+                    != [cadence_core::connection_dispatch::dto::OperationKindV1::AgenticosSearchConsoleReport]
+                    || !policy.allowed_human_operations.is_empty()
+                {
+                    return Err(Error::invalid(
+                        "invalid_request",
+                        "agenticos-provider policy allows only agenticos.search_console_report@1",
+                    ));
+                }
+                cadence_core::connection_dispatch::dto::validate_agenticos_read_policy_v1(&policy)
+                    .map_err(|e| Error::invalid(e.code.as_str(), e.message))?;
+                if policy.allowed_destinations.is_empty()
+                    || !policy.allowed_destinations.iter().all(|dest| {
+                        dest.as_str() == crate::platform::agenticos_provider::READ_ENDPOINT_URL
+                    })
+                {
+                    return Err(Error::invalid(
+                        "destination_refused",
+                        "the destination is not approved",
+                    ));
+                }
             }
             shared.store.protected_management_commit(
                 &workspace,

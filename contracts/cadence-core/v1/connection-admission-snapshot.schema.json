@@ -147,6 +147,50 @@
       "description": "Stable hosted agent UID: `agt-` plus the 32 lowercase hex UUID digits.",
       "type": "string"
     },
+    "AgenticosReadPolicyV1": {
+      "type": "object",
+      "properties": {
+        "adapter_manifest_pin": {
+          "$ref": "#/$defs/Ident"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "site_url": {
+          "type": "string"
+        },
+        "slug": {
+          "$ref": "#/$defs/Ident"
+        },
+        "upstream_connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "adapter_manifest_pin",
+        "slug",
+        "upstream_connection_id",
+        "site_url"
+      ]
+    },
     "ArtifactKindV1": {
       "type": "string",
       "enum": [
@@ -743,7 +787,8 @@
         "text.generate@1",
         "smtp.send@1",
         "smtp.test_send@1",
-        "smtp.verify@1"
+        "smtp.verify@1",
+        "agenticos.search_console_report@1"
       ]
     },
     "OperationPolicyV1": {
@@ -751,6 +796,16 @@
       "properties": {
         "active": {
           "type": "boolean"
+        },
+        "agenticos_read": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgenticosReadPolicyV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "allowed_destinations": {
           "type": "array",
@@ -923,7 +978,8 @@
       "type": "string",
       "enum": [
         "smtp",
-        "openrouter"
+        "openrouter",
+        "agenticos-provider"
       ]
     },
     "RequesterV1": {

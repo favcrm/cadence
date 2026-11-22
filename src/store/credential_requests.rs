@@ -429,6 +429,8 @@ pub(crate) fn provider_shape_allowed(provider: &str, shape: Option<&str>) -> boo
         ("agenticos", _) => false,
         ("devin", shape) if is_native_model_shape(shape) => true,
         (_, shape) if is_native_model_shape(shape) => false,
+        ("agenticos-provider", Some("token") | None) => true,
+        ("agenticos-provider", _) => false,
         _ => true,
     }
 }
@@ -449,6 +451,24 @@ fn validate_new(new: &NewCredentialRequest) -> Result<()> {
         return Err(Error::invalid(
             "invalid_request",
             "this provider does not enroll that shape",
+        ));
+    }
+    if new.provider == crate::platform::agenticos_provider::PLATFORM
+        && new.verb == CredentialVerb::Verify
+    {
+        return Err(Error::invalid(
+            "unsupported_verification",
+            "this provider has no reviewed verification adapter",
+        ));
+    }
+    if new.provider == crate::platform::agenticos_provider::PLATFORM
+        && !new.scopes.is_empty()
+        && (new.scopes.len() != 1
+            || new.scopes[0] != crate::platform::agenticos_provider::SCOPE_DEDICATED_READ)
+    {
+        return Err(Error::invalid(
+            "invalid_request",
+            "agenticos-provider credentials require the provider.read.dedicated scope",
         ));
     }
     let native_shape = is_native_model_shape(new.shape.as_deref());
@@ -539,7 +559,7 @@ fn validate_new(new: &NewCredentialRequest) -> Result<()> {
         return Err(Error::invalid("invalid_request", "too many scopes"));
     }
     for scope in &new.scopes {
-        identifier(scope, "Scope")?;
+        super::scope_name(scope)?;
     }
     if new.custody_epoch <= 0 {
         return Err(Error::invalid(
@@ -1289,4 +1309,69 @@ pub(crate) struct ManagementAttempt {
 
 fn identifier_shape(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+#[cfg(test)]
+mod agenticos_provider_tests {
+    use super::*;
+
+    fn base_new() -> NewCredentialRequest {
+        NewCredentialRequest {
+            provider: "agenticos-provider".to_string(),
+            verb: CredentialVerb::Enroll,
+            connection_id: None,
+            shape: Some("token".to_string()),
+            scopes: vec!["provider.read.dedicated".to_string()],
+            expected_credential_revision: None,
+            expected_authorization_revision: None,
+            requester_kind: "operator_ui".to_string(),
+            requester_participant: None,
+            conversation_id: None,
+            target_agent_uid: None,
+            custody_domain: "local".to_string(),
+            custody_epoch: 1,
+            context_digest: "sha256:0000000000000000".to_string(),
+            target_id_override: None,
+        }
+    }
+
+    #[test]
+    fn agenticos_provider_shape_scope_and_verify_rules() {
+        assert!(provider_shape_allowed("agenticos-provider", Some("token")));
+        assert!(provider_shape_allowed("agenticos-provider", None));
+        assert!(!provider_shape_allowed("agenticos-provider", Some("smtp")));
+        assert!(!provider_shape_allowed(
+            "agenticos-provider",
+            Some("native-model-api-key")
+        ));
+
+        validate_new(&base_new()).expect("dedicated token enroll validates");
+
+        let mut empty_scopes = base_new();
+        empty_scopes.scopes.clear();
+        validate_new(&empty_scopes).expect("empty scopes defaults later");
+
+        let mut bad_scope = base_new();
+        bad_scope.scopes = vec!["provider.read".to_string()];
+        assert_eq!(
+            validate_new(&bad_scope).unwrap_err().code(),
+            Some("invalid_request")
+        );
+
+        let mut bad_shape = base_new();
+        bad_shape.shape = Some("smtp".to_string());
+        assert_eq!(
+            validate_new(&bad_shape).unwrap_err().code(),
+            Some("invalid_request")
+        );
+
+        let mut verify = base_new();
+        verify.verb = CredentialVerb::Verify;
+        verify.connection_id = Some("conn-1".to_string());
+        verify.expected_credential_revision = Some(1);
+        assert_eq!(
+            validate_new(&verify).unwrap_err().code(),
+            Some("unsupported_verification")
+        );
+    }
 }
