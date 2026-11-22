@@ -19,7 +19,6 @@ use super::{semantic_digest, Memory};
 use crate::error::Result;
 use crate::issue::Pm;
 
-use resolve::git_blob;
 pub use resolve::resolve;
 
 /// Largest cited blob this analysis will read. A bigger source is reported as
@@ -291,7 +290,7 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                 // pins, never an assumption that the source still describes it.
                 if let Some(target) = condition.and_then(|c| c.target_revision.as_deref()) {
                     if reference.kind == EvidenceKind::Git && target != reference.revision {
-                        match git_blob(pm, &mem.project, &reference.source, target)? {
+                        match resolve::git_blob(pm, &mem.project, &reference.source, target)? {
                             (
                                 Resolution::Resolved {
                                     sha256: at_target, ..
