@@ -764,6 +764,7 @@ export default function Home({
   viewerSub = null,
   viewerIsMember = false,
   sessionId = null,
+  consultationSession = null,
   overview,
   documentFollowUps,
   onOpenIssue,
@@ -800,6 +801,7 @@ export default function Home({
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
   sessionId?: string | null;
+  consultationSession?: string | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
@@ -868,9 +870,7 @@ export default function Home({
       <MasterHome
         readOnly={readOnly}
         hosted={hosted}
-        consultationSession={hosted === true && operator === true && decisions && viewerSub && sessionId
-          ? memberScope(sessionId, viewerSub)
-          : null}
+        consultationSession={consultationSession}
         overview={overview}
         documentFollowUps={documentFollowUps}
         onOpenIssue={onOpenIssue}

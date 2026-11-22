@@ -1313,6 +1313,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
             operator={meta?.operator === true}
+            consultationSession={meta?.session?.user?.role === "operator" ? appAgentSession : null}
             templateReviewEnabled={templateReviewEnabled}
             templateReviewCanApprove={templateReviewCanApprove}
             overview={overviewState}
