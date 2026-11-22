@@ -51,8 +51,6 @@ export interface PendingMessage {
    *  manual same-id retry/discard affordances; absent, every existing
    *  surface keeps the Master "not sent" reading unchanged. */
   delivery?: "unconfirmed";
-  /** Retry must retain the original turn's private handoff compatibility header. */
-  appHandoff?: true;
   /** Epoch ms when it was first sent. */
   at: number;
   /** CAD-574: the cited needs subjects the send carried — a retry must
@@ -304,14 +302,10 @@ export function addPending(
   attachments?: PendingAttachment[],
   app?: { install_id: string; context_id?: string },
   conversation?: string,
-  appHandoff = false,
 ): ThreadState {
   const base = state ?? EMPTY_THREAD;
   const rest = base.pending.filter((p) => p.message !== message);
-  return { ...base, pending: [...rest, {
-    message, text, state: "sending", at, refs, attachments, app, conversation,
-    ...(appHandoff ? { appHandoff: true as const } : {}),
-  }] };
+  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs, attachments, app, conversation }] };
 }
 
 /** The POST answered: sent (awaiting its stored entry) or failed. */
