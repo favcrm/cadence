@@ -43,12 +43,16 @@ check(elapsedSecs(1000, 10_000) === 9 && elapsedSecs(10_000, 1000) === null && e
 // Tool labels and subjects.
 check(toolKey('app_call {"q":"Gia"}') === "app_call" && toolKey("web_search: cafes") === "web_search", "tool key");
 check(toolLabel('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Use an app", "a known tool has a label");
-for (const [name, label] of [["find_tools", "Find tools"], ["use_tool", "Use a tool"], ["tool_result_read", "Read a tool result"], ["connected_read", "Read a connected account"], ["connected_action", "Propose an account action"], ["catalog_search", "Search tools"], ["mcp_call_read", "Read from a connector"]] as const) {
+for (const [name, label] of [["agent_message", "Message an agent"], ["find_tools", "Find tools"], ["use_tool", "Use a tool"], ["tool_result_read", "Read a tool result"], ["connected_read", "Read a connected account"], ["connected_action", "Propose an account action"], ["catalog_search", "Search tools"], ["mcp_call_read", "Read from a connector"]] as const) {
   check(toolLabel(`${name} {"q":"x"}`) === label, `${name} is labelled ${label}`);
   check(translateUiText(label, "zh-TW") !== label, `${label} has a written-Chinese string`);
 }
 check(toolLabel("bash: cadence board read") === null && toolLabel("master ask-form") === null, "an unknown tool has none");
 check(toolSubject('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "contacts.search · Gia", "an app call leads with its operation, then the naming field");
+check(toolSubject('agent_message {"action":"send","alias":"bookkeeper","context_app":"accounting","text":"draft supplier bill"}') === "bookkeeper · accounting", "agent_message send shows alias and context_app without body text");
+check(toolSubject('agent_message {"action":"send","alias":"bookkeeper","text":"draft supplier bill"}') === "bookkeeper", "agent_message send shows alias alone when context_app is absent");
+check(toolSubject('agent_message {"action":"read","message":"msg-123"}') === "read · msg-123", "agent_message read shows action and message id");
+check(toolSubject('agent_message {"action":"inbox","alias":"bookkeeper"}') === "inbox · bookkeeper", "agent_message inbox shows action and alias");
 check(toolSubject('web_search {"query":"cafés","api_key":"k_123"}') === "cafés", "only naming fields are shown, never other arguments");
 check(toolSubject('artifact_show {"id":"art-5f3a","version":1}') === "art-5f3a", "an id when nothing names it better");
 check(toolSubject("web_search: cafés in Central") === "cafés in Central", "a plain argument");

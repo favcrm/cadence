@@ -200,6 +200,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     // agenticos-v2 #2147: owner-only, removes an unapproved skill.
     "workspace_skill_delete",
     "message_send",
+    "message_ack",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
@@ -346,7 +347,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // Asking for one scope makes a login without it a refusal at mint, which
         // can be named. Asking for both would mint a narrower envelope, and the
         // call would then get a bare 401 that reads like an expired login.
-        "issue_message_send" | "issue_messages_read" => &["cli.write"],
+        "issue_message_send" | "issue_messages_read" | "message_ack" => &["cli.write"],
         "issue_messages" => &["cli.read"],
         _ => &["cli.read", "cli.write"],
     }
@@ -405,6 +406,8 @@ const RECONCILE_ISSUE_MESSAGE_SEND: &str =
 const RECONCILE_ISSUE_MESSAGES_READ: &str =
     "the read point may or may not have moved — repeating the same call is safe, because \
     it only moves forward";
+const RECONCILE_MESSAGE_ACK: &str =
+    "run `cadence inbox <alias> --peek` to check which messages remain unacknowledged";
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
@@ -526,6 +529,7 @@ fn cli_effect(verb: &str) -> Effect {
         }
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
+        "message_ack" => mutation(RECONCILE_MESSAGE_ACK),
         // `settings_agents` is refined per operation by [`call_effect`]; without
         // the operation this is a write, the same fail-closed default
         // [`settings_op_scope`] takes.
@@ -5003,9 +5007,23 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
         ("message_send", Some("recipient_class_unsupported")) => Some((
             "recipient_class_unsupported",
-            "remote send reaches `master` for a human workspace owner only; \
-             personal assistants require separate assistant authority, and local \
-             workers use the local-assignment plane",
+            "remote send reaches `master` (human workspace owner only) or an active \
+             workspace specialist alias; that recipient is not available in this workspace",
+        )),
+        ("message_send", Some("ambiguous_recipient")) => Some((
+            "ambiguous_recipient",
+            "more than one active specialist matches that alias in this workspace — \
+             address the unique profile alias; nothing was sent",
+        )),
+        ("message_send", Some("app_context_not_bound")) => Some((
+            "app_context_not_bound",
+            "that `--context-app` is not actively bound to the target specialist \
+             for this owner — check the specialist's app bindings; nothing was sent",
+        )),
+        ("message_send", Some("ambiguous_app_context")) => Some((
+            "ambiguous_app_context",
+            "that specialist is bound to multiple apps — pass `--context-app <app>` \
+             to select one; nothing was sent",
         )),
         ("message_send", Some("message_id_conflict")) => Some((
             "message_id_conflict",
@@ -5016,13 +5034,14 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
         ("message_send", Some("rejected")) => Some((
             "rejected",
             "the recipient or the --message id was refused — `sys-` ids are \
-             daemon-owned; inspect the selected workspace's master and use a \
+             daemon-owned; inspect the selected workspace's recipients and use a \
              non-reserved stable message id",
         )),
         ("message_send", Some("not_permitted")) => Some((
             "not_permitted",
-            "remote `send master` requires a verified human workspace owner; \
-             agent, service and ordinary-member credentials do not grant master chat",
+            "remote send requires a verified human workspace owner (or an owner's \
+             approved assistant for specialist aliases); agent and ordinary-member \
+             credentials are not permitted",
         )),
         ("message_send", Some("insufficient_scope")) => Some((
             "insufficient_scope",
@@ -5033,6 +5052,21 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "invalid_request",
             "the send was refused at the request boundary — the remote call \
              needs a non-empty body and the stable --message id",
+        )),
+        ("message_ack", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote inbox acknowledgement requires the human workspace owner or \
+             sending principal; nothing was acknowledged",
+        )),
+        ("message_ack", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant `inbox ack` needs — \
+             re-login with write scope, then retry",
+        )),
+        ("message_ack", Some("invalid_request")) => Some((
+            "invalid_request",
+            "remote `inbox ack` was refused at the request boundary — pass a \
+             valid alias and positive seq(s) or --through; nothing was acknowledged",
         )),
         ("message_read", Some("not_permitted")) | ("message_inbox", Some("not_permitted")) => {
             Some((
@@ -6426,8 +6460,8 @@ fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String
 /// - `message` — the caller-chosen stable id echoed exactly (the
 ///   reconciliation key a lost reply is retried under);
 /// - `state` — a known lifecycle state and `duplicate` — a real bool;
-/// - `alias` — the requested canonical recipient echoed exactly (only
-///   `master` is ever requested);
+/// - `alias` — the requested recipient echoed (case-insensitive for
+///   specialist profile names alongside canonical `master`);
 /// - `workspace_id` — the immutable organization id for this destination
 ///   (the `org_id` pinned at login, never the registry slug);
 /// - `sender_subject` — the authenticated human's canonical subject; when
@@ -6445,7 +6479,7 @@ fn send_receipt_correlates(
     target: &RemoteTarget,
     cred: &Credential,
 ) -> bool {
-    let bound = |key: &str| {
+    let exact = |key: &str| {
         arguments
             .get(key)
             .and_then(Value::as_str)
@@ -6453,12 +6487,24 @@ fn send_receipt_correlates(
                 !expected.is_empty() && receipt.get(key).and_then(Value::as_str) == Some(expected)
             })
     };
-    bound("message")
-        && bound("alias")
+    let alias_matches = arguments
+        .get("alias")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| {
+            !expected.is_empty()
+                && receipt
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| !got.is_empty() && expected.eq_ignore_ascii_case(got))
+        });
+    exact("message")
+        && alias_matches
         && matches!(
             receipt.get("state").and_then(Value::as_str),
             Some(
                 "queued"
+                    | "delivered"
+                    | "answered"
                     | "submitting"
                     | "running"
                     | "completed"
@@ -6481,6 +6527,33 @@ fn send_receipt_correlates(
             .get("conversation")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
+}
+
+fn ack_receipt_correlates(
+    receipt: &Value,
+    arguments: &Map<String, Value>,
+    target: &RemoteTarget,
+) -> bool {
+    let alias_matches = arguments
+        .get("alias")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| {
+            !expected.is_empty()
+                && receipt
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| !got.is_empty() && expected.eq_ignore_ascii_case(got))
+        });
+    alias_matches
+        && receipt.get("workspace_id").and_then(Value::as_str) == Some(target.org_id.as_str())
+        && receipt.get("acked_count").and_then(Value::as_u64).is_some()
+        && receipt
+            .get("acked_seqs")
+            .and_then(Value::as_array)
+            .is_some_and(|seqs| {
+                seqs.iter()
+                    .all(|seq| seq.as_u64().is_some_and(|value| value > 0))
+            })
 }
 
 /// A hosted issue-id prefix as the registry stores it: 1-16 ASCII
@@ -6870,6 +6943,16 @@ fn call_verb_until_retry(
                 "remote send returned no usable correlated receipt — enqueue outcome is unknown",
             ));
         }
+        if verb == "message_ack"
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| ack_receipt_correlates(receipt, &arguments, target))
+        {
+            return Err(Error::unknown(format!(
+                "remote inbox ack returned no usable correlated receipt — {RECONCILE_MESSAGE_ACK}"
+            )));
+        }
         // A 2xx that does not echo this write is not evidence it landed. Reading
         // it as a refusal invites a new --message and a second stored copy, and
         // reading it as success claims something nobody saw.
@@ -7060,7 +7143,7 @@ fn call_verb_until_retry(
         if status == 501
             && matches!(
                 verb,
-                "issue_message_send" | "issue_messages" | "issue_messages_read"
+                "issue_message_send" | "issue_messages" | "issue_messages_read" | "message_ack"
             )
         {
             let nothing = if verb == "issue_messages" {
@@ -7071,6 +7154,7 @@ fn call_verb_until_retry(
             let command = match verb {
                 "issue_message_send" => "issue say",
                 "issue_messages_read" => "issue messages-read",
+                "message_ack" => "inbox ack",
                 _ => "issue messages",
             };
             return Err(Error::invalid(

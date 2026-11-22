@@ -147,6 +147,32 @@ check(
   "without a decisions source, no card",
 );
 
+{
+  const agentMsgHtml = renderToStaticMarkup(
+    createElement(
+      StagedSourceContext.Provider,
+      { value: sourceWith([row("pending")]) },
+      createElement(TurnStagedCards, {
+        toolEntries: [
+          result(
+            JSON.stringify({
+              message: "msg-rich-1",
+              alias: "Bookkeeper",
+              state: "answered",
+              staged_actions: [{ action_id: ID, app: "accounting", operation: "records.create" }],
+            }),
+          ),
+        ],
+        density: "full",
+      }),
+    ),
+  );
+  check(
+    agentMsgHtml.includes(`data-staged-id="${ID}"`) && agentMsgHtml.includes("data-staged-review"),
+    "settled agent_message result with staged_actions renders a clickable StagedActionCard",
+  );
+}
+
 // CAD-2463: the connected-effect staged card (AOS-647 email preview fixture).
 {
   const input = JSON.parse(require("fs").readFileSync(require("path").join(require("process").cwd(), "tests", "fixtures", "chat-cards", "connected-effect-email.json"), "utf8")) as Record<string, unknown>;

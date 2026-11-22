@@ -195,21 +195,26 @@ export function attachmentNames(entries: readonly ThreadEntry[]): Map<string, st
 
 const norm = (s: string): string => s.toLowerCase().replace(/-/g, "");
 
-/**
- * The decision id a staging result names: `{"staged": true, "actionId": …}`
- * (or `action_id`), from the result's JSON text or payload. A result that
- * only lists, reads or mentions an id names none (CAD-2450).
- */
-export function stagedActionId(entry: ThreadEntry): string | null {
+function resultObjects(entry: ThreadEntry): Record<string, unknown>[] {
   const candidates: unknown[] = [entry.payload];
   try {
     candidates.push(JSON.parse((entry.text ?? "").trim()));
   } catch {
     // Not JSON: not a staging result.
   }
-  for (const value of candidates) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const result = value as Record<string, unknown>;
+  return candidates.filter(
+    (value): value is Record<string, unknown> =>
+      Boolean(value) && typeof value === "object" && !Array.isArray(value),
+  );
+}
+
+/**
+ * The decision id a staging result names: `{"staged": true, "actionId": …}`
+ * (or `action_id`), from the result's JSON text or payload. A result that
+ * only lists, reads or mentions an id names none (CAD-2450).
+ */
+export function stagedActionId(entry: ThreadEntry): string | null {
+  for (const result of resultObjects(entry)) {
     if (result.staged === true) {
       const id = str(result.actionId) ?? str(result.action_id);
       if (id) return norm(id);
@@ -223,13 +228,53 @@ export function stagedActionId(entry: ThreadEntry): string | null {
 }
 
 /**
+ * All decision ids a turn's tool result surfaced: single direct staging
+ * results (`stagedActionId`) plus `staged_actions` from settled
+ * `agent_message` results. Inbox listings (`items`) and unsettled messages are
+ * excluded.
+ */
+export function stagedActionIds(entry: ThreadEntry): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const push = (id: string | null) => {
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  };
+  push(stagedActionId(entry));
+  for (const result of resultObjects(entry)) {
+    if (
+      typeof result.message !== "string" ||
+      typeof result.alias !== "string" ||
+      (result.state !== "answered" && result.state !== "failed") ||
+      !Array.isArray(result.staged_actions) ||
+      Array.isArray(result.items)
+    ) {
+      continue;
+    }
+    for (const item of result.staged_actions) {
+      if (typeof item === "string") {
+        const raw = str(item);
+        if (raw) push(norm(raw));
+      } else if (item && typeof item === "object" && !Array.isArray(item)) {
+        const rec = item as Record<string, unknown>;
+        const raw = str(rec.action_id) ?? str(rec.actionId);
+        if (raw) push(norm(raw));
+      }
+    }
+  }
+  return ids;
+}
+
+/**
  * The staged writes this turn made: a decision named by one of the turn's
  * staging results. Only rows the surface already holds can match, so a write
  * the viewer cannot see never shows, and a later turn that lists or reads the
  * decision does not repeat its card.
  */
 export function stagedInTurn(entries: readonly ThreadEntry[], rows: readonly StagedWrite[]): StagedWrite[] {
-  const ids = new Set(entries.filter((entry) => entry.kind === "tool_result").map(stagedActionId).filter((id): id is string => id !== null));
+  const ids = new Set(entries.filter((entry) => entry.kind === "tool_result").flatMap(stagedActionIds));
   if (ids.size === 0) return [];
   return rows.filter((row) => ids.has(norm(row.id)));
 }
