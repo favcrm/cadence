@@ -574,6 +574,8 @@ async function testComposerInteractions(): Promise<void> {
   let confirmOutcome: "failed" | "uncertain" | "accepted" = "failed";
 
   let statusOutcome: "sent" | "accepted" | "uncertain" = "sent";
+  let confirmGate: { promise: Promise<void>; resolve: () => void } | null = null;
+  let statusGate: { promise: Promise<void>; resolve: () => void } | null = null;
 
   const mockServices = {
     async call(op: string, args: Record<string, unknown>) {
@@ -598,6 +600,11 @@ async function testComposerInteractions(): Promise<void> {
           data: { decision: "prepared", effect_id: effectId, expires_at: "2099-01-01T00:00:00Z" },
         };
       }
+      if (statusGate) {
+        const gate = statusGate;
+        statusGate = null;
+        await gate.promise;
+      }
       return { ok: true as const, data: { state: statusOutcome } };
     },
     async planner(op: string, args: Record<string, unknown>) {
@@ -606,7 +613,14 @@ async function testComposerInteractions(): Promise<void> {
       return {
         label: "Send",
         records: true,
-        run: async () => ({ ok: true as const, data: { reply: { state: confirmOutcome } } }),
+        run: async () => {
+          if (confirmGate) {
+            const gate = confirmGate;
+            confirmGate = null;
+            await gate.promise;
+          }
+          return { ok: true as const, data: { reply: { state: confirmOutcome } } };
+        },
       };
     },
     async stageWhatsAppMedia(file: File) {
@@ -822,11 +836,14 @@ async function testComposerInteractions(): Promise<void> {
     });
     assert(
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
+        !!container.querySelector(".wa-reply-status[data-tone=\"confirming\"] .wa-reply-spinner") &&
+        apSend.getAttribute("data-loading") === "true" &&
+        !!apSend.querySelector(".wa-reply-spinner") &&
         container.textContent?.includes("Confirming send") &&
         !container.textContent?.includes("Send not confirmed") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
         apSend.disabled,
-      "initial uncertain starts confirming state without locking card or showing alert immediately",
+      "initial uncertain starts confirming state with spinner and without locking card or showing alert immediately",
     );
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 700));
@@ -867,7 +884,7 @@ async function testComposerInteractions(): Promise<void> {
       "escalate scenario keeps data-locked off while disabling duplicate send during Confirming send",
     );
     await React.act(async () => {
-      await new Promise((r) => setTimeout(r, 2_200));
+      await new Promise((r) => setTimeout(r, 6_400));
       await flush();
     });
     const checkBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Check status");
@@ -915,6 +932,76 @@ async function testComposerInteractions(): Promise<void> {
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
         !acText.readOnly,
       "accepted outcome keeps composer unlocked with non-alarming pending status",
+    );
+
+    // 8. In-flight send shows sending spinner + banner; manual Check status shows Button loading spinner
+    confirmOutcome = "uncertain";
+    statusOutcome = "sent";
+    const defer = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((res) => { resolve = res; });
+      return { promise, resolve };
+    };
+    const sendGate = defer();
+    confirmGate = sendGate;
+    const loadingSelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-loading",
+      announceInset: () => 96,
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "loading", selection: loadingSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+      await flush();
+    });
+    const ldText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const ldSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    await React.act(async () => {
+      setTextarea(ldText, "Sending spinner test");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(ldSend);
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sending" &&
+        container.textContent?.includes("Sending reply") &&
+        !!container.querySelector('.wa-reply-status[data-tone="sending"] .wa-reply-spinner') &&
+        ldSend.getAttribute("data-loading") === "true" &&
+        ldSend.getAttribute("aria-busy") === "true" &&
+        !!ldSend.querySelector(".wa-reply-spinner"),
+      "in-flight send renders sending status banner and send button spinner",
+    );
+    confirmOutcome = "accepted";
+    await React.act(async () => {
+      sendGate.resolve();
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted",
+      "accepted settles after in-flight send completes",
+    );
+    const recheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Recheck");
+    assert(!!recheckBtn, "accepted non-group renders Recheck button");
+    const checkGate = defer();
+    statusGate = checkGate;
+    await React.act(async () => {
+      recheckBtn!.click();
+      await flush();
+    });
+    const busyCheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Recheck");
+    assert(
+      busyCheckBtn?.getAttribute("aria-busy") === "true" &&
+        !!busyCheckBtn.querySelector(".btn-spin"),
+      "Recheck/Check status button shows native loading spinner while in flight",
+    );
+    await React.act(async () => {
+      checkGate.resolve();
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent",
+      "resolved Recheck settles to sent",
     );
   } finally {
     React.act(() => { root.unmount(); });
