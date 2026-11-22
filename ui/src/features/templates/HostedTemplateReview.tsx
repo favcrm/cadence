@@ -10,6 +10,15 @@ import { base64Blob, templatesApi, type TemplateDirectoryEntry, type TemplateSpe
 export type HostedTemplateReviewTarget = { name: string; version: number; digest: string };
 export type HostedTemplateRail = (onReview: () => void) => ReactNode;
 
+export interface HostedTemplateList {
+  pending: TemplateSummary[];
+  approved: TemplateSummary[];
+  loading: boolean;
+  error: boolean;
+  refresh: () => void;
+  open: (version: TemplateSummary, opener?: HTMLElement) => void;
+}
+
 type Preview = { kind: "pdf"; url: string; rows: number } | { kind: "html"; html: string; rows: number };
 type SampleRows = 1 | 36;
 
@@ -34,7 +43,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
   enabled: boolean;
   canApprove: boolean;
   onCompose?: (text: string) => void;
-}): { rail: HostedTemplateRail | undefined; drawer: ReactNode; pendingCount: number | undefined; open: (target: HostedTemplateReviewTarget, opener?: HTMLElement) => void; refresh: () => void } {
+}): { rail: HostedTemplateRail | undefined; templateList: HostedTemplateList | undefined; drawer: ReactNode; pendingCount: number | undefined; open: (target: HostedTemplateReviewTarget, opener?: HTMLElement) => void; refresh: () => void } {
   const t = useTranslate();
   const [directory, setDirectory] = useState<TemplateDirectoryEntry[] | null>(null);
   const [listError, setListError] = useState(false);
@@ -274,7 +283,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
     }
   };
 
-  const { byName, relevant, pendingCount } = useMemo(() => {
+  const { byName, relevant, pendingTemplates, approvedTemplates, pendingCount } = useMemo(() => {
     const byName = new Map<string, TemplateSummary[]>();
     const pending: TemplateSummary[] = [];
     const approved: TemplateSummary[] = [];
@@ -290,8 +299,17 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
       if (draft) pending.push(draft);
       if (active) approved.push(active);
     }
-    return { byName, relevant: [...pending, ...approved], pendingCount: pending.length };
+    return { byName, relevant: [...pending, ...approved], pendingTemplates: pending, approvedTemplates: approved, pendingCount: pending.length };
   }, [directory, canApprove]);
+
+  const templateList: HostedTemplateList | undefined = enabled ? {
+    pending: pendingTemplates,
+    approved: approvedTemplates,
+    loading: !directory && !listError,
+    error: listError,
+    refresh,
+    open: (version, opener) => open(targetOf(version), opener),
+  } : undefined;
   const shown = showAll ? relevant : relevant.slice(0, 5);
   const history = target ? byName.get(target.name)?.filter((v) => canApprove || v.status === "approved") ?? [] : [];
   const needsApproval = canApprove && view?.template.status === "draft";
@@ -398,7 +416,7 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
     </div>
   </DrawerShell> : null;
 
-  return { rail, drawer, pendingCount: directory === null ? undefined : pendingCount, open, refresh };
+  return { rail, templateList, drawer, pendingCount: directory === null ? undefined : pendingCount, open, refresh };
 }
 
 function CalculationRules({ calculation }: { calculation: TemplateSpec["calculation"] }) {

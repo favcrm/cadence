@@ -5,9 +5,12 @@ import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
-import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
+import { agentOn } from "../../lib/agentOn";
+import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import SharedComposer from "../app-shell/chat/Composer";
+import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import Conversation from "../app-shell/chat/Conversation";
+import { appendComposerDraft } from "./composerFill";
 import { tailTop } from "./dock";
 import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
@@ -97,6 +100,7 @@ export default function MemberChat({
   documentFollowUps,
   templateRail,
   templateCount,
+  templateList,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
@@ -106,6 +110,7 @@ export default function MemberChat({
   documentFollowUps?: DocumentFollowUpState;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
+  templateList?: HostedTemplateList;
 }) {
   const t = useTranslate();
   const roster = useQuery(resources.agents);
@@ -413,7 +418,14 @@ export default function MemberChat({
   const empty = loaded && history.error === undefined && items.length === 0;
   const showBootstrapCard =
     !readOnly && surface?.bootstrap === "pending" && identity.state === "ready";
-  const hasRail = decisions || documentFollowUps != null || templateRail != null;
+  const agents = roster.data?.agents ?? [];
+  const hasLiveAgents = agents.some((a) => a.running > 0);
+  const hasRail =
+    decisions ||
+    documentFollowUps != null ||
+    templateRail != null ||
+    templateList != null ||
+    agents.length > 0;
 
   return (
     <AssistantActorProvider actor={actor}>
@@ -550,6 +562,16 @@ export default function MemberChat({
             documentFollowUps={documentFollowUps}
             templateRail={templateRail}
             templateCount={templateCount}
+            templateList={templateList}
+            hasLiveAgents={hasLiveAgents}
+            onOpenIssue={onOpenIssue}
+            onAskAgent={!readOnly ? (agent, update) => {
+              const issues = agentOn(agent);
+              const text = `Check in with ${agent.alias}${issues.length ? ` on ${issues.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`;
+              const composerKey = `member-assist:${scope}`;
+              setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+              requestComposerFocus(composerKey);
+            } : undefined}
             readOnly={readOnly}
             decisions={decisions}
           />

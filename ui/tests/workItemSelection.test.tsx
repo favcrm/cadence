@@ -166,8 +166,8 @@ async function main() {
     // A new Home visit: a decided mark belongs to the visit it was made in.
     await React.act(async () => { beginTodoVisit(); });
     await flush();
-    const review = labelled(document.querySelector('[data-need="plan"]')!, "Review");
-    assert(review, "the plan card offers Review");
+    const review = document.querySelector('[data-need="plan"] .todo-hit') as HTMLButtonElement | null;
+    assert(review, "the plan card offers a clickable opener");
     review.focus();
     await click(review);
     await settle(() => assert(drawer("review"), "the plan decision opens in the shared detail"));

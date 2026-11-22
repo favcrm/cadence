@@ -169,7 +169,9 @@ await settle(() => assert(host.querySelector('[data-need="idea_plan"]'), "idea c
   const merge = host.querySelector('[data-need="merge_decision"]')!;
   assert(!/cccc|acme\/app|r1/.test(merge.textContent ?? ""), "the merge card carries no hash, PR or reviewer");
   assert(host.querySelectorAll("[data-need-group]").length === 0, "no group headings");
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Review"));
+  const needKinds = Array.from(host.querySelectorAll("[data-need]")).map((el) => el.getAttribute("data-need"));
+  assert(needKinds.indexOf("merge_decision") < needKinds.indexOf("idea_plan"), `Approvals sort before Reviews (${needKinds.join(",")})`);
+  await click(card.querySelector(".todo-hit"));
 }
 
 // The idea drawer: approve, send back with a reason, park with a date —
@@ -182,7 +184,7 @@ await settle(() => assert(document.querySelector('[data-drawer="review"]'), "rev
   const labels = Array.from(drawer.querySelectorAll("button")).map((b) => b.textContent);
   assert(labels.some((t) => t?.includes("Approve idea")), "approve offered");
   assert(labels.includes("Not now"), "Not now closes without deciding");
-  assert(/1 of 2/.test(drawer.textContent ?? ""), "n of m names the position");
+  assert(/2 of 2/.test(drawer.textContent ?? ""), "n of m names the position");
   assert(!/Easy to undo|Undo/.test(drawer.textContent ?? ""), "no undo promise: no server reversal exists");
   assert(!drawer.textContent?.includes("cadence "), "no command in the drawer");
   const title = drawer.querySelector(".crm-drawer-title");
@@ -203,7 +205,7 @@ assert(host.querySelector('[data-need="idea_plan"]'), "the card stays after Not 
 // send-back that states why.
 {
   const row = host.querySelector('[data-need="merge_decision"]')!;
-  await click(Array.from(row.querySelectorAll("button")).find((b) => b.textContent === "Review"));
+  await click(row.querySelector(".todo-hit"));
 }
 await settle(() => assert(document.querySelector('[data-drawer="review"]'), "merge drawer renders"));
 {

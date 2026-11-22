@@ -2,21 +2,37 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
-import { kindSpec, metaLine, routineDraftReviewHref, routineReviewHref, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
+import { ageWords, kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf } from "../decisions/stagedWrite";
 import { homeDecisions, useDecisions } from "../decisions/useDecisions";
-import AgentUpdates from "./AgentUpdates";
+import AgentUpdates, { type AgentFeedState } from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
 import { useTranslate } from "../../lib/locale";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import TodoCard from "./TodoCard";
+import { RailCard } from "./RailCard";
+import RailTodoDrawer, { type RailTodoTarget } from "./RailTodoDrawer";
+import RailFeedDrawer, { type RailFeedTarget } from "./RailFeedDrawer";
+import {
+  countFeedCategories,
+  decidedWriteStatusLabel,
+  FEED_CATEGORY_ORDER,
+  feedCategoriesForDecidedWrite,
+  feedCategoriesForInfoNeed,
+  presentTodoCategories,
+  sortUnifiedTodos,
+  todoCategoryForNeed,
+  waitingRoutineReason,
+  type FeedCategory,
+  type FeedCategoryKey,
+  type TodoCategory,
+  type UnifiedTodoItem,
+} from "./railModel";
 import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
 import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import { resources } from "../../lib/resources";
-import { routinesApi } from "../agents/routinesApi";
-import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
-import Button from "../../ui/Button";
+import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import Link from "../../ui/Link";
 
@@ -24,54 +40,29 @@ export { NeedMenu } from "./NeedMenu";
 
 export type DocumentFollowUpState = DocumentFollowUps | { status: "loading" };
 
-function DocumentFollowUpRows({
-  rows,
-  onOpen,
-  recent = false,
-}: {
-  rows: readonly (DocumentFollowUp & { outcome?: "approved" | "delivered" })[];
-  onOpen: () => void;
-  recent?: boolean;
-}) {
-  const t = useTranslate();
-  const heading = t(recent ? "Document activity" : "Document follow-ups");
-  return (
-    <section className="border-b border-ink-700" aria-label={heading}>
-      <h3 className="px-3 pt-2 text-label font-medium text-ink-400">{heading}</h3>
-      <ul className="todo-list">
-        {rows.map((row) => {
-          const href = `/wiki?file=${encodeURIComponent(row.id)}&version=${row.version}`;
-          const version = `v${row.version}`;
-          const meta = recent ? t(row.outcome === "delivered" ? "Delivered" : "Approved") : t("Approval requested");
-          const action = t(recent ? "Open" : "Review");
-          return (
-            <li key={`${row.id}:${row.version}`} className="flex min-w-0 items-center justify-between gap-2 border-b border-ink-800 px-3 py-2.5">
-              <div className="min-w-0">
-                <span className="block break-words text-label font-medium text-ink-100">{row.title}</span>
-                <span className="block break-words text-micro text-ink-400">
-                  {row.project ? `${row.project} · ` : ""}{version} · {meta}
-                </span>
-              </div>
-              <Link href={href} className={recent ? "lnk text-label shrink-0" : "btn btn-sm btn-secondary shrink-0"} onClick={onOpen} aria-label={`${action}: ${row.title}, ${version}`}>
-                {action}
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
-    </section>
-  );
+const EMPTY_AGENT_FEED: AgentFeedState = {
+  counts: { all: 0, working: 0, uploaded: 0, completed: 0, external: 0 },
+  liveCount: 0,
+  hasAny: false,
+};
+
+function mergeFeedCounts(
+  a: Record<FeedCategory, number>,
+  b: Record<FeedCategory, number>,
+): Record<FeedCategory, number> {
+  return {
+    all: a.all + b.all,
+    working: a.working + b.working,
+    uploaded: a.uploaded + b.uploaded,
+    completed: a.completed + b.completed,
+    external: a.external + b.external,
+  };
 }
 
 /**
- * The Home rail shows actions for the viewer in "To do" and informational
- * rows and recent work in "Updates". Private Home supplies only documents;
- * it does not mount Master activity. Under ~1100px it is a
- * slide-over opened from the floating button. Reading items (plans,
- * ideas, merge decisions) open inside the one shared work-item detail,
- * mounted by App (CAD-1811); the rail hands it the reading queue as it
- * stood when the item opened. The count and the sidebar's Home badge
- * include pending items only.
+ * The Home rail shows actions for the viewer in "To do" (one flat priority-sorted
+ * Card View with drawer-first actions) and read-only / talk-to-agent activity in
+ * "Feed". Under ~1100px it is a slide-over opened from the floating button.
  */
 export default function NeedsRail({
   overview,
@@ -88,6 +79,8 @@ export default function NeedsRail({
   decisions: decisionsOn = false,
   templateRail,
   templateCount,
+  templateList,
+  hasLiveAgents = false,
 }: {
   /** Only Master Home supplies the existing operator overview. */
   overview?: ResourceState<Overview>;
@@ -109,8 +102,17 @@ export default function NeedsRail({
   decisions?: boolean;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
+  templateList?: HostedTemplateList;
+  /** Live running agents known from parent workspace roster (drives green tab dot on both tabs). */
+  hasLiveAgents?: boolean;
 }) {
-  const [tab, setTab] = useState<"todo" | "updates">("todo");
+  const [tab, setTab] = useState<"todo" | "feed">("todo");
+  const [todoFilter, setTodoFilter] = useState<TodoCategory>("all");
+  const [feedFilter, setFeedFilter] = useState<FeedCategory>("all");
+  const [todoTarget, setTodoTarget] = useState<RailTodoTarget | null>(null);
+  const [feedTarget, setFeedTarget] = useState<RailFeedTarget | null>(null);
+  const [agentFeedState, setAgentFeedState] = useState<AgentFeedState>(EMPTY_AGENT_FEED);
+
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
   const privateHome = overview === undefined;
@@ -121,49 +123,13 @@ export default function NeedsRail({
   const { updates, decided } = split;
   const staged = useDecisions(decisionsOn);
   const [decidedRoutineIds, setDecidedRoutineIds] = useState<Record<string, boolean>>({});
-  const [decidingRoutineId, setDecidingRoutineId] = useState<string | null>(null);
-  const [routineActionErr, setRoutineActionErr] = useState<string | null>(null);
-  const waitingRoutines = (overviewData?.routine_needs ?? []).filter(
-    (r) => !decidedRoutineIds[r.id],
-  );
-  const routineProposals = (overviewData?.routine_proposals ?? []).filter(
-    (p) => !decidedRoutineIds[p.id],
-  );
-  const routineStepHolds = (overviewData?.routine_step_holds ?? []).filter(
-    (run) => !decidedRoutineIds[run.id],
-  );
+  const waitingRoutines = (overviewData?.routine_needs ?? []).filter((r) => !decidedRoutineIds[r.id]);
+  const routineProposals = (overviewData?.routine_proposals ?? []).filter((p) => !decidedRoutineIds[p.id]);
+  const routineStepHolds = (overviewData?.routine_step_holds ?? []).filter((run) => !decidedRoutineIds[run.id]);
 
-  const decideProposal = async (id: string, decision: "approve" | "dismiss") => {
-    if (decidingRoutineId || readOnly) return;
-    setDecidingRoutineId(id);
-    setRoutineActionErr(null);
-    try {
-      await routinesApi.proposalDecide(id, decision);
-      setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }));
-      void resources.overview.refresh();
-    } catch {
-      setRoutineActionErr(t("Could not record routine proposal decision."));
-    } finally {
-      setDecidingRoutineId(null);
-    }
-  };
-
-  const decideStepHold = async (id: string, decision: "approve" | "dismiss") => {
-    if (decidingRoutineId || readOnly) return;
-    setDecidingRoutineId(id);
-    setRoutineActionErr(null);
-    try {
-      await routinesApi.runDecide(id, decision);
-      setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }));
-      void resources.overview.refresh();
-    } catch {
-      setRoutineActionErr(t("Could not record step decision."));
-    } finally {
-      setDecidingRoutineId(null);
-    }
-  };
   const stagedCards = useMemo(() => staged.pending.map((w) => stagedNeed(w, t)), [staged.pending, t]);
   const todo = useMemo(() => withStaged(split.todo, stagedCards), [split.todo, stagedCards]);
+
   // The staged detail: the ids that were waiting when it opened, and where in them it is.
   const [review, setReview] = useState<{ queue: string[]; at: number } | null>(null);
   const [drawerToken, setDrawerToken] = useState<number | null>(null);
@@ -177,46 +143,34 @@ export default function NeedsRail({
   const local = useTodoLocal();
   // A new visit to Home: earlier decided and sent marks stop applying.
   useLayoutEffect(() => { if (!privateHome) beginTodoVisit(); }, [privateHome]);
+
   // The floating button that owns the slide-over's focus on the way out.
   const needBtn = useRef<HTMLButtonElement | null>(null);
   const wasOpen = useRef(false);
   const reviewOpening = useRef(false);
+  const stagedOpener = useRef<Element | null>(null);
+  const detailOpener = useRef<Element | null>(null);
+  const desktopScrollRef = useRef<HTMLDivElement | null>(null);
+  const drawerScrollRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    if (desktopScrollRef.current) desktopScrollRef.current.scrollTop = 0;
+    if (drawerScrollRef.current) drawerScrollRef.current.scrollTop = 0;
+  }, [tab, todoFilter, feedFilter, drawerToken]);
+
   useEffect(() => {
-    // Opening a review closes the slide-over on purpose: the button behind
-    // the scrim is not where focus belongs then.
     if (!drawer && wasOpen.current && !reviewOpening.current) needBtn.current?.focus();
     reviewOpening.current = false;
     wasOpen.current = drawer;
   }, [drawer]);
-  // An issue opened from the slide-over leaves Home — drop the drawer so
-  // a stale overlay never hangs over the navigation.
-  const openIssue = (id: string) => {
-    closeDrawerImmediate();
-    onOpenIssue?.(id);
-  };
-  const [showDecided, setShowDecided] = useState(false);
-  const showTab = (next: "todo" | "updates") => {
-    setTab(next);
-    if (decisionsOn && next === "updates") homeDecisions.clearNotice();
-  };
-  // Updates on screen is Updates viewed: a failed write stops asking for attention.
-  useEffect(() => {
-    if (!decisionsOn || tab !== "updates") return;
-    const markVisible = () => {
-      if (drawer || window.innerWidth >= 1100) homeDecisions.markFailedSeen();
-    };
-    markVisible();
-    window.addEventListener("resize", markVisible);
-    return () => window.removeEventListener("resize", markVisible);
-  }, [decisionsOn, tab, drawer, staged.decided]);
-  const stagedOpener = useRef<Element | null>(null);
-  /** The detail closed: the opener if it is still there, else the rail. */
-  const closeStaged = () => {
-    setReview(null);
+
+  const restoreRailFocus = (opener: Element | null) => {
     window.setTimeout(() => {
-      const opener = stagedOpener.current;
       const back =
-        opener instanceof HTMLElement && opener !== document.body && opener.isConnected && !opener.closest("[data-drawer]")
+        opener instanceof HTMLElement &&
+        opener !== document.body &&
+        opener.isConnected &&
+        !opener.closest("[data-drawer]")
           ? opener
           : // Only the rail that is on screen: the column at >= 1100px, else the floating button.
             window.innerWidth >= 1100
@@ -226,23 +180,155 @@ export default function NeedsRail({
     }, 20);
   };
 
-  const cards = todo.filter((n) => !marksFor(local, n).hidden);
+  // An issue opened from the slide-over leaves Home — drop the drawer so
+  // a stale overlay never hangs over the navigation.
+  const openIssue = (id: string) => {
+    closeDrawerImmediate();
+    onOpenIssue?.(id);
+  };
+  const [showDecided, setShowDecided] = useState(false);
+  const showTab = (next: "todo" | "feed") => {
+    setTab(next);
+    if (decisionsOn && next === "feed") homeDecisions.clearNotice();
+  };
+
+  // Feed on screen is Feed viewed: a failed write stops asking for attention.
+  useEffect(() => {
+    if (!decisionsOn || tab !== "feed") return;
+    const markVisible = () => {
+      if (drawer || window.innerWidth >= 1100) homeDecisions.markFailedSeen();
+    };
+    markVisible();
+    window.addEventListener("resize", markVisible);
+    return () => window.removeEventListener("resize", markVisible);
+  }, [decisionsOn, tab, drawer, staged.decided]);
+
+  const closeStaged = () => {
+    setReview(null);
+    restoreRailFocus(stagedOpener.current);
+  };
+
+  const openTodoDetail = (next: RailTodoTarget, opener: HTMLElement) => {
+    detailOpener.current = opener;
+    reviewOpening.current = true;
+    closeDrawerImmediate();
+    setTodoTarget(next);
+  };
+
+  const closeTodoDetail = (restoreFocus = true) => {
+    setTodoTarget(null);
+    if (restoreFocus !== false) restoreRailFocus(detailOpener.current);
+  };
+
+  const openFeedDetail = (next: RailFeedTarget, opener: HTMLElement) => {
+    detailOpener.current = opener;
+    reviewOpening.current = true;
+    closeDrawerImmediate();
+    setFeedTarget(next);
+  };
+
+  const closeFeedDetail = (restoreFocus = true) => {
+    setFeedTarget(null);
+    if (restoreFocus !== false) restoreRailFocus(detailOpener.current);
+  };
+
+  const cards = useMemo(() => todo.filter((n) => !marksFor(local, n).hidden), [todo, local]);
   const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
+
+  useEffect(() => {
+    if (todoTarget?.kind === "need" && !cards.some((n) => n.key === todoTarget.key)) {
+      setTodoTarget(null);
+    }
+  }, [todoTarget, cards]);
+
+  const pendingTemplates = useMemo(() => templateList?.pending ?? [], [templateList?.pending]);
+  const approvedTemplates = useMemo(() => templateList?.approved ?? [], [templateList?.approved]);
+
+  const unifiedTodos = useMemo<UnifiedTodoItem[]>(() => {
+    const raw: UnifiedTodoItem[] = [
+      ...cards.map((need): UnifiedTodoItem => ({
+        kind: "need",
+        key: `need:${need.key}`,
+        category: todoCategoryForNeed(need),
+        need,
+      })),
+      ...routineStepHolds.map((run): UnifiedTodoItem => ({
+        kind: "routine_step_hold",
+        key: `step:${run.id}`,
+        category: "approvals",
+        run,
+      })),
+      ...routineProposals.map((proposal): UnifiedTodoItem => ({
+        kind: "routine_proposal",
+        key: `proposal:${proposal.id}`,
+        category: "approvals",
+        proposal,
+      })),
+      ...waitingRoutines.map((routine): UnifiedTodoItem => ({
+        kind: "waiting_routine",
+        key: `routine:${routine.id}`,
+        category: "reviews",
+        routine,
+      })),
+      ...pendingDocuments.map((doc): UnifiedTodoItem => ({
+        kind: "document",
+        key: `doc:${doc.id}:${doc.version}`,
+        category: "reviews",
+        doc,
+      })),
+      ...pendingTemplates.map((template): UnifiedTodoItem => ({
+        kind: "template",
+        key: `tpl:${template.name}:${template.version}`,
+        category: "reviews",
+        template,
+      })),
+    ];
+    return sortUnifiedTodos(raw);
+  }, [cards, routineStepHolds, routineProposals, waitingRoutines, pendingDocuments, pendingTemplates]);
+
+  const todoCategories = useMemo(() => presentTodoCategories(unifiedTodos), [unifiedTodos]);
+  useEffect(() => {
+    if (todoFilter !== "all" && (todoCategories.length <= 1 || !todoCategories.some((c) => c.key === todoFilter))) {
+      setTodoFilter("all");
+    }
+  }, [todoFilter, todoCategories]);
+
+  const visibleTodos = useMemo(
+    () => (todoFilter === "all" ? unifiedTodos : unifiedTodos.filter((item) => item.category === todoFilter)),
+    [unifiedTodos, todoFilter],
+  );
+
   const count =
     cards.filter((n) => !isDone(n)).length +
     waitingRoutines.length +
     routineProposals.length +
     routineStepHolds.length +
-    pendingDocuments.length + (templateCount ?? 0);
-  const countKnown = (Boolean(overviewData) || (privateHome && (
-    documentFollowUps?.status === "ready" || templateCount !== undefined || (decisionsOn && staged.phase === "ready")
-  ))) && (templateRail == null || templateCount !== undefined);
-  const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
-  const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
+    pendingDocuments.length +
+    (templateList ? templateList.pending.length : (templateCount ?? 0));
+  const countKnown =
+    (Boolean(overviewData) ||
+      (privateHome &&
+        (documentFollowUps?.status === "ready" ||
+          templateCount !== undefined ||
+          (templateList !== undefined && !templateList.loading) ||
+          (decisionsOn && staged.phase === "ready")))) &&
+    (templateList ? !templateList.loading && templateCount !== undefined : templateRail == null || templateCount !== undefined);
+
+  const readers = useMemo(
+    () =>
+      unifiedTodos.flatMap((item) =>
+        item.kind === "need" && kindSpec(item.need).place === "drawer" && item.need.action.type !== "staged"
+          ? [item.need]
+          : [],
+      ),
+    [unifiedTodos],
+  );
+
   const ask = (need: HomeNeed, lead?: string) => {
     closeDrawerImmediate();
     onAsk?.(need, lead);
   };
+
   /** One reading item, with the queue as it stood when the detail opened:
    *  "n of m" does not recount when the overview refreshes mid-run. */
   const decisionFor = (need: HomeNeed, queue: HomeNeed[]): HomeDecisionOpen => ({
@@ -259,6 +345,7 @@ export default function NeedsRail({
     },
     ask: (lead) => ask(need, lead),
   });
+
   const reviewStaged = (queue: string[], at: number, opener: Element | null = document.activeElement) => {
     stagedOpener.current = opener;
     homeDecisions.clearNotice();
@@ -266,8 +353,8 @@ export default function NeedsRail({
     closeDrawerImmediate();
     setReview({ queue, at });
   };
+
   // CAD-2364: a chip in the thread opens the same review card, over what is waiting now.
-  // The chip is the opener: a click does not focus a button in every browser.
   const openStaged = useRef<(id: string, opener: HTMLElement) => void>(() => {});
   openStaged.current = (id: string, opener: HTMLElement) => {
     const queue = staged.pending.map((w) => w.id);
@@ -277,216 +364,235 @@ export default function NeedsRail({
   useEffect(() => {
     if (decisionsOn) return homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener));
   }, [decisionsOn]);
-  const openDecision = (key: string) => {
+
+  const openDecision = (key: string, opener?: HTMLElement) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
     if (stagedCard) {
-      // Not an issue-backed item: the staged detail is the rail's own, on the same shell.
       const queue = cards.flatMap((n) => (n.action.type === "staged" ? [n.action.id] : []));
-      reviewStaged(queue, Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0));
+      reviewStaged(queue, Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0), opener ?? document.activeElement);
       return;
     }
     const need = readers.find((n) => n.key === key);
     if (!need) return;
+    reviewOpening.current = true;
+    closeDrawerImmediate();
     onOpenDecision?.(decisionFor(need, readers.filter((n) => n.key === key || !isDone(n))));
   };
+
+  const openNeedCard = (need: HomeNeed, opener: HTMLElement) => {
+    if (need.action.type === "staged" || kindSpec(need).place === "drawer") {
+      openDecision(need.key, opener);
+      return;
+    }
+    openTodoDetail({ kind: "need", key: need.key }, opener);
+  };
+
+  const renderUnifiedTodoItem = (item: UnifiedTodoItem) => {
+    if (item.kind === "need") {
+      return (
+        <TodoCard
+          key={item.key}
+          need={item.need}
+          doneText={marksFor(local, item.need).doneText}
+          onOpen={openNeedCard}
+        />
+      );
+    }
+    if (item.kind === "routine_step_hold") {
+      const { run } = item;
+      const waitingStep =
+        (run.checklist_state ?? run.checklist ?? []).find((s) => s.state === "waiting_approval")?.label ??
+        t("Ask for approval first");
+      return (
+        <li key={item.key} className="needrow">
+          <RailCard
+            className="todo-card"
+            bodyClassName="todo-main min-w-0"
+            titleClassName="todo-hit"
+            metaClassName="todo-meta"
+            tone="warn"
+            statusLabel={t("Approval")}
+            source={run.agent_alias ?? t("Routine")}
+            title={<span className="todo-title">{run.routine_name ?? run.routine_id}</span>}
+            summary={waitingStep}
+            meta={run.agent_alias ?? undefined}
+            cue={t("Review")}
+            onOpen={(event) => openTodoDetail({ kind: "routine_step_hold", run }, event.currentTarget)}
+          />
+        </li>
+      );
+    }
+    if (item.kind === "routine_proposal") {
+      const { proposal } = item;
+      return (
+        <li key={item.key} className="needrow">
+          <RailCard
+            className="todo-card"
+            bodyClassName="todo-main min-w-0"
+            titleClassName="todo-hit"
+            metaClassName="todo-meta"
+            tone="warn"
+            statusLabel={t("Approval")}
+            source={proposal.proposed_by ?? t("Agent")}
+            title={<span className="todo-title">{proposal.title}</span>}
+            summary={t(proposal.kind === "wiki_propose" ? "Playbook draft" : "Routine draft")}
+            cue={t("Review")}
+            onOpen={(event) => openTodoDetail({ kind: "routine_proposal", proposal }, event.currentTarget)}
+          />
+        </li>
+      );
+    }
+    if (item.kind === "waiting_routine") {
+      const { routine } = item;
+      const reason = waitingRoutineReason(routine, t);
+      return (
+        <li key={item.key} className="needrow">
+          <RailCard
+            className="todo-card"
+            bodyClassName="todo-main min-w-0"
+            titleClassName="todo-hit"
+            metaClassName="todo-meta"
+            tone="info"
+            statusLabel={t("Review")}
+            source={routine.agent_alias ?? t("Routine")}
+            title={<span className="todo-title">{routine.name}</span>}
+            summary={reason}
+            cue={t("Review")}
+            onOpen={(event) => openTodoDetail({ kind: "waiting_routine", routine }, event.currentTarget)}
+          />
+        </li>
+      );
+    }
+    if (item.kind === "document") {
+      const { doc } = item;
+      return (
+        <li key={item.key} className="needrow">
+          <RailCard
+            className="todo-card"
+            bodyClassName="todo-main min-w-0"
+            titleClassName="todo-hit"
+            metaClassName="todo-meta"
+            tone="info"
+            statusLabel={t("Review")}
+            source={doc.project ?? t("Wiki")}
+            title={<span className="todo-title">{doc.title}</span>}
+            summary={`${doc.project ? `${doc.project} · ` : ""}v${doc.version}`}
+            meta={t("Approval requested")}
+            cue={t("Review")}
+            onOpen={(event) => openTodoDetail({ kind: "document", doc }, event.currentTarget)}
+          />
+        </li>
+      );
+    }
+    const { template } = item;
+    return (
+      <li key={item.key} className="needrow" data-record-id={`template:${template.name}:${template.version}`}>
+        <RailCard
+          className="todo-card"
+          bodyClassName="todo-main min-w-0"
+          titleClassName="todo-hit"
+          metaClassName="todo-meta"
+          tone="info"
+          statusLabel={t("Review")}
+          source={t("Templates")}
+          title={<span className="todo-title">{template.name} · v{template.version}</span>}
+          summary={t("Draft awaiting review")}
+          meta={t(template.kind)}
+          cue={t("Review")}
+          onOpen={(event) => {
+            reviewOpening.current = true;
+            closeDrawerImmediate();
+            templateList?.open(template, event.currentTarget);
+          }}
+        />
+      </li>
+    );
+  };
+
+  const todoSubhead = todoCategories.length > 1 ? (
+    <div className="rail-subhead">
+      <div className="seg-pills" role="group" aria-label={t("Filter to do")}>
+        <button
+          type="button"
+          className="seg-pill"
+          aria-pressed={todoFilter === "all"}
+          onClick={() => setTodoFilter("all")}
+        >
+          {t("All")} <span className="seg-n num">{unifiedTodos.length}</span>
+        </button>
+        {todoCategories.map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            className="seg-pill"
+            aria-pressed={todoFilter === entry.key}
+            onClick={() => setTodoFilter(entry.key)}
+          >
+            {t(entry.label)} <span className="seg-n num">{entry.count}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  ) : null;
+
   const todoBody = (
     <>
-      {templateRail?.(() => {
+      {!templateList && templateRail?.(() => {
         if (!drawer) return;
         reviewOpening.current = true;
         closeDrawerImmediate();
       })}
+      {templateList?.error && (
+        <p className="rail-state-card warn" role="alert">
+          {t("Templates could not be loaded.")}{" "}
+          <button type="button" className="lnk" onClick={templateList.refresh}>{t("Retry")}</button>
+        </p>
+      )}
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {staged.notice && review === null && (
         <p className="todo-note text-label text-ink-300 px-3 pt-2" role="status">
           <span>{noticeText(staged.notice, t)}</span>
           {staged.notice.outcome !== "still-waiting" && (
-            <button type="button" className="lnk text-label" onClick={() => showTab("updates")}>
-              {t("View in Updates")}
+            <button type="button" className="lnk text-label" onClick={() => showTab("feed")}>
+              {t("View in Feed")}
             </button>
           )}
         </p>
       )}
       {overview && !overviewData && overview.status === "failed" && (
-        <p className="px-3 py-2.5 text-label text-fail break-words">{t("The list couldn't be loaded. It will try again.")}</p>
+        <p className="rail-state-card fail">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
       {overview && !overviewData && overview.status !== "failed" && (
-        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
+        <p className="rail-state-card">{t("Reading what needs you…")}</p>
       )}
-      {/* An unread or failed decision list is not an empty list. */}
-      {(overviewData || privateHome) && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
-        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
+      {(overviewData || privateHome) && unifiedTodos.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
+        <p className="rail-state-card">{t("Reading what needs you…")}</p>
       )}
-      {(overviewData || privateHome) && cards.length === 0 && decisionsOn && staged.phase === "error" && (
-        <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
+      {(overviewData || privateHome) && unifiedTodos.length === 0 && decisionsOn && staged.phase === "error" && (
+        <p className="rail-state-card fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
-      {countKnown && count === 0 && cards.length === 0 && documentFollowUps?.status !== "unavailable" && documentFollowUps?.status !== "loading" && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
-        <p className="px-3 py-3 text-label text-ink-400">{t(privateHome ? "Nothing needs your review." : "Nothing needs you. The team is working.")}</p>
+      {countKnown && count === 0 && unifiedTodos.length === 0 && documentFollowUps?.status !== "unavailable" && documentFollowUps?.status !== "loading" && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
+        <p className="rail-state-card">{t(privateHome ? "Nothing needs your review." : "Nothing needs you. The team is working.")}</p>
       )}
       {documentFollowUps?.status === "loading" && (
-        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading document follow-ups…")}</p>
+        <p className="rail-state-card">{t("Reading document follow-ups…")}</p>
       )}
       {documentFollowUps?.status === "unavailable" && (
-        <p className="px-3 py-2.5 text-label text-warn">
+        <p className="rail-state-card warn">
           {t("Document follow-ups could not be loaded.")}{" "}
           <button type="button" className="lnk" onClick={() => void resources.overview.refresh()}>{t("Retry")}</button>
         </p>
       )}
-      {pendingDocuments.length > 0 && <DocumentFollowUpRows rows={pendingDocuments} onOpen={closeDrawerImmediate} />}
-      {routineActionErr && (
-        <p className="px-3 py-2 text-micro text-fail break-words" role="alert">
-          {routineActionErr}
-        </p>
-      )}
-      {(waitingRoutines.length > 0 || routineProposals.length > 0 || routineStepHolds.length > 0) && (
-        <ul className="todo-list" data-routine-needs>
-          {routineStepHolds.map((run) => {
-            const href = routineReviewHref(run.agent_alias, hostedRoster);
-            const waitingStep =
-              (run.checklist_state ?? run.checklist ?? []).find(
-                (s) => s.state === "waiting_approval",
-              )?.label ?? t("Ask for approval first");
-            return (
-              <li
-                key={run.id}
-                className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0"
-              >
-                <div className="min-w-0 flex-1">
-                  <span className="block text-label font-medium text-ink-100 truncate">
-                    {run.routine_name ?? run.routine_id}
-                  </span>
-                  <span className="block text-micro text-warn truncate">
-                    {waitingStep}
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                  {!readOnly && (
-                    <>
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        loading={decidingRoutineId === run.id}
-                        disabled={decidingRoutineId !== null}
-                        onClick={() => void decideStepHold(run.id, "approve")}
-                      >
-                        {t("Approve & send")}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={decidingRoutineId !== null}
-                        onClick={() => void decideStepHold(run.id, "dismiss")}
-                      >
-                        {t("Dismiss")}
-                      </Button>
-                    </>
-                  )}
-                  {href && <Link
-                    href={href}
-                    className="btn btn-sm btn-secondary"
-                    onClick={closeDrawerImmediate}
-                  >
-                    {t("Review")}
-                  </Link>}
-                </div>
-              </li>
-            );
-          })}
-          {routineProposals.map((p) => {
-            const href = routineDraftReviewHref(p, hostedRoster);
-            return (
-              <li key={p.id} className="px-3 py-2.5 border-b border-ink-800 flex flex-wrap items-center justify-between gap-2 min-w-0">
-                <div className="min-w-0 flex-1">
-                  <span className="block text-label font-medium text-ink-100 truncate">
-                    {p.title}
-                  </span>
-                  <span className="block text-micro text-ink-400 truncate">
-                    {p.kind === "wiki_propose" ? t("Playbook draft") : t("Routine draft")}
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                  {!readOnly && (
-                    <>
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        loading={decidingRoutineId === p.id}
-                        disabled={decidingRoutineId !== null}
-                        onClick={() => void decideProposal(p.id, "approve")}
-                      >
-                        {t("Approve")}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={decidingRoutineId !== null}
-                        onClick={() => void decideProposal(p.id, "dismiss")}
-                      >
-                        {t("Dismiss")}
-                      </Button>
-                    </>
-                  )}
-                  {href && <Link
-                    href={href}
-                    className="btn btn-sm btn-secondary"
-                    onClick={closeDrawerImmediate}
-                  >
-                    {t("Review")}
-                  </Link>}
-                </div>
-              </li>
-            );
-          })}
-          {waitingRoutines.map((r) => {
-            const href = routineReviewHref(r.agent_alias, hostedRoster);
-            return (
-              <li key={r.id} className="px-3 py-2.5 border-b border-ink-800 flex items-center justify-between gap-2 min-w-0">
-                <div className="min-w-0">
-                  <span className="block text-label font-medium text-ink-100 truncate">
-                    {r.name}
-                  </span>
-                  <span className="block text-micro text-ink-400 truncate">
-                    {r.status === "repoint_required"
-                      ? t("Choose thread")
-                      : r.approval_drift && (r.approved_rev !== null || r.approved_sha256 !== null)
-                        ? t("Playbook or script updated — approve to run")
-                        : t("Approve routine before first run")}
-                  </span>
-                </div>
-                {href && <Link
-                  href={href}
-                  className="btn btn-sm btn-secondary shrink-0"
-                  onClick={closeDrawerImmediate}
-                >
-                  {t("Review")}
-                </Link>}
-              </li>
-            );
-          })}
+
+      {visibleTodos.length > 0 && (
+        <ul className="rail-cards todo-list">
+          {visibleTodos.map(renderUnifiedTodoItem)}
         </ul>
       )}
-      <ul className="todo-list">
-        {cards.map((n, i) => (
-          <TodoCard
-            key={n.key}
-            need={n}
-            readOnly={readOnly}
-            scopedHost={scopedHost}
-            defaultOpen={i === firstPermission}
-            doneText={marksFor(local, n).doneText}
-            onReview={openDecision}
-            onOpenIssue={openIssue}
-            onAsk={(need) => ask(need)}
-            onHide={hideTodo}
-            onDone={doneTodo}
-            onSent={() => {
-              closeDrawerImmediate();
-              onSent?.();
-            }}
-          />
-        ))}
-      </ul>
-      {cards.length > 0 && <p className="todo-hint">{t("Tap a card to see more. “Fix it” hands the problem to Master.")}</p>}
+      {unifiedTodos.length > 0 && visibleTodos.length === 0 && (
+        <p className="rail-state-card">{t("No items in this category.")}</p>
+      )}
+
       {decided.length > 0 && (
         <section className="todo-decided" data-todo-decided>
           <button type="button" className="todo-decided-h" aria-expanded={showDecided} onClick={() => setShowDecided((s) => !s)}>
@@ -507,9 +613,11 @@ export default function NeedsRail({
                   </li>
                 ))}
               </ul>
-              {permissionsHref && <Link href={permissionsHref} className="lnk text-label" onClick={closeDrawerImmediate}>
-                {t("Standing rules are in Settings")}
-              </Link>}
+              {permissionsHref && (
+                <Link href={permissionsHref} className="lnk text-label" onClick={closeDrawerImmediate}>
+                  {t("Standing rules are in Settings")}
+                </Link>
+              )}
             </>
           )}
         </section>
@@ -517,64 +625,211 @@ export default function NeedsRail({
     </>
   );
 
-  const updatesBody = (
+  const decidedSlice = useMemo(() => staged.decided.slice(0, 8), [staged.decided]);
+  const nonAgentFeedCounts = useMemo(
+    () =>
+      countFeedCategories([
+        ...recentDocuments.map((): { categories: readonly FeedCategoryKey[] } => ({ categories: ["uploaded", "completed"] })),
+        ...approvedTemplates.map((): { categories: readonly FeedCategoryKey[] } => ({ categories: ["uploaded", "completed"] })),
+        ...decidedSlice.map((w) => ({ categories: feedCategoriesForDecidedWrite(w) })),
+        ...updates.map((n) => ({ categories: feedCategoriesForInfoNeed(n) })),
+      ]),
+    [recentDocuments, approvedTemplates, decidedSlice, updates],
+  );
+  const feedCounts = useMemo(
+    () => mergeFeedCounts(agentFeedState.counts, nonAgentFeedCounts),
+    [agentFeedState.counts, nonAgentFeedCounts],
+  );
+
+  const feedMatches = (categories: readonly FeedCategoryKey[]) =>
+    feedFilter === "all" || categories.includes(feedFilter);
+
+  const filteredRecentDocs = recentDocuments.filter(() => feedMatches(["uploaded", "completed"]));
+  const filteredApprovedTemplates = approvedTemplates.filter(() => feedMatches(["uploaded", "completed"]));
+  const filteredDecidedWrites = decidedSlice.filter((w) => feedMatches(feedCategoriesForDecidedWrite(w)));
+  const filteredUpdates = updates.filter((n) => feedMatches(feedCategoriesForInfoNeed(n)));
+
+  const feedAgentVisibleCount = feedFilter === "all" ? (agentFeedState.hasAny ? 1 : 0) : agentFeedState.counts[feedFilter];
+  const feedVisibleCount =
+    feedAgentVisibleCount +
+    filteredRecentDocs.length +
+    filteredApprovedTemplates.length +
+    filteredDecidedWrites.length +
+    filteredUpdates.length;
+
+  const feedSubhead = (
+    <div className="rail-subhead">
+      <div className="seg-pills" role="group" aria-label={t("Filter feed")}>
+        <button
+          type="button"
+          className="seg-pill"
+          aria-pressed={feedFilter === "all"}
+          onClick={() => setFeedFilter("all")}
+        >
+          {t("All")}
+        </button>
+        {FEED_CATEGORY_ORDER.map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            className="seg-pill"
+            aria-pressed={feedFilter === entry.key}
+            onClick={() => setFeedFilter(entry.key)}
+          >
+            {t(entry.label)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const feedBody = (
     <>
-      {recentDocuments.length > 0 && <DocumentFollowUpRows rows={recentDocuments} onOpen={closeDrawerImmediate} recent />}
-      {privateHome && recentDocuments.length === 0 && (
-        <p className="px-3 py-2.5 text-label text-ink-400">{t(documentFollowUps?.status === "loading" ? "Reading document follow-ups…" : documentFollowUps?.status === "unavailable" ? "Document follow-ups could not be loaded." : "No recent document activity.")}</p>
-      )}
-      {staged.decided.length > 0 && (
-        <ul className="todo-fyi" data-todo-decisions>
-          {staged.decided.slice(0, 8).map((w) => (
-            <DecidedLine key={w.id} write={w} />
-          ))}
+      <AgentUpdates
+        includeMasterReports={!privateHome}
+        category={feedFilter}
+        onAsk={onAskAgent ? (agent, update) => {
+          closeDrawerImmediate();
+          onAskAgent(agent, update);
+        } : undefined}
+        onOpenAgent={openFeedDetail}
+        onAgentFeedState={setAgentFeedState}
+      />
+
+      {filteredRecentDocs.length > 0 && (
+        <ul className="rail-cards" data-feed-docs>
+          {filteredRecentDocs.map((doc: DocumentFollowUp & { outcome?: "approved" | "delivered" }) => {
+            const outcome = doc.outcome === "delivered" ? "delivered" : "approved";
+            const outcomeLabel = outcome === "delivered" ? t("Delivered") : t("Approved");
+            return (
+              <li key={`${doc.id}:${doc.version}`} className="needrow">
+                <RailCard
+                  tone="ok"
+                  statusLabel={outcomeLabel}
+                  source={doc.project ?? t("Wiki")}
+                  title={doc.title}
+                  summary={`${doc.project ? `${doc.project} · ` : ""}v${doc.version}`}
+                  meta={t("Uploaded")}
+                  cue={t("Details")}
+                  onOpen={(event) => openFeedDetail({ kind: "document", doc: { ...doc, outcome } }, event.currentTarget)}
+                />
+              </li>
+            );
+          })}
         </ul>
       )}
-      {updates.length > 0 && (
-        <ul className="todo-fyi" data-todo-updates>
-          {updates.map((n) => (
-            <li key={n.key}>
-              <span>{updateTitle(n)}</span>
-              <span className="text-ink-500">
-                {/* An Updates row stays information; the subject id is a
-                    plain link to the issue it names, never an action. */}
-                {n.issue !== null && (
-                  <button type="button" className="lnk num" onClick={() => openIssue(n.issue!)}>
-                    {n.issue}
-                  </button>
-                )}
-                {n.issue !== null && " · "}
-                {metaLine(n)}
-              </span>
+
+      {filteredApprovedTemplates.length > 0 && (
+        <ul className="rail-cards" data-feed-templates>
+          {filteredApprovedTemplates.map((tpl) => (
+            <li key={`${tpl.name}:${tpl.version}`} className="needrow" data-record-id={`template:${tpl.name}:${tpl.version}`}>
+              <RailCard
+                tone="ok"
+                statusLabel={t("Approved")}
+                source={t("Templates")}
+                title={`${tpl.name} · v${tpl.version}`}
+                summary={t("Approved for reuse")}
+                meta={t(tpl.kind)}
+                cue={t("Open")}
+                onOpen={(event) => {
+                  reviewOpening.current = true;
+                  closeDrawerImmediate();
+                  templateList?.open(tpl, event.currentTarget);
+                }}
+              />
             </li>
           ))}
         </ul>
       )}
-      {onAskAgent && <AgentUpdates
-        onAsk={(agent, update) => {
-          closeDrawerImmediate();
-          onAskAgent(agent, update);
-        }}
-        onOpenIssue={openIssue}
-      />}
+
+      {filteredDecidedWrites.length > 0 && (
+        <ul className="rail-cards" data-todo-decisions>
+          {filteredDecidedWrites.map((write) => {
+            const outcome = outcomeOf(write);
+            const when = ageText(write.decidedAt ?? write.createdAt, t);
+            const statusLabel = decidedWriteStatusLabel(write, outcome, t);
+            const tone = outcome === "failed" ? "fail" : outcome === "unconfirmed" ? "warn" : "ok";
+            const summary =
+              outcome === "failed" || (outcome === "unconfirmed" && write.connected !== null && isUncertain(write))
+                ? reasonText(failureReason(write), t)
+                : write.target?.label ?? undefined;
+            return (
+              <li key={write.id} className="needrow" data-fail={outcome === "failed" ? "" : undefined}>
+                <RailCard
+                  className="decided-card"
+                  tone={tone}
+                  statusLabel={statusLabel}
+                  source={write.app ? <bdi>{isolate(write.app)}</bdi> : t("Workspace")}
+                  age={when}
+                  title={<bdi>{isolate(titleOf(write, t))}</bdi>}
+                  summary={summary ? <bdi>{isolate(summary)}</bdi> : undefined}
+                  meta={write.connected !== null
+                    ? <>{t("External")}{write.app ? <> · <bdi>{isolate(write.app)}</bdi></> : null}</>
+                    : write.app
+                      ? <bdi>{isolate(write.app)}</bdi>
+                      : undefined}
+                  external={write.connected !== null}
+                  cue={t("Details")}
+                  onOpen={(event) => openFeedDetail({ kind: "decided_write", write }, event.currentTarget)}
+                />
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {filteredUpdates.length > 0 && (
+        <ul className="rail-cards" data-todo-updates>
+          {filteredUpdates.map((need) => (
+            <li key={need.key} className="needrow">
+              <RailCard
+                tone="info"
+                statusLabel={t("Update")}
+                source={need.project && need.project !== "all" ? need.project : t("Workspace")}
+                age={ageWords(need.age)}
+                title={updateTitle(need)}
+                summary={metaLine(need)}
+                meta={need.issue ?? undefined}
+                cue={t("Details")}
+                onOpen={(event) => openFeedDetail({ kind: "info_need", need }, event.currentTarget)}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {privateHome && documentFollowUps?.status === "loading" && feedVisibleCount === 0 && (
+        <p className="rail-state-card">{t("Reading document follow-ups…")}</p>
+      )}
+      {documentFollowUps?.status === "unavailable" && (
+        <p className="rail-state-card warn">{t("Document follow-ups could not be loaded.")}</p>
+      )}
+      {feedVisibleCount === 0 && documentFollowUps?.status !== "loading" && (
+        <p className="rail-state-card">
+          {t(feedCounts.all === 0 && privateHome ? "No recent document activity." : "No activity in this category yet.")}
+        </p>
+      )}
     </>
   );
 
+  const liveAgents = Boolean(hasLiveAgents || agentFeedState.liveCount > 0);
   const tabs = (
     <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
-      <button aria-pressed={tab === "todo"} onClick={() => showTab("todo")}>
+      <button type="button" aria-pressed={tab === "todo"} onClick={() => showTab("todo")}>
         {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{countKnown ? count : "…"}</span>
       </button>
-      <button aria-pressed={tab === "updates"} onClick={() => showTab("updates")}>
-        {t("Updates")}
-        {staged.failedUnseen && tab !== "updates" && (
+      <button type="button" aria-pressed={tab === "feed"} onClick={() => showTab("feed")}>
+        {t("Feed")}
+        {liveAgents && <span className="live-dot" aria-hidden="true" />}
+        {staged.failedUnseen && tab !== "feed" && (
           <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
         )}
       </button>
     </div>
   );
 
-  const panelBody = <div>{tab === "todo" ? todoBody : updatesBody}</div>;
+  const panelSubhead = tab === "todo" ? todoSubhead : feedSubhead;
+  const panelBody = <div>{tab === "todo" ? todoBody : feedBody}</div>;
 
   return (
     <>
@@ -582,7 +837,8 @@ export default function NeedsRail({
       <div className="hidden rail:block h-full min-h-0">
         <section className="card needsrail overflow-hidden" aria-label={t("to do")}>
           {tabs}
-          <div className="rail-scroll min-h-0">{panelBody}</div>
+          {panelSubhead}
+          <div className="rail-scroll min-h-0" ref={desktopScrollRef}>{panelBody}</div>
         </section>
       </div>
 
@@ -610,6 +866,34 @@ export default function NeedsRail({
           onClose={closeStaged}
         />
       )}
+      <RailTodoDrawer
+        target={todoTarget}
+        needs={cards}
+        readOnly={readOnly}
+        scopedHost={scopedHost}
+        hostedRoster={hostedRoster}
+        onOpenIssue={openIssue}
+        onAsk={onAsk ? (need) => ask(need) : undefined}
+        onDone={doneTodo}
+        onHide={hideTodo}
+        onSent={() => {
+          closeDrawerImmediate();
+          onSent?.();
+        }}
+        onRoutineDecided={(id) => setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }))}
+        onClose={closeTodoDetail}
+      />
+      <RailFeedDrawer
+        target={feedTarget}
+        readOnly={readOnly}
+        onAskAgent={onAskAgent ? (agent, update) => {
+          closeDrawerImmediate();
+          onAskAgent(agent, update);
+        } : undefined}
+        onAskNeed={onAsk ? (need) => ask(need) : undefined}
+        onOpenIssue={openIssue}
+        onClose={closeFeedDetail}
+      />
       {drawerToken !== null && (
         <DrawerShell
           key={drawerToken}
@@ -624,21 +908,36 @@ export default function NeedsRail({
           label={t("to do")}
           title={t("To do")}
           tab={tab}
-          onTab={(next) => showTab(next as "todo" | "updates")}
+          onTab={(next) => showTab(next as "todo" | "feed")}
           tabs={[
             {
               id: "todo",
               label: `${t("To do")} ${countKnown ? count : "…"}`,
-              panel: <div className="rail-scroll min-h-0 flex-1">{todoBody}</div>,
+              panel: (
+                <div className="needsdrawer-panel flex flex-col min-h-0 flex-1">
+                  {todoSubhead}
+                  <div className="rail-scroll min-h-0 flex-1" ref={drawerScrollRef}>{todoBody}</div>
+                </div>
+              ),
             },
             {
-              id: "updates",
-              label: t("Updates"),
+              id: "feed",
+              label: t("Feed"),
               badge:
-                staged.failedUnseen && tab !== "updates" ? (
-                  <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
+                liveAgents || (staged.failedUnseen && tab !== "feed") ? (
+                  <span className="inline-flex items-center gap-1 ml-1.5">
+                    {liveAgents && <span className="live-dot" aria-hidden="true" />}
+                    {staged.failedUnseen && tab !== "feed" && (
+                      <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
+                    )}
+                  </span>
                 ) : undefined,
-              panel: <div className="rail-scroll min-h-0 flex-1">{updatesBody}</div>,
+              panel: (
+                <div className="needsdrawer-panel flex flex-col min-h-0 flex-1">
+                  {feedSubhead}
+                  <div className="rail-scroll min-h-0 flex-1" ref={drawerScrollRef}>{feedBody}</div>
+                </div>
+              ),
             },
           ]}
           onClose={() => {
@@ -647,58 +946,6 @@ export default function NeedsRail({
           }}
         />
       )}
-
     </>
-  );
-}
-
-/** One decided write in Updates: title, what happened, how long ago. A failed apply says why. */
-function DecidedLine({ write }: { write: StagedWrite }) {
-  const t = useTranslate();
-  const [raw, setRaw] = useState(false);
-  const outcome = outcomeOf(write);
-  const when = ageText(write.decidedAt ?? write.createdAt, t);
-  if (outcome === "failed") {
-    return (
-      <li data-fail>
-        <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
-        <span className="text-ink-500">
-          <span className="dx-bad">{t("Did not apply")}</span> · {when}
-        </span>
-        <span className="dx-why">
-          {reasonText(failureReason(write), t)}
-          <button type="button" className="lnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
-            {raw ? t("Hide raw") : t("Show raw")}
-          </button>
-          {raw && (
-            <pre className="rv-tech dx-raw" tabIndex={0}>
-              {write.result?.code ? `${t("code")}: ${write.result.code}\n\n` : ""}
-              {write.raw}
-            </pre>
-          )}
-        </span>
-      </li>
-    );
-  }
-  const label =
-    outcome === "unconfirmed"
-      ? t("Result not confirmed")
-      : outcome === "denied"
-      ? t("Denied")
-      : write.kind === "create_issue" && write.result?.ticket
-        ? `${t("Created")} ${write.result.ticket}`
-        : write.connected !== null
-          ? t(write.connected.effect === "send" ? "Sent" : "Drafted")
-          : t("Applied");
-  return (
-    <li>
-      <span><bdi>{isolate(titleOf(write, t))}</bdi></span>
-      <span className="text-ink-500">
-        {label} · {when}
-      </span>
-      {outcome === "unconfirmed" && write.connected !== null && isUncertain(write) && (
-        <span className="dx-why">{reasonText(failureReason(write), t)}</span>
-      )}
-    </li>
   );
 }

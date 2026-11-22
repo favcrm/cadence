@@ -105,8 +105,8 @@ async function main() {
   await React.act(async () => root.render(React.createElement(LocaleProvider, null, React.createElement(AppComponent))));
   await settle(() => assert(document.querySelector('[data-need="plan"]'), "the Home rail renders the plan card"));
 
-  const review = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Review");
-  assert(review, "the plan card offers Review");
+  const review = document.querySelector('[data-need="plan"] .todo-hit') as HTMLButtonElement | null;
+  assert(review, "the plan card offers a clickable opener");
   review.focus();
   await click(review);
   await settle(() => assert(document.querySelector('[data-drawer="review"]'), "the plan decision opens"));
