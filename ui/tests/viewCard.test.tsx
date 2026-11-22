@@ -211,3 +211,4 @@ const rule = (css: string, selector: string): string => css.slice(css.indexOf(se
 check(rule(readCss("styles.css"), ".viewcard-params {").includes("-webkit-line-clamp: 2"), "card params clamp to two lines");
 check(rule(readCss("features/canvas/canvas.css"), ".cv-title > .cv-appview-params {").includes("-webkit-line-clamp: 2"), "tab params clamp to two lines");
 check(rule(readCss("features/canvas/canvas.css"), ".cv-title > .cv-appview-sub {").includes("white-space: nowrap"), "the tab's app line stays on one line");
+check(rule(readCss("features/canvas/canvas.css"), ".cv-appview-open {").includes("display: block"), "the Open in link is a block so its long label ends in an ellipsis");
