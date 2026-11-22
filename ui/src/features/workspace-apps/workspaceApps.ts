@@ -324,7 +324,7 @@ function appResponseError(response: Response, value: unknown): ApiError {
   return new ApiError(message, response.status, code ? { code } : undefined);
 }
 
-async function request<T>(path: string, signal?: AbortSignal, body?: object, onResponse?: (status: number) => void): Promise<T> {
+async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
   return withPrivateOperation(async (operation) => {
     const read = body === undefined;
     const response = await privateFetch(path, {
@@ -336,7 +336,6 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object, onR
       ...(read ? {} : { body: JSON.stringify(body) }),
     }, operation);
     operation.assertCurrent();
-    onResponse?.(response.status);
     const value = await response.json().catch(() => null);
     operation.assertCurrent();
     if (!response.ok) throw appResponseError(response, value);
@@ -349,7 +348,6 @@ export type AppAgentSelection = {
   digest: string;
   revision: number;
   stale: boolean;
-  consultations?: true;
   agent: { id: string; name: string } | null;
 };
 
@@ -372,13 +370,6 @@ function appAgentSelection(value: unknown, installId: string, stale: boolean): A
   return { digest, revision, stale, agent: { id: agent.profile_id, name: agent.profile.name } };
 }
 
-export type AppConsultationReply =
-  | { state: "answered"; text: string }
-  | { state: "pending" | "unanswered" | "unconfirmed" };
-
-const consultationPath = (app: string, message: string) =>
-  `${installation(app)}/agent/consultations/${part(message)}`;
-
 /** One of the company's connected Instagram accounts or Facebook Pages (CAD-1290, CAD-1939). */
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
@@ -386,28 +377,7 @@ export const workspaceApps = {
     const value = await request<unknown>(`${installation(id)}/agent`, signal);
     if (typeof value !== "object" || value === null || !("stale" in value) || typeof value.stale !== "boolean")
       throw new ApiError("The server returned an invalid app agent selection", 502);
-    const selection = appAgentSelection(value, id, value.stale);
-    return "consultations" in value && value.consultations === true
-      ? { ...selection, consultations: true as const }
-      : selection;
-  },
-  sendConsultation: async (app: string, message: string, binding: AppAgentSelection, text: string, signal?: AbortSignal, onAccepted?: () => void) => {
-    const value = await request<unknown>(consultationPath(app, message), signal, {
-      expected_digest: binding.digest, expected_revision: binding.revision, text,
-    }, (status) => { if (status === 202) onAccepted?.(); });
-    if (typeof value !== "object" || value === null || !("message" in value) || value.message !== message ||
-      !("state" in value) || value.state !== "accepted" || !("duplicate" in value) || typeof value.duplicate !== "boolean")
-      throw new ApiError("The consultation receipt could not be verified", 502);
-  },
-  consultationReply: async (app: string, message: string, signal?: AbortSignal): Promise<AppConsultationReply> => {
-    const value = await request<unknown>(consultationPath(app, message), signal);
-    if (typeof value === "object" && value !== null && "message" in value && value.message === message && "state" in value) {
-      if (value.state === "answered" && "text" in value && typeof value.text === "string" && value.text.length > 0)
-        return { state: value.state, text: value.text };
-      if ((value.state === "pending" || value.state === "unanswered" || value.state === "unconfirmed") && !("text" in value))
-        return { state: value.state };
-    }
-    throw new ApiError("The consultation reply could not be verified", 502);
+    return appAgentSelection(value, id, value.stale);
   },
   setAppAgent: async (id: string, previous: AppAgentSelection, profileId: string | null, signal?: AbortSignal) => {
     const selected = appAgentSelection(await request<unknown>(`${installation(id)}/agent`, signal, {

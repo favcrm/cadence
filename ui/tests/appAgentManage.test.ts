@@ -1,4 +1,3 @@
-/// <reference lib="es2024.promise" />
 import type * as HappyDom from "happy-dom";
 import type * as ReactTypes from "react";
 import type * as ReactDomClient from "react-dom/client";
@@ -6,8 +5,6 @@ import type * as Locale from "../src/lib/locale";
 import type * as Manage from "../src/features/explorer/ManageApp";
 import type * as Navigation from "../screen-ui/src/navigation";
 import type * as HostNavigation from "../src/ui/hostNavigation";
-import type * as Consultation from "../src/features/home/AppConsultation";
-import type * as PrivateSession from "../src/lib/privateSession";
 
 declare function require(name: string): unknown;
 const { Window } = require("happy-dom") as typeof HappyDom;
@@ -33,8 +30,6 @@ const { LocaleProvider } = require("../src/lib/locale") as typeof Locale;
 const ManageApp = (require("../src/features/explorer/ManageApp") as typeof Manage).default;
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof Navigation;
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigation;
-const AppConsultation = (require("../src/features/home/AppConsultation") as typeof Consultation).default;
-const { pausePrivateReads, allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof PrivateSession;
 
 const installId = "install-accounting";
 const path = `/api/app-installations/${installId}`;
@@ -57,12 +52,6 @@ let reads = 0;
 let unconfirmed = false;
 let conflict = false;
 const writes: unknown[] = [];
-const consultationPosts: { id: string; body: unknown }[] = [];
-const consultationReads: string[] = [];
-let acknowledgeConsultation = true;
-let consultationRead: "failure" | "missing" | "unconfirmed" | "answer" = "failure";
-let consultationReply = "  \n ";
-let heldAgentRead: Promise<Response> | null = null;
 let removePreviewCalls = 0;
 let removeCalls = 0;
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
@@ -76,20 +65,6 @@ globalThis.fetch = async (input, init) => {
   if (url === `${path}/remove`) {
     removeCalls += 1;
     return json({ ok: true });
-  }
-  if (url.startsWith(`${path}/agent/consultations/`)) {
-    const id = url.split("/").pop()!;
-    if (init?.method === "POST") {
-      consultationPosts.push({ id, body: JSON.parse(String(init.body)) });
-      if (!acknowledgeConsultation) return json({}, 502);
-      return json({ message: id, state: "accepted", duplicate: false }, 202);
-    }
-    consultationReads.push(id);
-    if (consultationRead === "failure") return json({}, 503);
-    if (consultationRead === "missing") return json({}, 404);
-    return consultationRead === "unconfirmed"
-      ? json({ message: id, state: "unconfirmed" })
-      : json({ message: id, state: "answered", text: consultationReply });
   }
   if (url === path) return json(install);
   if (url === "/api/app-installations") return json([install]);
@@ -106,7 +81,6 @@ globalThis.fetch = async (input, init) => {
     const stale = !!state && state.digest !== install.digest;
     if (init?.method !== "POST") {
       reads += 1;
-      if (heldAgentRead) return heldAgentRead;
       return json({ install_id: installId, digest: install.digest, revision, stale, agent: !stale && state?.profile ? pin(state.profile) : null, consultations: true });
     }
     const body = JSON.parse(String(init.body));
@@ -141,7 +115,7 @@ async function render(session: string | null, operator = true, hosted = false) {
       }) })));
   });
 }
-const change = (el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null | undefined, value: string) => React.act(async () => {
+const change = (el: HTMLInputElement | HTMLSelectElement | null | undefined, value: string) => React.act(async () => {
   assert(el, "The input is available");
   Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value")!.set!.call(el, value);
   el.dispatchEvent(new Event(el.tagName === "SELECT" ? "change" : "input", { bubbles: true }));
@@ -151,14 +125,6 @@ const click = (button: HTMLButtonElement | null | undefined) => React.act(async 
   button.click();
 });
 const updateButton = (label: string) => [...host.querySelectorAll("button")].find(button => button.textContent?.trim() === label);
-async function renderConsultation(session: string | null) {
-  await React.act(async () => {
-    root.render(React.createElement(LocaleProvider, null, session
-      ? React.createElement(AppConsultation, { key: session, session, onCompose: (text: string) => { composed = text; } })
-      : null));
-  });
-}
-let composed = "";
 
 async function main() {
   try {
@@ -197,96 +163,6 @@ async function main() {
     assert(!selector() && reads === allowedReads, "A platform operator without a private session does not read or see the setting");
     await render("member", false);
     assert(!selector() && reads === allowedReads, "Members do not read or see the owner setting");
-    owner = "owner-a";
-    owners.set(owner, { revision: 4, digest: install.digest, profile: keeper });
-    await renderConsultation("owner-a");
-    await click(updateButton("Consult app agent"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "exact source");
-    await React.act(async () => { pausePrivateReads(); allowPrivateReads(); });
-    const { promise, resolve: settleAgentRead } = Promise.withResolvers<Response>();
-    heldAgentRead = promise;
-    await click(updateButton("Consult app agent"));
-    assert(updateButton("Send to app agent")?.disabled, "An interrupted draft waits for a fresh recipient");
-    assert(host.querySelector<HTMLTextAreaElement>("textarea")?.value === "exact source", "Verification interruption retains editable text");
-    await React.act(async () => settleAgentRead(json({}, 503)));
-    heldAgentRead = null;
-    assert(updateButton("Send to app agent")?.disabled && consultationPosts.length === 0, "A failed recipient read cannot send");
-    await click(updateButton("Close"));
-    await click(updateButton("Consult app agent"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "exact source");
-    acknowledgeConsultation = false;
-    await click(updateButton("Send to app agent"));
-    const first = consultationPosts[0];
-    assert(first && Number(consultationPosts.length) === 1, "The first POST was sent with a lost acknowledgement");
-    await renderConsultation(null);
-    await renderConsultation("owner-a");
-    await click(updateButton("Review consultation"));
-    assert(!updateButton("Retry same message"), "Retry is not available before checking the original operation");
-    consultationRead = "missing";
-    await click(updateButton("Check reply"));
-    assert(consultationReads[0] === first.id && Number(consultationPosts.length) === 1, "Recovery reads the original ID without posting");
-    acknowledgeConsultation = true;
-    await click(updateButton("Retry same message"));
-    assert(JSON.stringify(consultationPosts[1]) === JSON.stringify(first), "The explicit retry keeps the original ID, binding and text");
-    consultationRead = "failure";
-    await click(updateButton("Check reply"));
-    assert(host.textContent?.includes("Could not check for the reply"), "A failed read preserves admission");
-    await React.act(async () => { pausePrivateReads(); allowPrivateReads(); });
-    await click(updateButton("Review consultation"));
-    consultationRead = "missing";
-    await click(updateButton("Check reply"));
-    assert(!updateButton("Retry same message") && Number(consultationPosts.length) === 2, "A 404 after admission never offers a retry");
-    await click(updateButton("Start another"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "another source");
-    await click(updateButton("Send to app agent"));
-    consultationRead = "unconfirmed";
-    await click(updateButton("Check reply"));
-    await click(updateButton("Check reply"));
-    assert(!updateButton("Retry same message"), "An admitted consultation is never retried on an unconfirmed reply");
-    await click(updateButton("Dismiss review"));
-    assert(updateButton("Consult app agent") && Number(consultationPosts.length) === 3, "Dismissal clears local review without sending");
-    await click(updateButton("Consult app agent"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "third source");
-    await click(updateButton("Send to app agent"));
-    consultationRead = "answer";
-    await click(updateButton("Check reply"));
-    const replyRegion = () => host.querySelector<HTMLElement>('.wa-field > pre[role="region"][aria-labelledby]');
-    const replyText = () => replyRegion()?.textContent;
-    assert(replyText() === "  \n ", "Whitespace-only reply is literal");
-    assert(replyRegion()?.tabIndex === 0 && !host.querySelector("details"), "Readable reply is focusable and omits escaped toggle without CR");
-    await click(updateButton("Review in Master composer"));
-    assert(composed.includes(JSON.stringify("  \n ")), "Master evidence preserves the reply");
-
-    await click(updateButton("Consult app agent"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "fourth source");
-    await click(updateButton("Send to app agent"));
-    consultationReply = "A\r\nB\rC";
-    await click(updateButton("Check reply"));
-    assert(replyText() === "A\nB\nC", "Readable reply normalizes CR and CRLF to line breaks");
-    const replyLabelId = replyRegion()?.getAttribute("aria-labelledby");
-    assert(replyLabelId && document.getElementById(replyLabelId)?.textContent === "Exact agent reply", "Readable reply region is labeled");
-    const escaped = host.querySelector<HTMLElement>("details pre");
-    assert(escaped?.textContent === JSON.stringify(consultationReply) && JSON.parse(escaped.textContent) === consultationReply, "Original line endings are selectable as escaped text");
-    assert(escaped.getAttribute("role") === "region" && escaped.tabIndex === 0, "Escaped reply region is keyboard-focusable");
-    const escapedLabelId = escaped.getAttribute("aria-labelledby");
-    assert(escapedLabelId && document.getElementById(escapedLabelId)?.textContent === "Show exact line endings", "Escaped reply region is labeled by its summary");
-    await click(updateButton("Review in Master composer"));
-    const composedEvidence = JSON.parse(composed.slice(composed.indexOf("{"))) as { reply: string };
-    assert(composedEvidence.reply === consultationReply, "Master evidence preserves untouched CR and CRLF");
-
-    await click(updateButton("Consult app agent"));
-    await change(host.querySelector("select"), installId);
-    await change(host.querySelector("textarea"), "fifth source");
-    await click(updateButton("Send to app agent"));
-    await click(updateButton("Check reply"));
-    assert(replyText() === "A\nB\nC", "Retained reply is present before session reset");
-    await React.act(async () => resetPrivateSession());
-    assert(!updateButton("Review consultation") && replyText() === undefined, "Session reset erases a retained private reply");
   } finally {
     await React.act(async () => { root.unmount(); });
     await win.happyDOM.close();
