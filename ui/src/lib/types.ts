@@ -2203,3 +2203,106 @@ export interface RoutinesPayload {
 export interface RoutinePayload {
   routine: Routine;
 }
+
+/** AOS-693 / CAD-2627: ephemeral user-triggered agent-to-agent temp channels. */
+export type TempChannelStatus = "open" | "closed" | "expired";
+export type TempChannelViewerRole = "host" | "peer" | "supervisor";
+export type TempChannelMessageRole = "host" | "peer" | "supervisor" | "system";
+export type TempChannelMessageKind =
+  | "request"
+  | "question"
+  | "report"
+  | "proposal"
+  | "decision"
+  | "system";
+export type TempChannelDecision = "handled" | "discarded" | "needs_human";
+export type TempChannelTriageStatus = "pending" | "handled" | "discarded" | "needs_human";
+export type TempChannelAuditStatusFilter = "all" | "open" | "needs_human" | "ended";
+
+export interface TempChannelSummary {
+  id: string;
+  workspace_id: string;
+  purpose: string;
+  status: TempChannelStatus;
+  created_at: number;
+  expires_at: number;
+  closed_at: number | null;
+  closed_reason: string | null;
+  max_messages: number;
+  message_count: number;
+  lock_first_peer: boolean;
+  peer_claimed: boolean;
+  peer_label: string | null;
+  peer_joined_at: number | null;
+  host_label: string | null;
+  latest_seq: number;
+}
+
+export interface TempChannelMessage {
+  seq: number;
+  id: string;
+  role: TempChannelMessageRole;
+  sender_label: string | null;
+  kind: TempChannelMessageKind;
+  body: string;
+  created_at: number;
+  in_reply_to: string | null;
+  triage_status: TempChannelTriageStatus | null;
+  decision_summary: string | null;
+  decided_at: number | null;
+  decided_by: string | null;
+  untrusted_external_data: boolean;
+}
+
+export interface TempChannelSnapshot {
+  channel: TempChannelSummary;
+  viewer_role: TempChannelViewerRole;
+  messages: TempChannelMessage[];
+  latest_seq: number;
+  security_notice: string;
+}
+
+export interface TempChannelAuditItem extends TempChannelSummary {
+  creator_user_id: string;
+  creator_label: string | null;
+  pending_count: number;
+  needs_human_count: number;
+  updated_at: number;
+}
+
+export interface TempChannelAuditCounts {
+  all: number;
+  open: number;
+  needs_human: number;
+  ended: number;
+}
+
+export interface TempChannelAuditListPayload {
+  channels: TempChannelAuditItem[];
+  total: number;
+  counts: TempChannelAuditCounts;
+}
+
+export interface TempChannelAuditDetailPayload {
+  snapshot: TempChannelSnapshot;
+  creator_user_id: string | null;
+  creator_label: string | null;
+}
+
+export interface TempChannelDecidePayload {
+  channel: TempChannelSummary;
+  target_message_id: string;
+  triage_status: TempChannelDecision;
+  decision_message: TempChannelMessage;
+}
+
+export interface TempChannelRotatePeerPayload {
+  channel: TempChannelSummary;
+  api_url: string;
+  peer_prompt: string;
+}
+
+export interface TempChannelClosePayload {
+  channel: TempChannelSummary;
+  message: TempChannelMessage | null;
+}

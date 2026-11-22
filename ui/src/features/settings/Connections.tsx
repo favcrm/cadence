@@ -11,6 +11,7 @@ import type {
   ConnectionSite,
   CustomMcpConnectionSummary,
   HostedAccount,
+  TempChannelAuditCounts,
 } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
@@ -60,6 +61,12 @@ import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
 import SettingsDrawer from "./SettingsDrawer";
+import TempChannelsTab from "./TempChannelsTab";
+import {
+  connectionsTabParam,
+  tempChannelFocusParam,
+  type ConnectionsTab,
+} from "./tempChannelsView";
 import {
   CustomMcpConnectDrawer,
   CustomMcpInspectDrawer,
@@ -347,6 +354,33 @@ function ConnectionsIndex({
   );
   const mcpAutoOpened = useRef(false);
 
+  // CAD-2627 / AOS-693: Hosted board underline tabs (Connected services | Temp channels).
+  const [activeTab, setActiveTab] = useState<ConnectionsTab>(() =>
+    typeof window === "undefined" || !hostedBoard ? "services" : connectionsTabParam(window.location.search),
+  );
+  const [initialTempChannelId] = useState<string | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : tempChannelFocusParam(window.location.search),
+  );
+  const [tempCounts, setTempCounts] = useState<TempChannelAuditCounts | null>(null);
+  const servicesTabRef = useRef<HTMLButtonElement | null>(null);
+  const tempTabRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!hostedBoard || viewer.operator === null) return;
+    let alive = true;
+    void api
+      .tempChannelsList({ limit: 1 })
+      .then((res) => {
+        if (alive && res.counts) setTempCounts(res.counts);
+      })
+      .catch(() => {
+        // Older servers return 404; degrade silently until user opens the tab or upgrades.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [hostedBoard, viewer.operator]);
+
   const loadCustomMcp = (stillMounted?: () => boolean) => {
     if (!hostedBoard || viewer.operator === null) return;
     api
@@ -419,6 +453,25 @@ function ConnectionsIndex({
       ? returnedRow(visibleRows, returned.toolkit)
       : null;
 
+  const onTabKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    const order: { id: ConnectionsTab; ref: React.RefObject<HTMLButtonElement | null> }[] = [
+      { id: "services", ref: servicesTabRef },
+      { id: "temp-channels", ref: tempTabRef },
+    ];
+    const idx = order.findIndex((item) => item.id === activeTab);
+    if (idx === -1) return;
+    let nextIdx = idx;
+    if (e.key === "ArrowRight") nextIdx = (idx + 1) % order.length;
+    else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + order.length) % order.length;
+    else if (e.key === "Home") nextIdx = 0;
+    else if (e.key === "End") nextIdx = order.length - 1;
+    else return;
+    e.preventDefault();
+    const next = order[nextIdx];
+    setActiveTab(next.id);
+    next.ref.current?.focus();
+  };
+
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
       <div className="flex flex-wrap items-start gap-3 mb-4">
@@ -426,7 +479,7 @@ function ConnectionsIndex({
           <h1 id="connections-title" className="text-section font-medium text-ink-100">{t("Connections")}</h1>
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
-        {viewer.operator && (
+        {viewer.operator && (!hostedBoard || activeTab === "services") && (
           <div className="flex flex-wrap gap-1.5 shrink-0 items-center">
             <StaleChip state={listState ?? emptyGate} />
             <StaleChip state={providersState ?? emptyGate} />
@@ -446,6 +499,41 @@ function ConnectionsIndex({
         )}
       </div>
 
+      {hostedBoard && viewer.operator !== null && (
+        <nav className="conn-tabs" role="tablist" aria-label={t("Connections sections")} onKeyDown={onTabKeyDown}>
+          <button
+            ref={servicesTabRef}
+            id="conn-tab-services"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "services"}
+            aria-controls="conn-panel-services"
+            className="conn-tab"
+            onClick={() => setActiveTab("services")}
+          >
+            <span>{t("Connected services")}</span>
+          </button>
+          <button
+            ref={tempTabRef}
+            id="conn-tab-temp-channels"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "temp-channels"}
+            aria-controls="conn-panel-temp-channels"
+            className="conn-tab"
+            onClick={() => setActiveTab("temp-channels")}
+          >
+            <span>{t("Temp channels")}</span>
+            {tempCounts !== null && <span className="conn-tabn">{tempCounts.all}</span>}
+            {tempCounts !== null && tempCounts.needs_human > 0 && (
+              <span className="conn-tabn conn-tabn-warn">
+                {t("{n} needs human").replace("{n}", String(tempCounts.needs_human))}
+              </span>
+            )}
+          </button>
+        </nav>
+      )}
+
       {viewer.operator === null ? (
         <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
           {viewer.access === "unavailable" ? (
@@ -459,8 +547,21 @@ function ConnectionsIndex({
             t("Connections are available to the operator; the board is still proving this session.")
           )}
         </PageState>
+      ) : hostedBoard && activeTab === "temp-channels" ? (
+        <div id="conn-panel-temp-channels" role="tabpanel" aria-labelledby="conn-tab-temp-channels">
+          <TempChannelsTab
+            canWrite={!viewer.readOnly}
+            initialOpenId={initialTempChannelId}
+            onCountsChange={setTempCounts}
+          />
+        </div>
       ) : !viewer.operator ? (
-        <div className="space-y-4 min-w-0">
+        <div
+          id={hostedBoard ? "conn-panel-services" : undefined}
+          role={hostedBoard ? "tabpanel" : undefined}
+          aria-labelledby={hostedBoard ? "conn-tab-services" : undefined}
+          className="space-y-4 min-w-0"
+        >
           <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
           {hostedBoard && mcpRows.length > 0 && (
             <CustomMcpServerList
@@ -491,7 +592,11 @@ function ConnectionsIndex({
           )}
         </div>
       ) : (
-        <>
+        <div
+          id={hostedBoard ? "conn-panel-services" : undefined}
+          role={hostedBoard ? "tabpanel" : undefined}
+          aria-labelledby={hostedBoard ? "conn-tab-services" : undefined}
+        >
           {mcpReturned !== null && (
             <CustomMcpReturnBanner
               returned={mcpReturned}
@@ -643,7 +748,7 @@ function ConnectionsIndex({
               }}
             />
           )}
-        </>
+        </div>
       )}
     </section>
   );

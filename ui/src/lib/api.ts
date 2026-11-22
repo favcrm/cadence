@@ -45,6 +45,12 @@ import type {
   CustomMcpOAuthStartPayload,
   CustomMcpRevokePayload,
   CustomMcpToolMode,
+  TempChannelAuditDetailPayload,
+  TempChannelAuditListPayload,
+  TempChannelClosePayload,
+  TempChannelDecidePayload,
+  TempChannelDecision,
+  TempChannelRotatePeerPayload,
   Health,
   ProjectTimeline,
   ProtectedEntry,
@@ -1544,6 +1550,42 @@ export const api = {
     ),
   customMcpRevoke: (id: string) =>
     del<CustomMcpRevokePayload>(`/api/connections/mcp/${encodeURIComponent(id)}`),
+  /** AOS-693 / CAD-2627: Temp channels Inspect & Audit on a hosted workspace. */
+  tempChannelsList: (
+    params?: { status?: string; q?: string; limit?: number; offset?: number },
+    signal?: AbortSignal,
+  ) => {
+    const query = new URLSearchParams();
+    if (params?.status) query.set("status", params.status);
+    if (params?.q) query.set("q", params.q);
+    if (params?.limit !== undefined) query.set("limit", String(params.limit));
+    if (params?.offset !== undefined) query.set("offset", String(params.offset));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return get<TempChannelAuditListPayload>(`/api/connections/temp-channels${suffix}`, signal);
+  },
+  tempChannelDetail: (id: string, signal?: AbortSignal) =>
+    get<TempChannelAuditDetailPayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}`,
+      signal,
+    ),
+  tempChannelDecide: (
+    id: string,
+    body: { message_id: string; decision: TempChannelDecision; summary: string; body?: string },
+  ) =>
+    post<TempChannelDecidePayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/decide`,
+      body,
+    ),
+  tempChannelRotatePeer: (id: string) =>
+    post<TempChannelRotatePeerPayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/rotate-peer`,
+      {},
+    ),
+  tempChannelClose: (id: string, body?: { reason?: string }) =>
+    post<TempChannelClosePayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/close`,
+      body ?? {},
+    ),
   /**
    * `POST /api/connections/<id>/status` — the local configuration
    * check (operator-only). It inspects local configuration only: it
