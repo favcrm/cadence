@@ -19,8 +19,13 @@
   inset-block-end: 0;
   z-index: 1;
   grid-template-rows: minmax(0, 1fr);
-  padding: 0 clamp(0.75rem, 2.75cqi, 1.75rem) max(0.75rem, env(safe-area-inset-bottom));
+  padding: 1rem clamp(0.75rem, 2.75cqi, 1.75rem) max(0.75rem, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, color-mix(in srgb, var(--color-ink-950) 92%, transparent) 55%, transparent);
   pointer-events: none;
+}
+
+.wa-reply-dock[data-overlay]:has(> .wa-reply-status) {
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .wa-reply-dock[data-overlay]:not([data-inset]), .wa-reply-dock[data-inset="empty"] { visibility: hidden; }
@@ -37,6 +42,9 @@
   border-radius: 1rem;
   background-color: var(--color-ink-850);
   box-shadow: none;
+}
+.wa-reply-dock[data-overlay] .app-chat-composer.wa-reply-card[data-locked="true"] {
+  border-color: color-mix(in srgb, var(--color-warn) 44%, transparent);
 }
 .wa-reply-dock[data-overlay] .app-chat-composer.wa-reply-card:focus-within {
   border-color: color-mix(in srgb, var(--color-accent) 75%, transparent);
@@ -94,15 +102,44 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.35rem 0.6rem;
+  justify-content: space-between;
+  gap: 0.35rem 0.65rem;
+  padding: 0.425rem 0.7rem;
+  border-radius: 0.625rem;
+  border: 1px solid color-mix(in srgb, var(--color-edge) 28%, transparent);
+  background: var(--color-ink-850);
+  color: var(--color-ink-200);
+  box-shadow: var(--board-composer-shadow);
 }
 
-.wa-reply-status > p { margin: 0; }
+.wa-reply-status[data-tone="confirming"],
+.wa-reply-status[data-tone="accepted"] {
+  border-color: color-mix(in srgb, var(--color-info) 38%, transparent);
+  background: color-mix(in srgb, var(--color-info) 11%, var(--color-ink-850));
+}
+
+.wa-reply-status[data-tone="sent"] {
+  border-color: color-mix(in srgb, var(--color-ok) 40%, transparent);
+  background: color-mix(in srgb, var(--color-ok) 11%, var(--color-ink-850));
+}
+
+.wa-reply-status[data-tone="uncertain"] {
+  border-color: color-mix(in srgb, var(--color-warn) 48%, transparent);
+  background: color-mix(in srgb, var(--color-warn) 14%, var(--color-ink-850));
+}
+
+.wa-reply-status[data-tone="failed"] {
+  border-color: color-mix(in srgb, var(--color-fail) 45%, transparent);
+  background: color-mix(in srgb, var(--color-fail) 13%, var(--color-ink-850));
+}
+
+.wa-reply-status > p { margin: 0; flex: 1 1 12rem; }
 .wa-reply-tools { justify-content: flex-end; }
 .wa-reply-hint { margin-inline-end: auto; }
 
 .wa-reply-send {
   flex: none;
+  margin-inline-start: auto;
   display: grid;
   place-items: center;
   width: 2.125rem;
