@@ -754,8 +754,12 @@ fn project_verbs_are_a_registered_read_and_owner_write() {
     assert!(REMOTE_VERBS.contains(&"project_ls"));
     assert!(REMOTE_VERBS.contains(&"project_new"));
     assert!(REMOTE_VERBS.contains(&"project_timeline"));
+    assert!(REMOTE_VERBS.contains(&"project_policy_read"));
     assert_eq!(cli_requested_scopes("project_timeline"), &["cli.read"]);
     assert!(!mutating_cli_verb("project_timeline"));
+    assert_eq!(cli_requested_scopes("project_policy_read"), &["cli.read"]);
+    assert!(!mutating_cli_verb("project_policy_read"));
+    assert!(mutating_cli_verb("project_policy"));
     assert_eq!(cli_requested_scopes("project_ls"), &["cli.read"]);
     assert_eq!(cli_requested_scopes("project_new"), &["cli.write"]);
     assert!(!mutating_cli_verb("project_ls"));
@@ -763,6 +767,36 @@ fn project_verbs_are_a_registered_read_and_owner_write() {
     assert!(
         lost_mutation_note("project_new").contains("issue project ls"),
         "a lost project create must send the caller back to the registry read"
+    );
+
+    let read_args = json!({"project": "atlas"}).as_object().unwrap().clone();
+    let (ok_out, ok_requests) = run(
+        vec![(200, "", json!({"state": "not_stored", "project": "atlas"}))],
+        "project_policy_read",
+        read_args.clone(),
+        10,
+    );
+    assert_eq!(
+        ok_out.unwrap(),
+        json!({"state": "not_stored", "project": "atlas"})
+    );
+    assert_eq!(hits(&ok_requests, "/__platform/cli/authorize"), 1);
+    assert_eq!(
+        ok_requests[0]["body"]["requested_scopes"],
+        json!(["cli.read"])
+    );
+
+    let (err_out, _) = run(
+        vec![(500, "", json!({"error": "down"}))],
+        "project_policy_read",
+        read_args,
+        10,
+    );
+    let err = err_out.unwrap_err();
+    assert_ne!(
+        err.kind(),
+        "unknown",
+        "read verb 5xx must not surface as outcome_unknown: {err}"
     );
 }
 

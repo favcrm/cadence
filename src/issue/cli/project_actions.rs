@@ -59,9 +59,16 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 key,
                 visibility,
                 grants,
+                clear_grants,
+                json: _,
             } => {
+                let desired =
+                    resolve_project_policy_request(key, *visibility, grants, *clear_grants)?;
                 let pm = open_pm()?;
-                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants, "")?;
+                let out = match desired {
+                    None => write::read_project_policy(&pm, key)?,
+                    Some(vis) => write::set_project_policy(&pm, key, vis.recorded(), grants, "")?,
+                };
                 print_json(&out);
                 Ok(0)
             }

@@ -157,6 +157,16 @@ pub enum Visibility {
     Private,
 }
 
+impl Visibility {
+    /// Canonical hyphenated wire/JSON spelling shared across policy read/write paths.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceVisible => "workspace-visible",
+            Self::Private => "private",
+        }
+    }
+}
+
 /// One grant on a private project, keyed to a caller spelling the daemon
 /// already uses (`users/<sub>`, `operator`).
 ///
