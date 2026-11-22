@@ -3,7 +3,7 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { isolate } from "../decisions/stagedWrite";
-import { ageWords, kindSpec, metaLine, type HomeNeed } from "./needs";
+import { ageWords, kindSpec, type HomeNeed } from "./needs";
 import { cleanPermissionInline } from "./permissionFormat";
 import { todoPresentation } from "./railModel";
 import { marksFor, useTodoLocal } from "./todoLocal";
@@ -49,12 +49,18 @@ export default function TodoCard({
   const rawSource =
     action.type === "permission"
       ? t("Master")
-      : t(pres.sourceLabel);
+      : action.type === "staged"
+        ? (action.app ?? t("Workspace"))
+        : t(pres.sourceLabel);
+
+  const stagedDetail = action.type === "staged" ? need.summary ?? action.askedBy ?? null : null;
+  const stagedFooterAsker = action.type === "staged" && need.summary && action.askedBy ? action.askedBy : null;
+  const stagedExternal = action.type === "staged" && action.external;
 
   const summary = done
     ? doneText
     : action.type === "staged"
-      ? <bdi>{isolate(metaLine(need))}</bdi>
+      ? (stagedDetail ? <bdi>{isolate(stagedDetail)}</bdi> : undefined)
       : action.type === "permission"
         ? <span className="font-mono text-micro">{cleanPermissionInline(action.argv)}</span>
         : action.type === "merge"
@@ -66,9 +72,17 @@ export default function TodoCard({
               : (need.why && need.why !== rawSource ? need.why : null) ?? need.summary ?? undefined;
 
   const projectMeta =
-    action.type !== "staged" && need.project && need.project !== "all" && need.project !== rawSource
-      ? need.project
-      : undefined;
+    action.type === "staged"
+      ? stagedExternal
+        ? stagedFooterAsker
+          ? <>{t("External")} · <bdi>{isolate(stagedFooterAsker)}</bdi></>
+          : t("External")
+        : stagedFooterAsker
+          ? <bdi>{isolate(stagedFooterAsker)}</bdi>
+          : undefined
+      : need.project && need.project !== "all" && need.project !== rawSource
+        ? need.project
+        : undefined;
   const cue = done
     ? t("Done")
     : sending
@@ -92,13 +106,14 @@ export default function TodoCard({
         metaClassName="todo-meta"
         tone={pres.tone}
         statusLabel={t(pres.kindLabel)}
-        source={action.type === "staged" ? <bdi>{isolate(rawSource)}</bdi> : rawSource}
+        source={action.type === "staged" && action.app ? <bdi>{isolate(rawSource)}</bdi> : rawSource}
         age={ageWords(need.age)}
         done={done}
         disabled={done}
         title={<span className="todo-title" title={title}>{action.type === "staged" ? <bdi>{isolate(title)}</bdi> : title}</span>}
         summary={summary}
         meta={projectMeta}
+        external={stagedExternal}
         cue={cue}
         onOpen={(event) => {
           if (done) return;

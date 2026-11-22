@@ -2,7 +2,7 @@ import type { AgentsPayload, NeedsMe, StagedRoutineProposal, ThreadRef } from ".
 import { routePath } from "../../lib/router";
 import { hasScopedAssistantRoster, PERSONAL_ALIAS } from "../agents/personalAssistant";
 import { MASTER } from "./master";
-import { sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
+import { askedBy, sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
  * The Home rail's "Needs you" (CAD-328), built from the overview's
@@ -50,6 +50,9 @@ export type NeedAction =
        *  never comes from `needs_me`, the rail merges it in client-side. */
       type: "staged";
       id: string;
+      app: string | null;
+      askedBy: string | null;
+      external: boolean;
     }
   | {
       type: "permission";
@@ -523,6 +526,27 @@ export function needFingerprint(need: HomeNeed): string {
   return `${need.kind}|${id}`;
 }
 
+function stagedSummary(write: StagedWrite): string | null {
+  const cliSummary = write.cli?.summary?.trim();
+  if (cliSummary) return cliSummary;
+  const reason = write.reason?.trim();
+  if (reason) return reason;
+  const previewTitle = (write.connected?.preview?.title ?? write.customMcp?.preview?.title)?.trim();
+  if (previewTitle && previewTitle !== write.title.trim()) return previewTitle;
+  const targetLabel = write.target?.label?.trim();
+  if (targetLabel && !write.title.toLowerCase().includes(targetLabel.toLowerCase())) return targetLabel;
+  if (write.kind === "app_call" && write.changes.length > 0) {
+    const labels: string[] = [];
+    for (const change of write.changes) {
+      const label = change.label.trim();
+      if (label && !labels.includes(label)) labels.push(label);
+      if (labels.length === 3) break;
+    }
+    if (labels.length > 0) return labels.join(", ");
+  }
+  return null;
+}
+
 /** A pending staged decision as a To do card (CAD-2186). Built here, never read from `needs_me`. */
 export function stagedNeed(write: StagedWrite, t: (english: string) => string, nowMs = Date.now()): HomeNeed {
   return {
@@ -536,13 +560,19 @@ export function stagedNeed(write: StagedWrite, t: (english: string) => string, n
     age: Math.max(0, Math.floor((nowMs - write.createdAt) / 1000)),
     project: null,
     subject: null,
-    summary: null,
+    summary: stagedSummary(write),
     escalatedBy: null,
     command: "",
     link: null,
     issue: null,
     agent: null,
-    action: { type: "staged", id: write.id },
+    action: {
+      type: "staged",
+      id: write.id,
+      app: write.app,
+      askedBy: askedBy(write, t),
+      external: write.connected !== null || write.customMcp != null,
+    },
   };
 }
 

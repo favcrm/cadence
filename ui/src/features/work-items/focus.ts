@@ -29,9 +29,23 @@ export function restoreDetailFocus(opener: Element | null): void {
       return;
     }
     const heading = document.querySelector<HTMLElement>("[data-outlet-heading]");
-    if (heading === null) return;
-    if (!heading.hasAttribute("tabindex")) heading.tabIndex = -1;
-    heading.focus({ preventScroll: true });
+    if (heading !== null) {
+      if (!heading.hasAttribute("tabindex")) heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+      return;
+    }
+    // Home renders no [data-outlet-heading]; restore to the active rail entry point.
+    const selectors = window.innerWidth >= 1100
+      ? [".needsrail .todo-tabs > button", ".needbtn"]
+      : [".needbtn", ".needsrail .todo-tabs > button"];
+    const elements = selectors
+      .map((selector) => document.querySelector<HTMLElement>(selector))
+      .filter((el): el is HTMLElement => el !== null && el.isConnected);
+    const hasLayout = document.body.getClientRects().length > 0;
+    const fallback = hasLayout
+      ? elements.find((el) => el.getClientRects().length > 0) ?? null
+      : elements[0] ?? null;
+    fallback?.focus({ preventScroll: true });
   };
   // Browsers schedule after the removed drawer's layout and after any
   // explicit focus request from the closing action; a frame-less host (the

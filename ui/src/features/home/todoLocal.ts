@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from "react";
-import type { NeedsMe } from "../../lib/types";
+import type { NeedsMe, Overview } from "../../lib/types";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { needFingerprint, todoCount, todoSplit, type HomeNeed } from "./needs";
 
@@ -25,11 +25,21 @@ export interface TodoLocal {
   done: ReadonlyMap<string, { fp: string; text: string }>;
   sent: ReadonlyMap<string, string>;
   sending: ReadonlyMap<string, string>;
+  decidedRoutines: ReadonlySet<string>;
   /** Counts mounts of the Home rail; see `scope`. */
   visit: number;
 }
 
-const empty = (visit = 0): TodoLocal => ({ hidden: new Map(), done: new Map(), sent: new Map(), sending: new Map(), visit });
+export type OverviewRoutines = Pick<Overview, "routine_needs" | "routine_proposals" | "routine_step_holds">;
+
+const empty = (visit = 0): TodoLocal => ({
+  hidden: new Map(),
+  done: new Map(),
+  sent: new Map(),
+  sending: new Map(),
+  decidedRoutines: new Set(),
+  visit,
+});
 let state: TodoLocal = empty();
 const listeners = new Set<() => void>();
 
@@ -55,6 +65,12 @@ export const sendingTodo = (need: HomeNeed) => set({ ...state, sending: mark(sta
 /** A send ended: success marks the card sent, failure leaves it idle. */
 export const settleTodo = (need: HomeNeed, ok: boolean) =>
   set({ ...state, sending: unmark(state.sending, need), sent: ok ? mark(state.sent, need, scope(need, state.visit)) : state.sent });
+export const decideRoutine = (id: string) => {
+  if (state.decidedRoutines.has(id)) return;
+  const next = new Set(state.decidedRoutines);
+  next.add(id);
+  set({ ...state, decidedRoutines: next });
+};
 
 const has = (m: ReadonlyMap<string, string>, need: HomeNeed, fp = needFingerprint(need)) => m.get(need.key) === fp;
 
@@ -78,6 +94,28 @@ export const isSettled = (local: TodoLocal, need: HomeNeed) => {
   return m.hidden || m.doneText !== undefined;
 };
 
+function routineIds(routines: OverviewRoutines | null | undefined): string[] {
+  if (!routines) return [];
+  return [
+    ...(routines.routine_needs ?? []).map((r) => r.id),
+    ...(routines.routine_proposals ?? []).map((p) => p.id),
+    ...(routines.routine_step_holds ?? []).map((run) => run.id),
+  ];
+}
+
+export function pendingRoutineCount(routines: OverviewRoutines | null | undefined, local: TodoLocal): number {
+  return routineIds(routines).filter((id) => !local.decidedRoutines.has(id)).length;
+}
+
+/** Forget decided routine marks whose IDs are no longer in the overview. */
+export function reconcileRoutines(ids: readonly string[]) {
+  if (state.decidedRoutines.size === 0) return;
+  const live = new Set(ids);
+  const kept = new Set([...state.decidedRoutines].filter((id) => live.has(id)));
+  if (kept.size === state.decidedRoutines.size) return;
+  set({ ...state, decidedRoutines: kept });
+}
+
 /** Forget entries whose row is gone or has changed, so a returning need starts fresh. */
 export function reconcileTodo(current: readonly HomeNeed[]) {
   const by = new Map(current.map((n) => [n.key, n]));
@@ -89,6 +127,7 @@ export function reconcileTodo(current: readonly HomeNeed[]) {
     done: keep(state.done, (v) => v.fp, here),
     sent: keep(state.sent, (v) => v, here),
     sending: keep(state.sending, (v) => v, needFingerprint),
+    decidedRoutines: state.decidedRoutines,
     visit: state.visit,
   };
   const same = (a: ReadonlyMap<string, unknown>, b: ReadonlyMap<string, unknown>) => a.size === b.size;
@@ -112,14 +151,23 @@ export function useTodoLocal(): TodoLocal {
 }
 
 /** The sidebar's Home badge: pending To do items, less what the operator just settled. */
-export function useHomeCount(rows: NeedsMe[] | null | undefined, staged = 0): number {
+export function useHomeCount(
+  rows: NeedsMe[] | null | undefined,
+  staged = 0,
+  routines?: OverviewRoutines | null,
+): number {
   const local = useTodoLocal();
   const needs = rows ? todoSplit(rows).todo : null;
   const sig = needs?.map((n) => `${n.key}\t${needFingerprint(n)}`).join("\n") ?? null;
+  const ids = routines ? routineIds(routines) : null;
+  const routineSig = ids ? ids.join("\n") : null;
   // `sig` stands for `needs`: re-run only when a key or fingerprint changes.
   useEffect(() => {
     if (needs) reconcileTodo(needs);
   }, [sig]);
-  // Staged decisions (CAD-2186) are not in the overview; the caller counts them.
-  return todoCount(rows, (n) => isSettled(local, n)) + staged;
+  useEffect(() => {
+    if (ids) reconcileRoutines(ids);
+  }, [routineSig]);
+  // Staged decisions (CAD-2186) and pending routines (CAD-2317) count alongside `needs_me`.
+  return todoCount(rows, (n) => isSettled(local, n)) + staged + pendingRoutineCount(routines, local);
 }
