@@ -83,6 +83,16 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   assert(!(host.querySelector("aside")?.textContent ?? "").toLowerCase().includes("session"), "no old SESSION block");
   assert(!row.closest(".overflow-y-auto"), "the footer is outside the scrolling nav, so its dialog is not clipped");
   const aside = host.querySelector("aside")!;
+  const asideTokens = aside.className.split(/\s+/);
+  assert(
+    !asideTokens.includes("overflow-x-hidden") && !asideTokens.includes("overflow-hidden"),
+    "aside must not clip the 16rem account popover across the sidebar border",
+  );
+  assert(asideTokens.includes("min-w-0"), "aside keeps min-w-0 so the grid column shrinks to 64px rail cleanly");
+  assert(
+    aside.querySelector(".sidebar-scroll")?.className.split(/\s+/).includes("overflow-x-hidden"),
+    "inner sidebar scroll area retains overflow-x-hidden",
+  );
   const raised = () => /\bz-\[/.test(aside.className) || aside.hasAttribute("data-account-open");
   assert(!raised(), "menu closed: the aside carries no z-index (it must not cover the page's scrims)");
   await React.act(async () => { row.click(); });
@@ -189,6 +199,10 @@ for (const state of [
   assert(host.querySelector("aside"), "explicit local anonymous access mounts the workspace");
   assert(privateReads > 0, "admitted local workspace may load private resources");
   assert(!host.querySelector("[data-account-menu]"), "anonymous reader never gains an account identity");
+  assert(
+    host.querySelector("[data-sidebar-footer] > div")?.className.split(/\s+/).includes("truncate"),
+    "signed-out footer truncates cleanly in 64px collapsed rail mode",
+  );
   done();
 }
 
