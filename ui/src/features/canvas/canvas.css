@@ -332,11 +332,11 @@
 
 /* ---- CAD-2657: the app view's one header row, and the full-width canvas ---- */
 .cv-vhead { flex-wrap: nowrap; min-height: 3rem; padding: 8px 8px 8px 12px; background: var(--color-ink-875); }
-/* The title keeps priority over its chips; each chip and the title end in an ellipsis, never a second row. */
-.cv-vtitle { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 600; }
-.cv-chips { display: flex; flex: 0 4 auto; min-width: 0; gap: 6px; overflow: hidden; }
-.cv-chip { flex: 0 1 auto; min-width: 0; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px; border-radius: 6px; background: var(--color-ink-800); color: var(--color-ink-300); font-size: var(--text-micro); }
-.cv-chip-more { display: none; flex: none; border: 1px solid var(--color-ink-700); background: none; }
+/* The title is what truncates (an ellipsis, never a second row); chips keep their width and fold into "+N" instead. */
+.cv-vtitle { flex: 0 1 auto; min-width: 2.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 600; }
+.cv-chips { display: flex; flex: none; gap: 6px; }
+.cv-chip { flex: none; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px; border-radius: 6px; background: var(--color-ink-800); color: var(--color-ink-300); font-size: var(--text-micro); }
+.cv-chip-more { display: none; flex: none; max-width: none; border: 1px solid var(--color-ink-700); background: none; }
 .cv-gap { flex: 1 1 0; min-width: 0; }
 .cv-sep { flex: none; width: 1px; height: 1.125rem; background: var(--color-ink-700); }
 .cv-lock { position: relative; display: inline-grid; flex: none; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 6px; color: var(--color-ink-500); }
@@ -344,18 +344,22 @@
 .cv-tip { display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; width: max-content; max-width: 16rem; padding: 6px 10px; border-radius: 8px; background: var(--color-ink-100); color: var(--color-ink-900); font-size: var(--text-micro); line-height: 1.4; }
 .cv-lock:hover .cv-tip, .cv-lock:focus .cv-tip { display: block; }
 .cv-open { display: inline-flex; flex: 0 1 auto; align-items: center; gap: 6px; min-width: 0; max-width: 40%; overflow: hidden; white-space: nowrap; border: 1px solid var(--color-ink-700); }
+.cv-open svg { flex: none; }
 .cv-open-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .cv-fold { display: none; flex: none; }
 .cv-back { display: inline-flex; align-items: center; width: auto; gap: 6px; }
 .cv-back[data-expanded] { padding: 0 8px; font-size: var(--text-label); color: var(--color-ink-200); }
 .cv-back kbd { padding: 0 5px; border: 1px solid var(--color-ink-600); border-radius: 4px; color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
-/* As the pane narrows: the "Open in" label goes, then the actions fold into "⋯", then the chips into the first and "+N". */
-@container cv-main (max-width: 560px) { .cv-open-label { display: none; } }
+/* As the pane narrows: the chips fold into the first and "+N" and "Open in" goes icon-only, then the actions fold into "⋯". */
+@container cv-main (max-width: 640px) {
+  .cv-open-label { display: none; }
+  .cv-chip:not(:first-child):not(.cv-chip-more) { display: none; }
+  .cv-chip-more { display: inline-block; }
+}
 @container cv-main (max-width: 480px) {
   .cv-wide { display: none; }
   .cv-fold { display: inline-flex; }
-  .cv-chip:not(:first-child):not(.cv-chip-more) { display: none; }
-  .cv-chip-more { display: inline-block; }
+  .cv-chip { max-width: 7rem; }
 }
 .canvas-drawer[data-mode="sheet"] .cv-lock { width: 2.25rem; height: 2.25rem; }
 

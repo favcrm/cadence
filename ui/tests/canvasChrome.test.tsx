@@ -91,8 +91,12 @@ assert((expandedHead.match(/<header/g) ?? []).length === 1, "one header row");
 
 // ---- the narrow rules, as written ----
 const css = require("fs").readFileSync(`${process.cwd()}/src/features/canvas/canvas.css`, "utf8") as string;
-assert(/@container cv-main \(max-width: 560px\) \{ \.cv-open-label \{ display: none; \} \}/.test(css), "the Open in label goes first");
-assert(/@container cv-main \(max-width: 480px\)[^]*\.cv-wide \{ display: none; \}[^]*\.cv-fold \{ display: inline-flex; \}[^]*\.cv-chip-more \{ display: inline-block; \}/.test(css), "below 480px the actions fold into the menu and the chips into +N");
+assert(/@container cv-main \(max-width: 640px\) \{[^}]*\.cv-open-label \{ display: none; \}[^}]*\.cv-chip:not\(:first-child\):not\(\.cv-chip-more\) \{ display: none; \}[^}]*\.cv-chip-more \{ display: inline-block; \}/.test(css), "up to 640px the chips fold into the first and +N and Open in goes icon-only");
+assert(/@container cv-main \(max-width: 480px\)[^]*\.cv-wide \{ display: none; \}[^]*\.cv-fold \{ display: inline-flex; \}/.test(css), "below 480px the actions fold into the menu");
+assert(/\.cv-chips \{[^}]*flex: none;/.test(css) && /\.cv-chip \{[^}]*flex: none;/.test(css) && /\.cv-chip-more \{[^}]*flex: none;/.test(css), "chips and +N never shrink");
+assert(/\.cv-vtitle \{[^}]*flex: 0 1 auto;[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;/.test(css), "the title is what truncates");
+const longTitle = render({ title: "Quarterly profit and loss by cost centre, compared with prior year", chips: ["Q3 2026", "vs prior year", "by month"] });
+assert(longTitle.includes('class="cv-vtitle" title="Quarterly profit and loss by cost centre, compared with prior year"') && longTitle.includes("data-chips-more"), "a long title keeps its full text in a title and the +N stays");
 
 // ---- the drawer ----
 (win as any).innerWidth = 1400;
@@ -170,6 +174,8 @@ await settle();
 await click(el(hostEl, '[aria-label="Expand canvas"]')!);
 await click(el(hostEl, ".cv-back[data-expanded]")!);
 assert(!chrome.canvasChrome().full && el(hostEl, "[data-canvas-drawer]"), "Back to chat restores the split");
+await React.act(async () => { await new Promise((r) => requestAnimationFrame(() => r(null))); });
+assert(document.activeElement === el(hostEl, "[data-expand]"), "after Back to chat, focus lands on the expand control");
 await click(el(hostEl, '[aria-label="Expand canvas"]')!);
 await click(el(hostEl, '[aria-label="Collapse canvas"]')!);
 assert(!chrome.canvasChrome().full, "the collapse icon restores the split");

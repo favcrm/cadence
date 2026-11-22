@@ -3,11 +3,12 @@
  * (the phone sheet, or an expanded canvas) or the app's mark, the view's title
  * (the tab strip already says it when there are two or more) and the view's
  * params as chips. Right: the read-only lock, "Open in <App>", expand, close.
- * Width is the pane's own (a container query in canvas.css): the "Open in"
- * label goes first, then the actions fold into "⋯", then the chips into the
- * first one and "+N". Every part keeps its full text in a title.
+ * Width is the pane's own (a container query in canvas.css): the chips fold
+ * into the first one and "+N" and "Open in" goes icon-only, then the actions
+ * fold into "⋯". Chips never shrink: they show whole or fold, and the title is
+ * what truncates. Every part keeps its full text in a title.
  */
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { navigate } from "../../lib/useLocation";
 import Link from "../../ui/Link";
@@ -31,18 +32,29 @@ export interface ViewHeaderProps {
   onClose: () => void;
 }
 
+/** Leaving the expanded canvas removes the focused "Back to chat": hand focus to the expand control (or the "⋯" that holds it) rather than the page. */
+function focusExpand(root: HTMLElement | null): void {
+  requestAnimationFrame(() => {
+    for (const target of [root?.querySelector<HTMLElement>("[data-expand]"), root?.querySelector<HTMLElement>(".cv-fold button")]) {
+      target?.focus();
+      if (target && document.activeElement === target) return;
+    }
+  });
+}
+
 export default function ViewHeader({ mark, back, title, chips, note, open, expand, onClose }: ViewHeaderProps) {
   const t = useTranslate();
+  const head = useRef<HTMLElement | null>(null);
   const more = chips.slice(1);
   const expandLabel = t(expand?.expanded ? "Collapse canvas" : "Expand canvas");
   const folded: RowMenuItem[] = [];
   if (open) folded.push({ key: "open", label: open.label, hint: note ?? undefined, onSelect: () => { open.onOpen(); navigate(open.href); } });
   if (expand?.enabled) folded.push({ key: "expand", label: expandLabel, onSelect: expand.onToggle });
   return (
-    <header className="cv-head cv-vhead" data-view-header>
+    <header ref={head} className="cv-head cv-vhead" data-view-header>
       {back ? (
         <>
-          <button type="button" className="cv-iconbtn cv-back" data-expanded={back.expanded || undefined} onClick={back.onBack} aria-label={t("Back to chat")}>
+          <button type="button" className="cv-iconbtn cv-back" data-expanded={back.expanded || undefined} onClick={() => { back.onBack(); if (back.expanded) focusExpand(head.current); }} aria-label={t("Back to chat")}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
               <path d="m15 18-6-6 6-6" />
             </svg>
@@ -77,7 +89,7 @@ export default function ViewHeader({ mark, back, title, chips, note, open, expan
         </Link>
       ) : null}
       {expand ? (
-        <button type="button" className="cv-iconbtn cv-wide" onClick={expand.onToggle} disabled={!expand.enabled} aria-pressed={expand.expanded} aria-label={expandLabel} title={expandLabel}>
+        <button type="button" className="cv-iconbtn cv-wide" onClick={expand.onToggle} disabled={!expand.enabled} data-expand aria-pressed={expand.expanded} aria-label={expandLabel} title={expandLabel}>
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
             {expand.expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
           </svg>
