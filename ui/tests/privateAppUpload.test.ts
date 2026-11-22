@@ -39,12 +39,14 @@ const review = {
   notes: [], secret_warnings: [],
 };
 let calls: { path: string; init: RequestInit }[] = [];
-let responses: { status: number; body: unknown; headers?: Record<string, string> }[] = [];
+let responses: { status: number; body: unknown | ((init: RequestInit) => unknown); headers?: Record<string, string> }[] = [];
 globalThis.fetch = async (input, init) => {
-  calls.push({ path: String(input), init: init ?? {} });
+  const requestInit = init ?? {};
+  calls.push({ path: String(input), init: requestInit });
   const next = responses.shift();
   if (!next) throw new Error("unexpected request");
-  return new Response(JSON.stringify(next.body), {
+  const payload = typeof next.body === "function" ? (next.body as (init: RequestInit) => unknown)(requestInit) : next.body;
+  return new Response(JSON.stringify(payload), {
     status: next.status,
     headers: { "Content-Type": "application/json", ...next.headers },
   });
@@ -333,7 +335,10 @@ async function main() {
       b.textContent?.trim() === "Allow routine patch updates (30 days)");
     if (!optInBtn) throw new Error("expected explicit post-install 30-day opt-in button");
     equal(calls.filter((c) => c.path.includes("update-policy")).length, 0, "policy is never granted automatically");
-    responses = [{ status: 200, body: { ok: true, data: { policy: grantedPolicy } } }];
+    responses = [{ status: 200, body: (init: RequestInit) => {
+      const reqBody = JSON.parse(String(init.body)) as { expires_at?: unknown };
+      return { ok: true, data: { policy: { ...grantedPolicy, expires_at: reqBody.expires_at } } };
+    } }];
     await act(async () => optInBtn.click());
     equal(host.textContent?.includes("Routine patch permission saved for 30 days."), true);
 
@@ -389,7 +394,10 @@ async function main() {
     const savePolicyBtn = [...host.querySelectorAll("button")].find((b) =>
       b.textContent?.trim() === "Allow routine patch updates (30 days)");
     if (!savePolicyBtn) throw new Error("expected policy grant button");
-    responses = [{ status: 200, body: { ok: true, data: { policy: grantedPolicy } } }];
+    responses = [{ status: 200, body: (init: RequestInit) => {
+      const reqBody = JSON.parse(String(init.body)) as { expires_at?: unknown };
+      return { ok: true, data: { policy: { ...grantedPolicy, expires_at: reqBody.expires_at } } };
+    } }];
     await act(async () => savePolicyBtn.click());
     equal(host.textContent?.includes("Revoke permission"), true);
     const revokeBtn = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Revoke permission");
@@ -397,6 +405,96 @@ async function main() {
     responses = [{ status: 200, body: { ok: true, data: { revoked: true, install_id: "install_app1", policy_id: "pol_1" } } }];
     await act(async () => revokeBtn.click());
     equal(host.textContent?.includes("Routine patch permission revoked."), true);
+
+    // Round 8 regressions: fail-closed 403, strict optional fields, and routine policy request/response binding.
+    responses = [{ status: 403, body: { error: { code: "forbidden", message: "Forbidden." } } }];
+    await rejected(
+      listHostedPrivateReviews(),
+      (error: unknown) => error instanceof ApiError && error.status === 403 && error.code === "forbidden",
+      "HTTP 403 from review list must fail closed instead of looking unsupported",
+    );
+
+    for (const badReview of [
+      { ...review, will_revoke_grants: "yes" },
+      { ...review, active_bindings_count: -1 },
+    ]) {
+      responses = [{ status: 200, body: badReview }];
+      await rejected(
+        checkPrivateApp(file, null),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "malformed optional review revocation fields must refuse fail-closed",
+      );
+    }
+
+    for (const badHosted of [
+      { ...agentReceipt.data, will_revoke_grants: "yes" },
+      { ...agentReceipt.data, active_bindings_count: "2" },
+      { ...agentReceipt.data, requesting_agent: 123 },
+      { ...agentReceipt.data, will_revoke_grants: false, review: { ...agentReceipt.data.review, will_revoke_grants: true } },
+      { ...agentReceipt.data, state: "installed", applied_install_id: "install_other" },
+    ]) {
+      responses = [{ status: 200, body: { ok: true, data: badHosted } }];
+      await rejected(
+        getHostedPrivateReview(reviewId),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "malformed or mismatched hosted review fields must refuse fail-closed",
+      );
+    }
+
+    responses = [{ status: 200, body: { ok: true, data: {} } }];
+    await rejected(
+      readPrivateAppUpdatePolicy("install_app1"),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "missing data.policy field must fail closed",
+    );
+
+    responses = [{ status: 200, body: { ok: true, data: { policy: { ...grantedPolicy, repository_id: 42 } } } }];
+    await rejected(
+      readPrivateAppUpdatePolicy("install_app1"),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "staged_zip routine policy with nonzero repository_id must fail closed",
+    );
+
+    const otherDigest = `sha256:${"c".repeat(64)}`;
+    for (const mismatchedPolicy of [
+      { ...grantedPolicy, agent: "agents/other" },
+      { ...grantedPolicy, installed_digest: otherDigest },
+      { ...grantedPolicy, source_kind: "github", repository_id: 77 },
+      { ...grantedPolicy, repository_id: 42 },
+      { ...grantedPolicy, expires_at: grantedPolicy.expires_at + 1000 },
+    ]) {
+      responses = [{ status: 200, body: { ok: true, data: { policy: mismatchedPolicy } } }];
+      await rejected(
+        grantPrivateAppUpdatePolicy({
+          installId: "install_app1",
+          expectedDigest: digest,
+          agent: "agents/ap_upd",
+          source: "staged_zip",
+          expiresAt: grantedPolicy.expires_at,
+        }),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "staged_zip routine policy response mismatching request parameters must fail closed",
+      );
+    }
+
+    const githubGrantReq = {
+      installId: "install_app1",
+      expectedDigest: digest,
+      agent: "agents/ap_upd",
+      source: "github" as const,
+      repositoryId: 42,
+      expiresAt: grantedPolicy.expires_at,
+    };
+    const githubPolicy = { ...grantedPolicy, source_kind: "github", repository_id: 42 };
+    responses = [{ status: 200, body: { ok: true, data: { policy: githubPolicy } } }];
+    const savedGithubPolicy = await grantPrivateAppUpdatePolicy(githubGrantReq);
+    equal(savedGithubPolicy.source_kind, "github");
+    responses = [{ status: 200, body: { ok: true, data: { policy: { ...githubPolicy, repository_id: 99 } } } }];
+    await rejected(
+      grantPrivateAppUpdatePolicy(githubGrantReq),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "github routine policy response with wrong repository_id must fail closed",
+    );
   } finally {
     await act(async () => root.unmount());
     await win.happyDOM.close();

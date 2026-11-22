@@ -159,6 +159,24 @@ function invalid(): ApiError {
   return new ApiError("The package review could not be verified.", 502);
 }
 
+function parseOptionalBool(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return value;
+  throw invalid();
+}
+
+function parseOptionalNonNegativeInt(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  throw invalid();
+}
+
+function parseOptionalBoundedText(value: unknown, max = 256): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && value.length > 0 && value.length <= max) return value;
+  throw invalid();
+}
+
 function parseReview(value: unknown, target: PrivateTarget | null, sessionGeneration: number): PrivateReview {
   if (!object(value) || value.schema !== 1 || value.committed !== false || value.visibility !== "workspace" ||
       typeof value.name !== "string" || !value.name || typeof value.title !== "string" || !value.title ||
@@ -171,11 +189,8 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
   if (target && (value.install_id !== target.installId || value.name !== target.name ||
       value.expected_digest !== target.digest || value.expected_generation !== target.generation ||
       value.catalog_generation !== target.generation || !diff(value.structural_diff) || !screens(value.previous_screen_access))) throw invalid();
-  const willRevokeGrants = typeof value.will_revoke_grants === "boolean" ? value.will_revoke_grants : undefined;
-  const activeBindingsCount = typeof value.active_bindings_count === "number" &&
-    Number.isInteger(value.active_bindings_count) && value.active_bindings_count >= 0
-    ? value.active_bindings_count
-    : undefined;
+  const willRevokeGrants = parseOptionalBool(value.will_revoke_grants);
+  const activeBindingsCount = parseOptionalNonNegativeInt(value.active_bindings_count);
   return {
     name: value.name,
     title: value.title,
@@ -222,10 +237,6 @@ export type PrivateAppRoutinePolicy = {
   installed_digest: string;
 };
 
-function boundedText(value: unknown, max = 256): string | undefined {
-  return typeof value === "string" && value.length > 0 && value.length <= max ? value : undefined;
-}
-
 function parseHostedReviewRecord(data: Record<string, unknown>, id: string, generation: number): HostedPrivateReview {
   if (data.id !== id || typeof data.state !== "string" ||
       !["pending", "installed", "rejected", "expired"].includes(data.state) ||
@@ -242,16 +253,23 @@ function parseHostedReviewRecord(data: Record<string, unknown>, id: string, gene
   }
   const review = parseReview(raw, target, generation);
   if (data.name !== review.name || data.digest !== review.digest || data.generation !== review.generation) throw invalid();
-  const requestingAgent = boundedText(data.requesting_agent, 160);
-  const authorizedBy = boundedText(data.authorized_by, 160);
-  const willRevokeGrants = typeof data.will_revoke_grants === "boolean"
-    ? data.will_revoke_grants
-    : review.willRevokeGrants;
-  const activeBindingsCount = typeof data.active_bindings_count === "number" &&
-    Number.isInteger(data.active_bindings_count) && data.active_bindings_count >= 0
-    ? data.active_bindings_count
-    : review.activeBindingsCount;
-  const installedInstallId = boundedText(data.applied_install_id, 160) ?? target?.installId;
+  const requestingAgent = parseOptionalBoundedText(data.requesting_agent, 160);
+  const authorizedBy = parseOptionalBoundedText(data.authorized_by, 160);
+  const dataWillRevoke = parseOptionalBool(data.will_revoke_grants);
+  if (dataWillRevoke !== undefined && review.willRevokeGrants !== undefined && dataWillRevoke !== review.willRevokeGrants) {
+    throw invalid();
+  }
+  const willRevokeGrants = dataWillRevoke ?? review.willRevokeGrants;
+  const dataBindingsCount = parseOptionalNonNegativeInt(data.active_bindings_count);
+  if (dataBindingsCount !== undefined && review.activeBindingsCount !== undefined && dataBindingsCount !== review.activeBindingsCount) {
+    throw invalid();
+  }
+  const activeBindingsCount = dataBindingsCount ?? review.activeBindingsCount;
+  const appliedInstallId = parseOptionalBoundedText(data.applied_install_id, 160);
+  if (appliedInstallId !== undefined && target && appliedInstallId !== target.installId) {
+    throw invalid();
+  }
+  const installedInstallId = appliedInstallId ?? target?.installId;
   return {
     id,
     state: data.state as HostedPrivateReview["state"],
@@ -280,7 +298,7 @@ export async function listHostedPrivateReviews(signal?: AbortSignal): Promise<{ 
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (response.status === 403 || response.status === 404 || response.status === 501) {
+    if (response.status === 404 || response.status === 501) {
       return { supported: false, reviews: [] };
     }
     if (!response.ok) {
@@ -386,16 +404,34 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
   });
 }
 
-function parseRoutinePolicy(value: unknown, expectedInstallId: string): PrivateAppRoutinePolicy | null {
-  if (value === null || value === undefined) return null;
+function parseRoutinePolicy(
+  value: unknown,
+  expectedInstallId: string,
+  expected?: {
+    agent: string;
+    expectedDigest: string;
+    sourceKind: "github" | "staged_zip";
+    repositoryId: number;
+    expiresAt: number;
+  },
+): PrivateAppRoutinePolicy | null {
+  if (value === null) return null;
   if (!object(value) || typeof value.id !== "string" || !value.id ||
       value.install_id !== expectedInstallId ||
       typeof value.agent !== "string" || !AGENT_ACTOR.test(value.agent) ||
       (value.source_kind !== "github" && value.source_kind !== "staged_zip") ||
-      typeof value.repository_id !== "number" || !Number.isInteger(value.repository_id) || value.repository_id < 0 ||
+      typeof value.repository_id !== "number" || !Number.isInteger(value.repository_id) ||
+      (value.source_kind === "staged_zip" ? value.repository_id !== 0 : value.repository_id <= 0) ||
       typeof value.owner !== "string" || !value.owner ||
       typeof value.expires_at !== "number" || !Number.isFinite(value.expires_at) || value.expires_at <= 0 ||
       typeof value.installed_digest !== "string" || !DIGEST.test(value.installed_digest)) {
+    throw invalid();
+  }
+  if (expected && (value.agent !== expected.agent ||
+      value.installed_digest !== expected.expectedDigest ||
+      value.source_kind !== expected.sourceKind ||
+      value.repository_id !== expected.repositoryId ||
+      value.expires_at !== expected.expiresAt)) {
     throw invalid();
   }
   return {
@@ -482,7 +518,14 @@ export async function grantPrivateAppUpdatePolicy(input: {
       });
     }
     if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
-    const policy = parseRoutinePolicy(body.data.policy, input.installId);
+    const expectedRepositoryId = source === "github" ? input.repositoryId! : 0;
+    const policy = parseRoutinePolicy(body.data.policy, input.installId, {
+      agent: input.agent,
+      expectedDigest: input.expectedDigest,
+      sourceKind: source,
+      repositoryId: expectedRepositoryId,
+      expiresAt: input.expiresAt,
+    });
     if (!policy) throw invalid();
     return policy;
   });
