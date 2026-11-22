@@ -143,6 +143,7 @@ const canvasBrowserTranslations: Record<string, string> = {
   "drafting": "撰寫草稿中",
   "updating": "更新中",
   "updated to": "已更新至",
+  "Removing installed apps from a hosted workspace is not available yet.": "目前尚未支援從代管工作區移除已安裝的應用程式。",
 };
 
 for (const [source, expected] of Object.entries(canvasBrowserTranslations)) {

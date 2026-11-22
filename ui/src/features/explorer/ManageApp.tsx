@@ -41,11 +41,13 @@ export default function ManageApp({
   viewer,
   automaticUpdatesEnabled = true,
   appAgentSession,
+  hosted = false,
 }: {
   installId: string;
   viewer: Viewer;
   automaticUpdatesEnabled?: boolean;
   appAgentSession: string | null;
+  hosted?: boolean;
 }) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
@@ -258,6 +260,7 @@ export default function ManageApp({
   };
 
   const openRemove = () => {
+    if (hosted) return;
     void appExplorer.removePreview(installId)
       .then(setPreview)
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Couldn't work out what removing would take. Try again in a moment.")));
@@ -566,17 +569,23 @@ export default function ManageApp({
             </>
           ) : (
             <>
-              <h3 className="text-fail">{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
-              <p>{t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}</p>
-              <div className="mt-3">
-                <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
-              </div>
+              <h3 className={hosted ? undefined : "text-fail"}>{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
+              <p>
+                {hosted
+                  ? t("Removing installed apps from a hosted workspace is not available yet.")
+                  : t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}
+              </p>
+              {!hosted && (
+                <div className="mt-3">
+                  <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
+                </div>
+              )}
             </>
           )}
         </div>
       </div>
 
-      {removeOpen && preview && (
+      {!hosted && removeOpen && preview && (
         <RemoveDialog preview={preview} removing={removing} onCancel={() => setRemoveOpen(false)} onConfirm={doRemove} />
       )}
     </main>
