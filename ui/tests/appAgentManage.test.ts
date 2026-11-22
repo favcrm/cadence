@@ -167,7 +167,7 @@ async function main() {
     assert(Boolean(updateButton("Remove app…")), "Native Manage shows Remove app button");
     await render("owner-a", true, true);
     assert(!updateButton("Remove app…"), "Hosted Manage hides the unsupported Remove app button");
-    assert(host.textContent?.includes("Removing installed apps from a hosted workspace is not available yet."), "Hosted Manage explains removal is unavailable");
+    assert(host.textContent?.includes("Removing installed apps from a hosted workspace is not available yet. You can revoke tool access above."), "Hosted Manage explains removal is unavailable and points to revoking access above");
     assert(removePreviewCalls === 0 && removeCalls === 0, "Hosted Manage never calls remove-preview or remove");
     await render("owner-a", true, false);
     assert(!choice()?.querySelector('option[value="retired"]'), "Archived profiles are not offered");

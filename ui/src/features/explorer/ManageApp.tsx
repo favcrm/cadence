@@ -572,7 +572,7 @@ export default function ManageApp({
               <h3 className={hosted ? undefined : "text-fail"}>{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
               <p>
                 {hosted
-                  ? t("Removing installed apps from a hosted workspace is not available yet.")
+                  ? t("Removing installed apps from a hosted workspace is not available yet. You can revoke tool access above.")
                   : t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}
               </p>
               {!hosted && (
