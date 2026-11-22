@@ -341,6 +341,14 @@ struct TestRig {
 
 impl TestRig {
     fn new(mode: MembershipMode) -> Self {
+        Self::new_with_scope(mode, Some(WORKSPACE_SLUG), Some(DEPLOYMENT_ID))
+    }
+
+    fn new_with_scope(
+        mode: MembershipMode,
+        workspace: Option<&str>,
+        deployment: Option<&str>,
+    ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = dir.path();
@@ -516,8 +524,8 @@ impl TestRig {
         let policy_doc = json!({
             "connection_id": connection_id,
             "site_url": SITE_URL,
-            "workspace": WORKSPACE_SLUG,
-            "deployment": DEPLOYMENT_ID,
+            "workspace": workspace,
+            "deployment": deployment,
         });
         let policy_digest = Digest::try_from(material_digest_for_domain(
             "cadence-protected-policy-doc-v1",
@@ -539,8 +547,8 @@ impl TestRig {
                 slug: id(SLUG_SEARCH_CONSOLE_REPORT),
                 upstream_connection_id: id(UPSTREAM_CONN_ID),
                 site_url: SITE_URL.to_string(),
-                workspace: Some(id(WORKSPACE_SLUG)),
-                deployment: Some(id(DEPLOYMENT_ID)),
+                workspace: workspace.map(id),
+                deployment: deployment.map(id),
             }),
         };
         let manifest_id = "manifest-agenticos-read".to_string();
@@ -704,6 +712,27 @@ fn dedicated_mode(company: &str, deployment: &str) -> MembershipMode {
     assert!(
         matches!(mode, MembershipMode::Dedicated(_)),
         "fixture must capture dedicated mode"
+    );
+    mode
+}
+
+fn native_mode(company: &str) -> MembershipMode {
+    let vars = HashMap::from([
+        ("AGENTICOS_COMPANY", company.to_string()),
+        ("AGENTICOS_INSTANCE", "instemw01".to_string()),
+        ("AGENTICOS_BOARD_HOST", "board.example.test".to_string()),
+        (
+            "AGENTICOS_BOARD_ISSUER",
+            "https://issuer.example.test".to_string(),
+        ),
+        ("AGENTICOS_BOARD_COMPANY", company.to_string()),
+    ]);
+    let mode = MembershipMode::capture(&crate::lease::Hosted::default(), &|name| {
+        vars.get(name).cloned()
+    });
+    assert!(
+        matches!(mode, MembershipMode::Native(_)),
+        "fixture must capture native mode"
     );
     mode
 }
@@ -1276,4 +1305,329 @@ fn cad2508_management_policy_rpc_enforces_agenticos_provider_gate_even_when_read
     valid_policy.agenticos_read = None;
     let err = run_policy_rpc(&rig, &valid_policy, &policy_doc_digest).unwrap_err();
     assert_eq!(err.code(), Some("operation_not_granted"), "{err}");
+}
+
+#[test]
+fn cad2508_native_membership_mode_enforces_workspace_and_rejects_deployment() {
+    // 1. Native mode with matching workspace and deployment=None succeeds cleanly.
+    let ok_rig = TestRig::new_with_scope(native_mode(WORKSPACE_SLUG), Some(WORKSPACE_SLUG), None);
+    let (snap, receipt) = ok_rig.snapshot();
+    let args = ok_rig.invoke_payload(
+        &snap,
+        &receipt,
+        "cad2508-native-ok",
+        SITE_URL,
+        "2026-10-01",
+        "2026-10-07",
+    );
+    let res = ok_rig
+        .backend
+        .handle_runtime(&ok_rig.caller, OpsMethod::ConnectionInvokeV1, &args)
+        .expect("matching native workspace succeeds");
+    assert_eq!(res["state"], "done");
+    assert_eq!(ok_rig.upstream.posts(), 1);
+    assert_no_secret_leak(&res.to_string());
+
+    // 2. Native mode refuses any policy carrying a deployment slug OR mismatched workspace.
+    for (label, policy_ws, policy_dep) in [
+        (
+            "cad2508-native-dep",
+            Some(WORKSPACE_SLUG),
+            Some(DEPLOYMENT_ID),
+        ),
+        ("cad2508-native-ws", Some("other-workspace"), None),
+    ] {
+        let rig = TestRig::new_with_scope(native_mode(WORKSPACE_SLUG), policy_ws, policy_dep);
+        let (snap, receipt) = rig.snapshot();
+        let args = rig.invoke_payload(&snap, &receipt, label, SITE_URL, "2026-10-01", "2026-10-07");
+        let err = rig
+            .backend
+            .handle_runtime(&rig.caller, OpsMethod::ConnectionInvokeV1, &args)
+            .unwrap_err();
+        assert_eq!(err.code(), Some("operation_not_granted"), "{err}");
+        assert_eq!(rig.upstream.posts(), 0);
+    }
+}
+
+fn call_credential_entry_rpc(shared: &Arc<Shared>, method: &str, params: &Value) -> Result<Value> {
+    crate::daemon::credential_entry_rpc::rpc_credential_entry(
+        shared,
+        method,
+        params,
+        std::process::id(),
+        |attempt, input| shared.apply_human_credential_attempt(attempt, input),
+    )
+}
+
+fn mint_entry_proof_and_nonce(
+    shared: &Arc<Shared>,
+    entry_origin: &str,
+    request_id: &str,
+) -> (Value, String) {
+    let scope = crate::operator_auth::LinkScope::Entry {
+        origin: entry_origin.to_string(),
+        handoff: crate::operator_auth::EntryHandoff {
+            request_id: request_id.to_string(),
+            public_owner_hash: None,
+        },
+    };
+    let now = shared.operator_now();
+    let opened = {
+        let mut auth = shared.operator_auth();
+        let link_nonce = auth
+            .mint_for_account(
+                crate::operator_auth::Origin::Loopback,
+                scope.clone(),
+                now,
+                "owner-cad2508".to_string(),
+            )
+            .unwrap();
+        let (opened, _) = auth
+            .open_scoped(
+                &link_nonce,
+                crate::operator_auth::Origin::Loopback,
+                scope,
+                "",
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        opened
+    };
+    let proof = json!({
+        "token": opened.token,
+        "key": opened.key,
+        "origin": "loopback",
+        "entry_origin": entry_origin,
+        "public_only": false,
+    });
+    let nonce_out = call_credential_entry_rpc(
+        shared,
+        "credential_entry_session",
+        &json!({"request_id": request_id, "session": proof}),
+    )
+    .expect("issue entry nonce");
+    let nonce = nonce_out["nonce"].as_str().unwrap().to_string();
+    (proof, nonce)
+}
+
+fn vault_record_count(vault_dir: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        vault_dir.join("custody.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open vault sqlite");
+    conn.query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+        .expect("count vault records")
+}
+
+fn credential_record_count(shared: &Shared) -> i64 {
+    shared
+        .store
+        .read_tx(|tx| {
+            tx.query_row("SELECT count(*) FROM platform_credentials", [], |row| {
+                row.get(0)
+            })
+            .map_err(Error::from)
+        })
+        .unwrap()
+}
+
+#[test]
+fn cad2508_real_enroll_rpc_enforces_shape_and_scope_before_vault_write() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let entry_origin = "https://entry.cadence.test";
+    let mut opts = ServeOptions::default();
+    crate::daemon::configure_credential_entry_fixture(&mut opts, dir.path(), entry_origin)
+        .expect("entry fixture");
+    let pm = dir.path().join("pm");
+    std::fs::DirBuilder::new().mode(0o700).create(&pm).unwrap();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.membership_mode_for_test = Some(native_mode(WORKSPACE_SLUG));
+    opts.platforms.insert(
+        crate::platform::agenticos_provider::PLATFORM.into(),
+        Arc::new(
+            crate::platform::agenticos_provider::AgenticosProviderAdapter::for_dedicated_read()
+                .unwrap(),
+        ),
+    );
+    let state = dir.path().join("state");
+    let vault_dir = state.join("vault");
+    let shared = Shared::new(&state, &opts).expect("Shared::new");
+    let workspace_id = shared.store.connection_workspace_id().unwrap();
+    let vault = shared.platform_custody.encrypted().unwrap();
+    vault.initialize(&workspace_id, false).unwrap();
+    vault.unlock(&workspace_id).unwrap();
+
+    // 1. credential_request_create refuses wrong shape ("smtp") and wrong scope ("provider.read").
+    for bad_create in [
+        json!({
+            "provider": crate::platform::agenticos_provider::PLATFORM,
+            "verb": "enroll",
+            "shape": "smtp",
+            "scopes": [SCOPE_DEDICATED_READ],
+            "target_id": "emw-dedicated",
+        }),
+        json!({
+            "provider": crate::platform::agenticos_provider::PLATFORM,
+            "verb": "enroll",
+            "shape": "token",
+            "scopes": ["provider.read"],
+            "target_id": "emw-dedicated",
+        }),
+    ] {
+        let err = call_credential_entry_rpc(&shared, "credential_request_create", &bad_create)
+            .unwrap_err();
+        assert_eq!(err.code(), Some("invalid_request"), "{err}");
+    }
+
+    // 2. Real ProtectedConnections::enroll refuses wrong scopes BEFORE vault.write_row.
+    let req_bad_scope = call_credential_entry_rpc(
+        &shared,
+        "credential_request_create",
+        &json!({
+            "provider": crate::platform::agenticos_provider::PLATFORM,
+            "verb": "enroll",
+            "shape": "token",
+            "scopes": [SCOPE_DEDICATED_READ],
+            "target_id": "emw-dedicated",
+        }),
+    )
+    .expect("create request for tampered scope test")["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    shared
+        .store
+        .write_tx(|tx| {
+            tx.execute(
+                "UPDATE credential_requests SET scopes=?1 WHERE request_id=?2",
+                rusqlite::params![r#"["provider.read"]"#, req_bad_scope],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (proof, nonce) = mint_entry_proof_and_nonce(&shared, entry_origin, &req_bad_scope);
+    let err = call_credential_entry_rpc(
+        &shared,
+        "credential_request_submit",
+        &json!({
+            "request_id": req_bad_scope,
+            "nonce": nonce,
+            "session": proof,
+            "secret": TOKEN_SECRET,
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("invalid_request"), "{err}");
+    assert_eq!(vault_record_count(&vault_dir), 0);
+    assert_eq!(credential_record_count(&shared), 0);
+
+    // 3. credential_entry_session + credential_request_submit refuse tampered non-token shape ("smtp").
+    let req_bad_shape = call_credential_entry_rpc(
+        &shared,
+        "credential_request_create",
+        &json!({
+            "provider": crate::platform::agenticos_provider::PLATFORM,
+            "verb": "enroll",
+            "shape": "token",
+            "scopes": [SCOPE_DEDICATED_READ],
+            "target_id": "emw-dedicated",
+        }),
+    )
+    .expect("create request for tampered shape test")["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (proof, nonce) = mint_entry_proof_and_nonce(&shared, entry_origin, &req_bad_shape);
+    shared
+        .store
+        .write_tx(|tx| {
+            tx.execute(
+                "UPDATE credential_requests SET enrollment_shape='smtp' WHERE request_id=?1",
+                rusqlite::params![req_bad_shape],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let session_err = call_credential_entry_rpc(
+        &shared,
+        "credential_entry_session",
+        &json!({"request_id": req_bad_shape, "session": proof}),
+    )
+    .unwrap_err();
+    assert_eq!(session_err.code(), Some("request_changed"), "{session_err}");
+    let err = call_credential_entry_rpc(
+        &shared,
+        "credential_request_submit",
+        &json!({
+            "request_id": req_bad_shape,
+            "nonce": nonce,
+            "session": proof,
+            "secret": "smtp-secret-value",
+            "transport": {
+                "host": "smtp.example.test",
+                "port": 587,
+                "tls_mode": "starttls",
+                "username": "ops",
+                "sender": "ops@example.test",
+            },
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("request_changed"), "{err}");
+    assert_eq!(vault_record_count(&vault_dir), 0);
+    assert_eq!(credential_record_count(&shared), 0);
+
+    // 4. Valid token + provider.read.dedicated submission succeeds through real RPC -> enroll.
+    let req_ok = call_credential_entry_rpc(
+        &shared,
+        "credential_request_create",
+        &json!({
+            "provider": crate::platform::agenticos_provider::PLATFORM,
+            "verb": "enroll",
+            "shape": "token",
+            "scopes": [SCOPE_DEDICATED_READ],
+            "target_id": "emw-dedicated",
+        }),
+    )
+    .expect("create valid request")["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (proof, nonce) = mint_entry_proof_and_nonce(&shared, entry_origin, &req_ok);
+    let out = call_credential_entry_rpc(
+        &shared,
+        "credential_request_submit",
+        &json!({
+            "request_id": req_ok,
+            "nonce": nonce,
+            "session": proof,
+            "secret": TOKEN_SECRET,
+        }),
+    )
+    .expect("valid agenticos-provider enroll succeeds");
+    assert_eq!(out["status"], "saved");
+    assert_eq!(out["request"]["state"], "done");
+    assert_eq!(out["request"]["status"], "saved");
+    let conn_id = out["request"]["connection_id"].as_str().unwrap();
+    let stored = shared
+        .store
+        .connection_credential(conn_id)
+        .unwrap()
+        .expect("enrolled credential record");
+    assert_eq!(
+        stored.platform,
+        crate::platform::agenticos_provider::PLATFORM
+    );
+    assert_eq!(stored.exchange, "token");
+    assert_eq!(stored.scopes, vec![SCOPE_DEDICATED_READ.to_string()]);
+    assert!(stored
+        .custody
+        .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX));
+    assert_eq!(vault_record_count(&vault_dir), 1);
+    assert_eq!(credential_record_count(&shared), 1);
+    assert_no_secret_leak(&out.to_string());
 }

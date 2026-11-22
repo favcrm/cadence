@@ -2299,16 +2299,6 @@ impl ProtectedConnections {
             ),
             &screen,
         )?;
-        let identity = crate::platform::encrypted_sqlite::ExpectedIdentity {
-            workspace_id,
-            connection_id: base.connection_id.clone(),
-            provider: base.platform.clone(),
-            account: base.account.clone(),
-            credential_revision: revision,
-            exchange: exchange.clone(),
-            key_id,
-        };
-        let reference = vault.write_row(&identity, &bytes)?;
         let scopes = if attempt.scopes().is_empty() {
             default_scopes(attempt.provider())
         } else {
@@ -2322,6 +2312,16 @@ impl ProtectedConnections {
                 "agenticos-provider credentials require the provider.read.dedicated scope",
             ));
         }
+        let identity = crate::platform::encrypted_sqlite::ExpectedIdentity {
+            workspace_id,
+            connection_id: base.connection_id.clone(),
+            provider: base.platform.clone(),
+            account: base.account.clone(),
+            credential_revision: revision,
+            exchange: exchange.clone(),
+            key_id,
+        };
+        let reference = vault.write_row(&identity, &bytes)?;
         let record = crate::store::CredentialRecord {
             connection_id: base.connection_id,
             credential_revision: revision,
