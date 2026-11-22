@@ -569,6 +569,7 @@ async function testComposerInteractions(): Promise<void> {
   const callArgs: { op: string; args: Record<string, unknown> }[] = [];
   const plannerArgs: Record<string, unknown>[] = [];
   const deletedIds: string[] = [];
+  let stageCalls = 0;
   let prepareMode: "ok" | "facts_changed" = "ok";
   let confirmOutcome: "failed" | "uncertain" = "failed";
 
@@ -607,6 +608,7 @@ async function testComposerInteractions(): Promise<void> {
       };
     },
     async stageWhatsAppMedia(file: File) {
+      stageCalls += 1;
       if (file.type === "application/pdf") {
         return {
           ok: true as const,
@@ -684,6 +686,31 @@ async function testComposerInteractions(): Promise<void> {
     const tArea = container.querySelector("textarea") as HTMLTextAreaElement;
     const sendBtn = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
     assert(fInput && tArea && sendBtn, "composer controls rendered");
+
+    // 0. Client-side MIME/extension allowlist & size checks refuse before staging
+    const fakeSizedFile = (name: string, type: string, size: number) => {
+      const f = new File(["x"], name, { type });
+      Object.defineProperty(f, "size", { value: size, configurable: true });
+      return f;
+    };
+    const stageBefore = stageCalls;
+    for (const [badFile, expectedMsg] of [
+      [new File(["<svg/>"], "bad.svg", { type: "image/svg+xml" }), "not supported"],
+      [new File(["MZ"], "run.exe", { type: "" }), "not supported"],
+      [fakeSizedFile("huge.png", "image/png", 5 * 1024 * 1024 + 1), "5 MB or smaller"],
+      [fakeSizedFile("huge.pdf", "application/pdf", 10 * 1024 * 1024 + 1), "10 MB or smaller"],
+    ] as const) {
+      await React.act(async () => {
+        pickInputFile(fInput, badFile);
+        await flush();
+      });
+      assert(
+        stageCalls === stageBefore &&
+          !container.querySelector(".wa-reply-attachment") &&
+          container.textContent?.includes(expectedMsg),
+        `client-side validation refuses ${badFile.name} (${expectedMsg}) before staging`,
+      );
+    }
 
     // 1. Attach PDF, set caption, failed confirm keeps both attachment and text
     await React.act(async () => {

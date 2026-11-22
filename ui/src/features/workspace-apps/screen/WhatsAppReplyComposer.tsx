@@ -6,16 +6,42 @@ import { formatMediaBytes, object, type LinkedStagedAttachment, type recordServi
 import { LINKED_MEDIA_MAX_BYTES, LINKED_MEDIA_MAX_IMAGE_BYTES, WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
-const ATTACH_ACCEPT = [
-  "image/jpeg", "image/png", "image/webp",
+const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+const ALLOWED_NON_IMAGE_MIMES = [
   "video/mp4", "video/webm",
   "audio/mpeg", "audio/ogg", "audio/mp4", "audio/aac", "audio/wav", "audio/webm",
   "application/pdf", "text/plain", "text/csv",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".jpg,.jpeg,.png,.webp,.mp4,.webm,.mp3,.ogg,.m4a,.aac,.wav,.pdf,.txt,.csv,.docx,.xlsx,.pptx",
+];
+const ALLOWED_OUTBOUND_MIMES = new Set([
+  ...ALLOWED_IMAGE_MIMES,
+  ...ALLOWED_NON_IMAGE_MIMES,
+  "audio/mp3", "audio/x-m4a", "audio/m4a", "audio/x-wav", "audio/wave",
+]);
+const ALLOWED_IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+const ALLOWED_NON_IMAGE_EXTS = [
+  ".mp4", ".webm", ".mp3", ".ogg", ".m4a", ".aac", ".wav", ".pdf", ".txt", ".csv", ".docx", ".xlsx", ".pptx",
+];
+const ALLOWED_OUTBOUND_EXTS = new Set([...ALLOWED_IMAGE_EXTS, ...ALLOWED_NON_IMAGE_EXTS]);
+const ATTACH_ACCEPT = [
+  "image/jpeg", "image/png", "image/webp",
+  ...ALLOWED_NON_IMAGE_MIMES,
+  [...ALLOWED_IMAGE_EXTS, ...ALLOWED_NON_IMAGE_EXTS].join(","),
 ].join(",");
+
+function classifyLocalAttachment(file: File): "image" | "other" | null {
+  const mime = (file.type || "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if (mime !== "") {
+    if (!ALLOWED_OUTBOUND_MIMES.has(mime)) return null;
+    return ALLOWED_IMAGE_MIMES.has(mime) ? "image" : "other";
+  }
+  const dot = file.name.lastIndexOf(".");
+  const ext = dot > 0 ? file.name.slice(dot).toLowerCase() : "";
+  if (!ALLOWED_OUTBOUND_EXTS.has(ext)) return null;
+  return ALLOWED_IMAGE_EXTS.has(ext) ? "image" : "other";
+}
 
 export interface WhatsAppReplySelection {
   conversationId: string;
@@ -208,7 +234,12 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       setAttachError(zh ? "請選擇非空白檔案。" : "Select a non-empty file.");
       return;
     }
-    if (file.type.startsWith("image/") && file.size > LINKED_MEDIA_MAX_IMAGE_BYTES) {
+    const localKind = classifyLocalAttachment(file);
+    if (localKind === null) {
+      setAttachError(zh ? "WhatsApp 回覆不支援此檔案格式。" : "That file type is not supported for WhatsApp replies.");
+      return;
+    }
+    if (localKind === "image" && file.size > LINKED_MEDIA_MAX_IMAGE_BYTES) {
       setAttachError(zh ? "圖片大小不得超過 5 MB。" : "Images must be 5 MB or smaller.");
       return;
     }
