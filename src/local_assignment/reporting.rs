@@ -1,5 +1,9 @@
 use super::http::BoardHttp;
 use super::*;
+use crate::private_app_update::{
+    valid_generation, valid_install_id, valid_package_ref, valid_sha256_prefixed,
+    valid_zip_file_name,
+};
 use std::borrow::Cow;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
@@ -243,46 +247,6 @@ pub fn agent_credential_path(state_dir: &Path, message_id: &str) -> Result<PathB
 /// Where a turn-assigned private app ZIP is stored beside its `.bind` file.
 pub fn private_app_package_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
     Ok(binding_path(state_dir, message_id)?.with_extension("zip"))
-}
-
-fn valid_package_ref(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn valid_sha256_prefixed(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-fn valid_zip_file_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.ends_with(".zip")
-        && !value.contains(['/', '\\', '\0'])
-        && !value.contains("..")
-        && value.chars().all(|c| !c.is_control())
-}
-
-fn valid_install_id(value: &str) -> bool {
-    value.strip_prefix("install_").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest.len() <= 120
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    })
-}
-
-fn valid_generation(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && value.chars().all(|c| !c.is_control())
 }
 
 fn valid_zip_bytes(bytes: &[u8]) -> bool {

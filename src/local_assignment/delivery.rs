@@ -3,9 +3,9 @@ use super::reporting::MAX_PRIVATE_APP_ZIP_BYTES;
 use super::Kickoff;
 use crate::error::{Error, Result};
 use crate::private_app_update::{
-    format_readiness_refusal, resolve_private_app_updater, PrivateAppAdapterKind,
-    PrivateAppReadinessReason, PrivateAppUpdaterCandidate, PrivateAppUpdaterResolution,
-    ResolvedPrivateAppUpdater, ServerPrivateAppReadiness,
+    format_readiness_refusal, resolve_private_app_updater, valid_zip_file_name,
+    PrivateAppAdapterKind, PrivateAppReadinessReason, PrivateAppUpdaterCandidate,
+    PrivateAppUpdaterResolution, ResolvedPrivateAppUpdater, ServerPrivateAppReadiness,
 };
 use crate::remote_cli::{self, RemoteAnswer, RemoteTarget};
 use base64::Engine as _;
@@ -38,6 +38,8 @@ struct PrivateAppUpdateFrontmatter {
     workspace_default_updater: Option<String>,
     #[serde(default)]
     default_app_agent: Option<String>,
+    #[serde(default)]
+    is_chat_default_only: Option<bool>,
     #[serde(default)]
     personal_assistant_requested: Option<bool>,
     #[serde(default)]
@@ -230,13 +232,7 @@ fn valid_artifact_ref(value: &str) -> bool {
 fn sanitize_zip_file_name(raw: Option<&str>, artifact_id: &str) -> String {
     if let Some(name) = raw {
         let trimmed = name.trim();
-        let valid = !trimmed.is_empty()
-            && trimmed.len() <= 128
-            && trimmed.ends_with(".zip")
-            && !trimmed.contains(['/', '\\', '\0'])
-            && !trimmed.contains("..")
-            && trimmed.chars().all(|c| !c.is_control());
-        if valid {
+        if valid_zip_file_name(trimmed) {
             return trimmed.to_string();
         }
     }
@@ -424,18 +420,37 @@ fn fetch_profile_enabled_tools(
     )
 }
 
+fn non_empty_trimmed(opt: Option<&str>) -> Option<&str> {
+    opt.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn canonical_agent_actor(raw: &str) -> String {
+    if raw.starts_with("agents/") || raw.starts_with("service/") {
+        raw.to_string()
+    } else if raw.starts_with("ap_") {
+        format!("agents/{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
 fn make_updater_candidate<'a>(
     actor_opt: Option<&'a str>,
-    caps: Option<&'a [String]>,
+    is_chat_default_only: bool,
+    selected_actor_for_tools: Option<&str>,
     enabled_tools: Option<&'a [String]>,
     adapter: PrivateAppAdapterKind,
     fm: &'a PrivateAppUpdateFrontmatter,
 ) -> Option<PrivateAppUpdaterCandidate<'a>> {
     actor_opt.map(|actor| PrivateAppUpdaterCandidate {
         actor: Some(actor),
-        is_chat_default_only: false,
-        capabilities: caps,
-        enabled_tools,
+        is_chat_default_only,
+        capabilities: None,
+        enabled_tools: if selected_actor_for_tools == Some(actor) {
+            enabled_tools
+        } else {
+            None
+        },
         adapter,
         workspace_mcp_paired: fm.workspace_mcp_paired,
         board_active: fm.board_active,
@@ -453,55 +468,56 @@ fn resolve_updater_before_download(
 ) -> Result<ResolvedPrivateAppUpdater> {
     let adapter_str = adapter();
     let adapter_kind = PrivateAppAdapterKind::from_endpoint_adapter(adapter_str.as_deref());
-    let saved_caps = remote_cli::saved_capabilities(target);
-    let caps_slice = (!saved_caps.is_empty()).then_some(saved_caps.as_slice());
 
-    let explicit_actor = if let Some(agent) = fm.updater_agent.as_deref() {
-        Some(agent.to_string())
+    // Never promote a claimed profile or CAD-2434 chat-only default into an updater.
+    let explicit_actor = if let Some(agent) = non_empty_trimmed(fm.updater_agent.as_deref()) {
+        Some(canonical_agent_actor(agent))
     } else if fm.personal_assistant_requested == Some(true) {
         Some("service/personal_assistant".to_string())
     } else {
-        kickoff.profile_id.map(|id| format!("agents/{id}"))
-    };
-
-    let selected_actor_for_tools = explicit_actor
-        .as_deref()
-        .or(fm.dedicated_updater.as_deref())
-        .or(fm.workspace_default_updater.as_deref());
-    let profile_enabled_tools = if caps_slice.is_none() {
-        selected_actor_for_tools
-            .and_then(|actor| fetch_profile_enabled_tools(target, actor, deadline, wake_timeout))
-    } else {
         None
     };
+    let dedicated_actor =
+        non_empty_trimmed(fm.dedicated_updater.as_deref()).map(canonical_agent_actor);
+    let workspace_default_actor =
+        non_empty_trimmed(fm.workspace_default_updater.as_deref()).map(canonical_agent_actor);
+
+    // Fetch only the selected updater profile's own opt-in scopes, never the dispatcher login's.
+    let selected_actor_for_tools = explicit_actor
+        .as_deref()
+        .or(dedicated_actor.as_deref())
+        .or(workspace_default_actor.as_deref());
+    let profile_enabled_tools = selected_actor_for_tools
+        .and_then(|actor| fetch_profile_enabled_tools(target, actor, deadline, wake_timeout));
     let enabled_tools_slice = profile_enabled_tools.as_deref();
+    let is_chat_default_only = fm.is_chat_default_only == Some(true);
 
     let resolution = PrivateAppUpdaterResolution {
         explicit_agent: make_updater_candidate(
             explicit_actor.as_deref(),
-            caps_slice,
+            is_chat_default_only,
+            selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
             fm,
         ),
         dedicated_app_updater: make_updater_candidate(
-            fm.dedicated_updater.as_deref(),
-            caps_slice,
+            dedicated_actor.as_deref(),
+            is_chat_default_only,
+            selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
             fm,
         ),
         workspace_default_updater: make_updater_candidate(
-            fm.workspace_default_updater.as_deref(),
-            caps_slice,
+            workspace_default_actor.as_deref(),
+            is_chat_default_only,
+            selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
             fm,
         ),
-        has_chat_default_app_agent: fm
-            .default_app_agent
-            .as_deref()
-            .is_some_and(|id| !id.is_empty()),
+        has_chat_default_app_agent: non_empty_trimmed(fm.default_app_agent.as_deref()).is_some(),
         personal_assistant_requested: fm.personal_assistant_requested == Some(true),
     };
 
@@ -512,7 +528,7 @@ fn resolve_updater_before_download(
         )
     })?;
     if let Some(claimed_profile) = kickoff.profile_id {
-        if resolved.actor != format!("agents/{claimed_profile}") {
+        if resolved.actor != canonical_agent_actor(claimed_profile) {
             return Err(Error::invalid(
                 "private_app_readiness_refused",
                 format_readiness_refusal(&[PrivateAppReadinessReason::ActorMismatch]),
@@ -1086,6 +1102,7 @@ mod tests {
         zip_bytes: Vec<u8>,
         override_digest: Option<String>,
         review_id: String,
+        profile_tools: Option<Vec<String>>,
     ) -> (String, RecordedRequests, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1110,7 +1127,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&zip_bytes);
 
         let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(32) {
+            for stream in listener.incoming().take(64) {
                 let Ok(mut stream) = stream else { break };
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -1183,6 +1200,18 @@ mod tests {
                         match verb.as_str() {
                             "issue_show" => (200, issue_payload.clone()),
                             "issue_history" => (200, json!({"comments": []})),
+                            "agent_profile_show" => match &profile_tools {
+                                Some(tools) => (
+                                    200,
+                                    json!({
+                                        "profile": {
+                                            "id": args["id"],
+                                            "enabled_tools": tools,
+                                        }
+                                    }),
+                                ),
+                                None => (404, json!({"ok": false, "code": "not_found"})),
+                            },
                             "artifact_show" => (
                                 200,
                                 json!({
@@ -1290,9 +1319,15 @@ mod tests {
             ]
         });
 
-        let (endpoint, recorded, handle) =
-            spawn_mock_board(issue_payload, zip_bytes.clone(), None, review_id.clone());
-        let auth_dir = write_login(&root, &endpoint, &["cli.read", "cli.write", "wiki.read"]);
+        let (endpoint, recorded, handle) = spawn_mock_board(
+            issue_payload,
+            zip_bytes.clone(),
+            None,
+            review_id.clone(),
+            Some(vec!["cadence_writes".into()]),
+        );
+        // Dispatcher login deliberately lacks cli.write: readiness must come from the updater profile's cadence_writes.
+        let auth_dir = write_login(&root, &endpoint, &["cli.read", "wiki.read"]);
         let target = RemoteTarget {
             org: "acme".into(),
             endpoint: endpoint.clone(),
@@ -1315,7 +1350,7 @@ mod tests {
             audience: &endpoint,
             subject_id: Some("sub_12345"),
             issuer: Some("https://auth.example"),
-            profile_id: None,
+            profile_id: Some("ap_updater"),
         };
 
         let delivered_text = Arc::new(Mutex::new(String::new()));
@@ -1457,6 +1492,7 @@ mod tests {
         assert!(!zip_path.exists());
 
         let log = recorded.lock().unwrap();
+        assert!(log.iter().any(|(v, _)| v == "agent_profile_show"));
         assert!(log.iter().any(|(v, _)| v == "artifact_read"));
         let _ = fs::remove_dir_all(&root);
         drop(handle);
@@ -1490,6 +1526,7 @@ mod tests {
             issue_payload: Value,
             adapter_val: Option<&'a str>,
             caps: &'a [&'a str],
+            profile_tools: Option<Vec<&'a str>>,
             bad_digest: Option<&'a str>,
             profile_id: Option<&'a str>,
             expected_substr: &'a str,
@@ -1504,6 +1541,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "personal_assistant_excluded",
@@ -1516,8 +1554,32 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
+                expected_substr: "chat_default_not_updater",
+            },
+            NegCase {
+                label: "chat_default_claimed_as_profile",
+                issue_payload: base_issue(json!({"default_app_agent": "ap_chat"}), one_art.clone()),
+                adapter_val: Some("codex/managed"),
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
+                bad_digest: None,
+                profile_id: Some("ap_chat"),
+                expected_substr: "chat_default_not_updater",
+            },
+            NegCase {
+                label: "explicit_chat_default_only_flag",
+                issue_payload: base_issue(
+                    json!({"updater_agent": "agents/ap_chat", "is_chat_default_only": true}),
+                    one_art.clone(),
+                ),
+                adapter_val: Some("codex/managed"),
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
+                bad_digest: None,
+                profile_id: Some("ap_chat"),
                 expected_substr: "chat_default_not_updater",
             },
             NegCase {
@@ -1527,7 +1589,9 @@ mod tests {
                     one_art.clone(),
                 ),
                 adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "wiki.read"],
+                // Dispatcher login has cli.write, but updater profile lacks cadence_writes.
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["read_only"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "missing_write_scope",
@@ -1540,6 +1604,7 @@ mod tests {
                 ),
                 adapter_val: Some("claude/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "adapter_upload_unsupported",
@@ -1555,6 +1620,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "server_not_ready",
@@ -1570,6 +1636,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "personal_assistant_excluded",
@@ -1582,6 +1649,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: Some("ap_claimed"),
                 expected_substr: "actor_mismatch",
@@ -1594,6 +1662,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: Some(
                     "0000000000000000000000000000000000000000000000000000000000000000",
                 ),
@@ -1611,6 +1680,7 @@ mod tests {
                 ),
                 adapter_val: Some("codex/managed"),
                 caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
                 profile_id: None,
                 expected_substr: "multiple private-app-zip",
@@ -1623,6 +1693,7 @@ mod tests {
                 issue_payload,
                 adapter_val,
                 caps,
+                profile_tools,
                 bad_digest,
                 profile_id,
                 expected_substr,
@@ -1634,6 +1705,7 @@ mod tests {
                 zip_bytes.clone(),
                 bad_digest.map(str::to_string),
                 review_id.clone(),
+                profile_tools.map(|v| v.into_iter().map(str::to_string).collect()),
             );
             write_login(&root, &endpoint, caps);
             let target = RemoteTarget {
@@ -1714,6 +1786,7 @@ mod tests {
             b"PK\x03\x04x".to_vec(),
             None,
             format!("par_{}", "b".repeat(32)),
+            None,
         );
         write_login(&root, &endpoint, &["cli.read", "cli.write", "wiki.read"]);
         let target = RemoteTarget {

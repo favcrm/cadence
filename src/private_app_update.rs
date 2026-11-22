@@ -132,6 +132,46 @@ pub struct ResolvedPrivateAppUpdater {
     pub actor: String,
 }
 
+pub fn valid_package_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn valid_sha256_prefixed(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+pub fn valid_install_id(value: &str) -> bool {
+    value.strip_prefix("install_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 120
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+pub fn valid_generation(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.chars().all(|c| !c.is_control())
+}
+
+pub fn valid_zip_file_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.ends_with(".zip")
+        && !value.contains(['/', '\\', '\0'])
+        && !value.contains("..")
+        && value.chars().all(|c| !c.is_control())
+}
+
 fn valid_agent_actor(actor: &str) -> bool {
     let Some(id) = actor.strip_prefix("agents/") else {
         return false;
@@ -200,9 +240,11 @@ pub fn check_private_app_readiness(
             .iter()
             .any(|t| matches!(t.as_str(), "cadence_writes" | "cadence.write" | "cli.write"))
     });
-    let missing_write = match candidate.capabilities {
-        Some(_) => !has_cli_write,
-        None => !has_opt_in_write,
+    let missing_write = match (candidate.capabilities, candidate.enabled_tools) {
+        (Some(_), Some(_)) => !has_cli_write || !has_opt_in_write,
+        (Some(_), None) => !has_cli_write,
+        (None, Some(_)) => !has_opt_in_write,
+        (None, None) => true,
     };
     if missing_write {
         push_reason(&mut reasons, PrivateAppReadinessReason::MissingWriteScope);
@@ -565,5 +607,35 @@ mod tests {
             PrivateAppAdapterKind::from_endpoint_adapter(Some("codex/pty")),
             PrivateAppAdapterKind::Unsupported
         );
+    }
+
+    #[test]
+    fn readiness_enforces_both_write_sources_and_shared_validators() {
+        let caps = vec!["cli.write".into()];
+        let no_write_tools = vec!["read_only".into()];
+        let mut both = ready_candidate(Some("agents/ap_updater"), &caps);
+        both.enabled_tools = Some(&no_write_tools);
+        assert_eq!(
+            check_private_app_readiness(&both),
+            Err(vec![PrivateAppReadinessReason::MissingWriteScope])
+        );
+
+        let write_tools = vec!["cadence_writes".into()];
+        both.enabled_tools = Some(&write_tools);
+        assert_eq!(check_private_app_readiness(&both), Ok(()));
+
+        assert!(valid_package_ref("art-abc_123"));
+        assert!(!valid_package_ref("../escape"));
+        assert!(valid_sha256_prefixed(&format!("sha256:{}", "a".repeat(64))));
+        assert!(!valid_sha256_prefixed(&format!(
+            "sha256:{}",
+            "A".repeat(64)
+        )));
+        assert!(valid_install_id("install_app-1"));
+        assert!(!valid_install_id("app_1"));
+        assert!(valid_generation("c1:g2"));
+        assert!(!valid_generation("c1\ng2"));
+        assert!(valid_zip_file_name("app-update.zip"));
+        assert!(!valid_zip_file_name("../app.zip"));
     }
 }

@@ -95,7 +95,6 @@ export type PrivateReview = {
   target: PrivateTarget | null;
   willRevokeGrants?: boolean;
   activeBindingsCount?: number;
-  grantRevocationWarning?: string | null;
 };
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -177,11 +176,6 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
     Number.isInteger(value.active_bindings_count) && value.active_bindings_count >= 0
     ? value.active_bindings_count
     : undefined;
-  const grantRevocationWarning = value.grant_revocation_warning === null
-    ? null
-    : typeof value.grant_revocation_warning === "string"
-      ? value.grant_revocation_warning
-      : undefined;
   return {
     name: value.name,
     title: value.title,
@@ -201,7 +195,6 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
     target,
     ...(willRevokeGrants !== undefined ? { willRevokeGrants } : {}),
     ...(activeBindingsCount !== undefined ? { activeBindingsCount } : {}),
-    ...(grantRevocationWarning !== undefined ? { grantRevocationWarning } : {}),
   };
 }
 
@@ -215,12 +208,8 @@ export type HostedPrivateReview = {
   review: PrivateReview;
   requestingAgent?: string;
   authorizedBy?: string;
-  reviewUrl?: string;
-  appliedPolicyId?: string;
-  activationAuthority?: "exact_owner_consent" | "routine_policy" | "owner_applied";
   willRevokeGrants?: boolean;
   activeBindingsCount?: number;
-  grantRevocationWarning?: string | null;
   installedInstallId?: string;
 };
 
@@ -229,8 +218,6 @@ export type PrivateAppRoutinePolicy = {
   install_id: string;
   agent: string;
   source_kind: "github" | "staged_zip";
-  repository_id: number;
-  owner: string;
   expires_at: number;
   installed_digest: string;
 };
@@ -257,13 +244,6 @@ function parseHostedReviewRecord(data: Record<string, unknown>, id: string, gene
   if (data.name !== review.name || data.digest !== review.digest || data.generation !== review.generation) throw invalid();
   const requestingAgent = boundedText(data.requesting_agent, 160);
   const authorizedBy = boundedText(data.authorized_by, 160);
-  const reviewUrl = boundedText(data.review_url, 1024);
-  const appliedPolicyId = boundedText(data.applied_policy_id, 160);
-  const activationAuthority = data.activation_authority === "exact_owner_consent" ||
-    data.activation_authority === "routine_policy" ||
-    data.activation_authority === "owner_applied"
-    ? data.activation_authority
-    : undefined;
   const willRevokeGrants = typeof data.will_revoke_grants === "boolean"
     ? data.will_revoke_grants
     : review.willRevokeGrants;
@@ -271,9 +251,6 @@ function parseHostedReviewRecord(data: Record<string, unknown>, id: string, gene
     Number.isInteger(data.active_bindings_count) && data.active_bindings_count >= 0
     ? data.active_bindings_count
     : review.activeBindingsCount;
-  const grantRevocationWarning = data.grant_revocation_warning !== undefined
-    ? (data.grant_revocation_warning === null ? null : typeof data.grant_revocation_warning === "string" ? data.grant_revocation_warning : undefined)
-    : review.grantRevocationWarning;
   const installedInstallId = boundedText(data.applied_install_id, 160) ?? target?.installId;
   return {
     id,
@@ -285,12 +262,8 @@ function parseHostedReviewRecord(data: Record<string, unknown>, id: string, gene
     review,
     ...(requestingAgent ? { requestingAgent } : {}),
     ...(authorizedBy ? { authorizedBy } : {}),
-    ...(reviewUrl ? { reviewUrl } : {}),
-    ...(appliedPolicyId ? { appliedPolicyId } : {}),
-    ...(activationAuthority ? { activationAuthority } : {}),
     ...(willRevokeGrants !== undefined ? { willRevokeGrants } : {}),
     ...(activeBindingsCount !== undefined ? { activeBindingsCount } : {}),
-    ...(grantRevocationWarning !== undefined ? { grantRevocationWarning } : {}),
     ...(installedInstallId ? { installedInstallId } : {}),
   };
 }
@@ -426,8 +399,6 @@ function parseRoutinePolicy(value: unknown, expectedInstallId: string): PrivateA
     install_id: value.install_id,
     agent: value.agent,
     source_kind: value.source_kind,
-    repository_id: value.repository_id,
-    owner: value.owner,
     expires_at: value.expires_at,
     installed_digest: value.installed_digest,
   };

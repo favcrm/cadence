@@ -49,6 +49,10 @@ mod cad2290_hosted_finish_acceptance;
 #[cfg(test)]
 mod cad2337_stale_socket_finish_refusal;
 
+// Independently authored CAD-2584 acceptance; implementers must not weaken it.
+#[cfg(test)]
+mod cad2584_private_app_acceptance;
+
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
 const MAX_BODY: u64 = 1024 * 1024;
 

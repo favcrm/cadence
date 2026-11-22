@@ -18,6 +18,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::private_app_update::{
+    valid_generation, valid_install_id, valid_package_ref, valid_sha256_prefixed,
+};
 
 const TOOL_DEADLINE: Duration = Duration::from_secs(35);
 const PRIVATE_APP_WAKE_TIMEOUT_SECS: u64 = 60;
@@ -602,43 +605,12 @@ fn is_private_app_tool(name: &str) -> bool {
     )
 }
 
-fn valid_package_ref(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 fn valid_github_zip_url(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 800
         && value.starts_with("https://github.com/")
         && value.ends_with(".zip")
         && !value.bytes().any(|b| b <= 0x20 || b == 0x7f)
-}
-
-fn valid_install_id(value: &str) -> bool {
-    value.strip_prefix("install_").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest.len() <= 120
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    })
-}
-
-fn valid_sha256_prefixed(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-fn valid_generation(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && value.chars().all(|c| !c.is_control())
 }
 
 fn valid_request_id(value: &str) -> bool {
