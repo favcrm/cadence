@@ -2142,6 +2142,7 @@ pub(super) mod tests {
             audience: EP_A,
             subject_id: Some("user_claimant"),
             issuer: Some("https://issuer.example/original"),
+            profile_id: None,
         };
         cadence_agent::local_assignment::reporting::store_kickoff_binding(
             dir,
@@ -2281,6 +2282,7 @@ pub(super) mod tests {
             audience: &endpoint,
             subject_id: Some("user_claimant"),
             issuer: Some("https://issuer.example/original"),
+            profile_id: None,
         };
         cadence_agent::local_assignment::reporting::store_kickoff_binding(
             &dir,

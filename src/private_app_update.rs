@@ -18,6 +18,40 @@ pub enum PrivateAppReadinessReason {
     AdapterUploadUnsupported,
     UnpairedWorkspaceMcp,
     BoardUnavailable,
+    ActorMismatch,
+    ServerNotReady,
+}
+
+impl PrivateAppReadinessReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingIdentity => "missing_identity",
+            Self::PersonalAssistantExcluded => "personal_assistant_excluded",
+            Self::ChatDefaultNotUpdater => "chat_default_not_updater",
+            Self::MissingWriteScope => "missing_write_scope",
+            Self::AdapterUploadUnsupported => "adapter_upload_unsupported",
+            Self::UnpairedWorkspaceMcp => "unpaired_workspace_mcp",
+            Self::BoardUnavailable => "board_unavailable",
+            Self::ActorMismatch => "actor_mismatch",
+            Self::ServerNotReady => "server_not_ready",
+        }
+    }
+}
+
+/// Format readiness refusal reasons into a deterministic, non-sensitive error string.
+pub fn format_readiness_refusal(reasons: &[PrivateAppReadinessReason]) -> String {
+    let codes = if reasons.is_empty() {
+        PrivateAppReadinessReason::MissingIdentity
+            .as_str()
+            .to_string()
+    } else {
+        reasons
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("private app updater is not ready ({codes}); update aborted before staging package")
 }
 
 /// Which transport adapter executes the update.
@@ -27,6 +61,19 @@ pub enum PrivateAppAdapterKind {
     CodexMcpAgent,
     WorkspaceMcp,
     Unsupported,
+}
+
+impl PrivateAppAdapterKind {
+    /// Map an endpoint adapter string (`"{provider}/{endpoint_kind}"`) to upload support.
+    pub fn from_endpoint_adapter(adapter: Option<&str>) -> Self {
+        match adapter {
+            Some("codex/managed" | "codex/managed-ws") => Self::CodexMcpAgent,
+            Some(value) if value == "workspace_mcp" || value.starts_with("workspace_mcp/") => {
+                Self::WorkspaceMcp
+            }
+            _ => Self::Unsupported,
+        }
+    }
 }
 
 /// Server-reported readiness snapshot from Workspace MCP `connection_status`.
@@ -102,6 +149,17 @@ fn push_reason(reasons: &mut Vec<PrivateAppReadinessReason>, reason: PrivateAppR
     }
 }
 
+fn validate_actor_value(value: &str, reasons: &mut Vec<PrivateAppReadinessReason>) {
+    if value.starts_with("service/") {
+        push_reason(
+            reasons,
+            PrivateAppReadinessReason::PersonalAssistantExcluded,
+        );
+    } else if !valid_agent_actor(value) {
+        push_reason(reasons, PrivateAppReadinessReason::MissingIdentity);
+    }
+}
+
 /// Evaluate whether a candidate can stage ZIP artifacts and execute private app updates.
 pub fn check_private_app_readiness(
     candidate: &PrivateAppUpdaterCandidate<'_>,
@@ -115,17 +173,22 @@ pub fn check_private_app_readiness(
     }
 
     let server_actor = candidate.server_readiness.and_then(|s| s.actor.as_deref());
-    let actor = candidate.actor.or(server_actor);
-    match actor {
-        Some(value) if value.starts_with("service/") => {
-            push_reason(
-                &mut reasons,
-                PrivateAppReadinessReason::PersonalAssistantExcluded,
-            );
-        }
-        Some(value) if valid_agent_actor(value) => {}
-        _ => {
+    match (candidate.actor, server_actor) {
+        (None, None) => {
             push_reason(&mut reasons, PrivateAppReadinessReason::MissingIdentity);
+        }
+        (local, server) => {
+            if let Some(value) = local {
+                validate_actor_value(value, &mut reasons);
+            }
+            if let Some(value) = server {
+                validate_actor_value(value, &mut reasons);
+            }
+            if let (Some(local_actor), Some(server_actor_val)) = (local, server) {
+                if local_actor != server_actor_val {
+                    push_reason(&mut reasons, PrivateAppReadinessReason::ActorMismatch);
+                }
+            }
         }
     }
 
@@ -169,24 +232,22 @@ pub fn check_private_app_readiness(
 
     if let Some(server) = candidate.server_readiness {
         for raw in &server.reasons {
-            match raw.as_str() {
-                "board_unavailable" => {
-                    push_reason(&mut reasons, PrivateAppReadinessReason::BoardUnavailable);
-                }
+            let mapped = match raw.as_str() {
+                "board_unavailable" => PrivateAppReadinessReason::BoardUnavailable,
                 "missing_cli_scope" | "missing_write_scope" => {
-                    push_reason(&mut reasons, PrivateAppReadinessReason::MissingWriteScope);
+                    PrivateAppReadinessReason::MissingWriteScope
                 }
-                "unpaired_workspace_mcp" => {
-                    push_reason(
-                        &mut reasons,
-                        PrivateAppReadinessReason::UnpairedWorkspaceMcp,
-                    );
+                "unpaired_workspace_mcp" => PrivateAppReadinessReason::UnpairedWorkspaceMcp,
+                "personal_assistant_excluded" | "agent_required" => {
+                    PrivateAppReadinessReason::PersonalAssistantExcluded
                 }
-                _ => {}
-            }
+                "missing_identity" => PrivateAppReadinessReason::MissingIdentity,
+                _ => PrivateAppReadinessReason::ServerNotReady,
+            };
+            push_reason(&mut reasons, mapped);
         }
         if !server.ready && server.reasons.is_empty() {
-            push_reason(&mut reasons, PrivateAppReadinessReason::MissingIdentity);
+            push_reason(&mut reasons, PrivateAppReadinessReason::ServerNotReady);
         }
     }
 
@@ -398,6 +459,111 @@ mod tests {
                 ..Default::default()
             }),
             Err(vec![PrivateAppReadinessReason::PersonalAssistantExcluded])
+        );
+    }
+
+    #[test]
+    fn readiness_fails_closed_on_unknown_server_reason_empty_not_ready_and_actor_mismatch() {
+        let write_caps = vec!["cli.write".into()];
+
+        // 1. server.ready == false with an unrecognized reason fails closed with ServerNotReady.
+        let unknown_not_ready = ServerPrivateAppReadiness {
+            ready: false,
+            actor: Some("agents/ap_1".into()),
+            reasons: vec!["policy_locked".into()],
+        };
+        let mut c1 = ready_candidate(Some("agents/ap_1"), &write_caps);
+        c1.server_readiness = Some(&unknown_not_ready);
+        assert_eq!(
+            check_private_app_readiness(&c1),
+            Err(vec![PrivateAppReadinessReason::ServerNotReady])
+        );
+
+        // 2. server.ready == true with an unrecognized reason still fails closed with ServerNotReady.
+        let unknown_when_ready = ServerPrivateAppReadiness {
+            ready: true,
+            actor: Some("agents/ap_1".into()),
+            reasons: vec!["unexpected_restriction".into()],
+        };
+        let mut c2 = ready_candidate(Some("agents/ap_1"), &write_caps);
+        c2.server_readiness = Some(&unknown_when_ready);
+        assert_eq!(
+            check_private_app_readiness(&c2),
+            Err(vec![PrivateAppReadinessReason::ServerNotReady])
+        );
+
+        // 3. server.ready == false with empty reasons returns Err([ServerNotReady]).
+        let empty_not_ready = ServerPrivateAppReadiness {
+            ready: false,
+            actor: None,
+            reasons: Vec::new(),
+        };
+        let mut c3 = ready_candidate(Some("agents/ap_1"), &write_caps);
+        c3.server_readiness = Some(&empty_not_ready);
+        assert_eq!(
+            check_private_app_readiness(&c3),
+            Err(vec![PrivateAppReadinessReason::ServerNotReady])
+        );
+
+        // 4. Local agents/* actor cannot override a server-reported service/* actor.
+        let server_pa = ServerPrivateAppReadiness {
+            ready: true,
+            actor: Some("service/pa_1".into()),
+            reasons: Vec::new(),
+        };
+        let mut c4 = ready_candidate(Some("agents/ap_1"), &write_caps);
+        c4.server_readiness = Some(&server_pa);
+        assert_eq!(
+            check_private_app_readiness(&c4),
+            Err(vec![
+                PrivateAppReadinessReason::PersonalAssistantExcluded,
+                PrivateAppReadinessReason::ActorMismatch,
+            ])
+        );
+
+        // 5. Disagreement between two agents/* actors returns ActorMismatch.
+        let server_other_agent = ServerPrivateAppReadiness {
+            ready: true,
+            actor: Some("agents/ap_2".into()),
+            reasons: Vec::new(),
+        };
+        let mut c5 = ready_candidate(Some("agents/ap_1"), &write_caps);
+        c5.server_readiness = Some(&server_other_agent);
+        assert_eq!(
+            check_private_app_readiness(&c5),
+            Err(vec![PrivateAppReadinessReason::ActorMismatch])
+        );
+    }
+
+    #[test]
+    fn adapter_kind_from_endpoint_adapter_maps_known_and_unsupported() {
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("codex/managed")),
+            PrivateAppAdapterKind::CodexMcpAgent
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("codex/managed-ws")),
+            PrivateAppAdapterKind::CodexMcpAgent
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("workspace_mcp")),
+            PrivateAppAdapterKind::WorkspaceMcp
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("workspace_mcp/hosted")),
+            PrivateAppAdapterKind::WorkspaceMcp
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(None),
+            PrivateAppAdapterKind::Unsupported
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("claude/managed")),
+            PrivateAppAdapterKind::Unsupported
+        );
+        assert_eq!(
+            PrivateAppAdapterKind::from_endpoint_adapter(Some("codex/pty")),
+            PrivateAppAdapterKind::Unsupported
         );
     }
 }

@@ -928,6 +928,30 @@ fn execute_private_app_call(state_dir: &Path, alias: &str, call: PrivateAppCall)
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_private_app_tool_with(
+    auth_dir: &Path,
+    state_dir: &Path,
+    message_id: &str,
+    target: &crate::remote_cli::RemoteTarget,
+    slot: &crate::remote_cli::AgentSlot,
+    name: &str,
+    args: &Value,
+    wake_timeout: u64,
+) -> Result<String> {
+    let call = parse_private_app_call(name, args)?;
+    execute_private_app_call_with(
+        auth_dir,
+        state_dir,
+        message_id,
+        target,
+        slot,
+        call,
+        wake_timeout,
+    )
+}
+
 fn execute_private_app_call_with(
     auth_dir: &Path,
     state_dir: &Path,
@@ -1523,6 +1547,7 @@ mod tests {
             audience: &endpoint,
             subject_id: Some("sub_12345"),
             issuer: Some("https://auth.example"),
+            profile_id: None,
         };
         crate::local_assignment::reporting::store_kickoff_binding(
             &state_dir,

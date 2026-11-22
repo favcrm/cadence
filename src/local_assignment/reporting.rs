@@ -1066,6 +1066,11 @@ fn acquire_lock(binding: &Path) -> Result<FileLock> {
 }
 
 #[cfg(test)]
+pub(super) fn settle_binding_for_test(state_dir: &Path, message_id: &str) -> Result<()> {
+    mark_fenced(&binding_path(state_dir, message_id)?)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{NewAgent, Store};
@@ -1087,6 +1092,7 @@ mod tests {
             audience: "https://hosted-report.invalid",
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-report.invalid"),
+            profile_id: None,
         }
     }
 
