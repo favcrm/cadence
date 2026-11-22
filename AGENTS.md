@@ -158,19 +158,18 @@ Those are the evaluator's counts. On a hosted org the gate counts the review
 axes itself (below), so a hosted `routine` PR still wants the two workflow
 reviews and the operator's approval unless the PR is `class: auto`.
 
-**Review standard.** A review is valid when a fresh-context session that is not
-the author does it; a subagent qualifies. Fresh means it inherits no
-conversation or context from the work: a forked subagent or a resumed authoring
-session does not count, and its brief points at the change (PR, exact head,
-ticket) without the author's conclusions. A second model vendor is optional. A
-separate human or account is not required. Records say "fresh-session review"
-and never claim independent parties. Standards and Spec/security stay two
-separate passes where two are required, each by its own fresh session. Gate,
-security, schema and release PRs keep fresh-session Opus reviews; the workflow
-rows below are a cheap first pass on them. The gate cannot prove freshness when
-the author and the reviewer act under one login, so the standard is ours to keep
-and the operator's approval is the accountability. The standard changes no
-approval rule for send, publish, spend or deploy.
+**Review standard.** A source review is independent when a fresh-context
+session other than the author does it; a read-only subagent qualifies. A
+resumed authoring session or a fork that inherits its conversation does not.
+Brief the reviewer with the PR, exact head and ticket, not the author's
+conclusions. A separate human, account or model vendor is not required for
+source review. Record "fresh-session review," not "independent parties."
+For hosted Standards and Spec/security, only eligible owner-attested verdicts
+or trusted workflow results count. A fresh OMP review is evidence, not a
+hosted verdict. See [Review evidence](docs/guides/delivery.md#review-evidence).
+If two source reviews are required, use a separate fresh session for each
+axis. Gate, security, schema and release PRs keep fresh-session Opus reviews;
+the workflow rows below are a cheap first pass on them.
 
 **The hosted route** is this repository's supported delivery route.
 
@@ -262,10 +261,9 @@ is native-only, is refused on a hosted org, and ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate` (2026-12-31); do not offer it as a hosted route.
 
 **Findings.** Notes never block. REVISE only for a correctness, security or
-ticket-requirement gap. Everything else (wording, docs, comments, style, extra
-tests) is a note: PASS with notes, and the author files one follow-up ticket
-listing them. Those fixes land in a follow-up PR, never in the reviewed PR,
-because a new head voids every verdict. A gate or daemon-enforced rule change
+ticket-requirement gap. Keep non-blocking notes on the review as PASS with
+notes. Batch independently useful follow-up work; don't open a ticket just to
+transcribe notes or push a new head for them. A gate or daemon-enforced rule change
 without its acceptance check is a REVISE. A reviewer who sees auth, identity,
 credential, signature, secret or confinement logic in a one-review PR returns
 REVISE, names the trigger in `Risk:` and asks for the second pass. When unsure,
@@ -731,8 +729,9 @@ name. Never run `rm <scratchpad>/*`.
 
 ### Reporting
 
-- Every lane ends with a six-field reflection (expected, evidence, cause,
-  correction, lesson, next) posted to the ticket.
+- For routine closeout, record the verified outcome, evidence and any remaining
+  limitation or next owner in one ticket comment. Add a short reflection for a
+  material blocker, recurring friction or a reusable lesson.
 - Copy SHAs from `git` or `gh` output; never type them by hand.
 
 ## Operator decisions in force
