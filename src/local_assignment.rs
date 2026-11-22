@@ -49,6 +49,10 @@ mod cad2290_hosted_finish_acceptance;
 #[cfg(test)]
 mod cad2337_stale_socket_finish_refusal;
 
+// Independently authored CAD-2584 acceptance; implementers must not weaken it.
+#[cfg(test)]
+mod cad2584_private_app_acceptance;
+
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
 const MAX_BODY: u64 = 1024 * 1024;
 
@@ -78,6 +82,8 @@ pub struct Kickoff<'a> {
     /// Both are required together. A missing half is not inferred.
     pub subject_id: Option<&'a str>,
     pub issuer: Option<&'a str>,
+    /// Optional profile recorded for this claim (`ap_...`).
+    pub profile_id: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -1871,6 +1877,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 audience: self.audience.as_str(),
                 subject_id: self.subject_id.as_deref(),
                 issuer: self.issuer.as_deref(),
+                profile_id: current.profile_id.as_deref(),
             };
             match deliver(&kickoff) {
                 Ok(value) => {

@@ -1,9 +1,30 @@
 use super::http::BoardHttp;
 use super::*;
+use crate::private_app_update::{
+    valid_generation, valid_install_id, valid_package_ref, valid_sha256_prefixed,
+    valid_zip_file_name,
+};
 use std::borrow::Cow;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 use std::time::Instant;
+
+/// Dispatcher-pinned private app ZIP custody attached to one running claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateAppPackageCustody {
+    pub artifact_ref: String,
+    pub zip_sha256: String,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<String>,
+}
+
+pub const MAX_PRIVATE_APP_ZIP_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +58,9 @@ struct KickoffFile {
     /// member: the managed route cannot use this file.
     #[serde(default)]
     issuer: Option<String>,
+    /// Dispatcher-pinned private app update package bound to this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_app_package: Option<PrivateAppPackageCustody>,
 }
 
 fn pinned_issuer(value: &str) -> bool {
@@ -210,12 +234,213 @@ pub struct HostedBindingTarget {
     pub assignment_id: String,
     pub claim_id: String,
     pub generation: u64,
+    /// Turn-assigned private app package custody when attached at dispatch.
+    pub private_app_package: Option<PrivateAppPackageCustody>,
 }
 
 /// Where a session's own credential for this kickoff is cached, beside its
 /// `.bind` file (CAD-2149). Private, short-lived, and gone with the binding.
 pub fn agent_credential_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
     Ok(binding_path(state_dir, message_id)?.with_extension("agent"))
+}
+
+/// Where a turn-assigned private app ZIP is stored beside its `.bind` file.
+pub fn private_app_package_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
+    Ok(binding_path(state_dir, message_id)?.with_extension("zip"))
+}
+
+fn valid_zip_bytes(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len() <= MAX_PRIVATE_APP_ZIP_BYTES
+        && (bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06"))
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn write_zip_private(zip_path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = unique_temp(zip_path);
+    write_private(&tmp, bytes).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+    fs::rename(&tmp, zip_path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+    if let Some(parent) = zip_path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn read_zip_verified(zip_path: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(zip_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::rejected("assigned private app package file is missing")
+        } else {
+            error.into()
+        }
+    })?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.mode() & 0o077 != 0 {
+        return Err(Error::rejected(
+            "assigned private app package must be a private regular file",
+        ));
+    }
+    if meta.len() == 0 || meta.len() > MAX_PRIVATE_APP_ZIP_BYTES as u64 {
+        return Err(Error::rejected(
+            "assigned private app package exceeds size bounds",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(zip_path)?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take((MAX_PRIVATE_APP_ZIP_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if !valid_zip_bytes(&bytes) {
+        return Err(Error::rejected(
+            "assigned file is not a valid private app ZIP",
+        ));
+    }
+    if sha256_prefixed(&bytes) != expected_sha256 {
+        return Err(Error::rejected(
+            "assigned private app package digest does not match kickoff custody pin",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Bind a turn-assigned private app ZIP archive beside `<message_id>.bind`.
+/// Computes and pins `zip_sha256`; idempotent only for an exact matching repeat.
+#[allow(clippy::too_many_arguments)]
+pub fn store_private_app_package(
+    state_dir: &Path,
+    message_id: &str,
+    artifact_ref: &str,
+    file_name: &str,
+    bytes: &[u8],
+    install_id: Option<&str>,
+    expected_digest: Option<&str>,
+    expected_generation: Option<&str>,
+) -> Result<PrivateAppPackageCustody> {
+    if !valid_package_ref(artifact_ref) {
+        return Err(Error::rejected("invalid private app package reference"));
+    }
+    if !valid_zip_file_name(file_name) {
+        return Err(Error::rejected("invalid private app ZIP filename"));
+    }
+    if !valid_zip_bytes(bytes) {
+        return Err(Error::rejected(
+            "private app package must be a non-empty ZIP of at most 8 MiB",
+        ));
+    }
+    if let Some(id) = install_id {
+        if !valid_install_id(id) {
+            return Err(Error::rejected("invalid private app install_id"));
+        }
+    }
+    if let Some(digest) = expected_digest {
+        if !valid_sha256_prefixed(digest) {
+            return Err(Error::rejected("invalid private app expected_digest"));
+        }
+    }
+    if let Some(generation) = expected_generation {
+        if !valid_generation(generation) {
+            return Err(Error::rejected("invalid private app expected_generation"));
+        }
+    }
+    if (expected_digest.is_some() || expected_generation.is_some()) && install_id.is_none() {
+        return Err(Error::rejected("target CAS pins require install_id"));
+    }
+
+    let custody = PrivateAppPackageCustody {
+        artifact_ref: artifact_ref.to_string(),
+        zip_sha256: sha256_prefixed(bytes),
+        file_name: file_name.to_string(),
+        install_id: install_id.map(str::to_string),
+        expected_digest: expected_digest.map(str::to_string),
+        expected_generation: expected_generation.map(str::to_string),
+    };
+    let bind_path = binding_path(state_dir, message_id)?;
+    let _lock = acquire_lock(&bind_path)?;
+    let mut binding = read_kickoff_file(&bind_path)?
+        .ok_or_else(|| Error::rejected("hosted kickoff binding does not exist"))?;
+    if binding.version != 1
+        || binding.message_id != message_id
+        || binding.settled
+        || binding.reported_state.is_some()
+    {
+        return Err(Error::rejected(
+            "hosted kickoff binding is closed or does not match this message",
+        ));
+    }
+    let zip_path = private_app_package_path(state_dir, message_id)?;
+    if let Some(existing) = &binding.private_app_package {
+        if existing != &custody {
+            return Err(Error::rejected(
+                "hosted kickoff already binds a different private app package",
+            ));
+        }
+        if read_zip_verified(&zip_path, &custody.zip_sha256).is_ok() {
+            return Ok(custody);
+        }
+        return Err(Error::rejected(
+            "existing private app package custody could not be verified",
+        ));
+    }
+    write_zip_private(&zip_path, bytes)?;
+    binding.private_app_package = Some(custody.clone());
+    write_kickoff_file(&bind_path, &binding)?;
+    Ok(custody)
+}
+
+/// Read and digest-verify the turn-assigned private app ZIP for `expected_ref`.
+pub fn read_private_app_package(
+    state_dir: &Path,
+    message_id: &str,
+    expected_ref: &str,
+) -> Result<(PrivateAppPackageCustody, Vec<u8>)> {
+    if !valid_package_ref(expected_ref) {
+        return Err(Error::rejected("invalid private app package reference"));
+    }
+    let bind_path = binding_path(state_dir, message_id)?;
+    let _lock = acquire_lock(&bind_path)?;
+    let binding = read_kickoff_file(&bind_path)?
+        .ok_or_else(|| Error::rejected("hosted kickoff binding does not exist"))?;
+    if binding.version != 1
+        || binding.message_id != message_id
+        || binding.settled
+        || binding.reported_state.is_some()
+    {
+        return Err(Error::rejected(
+            "hosted kickoff binding is closed or does not match this message",
+        ));
+    }
+    let custody = binding
+        .private_app_package
+        .ok_or_else(|| Error::rejected("this turn has no assigned private app package"))?;
+    if custody.artifact_ref != expected_ref
+        || !valid_sha256_prefixed(&custody.zip_sha256)
+        || !valid_zip_file_name(&custody.file_name)
+    {
+        return Err(Error::rejected(
+            "package_ref does not match the turn-assigned private app package",
+        ));
+    }
+    let zip_path = private_app_package_path(state_dir, message_id)?;
+    let bytes = read_zip_verified(&zip_path, &custody.zip_sha256)?;
+    Ok((custody, bytes))
 }
 
 /// Read the live hosted target for `message_id`.
@@ -260,6 +485,7 @@ pub fn hosted_binding_target(
         assignment_id: file.assignment_id,
         claim_id: file.claim_id,
         generation: file.generation,
+        private_app_package: file.private_app_package,
     }))
 }
 
@@ -311,6 +537,7 @@ pub fn store_kickoff_binding(
             settled: false,
             subject_id: Some(subject_id.to_string()),
             issuer: Some(issuer.to_string()),
+            private_app_package: None,
         },
     )?;
     if created {
@@ -732,17 +959,21 @@ fn drop_agent_credential(binding: &Path) {
     let cache = binding.with_extension("agent");
     let _ = write_private(&binding.with_extension("agent.dropped"), b"1\n");
     let _ = fs::remove_file(&cache);
-    if let (Some(dir), Some(name)) = (
-        cache.parent(),
-        cache.file_name().and_then(|name| name.to_str()),
-    ) {
-        let prefix = format!(".{name}.");
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let file = entry.file_name();
-                let Some(file) = file.to_str() else { continue };
-                if file.starts_with(&prefix) && file.ends_with(".tmp") {
-                    let _ = fs::remove_file(entry.path());
+    let zip = binding.with_extension("zip");
+    let _ = fs::remove_file(&zip);
+    for stale_base in [&cache, &zip] {
+        if let (Some(dir), Some(name)) = (
+            stale_base.parent(),
+            stale_base.file_name().and_then(|name| name.to_str()),
+        ) {
+            let prefix = format!(".{name}.");
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let file = entry.file_name();
+                    let Some(file) = file.to_str() else { continue };
+                    if file.starts_with(&prefix) && file.ends_with(".tmp") {
+                        let _ = fs::remove_file(entry.path());
+                    }
                 }
             }
         }
@@ -770,7 +1001,7 @@ struct FileLock {
     _file: File,
 }
 
-fn try_lock(binding: &Path) -> Result<Option<FileLock>> {
+fn open_lock(binding: &Path, flags: libc::c_int) -> Result<Option<FileLock>> {
     let lock_path = binding.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
@@ -782,11 +1013,25 @@ fn try_lock(binding: &Path) -> Result<Option<FileLock>> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), flags) };
     if rc != 0 {
         return Ok(None);
     }
     Ok(Some(FileLock { _file: file }))
+}
+
+fn try_lock(binding: &Path) -> Result<Option<FileLock>> {
+    open_lock(binding, libc::LOCK_EX | libc::LOCK_NB)
+}
+
+fn acquire_lock(binding: &Path) -> Result<FileLock> {
+    open_lock(binding, libc::LOCK_EX)?
+        .ok_or_else(|| Error::busy("hosted kickoff binding lock could not be acquired"))
+}
+
+#[cfg(test)]
+pub(super) fn settle_binding_for_test(state_dir: &Path, message_id: &str) -> Result<()> {
+    mark_fenced(&binding_path(state_dir, message_id)?)
 }
 
 #[cfg(test)]
@@ -811,6 +1056,7 @@ mod tests {
             audience: "https://hosted-report.invalid",
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-report.invalid"),
+            profile_id: None,
         }
     }
 
@@ -1215,5 +1461,109 @@ mod tests {
         assert!(hosted_binding_target(dir.path(), "end-live")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn cad2584_private_app_package_custody_pins_digest_and_cleans_up_on_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        bind(dir.path(), "pkg-1");
+        let zip_bytes = b"PK\x03\x04synthetic-private-app-zip";
+        let install_id = "install_demo123";
+        let expected_digest = format!("sha256:{}", "a".repeat(64));
+
+        // Target pins require install_id and reject malformed filenames or non-ZIP bytes.
+        assert!(store_private_app_package(
+            dir.path(),
+            "pkg-1",
+            "pkg_ref_1",
+            "../evil.zip",
+            zip_bytes,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(store_private_app_package(
+            dir.path(),
+            "pkg-1",
+            "pkg_ref_1",
+            "app.zip",
+            b"not-a-zip",
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(store_private_app_package(
+            dir.path(),
+            "pkg-1",
+            "pkg_ref_1",
+            "app.zip",
+            zip_bytes,
+            None,
+            Some(&expected_digest),
+            None,
+        )
+        .is_err());
+
+        let custody = store_private_app_package(
+            dir.path(),
+            "pkg-1",
+            "pkg_ref_1",
+            "app-v1.zip",
+            zip_bytes,
+            Some(install_id),
+            Some(&expected_digest),
+            Some("c1:gen1"),
+        )
+        .unwrap();
+        assert_eq!(custody.artifact_ref, "pkg_ref_1");
+        assert_eq!(custody.zip_sha256, sha256_prefixed(zip_bytes));
+
+        // Exact repeat is idempotent; conflicting repeat refuses.
+        assert_eq!(
+            store_private_app_package(
+                dir.path(),
+                "pkg-1",
+                "pkg_ref_1",
+                "app-v1.zip",
+                zip_bytes,
+                Some(install_id),
+                Some(&expected_digest),
+                Some("c1:gen1"),
+            )
+            .unwrap(),
+            custody
+        );
+        assert!(store_private_app_package(
+            dir.path(),
+            "pkg-1",
+            "pkg_ref_2",
+            "app-v1.zip",
+            zip_bytes,
+            Some(install_id),
+            Some(&expected_digest),
+            Some("c1:gen1"),
+        )
+        .is_err());
+
+        // Wrong ref refused; matching ref returns verified bytes.
+        assert!(read_private_app_package(dir.path(), "pkg-1", "wrong_ref").is_err());
+        let (read_custody, read_bytes) =
+            read_private_app_package(dir.path(), "pkg-1", "pkg_ref_1").unwrap();
+        assert_eq!(read_custody, custody);
+        assert_eq!(read_bytes, zip_bytes);
+
+        // Tampered .zip fails SHA-256 verification.
+        let zip_path = private_app_package_path(dir.path(), "pkg-1").unwrap();
+        fs::write(&zip_path, b"PK\x03\x04tampered").unwrap();
+        assert!(read_private_app_package(dir.path(), "pkg-1", "pkg_ref_1").is_err());
+
+        // Restore good bytes, then settle: both .agent and .zip disappear.
+        fs::write(&zip_path, zip_bytes).unwrap();
+        assert!(read_private_app_package(dir.path(), "pkg-1", "pkg_ref_1").is_ok());
+        mark_fenced(&binding_path(dir.path(), "pkg-1").unwrap()).unwrap();
+        assert!(!zip_path.exists());
+        assert!(read_private_app_package(dir.path(), "pkg-1", "pkg_ref_1").is_err());
     }
 }

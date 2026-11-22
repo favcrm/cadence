@@ -1,10 +1,22 @@
-import { checkPrivateApp, applyPrivateApp, decideHostedPrivateReview, getHostedPrivateReview } from "../src/features/workspace-apps/privateAppUpload";
-import { ApiError } from "../src/lib/apiError";
+import {
+  applyPrivateApp,
+  authorizeHostedPrivateReview,
+  checkPrivateApp,
+  decideHostedPrivateReview,
+  getHostedPrivateReview,
+  grantPrivateAppUpdatePolicy,
+  listHostedPrivateReviews,
+  readPrivateAppUpdatePolicy,
+  revokePrivateAppUpdatePolicy,
+} from "../src/features/workspace-apps/privateAppUpload";
+import { ApiError, errorRequestId } from "../src/lib/apiError";
 import type * as HappyDom from "happy-dom";
 import type * as React from "react";
 import type * as ReactDom from "react-dom/client";
 import type * as Locale from "../src/lib/locale";
 import type * as Dialog from "../src/features/workspace-apps/PrivateAppDialog";
+import type * as ReviewCardsModule from "../src/features/home/PrivateAppReviewCards";
+import type * as UpdaterSettingsModule from "../src/features/workspace-apps/PrivateAppUpdaterSettings";
 
 declare function require(name: string): unknown;
 function equal(actual: unknown, expected: unknown, message = "values differ"): void {
@@ -27,12 +39,17 @@ const review = {
   notes: [], secret_warnings: [],
 };
 let calls: { path: string; init: RequestInit }[] = [];
-let responses: { status: number; body: unknown }[] = [];
+let responses: { status: number; body: unknown | ((init: RequestInit) => unknown); headers?: Record<string, string> }[] = [];
 globalThis.fetch = async (input, init) => {
-  calls.push({ path: String(input), init: init ?? {} });
+  const requestInit = init ?? {};
+  calls.push({ path: String(input), init: requestInit });
   const next = responses.shift();
   if (!next) throw new Error("unexpected request");
-  return new Response(JSON.stringify(next.body), { status: next.status, headers: { "Content-Type": "application/json" } });
+  const payload = typeof next.body === "function" ? (next.body as (init: RequestInit) => unknown)(requestInit) : next.body;
+  return new Response(JSON.stringify(payload), {
+    status: next.status,
+    headers: { "Content-Type": "application/json", ...next.headers },
+  });
 };
 
 async function main() {
@@ -147,12 +164,18 @@ async function main() {
     return originalRequire.call(this, name);
   };
   let dialog: typeof Dialog;
+  let reviewCardsMod: typeof ReviewCardsModule;
+  let updaterSettingsMod: typeof UpdaterSettingsModule;
   try {
     dialog = require("../src/features/workspace-apps/PrivateAppDialog") as typeof Dialog;
+    reviewCardsMod = require("../src/features/home/PrivateAppReviewCards") as typeof ReviewCardsModule;
+    updaterSettingsMod = require("../src/features/workspace-apps/PrivateAppUpdaterSettings") as typeof UpdaterSettingsModule;
   } finally {
     loader.prototype.require = originalRequire;
   }
   const { PrivateAppDialog } = dialog;
+  const PrivateAppReviewCards = reviewCardsMod.default;
+  const { PrivateAppUpdaterSettings } = updaterSettingsMod;
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
@@ -185,6 +208,293 @@ async function main() {
     equal(approve(), undefined, "a late refused approval cannot be submitted again from the stale dialog");
     equal(calls.map(({ init }) => init.method ?? "GET").join(" "), "GET POST GET",
       "the stale refusal is reconciled without replaying approval");
+
+    // AOS-690 transport helpers & pre-AOS-690 404/501 degradation.
+    equal(errorRequestId({ error: { request_id: "req_body_1" } }), "req_body_1");
+    equal(
+      errorRequestId({}, new Response(null, { headers: { "x-request-id": "req_hdr_2" } })),
+      "req_hdr_2",
+    );
+    equal(errorRequestId({ error: { request_id: "bad space" } }), undefined);
+
+    for (const status of [404, 501]) {
+      responses = [{ status, body: { error: { code: "not_found" } } }];
+      const missing = await listHostedPrivateReviews();
+      equal(missing.supported, false);
+      equal(missing.reviews.length, 0);
+
+      responses = [{ status, body: { error: { code: "not_found" } } }];
+      const polMissing = await readPrivateAppUpdatePolicy("install_app1");
+      equal(polMissing.supported, false);
+      equal(polMissing.policy, null);
+    }
+
+    const agentReceipt = {
+      ok: true,
+      data: {
+        ...receipt.data,
+        install_id: "install_app1",
+        expected_digest: digest,
+        requesting_agent: "agents/ap_upd",
+        will_revoke_grants: true,
+        active_bindings_count: 2,
+        review: {
+          ...review,
+          install_id: "install_app1",
+          expected_digest: digest,
+          expected_generation: review.catalog_generation,
+          structural_diff: { added: ["app.md"], changed: [], removed: [] },
+          previous_screen_access: review.screen_access,
+        },
+      },
+    };
+    responses = [{ status: 200, body: { ok: true, data: { reviews: [agentReceipt.data] } } }];
+    const listed = await listHostedPrivateReviews();
+    equal(listed.supported, true);
+    equal(listed.reviews.length, 1);
+    equal(listed.reviews[0]?.requestingAgent, "agents/ap_upd");
+    equal(listed.reviews[0]?.activeBindingsCount, 2);
+
+    responses = [{ status: 200, body: { ok: true, data: { ...agentReceipt.data, authorized_by: "owner_1" } } }];
+    const authorized = await authorizeHostedPrivateReview(listed.reviews[0]!);
+    equal(authorized.authorizedBy, "owner_1");
+
+    responses = [
+      { status: 409, body: { error: { code: "review_closed", message: "Review closed." } } },
+      { status: 200, body: agentReceipt },
+    ];
+    await rejected(
+      authorizeHostedPrivateReview(listed.reviews[0]!),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "a 409 review_closed with a still-pending readback must refuse fail-closed",
+    );
+
+    calls = [];
+    responses = [
+      { status: 409, body: { error: { code: "review_closed", message: "Review closed." } } },
+      { status: 200, body: { ok: true, data: { ...agentReceipt.data, state: "installed", applied_install_id: "install_app1" } } },
+    ];
+    const closedAuth = await authorizeHostedPrivateReview(listed.reviews[0]!);
+    equal(closedAuth.state, "installed");
+    equal(calls.map(({ init }) => init.method ?? "GET").join(" "), "POST GET");
+
+    responses = [{ status: 200, body: agentReceipt }];
+    await rejected(
+      authorizeHostedPrivateReview(listed.reviews[0]!),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "a 200 authorize response without authorized_by must refuse fail-closed",
+    );
+
+    const grantedPolicy = {
+      id: "pol_1",
+      install_id: "install_app1",
+      agent: "agents/ap_upd",
+      source_kind: "staged_zip",
+      repository_id: 0,
+      owner: "owner_1",
+      expires_at: Date.now() + 86_400_000,
+      installed_digest: digest,
+    };
+    calls = [];
+    responses = [{ status: 200, body: { ok: true, data: { policy: grantedPolicy } } }];
+    const savedPolicy = await grantPrivateAppUpdatePolicy({
+      installId: "install_app1",
+      expectedDigest: digest,
+      agent: "agents/ap_upd",
+      source: "staged_zip",
+      expiresAt: grantedPolicy.expires_at,
+    });
+    equal(savedPolicy.source_kind, "staged_zip");
+    const grantPayload = JSON.parse(String(calls[0]?.init.body)) as Record<string, unknown>;
+    equal("repository_id" in grantPayload, false, "staged_zip policy must omit repository_id");
+    equal(grantPayload.expires_at, grantedPolicy.expires_at);
+
+    responses = [{ status: 200, body: { ok: true, data: { revoked: true, install_id: "install_app1", policy_id: "pol_1" } } }];
+    await revokePrivateAppUpdatePolicy("install_app1", "pol_1");
+
+    // Mounted PrivateAppDialog: Authorize button, request_id ref, and opt-in 30-day policy after install.
+    calls = [];
+    responses = [{ status: 200, body: agentReceipt }];
+    await mount("agent-review");
+    equal(host.textContent?.includes("agents/ap_upd"), true);
+    equal(host.textContent?.includes("2 connection or tool grants"), true);
+    const agentConsent = host.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    if (!agentConsent) throw new Error("expected consent checkbox");
+    await act(async () => agentConsent.click());
+    const authBtn = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Authorize agent to apply");
+    if (!authBtn) throw new Error("expected Authorize agent to apply button");
+    responses = [{ status: 200, body: { ok: true, data: { ...agentReceipt.data, authorized_by: "owner_1" } } }];
+    await act(async () => authBtn.click());
+    equal(host.textContent?.includes("Authorized for agent apply"), true);
+
+    const approveBtn = approve();
+    if (!approveBtn) throw new Error("expected Approve and install button");
+    responses = [{ status: 200, body: { ok: true, data: { ...agentReceipt.data, state: "installed", applied_install_id: "install_app1" } } }];
+    await act(async () => approveBtn.click());
+    const optInBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.trim() === "Allow routine patch updates (30 days)");
+    if (!optInBtn) throw new Error("expected explicit post-install 30-day opt-in button");
+    equal(calls.filter((c) => c.path.includes("update-policy")).length, 0, "policy is never granted automatically");
+    responses = [{ status: 200, body: (init: RequestInit) => {
+      const reqBody = JSON.parse(String(init.body)) as { expires_at?: unknown };
+      return { ok: true, data: { policy: { ...grantedPolicy, expires_at: reqBody.expires_at } } };
+    } }];
+    await act(async () => optInBtn.click());
+    equal(host.textContent?.includes("Routine patch permission saved for 30 days."), true);
+
+    // Local check refusal surfaces Ref: <requestId>.
+    responses = [{ status: 200, body: { schema: 1, enabled: false } }];
+    await act(async () => root.render(createElement(LocaleProvider, null,
+      createElement(PrivateAppDialog, { key: "diag-upload", onClose() {}, onInstalled() {} }))));
+    const fileInput = host.querySelector<HTMLInputElement>('input[type="file"]');
+    if (!fileInput) throw new Error("expected file input");
+    const dtFile = new File(["zip-bytes"], "bad.zip", { type: "application/zip" });
+    Object.defineProperty(fileInput, "files", { value: [dtFile], configurable: true });
+    await act(async () => { fileInput.dispatchEvent(new Event("change", { bubbles: true })); });
+    const checkBtn = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Check package");
+    if (!checkBtn) throw new Error("expected Check package button");
+    responses = [{
+      status: 409,
+      headers: { "x-request-id": "req_diag_99" },
+      body: { ok: false, error: { code: "invalid_archive", message: "The zip manifest was unreadable.", request_id: "req_diag_99" } },
+    }];
+    await act(async () => checkBtn.click());
+    equal(host.textContent?.includes("Ref: req_diag_99"), true);
+
+    // Mounted Home PrivateAppReviewCards: hides silently on 404; installs inline on 200.
+    responses = [{ status: 404, body: { error: "not_found" } }];
+    await act(async () => root.render(createElement(LocaleProvider, null,
+      createElement(PrivateAppReviewCards, { enabled: true, revision: 1 }))));
+    equal(host.innerHTML, "", "404 pre-AOS-690 review list hides silently");
+
+    responses = [{ status: 200, body: { ok: true, data: { reviews: [agentReceipt.data] } } }];
+    await act(async () => root.render(createElement(LocaleProvider, null,
+      createElement(PrivateAppReviewCards, { enabled: true, revision: 2 }))));
+    const link = host.querySelector<HTMLAnchorElement>(`a[href="/apps?review=${reviewId}"]`);
+    if (!link) throw new Error("expected fallback /apps?review= link in Home card");
+    const cardApprove = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Approve and install");
+    if (!cardApprove) throw new Error("expected inline Approve and install button in Home card");
+    responses = [{ status: 200, body: { ok: true, data: { ...agentReceipt.data, state: "installed", applied_install_id: "install_app1" } } }];
+    await act(async () => cardApprove.click());
+    equal(host.textContent?.includes("Installed."), true);
+
+    // Mounted Manage PrivateAppUpdaterSettings: hides on 404, grants & revokes on 200.
+    responses = [{ status: 404, body: { error: "not_found" } }];
+    await act(async () => root.render(createElement(LocaleProvider, null,
+      createElement(PrivateAppUpdaterSettings, { installId: "install_app1", installedDigest: digest, busy: false }))));
+    equal(host.innerHTML, "", "404 pre-AOS-690 update-policy hides silently");
+
+    responses = [
+      { status: 200, body: { ok: true, data: { policy: null } } },
+      { status: 200, body: { profiles: [{ id: "ap_upd", name: "App Updater", status: "active" }] } },
+    ];
+    await act(async () => root.render(createElement(LocaleProvider, null,
+      createElement(PrivateAppUpdaterSettings, { key: "mgr-200", installId: "install_app1", installedDigest: digest, busy: false }))));
+    equal(host.textContent?.includes("Private app update automation"), true);
+    const savePolicyBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.trim() === "Allow routine patch updates (30 days)");
+    if (!savePolicyBtn) throw new Error("expected policy grant button");
+    responses = [{ status: 200, body: (init: RequestInit) => {
+      const reqBody = JSON.parse(String(init.body)) as { expires_at?: unknown };
+      return { ok: true, data: { policy: { ...grantedPolicy, expires_at: reqBody.expires_at } } };
+    } }];
+    await act(async () => savePolicyBtn.click());
+    equal(host.textContent?.includes("Revoke permission"), true);
+    const revokeBtn = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Revoke permission");
+    if (!revokeBtn) throw new Error("expected Revoke permission button");
+    responses = [{ status: 200, body: { ok: true, data: { revoked: true, install_id: "install_app1", policy_id: "pol_1" } } }];
+    await act(async () => revokeBtn.click());
+    equal(host.textContent?.includes("Routine patch permission revoked."), true);
+
+    // Round 8 regressions: fail-closed 403, strict optional fields, and routine policy request/response binding.
+    responses = [{ status: 403, body: { error: { code: "forbidden", message: "Forbidden." } } }];
+    await rejected(
+      listHostedPrivateReviews(),
+      (error: unknown) => error instanceof ApiError && error.status === 403 && error.code === "forbidden",
+      "HTTP 403 from review list must fail closed instead of looking unsupported",
+    );
+
+    for (const badReview of [
+      { ...review, will_revoke_grants: "yes" },
+      { ...review, active_bindings_count: -1 },
+    ]) {
+      responses = [{ status: 200, body: badReview }];
+      await rejected(
+        checkPrivateApp(file, null),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "malformed optional review revocation fields must refuse fail-closed",
+      );
+    }
+
+    for (const badHosted of [
+      { ...agentReceipt.data, will_revoke_grants: "yes" },
+      { ...agentReceipt.data, active_bindings_count: "2" },
+      { ...agentReceipt.data, requesting_agent: 123 },
+      { ...agentReceipt.data, will_revoke_grants: false, review: { ...agentReceipt.data.review, will_revoke_grants: true } },
+      { ...agentReceipt.data, state: "installed", applied_install_id: "install_other" },
+    ]) {
+      responses = [{ status: 200, body: { ok: true, data: badHosted } }];
+      await rejected(
+        getHostedPrivateReview(reviewId),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "malformed or mismatched hosted review fields must refuse fail-closed",
+      );
+    }
+
+    responses = [{ status: 200, body: { ok: true, data: {} } }];
+    await rejected(
+      readPrivateAppUpdatePolicy("install_app1"),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "missing data.policy field must fail closed",
+    );
+
+    responses = [{ status: 200, body: { ok: true, data: { policy: { ...grantedPolicy, repository_id: 42 } } } }];
+    await rejected(
+      readPrivateAppUpdatePolicy("install_app1"),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "staged_zip routine policy with nonzero repository_id must fail closed",
+    );
+
+    const otherDigest = `sha256:${"c".repeat(64)}`;
+    for (const mismatchedPolicy of [
+      { ...grantedPolicy, agent: "agents/other" },
+      { ...grantedPolicy, installed_digest: otherDigest },
+      { ...grantedPolicy, source_kind: "github", repository_id: 77 },
+      { ...grantedPolicy, repository_id: 42 },
+      { ...grantedPolicy, expires_at: grantedPolicy.expires_at + 1000 },
+    ]) {
+      responses = [{ status: 200, body: { ok: true, data: { policy: mismatchedPolicy } } }];
+      await rejected(
+        grantPrivateAppUpdatePolicy({
+          installId: "install_app1",
+          expectedDigest: digest,
+          agent: "agents/ap_upd",
+          source: "staged_zip",
+          expiresAt: grantedPolicy.expires_at,
+        }),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+        "staged_zip routine policy response mismatching request parameters must fail closed",
+      );
+    }
+
+    const githubGrantReq = {
+      installId: "install_app1",
+      expectedDigest: digest,
+      agent: "agents/ap_upd",
+      source: "github" as const,
+      repositoryId: 42,
+      expiresAt: grantedPolicy.expires_at,
+    };
+    const githubPolicy = { ...grantedPolicy, source_kind: "github", repository_id: 42 };
+    responses = [{ status: 200, body: { ok: true, data: { policy: githubPolicy } } }];
+    const savedGithubPolicy = await grantPrivateAppUpdatePolicy(githubGrantReq);
+    equal(savedGithubPolicy.source_kind, "github");
+    responses = [{ status: 200, body: { ok: true, data: { policy: { ...githubPolicy, repository_id: 99 } } } }];
+    await rejected(
+      grantPrivateAppUpdatePolicy(githubGrantReq),
+      (error: unknown) => error instanceof ApiError && error.status === 502,
+      "github routine policy response with wrong repository_id must fail closed",
+    );
   } finally {
     await act(async () => root.unmount());
     await win.happyDOM.close();

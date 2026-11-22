@@ -7,9 +7,22 @@ import { AppGlyph } from "../explorer/shared";
 import { installedAppHref } from "../apps/appViewModel";
 import { notifyAppsChanged, type Installation } from "./workspaceApps";
 import { WorkspaceDialog } from "./WorkspaceDialog";
-import { applyPrivateApp, checkPrivateApp, decideHostedPrivateReview, fetchGithubPrivateApp, getHostedPrivateReview, githubPrivateAppAvailable, type HostedPrivateReview, type PrivateReview, type PrivateTarget } from "./privateAppUpload";
+import {
+  applyPrivateApp,
+  authorizeHostedPrivateReview,
+  checkPrivateApp,
+  decideHostedPrivateReview,
+  fetchGithubPrivateApp,
+  getHostedPrivateReview,
+  githubPrivateAppAvailable,
+  grantPrivateAppUpdatePolicy,
+  type HostedPrivateReview,
+  type PrivateReview,
+  type PrivateTarget,
+} from "./privateAppUpload";
 
 const ZIP_LIMIT = 8 * 1024 * 1024;
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const STALE_REVIEW = "Workspace apps changed after this review was created. Ask the requester for a new review.";
 
 /** The owner reviews a host-checked package before explicitly committing the same File. */
@@ -33,8 +46,12 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
   const [consent, setConsent] = useState(false);
   const [hostedReview, setHostedReview] = useState<HostedPrivateReview | null>(null);
   const [hostedLoading, setHostedLoading] = useState(Boolean(reviewId !== undefined));
-  const [busy, setBusy] = useState<"check" | "apply" | "reject" | null>(null);
+  const [busy, setBusy] = useState<"check" | "apply" | "authorize" | "reject" | "policy" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorRequestId, setErrorRequestId] = useState<string | null>(null);
+  const [policyStatus, setPolicyStatus] = useState<"idle" | "granted" | "error">("idle");
+  const [policyMessage, setPolicyMessage] = useState<string | null>(null);
+  const [policyRequestId, setPolicyRequestId] = useState<string | null>(null);
   const [uncertain, setUncertain] = useState(false);
   const [installed, setInstalled] = useState<Installation | null>(null);
   const reviewHeading = useRef<HTMLHeadingElement>(null);
@@ -48,7 +65,8 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     });
     else {
       setHostedLoading(true);
-      setError(null);
+      setError(null); setErrorRequestId(null);
+      setPolicyStatus("idle"); setPolicyMessage(null); setPolicyRequestId(null);
       void getHostedPrivateReview(reviewId, controller.signal).then((request) => {
         if (controller.signal.aborted || epoch.current !== current || !privateReadsAllowed()) return;
         setHostedReview(request);
@@ -56,15 +74,19 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
         setError(stale ? STALE_REVIEW : null);
         setReview(request.state === "pending" && !stale ? request.review : null);
         setUncertain(false);
-      }).catch(() => {
-        if (!controller.signal.aborted && epoch.current === current) setError("This review is missing or unavailable.");
+      }).catch((cause) => {
+        if (!controller.signal.aborted && epoch.current === current) {
+          setError("This review is missing or unavailable.");
+          setErrorRequestId(cause instanceof ApiError ? (cause.requestId ?? null) : null);
+        }
       }).finally(() => { if (!controller.signal.aborted && epoch.current === current) setHostedLoading(false); });
     }
     const invalidate = () => {
       epoch.current++;
       setGithubAvailable(false); setSource("upload"); setReview(null); setCheckedFile(null);
-      setProvenance(null); setConsent(false); setGithubUrl(""); setFile(null); setError(null);
+      setProvenance(null); setConsent(false); setGithubUrl(""); setFile(null); setError(null); setErrorRequestId(null);
       setHostedReview(null); setHostedLoading(false);
+      setPolicyStatus("idle"); setPolicyMessage(null); setPolicyRequestId(null);
       if (reviewId !== undefined) setError("This review is missing or unavailable.");
     };
     const stopPause = onPrivateReadsPaused(invalidate);
@@ -85,7 +107,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
   const close = () => { if (!inFlight.current) onClose(); };
   const selectFile = (selected: File | null) => {
     if (inFlight.current) return;
-    setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); setError(null);
+    setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false); setError(null); setErrorRequestId(null);
     if (selected && (selected.size === 0 || selected.size > ZIP_LIMIT)) {
       setFile(null);
       setError(t("Choose a non-empty ZIP no larger than 8 MiB."));
@@ -98,7 +120,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     const current = epoch.current;
     const generation = privateSessionGeneration();
     inFlight.current = true;
-    setBusy("check"); setError(null); setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false);
+    setBusy("check"); setError(null); setErrorRequestId(null); setReview(null); setCheckedFile(null); setProvenance(null); setConsent(false);
     try {
       const fetched = source === "github" ? await fetchGithubPrivateApp(githubUrl.trim()) : null;
       if (epoch.current !== current || !privateReadsAllowed() || privateSessionGeneration() !== generation ||
@@ -113,13 +135,14 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
     } catch (cause) {
       if (epoch.current !== current || !privateReadsAllowed() || privateSessionGeneration() !== generation) return;
       setError(t(packageCheckError(cause, source)));
+      setErrorRequestId(cause instanceof ApiError ? (cause.requestId ?? null) : null);
     } finally { inFlight.current = false; setBusy(null); }
   };
   const apply = async () => {
     if (!checkedFile || !review || !consent || inFlight.current || !review.compatible || review.warnings) return;
     const current = epoch.current;
     inFlight.current = true;
-    setBusy("apply"); setError(null);
+    setBusy("apply"); setError(null); setErrorRequestId(null);
     try {
       const result = await applyPrivateApp(checkedFile, review);
       if (epoch.current !== current || !privateReadsAllowed()) { setUncertain(true); notifyAppsChanged(); return; }
@@ -132,12 +155,37 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       setReview(null); setUncertain(true); notifyAppsChanged();
     } finally { inFlight.current = false; setBusy(null); }
   };
+  const authorize = async () => {
+    if (!hostedReview || hostedReview.state !== "pending" || hostedReview.catalogStale || !consent || !hostedReview.review.compatible || hostedReview.review.warnings || inFlight.current) return;
+    const current = epoch.current;
+    inFlight.current = true;
+    setBusy("authorize"); setError(null); setErrorRequestId(null);
+    try {
+      const result = await authorizeHostedPrivateReview(hostedReview);
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      setHostedReview(result);
+      if (result.state !== "pending" || result.catalogStale) setReview(null);
+    } catch (cause) {
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      if (cause instanceof ApiError && cause.status === 409 && (cause.code === "installation_stale" || cause.code === "app_exists" || cause.code === "package_changed")) {
+        setReview(null);
+        setError(STALE_REVIEW);
+        setErrorRequestId(cause.requestId ?? null);
+      } else if (cause instanceof ApiError && cause.status === 403) {
+        setError("Only a current workspace owner can review this request.");
+        setErrorRequestId(cause.requestId ?? null);
+      } else {
+        setError(cause instanceof ApiError && cause.message ? cause.message : "The authorization did not finish.");
+        setErrorRequestId(cause instanceof ApiError ? (cause.requestId ?? null) : null);
+      }
+    } finally { inFlight.current = false; setBusy(null); }
+  };
   const decide = async (decision: "install" | "reject") => {
     if (!hostedReview || hostedReview.state !== "pending" || inFlight.current ||
         (decision === "install" && (hostedReview.catalogStale || !consent || !hostedReview.review.compatible || hostedReview.review.warnings))) return;
     const current = epoch.current;
     inFlight.current = true;
-    setBusy(decision === "install" ? "apply" : "reject"); setError(null);
+    setBusy(decision === "install" ? "apply" : "reject"); setError(null); setErrorRequestId(null);
     try {
       const result = await decideHostedPrivateReview(hostedReview, decision);
       if (epoch.current !== current || !privateReadsAllowed()) return;
@@ -148,12 +196,40 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       setReview(null);
       if (cause instanceof ApiError && cause.status === 409 && (cause.code === "installation_stale" || cause.code === "app_exists" || cause.code === "package_changed")) {
         setError(STALE_REVIEW);
+        setErrorRequestId(cause.requestId ?? null);
       } else if (cause instanceof ApiError && cause.status === 403) {
         setError("Only a current workspace owner can review this request.");
+        setErrorRequestId(cause.requestId ?? null);
       } else {
         setUncertain(true);
+        setErrorRequestId(cause instanceof ApiError ? (cause.requestId ?? null) : null);
         if (decision === "install") notifyAppsChanged();
       }
+    } finally { inFlight.current = false; setBusy(null); }
+  };
+  const grantRoutinePolicy = async () => {
+    const installTargetId = hostedReview?.installedInstallId ?? hostedReview?.review.target?.installId ?? installation?.install_id;
+    const agent = hostedReview?.requestingAgent;
+    if (!hostedReview || hostedReview.state !== "installed" || !installTargetId || !agent?.startsWith("agents/") || inFlight.current) return;
+    const current = epoch.current;
+    inFlight.current = true;
+    setBusy("policy"); setPolicyStatus("idle"); setPolicyMessage(null); setPolicyRequestId(null);
+    try {
+      await grantPrivateAppUpdatePolicy({
+        installId: installTargetId,
+        expectedDigest: hostedReview.review.digest,
+        agent,
+        source: "staged_zip",
+        expiresAt: Date.now() + THIRTY_DAYS_MS,
+      });
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      setPolicyStatus("granted");
+      setPolicyMessage(t("Routine patch permission saved for 30 days."));
+    } catch (cause) {
+      if (epoch.current !== current || !privateReadsAllowed()) return;
+      setPolicyStatus("error");
+      setPolicyMessage(cause instanceof ApiError && cause.message ? cause.message : t("Routine update permission could not be saved."));
+      setPolicyRequestId(cause instanceof ApiError ? (cause.requestId ?? null) : null);
     } finally { inFlight.current = false; setBusy(null); }
   };
 
@@ -200,6 +276,14 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
             <Button disabled={busy !== null} onClick={() => void decide("reject")}>
               {busy === "reject" ? t("Rejecting…") : t("Reject request")}
             </Button>
+            {hostedReview.requestingAgent && !hostedReview.authorizedBy && (
+              <Button
+                disabled={!consent || !review.compatible || review.warnings || busy !== null}
+                onClick={() => void authorize()}
+              >
+                {busy === "authorize" ? t("Authorizing…") : t("Authorize agent to apply")}
+              </Button>
+            )}
             <Button
               className="btn-primary"
               disabled={!consent || !review.compatible || review.warnings || busy !== null}
@@ -240,6 +324,27 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
       ) : reviewId !== undefined && !review && !uncertain ? (
         <div className="space-y-3" role={error ? "alert" : "status"}>
           <p className="text-secondary text-ink-200">{error ? t(error) : hostedReview?.state === "installed" ? t("This request has been installed.") : hostedReview?.state === "rejected" ? t("This request was rejected.") : hostedReview?.state === "expired" ? t("This request has expired.") : t("This review is missing or unavailable.")}</p>
+          {errorRequestId && <p className="text-micro text-ink-400 num">Ref: {errorRequestId}</p>}
+          {!error && hostedReview?.state === "installed" && hostedReview.requestingAgent?.startsWith("agents/") &&
+            (hostedReview.installedInstallId ?? hostedReview.review.target?.installId ?? installation?.install_id) && (
+            <div className="space-y-2 border-t border-ink-800 pt-3">
+              <p className="text-label text-ink-400">
+                {t("Optionally allow {agent} to apply routine patch updates (no new permissions) for 30 days.")
+                  .replace("{agent}", () => hostedReview.requestingAgent ?? "")}
+              </p>
+              {policyStatus !== "granted" && (
+                <Button className="btn-sm" disabled={busy !== null} onClick={() => void grantRoutinePolicy()}>
+                  {busy === "policy" ? t("Saving…") : t("Allow routine patch updates (30 days)")}
+                </Button>
+              )}
+              {policyMessage && (
+                <p className={`text-label ${policyStatus === "error" ? "text-fail" : "text-ink-200"}`} role={policyStatus === "error" ? "alert" : "status"}>
+                  {policyMessage}
+                  {policyRequestId && <span className="ml-2 text-micro text-ink-400 num">Ref: {policyRequestId}</span>}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       ) : installed ? (
         <div className="pa-installed" role="status">
@@ -375,7 +480,7 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                     maxLength={512}
                     value={githubUrl}
                     disabled={busy !== null}
-                    onChange={(event) => { setGithubUrl(event.currentTarget.value); setError(null); }}
+                    onChange={(event) => { setGithubUrl(event.currentTarget.value); setError(null); setErrorRequestId(null); }}
                     placeholder="https://github.com/owner/repo/releases/download/tag/app.zip"
                   />
                   <p id={`${githubInputId}-help`} className="text-micro text-ink-400 leading-relaxed">
@@ -383,7 +488,12 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                   </p>
                 </div>
               )}
-              {error && <p className="alert fail" role="alert">{error}</p>}
+              {error && (
+                <div className="space-y-1">
+                  <p className="alert fail" role="alert">{error}</p>
+                  {errorRequestId && <p className="text-micro text-ink-400 num">Ref: {errorRequestId}</p>}
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -402,9 +512,15 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                   </div>
                   {review.summary && <p className="text-label text-ink-400 mt-0.5 wrap-anywhere">{review.summary}</p>}
                   {hostedReview && (
-                    <p className="text-micro text-ink-500 mt-1">
-                      {t("Expires")}: {new Date(hostedReview.expiresAt).toLocaleString()}
-                    </p>
+                    <div className="mt-1 space-y-0.5 text-micro text-ink-500">
+                      <p>{t("Expires")}: {new Date(hostedReview.expiresAt).toLocaleString()}</p>
+                      {hostedReview.requestingAgent && (
+                        <p>{t("Requested by")}: <code>{hostedReview.requestingAgent}</code></p>
+                      )}
+                      {hostedReview.authorizedBy && (
+                        <p className="text-ink-200">{t("Authorized for agent apply")}</p>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -516,12 +632,27 @@ export function PrivateAppDialog({ installation, reviewId, onClose, onInstalled 
                 </div>
               </details>
 
-              {((installation && review.digest !== installation.digest) || (review.target && review.digest !== review.target.digest)) && (
-                <p className="alert warn">{t("Updating this app revokes its connection and tool grants. Reconnect them after the update.")}</p>
+              {((hostedReview?.willRevokeGrants === true || review.willRevokeGrants === true) ||
+                ((hostedReview?.willRevokeGrants ?? review.willRevokeGrants) !== false &&
+                  ((installation && review.digest !== installation.digest) || (review.target && review.digest !== review.target.digest)))) && (
+                <p className="alert warn">
+                  {(() => {
+                    const count = hostedReview?.activeBindingsCount ?? review.activeBindingsCount;
+                    return typeof count === "number" && count > 0
+                      ? t("Updating this app revokes {count} connection or tool grants. Reconnect them after the update.")
+                          .replace("{count}", () => String(count))
+                      : t("Updating this app revokes its connection and tool grants. Reconnect them after the update.");
+                  })()}
+                </p>
               )}
               <p className="alert warn">{t("This check does not scan for secrets or review app behavior.")}</p>
               {review.warnings && <p className="alert fail" role="alert">{t("The package reported warnings. Resolve them before installing.")}</p>}
-              {error && <p className="alert fail" role="alert">{error}</p>}
+              {error && (
+                <div className="space-y-1">
+                  <p className="alert fail" role="alert">{error}</p>
+                  {errorRequestId && <p className="text-micro text-ink-400 num">Ref: {errorRequestId}</p>}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -543,6 +674,15 @@ function packageCheckError(cause: unknown, source: "upload" | "github"): string 
       case "github_asset_unpinned": return "This release has no ZIP checksum. Upload the ZIP instead.";
       case "github_asset_changed": return "The ZIP no longer matches its release checksum. Check the release again.";
       case "payload_too_large": return "Choose a non-empty ZIP no larger than 8 MiB.";
+      case "content_type": return "Choose a ZIP app package.";
+      case "invalid_archive":
+      case "manifest_invalid": return cause.message || "The package structure or manifest is invalid.";
+      case "capability_unavailable": return "This workspace cannot verify the package right now. Try again shortly.";
+    }
+    if (cause.code && cause.message && cause.message.length <= 240 &&
+        cause.message !== "The package check failed." &&
+        cause.message !== "The GitHub package could not be fetched.") {
+      return cause.message;
     }
   }
   return source === "github"

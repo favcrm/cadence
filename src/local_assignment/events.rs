@@ -46,6 +46,12 @@ impl WorkspaceBinding {
     pub fn default_alias(&self) -> Option<&str> {
         self.default_alias.as_deref()
     }
+    pub(super) fn adapter_for(&self, alias: &str) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|agent| agent.alias == alias)
+            .map(|agent| agent.adapter.as_str())
+    }
     fn target(&self) -> RemoteTarget {
         RemoteTarget {
             org: self.org.clone(),
@@ -738,11 +744,14 @@ pub fn run(
                     let mut coord = guarded_http(&target, &lifetime)?.into_coordinator()?;
                     coord.delivery_guard = Some(lifetime.clone());
                     let mut deliver = |kickoff: &Kickoff| {
-                        super::delivery::deliver_kickoff_with(
+                        let adapter_for_alias =
+                            binding.adapter_for(kickoff.alias).map(str::to_string);
+                        super::delivery::deliver_kickoff_with_adapter(
                             &target,
                             &state,
                             kickoff,
                             30,
+                            &|| adapter_for_alias.clone(),
                             &|params| {
                                 if !lifetime() {
                                     return Err(Error::busy_coded(
@@ -839,15 +848,23 @@ fn session(
                 "workspace binding stopped or changed",
             ));
         }
-        super::delivery::deliver_kickoff_with(&target, state, kickoff, 30, &|params| {
-            if !lifetime() {
-                return Err(Error::busy_coded(
-                    "binding_cancelled",
-                    "workspace binding stopped or changed",
-                ));
-            }
-            send(params)
-        })
+        let adapter_for_alias = binding.adapter_for(kickoff.alias).map(str::to_string);
+        super::delivery::deliver_kickoff_with_adapter(
+            &target,
+            state,
+            kickoff,
+            30,
+            &|| adapter_for_alias.clone(),
+            &|params| {
+                if !lifetime() {
+                    return Err(Error::busy_coded(
+                        "binding_cancelled",
+                        "workspace binding stopped or changed",
+                    ));
+                }
+                send(params)
+            },
+        )
     };
     if !inbox.initialized {
         if inbox.recovery_watermark.is_none() {

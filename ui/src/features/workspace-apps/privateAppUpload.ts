@@ -1,4 +1,4 @@
-import { ApiError, errorMessage } from "../../lib/apiError";
+import { ApiError, errorMessage, errorRequestId } from "../../lib/apiError";
 import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { workspaceApps, type AccessDiff, type Installation } from "./workspaceApps";
@@ -7,6 +7,8 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const ZIP_LIMIT = 8 * 1024 * 1024;
 const GITHUB_SOURCE = "/api/app-installations/private/github";
 const HOSTED_REVIEW_ID = /^par_[0-9a-f]{32}$/;
+const AGENT_ACTOR = /^agents\/[A-Za-z0-9_-]{1,120}$/;
+const INSTALL_ID = /^install_[A-Za-z0-9_-]{1,120}$/;
 
 /** Discovery is deliberately optional: older hosts keep the upload-only flow. */
 export async function githubPrivateAppAvailable(signal?: AbortSignal): Promise<boolean> {
@@ -37,7 +39,10 @@ export async function fetchGithubPrivateApp(url: string): Promise<{ file: File; 
     if (!response.ok) {
       const body: unknown = await response.json().catch(() => null);
       operation.assertCurrent();
-      throw new ApiError(errorMessage(body, "The GitHub package could not be fetched."), response.status, { code: refusalCode(body) });
+      throw new ApiError(errorMessage(body, "The GitHub package could not be fetched."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
     }
     const digest = response.headers.get("X-Cadence-App-Zip-Sha256");
     if (response.status !== 200 || !/^application\/zip(?:\s*;|$)/i.test(response.headers.get("Content-Type") ?? "") ||
@@ -88,6 +93,8 @@ export type PrivateReview = {
   warnings: boolean;
   sessionGeneration: number;
   target: PrivateTarget | null;
+  willRevokeGrants?: boolean;
+  activeBindingsCount?: number;
 };
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -152,6 +159,24 @@ function invalid(): ApiError {
   return new ApiError("The package review could not be verified.", 502);
 }
 
+function parseOptionalBool(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return value;
+  throw invalid();
+}
+
+function parseOptionalNonNegativeInt(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  throw invalid();
+}
+
+function parseOptionalBoundedText(value: unknown, max = 256): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && value.length > 0 && value.length <= max) return value;
+  throw invalid();
+}
+
 function parseReview(value: unknown, target: PrivateTarget | null, sessionGeneration: number): PrivateReview {
   if (!object(value) || value.schema !== 1 || value.committed !== false || value.visibility !== "workspace" ||
       typeof value.name !== "string" || !value.name || typeof value.title !== "string" || !value.title ||
@@ -164,6 +189,8 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
   if (target && (value.install_id !== target.installId || value.name !== target.name ||
       value.expected_digest !== target.digest || value.expected_generation !== target.generation ||
       value.catalog_generation !== target.generation || !diff(value.structural_diff) || !screens(value.previous_screen_access))) throw invalid();
+  const willRevokeGrants = parseOptionalBool(value.will_revoke_grants);
+  const activeBindingsCount = parseOptionalNonNegativeInt(value.active_bindings_count);
   return {
     name: value.name,
     title: value.title,
@@ -181,6 +208,8 @@ function parseReview(value: unknown, target: PrivateTarget | null, sessionGenera
     warnings: value.secret_warnings.length > 0,
     sessionGeneration,
     target,
+    ...(willRevokeGrants !== undefined ? { willRevokeGrants } : {}),
+    ...(activeBindingsCount !== undefined ? { activeBindingsCount } : {}),
   };
 }
 
@@ -192,11 +221,23 @@ export type HostedPrivateReview = {
   source: string;
   zipSha256: string;
   review: PrivateReview;
+  requestingAgent?: string;
+  authorizedBy?: string;
+  willRevokeGrants?: boolean;
+  activeBindingsCount?: number;
+  installedInstallId?: string;
 };
 
-function parseHostedReview(body: unknown, id: string, generation: number): HostedPrivateReview {
-  if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
-  const data = body.data;
+export type PrivateAppRoutinePolicy = {
+  id: string;
+  install_id: string;
+  agent: string;
+  source_kind: "github" | "staged_zip";
+  expires_at: number;
+  installed_digest: string;
+};
+
+function parseHostedReviewRecord(data: Record<string, unknown>, id: string, generation: number): HostedPrivateReview {
   if (data.id !== id || typeof data.state !== "string" ||
       !["pending", "installed", "rejected", "expired"].includes(data.state) ||
       (data.catalog_stale !== undefined && typeof data.catalog_stale !== "boolean") ||
@@ -212,8 +253,68 @@ function parseHostedReview(body: unknown, id: string, generation: number): Hoste
   }
   const review = parseReview(raw, target, generation);
   if (data.name !== review.name || data.digest !== review.digest || data.generation !== review.generation) throw invalid();
-  return { id, state: data.state as HostedPrivateReview["state"], catalogStale: data.catalog_stale === true,
-    expiresAt: data.expires_at, source: data.source, zipSha256: data.zip_sha256, review };
+  const requestingAgent = parseOptionalBoundedText(data.requesting_agent, 160);
+  const authorizedBy = parseOptionalBoundedText(data.authorized_by, 160);
+  const dataWillRevoke = parseOptionalBool(data.will_revoke_grants);
+  if (dataWillRevoke !== undefined && review.willRevokeGrants !== undefined && dataWillRevoke !== review.willRevokeGrants) {
+    throw invalid();
+  }
+  const willRevokeGrants = dataWillRevoke ?? review.willRevokeGrants;
+  const dataBindingsCount = parseOptionalNonNegativeInt(data.active_bindings_count);
+  if (dataBindingsCount !== undefined && review.activeBindingsCount !== undefined && dataBindingsCount !== review.activeBindingsCount) {
+    throw invalid();
+  }
+  const activeBindingsCount = dataBindingsCount ?? review.activeBindingsCount;
+  const appliedInstallId = parseOptionalBoundedText(data.applied_install_id, 160);
+  if (appliedInstallId !== undefined && target && appliedInstallId !== target.installId) {
+    throw invalid();
+  }
+  const installedInstallId = appliedInstallId ?? target?.installId;
+  return {
+    id,
+    state: data.state as HostedPrivateReview["state"],
+    catalogStale: data.catalog_stale === true,
+    expiresAt: data.expires_at,
+    source: data.source,
+    zipSha256: data.zip_sha256,
+    review,
+    ...(requestingAgent ? { requestingAgent } : {}),
+    ...(authorizedBy ? { authorizedBy } : {}),
+    ...(willRevokeGrants !== undefined ? { willRevokeGrants } : {}),
+    ...(activeBindingsCount !== undefined ? { activeBindingsCount } : {}),
+    ...(installedInstallId ? { installedInstallId } : {}),
+  };
+}
+
+function parseHostedReview(body: unknown, id: string, generation: number): HostedPrivateReview {
+  if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
+  return parseHostedReviewRecord(body.data, id, generation);
+}
+
+export async function listHostedPrivateReviews(signal?: AbortSignal): Promise<{ supported: boolean; reviews: HostedPrivateReview[] }> {
+  return withPrivateOperation(async (operation) => {
+    const response = await privateFetch("/api/app-installations/private/reviews", {
+      credentials: "same-origin", cache: "no-store", headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (response.status === 404 || response.status === 501) {
+      return { supported: false, reviews: [] };
+    }
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "Pending private app reviews are unavailable."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
+    if (!object(body) || body.ok !== true || !object(body.data) || !Array.isArray(body.data.reviews)) throw invalid();
+    const reviews: HostedPrivateReview[] = [];
+    for (const row of body.data.reviews) {
+      if (!object(row) || typeof row.id !== "string" || !HOSTED_REVIEW_ID.test(row.id)) throw invalid();
+      reviews.push(parseHostedReviewRecord(row, row.id, operation.generation));
+    }
+    return { supported: true, reviews };
+  }, signal);
 }
 
 export async function getHostedPrivateReview(id: string, signal?: AbortSignal): Promise<HostedPrivateReview> {
@@ -224,9 +325,45 @@ export async function getHostedPrivateReview(id: string, signal?: AbortSignal): 
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new ApiError(errorMessage(body, "The review is unavailable."), response.status, { code: refusalCode(body) });
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "The review is unavailable."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
     return parseHostedReview(body, id, operation.generation);
   }, signal);
+}
+
+export async function authorizeHostedPrivateReview(request: HostedPrivateReview): Promise<HostedPrivateReview> {
+  if (!HOSTED_REVIEW_ID.test(request.id) || request.catalogStale) throw invalid();
+  return withPrivateOperation(async (operation) => {
+    if (operation.generation !== request.review.sessionGeneration || request.state !== "pending") throw invalid();
+    const response = await privateFetch(`/api/app-installations/private/reviews/${encodeURIComponent(request.id)}/authorize`, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify({ digest: request.review.digest, zip_sha256: request.zipSha256 }),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    const code = refusalCode(body);
+    const reconcile = response.status === 409 &&
+      (code === "review_closed" || code === "installation_stale" || code === "app_exists");
+    const refusal = () => new ApiError(errorMessage(body, "The authorization did not finish."), response.status, {
+      code,
+      requestId: errorRequestId(body, response),
+    });
+    if (!response.ok && !reconcile) throw refusal();
+    const receipt = reconcile ? await getHostedPrivateReview(request.id) : parseHostedReview(body, request.id, operation.generation);
+    operation.assertCurrent();
+    if (receipt.review.digest !== request.review.digest || receipt.zipSha256 !== request.zipSha256) throw invalid();
+    if (reconcile) {
+      if (receipt.state === "pending") throw code === "review_closed" ? invalid() : refusal();
+      return receipt;
+    }
+    if (receipt.state !== "pending" || !receipt.authorizedBy) throw invalid();
+    return receipt;
+  });
 }
 
 export async function decideHostedPrivateReview(request: HostedPrivateReview, decision: "install" | "reject"): Promise<HostedPrivateReview> {
@@ -244,14 +381,17 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
     const code = refusalCode(body);
     const reconcile = response.status === 409 &&
       (code === "review_closed" || code === "installation_stale" || code === "app_exists");
-    const refusal = () => new ApiError(errorMessage(body, "The decision did not finish."), response.status, { code });
+    const refusal = () => new ApiError(errorMessage(body, "The decision did not finish."), response.status, {
+      code,
+      requestId: errorRequestId(body, response),
+    });
     if (!response.ok && !reconcile) throw refusal();
     if (decision === "install" && response.status === 201) {
       if (!object(body) || body.committed !== true || body.source_kind !== "private" ||
           body.digest !== request.review.digest || body.name !== request.review.name ||
           body.version !== request.review.version || typeof body.install_id !== "string" || !body.install_id ||
           (request.review.target && body.install_id !== request.review.target.installId)) throw invalid();
-      return { ...request, state: "installed" };
+      return { ...request, state: "installed", installedInstallId: body.install_id };
     }
     // A competing decision can close this review after the initial check
     // but before activation. Read its receipt once, never replay the POST.
@@ -261,6 +401,156 @@ export async function decideHostedPrivateReview(request: HostedPrivateReview, de
     if (receipt.state === "pending" && reconcile && code !== "review_closed") throw refusal();
     if (receipt.state === "pending" || (!reconcile && decision === "install" && receipt.state !== "installed")) throw invalid();
     return receipt;
+  });
+}
+
+function parseRoutinePolicy(
+  value: unknown,
+  expectedInstallId: string,
+  expected?: {
+    agent: string;
+    expectedDigest: string;
+    sourceKind: "github" | "staged_zip";
+    repositoryId: number;
+    expiresAt: number;
+  },
+): PrivateAppRoutinePolicy | null {
+  if (value === null) return null;
+  if (!object(value) || typeof value.id !== "string" || !value.id ||
+      value.install_id !== expectedInstallId ||
+      typeof value.agent !== "string" || !AGENT_ACTOR.test(value.agent) ||
+      (value.source_kind !== "github" && value.source_kind !== "staged_zip") ||
+      typeof value.repository_id !== "number" || !Number.isInteger(value.repository_id) ||
+      (value.source_kind === "staged_zip" ? value.repository_id !== 0 : value.repository_id <= 0) ||
+      typeof value.owner !== "string" || !value.owner ||
+      typeof value.expires_at !== "number" || !Number.isFinite(value.expires_at) || value.expires_at <= 0 ||
+      typeof value.installed_digest !== "string" || !DIGEST.test(value.installed_digest)) {
+    throw invalid();
+  }
+  if (expected && (value.agent !== expected.agent ||
+      value.installed_digest !== expected.expectedDigest ||
+      value.source_kind !== expected.sourceKind ||
+      value.repository_id !== expected.repositoryId ||
+      value.expires_at !== expected.expiresAt)) {
+    throw invalid();
+  }
+  return {
+    id: value.id,
+    install_id: value.install_id,
+    agent: value.agent,
+    source_kind: value.source_kind,
+    expires_at: value.expires_at,
+    installed_digest: value.installed_digest,
+  };
+}
+
+export async function readPrivateAppUpdatePolicy(
+  installId: string,
+  signal?: AbortSignal,
+): Promise<{ supported: boolean; policy: PrivateAppRoutinePolicy | null }> {
+  if (!INSTALL_ID.test(installId)) throw invalid();
+  return withPrivateOperation(async (operation) => {
+    const response = await privateFetch(`/api/app-installations/${encodeURIComponent(installId)}/private/update-policy`, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify({ operation: "read", install_id: installId }),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (response.status === 404 || response.status === 501) {
+      return { supported: false, policy: null };
+    }
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "Update automation settings are unavailable."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
+    if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
+    return { supported: true, policy: parseRoutinePolicy(body.data.policy, installId) };
+  }, signal);
+}
+
+export async function grantPrivateAppUpdatePolicy(input: {
+  installId: string;
+  expectedDigest: string;
+  agent: string;
+  source?: "github" | "staged_zip";
+  repositoryId?: number;
+  expiresAt: number;
+}): Promise<PrivateAppRoutinePolicy> {
+  const source = input.source ?? "staged_zip";
+  if (!INSTALL_ID.test(input.installId) || !DIGEST.test(input.expectedDigest) ||
+      !AGENT_ACTOR.test(input.agent) || !Number.isInteger(input.expiresAt) || input.expiresAt <= 0 ||
+      (source === "github" && (!Number.isInteger(input.repositoryId) || (input.repositoryId ?? 0) <= 0))) {
+    throw invalid();
+  }
+  return withPrivateOperation(async (operation) => {
+    const payload = source === "github"
+      ? {
+          operation: "grant",
+          install_id: input.installId,
+          expected_digest: input.expectedDigest,
+          agent: input.agent,
+          source: "github",
+          repository_id: input.repositoryId,
+          expires_at: input.expiresAt,
+        }
+      : {
+          operation: "grant",
+          install_id: input.installId,
+          expected_digest: input.expectedDigest,
+          agent: input.agent,
+          source: "staged_zip",
+          expires_at: input.expiresAt,
+        };
+    const response = await privateFetch(`/api/app-installations/${encodeURIComponent(input.installId)}/private/update-policy`, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify(payload),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "Routine update permission could not be saved."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
+    if (!object(body) || body.ok !== true || !object(body.data)) throw invalid();
+    const expectedRepositoryId = source === "github" ? input.repositoryId! : 0;
+    const policy = parseRoutinePolicy(body.data.policy, input.installId, {
+      agent: input.agent,
+      expectedDigest: input.expectedDigest,
+      sourceKind: source,
+      repositoryId: expectedRepositoryId,
+      expiresAt: input.expiresAt,
+    });
+    if (!policy) throw invalid();
+    return policy;
+  });
+}
+
+export async function revokePrivateAppUpdatePolicy(installId: string, policyId: string): Promise<void> {
+  if (!INSTALL_ID.test(installId) || !/^[A-Za-z0-9_-]{1,128}$/.test(policyId)) throw invalid();
+  await withPrivateOperation(async (operation) => {
+    const response = await privateFetch(`/api/app-installations/${encodeURIComponent(installId)}/private/update-policy`, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify({ operation: "revoke", install_id: installId, policy_id: policyId }),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "Routine update permission could not be revoked."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
+    if (!object(body) || body.ok !== true || !object(body.data) ||
+        body.data.revoked !== true || body.data.install_id !== installId || body.data.policy_id !== policyId) {
+      throw invalid();
+    }
   });
 }
 
@@ -277,7 +567,12 @@ export async function checkPrivateApp(file: File, target: PrivateTarget | null):
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new ApiError(errorMessage(body, "The package check failed."), response.status, { code: refusalCode(body) });
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "The package check failed."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
     return parseReview(body, target, operation.generation);
   });
 }
@@ -297,7 +592,12 @@ export async function applyPrivateApp(file: File, review: PrivateReview): Promis
     }, operation);
     const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new ApiError(errorMessage(body, "The installation did not finish."), response.status);
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "The installation did not finish."), response.status, {
+        code: refusalCode(body),
+        requestId: errorRequestId(body, response),
+      });
+    }
     try {
       if (!object(body) || body.committed !== true || body.source_kind !== "private" || body.digest !== review.digest ||
           body.name !== review.name || body.version !== review.version || typeof body.install_id !== "string" || !body.install_id ||
