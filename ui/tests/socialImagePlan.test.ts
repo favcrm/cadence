@@ -47,9 +47,21 @@ async function click(element: Element | null | undefined) {
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function choose(id: string, label: string) {
-  await click(document.querySelector(`#${id}`));
-  const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
-  assert(option && !option.closest("[inert]"), "Options stay reachable and not inside an inert ancestor");
+  const trigger = document.querySelector(`#${id}`);
+  const dialog = trigger?.closest('[role="dialog"], dialog');
+  assert(dialog && !dialog.hasAttribute("inert"), "Combobox trigger sits inside the active drawer/dialog");
+  await click(trigger);
+  const listId = trigger?.getAttribute("aria-controls");
+  const listbox = listId ? document.getElementById(listId) : null;
+  assert(listbox && listbox.getAttribute("role") === "listbox", "Combobox opens its own aria-controls listbox");
+  const option = Array.from(listbox.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
+  assert(option && !option.closest("[inert]"), "Options belong to the active combobox listbox and stay reachable outside inert ancestors");
+  assert(
+    dialog.tagName === "DIALOG"
+      ? option.closest("dialog") === dialog
+      : option.closest(".select-pop")?.parentElement === document.body,
+    "Listbox portals inside native <dialog> or onto document.body above DrawerShell",
+  );
   await click(option);
 }
 async function fill(selector: string, value: string) {
