@@ -23,6 +23,7 @@ interface ProviderCopy {
   radioLabel: string;
   loadingLabel: string;
   pinButton: string;
+  selectPrompt: string;
   changedHint: string;
   unchangedHint: string;
   footerLock: string;
@@ -46,6 +47,7 @@ const PROVIDER_COPY: Record<AssetPinningProvider, ProviderCopy> = {
     radioLabel: "Meta ad accounts",
     loadingLabel: "Loading ad accounts",
     pinButton: "Pin ad account",
+    selectPrompt: "Select an ad account above to pin.",
     changedHint:
       "Pin applies to Meta Ads tools and spend effects for this connection; it does not change Meta Ads.",
     unchangedHint: "This ad account is already pinned.",
@@ -69,6 +71,7 @@ const PROVIDER_COPY: Record<AssetPinningProvider, ProviderCopy> = {
     radioLabel: "Google Ads customers",
     loadingLabel: "Loading customers",
     pinButton: "Pin customer",
+    selectPrompt: "Select a customer ID above to pin.",
     changedHint:
       "Pin applies to Google Ads tools and spend effects for this connection; it does not change Google Ads.",
     unchangedHint: "This customer ID is already pinned.",
@@ -104,11 +107,18 @@ function formatPinnedAsset(label: string | null, value: string): string {
  * Lists live accounts/customers via `GET /api/connections/:id/assets` and pins one at
  * connection level via `POST /api/connections/:id/asset`.
  */
-export function ConnectionAssetPicker({ row, canWrite }: { row: Connection; canWrite: boolean }) {
+export function ConnectionAssetPicker({
+  row,
+  provider,
+  canWrite,
+}: {
+  row: Connection;
+  provider: AssetPinningProvider;
+  canWrite: boolean;
+}) {
   const t = useTranslate();
   const headingId = useId();
   const filterId = useId();
-  const provider: AssetPinningProvider = isAssetPinningProvider(row.provider) ? row.provider : "metaads";
   const copy = PROVIDER_COPY[provider];
 
   const [assets, setAssets] = useState<ConnectionAsset[] | null>(null);
@@ -379,10 +389,14 @@ export function ConnectionAssetPicker({ row, canWrite }: { row: Connection; canW
             loading={saving}
             disabled={!changed}
           >
-            {changed ? t(copy.pinButton) : t("Pinned")}
+            {changed || draft === null ? t(copy.pinButton) : t("Pinned")}
           </Button>
           <span className="text-micro text-ink-500 break-words">
-            {changed ? t(copy.changedHint) : t(copy.unchangedHint)}
+            {changed
+              ? t(copy.changedHint)
+              : draft === null
+                ? t(copy.selectPrompt)
+                : t(copy.unchangedHint)}
           </span>
         </div>
       )}

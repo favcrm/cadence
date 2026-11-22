@@ -163,6 +163,13 @@ async function main() {
   ok(text().includes("Meta ad account"), "Meta ad account heading renders");
   ok(text().includes("Showing 10 of 10"), "account filter counter renders for >8 assets");
 
+  const initialPinMeta = Array.from(mount.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes("Pin ad account"),
+  ) as HTMLButtonElement | undefined;
+  ok(initialPinMeta !== undefined && initialPinMeta.disabled, "unpinned Meta button reads Pin ad account (disabled)");
+  ok(text().includes("Select an ad account above to pin."), "unpinned Meta guidance renders");
+  ok(!text().includes("This ad account is already pinned."), "unpinned Meta does not claim already pinned");
+
   const radios = () => Array.from(mount.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
   ok(radios().length === 10, `10 Meta radios render: ${radios().length}`);
   ok(radios()[9]!.disabled, "unselectable Meta account radio is disabled");
@@ -201,6 +208,11 @@ async function main() {
     "Meta pin confirmation displays label and value",
   );
   ok(text().includes("Used by Meta Ads tools"), "Meta status footer updates");
+  const pinnedMetaBtn = Array.from(mount.querySelectorAll("button")).find(
+    (b) => b.textContent?.trim() === "Pinned",
+  ) as HTMLButtonElement | undefined;
+  ok(pinnedMetaBtn !== undefined && pinnedMetaBtn.disabled, "post-pin Meta button reads Pinned (disabled)");
+  ok(text().includes("This ad account is already pinned."), "post-pin Meta shows already pinned hint");
 
   // 2. Google Ads: renders customer IDs and handles normalized server value response.
   const googleRow = {
@@ -226,6 +238,12 @@ async function main() {
   await flush();
   ok(text().includes("Google Ads customer"), "Google Ads customer heading renders");
   ok(text().includes("412-890-3310"), "Google Ads formatted customer label renders");
+  const initialPinGoogle = Array.from(mount.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes("Pin customer"),
+  ) as HTMLButtonElement | undefined;
+  ok(initialPinGoogle !== undefined && initialPinGoogle.disabled, "unpinned Google button reads Pin customer (disabled)");
+  ok(text().includes("Select a customer ID above to pin."), "unpinned Google guidance renders");
+  ok(!text().includes("This customer ID is already pinned."), "unpinned Google does not claim already pinned");
   ok(radios().length === 2 && radios()[1]!.disabled, "unselectable Google Ads customer disabled");
   await act(async () => {
     radios()[0]!.click();
@@ -243,6 +261,11 @@ async function main() {
     text().includes("Pinned. Google Ads tools for this connection now use 412-890-3310 (4128903310)."),
     "Google pin confirmation displays normalized value",
   );
+  const pinnedGoogleBtn = Array.from(mount.querySelectorAll("button")).find(
+    (b) => b.textContent?.trim() === "Pinned",
+  ) as HTMLButtonElement | undefined;
+  ok(pinnedGoogleBtn !== undefined && pinnedGoogleBtn.disabled, "post-pin Google button reads Pinned (disabled)");
+  ok(text().includes("This customer ID is already pinned."), "post-pin Google shows already pinned hint");
 
   // 3. Non-owner view (`canWrite: false`): radios disabled and no Pin button.
   await act(async () => {

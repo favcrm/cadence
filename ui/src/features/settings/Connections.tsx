@@ -1893,7 +1893,7 @@ export function ConnectionDetail({
       )}
 
       {hostedBoard && isAssetPinningProvider(row.provider) && (
-        <ConnectionAssetPicker row={row} canWrite={canWrite} />
+        <ConnectionAssetPicker row={row} provider={row.provider} canWrite={canWrite} />
       )}
 
       {note && (
