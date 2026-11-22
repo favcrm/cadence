@@ -1,3 +1,4 @@
+/// <reference lib="es2024.promise" />
 import type * as HappyDom from "happy-dom";
 import type * as ReactTypes from "react";
 import type * as ReactDomClient from "react-dom/client";
@@ -57,7 +58,11 @@ let unconfirmed = false;
 let conflict = false;
 const writes: unknown[] = [];
 const consultationPosts: { id: string; body: unknown }[] = [];
-let consultationRead: "failure" | "missing" | "answer" = "failure";
+const consultationReads: string[] = [];
+let acknowledgeConsultation = true;
+let consultationRead: "failure" | "missing" | "unconfirmed" | "answer" = "failure";
+let consultationReply = "  \n ";
+let heldAgentRead: Promise<Response> | null = null;
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 
 globalThis.fetch = async (input, init) => {
@@ -66,11 +71,15 @@ globalThis.fetch = async (input, init) => {
     const id = url.split("/").pop()!;
     if (init?.method === "POST") {
       consultationPosts.push({ id, body: JSON.parse(String(init.body)) });
+      if (!acknowledgeConsultation) return json({}, 502);
       return json({ message: id, state: "accepted", duplicate: false }, 202);
     }
+    consultationReads.push(id);
     if (consultationRead === "failure") return json({}, 503);
     if (consultationRead === "missing") return json({}, 404);
-    return json({ message: id, state: "answered", text: "  \n " });
+    return consultationRead === "unconfirmed"
+      ? json({ message: id, state: "unconfirmed" })
+      : json({ message: id, state: "answered", text: consultationReply });
   }
   if (url === path) return json(install);
   if (url === "/api/app-installations") return json([install]);
@@ -87,6 +96,7 @@ globalThis.fetch = async (input, init) => {
     const stale = !!state && state.digest !== install.digest;
     if (init?.method !== "POST") {
       reads += 1;
+      if (heldAgentRead) return heldAgentRead;
       return json({ install_id: installId, digest: install.digest, revision, stale, agent: !stale && state?.profile ? pin(state.profile) : null, consultations: true });
     }
     const body = JSON.parse(String(init.body));
@@ -121,7 +131,7 @@ async function render(session: string | null, operator = true) {
       }) })));
   });
 }
-const change = (el: HTMLInputElement | HTMLSelectElement | null | undefined, value: string) => React.act(async () => {
+const change = (el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null | undefined, value: string) => React.act(async () => {
   assert(el, "The input is available");
   Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value")!.set!.call(el, value);
   el.dispatchEvent(new Event(el.tagName === "SELECT" ? "change" : "input", { bubbles: true }));
@@ -176,39 +186,73 @@ async function main() {
     await renderConsultation("owner-a");
     await click(updateButton("Consult app agent"));
     await change(host.querySelector("select"), installId);
-    const source = host.querySelector<HTMLTextAreaElement>("textarea");
-    assert(source, "Consultation source is available");
-    await React.act(async () => {
-      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(source), "value")!.set!.call(source, "exact source");
-      source.dispatchEvent(new Event("input", { bubbles: true }));
-    });
+    await change(host.querySelector("textarea"), "exact source");
+    await React.act(async () => { pausePrivateReads(); allowPrivateReads(); });
+    const { promise, resolve: settleAgentRead } = Promise.withResolvers<Response>();
+    heldAgentRead = promise;
+    await click(updateButton("Consult app agent"));
+    assert(updateButton("Send to app agent")?.disabled, "An interrupted draft waits for a fresh recipient");
+    assert(host.querySelector<HTMLTextAreaElement>("textarea")?.value === "exact source", "Verification interruption retains editable text");
+    await React.act(async () => settleAgentRead(json({}, 503)));
+    heldAgentRead = null;
+    assert(updateButton("Send to app agent")?.disabled && consultationPosts.length === 0, "A failed recipient read cannot send");
+    await click(updateButton("Close"));
+    await click(updateButton("Consult app agent"));
+    await change(host.querySelector("select"), installId);
+    await change(host.querySelector("textarea"), "exact source");
+    acknowledgeConsultation = false;
     await click(updateButton("Send to app agent"));
-    assert(consultationPosts.length === 1, "A single consultation is admitted");
+    const first = consultationPosts[0];
+    assert(first && Number(consultationPosts.length) === 1, "The first POST was sent with a lost acknowledgement");
     await renderConsultation(null);
     await renderConsultation("owner-a");
     await click(updateButton("Review consultation"));
+    assert(!updateButton("Retry same message"), "Retry is not available before checking the original operation");
+    consultationRead = "missing";
+    await click(updateButton("Check reply"));
+    assert(consultationReads[0] === first.id && Number(consultationPosts.length) === 1, "Recovery reads the original ID without posting");
+    acknowledgeConsultation = true;
+    await click(updateButton("Retry same message"));
+    assert(JSON.stringify(consultationPosts[1]) === JSON.stringify(first), "The explicit retry keeps the original ID, binding and text");
+    consultationRead = "failure";
     await click(updateButton("Check reply"));
     assert(host.textContent?.includes("Could not check for the reply"), "A failed read preserves admission");
     await React.act(async () => { pausePrivateReads(); allowPrivateReads(); });
     await click(updateButton("Review consultation"));
     consultationRead = "missing";
     await click(updateButton("Check reply"));
-    assert(!updateButton("Retry same message") && consultationPosts.length === 1, "A 404 after admission never offers a retry");
+    assert(!updateButton("Retry same message") && Number(consultationPosts.length) === 2, "A 404 after admission never offers a retry");
     await click(updateButton("Start another"));
     await change(host.querySelector("select"), installId);
-    const second = host.querySelector<HTMLTextAreaElement>("textarea")!;
-    await React.act(async () => {
-      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(second), "value")!.set!.call(second, "another source");
-      second.dispatchEvent(new Event("input", { bubbles: true }));
-    });
+    await change(host.querySelector("textarea"), "another source");
+    await click(updateButton("Send to app agent"));
+    consultationRead = "unconfirmed";
+    await click(updateButton("Check reply"));
+    await click(updateButton("Check reply"));
+    assert(!updateButton("Retry same message"), "An admitted consultation is never retried on an unconfirmed reply");
+    await click(updateButton("Dismiss review"));
+    assert(updateButton("Consult app agent") && Number(consultationPosts.length) === 3, "Dismissal clears local review without sending");
+    await click(updateButton("Consult app agent"));
+    await change(host.querySelector("select"), installId);
+    await change(host.querySelector("textarea"), "third source");
     await click(updateButton("Send to app agent"));
     consultationRead = "answer";
     await click(updateButton("Check reply"));
-    assert([...host.querySelectorAll("textarea")].some((field) => field.value === "  \n "), "Whitespace-only reply is literal");
+    const replyText = () => host.querySelector("pre[aria-labelledby]")?.textContent;
+    assert(replyText() === "  \n ", "Whitespace-only reply is literal");
     await click(updateButton("Review in Master composer"));
     assert(composed.includes(JSON.stringify("  \n ")), "Master evidence preserves the reply");
+
+    await click(updateButton("Consult app agent"));
+    await change(host.querySelector("select"), installId);
+    await change(host.querySelector("textarea"), "fourth source");
+    await click(updateButton("Send to app agent"));
+    consultationReply = "A\r\nB\rC";
+    await click(updateButton("Check reply"));
+    assert(replyText() === consultationReply, "Reply review retains CR and CRLF");
+    assert(host.querySelector("details pre")?.textContent === JSON.stringify(consultationReply), "Original line endings are selectable as escaped text");
     await React.act(async () => resetPrivateSession());
-    assert(!updateButton("Review consultation"), "Session reset erases consultation");
+    assert(!updateButton("Review consultation") && replyText() === undefined, "Session reset erases a retained private reply");
   } finally {
     await React.act(async () => { root.unmount(); });
     await win.happyDOM.close();

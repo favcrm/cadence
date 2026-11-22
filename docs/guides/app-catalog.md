@@ -466,10 +466,15 @@ app agent** in Home to choose an app and review the exact text before sending.
 Only that text is shared; the app agent does not receive either chat's history
 and cannot stage or save changes in this turn. **Review consultation** returns
 to the same message after navigating away or a temporary verification pause.
-If a send is unconfirmed, use **Check reply** before retrying the same message;
-an admitted message is never retried after a failed reply check.
-**Review in Master composer** copies the source and exact reply for editing; it does not send. Any app
-proposal still uses the normal, separate approval decision.
+An unsent draft keeps its text after a temporary pause, but Send waits for
+the recipient to be verified again. If a send is unconfirmed, use **Check
+reply** before retrying the same message. An admitted message is never retried
+after a failed reply check. **Dismiss review** clears an unresolved review
+from this browser without sending again or cancelling the original.
+**Show exact line endings** reveals escaped text for replies containing
+carriage returns. **Review in Master composer** copies the original source
+and reply for editing; it does not send. Any proposal still needs separate
+approval.
 
 A verified operator selects an immutable published release, chooses **Review
 installation** or **Review update**, reviews the checked package and access

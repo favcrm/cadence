@@ -64,6 +64,8 @@ export default function AppConsultation({ session, onCompose }: { session: strin
       setOpen(false);
       setApps(null);
       setAppsFailed(false);
+      setSelection(null);
+      setSelectionFailed(false);
     };
     const forget = () => { clear(); setOpen(false); setApps(null); setAppsFailed(false); };
     const offPause = onPrivateReadsPaused(pause);
@@ -186,6 +188,9 @@ export default function AppConsultation({ session, onCompose }: { session: strin
           {sent && !settled && phase !== "sending" && <Button loading={checking} onClick={() => void check(sent)}>
             {t("Check reply")}
           </Button>}
+          {phase === "read_error" && <Button disabled={checking} onClick={() => { clear(); setOpen(false); }}>
+            {t("Dismiss review")}
+          </Button>}
           {sent && phase === "retry" && <Button variant="primary" disabled={checking} onClick={() => void post(sent)}>{t("Retry same message")}</Button>}
           {!sent && <Button variant="primary" disabled={!canSend} onClick={() => {
             if (canSend) void post({ id: crypto.randomUUID(), app, binding, text });
@@ -217,10 +222,15 @@ export default function AppConsultation({ session, onCompose }: { session: strin
             value={sent?.text ?? text} onChange={(event) => setText(event.currentTarget.value)} />
         </label>
         {notice && <p role="status" className="text-label text-ink-300">{notice}</p>}
-        {review !== null && <label className="wa-field">
-          {t("Exact agent reply")}
-          <textarea className="wa-input wa-prompt-input" rows={6} readOnly value={review} />
-        </label>}
+        {phase === "read_error" && <p className="text-label text-ink-400">{t("Dismissing this review does not cancel the consultation.")}</p>}
+        {review !== null && <div className="wa-field">
+          <span id={`${selectId}-reply`}>{t("Exact agent reply")}</span>
+          <pre aria-labelledby={`${selectId}-reply`} tabIndex={0} className="wa-input m-0 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{review}</pre>
+          {review.includes("\r") && <details className="text-label text-ink-300">
+            <summary>{t("Show exact line endings")}</summary>
+            <pre className="wa-input m-0 mt-1.5 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(review)}</pre>
+          </details>}
+        </div>}
         </div>
       </WorkspaceDialog>}
     </>
