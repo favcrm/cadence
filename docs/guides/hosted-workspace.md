@@ -278,6 +278,13 @@ dropped whole, and a host refusal leaves the bundled skills unchanged. Only
 approved revisions belong here; a draft never does, and a skill never grants,
 adds or selects a tool.
 
+A tool-free surface sets `builtInSkills: false` with an empty `tools` list.
+That omits the skill tools and their prompt contribution without changing
+other hosted sessions. In a dedicated session with `captureOperationReplies`
+enabled, `operationReply(id)` inspects the exact durable input, including
+queued and placed work, without opening the engine or resuming the turn.
+An unconfirmed result is not proof that the input never ran.
+
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
 turn: `{ installId, contextId? }`, with `contextId` absent for an

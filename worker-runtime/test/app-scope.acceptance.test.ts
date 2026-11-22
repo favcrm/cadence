@@ -2376,6 +2376,7 @@ describe("no-wake settlement acceptance", () => {
       const withdrawn = await root.submit(
         { type: "input", requestId: "handoff:withdrawn", content: "March" }, BACKGROUND_CONTEXT,
       );
+      expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "pending", operationId: "handoff:withdrawn" });
       expect(await withdrawn.abort(BACKGROUND_CONTEXT)).toBe("aborted");
       expect((await withdrawn.wait(BACKGROUND_CONTEXT)).status).toBe("unanswered");
       const reply = { state: "answered", operationId: "handoff:first", text: "Reply to January" };
@@ -2385,8 +2386,8 @@ describe("no-wake settlement acceptance", () => {
       expect(await ordinary.operationReply("handoff:first")).toEqual(unconfirmed("handoff:first"));
       expect(await session.operationReply("handoff:first")).toEqual(reply);
       expect(await session.operationReply("handoff:withdrawn")).toEqual({ state: "unanswered", operationId: "handoff:withdrawn" });
-      for (const id of ["handoff:later", "handoff:absent"])
-        expect(await session.operationReply(id)).toEqual(unconfirmed(id));
+      expect(await session.operationReply("handoff:later")).toEqual({ state: "pending", operationId: "handoff:later" });
+      expect(await session.operationReply("handoff:absent")).toEqual(unconfirmed("handoff:absent"));
       scripted.release();
       expect((await later.wait(BACKGROUND_CONTEXT)).status).toBe("done");
       await engine.waitForIdle(BACKGROUND_CONTEXT);

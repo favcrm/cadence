@@ -305,6 +305,8 @@ export interface HostedSessionOptions {
      */
     resumeModel?(url: string, signal?: AbortSignal): Promise<Response>;
     readonly tools: readonly RuntimeTools[];
+    /** Omit the runtime skill tools and their prompt contribution for a tool-free surface. */
+    readonly builtInSkills?: false;
     /**
      * The workspace's approved skills, read once when the conversation's harness
      * opens (CAD-2395). Supply only approved revisions; a draft must never reach
@@ -347,13 +349,13 @@ export interface AskResult {
     readonly text: string | undefined;
     readonly operationId: string | undefined;
 }
-/** A read-only reply from an exact input. Unconfirmed is never proof it did not run. */
+/** Durable status of an exact input. Unconfirmed is never proof it did not run. */
 export type OperationReply = {
     readonly state: "answered";
     readonly operationId: string;
     readonly text: string;
 } | {
-    readonly state: "unanswered" | "unconfirmed";
+    readonly state: "pending" | "unanswered" | "unconfirmed";
     readonly operationId: string;
 };
 /** One submission the runtime has not settled yet. */

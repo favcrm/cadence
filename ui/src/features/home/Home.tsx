@@ -1691,7 +1691,7 @@ function MasterHome({
             </div>
             <div className="assistant-heading-actions">
               {!effectiveReadOnly && consultationSession && (
-                <AppConsultation key={consultationSession} onCompose={(text) => {
+                <AppConsultation key={consultationSession} session={consultationSession} onCompose={(text) => {
                   fillComposer(text);
                   window.requestAnimationFrame(focusHomeComposer);
                 }} />

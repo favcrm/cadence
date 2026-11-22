@@ -13,7 +13,12 @@ type Progress =
   | { state: "sending" | "pending" | "uncertain" | "retry" | "unanswered" | "read_error" | "unavailable" }
   | { state: "answered"; text: string };
 
-export default function AppConsultation({ onCompose }: { onCompose: (text: string) => void }) {
+// This belongs to the verified session, not the Home route.
+let remembered: { session: string; sent: Send; progress: Progress; admitted: boolean } | null = null;
+onPrivateSessionReset(() => { remembered = null; });
+
+export default function AppConsultation({ session, onCompose }: { session: string; onCompose: (text: string) => void }) {
+  if (remembered && remembered.session !== session) remembered = null;
   const t = useTranslate();
   const selectId = useId();
   const [open, setOpen] = useState(false);
@@ -23,8 +28,12 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
   const [appId, setAppId] = useState("");
   const [selection, setSelection] = useState<{ id: string; binding: AppAgentSelection } | null>(null);
   const [text, setText] = useState("");
-  const [sent, setSent] = useState<Send | null>(null);
-  const [progress, setProgress] = useState<Progress | null>(null);
+  const [sent, setSent] = useState<Send | null>(() => remembered?.sent ?? null);
+  const [progress, setProgressState] = useState<Progress | null>(() => remembered?.progress ?? null);
+  const setProgress = (next: Progress | null) => {
+    if (remembered && next) remembered.progress = next;
+    setProgressState(next);
+  };
   const [checking, setChecking] = useState(false);
   const flight = useRef<AbortController | null>(null);
   const checks = useRef(0);
@@ -33,6 +42,7 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
     flight.current?.abort();
     flight.current = null;
     checks.current = 0;
+    remembered = null;
     setChecking(false);
     setSent(null);
     setProgress(null);
@@ -43,10 +53,26 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
   }, []);
 
   useEffect(() => {
+    const pause = () => {
+      flight.current?.abort();
+      flight.current = null;
+      setChecking(false);
+      if (remembered?.progress.state === "sending") {
+        remembered.progress = { state: "uncertain" };
+        setProgressState(remembered.progress);
+      }
+      setOpen(false);
+      setApps(null);
+      setAppsFailed(false);
+    };
     const forget = () => { clear(); setOpen(false); setApps(null); setAppsFailed(false); };
-    const offPause = onPrivateReadsPaused(forget);
+    const offPause = onPrivateReadsPaused(pause);
     const offReset = onPrivateSessionReset(forget);
-    return () => { offPause(); offReset(); flight.current?.abort(); };
+    return () => {
+      offPause(); offReset();
+      flight.current?.abort();
+      if (remembered?.progress.state === "sending") remembered.progress = { state: "uncertain" };
+    };
   }, [clear]);
 
   const editing = open && sent === null;
@@ -77,11 +103,17 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
     const controller = new AbortController();
     flight.current = controller;
     checks.current = 0;
+    remembered = { session, sent: send, progress: { state: "sending" }, admitted: remembered?.admitted ?? false };
     setSent(send);
     setProgress({ state: "sending" });
     try {
-      await workspaceApps.sendConsultation(send.app.install_id, send.id, send.binding, send.text, controller.signal);
-      if (!controller.signal.aborted) setProgress({ state: "pending" });
+      await workspaceApps.sendConsultation(send.app.install_id, send.id, send.binding, send.text, controller.signal, () => {
+        if (!controller.signal.aborted && remembered) remembered.admitted = true;
+      });
+      if (!controller.signal.aborted) {
+        if (remembered) remembered.admitted = true;
+        setProgress({ state: "pending" });
+      }
     } catch (error) {
       const refused = error instanceof ApiError && [400, 401, 403, 404, 409].includes(error.status);
       if (!controller.signal.aborted) setProgress({ state: refused ? "unavailable" : "uncertain" });
@@ -90,19 +122,21 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
     }
   };
 
-  const check = useCallback(async (send: Send, knownPending: boolean) => {
+  const check = useCallback(async (send: Send) => {
     if (flight.current) return;
     const controller = new AbortController();
     flight.current = controller;
     setChecking(true);
     try {
       const reply = await workspaceApps.consultationReply(send.app.install_id, send.id, controller.signal);
-      if (!controller.signal.aborted)
-        setProgress(reply.state === "answered" ? reply : { state: reply.state === "unconfirmed" ? "retry" : reply.state });
+      if (!controller.signal.aborted) {
+        if (reply.state !== "unconfirmed" && remembered) remembered.admitted = true;
+        setProgress(reply.state === "answered" ? reply : { state: reply.state === "unconfirmed" ? (remembered?.admitted ? "read_error" : "retry") : reply.state });
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         const status = error instanceof ApiError ? error.status : null;
-        setProgress({ state: status === 404 && !knownPending ? "retry"
+        setProgress({ state: status === 404 && !remembered?.admitted ? "retry"
           : status === 401 || status === 403 || status === 404 ? "unavailable" : "read_error" });
       }
     } finally {
@@ -113,7 +147,7 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
   const phase = progress?.state;
   useEffect(() => {
     if (!open || sent === null || phase !== "pending" || checking || checks.current >= CHECK_LIMIT) return;
-    const timer = window.setTimeout(() => { checks.current++; void check(sent, true); }, 1600);
+    const timer = window.setTimeout(() => { checks.current++; void check(sent); }, 1600);
     return () => window.clearTimeout(timer);
   }, [open, sent, phase, checking, check]);
 
@@ -149,7 +183,7 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
         onClose={close}
         footer={<>
           {settled && <Button onClick={clear}>{t("Start another")}</Button>}
-          {sent && !settled && phase !== "sending" && <Button loading={checking} onClick={() => void check(sent, phase === "pending")}>
+          {sent && !settled && phase !== "sending" && <Button loading={checking} onClick={() => void check(sent)}>
             {t("Check reply")}
           </Button>}
           {sent && phase === "retry" && <Button variant="primary" disabled={checking} onClick={() => void post(sent)}>{t("Retry same message")}</Button>}
@@ -167,13 +201,13 @@ export default function AppConsultation({ onCompose }: { onCompose: (text: strin
         <div className="flex flex-col gap-3">
         <label className="wa-field" htmlFor={selectId}>
           {t("Installed app")}
-          <select id={selectId} className="wa-input" value={appId} disabled={!!sent || !apps?.length} onChange={(event) => {
+          <select id={selectId} className="wa-input" value={sent?.app.install_id ?? appId} disabled={!!sent || !apps?.length} onChange={(event) => {
             setSelection(null);
             setSelectionFailed(false);
             setAppId(event.currentTarget.value);
           }}>
             <option value="">{t("Choose an app")}</option>
-            {apps?.map((item) => <option key={item.install_id} value={item.install_id}>{item.title || item.name}</option>)}
+            {(sent ? [sent.app] : apps ?? []).map((item) => <option key={item.install_id} value={item.install_id}>{item.title || item.name}</option>)}
           </select>
         </label>
         {binding?.agent && <p className="text-label text-ink-300">{t("To: {agent}").replace("{agent}", () => binding.agent!.name)}</p>}

@@ -5,6 +5,8 @@ import type * as Locale from "../src/lib/locale";
 import type * as Manage from "../src/features/explorer/ManageApp";
 import type * as Navigation from "../screen-ui/src/navigation";
 import type * as HostNavigation from "../src/ui/hostNavigation";
+import type * as Consultation from "../src/features/home/AppConsultation";
+import type * as PrivateSession from "../src/lib/privateSession";
 
 declare function require(name: string): unknown;
 const { Window } = require("happy-dom") as typeof HappyDom;
@@ -30,6 +32,8 @@ const { LocaleProvider } = require("../src/lib/locale") as typeof Locale;
 const ManageApp = (require("../src/features/explorer/ManageApp") as typeof Manage).default;
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof Navigation;
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigation;
+const AppConsultation = (require("../src/features/home/AppConsultation") as typeof Consultation).default;
+const { pausePrivateReads, allowPrivateReads, resetPrivateSession } = require("../src/lib/privateSession") as typeof PrivateSession;
 
 const installId = "install-accounting";
 const path = `/api/app-installations/${installId}`;
@@ -52,10 +56,22 @@ let reads = 0;
 let unconfirmed = false;
 let conflict = false;
 const writes: unknown[] = [];
+const consultationPosts: { id: string; body: unknown }[] = [];
+let consultationRead: "failure" | "missing" | "answer" = "failure";
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), win.location.href).pathname;
+  if (url.startsWith(`${path}/agent/consultations/`)) {
+    const id = url.split("/").pop()!;
+    if (init?.method === "POST") {
+      consultationPosts.push({ id, body: JSON.parse(String(init.body)) });
+      return json({ message: id, state: "accepted", duplicate: false }, 202);
+    }
+    if (consultationRead === "failure") return json({}, 503);
+    if (consultationRead === "missing") return json({}, 404);
+    return json({ message: id, state: "answered", text: "  \n " });
+  }
   if (url === path) return json(install);
   if (url === "/api/app-installations") return json([install]);
   if (url === "/api/app-home") return json({ installations: [{ install_id: installId, attention: { state: "ok" } }] });
@@ -71,7 +87,7 @@ globalThis.fetch = async (input, init) => {
     const stale = !!state && state.digest !== install.digest;
     if (init?.method !== "POST") {
       reads += 1;
-      return json({ install_id: installId, digest: install.digest, revision, stale, agent: !stale && state?.profile ? pin(state.profile) : null });
+      return json({ install_id: installId, digest: install.digest, revision, stale, agent: !stale && state?.profile ? pin(state.profile) : null, consultations: true });
     }
     const body = JSON.parse(String(init.body));
     writes.push(body);
@@ -115,6 +131,14 @@ const click = (button: HTMLButtonElement | null | undefined) => React.act(async 
   button.click();
 });
 const updateButton = (label: string) => [...host.querySelectorAll("button")].find(button => button.textContent?.trim() === label);
+async function renderConsultation(session: string | null) {
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, session
+      ? React.createElement(AppConsultation, { key: session, session, onCompose: (text: string) => { composed = text; } })
+      : null));
+  });
+}
+let composed = "";
 
 async function main() {
   try {
@@ -147,6 +171,44 @@ async function main() {
     assert(!selector() && reads === allowedReads, "A platform operator without a private session does not read or see the setting");
     await render("member", false);
     assert(!selector() && reads === allowedReads, "Members do not read or see the owner setting");
+    owner = "owner-a";
+    owners.set(owner, { revision: 4, digest: install.digest, profile: keeper });
+    await renderConsultation("owner-a");
+    await click(updateButton("Consult app agent"));
+    await change(host.querySelector("select"), installId);
+    const source = host.querySelector<HTMLTextAreaElement>("textarea");
+    assert(source, "Consultation source is available");
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(source), "value")!.set!.call(source, "exact source");
+      source.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await click(updateButton("Send to app agent"));
+    assert(consultationPosts.length === 1, "A single consultation is admitted");
+    await renderConsultation(null);
+    await renderConsultation("owner-a");
+    await click(updateButton("Review consultation"));
+    await click(updateButton("Check reply"));
+    assert(host.textContent?.includes("Could not check for the reply"), "A failed read preserves admission");
+    await React.act(async () => { pausePrivateReads(); allowPrivateReads(); });
+    await click(updateButton("Review consultation"));
+    consultationRead = "missing";
+    await click(updateButton("Check reply"));
+    assert(!updateButton("Retry same message") && consultationPosts.length === 1, "A 404 after admission never offers a retry");
+    await click(updateButton("Start another"));
+    await change(host.querySelector("select"), installId);
+    const second = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(second), "value")!.set!.call(second, "another source");
+      second.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await click(updateButton("Send to app agent"));
+    consultationRead = "answer";
+    await click(updateButton("Check reply"));
+    assert([...host.querySelectorAll("textarea")].some((field) => field.value === "  \n "), "Whitespace-only reply is literal");
+    await click(updateButton("Review in Master composer"));
+    assert(composed.includes(JSON.stringify("  \n ")), "Master evidence preserves the reply");
+    await React.act(async () => resetPrivateSession());
+    assert(!updateButton("Review consultation"), "Session reset erases consultation");
   } finally {
     await React.act(async () => { root.unmount(); });
     await win.happyDOM.close();
