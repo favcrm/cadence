@@ -47,6 +47,16 @@ export interface StagedResult {
   ticket?: string;
 }
 
+export interface StagedWhatsApp {
+  operation: string;
+  provider: "linked" | "official" | null;
+  providerLabel: "Linked Device" | "Official API" | null;
+  category: "message" | "broadcast" | "handoff" | "lifecycle";
+  destructive: boolean;
+  warning: string | null;
+  attachment: { summary: string; sha256: string | null } | null;
+}
+
 export interface StagedWrite {
   id: string;
   kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect";
@@ -75,6 +85,8 @@ export interface StagedWrite {
   recordLink: string | null;
   /** `cadence_cli` (AOS-679): a hosted Cadence CLI write staged for the owner. Display text is made visible (see `visible`). */
   cli?: { verb: string; summary: string | null; requestedBy: string | null };
+  /** `app_call` for `waba` / `whatsapp.*` operations. */
+  whatsapp?: StagedWhatsApp | null;
   /** `connected_effect`: the draft or send a connected tool would make. */
   connected: {
     effect: "draft" | "send";
@@ -221,6 +233,87 @@ export function rawText(args: unknown): string {
   }
 }
 
+function normalizeWhatsAppChanges(changes: StagedChange[], isWhatsApp: boolean): StagedChange[] {
+  if (!isWhatsApp) return changes;
+  return changes.map((c) => {
+    const field = visible(c.field);
+    const label = visible(c.label);
+    const rawBefore = typeof c.before === "string" ? visible(c.before) : c.before;
+    let rawAfter = typeof c.after === "string" ? visible(c.after) : c.after;
+    if (field === "provider" && (rawAfter === "linked" || rawAfter === "official")) {
+      rawAfter = rawAfter === "linked" ? "Linked Device" : "Official API";
+    }
+    return {
+      field,
+      label,
+      kind: c.kind,
+      ...(rawBefore !== undefined ? { before: rawBefore } : {}),
+      ...(rawAfter !== undefined ? { after: rawAfter } : {}),
+    };
+  });
+}
+
+function parseStagedWhatsApp(input: Record<string, unknown>, rawChanges: StagedChange[]): StagedWhatsApp | null {
+  const operation = str(input.operation);
+  if (!operation || !operation.startsWith("whatsapp.")) return null;
+  let parsedArgs: Record<string, unknown> | null = null;
+  if (typeof input.args === "string") {
+    try {
+      const candidate: unknown = JSON.parse(input.args);
+      if (isRecord(candidate)) parsedArgs = candidate;
+    } catch {
+      parsedArgs = null;
+    }
+  } else if (isRecord(input.args)) {
+    parsedArgs = input.args;
+  }
+  const providerRaw =
+    rawChanges.find((c) => c.field === "provider")?.after ??
+    (parsedArgs ? str(parsedArgs.provider) : null);
+  const provider = providerRaw === "linked" || providerRaw === "official" ? providerRaw : null;
+  const providerLabel = provider === "linked" ? "Linked Device" : provider === "official" ? "Official API" : null;
+  const category: StagedWhatsApp["category"] =
+    operation === "whatsapp.broadcast.stage" ||
+    operation === "whatsapp.broadcast.test.stage" ||
+    operation === "whatsapp.broadcast.stop.stage"
+      ? "broadcast"
+      : operation === "whatsapp.handoff.stage"
+        ? "handoff"
+        : operation === "whatsapp.connect" ||
+            operation === "whatsapp.start" ||
+            operation === "whatsapp.stop" ||
+            operation === "whatsapp.disconnect" ||
+            operation === "whatsapp.link" ||
+            operation === "whatsapp.rescope"
+          ? "lifecycle"
+          : "message";
+  let warning: string | null = null;
+  if (operation === "whatsapp.disconnect") {
+    warning = "Disconnecting wipes or revokes this WhatsApp connection and stops inbound/outbound messaging until re-paired or re-linked.";
+  } else if (operation === "whatsapp.stop") {
+    warning = "Stopping pauses live WhatsApp messaging for this workspace until started again.";
+  } else if (operation === "whatsapp.broadcast.stage") {
+    warning = "Approving sends this broadcast to all matched WhatsApp recipients. This cannot be undone.";
+  } else if (operation === "whatsapp.broadcast.stop.stage") {
+    warning = "Approving stops the running WhatsApp broadcast immediately.";
+  } else if (operation === "whatsapp.link" || operation === "whatsapp.rescope") {
+    warning = "Approving changes the Official WhatsApp connection binding for this workspace.";
+  }
+  const attChange = rawChanges.find((c) => c.field === "attachment" && typeof c.after === "string" && c.after !== "");
+  const shaChange = rawChanges.find((c) => c.field === "attachment_sha256" && typeof c.after === "string" && c.after !== "");
+  return {
+    operation,
+    provider,
+    providerLabel,
+    category,
+    destructive: warning !== null,
+    warning,
+    attachment: attChange?.after
+      ? { summary: visible(attChange.after), sha256: shaChange?.after ? visible(shaChange.after) : null }
+      : null,
+  };
+}
+
 function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
   const input = isRecord(row.input) ? row.input : {};
   const origin = parseOrigin(row.origin);
@@ -229,10 +322,11 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
     // An API that predates the summary: the approver sentence and the raw call.
     const subject = str(input.subject) ?? str(row.subject);
     if (subject === null) return null;
+    const whatsapp = parseStagedWhatsApp(input, []);
     return {
       ...base,
       kind: "app_call",
-      title: subject,
+      title: whatsapp ? visible(subject) : subject,
       app: str(input.app),
       target: null,
       changes: [],
@@ -241,10 +335,11 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
       reason: null,
       consent: null,
       effects: [],
-      raw: rawText(input.args ?? input),
-      origin,
+      raw: whatsapp ? visible(rawText(input.args ?? input)) : rawText(input.args ?? input),
+      origin: whatsapp && origin ? { ...origin, label: visible(origin.label), via: visible(origin.via) } : origin,
       result,
       recordLink: null,
+      ...(whatsapp ? { whatsapp } : {}),
       connected: null,
       customMcp: null,
     };
@@ -252,28 +347,40 @@ function parseAppCall(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "d
   if (!Array.isArray(row.changes)) return null;
   const changes = row.changes.map(parseChange);
   if (changes.some((c) => c === null)) return null;
-  const target = isRecord(row.target) && str(row.target.label)
+  const rawChanges = changes as StagedChange[];
+  const whatsapp = parseStagedWhatsApp(input, rawChanges);
+  const rawTarget = isRecord(row.target) && str(row.target.label)
     ? { kind: str(row.target.kind) ?? "record", label: str(row.target.label)!, id: str(row.target.id) }
     : null;
-  const effects = Array.isArray(row.effects) ? row.effects.filter((e): e is string => typeof e === "string" && e.trim() !== "") : [];
+  const target = whatsapp && rawTarget
+    ? { kind: visible(rawTarget.kind), label: visible(rawTarget.label), id: rawTarget.id ? visible(rawTarget.id) : null }
+    : rawTarget;
+  const effects = Array.isArray(row.effects)
+    ? row.effects
+        .filter((e): e is string => typeof e === "string" && e.trim() !== "")
+        .map((e) => (whatsapp ? visible(e) : e))
+    : [];
   const unchanged = typeof row.unchanged_count === "number" && row.unchanged_count > 0 ? Math.floor(row.unchanged_count) : 0;
+  const rawReason = str(row.reason);
+  const safeResult = whatsapp && result?.code !== undefined ? { ...result, code: visible(result.code) } : result;
   return {
     ...base,
     kind: "app_call",
-    title,
+    title: whatsapp ? visible(title) : title,
     app: str(row.app) ?? str(input.app),
     target,
-    changes: changes as StagedChange[],
+    changes: normalizeWhatsAppChanges(rawChanges, whatsapp !== null),
     unchangedCount: unchanged,
     // Only an explicit `true` makes the summary complete.
     changesComplete: row.changes_complete === true,
-    reason: str(row.reason),
+    reason: whatsapp && rawReason !== null ? visible(rawReason) : rawReason,
     consent: parseConsent(row.consent),
     effects,
-    raw: rawText(row.args ?? input.args ?? input),
-    origin,
-    result,
+    raw: whatsapp ? visible(rawText(row.args ?? input.args ?? input)) : rawText(row.args ?? input.args ?? input),
+    origin: whatsapp && origin ? { ...origin, label: visible(origin.label), via: visible(origin.via) } : origin,
+    result: safeResult,
     recordLink: str(row.record_link),
+    ...(whatsapp ? { whatsapp } : {}),
     connected: null,
     customMcp: null,
   };
@@ -521,7 +628,10 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 }
 
 /** The provider may have acted: not a failure, not a success, and not "nothing ran", whatever the row's status. */
-export const isUncertain = (write: StagedWrite): boolean => write.connected !== null && write.result?.ok === false && (write.result.code === "uncertain" || write.result.retry === true);
+export const isUncertain = (write: StagedWrite): boolean =>
+  (write.connected !== null || write.whatsapp != null) &&
+  write.result?.ok === false &&
+  (write.result.code === "uncertain" || write.result.retry === true);
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
@@ -587,6 +697,7 @@ export function failureReason(write: StagedWrite): string {
   if (write.cli) return `refused (${code ?? "unknown"})`;
   if (write.customMcp != null) return (code && CUSTOM_MCP_REASONS[code]) || `refused (${code ?? "unknown"})`;
   if (write.connected !== null) return (code && CONNECTED_REASONS[code]) || `refused (${code ?? "unknown"})`;
+  if (write.whatsapp != null) return (code && REASONS[code]) || `refused (${code ?? "unknown"})`;
   return (code && REASONS[code]) || "the reason is not recognised";
 }
 

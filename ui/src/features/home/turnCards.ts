@@ -308,12 +308,26 @@ export function stagedFields(write: StagedWrite): { fields: StagedField[]; more:
   // CAD-2463: a connected effect's message is the body, in full (the preview
   // already caps it at 2,000 characters); the card clamps it, not cuts it.
   const bodyField = preview?.fields.find((field) => BODY_ROLES.has(field.role)) ?? null;
-  const body = bodyField && bodyField.value.trim() !== "" ? bodyField.value : null;
+  const waTextChange = !preview && write.whatsapp != null
+    ? write.changes.find((change) => change.field === "text" && change.kind !== "removed" && (change.after ?? "").trim() !== "") ?? null
+    : null;
+  const body =
+    bodyField && bodyField.value.trim() !== ""
+      ? bodyField.value
+      : waTextChange && waTextChange.after
+        ? waTextChange.after
+        : null;
+  const orderedChanges = write.whatsapp != null
+    ? [
+        ...write.changes.filter((change) => change !== waTextChange && change.field !== "digest"),
+        ...write.changes.filter((change) => change !== waTextChange && change.field === "digest"),
+      ]
+    : write.changes;
   const all: StagedField[] = preview
     ? preview.fields
         .filter((field) => field !== bodyField || body === null)
         .map((field) => ({ label: field.label, value: cut(field.value), missing: field.value.trim() === "", removed: false }))
-    : write.changes.map((change) => {
+    : orderedChanges.map((change) => {
         if (change.kind === "removed") return { label: change.label, value: cut(change.before ?? ""), missing: false, removed: true };
         const value = change.after ?? "";
         return { label: change.label, value: cut(value), missing: change.after == null || value.trim() === "", removed: false };
@@ -340,6 +354,7 @@ export function stagedAccount(write: StagedWrite): string | null {
     write.connected?.account ??
     write.customMcp?.preview?.account ??
     write.customMcp?.endpointHost ??
+    write.whatsapp?.providerLabel ??
     null;
   return account && account.trim() !== "" ? account.trim() : null;
 }
@@ -387,6 +402,21 @@ export function stagedStatus(write: StagedWrite, outcome: StagedOutcome, railWor
   if (write.customMcp != null) {
     if (outcome === "applied") return "Ran";
     if (outcome === "failed") return "Couldn't run";
+    return railWord;
+  }
+  if (write.whatsapp != null) {
+    if (write.whatsapp.category === "message" || write.whatsapp.category === "broadcast") {
+      if (write.whatsapp.operation === "whatsapp.broadcast.stop.stage") {
+        if (outcome === "applied") return "Stopped";
+        if (outcome === "failed") return "Couldn't stop";
+        return railWord;
+      }
+      if (outcome === "applied") return "Sent";
+      if (outcome === "failed") return "Couldn't send";
+      return railWord;
+    }
+    if (outcome === "applied") return "Applied";
+    if (outcome === "failed") return "Couldn't apply";
     return railWord;
   }
   const effect = write.connected?.effect;

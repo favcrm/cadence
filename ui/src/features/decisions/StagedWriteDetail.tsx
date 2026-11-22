@@ -120,7 +120,7 @@ function ApprovalsTab({
   const [raw, setRaw] = useState(!write.changesComplete);
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
   const update = write.target !== null && write.changesComplete;
-  const heading = update ? t("Changes compared with the current record") : write.connected !== null || write.customMcp != null || write.cli ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
+  const heading = update ? t("Changes compared with the current record") : write.connected !== null || write.customMcp != null || write.cli || write.whatsapp != null ? t("Arguments") : write.target !== null ? t("Values sent") : t("Fields");
   const name = write.origin?.label ?? write.proposer?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
@@ -137,6 +137,16 @@ function ApprovalsTab({
         </p>
       )}
       {state}
+      {write.whatsapp?.providerLabel && (
+        <p className="rv-note m-0" data-whatsapp-provider={write.whatsapp.provider ?? undefined}>
+          {t("WhatsApp mode")}: <B>{t(write.whatsapp.providerLabel)}</B>
+        </p>
+      )}
+      {write.whatsapp?.destructive && write.whatsapp.warning && (
+        <p className="issue-peek-note warn m-0" role="alert" data-whatsapp-warning={write.whatsapp.operation}>
+          {t(write.whatsapp.warning)}
+        </p>
+      )}
       {(write.connected !== null || write.customMcp != null) && write.status === "pending" && write.result === null && (
         <p className="rv-note m-0">
           {write.customMcp != null
@@ -146,7 +156,7 @@ function ApprovalsTab({
             : t(write.connected!.effect === "send" ? "Approving sends this once. Nothing has been sent yet." : "Approving drafts this once. Nothing has been drafted yet.")}
         </p>
       )}
-      {(write.connected !== null || write.customMcp != null) && write.status === "pending" && write.result?.ok === false && (
+      {(write.connected !== null || write.customMcp != null || write.whatsapp != null) && write.status === "pending" && write.result?.ok === false && (
         <p className="issue-peek-note warn m-0" role="status">
           {t("The last approval attempt did not finish: {reason}. It is still waiting; check before approving again.").replace("{reason}", reasonText(failureReason(write), t))}
         </p>
@@ -280,7 +290,17 @@ function OverviewTab({ write, domain, via, t }: { write: StagedWrite; domain: St
             </div>
             <div className="dx-kv-line">
               <dt>{t("Kind")}</dt>
-              <dd>{write.kind === "create_issue" ? t("Issue proposal") : write.customMcp ? t("Custom MCP tool") : write.connected ? t("Connected action") : write.cli ? t("Cadence command") : t("App write")}</dd>
+              <dd>{
+                write.kind === "create_issue" ? t("Issue proposal")
+                : write.customMcp ? t("Custom MCP tool")
+                : write.connected ? t("Connected action")
+                : write.cli ? t("Cadence command")
+                : write.whatsapp?.category === "lifecycle" ? t("WhatsApp lifecycle")
+                : write.whatsapp?.category === "broadcast" ? t("WhatsApp broadcast")
+                : write.whatsapp?.category === "handoff" ? t("WhatsApp handoff")
+                : write.whatsapp ? t("WhatsApp message")
+                : t("App write")
+              }</dd>
             </div>
             <div className="dx-kv-line">
               <dt>{t("Surface")}</dt>

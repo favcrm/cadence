@@ -542,7 +542,7 @@ fn verb_for(
                 _ => {
                     return Err(Error::rejected(
                         "one of -m or --file is required — nothing was sent",
-                    ))
+                    ));
                 }
             };
             if body.trim().is_empty() {
@@ -1366,6 +1366,87 @@ fn verb_for(
                     args.insert("operation".into(), json!("connection_revoke"));
                     args.insert("connectionId".into(), json!(connection_id));
                 }
+                ConnectionAction::Whatsapp { action } => match action {
+                    super::connection::WhatsappAction::Status { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_status"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Connect { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_connect"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Start { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_start"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Stop { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_stop"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Disconnect { provider, confirm } => {
+                        if !*confirm {
+                            return Err(Error::usage(
+                                "disconnecting WhatsApp is destructive and requires --confirm",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_disconnect"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": provider.as_str(), "confirm": true }),
+                        );
+                    }
+                    super::connection::WhatsappAction::Inspect { company_id } => {
+                        if !valid_whatsapp_company_id(company_id) {
+                            return Err(Error::invalid(
+                                "whatsapp_inspect",
+                                "--company-id must be 1-128 characters with no ASCII control characters",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_inspect"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": "official", "favcrm_company_id": company_id }),
+                        );
+                    }
+                    super::connection::WhatsappAction::Link {
+                        company_id,
+                        request,
+                    } => {
+                        if !valid_whatsapp_company_id(company_id) {
+                            return Err(Error::invalid(
+                                "whatsapp_link",
+                                "--company-id must be 1-128 characters with no ASCII control characters",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_link"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": "official", "favcrm_company_id": company_id }),
+                        );
+                        if let Some(req) = request.as_deref() {
+                            if !valid_platform_handle(req) {
+                                return Err(Error::invalid(
+                                    "whatsapp_link",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            args.insert("key".into(), json!(req));
+                        }
+                    }
+                    super::connection::WhatsappAction::Rescope { request } => {
+                        args.insert("operation".into(), json!("whatsapp_rescope"));
+                        args.insert("body".into(), json!({ "provider": "official" }));
+                        if let Some(req) = request.as_deref() {
+                            if !valid_platform_handle(req) {
+                                return Err(Error::invalid(
+                                    "whatsapp_rescope",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            args.insert("key".into(), json!(req));
+                        }
+                    }
+                },
                 _ => return Err(unavailable(command_path)),
             }
             "platform_call"
@@ -1655,6 +1736,12 @@ fn valid_platform_handle(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn valid_whatsapp_company_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 }
 
 fn platform_request_key(
@@ -2197,7 +2284,9 @@ fn artifact(
                 return Ok(0);
             };
             fn malformed_page() -> Error {
-                Error::rejected("remote answered a malformed or inconsistent artifact page; nothing was written")
+                Error::rejected(
+                    "remote answered a malformed or inconsistent artifact page; nothing was written",
+                )
             }
             let mut bytes = Vec::new();
             let mut pinned = version.map(u64::from);
@@ -2338,7 +2427,7 @@ fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
         WikiAction::Cat { path, .. } if body["kind"] == "dir" => {
             return Err(Error::rejected(format!(
                 "wiki cat '{path}' refused: a directory — use `wiki ls`"
-            )))
+            )));
         }
         WikiAction::Cat {
             offset, bytes, rev, ..
@@ -3124,6 +3213,35 @@ where
                 );
                 return Ok(0);
             }
+            if matches!(
+                &command,
+                Commands::Connection {
+                    action: ConnectionAction::Whatsapp { .. }
+                }
+            ) {
+                if cadence_agent::remote_cli::contains_qr_key(&body) {
+                    return Err(Error::rejected(
+                        "refused unsafe WhatsApp response containing pairing QR material",
+                    ));
+                }
+                if matches!(
+                    &command,
+                    Commands::Connection {
+                        action: ConnectionAction::Whatsapp {
+                            action: super::connection::WhatsappAction::Connect { .. }
+                                | super::connection::WhatsappAction::Rescope { .. }
+                        }
+                    }
+                ) && (body.pointer("/data/pairing_url").is_some()
+                    || body.pointer("/data/signup_url").is_some()
+                    || body.pointer("/data/url").is_some())
+                {
+                    eprint_line(
+                        "Open this authenticated URL in your own browser; no browser was opened \
+                         here and no pairing QR secret is printed.",
+                    );
+                }
+            }
             if matches!(&command, Commands::Platform { .. }) {
                 for summary in super::platform::platform_human_summary(&body) {
                     eprint_line(&summary);
@@ -3199,6 +3317,20 @@ fn connection_owner_verb(command: &Commands) -> Option<&'static str> {
         Commands::Connection {
             action: ConnectionAction::Enroll { .. },
         } => Some("connection enroll"),
+        Commands::Connection {
+            action: ConnectionAction::Whatsapp { action },
+        } => Some(match action {
+            super::connection::WhatsappAction::Status { .. } => "connection whatsapp status",
+            super::connection::WhatsappAction::Connect { .. } => "connection whatsapp connect",
+            super::connection::WhatsappAction::Start { .. } => "connection whatsapp start",
+            super::connection::WhatsappAction::Stop { .. } => "connection whatsapp stop",
+            super::connection::WhatsappAction::Disconnect { .. } => {
+                "connection whatsapp disconnect"
+            }
+            super::connection::WhatsappAction::Inspect { .. } => "connection whatsapp inspect",
+            super::connection::WhatsappAction::Link { .. } => "connection whatsapp link",
+            super::connection::WhatsappAction::Rescope { .. } => "connection whatsapp rescope",
+        }),
         _ => None,
     }
 }
@@ -6018,6 +6150,134 @@ mod read_contract_tests {
             assert_eq!(verb, "platform_call");
             assert_eq!(args, expected);
         }
+    }
+
+    #[test]
+    fn hosted_whatsapp_connections_map_strictly_and_require_human_owner() {
+        use super::super::connection::{WhatsappAction, WhatsappProviderArg};
+        for (action, expected, owner_verb) in [
+            (
+                WhatsappAction::Status {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_status", "body": {"provider": "linked"}}),
+                "connection whatsapp status",
+            ),
+            (
+                WhatsappAction::Status {
+                    provider: WhatsappProviderArg::Official,
+                },
+                json!({"operation": "whatsapp_status", "body": {"provider": "official"}}),
+                "connection whatsapp status",
+            ),
+            (
+                WhatsappAction::Connect {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_connect", "body": {"provider": "linked"}}),
+                "connection whatsapp connect",
+            ),
+            (
+                WhatsappAction::Start {
+                    provider: WhatsappProviderArg::Official,
+                },
+                json!({"operation": "whatsapp_start", "body": {"provider": "official"}}),
+                "connection whatsapp start",
+            ),
+            (
+                WhatsappAction::Stop {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_stop", "body": {"provider": "linked"}}),
+                "connection whatsapp stop",
+            ),
+            (
+                WhatsappAction::Disconnect {
+                    provider: WhatsappProviderArg::Official,
+                    confirm: true,
+                },
+                json!({"operation": "whatsapp_disconnect", "body": {"provider": "official", "confirm": true}}),
+                "connection whatsapp disconnect",
+            ),
+            (
+                WhatsappAction::Inspect {
+                    company_id: "comp_42".into(),
+                },
+                json!({"operation": "whatsapp_inspect", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
+                "connection whatsapp inspect",
+            ),
+            (
+                WhatsappAction::Link {
+                    company_id: "comp_42".into(),
+                    request: None,
+                },
+                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
+                "connection whatsapp link",
+            ),
+            (
+                WhatsappAction::Link {
+                    company_id: "comp_42".into(),
+                    request: Some("req_link_1".into()),
+                },
+                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}, "key": "req_link_1"}),
+                "connection whatsapp link",
+            ),
+            (
+                WhatsappAction::Rescope { request: None },
+                json!({"operation": "whatsapp_rescope", "body": {"provider": "official"}}),
+                "connection whatsapp rescope",
+            ),
+            (
+                WhatsappAction::Rescope {
+                    request: Some("req_rescope_1".into()),
+                },
+                json!({"operation": "whatsapp_rescope", "body": {"provider": "official"}, "key": "req_rescope_1"}),
+                "connection whatsapp rescope",
+            ),
+        ] {
+            let cmd = Commands::Connection {
+                action: ConnectionAction::Whatsapp { action },
+            };
+            assert_eq!(connection_owner_verb(&cmd), Some(owner_verb));
+            let (verb, args) = outcome(&cmd).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args, expected);
+        }
+
+        let err = outcome(&Commands::Connection {
+            action: ConnectionAction::Whatsapp {
+                action: WhatsappAction::Disconnect {
+                    provider: WhatsappProviderArg::Linked,
+                    confirm: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--confirm"),
+            "disconnect without --confirm must refuse: {err}"
+        );
+
+        let bad_co = outcome(&Commands::Connection {
+            action: ConnectionAction::Whatsapp {
+                action: WhatsappAction::Inspect {
+                    company_id: "bad\nid".into(),
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(bad_co.contains("--company-id"), "{bad_co}");
+
+        assert!(cadence_agent::remote_cli::contains_qr_key(
+            &json!({"ok": true, "data": {"qr": "secret"}})
+        ));
+        assert!(cadence_agent::remote_cli::contains_qr_key(
+            &json!({"nested": [{"QR_SVG": "<svg/>"}]})
+        ));
+        assert!(!cadence_agent::remote_cli::contains_qr_key(&json!({
+            "ok": true,
+            "data": {"provider": "linked", "state": "pairing", "pairing_url": "https://example.test/account#linked"}
+        })));
     }
 
     #[test]

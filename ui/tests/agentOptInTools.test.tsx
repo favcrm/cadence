@@ -52,6 +52,11 @@ async function main() {
   assert(!toolGroupOn(profile(), "cadence_writes"), "absent enabled_tools shows Cadence writes off");
   assert(!toolGroupOn(profile({ disabled_tools: [] }), "cadence_writes"), "not being in disabled_tools does not turn an opt-in group on");
   assert(toolGroupOn(profile({ enabled_tools: ["cadence_writes"] }), "cadence_writes"), "enabled_tools turns it on");
+  for (const wabaGroup of ["whatsapp_read", "whatsapp_stage", "whatsapp_manage"]) {
+    assert(!toolGroupOn(profile(), wabaGroup), `absent enabled_tools shows ${wabaGroup} off`);
+    assert(!toolGroupOn(profile({ disabled_tools: ["board"] }), wabaGroup), `not being in disabled_tools never turns ${wabaGroup} on`);
+    assert(toolGroupOn(profile({ enabled_tools: [wabaGroup] }), wabaGroup), `enabled_tools turns ${wabaGroup} on`);
+  }
   assert(toolGroupOn(profile(), "board"), "an ordinary group is on unless disabled");
   assert(!toolGroupOn(profile({ disabled_tools: ["board"] }), "board"), "an ordinary group listed in disabled_tools is off");
   // The update body sends enabled_tools only when asked.
@@ -85,28 +90,55 @@ async function main() {
       root.render(React.createElement(AgentTabBody, { tab: "tools", c }));
     });
   };
-  const sw = () => host.querySelector<HTMLButtonElement>('button[role="switch"][aria-label="On for this agent: Cadence writes"]');
+  const sw = (label = "Cadence writes") =>
+    host.querySelector<HTMLButtonElement>(`button[role="switch"][aria-label="On for this agent: ${label}"]`);
 
   await mount(profile(), true);
   assert(host.textContent?.includes("Cadence writes"), "the toggle is listed");
+  for (const label of ["WhatsApp read", "WhatsApp draft & stage", "WhatsApp lifecycle"]) {
+    assert(host.textContent?.includes(label), `${label} toggle is listed`);
+    assert(sw(label)?.getAttribute("aria-checked") === "false", `${label} defaults to off`);
+  }
   assert(sw()?.getAttribute("aria-checked") === "false", "a profile with no enabled_tools shows it off");
   await React.act(async () => {
     sw()!.click();
   });
   assert(JSON.stringify(sent) === JSON.stringify([["cadence_writes"]]), "an owner turning it on saves enabled_tools: [cadence_writes]");
 
+  await React.act(async () => {
+    sw("WhatsApp read")!.click();
+  });
+  assert(JSON.stringify(sent[sent.length - 1]) === JSON.stringify(["whatsapp_read"]), "an owner can toggle WhatsApp read");
+
+  await mount(profile({ enabled_tools: ["cadence_writes", "whatsapp_read", "whatsapp_stage"] }), true);
+  assert(sw("WhatsApp read")?.getAttribute("aria-checked") === "true", "WhatsApp read reflects enabled_tools");
+  assert(sw("WhatsApp draft & stage")?.getAttribute("aria-checked") === "true", "WhatsApp draft & stage reflects enabled_tools");
+  assert(sw("WhatsApp lifecycle")?.getAttribute("aria-checked") === "false", "WhatsApp lifecycle stays off");
+  await React.act(async () => {
+    sw("WhatsApp lifecycle")!.click();
+  });
+  assert(
+    JSON.stringify(sent[sent.length - 1]) === JSON.stringify(["cadence_writes", "whatsapp_read", "whatsapp_stage", "whatsapp_manage"]),
+    "toggling WhatsApp lifecycle preserves existing enabled_tools",
+  );
+
   await mount(profile({ enabled_tools: ["cadence_writes"] }), true);
   assert(sw()?.getAttribute("aria-checked") === "true", "the toggle reflects enabled_tools");
   await React.act(async () => {
     sw()!.click();
   });
-  assert(JSON.stringify(sent[1]) === "[]", "an owner turning it off saves an empty enabled_tools");
+  assert(JSON.stringify(sent[sent.length - 1]) === "[]", "an owner turning it off saves an empty enabled_tools");
 
-  await mount(profile({ enabled_tools: ["cadence_writes"] }), false);
-  assert(sw() === null, "a non-owner gets no switch");
-  const state = host.querySelector('[data-work-panel="opt-in-tools"] .sk-switch');
-  assert(state?.getAttribute("data-state") === "on" && state.textContent === "On", "a non-owner still sees the state, read-only");
-  assert(sent.length === 2, "a non-owner sends nothing");
+  await mount(profile({ enabled_tools: ["cadence_writes", "whatsapp_manage"] }), false);
+  assert(sw() === null && sw("WhatsApp read") === null && sw("WhatsApp lifecycle") === null, "a non-owner gets no switch");
+  const states = Array.from(host.querySelectorAll('[data-work-panel="opt-in-tools"] .sk-switch')).map((el) =>
+    `${el.getAttribute("data-state")}:${el.textContent}`,
+  );
+  assert(
+    JSON.stringify(states) === JSON.stringify(["on:On", "off:Off", "off:Off", "on:On"]),
+    `a non-owner still sees all opt-in states read-only: ${JSON.stringify(states)}`,
+  );
+  assert(sent.length === 4, "a non-owner sends nothing");
 
   // The real hook: body is the stored fields plus enabled_tools at the page's revision; a 409 is a conflict.
   const writes: object[] = [];

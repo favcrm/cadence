@@ -13,6 +13,69 @@ pub(super) fn validate_connection_id(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum WhatsappProviderArg {
+    Linked,
+    Official,
+}
+
+impl WhatsappProviderArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Official => "official",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WhatsappAction {
+    /// Show live WhatsApp channel status (never prints pairing QR secrets).
+    Status {
+        #[arg(long, value_enum)]
+        provider: WhatsappProviderArg,
+    },
+    /// Request an authenticated browser pairing / signup URL (never prints QR secrets).
+    Connect {
+        #[arg(long, value_enum)]
+        provider: WhatsappProviderArg,
+    },
+    /// Start or resume the workspace WhatsApp connection.
+    Start {
+        #[arg(long, value_enum)]
+        provider: WhatsappProviderArg,
+    },
+    /// Pause or stop the workspace WhatsApp connection without wiping credentials.
+    Stop {
+        #[arg(long, value_enum)]
+        provider: WhatsappProviderArg,
+    },
+    /// Reset Linked Device credentials or unlink Official FavCRM grant (requires --confirm).
+    Disconnect {
+        #[arg(long, value_enum)]
+        provider: WhatsappProviderArg,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Inspect an Official API FavCRM company binding candidate.
+    Inspect {
+        #[arg(long = "company-id")]
+        company_id: String,
+    },
+    /// Link an Official API FavCRM company binding for this hosted workspace.
+    Link {
+        #[arg(long = "company-id")]
+        company_id: String,
+        #[arg(long)]
+        request: Option<String>,
+    },
+    /// Request an Official API FavCRM OAuth rescope URL for this hosted workspace.
+    Rescope {
+        #[arg(long)]
+        request: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ConnectionAction {
     /// List reviewed provider descriptors and supported connection shapes.
@@ -155,6 +218,11 @@ pub(crate) enum ConnectionAction {
         secret_stdin: bool,
         #[arg(long)]
         accept_same_uid_risk: bool,
+    },
+    /// Manage hosted WhatsApp Business channels (Linked Device or Official API).
+    Whatsapp {
+        #[command(subcommand)]
+        action: WhatsappAction,
     },
 }
 #[derive(Subcommand)]
@@ -331,6 +399,12 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
         ConnectionAction::Sites { .. } | ConnectionAction::SelectSite { .. } => {
             return Err(Error::usage(
                 "connection sites/select-site are hosted-workspace operations; \
+                 pass --org <logged-in-workspace>",
+            ));
+        }
+        ConnectionAction::Whatsapp { .. } => {
+            return Err(Error::usage(
+                "connection whatsapp is a hosted-workspace operation; \
                  pass --org <logged-in-workspace>",
             ));
         }
@@ -753,6 +827,127 @@ mod tests {
             ],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn whatsapp_connection_subcommands_parse_cleanly() {
+        for args in [
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "status",
+                "--provider",
+                "linked",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "status",
+                "--provider",
+                "official",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "connect",
+                "--provider",
+                "linked",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "connect",
+                "--provider",
+                "official",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "start",
+                "--provider",
+                "linked",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "stop",
+                "--provider",
+                "official",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "disconnect",
+                "--provider",
+                "linked",
+                "--confirm",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "disconnect",
+                "--provider",
+                "official",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "inspect",
+                "--company-id",
+                "co_123",
+            ],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "link",
+                "--company-id",
+                "co_123",
+                "--request",
+                "req_1",
+            ],
+            vec!["cadence", "connection", "whatsapp", "rescope"],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "rescope",
+                "--request",
+                "req_2",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args.clone()).is_ok(),
+                "expected valid whatsapp parse: {args:?}"
+            );
+        }
+        for bad in [
+            vec!["cadence", "connection", "whatsapp", "status"],
+            vec![
+                "cadence",
+                "connection",
+                "whatsapp",
+                "status",
+                "--provider",
+                "other",
+            ],
+            vec!["cadence", "connection", "whatsapp", "inspect"],
+            vec!["cadence", "connection", "whatsapp", "link"],
+        ] {
+            assert!(
+                Cli::try_parse_from(bad.clone()).is_err(),
+                "expected invalid whatsapp args to fail: {bad:?}"
+            );
         }
     }
 }

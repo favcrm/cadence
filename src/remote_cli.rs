@@ -418,6 +418,7 @@ const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved �
 const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_WHATSAPP_STATUS: &str = "check live WhatsApp connection state with `cadence --org <org> connection whatsapp status --provider <linked|official>` before repeating";
 const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
 const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
@@ -588,16 +589,32 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
         Surface::Cli if verb == "platform_call" => {
             match arguments.get("operation").and_then(Value::as_str) {
                 Some(
-                    "tools" | "status" | "artifact" | "connection_providers" | "connection_list",
+                    "tools"
+                    | "status"
+                    | "artifact"
+                    | "connection_providers"
+                    | "connection_list"
+                    | "whatsapp_status"
+                    | "whatsapp_inspect",
                 ) => Effect::Read,
                 // CAD-2226: starting an owner enrollment mints a one-time provider
                 // link, so its lost or unusable answer is a possible mutation; the
                 // read above the link (`connection ls`) is what reconciles it.
                 Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some(
+                    "whatsapp_connect"
+                    | "whatsapp_start"
+                    | "whatsapp_stop"
+                    | "whatsapp_disconnect"
+                    | "whatsapp_link"
+                    | "whatsapp_rescope",
+                ) => mutation(RECONCILE_WHATSAPP_STATUS),
                 Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
                 Some("call") => match arguments.get("tool").and_then(Value::as_str) {
                     Some(
                         "app_describe"
+                        | "app_skill"
+                        | "board_pending_actions"
                         | "private_app_review_status"
                         | "private_app_review_reconcile",
                     ) => Effect::Read,
@@ -875,6 +892,21 @@ pub fn connected_effect_stage_answer(answer: &Value) -> bool {
 }
 pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
+}
+
+/// SEC-001: raw WhatsApp pairing QR payloads must never appear in CLI or MCP output.
+pub fn contains_qr_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            let lower = key.to_ascii_lowercase();
+            matches!(
+                lower.as_str(),
+                "qr" | "qr_code" | "qr_svg" | "qr_data" | "pairing_qr"
+            ) || contains_qr_key(child)
+        }),
+        Value::Array(items) => items.iter().any(contains_qr_key),
+        _ => false,
+    }
 }
 
 /// The one-time provider authorization link, only when the answer carries one
@@ -3008,7 +3040,7 @@ fn save_credential(dir: &Path, slug: &str, cred: &Credential) -> Result<()> {
         _ => {
             return Err(reject(
                 "remote credential destination must be a private owned regular file",
-            ))
+            ));
         }
     }
     let mut random = [0u8; 16];
@@ -3659,7 +3691,9 @@ fn authorize(
                 _ => Err(refusal_error(status, body.as_ref())),
             }
         }
-        403 if refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED) => {
+        403 if refusal_fields(body.as_ref()).0
+            == Some(agent_credential::HUMAN_SESSION_REQUIRED) =>
+        {
             Err(Error::invalid(
                 agent_credential::HUMAN_SESSION_REQUIRED,
                 refusal_error(status, body.as_ref()).to_string(),
@@ -4257,7 +4291,9 @@ fn upload_template_in(
             None => renewed_credential(dir, target, deadline)?,
         };
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
-            return Err(reject("template upload needs the cli.write capability, which this remote login lacks — nothing was sent"));
+            return Err(reject(
+                "template upload needs the cli.write capability, which this remote login lacks — nothing was sent",
+            ));
         }
         if Instant::now() >= deadline {
             return Err(waking());
@@ -4312,10 +4348,10 @@ fn upload_template_in(
         }
         match classify(status, retry_after, body) {
             Verdict::Done(Ok(ans)) => {
-                return template_upload_receipt(ans, &request_id, upload.bytes)
+                return template_upload_receipt(ans, &request_id, upload.bytes);
             }
             Verdict::Done(Err(_)) if (200..300).contains(&status) => {
-                return Err(template_upload_outcome_unknown())
+                return Err(template_upload_outcome_unknown());
             }
             Verdict::Done(Err(e)) => return Err(e),
             Verdict::Conflict(_) => return Err(reject("remote template upload conflicted")),
@@ -4335,7 +4371,9 @@ fn upload_template_in(
 }
 
 fn template_upload_outcome_unknown() -> Error {
-    Error::unknown("the template source upload may or may not have been recorded — retry the command only after checking `template list` or `template show`")
+    Error::unknown(
+        "the template source upload may or may not have been recorded — retry the command only after checking `template list` or `template show`",
+    )
 }
 
 fn template_upload_receipt(answer: Value, req_id: &str, bytes: &[u8]) -> Result<Value> {
@@ -4353,7 +4391,9 @@ fn template_upload_receipt(answer: Value, req_id: &str, bytes: &[u8]) -> Result<
 }
 
 pub fn template_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String {
-    format!("this workspace's server does not serve `{verb}` yet (HTTP {status}; requires AOS-481): update the tenant server first, then use this Cadence client. Nothing was {nothing}")
+    format!(
+        "this workspace's server does not serve `{verb}` yet (HTTP {status}; requires AOS-481): update the tenant server first, then use this Cadence client. Nothing was {nothing}"
+    )
 }
 
 fn is_template_or_document_verb(verb: &str) -> bool {
@@ -5336,7 +5376,7 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
         // proof of absence or of server-side revocation.
         Err(_) => {
             return json!({"state": "invalid_local_credential", "live_verified": false,
-                "note": "the saved credential cannot be read; run `cadence login` again"})
+                "note": "the saved credential cannot be read; run `cadence login` again"});
         }
     };
     let at = now().unwrap_or(0);
@@ -6737,7 +6777,7 @@ fn call_verb_until_retry(
                     ),
                     None if keyed_create => return Err(identity_changed()),
                     None if require_agent => {
-                        return Err(agent_credential::platform_agent_required())
+                        return Err(agent_credential::platform_agent_required());
                     }
                     None => (None, false),
                 }
@@ -6970,6 +7010,14 @@ fn call_verb_until_retry(
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
+                Some(op)
+                    if op.starts_with("whatsapp_")
+                        && body.as_ref().is_some_and(contains_qr_key) =>
+                {
+                    return Err(reject(
+                        "refused unsafe WhatsApp response containing pairing QR material",
+                    ));
+                }
                 _ => {}
             }
         }
@@ -7140,7 +7188,17 @@ fn call_verb_until_retry(
         let platform_outcome_unknown = effect.is_mutation()
             && matches!(
                 platform_operation,
-                Some("call" | "connected_read" | "connection_start")
+                Some(
+                    "call"
+                        | "connected_read"
+                        | "connection_start"
+                        | "whatsapp_connect"
+                        | "whatsapp_start"
+                        | "whatsapp_stop"
+                        | "whatsapp_disconnect"
+                        | "whatsapp_link"
+                        | "whatsapp_rescope"
+                )
             )
             && !board_gate_refused(body.as_ref())
             && !tracker_unavailable_before_verb(status, body.as_ref())
@@ -7366,10 +7424,39 @@ fn call_verb_until_retry(
                     .map_or(String::new(), |c| format!(", {c}"))
             )));
         }
+        if matches!(
+            platform_operation,
+            Some(
+                "whatsapp_status"
+                    | "whatsapp_inspect"
+                    | "whatsapp_connect"
+                    | "whatsapp_start"
+                    | "whatsapp_stop"
+                    | "whatsapp_disconnect"
+                    | "whatsapp_link"
+                    | "whatsapp_rescope"
+            )
+        ) && (status == 501
+            || (status == 400
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("invalid_request" | "unknown_verb")
+                )))
+        {
+            let operation = platform_operation.unwrap_or_default();
+            return Err(reject(format!(
+                "the hosted tenant server does not serve `platform call` operation \
+                 `{operation}` (HTTP {status}{}) — update the hosted server first, then this \
+                 Cadence client",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
         if platform_operation == Some("call")
             && matches!(
                 arguments.get("tool").and_then(Value::as_str),
-                Some("app_call" | "app_describe")
+                Some("app_call" | "app_describe" | "app_skill" | "board_pending_actions")
             )
         {
             if let Some(error) = app_action_refusal(status, refusal_code.as_deref()) {
@@ -7538,7 +7625,7 @@ fn account_image_identity_from(
         None => {
             return Err(reject(
                 "saved account login expired — run `cadence login` again",
-            ))
+            ));
         }
     };
     Ok(AccountImageIdentity {

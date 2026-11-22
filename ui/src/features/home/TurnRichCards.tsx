@@ -228,6 +228,11 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
           {outside === 1 ? t("1 recipient is outside your company domain") : `${outside} ${t("recipients are outside your company domain")}`}
         </p>
       )}
+      {write.whatsapp?.destructive && write.whatsapp.warning && (
+        <p className="turncard-flag" role="note" data-whatsapp-warning={write.whatsapp.operation}>
+          {t(write.whatsapp.warning)}
+        </p>
+      )}
       {more > 0 && <p className="text-micro text-ink-500">{t("More on the review card")} (+{more})</p>}
         </>
       )}
