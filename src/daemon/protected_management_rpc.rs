@@ -194,7 +194,7 @@ fn action(shared: &Arc<Shared>, params: &Value) -> Result<Value> {
     result
 }
 
-fn execute(
+pub(super) fn execute(
     shared: &Arc<Shared>,
     action: &str,
     params: &Value,
@@ -336,13 +336,15 @@ fn execute(
                     "the policy digest does not match the approved document",
                 ));
             }
-            if policy.allowed_operations.contains(
+            let connection = shared.store.protected_connection_row(&connection_id)?;
+            let is_agenticos_connection = connection
+                .as_ref()
+                .is_some_and(|c| c.platform == crate::platform::agenticos_provider::PLATFORM);
+            let touches_agenticos_read = policy.allowed_operations.contains(
                 &cadence_core::connection_dispatch::dto::OperationKindV1::AgenticosSearchConsoleReport,
-            ) || policy.agenticos_read.is_some()
-            {
-                let connection = shared
-                    .store
-                    .protected_connection_row(&connection_id)?
+            ) || policy.agenticos_read.is_some();
+            if is_agenticos_connection || touches_agenticos_read {
+                let connection = connection
                     .ok_or_else(|| Error::invalid("not_found", "the selector is unavailable"))?;
                 if connection.platform != crate::platform::agenticos_provider::PLATFORM
                     || connection.scopes
@@ -364,11 +366,9 @@ fn execute(
                 }
                 cadence_core::connection_dispatch::dto::validate_agenticos_read_policy_v1(&policy)
                     .map_err(|e| Error::invalid(e.code.as_str(), e.message))?;
-                if !policy
-                    .allowed_destinations
-                    .iter()
-                    .any(|dest| dest.as_str() == "https://api-v2.agenticos.hk/v1/runtime/tools/read")
-                {
+                if !policy.allowed_destinations.iter().any(|dest| {
+                    dest.as_str() == crate::platform::agenticos_provider::READ_ENDPOINT_URL
+                }) {
                     return Err(Error::invalid(
                         "destination_refused",
                         "the destination is not approved",

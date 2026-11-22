@@ -1750,7 +1750,7 @@ fn execute_agenticos_read(
     material: &ProviderMaterial,
 ) -> ValidatedOutcomeV1 {
     if material.destination.https_endpoint().as_deref()
-        != Some("https://api-v2.agenticos.hk/v1/runtime/tools/read")
+        != Some(crate::platform::agenticos_provider::READ_ENDPOINT_URL)
     {
         return refused_outcome(ErrorCodeV1::DestinationRefused);
     }
@@ -2751,7 +2751,11 @@ fn agenticos_read_destination() -> Result<ResolvedDestinationV1> {
         kind: DestinationKindV1::Https,
         host: ident("api-v2.agenticos.hk")?,
         port: None,
-        path: Some("v1/runtime/tools/read".to_string()),
+        path: Some(
+            cadence_core::connection_dispatch::dto::AGENTICOS_PROVIDER_READ_PATH
+                .trim_start_matches('/')
+                .to_string(),
+        ),
     };
     validate_resolved_destination_v1(&destination).map_err(|_| destination_refused())?;
     Ok(destination)

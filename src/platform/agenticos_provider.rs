@@ -26,6 +26,7 @@ pub const SCOPE_DEDICATED_READ: &str = "provider.read.dedicated";
 pub const SLUG_SEARCH_CONSOLE_REPORT: &str = "search_console_report";
 pub const MANIFEST_VERSION: &str = "cadence-provider-tools@1";
 const READ_PATH: &str = "/v1/runtime/tools/read";
+pub const READ_ENDPOINT_URL: &str = "https://api-v2.agenticos.hk/v1/runtime/tools/read";
 pub const LOOKUP_PATH: &str = "/v1/runtime/tools/requests/lookup";
 const BODY_CAP: u64 = 2 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 90;

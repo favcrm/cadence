@@ -32,7 +32,8 @@ use crate::daemon::public_membership::MembershipMode;
 use crate::daemon::{ServeOptions, Shared};
 use crate::error::{Error, Result};
 use crate::platform::agenticos_provider::{
-    MANIFEST_VERSION, PRODUCTION_ORIGIN, SCOPE_DEDICATED_READ, SLUG_SEARCH_CONSOLE_REPORT,
+    MANIFEST_VERSION, PRODUCTION_ORIGIN, READ_ENDPOINT_URL, SCOPE_DEDICATED_READ,
+    SLUG_SEARCH_CONSOLE_REPORT,
 };
 use crate::protected_runtime::ops::{OpsMethod, RuntimeCaller};
 use crate::store::connection_dispatch::{
@@ -48,7 +49,6 @@ const WORKSPACE_SLUG: &str = "emw";
 const DEPLOYMENT_ID: &str = "dep-emw-01";
 const SITE_URL: &str = "sc-domain:example.com";
 const UPSTREAM_CONN_ID: &str = "con_emw_gsc_1";
-const DEST_ENDPOINT: &str = "https://api-v2.agenticos.hk/v1/runtime/tools/read";
 
 fn sha(c: char) -> Digest {
     Digest::try_from(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
@@ -529,7 +529,7 @@ impl TestRig {
             active: true,
             allowed_operations: vec![OperationKindV1::AgenticosSearchConsoleReport],
             allowed_human_operations: vec![],
-            allowed_destinations: vec![id(DEST_ENDPOINT)],
+            allowed_destinations: vec![id(READ_ENDPOINT_URL)],
             allowed_models: vec![],
             provider_profile: id("agenticos-provider"),
             data_scopes: Vec::<DataScopeV1>::new(),
@@ -743,6 +743,7 @@ fn cad2508_happy_path_dedicated_search_console_read_and_no_secret_leak() {
 
     assert_eq!(res["state"], "done");
     assert_eq!(res["receipt"]["state"], "done");
+    assert!(res["receipt"]["usage"].is_null());
     assert_eq!(res["receipt"]["cost"]["reserved_micros"], "0");
     assert_eq!(res["receipt"]["cost"]["actual_micros"], "0");
     assert_eq!(res["receipt"]["result"]["kind"], "agenticos.read@1");
@@ -1155,4 +1156,145 @@ fn cad2508_upstream_bearer_leak_is_withheld_as_unknown() {
     assert!(res["receipt"]["result"].is_null());
     assert_no_secret_leak(&res.to_string());
     assert_no_secret_leak(&rig.dispatch_dump());
+}
+
+#[test]
+fn cad2508_management_policy_rpc_enforces_agenticos_provider_gate_even_when_read_omitted() {
+    let rig = TestRig::new(dedicated_mode(WORKSPACE_SLUG, DEPLOYMENT_ID));
+    let authority = rig.shared.store.protected_authority().unwrap();
+    let eligibility = rig.owner.management_evidence().unwrap();
+
+    let policy_doc_digest = cadence_core::connection_dispatch::material_digest_for_domain(
+        "cadence-protected-policy-doc-v1",
+        &json!({"connection_id": rig.connection_id, "test": "policy-gate"}),
+    );
+
+    // 1. Omitting agenticos.search_console_report@1 and agenticos_read on an agenticos-provider
+    // connection must STILL enter the gate and fail closed before commit.
+    let omitted_read_policy = OperationPolicyV1 {
+        policy_revision: Revision::new(2).unwrap(),
+        active: true,
+        allowed_operations: vec![OperationKindV1::SmtpSend],
+        allowed_human_operations: vec![],
+        allowed_destinations: vec![id(READ_ENDPOINT_URL)],
+        allowed_models: vec![],
+        provider_profile: id("agenticos-provider"),
+        data_scopes: vec![],
+        approved_document_digest: Digest::try_from(policy_doc_digest.clone()).unwrap(),
+        agenticos_read: None,
+    };
+    let err = crate::daemon::protected_management_rpc::execute(
+        &rig.shared,
+        "policy",
+        &json!({
+            "connection_id": rig.connection_id,
+            "credential_revision": 1,
+            "policy": omitted_read_policy,
+            "policy_digest": policy_doc_digest,
+        }),
+        &authority,
+        &eligibility,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("invalid_request"), "{err}");
+
+    // 2. Missing READ_ENDPOINT_URL in allowed_destinations must fail with destination_refused.
+    let bad_dest_policy = OperationPolicyV1 {
+        policy_revision: Revision::new(2).unwrap(),
+        active: true,
+        allowed_operations: vec![OperationKindV1::AgenticosSearchConsoleReport],
+        allowed_human_operations: vec![],
+        allowed_destinations: vec![id("https://evil.example/v1/runtime/tools/read")],
+        allowed_models: vec![],
+        provider_profile: id("agenticos-provider"),
+        data_scopes: vec![],
+        approved_document_digest: Digest::try_from(policy_doc_digest.clone()).unwrap(),
+        agenticos_read: Some(AgenticosReadPolicyV1 {
+            adapter_manifest_pin: id(MANIFEST_VERSION),
+            slug: id(SLUG_SEARCH_CONSOLE_REPORT),
+            upstream_connection_id: id(UPSTREAM_CONN_ID),
+            site_url: SITE_URL.to_string(),
+            workspace: Some(id(WORKSPACE_SLUG)),
+            deployment: Some(id(DEPLOYMENT_ID)),
+        }),
+    };
+    let err = crate::daemon::protected_management_rpc::execute(
+        &rig.shared,
+        "policy",
+        &json!({
+            "connection_id": rig.connection_id,
+            "credential_revision": 1,
+            "policy": bad_dest_policy,
+            "policy_digest": policy_doc_digest,
+        }),
+        &authority,
+        &eligibility,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("destination_refused"), "{err}");
+
+    // 3. Valid policy succeeds (`policy_revision: 2`).
+    let mut valid_policy = OperationPolicyV1 {
+        policy_revision: Revision::new(2).unwrap(),
+        active: true,
+        allowed_operations: vec![OperationKindV1::AgenticosSearchConsoleReport],
+        allowed_human_operations: vec![],
+        allowed_destinations: vec![id(READ_ENDPOINT_URL)],
+        allowed_models: vec![],
+        provider_profile: id("agenticos-provider"),
+        data_scopes: vec![],
+        approved_document_digest: Digest::try_from(policy_doc_digest.clone()).unwrap(),
+        agenticos_read: Some(AgenticosReadPolicyV1 {
+            adapter_manifest_pin: id(MANIFEST_VERSION),
+            slug: id(SLUG_SEARCH_CONSOLE_REPORT),
+            upstream_connection_id: id(UPSTREAM_CONN_ID),
+            site_url: SITE_URL.to_string(),
+            workspace: Some(id(WORKSPACE_SLUG)),
+            deployment: Some(id(DEPLOYMENT_ID)),
+        }),
+    };
+    let ok = crate::daemon::protected_management_rpc::execute(
+        &rig.shared,
+        "policy",
+        &json!({
+            "connection_id": rig.connection_id,
+            "credential_revision": 1,
+            "policy": valid_policy,
+            "policy_digest": policy_doc_digest,
+        }),
+        &authority,
+        &eligibility,
+    )
+    .expect("valid agenticos-provider policy commits");
+    assert_eq!(ok["action"], "policy");
+    assert_eq!(ok["policy_revision"], "2");
+
+    // 4. Connection with wrong scopes fails even if submitted policy omits the read.
+    rig.shared
+        .store
+        .write_tx(|tx| {
+            tx.execute(
+                "UPDATE platform_credentials SET scopes=?1 WHERE connection_id=?2",
+                rusqlite::params![r#"["provider.read"]"#, rig.connection_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    valid_policy.policy_revision = Revision::new(3).unwrap();
+    valid_policy.allowed_operations = vec![];
+    valid_policy.agenticos_read = None;
+    let err = crate::daemon::protected_management_rpc::execute(
+        &rig.shared,
+        "policy",
+        &json!({
+            "connection_id": rig.connection_id,
+            "credential_revision": 1,
+            "policy": valid_policy,
+            "policy_digest": policy_doc_digest,
+        }),
+        &authority,
+        &eligibility,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("operation_not_granted"), "{err}");
 }

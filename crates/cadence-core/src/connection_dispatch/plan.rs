@@ -779,6 +779,8 @@ pub fn settle_connection_dispatch_v1(
                     price: read.price.clone(),
                     result_json: read.result_json.clone(),
                 }));
+                // Read receipts carry no token usage; settlement.receipt.usage stays None.
+                usage = None;
                 (DispatchStateV1::Done, Some(UsdMicros::zero()))
             }
         },
@@ -1195,6 +1197,185 @@ mod agenticos_read_tests {
         .unwrap();
         assert!(!settlement.fence);
         assert_eq!(settlement.receipt.state, DispatchStateV1::Done);
+        assert!(settlement.receipt.usage.is_none());
         settlement.receipt.validate().unwrap();
+    }
+
+    #[test]
+    fn search_console_receipt_and_outcome_validation_rules() {
+        use crate::connection_dispatch::dto::{
+            UsageV1, MAX_AGENTICOS_READ_BYTES, MAX_RECEIPT_METADATA_BYTES,
+        };
+
+        let endpoint = "https://api-v2.agenticos.hk/v1/runtime/tools/read";
+        let snapshot = sample_snapshot(endpoint, "sc-domain:example.com");
+        let ok_invoke = make_invoke(
+            "sc-domain:example.com",
+            "2026-10-01",
+            "2026-10-07",
+            vec![],
+            Some(10),
+        );
+        let PlanOutcomeV1::Prepared(prepared) =
+            plan_connection_dispatch_v1(&snapshot, AdmissionRequestV1::Agent(ok_invoke), None)
+                .unwrap()
+        else {
+            panic!("expected prepared");
+        };
+        let next_head = crate::connection_dispatch::ledger::extend_ledger_v1(
+            prepared.previous_head(),
+            &crate::connection_dispatch::ledger::LedgerMutationV1 {
+                v: 1,
+                database_epoch: rev(1),
+                kind: crate::connection_dispatch::ledger::LedgerMutationKindV1::Reservation,
+                refs: prepared.binding_refs(),
+            },
+        )
+        .unwrap();
+        let commit = prepared.finalize(&next_head).unwrap();
+
+        let sample_price = AgenticosReadPriceV1 {
+            amount: "0.000003".to_string(),
+            currency: CurrencyV1::Usd,
+            scale: 6,
+        };
+        let sample_usage = UsageV1 {
+            input_tokens: Counter::new(1).unwrap(),
+            output_tokens: Counter::new(1).unwrap(),
+            reasoning_tokens: Counter::zero(),
+            total_tokens: Counter::new(2).unwrap(),
+        };
+
+        // 1. Outcome with token usage is refused for AgenticosRead.
+        let bad_usage_outcome = ValidatedOutcomeV1 {
+            v: 1,
+            kind: OutcomeKindV1::Done,
+            usage: Some(sample_usage.clone()),
+            result: Some(OutcomeResultV1::AgenticosRead(AgenticosReadOutcomeV1 {
+                kind: AgenticosReadResultKindV1::AgenticosRead,
+                slug: ident("search_console_report").unwrap(),
+                repeated: false,
+                price: Some(sample_price.clone()),
+                result_json: r#"{"rows":[]}"#.to_string(),
+            })),
+            refused_code: None,
+        };
+        assert_eq!(
+            settle_connection_dispatch_v1(&commit, bad_usage_outcome)
+                .unwrap_err()
+                .code,
+            ErrorCodeV1::InvalidRequest
+        );
+
+        // 2. Large valid payload (> MAX_RECEIPT_METADATA_BYTES, <= MAX_AGENTICOS_READ_BYTES) settles cleanly.
+        let large_json = format!(
+            r#"{{"pad":"{}"}}"#,
+            "a".repeat(MAX_RECEIPT_METADATA_BYTES + 1024)
+        );
+        assert!(large_json.len() > MAX_RECEIPT_METADATA_BYTES);
+        assert!(large_json.len() <= MAX_AGENTICOS_READ_BYTES);
+        let large_settlement = settle_connection_dispatch_v1(
+            &commit,
+            ValidatedOutcomeV1 {
+                v: 1,
+                kind: OutcomeKindV1::Done,
+                usage: None,
+                result: Some(OutcomeResultV1::AgenticosRead(AgenticosReadOutcomeV1 {
+                    kind: AgenticosReadResultKindV1::AgenticosRead,
+                    slug: ident("search_console_report").unwrap(),
+                    repeated: true,
+                    price: None,
+                    result_json: large_json,
+                })),
+                refused_code: None,
+            },
+        )
+        .unwrap();
+        assert!(large_settlement.receipt.usage.is_none());
+        large_settlement.receipt.validate().unwrap();
+
+        // 3. Receipt with usage set on AgenticosRead is refused directly by receipt validation.
+        let mut forged_usage_receipt = large_settlement.receipt.clone();
+        forged_usage_receipt.usage = Some(sample_usage);
+        assert_eq!(
+            forged_usage_receipt.validate().unwrap_err().code,
+            ErrorCodeV1::InvalidRequest
+        );
+
+        // 4. Oversized result_json (> MAX_AGENTICOS_READ_BYTES) is refused with PayloadTooLarge.
+        let oversized = "a".repeat(MAX_AGENTICOS_READ_BYTES + 1);
+        let err = settle_connection_dispatch_v1(
+            &commit,
+            ValidatedOutcomeV1 {
+                v: 1,
+                kind: OutcomeKindV1::Done,
+                usage: None,
+                result: Some(OutcomeResultV1::AgenticosRead(AgenticosReadOutcomeV1 {
+                    kind: AgenticosReadResultKindV1::AgenticosRead,
+                    slug: ident("search_console_report").unwrap(),
+                    repeated: false,
+                    price: Some(sample_price.clone()),
+                    result_json: oversized.clone(),
+                })),
+                refused_code: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCodeV1::PayloadTooLarge);
+
+        let mut oversized_receipt = large_settlement.receipt.clone();
+        if let Some(ReceiptResultV1::AgenticosRead(ref mut r)) = oversized_receipt.result {
+            r.result_json = oversized;
+        }
+        assert_eq!(
+            oversized_receipt.validate().unwrap_err().code,
+            ErrorCodeV1::PayloadTooLarge
+        );
+
+        // 5. Missing price when repeated=false and invalid price formats refuse with InvalidRequest.
+        for bad_read in [
+            AgenticosReadOutcomeV1 {
+                kind: AgenticosReadResultKindV1::AgenticosRead,
+                slug: ident("search_console_report").unwrap(),
+                repeated: false,
+                price: None,
+                result_json: r#"{"rows":[]}"#.to_string(),
+            },
+            AgenticosReadOutcomeV1 {
+                kind: AgenticosReadResultKindV1::AgenticosRead,
+                slug: ident("search_console_report").unwrap(),
+                repeated: false,
+                price: Some(AgenticosReadPriceV1 {
+                    amount: "0.000003".to_string(),
+                    currency: CurrencyV1::Usd,
+                    scale: 2,
+                }),
+                result_json: r#"{"rows":[]}"#.to_string(),
+            },
+            AgenticosReadOutcomeV1 {
+                kind: AgenticosReadResultKindV1::AgenticosRead,
+                slug: ident("search_console_report").unwrap(),
+                repeated: false,
+                price: Some(AgenticosReadPriceV1 {
+                    amount: "0.1".to_string(),
+                    currency: CurrencyV1::Usd,
+                    scale: 6,
+                }),
+                result_json: r#"{"rows":[]}"#.to_string(),
+            },
+        ] {
+            let err = settle_connection_dispatch_v1(
+                &commit,
+                ValidatedOutcomeV1 {
+                    v: 1,
+                    kind: OutcomeKindV1::Done,
+                    usage: None,
+                    result: Some(OutcomeResultV1::AgenticosRead(bad_read)),
+                    refused_code: None,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCodeV1::InvalidRequest);
+        }
     }
 }
