@@ -461,6 +461,15 @@ selection. Platform operator sessions cannot manage this private setting. Use
 without applying an unsaved choice. If a save cannot be confirmed, check what
 the board read back before trying again.
 
+On a hosted board that supports consultations, an owner can use **Consult
+app agent** in Home to choose an app and review the exact text before sending.
+Only that text is shared; the app agent does not receive either chat's history
+and cannot stage or save changes in this turn. **Review consultation** returns
+to the same message in the current session. If a send is unconfirmed, use
+**Check reply** before retrying the same message. **Review in Master composer**
+copies the source and exact reply for editing; it does not send. Any app
+proposal still uses the normal, separate approval decision.
+
 A verified operator selects an immutable published release, chooses **Review
 installation** or **Review update**, reviews the checked package and access
 changes, then explicitly confirms Apply. Fresh installs may choose an older
