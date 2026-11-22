@@ -454,22 +454,22 @@ async function main() {
       await new Promise((r) => setTimeout(r, 0));
     });
 
-    const tabs = Array.from(host.querySelectorAll('[role="tab"]')).map((b) => b.textContent?.trim());
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]')).map((b) => b.textContent?.trim());
     equal(tabs, ["Overview", "Evidence", "Approvals", "Activity", "Audit"], "WorkItemDetail omits Code tab on non-repo item");
-    assert(host.textContent?.includes("Publish Q3 pricing FAQ"), "Overview renders linked follow-up title");
-    const linkBtn = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.trim() === "DEMOCOMPANY-2");
+    assert(document.body.textContent?.includes("Publish Q3 pricing FAQ"), "Overview renders linked follow-up title");
+    const linkBtn = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "DEMOCOMPANY-2");
     assert(linkBtn, "Overview renders clickable follow-up id");
     await React.act(() => linkBtn.click());
     equal(drawerOpened, ["DEMOCOMPANY-2"], "WorkItemDetail follow-up button opens linked item");
 
-    const approvalsTab = Array.from(host.querySelectorAll('[role="tab"]')).find(
+    const approvalsTab = Array.from(document.querySelectorAll('[role="tab"]')).find(
       (b) => b.textContent?.trim() === "Approvals",
     ) as HTMLButtonElement | undefined;
     assert(approvalsTab, "Approvals tab exists");
     await React.act(() => approvalsTab.click());
-    assert(host.textContent?.includes("Approve Q3 enterprise pricing"), "Approvals tab lists matching staged/decided action");
-    assert(host.textContent?.includes("Out-of-range timestamp staged write"), "Approvals tab renders staged action with out-of-range timestamp safely");
-    assert(host.textContent?.includes("Atlas (agent)"), "Approvals tab shows staged action origin");
+    assert(document.body.textContent?.includes("Approve Q3 enterprise pricing"), "Approvals tab lists matching staged/decided action");
+    assert(document.body.textContent?.includes("Out-of-range timestamp staged write"), "Approvals tab renders staged action with out-of-range timestamp safely");
+    assert(document.body.textContent?.includes("Atlas (agent)"), "Approvals tab shows staged action origin");
 
     await React.act(async () => root.unmount());
     host.remove();
@@ -510,16 +510,16 @@ async function main() {
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    const tabs = Array.from(host.querySelectorAll('[role="tab"]')) as HTMLButtonElement[];
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]')) as HTMLButtonElement[];
     equal(tabs.length, 6, "PR/approval-bearing WorkItemDetail keeps all 6 tabs including Code");
     assert(tabs.some((b) => b.textContent?.trim() === "程式碼"), "zh-TW translates Code tab");
-    assert(host.textContent?.includes("相關與跟進項目"), "zh-TW translates Related & follow-ups");
-    assert(host.textContent?.includes("策略與外部影響"), "zh-TW translates Policy and effect");
+    assert(document.body.textContent?.includes("相關與跟進項目"), "zh-TW translates Related & follow-ups");
+    assert(document.body.textContent?.includes("策略與外部影響"), "zh-TW translates Policy and effect");
     const approvalsTab = tabs.find((b) => b.textContent?.trim() === "批准記錄");
     assert(approvalsTab, "zh-TW translates Approvals tab");
     await React.act(() => approvalsTab.click());
-    assert(host.textContent?.includes("favcrm/cadence #1700"), "ApprovalsPanel renders recorded repo and PR");
-    assert(host.textContent?.includes("e2444a223202 · 生效中"), "ApprovalsPanel renders head SHA and translated in-force state");
+    assert(document.body.textContent?.includes("favcrm/cadence #1700"), "ApprovalsPanel renders recorded repo and PR");
+    assert(document.body.textContent?.includes("e2444a223202 · 生效中"), "ApprovalsPanel renders head SHA and translated in-force state");
 
     win.localStorage.removeItem("cadence-locale");
     await React.act(async () => root.unmount());
@@ -625,7 +625,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, 0));
     });
     assert(
-      !discardedHost.textContent?.includes("recorded in Approvals."),
+      !document.body.textContent?.includes("recorded in Approvals."),
       "discarded/unloaded WorkItemDetail never claims recorded approvals from stagedActions",
     );
     await React.act(async () => discardedRoot.unmount());

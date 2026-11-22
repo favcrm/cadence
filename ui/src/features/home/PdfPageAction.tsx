@@ -197,7 +197,6 @@ function PdfPageDialog({ source, target, close }: {
       modal
       trapFocus
       size="lg"
-      portal
       preventClose={busy}
       label={t("Attach pages as images")}
       title={t("Attach pages as images")}

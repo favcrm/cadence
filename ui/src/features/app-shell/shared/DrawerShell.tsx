@@ -69,7 +69,7 @@ export interface DrawerShellProps {
   preventCloseNote?: ReactNode;
   /** Optional target to focus when the drawer mounts (falls back to heading). */
   initialFocus?: RefObject<HTMLElement | null>;
-  /** Render scrim and drawer into `document.body` to escape ancestor stacking contexts. */
+  /** Render scrim and drawer into `document.body`. Defaults to `true` for `scrim="board"` and `false` for `scrim="outlet"`. */
   portal?: boolean;
   /** Optional extra class name appended to the drawer panel. */
   className?: string;
@@ -228,7 +228,7 @@ export default function DrawerShell(props: DrawerShellProps) {
     preventClose = false,
     preventCloseNote,
     initialFocus,
-    portal = false,
+    portal,
     className,
     scrimClassName,
     closeLabel,
@@ -290,6 +290,7 @@ export default function DrawerShell(props: DrawerShellProps) {
   const scrimLeft = useScrimLeft(props.geometry?.left);
   const editing = edit != null;
   const board = scrim === "board";
+  const usePortal = portal ?? board;
 
   const stackId = useRef<symbol>(Symbol("drawer"));
   const [, setStackTick] = useState(0);
@@ -726,7 +727,7 @@ export default function DrawerShell(props: DrawerShellProps) {
     </>
   );
 
-  if (portal && typeof document !== "undefined" && document.body) {
+  if (usePortal && typeof document !== "undefined" && document.body) {
     return createPortal(tree, document.body);
   }
   return tree;

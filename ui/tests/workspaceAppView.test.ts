@@ -137,20 +137,20 @@ const host = document.createElement("div"); document.body.append(host);
 let root = createRoot(host);
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
 const flush = () => React.act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-const text = () => host.textContent ?? "";
-const button = (label: string) => Array.from(host.querySelectorAll("button")).find(value => value.textContent?.trim() === label);
+const text = () => document.body.textContent ?? "";
+const button = (label: string) => Array.from(document.querySelectorAll("button")).find(value => value.textContent?.trim() === label);
 async function click(element: Element | undefined | null) {
   assert(element, "Click target exists");
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function closeDrawer(ariaLabel: string) {
-  await click(host.querySelector(`button[aria-label="${ariaLabel}"]`));
-  const closing = host.querySelector("[data-drawer][data-closing]");
+  await click(document.querySelector(`button[aria-label="${ariaLabel}"]`));
+  const closing = document.querySelector("[data-drawer][data-closing]");
   if (closing) {
     await React.act(async () => { closing.dispatchEvent(new Event("transitionend", { bubbles: true })); });
     await flush();
   }
-  if (host.querySelector("[data-drawer][data-closing]")) {
+  if (document.querySelector("[data-drawer][data-closing]")) {
     await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
     await flush();
   }
@@ -162,7 +162,7 @@ async function fresh(operator = true, readOnly = false) {
   await React.act(async () => root.unmount()); root = createRoot(host); reads.length = writes.length = 0; await render(operator, readOnly);
 }
 async function fill(selector: string, value: string) {
-  const element = host.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
+  const element = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
   assert(element, "Field exists");
   const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   await React.act(async () => {
@@ -171,7 +171,7 @@ async function fill(selector: string, value: string) {
   });
 }
 async function choose(id: string, label: string) {
-  await click(host.querySelector(`#${id}`));
+  await click(document.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
   assert(option && !option.closest("[inert]"), "Modal combobox options stay reachable and not inside an inert ancestor");
   await click(option);
@@ -234,7 +234,7 @@ async function main() {
   rows = [acceptedRun()]; await click(button("Refresh")); await click(button("Library"));
   assert(host.querySelector(".wa-post-card")?.textContent?.includes("Reviewed text"), "Library card previews the accepted stored caption rather than source facts");
   const card = host.querySelector(".wa-post-card"); await click(card);
-  assert(host.querySelector('[data-drawer="post-run"][role="dialog"][aria-modal="true"]'), "Post inspection opens in the shared modal drawer");
+  assert(document.querySelector('[data-drawer="post-run"][role="dialog"][aria-modal="true"]'), "Post inspection opens in the shared modal drawer");
   assert(text().includes("Reviewer accepted") && text().includes("Reviewed text"), "Library opens real persisted review and immutable artifact");
   assert(text().includes("Synthetic source facts"), "Frozen review shows source facts from the package's actual source input");
   assert(writes.length === 0, "Artifact inspection does not stage or release automatically");

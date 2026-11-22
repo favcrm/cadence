@@ -1,5 +1,6 @@
 /* Settings > Agents. Layout from the approved mock; tokens and controls stay the board's. */
 .agents-settings { display: flex; flex-direction: column; min-width: 0; padding: 24px 32px 40px; }
+.agents-settings.agents-settings-drawer { padding: 0; }
 .agents-settings .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .agents-settings h1 { margin: 0; font-size: var(--text-drawer); font-weight: 600; letter-spacing: -0.02em; color: var(--color-ink-100); }
 .agents-settings h2 { margin: 0; font-size: var(--text-cardtitle); font-weight: 500; color: var(--color-ink-100); }

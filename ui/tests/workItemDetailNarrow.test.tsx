@@ -66,7 +66,7 @@ async function main() {
     ));
     await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     const kind = origin === "home" ? "review" : "work-item";
-    const drawer = host.querySelector(`[data-drawer="${kind}"]`);
+    const drawer = document.querySelector(`[data-drawer="${kind}"]`);
     assert(drawer, `${origin}: the shared detail renders its ${kind} drawer`);
     const tabs = drawer.querySelector(".crm-drawer-tabs") as HTMLElement | null;
     assert(tabs, `${origin}: the tab strip renders`);

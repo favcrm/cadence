@@ -85,31 +85,31 @@ const host = document.createElement("div"); document.body.append(host);
 let root = createRoot(host);
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
 const flush = () => React.act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-const button = (label: string) => Array.from(host.querySelectorAll("button")).find(value => value.textContent?.trim() === label);
+const button = (label: string) => Array.from(document.querySelectorAll("button")).find(value => value.textContent?.trim() === label);
 async function click(element: Element | undefined | null) {
   assert(element, "Click target exists");
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function closeDrawer(ariaLabel: string) {
-  await click(host.querySelector(`button[aria-label="${ariaLabel}"]`));
-  const closing = host.querySelector("[data-drawer][data-closing]");
+  await click(document.querySelector(`button[aria-label="${ariaLabel}"]`));
+  const closing = document.querySelector("[data-drawer][data-closing]");
   if (closing) {
     await React.act(async () => { closing.dispatchEvent(new Event("transitionend", { bubbles: true })); });
     await flush();
   }
-  if (host.querySelector("[data-drawer][data-closing]")) {
+  if (document.querySelector("[data-drawer][data-closing]")) {
     await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
     await flush();
   }
 }
 async function fill(selector: string, value: string) {
-  const element = host.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
+  const element = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
   assert(element, "Field exists");
   const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   await React.act(async () => { Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(element, value); element.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 async function choose(id: string, label: string) {
-  await click(host.querySelector(`#${id}`));
+  await click(document.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
   assert(option && !option.closest("[inert]"), "Options stay reachable and not inside an inert ancestor");
   await click(option);
@@ -118,8 +118,8 @@ async function main() {
   await React.act(async () => root.render(mountApp({ operator: true, readOnly: false }))); await flush();
   assert(!host.textContent?.includes("no supported board workspace") && button("New post") && button("Sources"), "Installed v0.5 opens the board with post and source actions");
   await click(button("New post"));
-  assert(host.querySelector("#wa-content-prompt") && host.querySelector("#wa-image-prompt"), "New post exposes both Cadence-owned per-post prompts");
-  await click(host.querySelector("#wa-workflow"));
+  assert(document.querySelector("#wa-content-prompt") && document.querySelector("#wa-image-prompt"), "New post exposes both Cadence-owned per-post prompts");
+  await click(document.querySelector("#wa-workflow"));
   assert(Array.from(document.querySelectorAll('[role="option"]')).some(value => value.textContent?.includes("Caption and image from pasted facts")), "v0.5 offers the manual-facts image workflow");
   await closeDrawer("Close New post");
   await click(button("Settings"));
@@ -129,10 +129,10 @@ async function main() {
   await click(button("Find public posts"));
   // CAD-1129: the source connection resolves (quote fetched) but the
   // board shows no provider charge — spend stays in the host.
-  assert(host.textContent?.includes("source connection is ready"), "Operator sees the source connection resolve before planning a read");
+  assert(document.body.textContent?.includes("source connection is ready"), "Operator sees the source connection resolve before planning a read");
   // CAD-1129: the source dialog shows no provider charge — WorkspaceApp's
   // approval copy is the CAD-1123 lane's own removal, not this dialog's.
-  const dlg = host.querySelector('[data-drawer="source-import"][role="dialog"]');
+  const dlg = document.querySelector('[data-drawer="source-import"][role="dialog"]');
   assert(dlg && !dlg.textContent?.includes("USD") && !dlg.textContent?.includes("price") && !dlg.textContent?.includes("charge"), "the source dialog shows no price or charge text");
   await fill("#wa-profile-handle", "@juicysuite_crm"); await choose("wa-source-owner", "pm-a"); await choose("wa-source-reader", "writer-a");
   await click(button("Create source plan"));
@@ -194,7 +194,7 @@ async function main() {
   }
   receiptRows = [receipt]; await click(button("Board")); await click(button("Sources"));
   await click(button("Use as source"));
-  const sourceField = host.querySelector("#wa-post-source") as HTMLTextAreaElement;
+  const sourceField = document.querySelector("#wa-post-source") as HTMLTextAreaElement;
   assert(sourceField.readOnly && sourceField.value.includes("Original line two"), "Selected raw caption is inspectable but not editable");
   await fill("#wa-post-title", "New social caption"); await choose("wa-workflow", "Instagram caption"); await choose("wa-owner", "pm-a"); await choose("wa-writer", "writer-a"); await choose("wa-reviewer", "reviewer-a");
   await click(button("Create plan"));

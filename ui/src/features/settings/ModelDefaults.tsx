@@ -1082,7 +1082,9 @@ export default function ModelDefaults() {
           </div>
         }
       >
-        <div className="dbody">{body}</div>
+        <div className="agents-settings agents-settings-drawer">
+          <div className="dbody">{body}</div>
+        </div>
       </DrawerShell>
     );
   }

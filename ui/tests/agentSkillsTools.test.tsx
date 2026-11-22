@@ -217,7 +217,7 @@ async function main() {
   await React.act(async () => {
     qaRow.click();
   });
-  const drawer = host.querySelector("[data-drawer='agent-item']");
+  const drawer = document.querySelector("[data-drawer='agent-item']");
   assert(drawer?.textContent?.includes("QA instructions."), "drawer shows SKILL.md content");
   assert(drawer?.textContent?.includes("Not loaded in running session"), "drawer shows runtime loaded=false honestly");
   assert(!drawer?.textContent?.includes("In every session"), "never fabricates In every session");
@@ -267,7 +267,10 @@ async function main() {
   const enabledSwitches = Array.from(host.querySelectorAll<HTMLButtonElement>('button[role="switch"]')).filter((b) => !b.disabled);
   assert(enabledSwitches.length === 0, "member/read-only view exposes no writable switches");
 
-  root.unmount();
+  await React.act(async () => {
+    root.unmount();
+  });
+  host.remove();
   console.log("agentSkillsTools checks passed");
 }
 

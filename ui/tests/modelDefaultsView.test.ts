@@ -106,7 +106,7 @@ const render = async (gate: string | null = null) => {
   await flush();
 };
 const button = (label: string) =>
-  Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find((el) => {
+  Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((el) => {
     const text = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
     return text === label || text.startsWith(label);
   });
@@ -119,7 +119,7 @@ const harnessNote = () => host.querySelector(".hnote")?.textContent;
 const setHarnessNote = async (value: string) => {
   await click(button("Harnesses"));
   await click(host.querySelector(".hrow"));
-  const input = host.querySelector<HTMLTextAreaElement>("[role=dialog] textarea");
+  const input = document.querySelector<HTMLTextAreaElement>("[role=dialog] textarea");
   assert(input, "Harness note editor exists");
   const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")!.set!;
   await React.act(async () => {

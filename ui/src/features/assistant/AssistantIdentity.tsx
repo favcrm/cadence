@@ -380,7 +380,6 @@ function AssistantAboutDialog({
       modal
       trapFocus
       size="sm"
-      portal
       className="assistant-about"
       closeLabel={t("Close assistant details")}
       dataAttributes={{

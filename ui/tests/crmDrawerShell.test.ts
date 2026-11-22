@@ -137,7 +137,8 @@ async function main() {
   assert(st.deleted === 1 && !q('[role="menu"]'), "destructive item fires once and closes the menu");
   assert(document.activeElement === menuBtn, "focus returns to the menu trigger");
 
-  // Scrim covers the outlet, not the chat pane.
+  // Scrim covers the outlet, not the chat pane; outlet-scrim renders inline (not portaled).
+  assert(q(".crm-drawer")?.parentElement === host, "outlet-scrim drawer stays inline under host");
   assert(q<HTMLElement>(".crm-drawer-scrim")?.style.left === "300px", "scrim starts at the outlet edge");
 
   // Edit mode: the body swaps in place, the footer becomes Cancel / Save, no read view below.
@@ -224,12 +225,13 @@ async function main() {
   await React.act(async () => { root2.render(h(StackHarness)); });
   await flush();
 
-  const parentPanel = host2.querySelector('[data-drawer="parent-doc"]') as HTMLElement | null;
-  const childPanel = host2.querySelector('[data-drawer="child-doc"]') as HTMLElement | null;
+  const parentPanel = document.querySelector('[data-drawer="parent-doc"]') as HTMLElement | null;
+  const childPanel = document.querySelector('[data-drawer="child-doc"]') as HTMLElement | null;
   assert(parentPanel && childPanel, "nested drawers render together");
-  assert(parentPanel.classList.contains("s-drawer") && host2.querySelector(".s-drawer-scrim"), "canonical .s-drawer classes are present");
+  assert(parentPanel.parentElement === document.body && childPanel.parentElement === document.body, "board-scrim drawers portal to document.body by default");
+  assert(parentPanel.classList.contains("s-drawer") && document.querySelector(".s-drawer-scrim"), "canonical .s-drawer classes are present");
   assert(parentPanel.getAttribute("data-size") === "sm" && childPanel.getAttribute("data-size") === "lg", "size attributes apply");
-  assert(host2.textContent?.includes("single-view body"), "children single-view renders without tabs");
+  assert(document.body.textContent?.includes("single-view body"), "children single-view renders without tabs");
   assert(parentPanel.getAttribute("data-receded") === "true" && parentPanel.hasAttribute("inert"), "parent recedes while child is open");
   assert(parentPanel.getAttribute("data-depth") === null && childPanel.getAttribute("data-depth") === "1", "child takes depth 1");
 

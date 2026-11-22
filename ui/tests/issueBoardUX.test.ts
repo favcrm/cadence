@@ -215,7 +215,7 @@ async function run() {
       detail: null,
       readState: { data: null, status: "failed", error: "offline", asOf: null, inFlight: false },
     })));
-    const drawer = () => drawerHost.querySelector('[role="dialog"]');
+    const drawer = () => document.querySelector('[role="dialog"]');
     assert(drawer(), "the shared detail renders its drawer surface");
     assert(drawer()!.querySelector('[role="alert"]')?.textContent?.includes("offline"), "failed detail explains its read error");
     await React.act(() => Array.from(drawer()!.querySelectorAll("button")).find((item) => item.textContent === "Retry")?.click());
