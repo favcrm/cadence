@@ -714,10 +714,16 @@ name. Never run `rm <scratchpad>/*`.
    prerequisite changed (see "The tracker write lock and an interrupted write").
    If it holds the ticket (an open PR, a claim newer than the merge), say why on
    the ticket.
-2. Release your own lane: `cadence --org fav-limited issue finish <ID> [--worktree
-   <path>]` on a hosted org (it takes no other option), or `cadence issue finish
-   <ID> --worktree <path>` natively. Natively, `cadence issue finish --merged
-   --dry-run` previews the sweep and removes nothing. Its activity, clean-tree and
+2. Release your own lane: for a hosted `--profile` lane started by your
+   session, first end its running assignment with
+   `cadence --org fav-limited agent report <assignment-id> --state result --head <full-sha> --text "<summary>"`
+   (the assignment id is in `issue start`'s receipt or `cadence --org fav-limited agent assignments`),
+   then run `cadence --org fav-limited issue finish <ID> [--worktree <path>]`
+   (it takes no other option). Do not use `agent reassign --cancel --release-lane`
+   on an active `--profile` lane: cancellation sets the retired-lane guard and
+   blocks automatic release for external sessions. Natively, run
+   `cadence issue finish <ID> --worktree <path>` (`cadence issue finish --merged
+   --dry-run` previews the sweep and removes nothing). Its activity, clean-tree and
    commit-survival guards may refuse cleanup. Report the exact refusal and
    hand off to the lane's owner or operator when their connection is needed;
    don't force or remove it by hand to get around the refusal. Leave other
