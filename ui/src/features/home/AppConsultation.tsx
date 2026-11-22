@@ -155,6 +155,7 @@ export default function AppConsultation({ session, onCompose }: { session: strin
 
   const close = () => { if (sent === null) clear(); setOpen(false); };
   const review = progress?.state === "answered" ? progress.text : null;
+  const readableReply = review === null ? null : review.replace(/\r\n?/g, "\n");
   const settled = phase === "answered" || phase === "unanswered" || phase === "unavailable";
   let notice: string | null = null;
   if (phase === "sending") notice = t("Sending only the text shown below…");
@@ -225,10 +226,10 @@ export default function AppConsultation({ session, onCompose }: { session: strin
         {phase === "read_error" && <p className="text-label text-ink-400">{t("Dismissing this review does not cancel the consultation.")}</p>}
         {review !== null && <div className="wa-field">
           <span id={`${selectId}-reply`}>{t("Exact agent reply")}</span>
-          <pre aria-labelledby={`${selectId}-reply`} tabIndex={0} className="wa-input m-0 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{review}</pre>
-          {review.includes("\r") && <details className="text-label text-ink-300">
-            <summary>{t("Show exact line endings")}</summary>
-            <pre className="wa-input m-0 mt-1.5 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(review)}</pre>
+          <pre role="region" aria-labelledby={`${selectId}-reply`} tabIndex={0} className="wa-input m-0 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{readableReply}</pre>
+          {review.includes("\r") && <details className="min-w-0 text-label text-ink-300">
+            <summary id={`${selectId}-escaped`}>{t("Show exact line endings")}</summary>
+            <pre role="region" aria-labelledby={`${selectId}-escaped`} tabIndex={0} className="wa-input m-0 mt-1.5 max-h-60 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(review)}</pre>
           </details>}
         </div>}
         </div>

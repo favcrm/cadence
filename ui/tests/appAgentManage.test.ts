@@ -238,8 +238,10 @@ async function main() {
     await click(updateButton("Send to app agent"));
     consultationRead = "answer";
     await click(updateButton("Check reply"));
-    const replyText = () => host.querySelector("pre[aria-labelledby]")?.textContent;
+    const replyRegion = () => host.querySelector<HTMLElement>('.wa-field > pre[role="region"][aria-labelledby]');
+    const replyText = () => replyRegion()?.textContent;
     assert(replyText() === "  \n ", "Whitespace-only reply is literal");
+    assert(replyRegion()?.tabIndex === 0 && !host.querySelector("details"), "Readable reply is focusable and omits escaped toggle without CR");
     await click(updateButton("Review in Master composer"));
     assert(composed.includes(JSON.stringify("  \n ")), "Master evidence preserves the reply");
 
@@ -249,8 +251,24 @@ async function main() {
     await click(updateButton("Send to app agent"));
     consultationReply = "A\r\nB\rC";
     await click(updateButton("Check reply"));
-    assert(replyText() === consultationReply, "Reply review retains CR and CRLF");
-    assert(host.querySelector("details pre")?.textContent === JSON.stringify(consultationReply), "Original line endings are selectable as escaped text");
+    assert(replyText() === "A\nB\nC", "Readable reply normalizes CR and CRLF to line breaks");
+    const replyLabelId = replyRegion()?.getAttribute("aria-labelledby");
+    assert(replyLabelId && document.getElementById(replyLabelId)?.textContent === "Exact agent reply", "Readable reply region is labeled");
+    const escaped = host.querySelector<HTMLElement>("details pre");
+    assert(escaped?.textContent === JSON.stringify(consultationReply) && JSON.parse(escaped.textContent) === consultationReply, "Original line endings are selectable as escaped text");
+    assert(escaped.getAttribute("role") === "region" && escaped.tabIndex === 0, "Escaped reply region is keyboard-focusable");
+    const escapedLabelId = escaped.getAttribute("aria-labelledby");
+    assert(escapedLabelId && document.getElementById(escapedLabelId)?.textContent === "Show exact line endings", "Escaped reply region is labeled by its summary");
+    await click(updateButton("Review in Master composer"));
+    const composedEvidence = JSON.parse(composed.slice(composed.indexOf("{"))) as { reply: string };
+    assert(composedEvidence.reply === consultationReply, "Master evidence preserves untouched CR and CRLF");
+
+    await click(updateButton("Consult app agent"));
+    await change(host.querySelector("select"), installId);
+    await change(host.querySelector("textarea"), "fifth source");
+    await click(updateButton("Send to app agent"));
+    await click(updateButton("Check reply"));
+    assert(replyText() === "A\nB\nC", "Retained reply is present before session reset");
     await React.act(async () => resetPrivateSession());
     assert(!updateButton("Review consultation") && replyText() === undefined, "Session reset erases a retained private reply");
   } finally {
