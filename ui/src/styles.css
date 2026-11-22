@@ -2090,10 +2090,30 @@ textarea.agentform-input { height: auto; width: 100%; }
 .s-drawer.needsdrawer .s-drawer-body,
 .s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
   padding: 0;
+  padding-inline: 0;
+  scrollbar-gutter: auto;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--color-ink-875);
+}
+.s-drawer.needsdrawer .rail-subhead {
+  padding: .4375rem .5rem;
+}
+.s-drawer.needsdrawer .seg-pills {
+  gap: .1875rem;
+}
+.s-drawer.needsdrawer .seg-pill {
+  padding: .1875rem .45rem;
+  font-size: var(--text-micro);
+}
+@media (max-width: 860px) {
+  .s-drawer.needsdrawer .s-drawer-body,
+  .s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
+    padding: 0;
+    padding-inline: 0;
+    scrollbar-gutter: auto;
+  }
 }
 
 /* A group header — Decisions opens by default; the rest fold. */
@@ -2280,8 +2300,11 @@ textarea.agentform-input { height: auto; width: 100%; }
   list-style: none;
   margin: 0;
 }
-.rail-cards + .rail-cards {
+.rail-cards:not([hidden]) ~ .rail-cards:not([hidden]) {
   padding-top: 0;
+}
+.rail-cards:not([hidden]):has(~ .rail-cards:not([hidden])) {
+  padding-bottom: .5rem;
 }
 .todo-list {
   padding: .625rem .75rem 1rem;
@@ -2367,13 +2390,15 @@ textarea.agentform-input { height: auto; width: 100%; }
   border-color: var(--color-ink-600);
   background: var(--color-ink-800);
 }
-.rc-head {
+.rail-card .rc-head {
   pointer-events: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: nowrap;
   gap: .5rem;
   min-width: 0;
+  margin: 0;
   font-size: var(--text-micro);
   color: var(--color-ink-400);
 }

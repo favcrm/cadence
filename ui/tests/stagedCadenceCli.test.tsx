@@ -171,7 +171,8 @@ async function render() {
   const v = await render();
   await settle(() => assert(v.cards().length === 1, "only the renderable cadence_cli row is a card"));
   assert(text(v.cards()[0].querySelector(".todo-title")) === "Cadence: issue new", "the verb is the title");
-  assert(/Home assistant/.test(text(v.cards()[0].querySelector(".todo-meta"))), "the asker is on the card");
+  assert(text(v.cards()[0].querySelector(".todo-meta")) === "ops: Ship the gift pack", `summary shows staged CLI summary (got "${text(v.cards()[0].querySelector(".todo-meta"))}")`);
+  assert(/Home assistant/.test(text(v.cards()[0].querySelector(".rc-meta"))), "the asker is in the card footer");
   await click(v.cards()[0].querySelector(".todo-hit"));
   await settle(() => assert(drawerEl(), "the drawer opens"));
   const d = drawerEl()!;

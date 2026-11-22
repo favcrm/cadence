@@ -356,7 +356,7 @@ export default function AgentUpdates({
   const matchingCount = category === "all" ? agents.length : feedSummary.counts[category];
 
   return (
-    <div>
+    <>
       {!state.data && (
         <p className="rail-state-card">
           {state.status === "failed" ? `${t("Agent updates unavailable")} — ${state.error}` : t("Reading agent activity…")}
@@ -395,6 +395,6 @@ export default function AgentUpdates({
           <Link href="/agents" className="lnk">{t("See all agents")}</Link>
         </p>
       )}
-    </div>
+    </>
   );
 }
