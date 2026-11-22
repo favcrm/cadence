@@ -24,13 +24,18 @@ function format(value: Day, locale: string, withYear = true): string {
   return `${value.d} ${MONTHS[value.m - 1]}${withYear ? ` ${value.y}` : ""}`;
 }
 
-/** "" when there are no params. Two days read as a range ("1 Jul – 30 Sep 2026"). */
-export function paramsLine(params: RouteParams | undefined, locale: string): string {
+/** One chip per param, in the card's own order; two calendar days read as one range ("1 Jul – 30 Sep 2026"). */
+export function paramChips(params: RouteParams | undefined, locale: string): string[] {
   const values = Object.values(params ?? {});
   const days = values.map(day);
   if (values.length === 2 && days[0] && days[1]) {
     const [from, to] = days;
-    return `${format(from, locale, from.y !== to.y)} – ${format(to, locale)}`;
+    return [`${format(from, locale, from.y !== to.y)} – ${format(to, locale)}`];
   }
-  return values.map((value, i) => { const d = days[i]; return d ? format(d, locale) : value; }).join(" · ");
+  return values.map((value, i) => { const d = days[i]; return d ? format(d, locale) : value; });
+}
+
+/** "" when there are no params; else the chips on one line. */
+export function paramsLine(params: RouteParams | undefined, locale: string): string {
+  return paramChips(params, locale).join(" · ");
 }

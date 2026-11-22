@@ -2437,10 +2437,12 @@ Object.assign(zhTW, {
   "Open in canvas": "在畫布開啟",
   "No access": "沒有存取權限",
   "Live": "即時",
-  "Shown as you": "以你的身分顯示",
   "Shown in {app}": "顯示於 {app}",
   "Opened": "已開啟",
-  "Read-only here · Open in {app} to edit": "此處唯讀 · 請在 {app} 開啟以編輯",
+  // CAD-2657: the canvas header, the lock and the full-width canvas.
+  "Read-only here — open in {app} to edit": "此處唯讀 — 請在 {app} 開啟以編輯",
+  "More actions": "更多操作",
+  "Collapse canvas": "收合畫布",
   "This screen could not be opened.": "無法開啟此畫面。",
   "Retry": "重試",
   // CAD-2475: the canvas view card.

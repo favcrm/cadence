@@ -197,6 +197,10 @@ as "Edits are disabled on this board", and use compact padding. The host shows
 "Open in <App> to edit" itself. `openDrawer` is unchanged: only a `drawer`
 mount refuses it.
 
+The host's header already shows the view's title (and the app's mark), so an app
+should also hide its own page title (the in-body heading such as "Customers")
+when `surfaceRole()` is `"canvas"`.
+
 ### Declaring views
 
 An app that wants chat to open one of its places ("show me Q3's P&L") declares
