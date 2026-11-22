@@ -328,6 +328,8 @@ pub fn help_guide(path: &str) -> Option<&'static str> {
     Some(match path {
         "wiki search" | "wiki cat" => {
             "Company/wiki answers: search is lexical AND (12-token/256-byte cap). \
+Pass the keywords as separate words in one call, no quotes: \
+`wiki search acme invoice --json`. \
 Scope by vendor/entity, operation/field and exact version/ID; narrow with a \
 caller-authorized --path. Run each `wiki search --json` and `wiki cat --meta` in \
 separate calls; --meta returns body+revision. A hit proves discovery, never body; \

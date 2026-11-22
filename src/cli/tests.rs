@@ -2375,3 +2375,77 @@ fn cloud_agent_login_help_names_all_three_scopes() {
         assert!(help.contains(scope), "login help omits {scope}:\n{help}");
     }
 }
+
+/// CAD-1524: the master's command guard refuses quotes, so a multi-word
+/// wiki query must work as separate plain words. They join into the same
+/// space-separated query a quoted argument sends, the guard accepts that
+/// argv as it accepts a one-word search, and a quoted or piped query is
+/// still refused.
+#[test]
+fn wiki_search_takes_separate_words_the_master_guard_allows() {
+    use cadence_agent::master_perm::{classify, Class};
+    use cadence_agent::wiki::cli::WikiAction;
+
+    let query = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+        Commands::Wiki {
+            action: WikiAction::Search { q, json, .. },
+        } => (q.join(" "), json),
+        _ => panic!("not a wiki search"),
+    };
+    let words = [
+        "cadence",
+        "wiki",
+        "search",
+        "synthetic",
+        "verification",
+        "marker",
+        "--json",
+    ];
+    assert_eq!(
+        query(&words),
+        ("synthetic verification marker".to_string(), true)
+    );
+    assert_eq!(
+        query(&[
+            "cadence",
+            "wiki",
+            "search",
+            "synthetic verification marker",
+            "--json"
+        ]),
+        ("synthetic verification marker".to_string(), true)
+    );
+    assert!(Cli::try_parse_from(["cadence", "wiki", "search", "--json"]).is_err());
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let one = classify(
+        &argv(&["cadence", "wiki", "search", "marker", "--json"]),
+        dir.path(),
+        &[],
+        &[],
+    );
+    let many = classify(&argv(&words), dir.path(), &[], &[]);
+    assert_eq!(
+        many, one,
+        "a multi-word search is classed like a one-word search"
+    );
+    assert!(
+        !matches!(many, Class::IllFormed { .. } | Class::Never { .. }),
+        "{many:?}"
+    );
+    for refused in [
+        &["cadence", "wiki", "search", "\"synthetic", "marker\""][..],
+        &["cadence", "wiki", "search", "marker", "|", "head"][..],
+        &["cadence", "wiki", "search", "marker;", "rm"][..],
+        &["cadence", "wiki", "search", "marker", ">", "out"][..],
+    ] {
+        assert!(
+            matches!(
+                classify(&argv(refused), dir.path(), &[], &[]),
+                Class::IllFormed { .. }
+            ),
+            "{refused:?} must stay refused"
+        );
+    }
+}
