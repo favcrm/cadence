@@ -144,7 +144,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
     await flush();
   };
   const button = (label: string) =>
-    Array.from(host.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
+    Array.from(document.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
   await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress })); });
   // A row is a name and one line; everything else is in the drawer it opens.
   const open = async (name: string) => {
@@ -154,16 +154,32 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
   const rowFor = (name: string) =>
     Array.from(host.querySelectorAll("button.settings-row")).find((b) => b.querySelector("b")?.textContent === name);
   const closeDrawer = async () => {
-    await click(Array.from(host.querySelectorAll("button")).find((b) => /close/i.test(b.getAttribute("aria-label") ?? b.textContent ?? "")));
+    await click(Array.from(document.querySelectorAll("button")).find((b) => /close/i.test(b.getAttribute("aria-label") ?? b.textContent ?? "")));
     await sleep(320);
     await flush();
   };
   const mainText = () => {
-    const clone = host.cloneNode(true) as HTMLElement;
+    const clone = document.body.cloneNode(true) as HTMLElement;
     clone.querySelectorAll("details").forEach((d) => d.remove());
     return clone.textContent ?? "";
   };
-  return { host, settle, click, button, open, rowFor, closeDrawer, sleep, flush, React, mainText, unmount: () => React.act(async () => root.unmount()) };
+  return {
+    host: document.body,
+    settle,
+    click,
+    button,
+    open,
+    rowFor,
+    closeDrawer,
+    sleep,
+    flush,
+    React,
+    mainText,
+    unmount: async () => {
+      await React.act(async () => root.unmount());
+      host.remove();
+    },
+  };
 }
 
 const fresh = (over: Partial<World> = {}): World => ({

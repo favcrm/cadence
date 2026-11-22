@@ -376,7 +376,7 @@ async function main() {
   await click("Open agent Developer");
   await render();
   assert(open === "Developer", "a profile opens on the same agent route as any agent");
-  assert(!host.querySelector("dialog.rc-sheet"), "the drawer is gone");
+  assert(!document.querySelector('[data-drawer="hire"]'), "the drawer is gone");
   const gate = host.querySelector(".ag-chat-gate");
   assert(gate?.textContent?.includes("can’t reply here yet"), "the page says why nothing can answer");
   assert(gate?.textContent?.includes("cadence agent context ap_1"), "the reason sits with the connect commands");
@@ -418,8 +418,8 @@ async function main() {
   tab = "settings";
   await render();
   assert(host.querySelector("main.agents-page [role='tablist']"), "the profile keeps its tabs");
-  assert(!host.querySelector("[data-drawer]")?.textContent?.includes("Figures"), "unknown stats show no tiles of dashes");
-  const text = host.querySelector("main.agents-page")!.textContent!;
+  assert(!document.querySelector("[data-drawer]")?.textContent?.includes("Figures"), "unknown stats show no tiles of dashes");
+  const text = document.body.textContent!;
   for (const evidence of [
     agents[1].recovery!,
     agents[1].resume!,
@@ -442,8 +442,8 @@ async function main() {
   failDetail = false;
   await click("Retry");
   assert(
-    host.querySelector("main.agents-page")?.textContent?.includes("session-blocked") &&
-      !host.textContent?.includes("Some details aren’t available"),
+    document.body.textContent?.includes("session-blocked") &&
+      !document.body.textContent?.includes("Some details aren’t available"),
     "retry replaces failure with details",
   );
   // An open drawer keeps Esc for itself: the page stays where it is.
@@ -455,16 +455,16 @@ async function main() {
   assert((tab as string) !== "overview", "Escape closes the drawer, not the page");
   tab = "skills";
   await render();
-  assert(!host.querySelector("[data-drawer]"), "the settings drawer closes with its section");
+  assert(!document.querySelector("[data-drawer]"), "the settings drawer closes with its section");
   assert(host.querySelectorAll(".ap-mrow").length === 7, "skills are rows");
   await React.act(() => host.querySelector<HTMLElement>(".ap-mrow")!.click());
-  assert(host.querySelector("[data-drawer='agent-item']")?.textContent?.includes("Source"), "a row opens one drawer with its details");
+  assert(document.querySelector("[data-drawer='agent-item']")?.textContent?.includes("Source"), "a row opens one drawer with its details");
   assert(!host.querySelector(".ap-rows")?.textContent?.includes("Source"), "details live in the drawer, not the row");
   // The gear opens over the section you are on, and stays out of the URL.
   tab = "history";
   await render();
   await React.act(() => button("Agent settings")!.click());
-  assert(host.querySelector("[data-drawer='agent-settings']"), "the gear opens the settings drawer");
+  assert(document.querySelector("[data-drawer='agent-settings']"), "the gear opens the settings drawer");
   assert((tab as string) === "history" && host.querySelector(".ap-tab[aria-selected='true']")?.textContent === "History", "the gear keeps the current section");
   await React.act(() =>
     document.body.dispatchEvent(
@@ -512,8 +512,8 @@ async function main() {
   await React.act(async () => releaseDetail!());
   await flush();
   assert(
-    host.querySelector("main.agents-page")?.textContent?.includes("session-stopped") &&
-      !host.querySelector("main.agents-page")?.textContent?.includes("session-dev"),
+    document.querySelector("[data-drawer='agent-settings']")?.textContent?.includes("session-stopped") &&
+      !document.body.textContent?.includes("session-dev"),
     "late old detail cannot cross into another alias",
   );
   open = null;
@@ -578,12 +578,12 @@ async function main() {
   const gearButton = host.querySelector<HTMLButtonElement>("button[aria-label='Agent settings']");
   assert(gearButton, "the gear is on the page");
   await React.act(() => gearButton.click());
-  assert(host.querySelector("[data-drawer='agent-settings']"), "the gear opens its drawer");
+  assert(document.querySelector("[data-drawer='agent-settings']"), "the gear opens its drawer");
   tab = "overview";
   await render();
   tab = "instructions";
   await render();
-  assert(!host.querySelector("[data-drawer='agent-settings']"), "the chat closes the gear, so coming back doesn't reopen it");
+  assert(!document.querySelector("[data-drawer='agent-settings']"), "the chat closes the gear, so coming back doesn't reopen it");
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
   assert(box()?.value === "Synthetic instructions" && box()!.readOnly, "a stale board keeps the text and takes no edit");
@@ -618,7 +618,7 @@ async function main() {
   reads.length = 0;
   await render();
   assert(host.querySelector("main.agents-page h1")?.textContent === "Writer" && !host.textContent?.includes("Loading agent details"), "a section link on a profile reaches that section, not a stuck read");
-  const notes = () => host.querySelector("[data-drawer='agent-settings']")?.textContent ?? "";
+  const notes = () => document.querySelector("[data-drawer='agent-settings']")?.textContent ?? "";
   assert(notes().includes("agents/Writer/knowledge"), "a profile without a named root keeps its alias folder");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [{ ...withProfile, wiki_root: "agents/ap_2" }] });
   await render();
@@ -705,6 +705,7 @@ async function main() {
   for (const empty of ["Nothing queued.", "No results yet.", "No events yet.", "no role text"])
     assert(!failedPanel.includes(empty), `the panel claims nothing about unread details: ${empty}`);
   await React.act(() => freshRoot.unmount());
+  freshHost.remove();
   // A board that answers 501 keeps no details: permanent, so nothing to retry.
   detailNotServed = true;
   failDetail = false;
@@ -755,7 +756,7 @@ async function main() {
   assert(!Array.from(servedHost.querySelectorAll(".ag-chat-main button")).some((b) => b.textContent?.trim() === "Retry"), "there is no Retry that can never succeed");
   for (const section of ["history", "instructions", "settings"] as const) {
     await mountServed("dev", section, liveRoster);
-    const page = servedHost.textContent ?? "";
+    const page = document.body.textContent ?? "";
     assert(!page.includes("Loading agent details"), `the ${section} section does not stick on loading on a 501 board`);
     assert(!page.includes("No events yet.") && !page.includes("No results yet."), `the ${section} section claims no empty history on a 501 board`);
   }
@@ -768,7 +769,7 @@ async function main() {
   ] as const) {
     for (const section of ["settings", "history", "instructions"] as const) {
       await mountServed(alias, section, roster);
-      const page = servedHost.textContent ?? "";
+      const page = document.body.textContent ?? "";
       for (const claim of unknownClaims)
         assert(!page.includes(claim), `${label}, ${section}, 501: claims nothing it cannot know: ${claim}`);
       assert(page.includes("Some details aren’t available"), `${label}, ${section}, 501: reports that details are missing`);
@@ -798,7 +799,7 @@ async function main() {
   assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
   assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
   await mountServed("dev", "settings", liveRoster);
-  assert(servedHost.textContent?.includes("doesn’t report runtime details"), "the runtime section says what is actually missing");
+  assert(document.querySelector("[data-drawer='agent-settings']")?.textContent?.includes("doesn’t report runtime details"), "the runtime section says what is actually missing");
   assert(!servedHost.querySelector("main.agents-page button:disabled"), "nothing on the page is a disabled promise");
   // A 501 for another reason, such as an outdated daemon, is an ordinary failure.
   detailNotServedCode = "unsupported_daemon";
@@ -875,7 +876,7 @@ async function main() {
   assert(!(await chipsFor({ ...withRunner, status: "stale", error: "Refresh unavailable" }, true)).includes("Call the first lead"), "a stale board offers no first-job chips");
   rolesPayload = null;
   // A failed read inside the gear drawer recovers there: the page's Retry is behind its scrim.
-  const gearDrawer = () => servedHost.querySelector("[data-drawer='agent-settings']");
+  const gearDrawer = () => document.querySelector("[data-drawer='agent-settings']");
   await mountServed("dev", "settings", liveRoster);
   assert(gearDrawer()?.textContent?.includes("Access unavailable"), "a failed access read says so");
   accessPayload = { grants: [], connections: [], custody: null };

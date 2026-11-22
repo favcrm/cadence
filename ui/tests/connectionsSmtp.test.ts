@@ -533,13 +533,14 @@ async function main() {
   assert(smtpAccountRow, "smtp account row renders as a button");
   await act(async () => { smtpAccountRow.focus(); smtpAccountRow.click(); });
   await settle(() => {
-    assert(text5().includes("Check configuration"), "the drawer has the local check action");
-    assert(text5().includes("Disconnect"), "the drawer offers disconnect");
+    const drawerText = document.querySelector(".crm-drawer")?.textContent ?? "";
+    assert(drawerText.includes("Check configuration"), "the drawer has the local check action");
+    assert(drawerText.includes("Disconnect"), "the drawer offers disconnect");
   });
   // A credential typed for one account must never carry to another: rows stay
   // reachable by keyboard behind the drawer, so this path is real.
-  await act(async () => { (byTextIn(host5, "button", "Update credentials…") as HTMLButtonElement).click(); });
-  const typed = host5.querySelector('.crm-drawer input[type="password"], .crm-drawer input') as HTMLInputElement;
+  await act(async () => { (byTextIn(document.body, "button", "Update credentials…") as HTMLButtonElement).click(); });
+  const typed = document.querySelector('.crm-drawer input[type="password"], .crm-drawer input') as HTMLInputElement;
   assert(typed, "the update form opened");
   await act(async () => {
     Object.getOwnPropertyDescriptor(Object.getPrototypeOf(typed), "value")!.set!.call(typed, "ALPHA-SECRET");
@@ -549,7 +550,7 @@ async function main() {
   assert(otherRow, "a second account row exists");
   await act(async () => { otherRow.click(); });
   await settle(() => {
-    const values = Array.from(host5.querySelectorAll<HTMLInputElement>(".crm-drawer input")).map((i) => i.value);
+    const values = Array.from(document.querySelectorAll<HTMLInputElement>(".crm-drawer input")).map((i) => i.value);
     assert(!values.includes("ALPHA-SECRET"), "the typed credential did not follow to the other account");
   });
   await act(async () => {

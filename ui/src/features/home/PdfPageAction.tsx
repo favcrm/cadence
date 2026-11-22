@@ -1,12 +1,11 @@
 import { createContext, useCallback, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import Button from "../../ui/Button";
 import { ATTACH_MAX_BYTES, ATTACH_MAX_FILES, type AttachDestination } from "../app-shell/chat/attach";
 import { activeComposerSlot, addFiles, attachItems, subscribeAttach } from "../app-shell/chat/composerStore";
-import { WorkspaceDialog } from "../workspace-apps/WorkspaceDialog";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import "../workspace-apps/workspace-apps.css";
 import { attachmentHref, openAttachmentInTab, type AttachmentFile } from "./AttachmentMedia";
 import type { LoadedPdfPages } from "./pdfPageImages";
@@ -80,7 +79,7 @@ export default function PdfPageAction({ source, target, tileTitle, children }: {
         aria-haspopup="dialog" onClick={() => setOpen(true)}>
         {children}
       </button>
-      {open && createPortal(<PdfPageDialog source={source} target={target} close={() => setOpen(false)} />, document.body)}
+      {open && <PdfPageDialog source={source} target={target} close={() => setOpen(false)} />}
     </>
   );
 }
@@ -192,7 +191,17 @@ function PdfPageDialog({ source, target, close }: {
   }
 
   return (
-    <WorkspaceDialog title={t("Attach pages as images")} onClose={close}>
+    <DrawerShell
+      kind="pdf-pages"
+      scrim="board"
+      modal
+      trapFocus
+      size="lg"
+      preventClose={busy}
+      label={t("Attach pages as images")}
+      title={t("Attach pages as images")}
+      onClose={close}
+    >
       <form className="grid gap-3" onSubmit={(event) => void submit(event)}>
         <div className="flex items-center justify-between gap-2">
           <p className="m-0 min-w-0 truncate" title={original.file.name}>{original.file.name}</p>
@@ -219,6 +228,6 @@ function PdfPageDialog({ source, target, close }: {
           </Button>
         </div>}
       </form>
-    </WorkspaceDialog>
+    </DrawerShell>
   );
 }

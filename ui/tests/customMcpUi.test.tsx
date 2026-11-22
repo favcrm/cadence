@@ -139,9 +139,9 @@ async function main() {
   const host = document.createElement("div");
   document.body.appendChild(host);
   const root = createRoot(host);
-  const text = () => host.textContent ?? "";
+  const text = () => document.body.textContent ?? "";
   const byText = (sel: string, txt: string) =>
-    Array.from(host.querySelectorAll(sel)).find((el) => el.textContent?.includes(txt)) as HTMLButtonElement | undefined;
+    Array.from(document.querySelectorAll(sel)).find((el) => el.textContent?.includes(txt)) as HTMLButtonElement | undefined;
 
   await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: true, readOnly: false }, hostedBoard: true })); });
   await settle(() => {
@@ -152,29 +152,29 @@ async function main() {
   });
 
   await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
-  await settle(() => assert(host.querySelector('[data-drawer="custom-mcp"]')?.textContent?.includes("create_invoice"), "inspect drawer shows pinned tool"));
+  await settle(() => assert(document.querySelector('[data-drawer="custom-mcp"]')?.textContent?.includes("create_invoice"), "inspect drawer shows pinned tool"));
 
   await act(async () => byText('[role="tab"]', "Instructions & Guide")!.click());
   await settle(() => assert(text().includes("Always include idempotency keys") && text().includes("Search customers before creating invoices."), "guide tab shows server & agent guides"));
 
   await act(async () => byText('[role="tab"]', "Policies")!.click());
-  await settle(() => assert(host.querySelector('[data-connection-policy]') && text().includes("Action safety") && text().includes("nova"), "owner Policies tab shows policy & allowed agents"));
+  await settle(() => assert(document.querySelector('[data-connection-policy]') && text().includes("Action safety") && text().includes("nova"), "owner Policies tab shows policy & allowed agents"));
   await act(async () => byText('[data-connection-policy] [role="radio"]', "Read only")!.click());
   await act(async () => byText('[data-connection-policy] button', "Save access settings")!.click());
-  await settle(() => assert(host.querySelector('.custmcp-ok-banner')?.textContent?.includes("Access settings saved"), "green ok banner shown instead of warning"));
+  await settle(() => assert(document.querySelector('.custmcp-ok-banner')?.textContent?.includes("Access settings saved"), "green ok banner shown instead of warning"));
 
-  await act(async () => (host.querySelector('[data-drawer="custom-mcp"] button[aria-label*="Close"]') as HTMLButtonElement).click());
-  const closingDrawer = host.querySelector('[data-drawer="custom-mcp"][data-closing]');
+  await act(async () => (document.querySelector('[data-drawer="custom-mcp"] button[aria-label*="Close"]') as HTMLButtonElement).click());
+  const closingDrawer = document.querySelector('[data-drawer="custom-mcp"][data-closing]');
   assert(closingDrawer, "inspect drawer enters closing state");
   await act(async () => { closingDrawer.dispatchEvent(new win.Event("transitionend", { bubbles: true })); });
-  await settle(() => assert(!host.querySelector('[data-drawer="custom-mcp"]'), "inspect drawer closes"));
+  await settle(() => assert(!document.querySelector('[data-drawer="custom-mcp"]'), "inspect drawer closes"));
 
   await act(async () => byText("button", "+ Connect custom MCP server")!.click());
   await settle(() => assert(text().includes("1. Endpoint") && text().includes("2. Discovery & Consent") && text().includes("Auto MCP OAuth 2.1 + PKCE"), "3-step connect drawer opens"));
 
   await act(async () => byText('[role="radio"]', "OAuth client ID")!.click());
   await settle(() => {
-    const summary = host.querySelector('.custmcp-manual summary')?.textContent ?? "";
+    const summary = document.querySelector('.custmcp-manual summary')?.textContent ?? "";
     assert(summary.includes("OAuth client ID") && !summary.includes("oauth_static"), "summary uses human label, not raw enum");
   });
   await act(async () => byText('[role="radio"]', "Auto MCP OAuth 2.1")!.click());
@@ -183,27 +183,27 @@ async function main() {
     el.dispatchEvent(new win.Event("input", { bubbles: true }));
   };
   await act(async () => {
-    setNativeValue(host.querySelector('input[placeholder="Acme Billing MCP"]') as HTMLInputElement, "Acme OAuth");
-    setNativeValue(host.querySelector('input[type="url"]') as HTMLInputElement, "https://mcp.acme.example/v1/mcp");
+    setNativeValue(document.querySelector('input[placeholder="Acme Billing MCP"]') as HTMLInputElement, "Acme OAuth");
+    setNativeValue(document.querySelector('input[type="url"]') as HTMLInputElement, "https://mcp.acme.example/v1/mcp");
   });
-  await act(async () => { host.querySelector("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); });
+  await act(async () => { document.querySelector("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); });
   await settle(() => {
-    const preview = host.querySelector("[data-mcp-discovery-preview]")?.textContent ?? "";
+    const preview = document.querySelector("[data-mcp-discovery-preview]")?.textContent ?? "";
     assert(preview.includes("auth.acme.example") && preview.includes("Dynamic Client Registration") && preview.includes("Continue to OAuth sign-in"), "Step 2 discovery preview shown");
   });
 
   policyCalls.length = 0;
   await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: false, readOnly: false }, hostedBoard: true })); });
   await settle(() => {
-    assert(text().includes("Shared Custom MCP servers (read-only)") && !text().includes("+ Connect custom MCP server") && host.querySelectorAll('input[type="password"]').length === 0, "member view read-only");
+    assert(text().includes("Shared Custom MCP servers (read-only)") && !text().includes("+ Connect custom MCP server") && document.querySelectorAll('input[type="password"]').length === 0, "member view read-only");
   });
   await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
   await settle(() => {
-    const drawer = host.querySelector('[data-drawer="custom-mcp"]');
+    const drawer = document.querySelector('[data-drawer="custom-mcp"]');
     assert(drawer && drawer.textContent?.includes("Read-only view") && drawer.querySelectorAll('.custmcp-mode-btn').length === 0, "member read-only drawer");
   });
   await act(async () => byText('[role="tab"]', "Policies")!.click());
-  await settle(() => assert(host.querySelector('[data-mcp-policy-readonly]') && policyCalls.length === 0, "member Policies read-only with 0 /policy requests"));
+  await settle(() => assert(document.querySelector('[data-mcp-policy-readonly]') && policyCalls.length === 0, "member Policies read-only with 0 /policy requests"));
 
   const { ConnectCard } = require("../src/features/home/ConnectCard") as typeof import("../src/features/home/ConnectCard");
   win.history.replaceState({}, "", "/home?aos_connect=connected&toolkit=custom_mcp&connection_id=conn_mcp_billing_1");

@@ -1,27 +1,45 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { createPortal } from "react-dom";
 import Button from "../../../ui/Button";
+import { IconClose } from "../../../ui/icons";
 import { useTranslate } from "../../../lib/localeText";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**
- * CAD-1052 one reusable detail-drawer shell for the CRM customer and
- * segment drawers. Layout contract (the clickable mockup is the spec):
- *  - header: avatar/icon, title, subtitle, status pills/tags, an optional
- *    warning strip (text only, never a button) and the tab strip;
- *  - body: the active tab panel, or `edit.body` swapped in place;
- *  - footer: pinned. Every action lives here, grouped on the left — the ⋯
- *    menu (opens upward, destructive item last and red), secondary buttons,
- *    one primary last; the note sits on the right. While editing it becomes
- *    Cancel / Save in the same group.
- * The scrim dims the outlet only: the left chat pane stays usable.
- * `scrim="board"` (CAD-1216, the Home review drawer) is opt-in: the scrim
- * covers the whole board, a `kicker` sits above the title and `foot`
- * replaces the footer's slots; phones get a bottom sheet.
- * Escape closes an open menu first, then cancels an edit, then the
- * drawer; focus returns through `useDrawerClose`.
+ * Reusable detail-drawer shell across native board surfaces and `@cadence/screen-ui`.
+ *  - header: optional avatar/icon, kicker, title, subtitle, status pills/tags,
+ *    optional warning strip (text only, never a button), and gliding tabs;
+ *  - body: `children` (single view), active tab panel, or `edit.body` swapped in place;
+ *  - footer: pinned. Actions group on the left (⋯ menu, secondary, primary) and
+ *    read-only note on the right. While editing it becomes Cancel / Save.
+ * `scrim="outlet"` dims the outlet only so the chat pane stays usable.
+ * `scrim="board"` covers the full document (`sm` 24rem, `md` 34rem default,
+ * `lg` 42rem) and turns into a bottom sheet with grab-drag dismissal at <= 860px.
+ * Supports LIFO stacking (`data-depth`, parent `data-receded` + `inert`),
+ * guarded dismissal (`preventClose` + micro-nudge), scroll-edge shadows,
+ * `portal`, `initialFocus`, and Escape/Tab focus containment.
  */
-export type DrawerTab = { id: string; label: string; panel: ReactNode };
-export type DrawerMenuItem = { key: string; label: string; onSelect: () => void; destructive?: boolean; disabled?: boolean; title?: string };
+export type DrawerTab = { id: string; label: string; badge?: ReactNode; panel: ReactNode };
+export type DrawerSize = "sm" | "md" | "lg";
+export type DrawerMenuItem = {
+  key: string;
+  label: string;
+  onSelect: () => void;
+  destructive?: boolean;
+  disabled?: boolean;
+  title?: string;
+};
 export type DrawerEdit = {
   /** `id` of the `<form>` in `body`; the footer Save submits it. */
   formId: string;
@@ -39,17 +57,37 @@ export interface DrawerShellProps {
   kicker?: ReactNode;
   /** `board` dims the whole board, not only the outlet. Default `outlet`. */
   scrim?: "outlet" | "board";
+  /** Width token for the drawer (`sm` 24rem, `md` 34rem, `lg` 42rem). */
+  size?: DrawerSize;
   /** The host traps focus inside the drawer (CAD-2186); announce it as modal. */
   modal?: boolean;
   /** Own keyboard containment and dismissal for this modal, including nested drawers. */
   trapFocus?: boolean;
+  /** Prevent dismissal on scrim/Escape/close/drag (e.g. while a submit is busy). */
+  preventClose?: boolean;
+  /** Optional status note surfaced when dismissal is blocked by `preventClose`. */
+  preventCloseNote?: ReactNode;
+  /** Optional target to focus when the drawer mounts (falls back to heading). */
+  initialFocus?: RefObject<HTMLElement | null>;
+  /** Render scrim and drawer into `document.body`. Defaults to `true` for `scrim="board"` and `false` for `scrim="outlet"`. */
+  portal?: boolean;
+  /** Optional extra class name appended to the drawer panel. */
+  className?: string;
+  /** Optional extra class name appended to the scrim element. */
+  scrimClassName?: string;
+  /** Override accessible label for the top close button. */
+  closeLabel?: string;
+  /** Extra `data-*` attributes forwarded onto the dialog panel. */
+  dataAttributes?: Record<`data-${string}`, string | undefined>;
   title: ReactNode;
   subtitle?: ReactNode;
   avatar?: ReactNode;
   pills?: ReactNode;
   /** Plain warning copy; rendered as a strip with no controls. */
   warning?: ReactNode;
-  tabs: DrawerTab[];
+  /** Single-view body when `tabs` are not provided. */
+  children?: ReactNode;
+  tabs?: DrawerTab[];
   /** Optional controlled tab (so a body link can switch tabs). */
   tab?: string;
   onTab?: (id: string) => void;
@@ -67,6 +105,40 @@ export interface DrawerShellProps {
   onClose: () => void;
   /** Frame-local scrim edge. When supplied, no host outlet is measured. */
   geometry?: { left: number };
+}
+
+type StackEntry = {
+  id: symbol;
+  closing: boolean;
+  notify: () => void;
+};
+
+const drawerStack: StackEntry[] = [];
+
+function notifyDrawerStack() {
+  for (const entry of drawerStack) entry.notify();
+}
+
+function getStackState(id: symbol): { isTopmost: boolean; depth: number; receded: boolean } {
+  const index = drawerStack.findIndex((entry) => entry.id === id);
+  if (index === -1) return { isTopmost: true, depth: 0, receded: false };
+  const isTopmost = index === drawerStack.length - 1;
+  const receded = drawerStack.slice(index + 1).some((entry) => !entry.closing);
+  return { isTopmost, depth: index, receded };
+}
+
+function listFocusable(root: HTMLElement): HTMLElement[] {
+  const checkLayout = typeof root.getClientRects === "function" && root.getClientRects().length > 0;
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), a[href]:not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((element) => {
+    if (element.closest('[role="dialog"]') !== root) return false;
+    if (element.closest("[hidden], [inert]") !== null) return false;
+    if (checkLayout && element.getClientRects().length === 0) return false;
+    return true;
+  });
 }
 
 /** Left edge of the outlet, so the scrim never dims the chat pane. */
@@ -108,7 +180,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
     e.preventDefault();
   };
   return (
-    <div className="crm-drawer-menu" ref={wrap} onKeyDown={onKey}>
+    <div className="s-drawer-menu crm-drawer-menu" ref={wrap} onKeyDown={onKey}>
       <button
         ref={trigger}
         type="button"
@@ -121,7 +193,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ⋯
       </button>
       {open && (
-        <div className="crm-drawer-pop" role="menu" aria-label={t("More actions")}>
+        <div className="s-drawer-pop crm-drawer-pop" role="menu" aria-label={t("More actions")}>
           {items.map((item) => (
             <button
               key={item.key}
@@ -147,8 +219,44 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
 }
 
 export default function DrawerShell(props: DrawerShellProps) {
-  const { kind, label, kicker, scrim = "outlet", title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, foot, onClose } = props;
+  const {
+    kind,
+    label,
+    kicker,
+    scrim = "outlet",
+    size,
+    preventClose = false,
+    preventCloseNote,
+    initialFocus,
+    portal,
+    className,
+    scrimClassName,
+    closeLabel,
+    dataAttributes,
+    title,
+    subtitle,
+    avatar,
+    pills,
+    warning,
+    children,
+    tabs = [],
+    tab: tabProp,
+    onTab,
+    edit,
+    state,
+    menu,
+    secondary,
+    primary,
+    note,
+    foot,
+    onClose,
+  } = props;
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const tabsRef = useRef<HTMLDivElement | null>(null);
   const headRef = useRef<HTMLHeadingElement | null>(null);
+  const initialFocusRef = useRef(initialFocus);
+  initialFocusRef.current = initialFocus;
   const [tabState, setTabState] = useState(tabs[0]?.id ?? "");
   const tab = tabProp ?? tabState;
   const setTab = (id: string) => {
@@ -156,173 +264,461 @@ export default function DrawerShell(props: DrawerShellProps) {
     onTab?.(id);
   };
   const [menuOpen, setMenuOpen] = useState(false);
+  const [nudged, setNudged] = useState(false);
+  const [guardShown, setGuardShown] = useState(false);
+  const nudgeTimer = useRef<number | null>(null);
+  const [scrolledTop, setScrolledTop] = useState(false);
+  const [scrolledBottom, setScrolledBottom] = useState(false);
+  const [inkStyle, setInkStyle] = useState<{ x: number; w: number; top: number; ready: boolean }>({
+    x: 0,
+    w: 0,
+    top: 0,
+    ready: false,
+  });
+  const [dragY, setDragY] = useState(0);
+  const dragRef = useRef<{ active: boolean; id: number; startY: number; lastY: number; lastAt: number; velocity: number }>({
+    active: false,
+    id: -1,
+    startY: 0,
+    lastY: 0,
+    lastAt: 0,
+    velocity: 0,
+  });
+
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   const t = useTranslate();
   const scrimLeft = useScrimLeft(props.geometry?.left);
   const editing = edit != null;
+  const board = scrim === "board";
+  const usePortal = portal ?? board;
 
-  // Land on the heading so a deep link (no opener) still has a place.
-  useEffect(() => {
-    headRef.current?.focus();
-  }, []);
-  useEffect(() => {
-    if (props.trapFocus) return;
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      // An Escape another control inside already handled (cancelled) is not
-      // the drawer's. An open Select's Escape stops at the Select and never
-      // reaches the window; this guards any other inner handler that cancels.
-      if (e.key !== "Escape" || e.defaultPrevented) return;
-      if (menuOpen) setMenuOpen(false);
-      else if (edit != null) edit.onCancel();
-      else requestClose();
+  const stackId = useRef<symbol>(Symbol("drawer"));
+  const [, setStackTick] = useState(0);
+  useLayoutEffect(() => {
+    const id = stackId.current;
+    const entry: StackEntry = {
+      id,
+      closing: false,
+      notify: () => setStackTick((n) => n + 1),
     };
-    addEventListener("keydown", onKeyDown);
-    return () => removeEventListener("keydown", onKeyDown);
-  }, [menuOpen, edit, requestClose, props.trapFocus]);
+    drawerStack.push(entry);
+    notifyDrawerStack();
+    return () => {
+      const idx = drawerStack.indexOf(entry);
+      if (idx !== -1) drawerStack.splice(idx, 1);
+      notifyDrawerStack();
+    };
+  }, []);
 
-  const onModalKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (!props.trapFocus || event.defaultPrevented) return;
-    const root = event.currentTarget;
-    const target = event.target as HTMLElement;
-    // A nested dialog owns its own keys. Portaled Select content still bubbles
-    // through React, but has no DOM ancestor dialog.
-    const dialog = target.closest('[role="dialog"]');
-    if (dialog && dialog !== root) return;
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      if (menuOpen) setMenuOpen(false);
-      else if (edit != null) edit.onCancel();
-      else requestClose();
+  useLayoutEffect(() => {
+    const entry = drawerStack.find((item) => item.id === stackId.current);
+    if (!entry || entry.closing === closing) return;
+    entry.closing = closing;
+    notifyDrawerStack();
+  }, [closing]);
+
+  const { isTopmost, depth, receded } = getStackState(stackId.current);
+
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    if (receded) {
+      panel.setAttribute("inert", "");
+      return () => panel.removeAttribute("inert");
+    }
+    panel.removeAttribute("inert");
+    return undefined;
+  }, [receded]);
+
+  useEffect(() => {
+    if (!preventClose) setGuardShown(false);
+  }, [preventClose]);
+
+  useEffect(() => {
+    return () => {
+      if (nudgeTimer.current !== null) window.clearTimeout(nudgeTimer.current);
+    };
+  }, []);
+
+  const triggerNudge = useCallback(() => {
+    if (preventCloseNote !== undefined) setGuardShown(true);
+    setNudged(true);
+    if (nudgeTimer.current !== null) window.clearTimeout(nudgeTimer.current);
+    nudgeTimer.current = window.setTimeout(() => {
+      nudgeTimer.current = null;
+      setNudged(false);
+    }, 260);
+  }, [preventCloseNote]);
+
+  const attemptClose = useCallback(() => {
+    if (preventClose || edit?.pending) {
+      triggerNudge();
       return;
     }
-    if (event.key !== "Tab") return;
-    event.stopPropagation();
-    const items = Array.from(root.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-    )).filter((element) => element.closest('[role="dialog"]') === root && element.getClientRects().length > 0);
-    const active = document.activeElement;
-    // A searchable Select moves focus to a portaled input. Continue from its
-    // combobox in the drawer rather than allowing Tab to escape to the page.
-    const controls = target.getAttribute("aria-controls");
-    const index = items.findIndex((element) => element === active ||
-      (controls !== null && element.getAttribute("role") === "combobox" && element.getAttribute("aria-controls") === controls));
-    if (items.length === 0) {
-      event.preventDefault();
-      headRef.current?.focus();
-    } else if (index === -1 || !root.contains(target) || (event.shiftKey ? index === 0 : index === items.length - 1)) {
-      event.preventDefault();
-      const next = index === -1
-        ? (event.shiftKey ? items.length - 1 : 0)
-        : (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
-      items[next]?.focus();
-    }
-  };
+    requestClose();
+  }, [preventClose, edit?.pending, triggerNudge, requestClose]);
 
-  const active = tabs.find((t) => t.id === tab) ?? tabs[0];
+  // Land on `initialFocus` (when supplied) or the heading so deep links and forms land sensibly.
+  useEffect(() => {
+    const preferred = initialFocusRef.current?.current;
+    if (preferred && preferred.isConnected) preferred.focus();
+    else headRef.current?.focus();
+  }, []);
+
+  // Bubble-phase window listener lets inner controls (Select, OverflowMenu,
+  // row menus, ConfirmDialog) handle Escape first and still catches Escape/Tab
+  // even when focus moved to `document.body` after a submit button disabled.
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!isTopmost || closing || event.defaultPrevented) return;
+      const root = panelRef.current;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      // Another higher modal overlay (ConfirmDialog or native <dialog open>) owns its keys.
+      if (document.querySelector(".s-confirm-wrap, .crm-confirm-wrap, dialog[open]") !== null) return;
+      const targetDialog = target?.closest('[role="dialog"]') ?? null;
+      if (targetDialog !== null && root !== null && targetDialog !== root) return;
+
+      if (event.key === "Escape") {
+        if (menuOpen) {
+          if (props.trapFocus) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          setMenuOpen(false);
+        } else if (edit != null) {
+          if (props.trapFocus) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          if (edit.pending || preventClose) triggerNudge();
+          else edit.onCancel();
+        } else {
+          if (props.trapFocus) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          attemptClose();
+        }
+        return;
+      }
+
+      if (!props.trapFocus || event.key !== "Tab" || !root) return;
+      event.stopPropagation();
+      const items = listFocusable(root);
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const controls = target?.getAttribute("aria-controls") ?? null;
+      const index = items.findIndex(
+        (element) =>
+          element === active ||
+          (controls !== null && element.getAttribute("role") === "combobox" && element.getAttribute("aria-controls") === controls),
+      );
+      if (items.length === 0) {
+        event.preventDefault();
+        headRef.current?.focus();
+        return;
+      }
+      const onHeading = active === headRef.current;
+      const outside = !(active instanceof Node) || !root.contains(active);
+      if (onHeading) {
+        if (event.shiftKey) {
+          event.preventDefault();
+          items[items.length - 1]?.focus();
+        } else {
+          event.preventDefault();
+          items[0]?.focus();
+        }
+        return;
+      }
+      if (outside || index === -1 || (event.shiftKey ? index === 0 : index === items.length - 1)) {
+        event.preventDefault();
+        const next =
+          outside || index === -1
+            ? event.shiftKey
+              ? items.length - 1
+              : 0
+            : (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
+        items[next]?.focus();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isTopmost, closing, props.trapFocus, menuOpen, edit, preventClose, triggerNudge, attemptClose]);
+
+  const active = tabs.find((item) => item.id === tab) ?? tabs[0];
+  const showingTabs = state == null && !editing && tabs.length > 1;
+  const activeTabId = active?.id ?? "";
+
+  // Scroll-edge shadows.
+  const measureScroll = useCallback(() => {
+    const body = bodyRef.current;
+    if (!body) return;
+    setScrolledTop(body.scrollTop > 4);
+    setScrolledBottom(body.scrollTop + body.clientHeight < body.scrollHeight - 4);
+  }, []);
+
+  useLayoutEffect(() => {
+    measureScroll();
+    const body = bodyRef.current;
+    if (!body) return;
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(measureScroll);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [measureScroll, activeTabId, editing, state, children]);
+
+  // Gliding tab underline indicator.
+  useLayoutEffect(() => {
+    if (!showingTabs) {
+      setInkStyle((prev) => (prev.ready ? { x: 0, w: 0, top: 0, ready: false } : prev));
+      return;
+    }
+    const updateInk = () => {
+      const strip = tabsRef.current;
+      if (!strip) return;
+      const selected = strip.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+      if (!selected || selected.offsetWidth === 0) {
+        setInkStyle((prev) => (prev.ready ? { x: 0, w: 0, top: 0, ready: false } : prev));
+        return;
+      }
+      setInkStyle({
+        x: selected.offsetLeft,
+        w: selected.offsetWidth,
+        top: selected.offsetTop + selected.offsetHeight - 2,
+        ready: true,
+      });
+    };
+    updateInk();
+    const strip = tabsRef.current;
+    if (!strip || typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(updateInk);
+    observer.observe(strip);
+    return () => observer.disconnect();
+  }, [showingTabs, activeTabId, tabs.length]);
+
   const onTabKey = (e: KeyboardEvent, index: number) => {
     if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
     const next = tabs[(index + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+    if (!next) return;
     setTab(next.id);
     document.getElementById(`crm-tab-${kind}-${next.id}`)?.focus();
   };
-  const hasFooter = state == null && (editing || foot != null || (menu?.length ?? 0) > 0 || secondary != null || primary != null || note != null);
-  const board = scrim === "board";
 
-  return (
+  // Mobile sheet drag-to-dismiss gesture on grab handle.
+  const onGrabDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (closing) return;
+    dragRef.current = {
+      active: true,
+      id: event.pointerId,
+      startY: event.clientY,
+      lastY: event.clientY,
+      lastAt: event.timeStamp,
+      velocity: 0,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const onGrabMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag.active || drag.id !== event.pointerId) return;
+    const dy = Math.max(0, event.clientY - drag.startY);
+    const dt = Math.max(1, event.timeStamp - drag.lastAt);
+    drag.velocity = (event.clientY - drag.lastY) / dt;
+    drag.lastY = event.clientY;
+    drag.lastAt = event.timeStamp;
+    setDragY(preventClose || edit?.pending ? Math.round(dy * 0.18) : Math.round(dy));
+  };
+  const endGrabDrag = (event: ReactPointerEvent<HTMLDivElement>, cancelled: boolean) => {
+    const drag = dragRef.current;
+    if (!drag.active || drag.id !== event.pointerId) return;
+    drag.active = false;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    const currentDragY = dragY;
+    setDragY(0);
+    if (cancelled) return;
+    if (preventClose || edit?.pending) {
+      if (currentDragY > 6) triggerNudge();
+      return;
+    }
+    const panelHeight = panelRef.current?.offsetHeight || 600;
+    if (currentDragY > Math.max(96, panelHeight * 0.28) || (currentDragY > 24 && drag.velocity > 0.55)) {
+      requestClose();
+    }
+  };
+
+  const resolvedNote = guardShown && preventCloseNote !== undefined ? preventCloseNote : note;
+  const hasFooter =
+    state == null &&
+    (editing || foot != null || (menu?.length ?? 0) > 0 || secondary != null || primary != null || resolvedNote != null);
+  const bodyContent = state ?? (editing ? edit.body : tabs.length > 0 ? active?.panel : children);
+  const panelStyle: CSSProperties | undefined =
+    dragY > 0 ? { transform: `translateY(${dragY}px)`, transition: "none" } : undefined;
+  const effectiveSize = size ?? (board ? "md" : undefined);
+
+  const tree = (
     <>
       <div
-        className="crm-drawer-scrim"
+        className={scrimClassName ? `s-drawer-scrim crm-drawer-scrim ${scrimClassName}` : "s-drawer-scrim crm-drawer-scrim"}
         style={{ left: board ? 0 : scrimLeft }}
         data-scrim={board ? "board" : undefined}
+        data-depth={depth > 0 ? String(depth) : undefined}
         data-closing={closing || undefined}
-        onClick={requestClose}
+        onClick={attemptClose}
         aria-hidden="true"
       />
       <div
-        className="crm-drawer crm-drawer-shell"
+        ref={panelRef}
+        {...(dataAttributes ?? {})}
+        className={className ? `s-drawer crm-drawer crm-drawer-shell ${className}` : "s-drawer crm-drawer crm-drawer-shell"}
         role="dialog"
         aria-modal={props.modal === true ? "true" : "false"}
         aria-label={label}
         data-drawer={kind}
         data-scrim={board ? "board" : undefined}
+        data-size={effectiveSize}
         data-mode={editing ? "edit" : "view"}
+        data-depth={depth > 0 ? String(depth) : undefined}
+        data-receded={receded ? "true" : undefined}
+        data-nudged={nudged ? "true" : undefined}
+        data-scrolled-top={scrolledTop ? "true" : undefined}
+        data-scrolled-bottom={scrolledBottom ? "true" : undefined}
         data-closing={closing || undefined}
+        style={panelStyle}
         onTransitionEnd={onTransitionEnd}
-        onKeyDown={props.trapFocus ? onModalKeyDown : undefined}
       >
-        <header className="crm-drawer-top">
-          <div className="crm-drawer-id">
-            {avatar != null && <span className="crm-drawer-avatar" aria-hidden="true">{avatar}</span>}
-            <div className="crm-drawer-titles">
-              {kicker != null && <div className="crm-drawer-kicker">{kicker}</div>}
-              <h3 ref={headRef} className="crm-drawer-title" tabIndex={-1}>
+        {board && (
+          <div
+            className="s-drawer-grab"
+            aria-hidden="true"
+            onPointerDown={onGrabDown}
+            onPointerMove={onGrabMove}
+            onPointerUp={(e) => endGrabDrag(e, false)}
+            onPointerCancel={(e) => endGrabDrag(e, true)}
+          >
+            <span className="s-drawer-grab-pill" />
+          </div>
+        )}
+        <header className="s-drawer-top crm-drawer-top">
+          <div className="s-drawer-id crm-drawer-id">
+            {avatar != null && (
+              <span className="s-drawer-avatar crm-drawer-avatar" aria-hidden="true">
+                {avatar}
+              </span>
+            )}
+            <div className="s-drawer-titles crm-drawer-titles">
+              {kicker != null && <div className="s-drawer-kicker crm-drawer-kicker">{kicker}</div>}
+              <h3 ref={headRef} className="s-drawer-title crm-drawer-title" tabIndex={-1}>
                 {title}
               </h3>
-              {subtitle != null && <div className="crm-drawer-sub">{subtitle}</div>}
-              {pills != null && <div className="crm-drawer-pills">{pills}</div>}
+              {subtitle != null && <div className="s-drawer-sub crm-drawer-sub">{subtitle}</div>}
+              {pills != null && <div className="s-drawer-pills crm-drawer-pills">{pills}</div>}
             </div>
-            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`${t("Close")} ${label.toLowerCase()}`}>
-              ✕
+            <button
+              type="button"
+              className="s-drawer-close btn btn-sm btn-ghost btn-icon"
+              onClick={attemptClose}
+              aria-label={closeLabel ?? `${t("Close")} ${label.toLowerCase()}`}
+            >
+              <IconClose size={15} />
             </button>
           </div>
           {warning != null && !editing && state == null && (
-            <p className="crm-drawer-warn" data-testid="drawer-warning">{warning}</p>
+            <p className="s-drawer-warn crm-drawer-warn" data-testid="drawer-warning">
+              {warning}
+            </p>
           )}
-          {state == null && !editing && tabs.length > 1 && (
-            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} ${t("sections")}`}>
-              {tabs.map((t, i) => (
+          {showingTabs && (
+            <div
+              ref={tabsRef}
+              className="s-drawer-tabs crm-drawer-tabs"
+              role="tablist"
+              aria-label={`${label} ${t("sections")}`}
+              data-ink-ready={inkStyle.ready ? "true" : undefined}
+            >
+              {tabs.map((tabItem, i) => (
                 <button
-                  key={t.id}
-                  id={`crm-tab-${kind}-${t.id}`}
+                  key={tabItem.id}
+                  id={`crm-tab-${kind}-${tabItem.id}`}
                   type="button"
                   role="tab"
-                  className="crm-drawer-tab"
-                  aria-selected={active?.id === t.id}
+                  className="s-drawer-tab crm-drawer-tab"
+                  aria-selected={active?.id === tabItem.id}
                   aria-controls={`crm-panel-${kind}`}
-                  tabIndex={active?.id === t.id ? 0 : -1}
-                  onClick={() => setTab(t.id)}
+                  tabIndex={active?.id === tabItem.id ? 0 : -1}
+                  onClick={() => setTab(tabItem.id)}
                   onKeyDown={(e) => onTabKey(e, i)}
                 >
-                  {t.label}
+                  {tabItem.label}
+                  {tabItem.badge}
                 </button>
               ))}
+              {inkStyle.ready && (
+                <span
+                  className="s-drawer-tab-ink"
+                  aria-hidden="true"
+                  style={{
+                    transform: `translateX(${inkStyle.x}px)`,
+                    width: `${inkStyle.w}px`,
+                    top: `${inkStyle.top}px`,
+                  }}
+                />
+              )}
             </div>
           )}
-          {editing && <h4 className="crm-drawer-edit-title">{edit.title}</h4>}
+          {editing && <h4 className="s-drawer-edit-title crm-drawer-edit-title">{edit.title}</h4>}
         </header>
         <div
-          className="crm-drawer-body"
+          ref={bodyRef}
+          className="s-drawer-body crm-drawer-body"
           id={`crm-panel-${kind}`}
-          role={state == null && !editing && tabs.length > 1 ? "tabpanel" : undefined}
-          aria-labelledby={state == null && !editing && tabs.length > 1 && active ? `crm-tab-${kind}-${active.id}` : undefined}
+          role={showingTabs ? "tabpanel" : undefined}
+          aria-labelledby={showingTabs && active ? `crm-tab-${kind}-${active.id}` : undefined}
+          onScroll={measureScroll}
         >
-          {state ?? (editing ? edit.body : active?.panel)}
+          {bodyContent}
         </div>
         {hasFooter && (
-          <footer className="crm-drawer-foot" data-state={note != null && !editing ? "read-only" : undefined}>
+          <footer
+            className="s-drawer-foot crm-drawer-foot"
+            data-state={resolvedNote != null && !editing ? "read-only" : undefined}
+          >
             {editing ? (
               <>
-                <div className="crm-drawer-actions">
+                <div className="s-drawer-actions crm-drawer-actions">
                   <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
                     {t("Cancel")}
                   </Button>
-                  <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
+                  <button
+                    type="submit"
+                    form={edit.formId}
+                    className="btn btn-sm btn-primary"
+                    disabled={edit.pending}
+                    aria-busy={edit.pending || undefined}
+                  >
                     {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
                   </button>
                 </div>
-                {note != null && <span className="crm-drawer-note">{note}</span>}
+                {resolvedNote != null && <span className="s-drawer-note crm-drawer-note">{resolvedNote}</span>}
               </>
             ) : foot != null ? (
               foot
             ) : (
               <>
-                <div className="crm-drawer-actions">
-                  {menu != null && menu.length > 0 && <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />}
+                <div className="s-drawer-actions crm-drawer-actions">
+                  {menu != null && menu.length > 0 && (
+                    <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />
+                  )}
                   {secondary}
                   {primary}
                 </div>
-                {note != null && <span className="crm-drawer-note">{note}</span>}
+                {resolvedNote != null && (
+                  <span
+                    className="s-drawer-note crm-drawer-note"
+                    data-tone={guardShown ? "warn" : undefined}
+                    role={guardShown ? "status" : undefined}
+                  >
+                    {resolvedNote}
+                  </span>
+                )}
               </>
             )}
           </footer>
@@ -330,4 +726,9 @@ export default function DrawerShell(props: DrawerShellProps) {
       </div>
     </>
   );
+
+  if (usePortal && typeof document !== "undefined" && document.body) {
+    return createPortal(tree, document.body);
+  }
+  return tree;
 }

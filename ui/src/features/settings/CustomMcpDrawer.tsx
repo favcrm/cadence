@@ -921,7 +921,8 @@ export function CustomMcpInspectDrawer({
 
   return (
     <DrawerShell
-      kind="custom-mcp" label={connection.name} kicker={t("Custom MCP server")} title={connection.name} subtitle={connection.endpoint_host}
+      kind="custom-mcp" scrim="board" modal trapFocus size="md"
+      label={connection.name} kicker={t("Custom MCP server")} title={connection.name} subtitle={connection.endpoint_host}
       pills={
         <>
           <span className={`chip ${statusChipClass(statusView.tone)}`}>{statusView.tone === "ok" && <IconCheck size={11} />}{t(statusView.label)}</span>

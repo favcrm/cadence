@@ -372,7 +372,7 @@ body {
   pointer-events: none;
 }
 .mobile-navigation-layer { position: fixed; inset: 0; z-index: 100; }
-.mobile-navigation-scrim { position: absolute; inset: 0; background: #0009; }
+.mobile-navigation-scrim { position: absolute; inset: 0; background: var(--color-scrim); }
 .mobile-navigation-drawer {
   position: absolute;
   inset: 0 auto 0 0;
@@ -2086,25 +2086,7 @@ textarea.agentform-input { height: auto; width: 100%; }
   border-color: var(--color-edge-hover);
   transform: translateY(-1px);
 }
-.needsscrim {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  background: var(--color-scrim);
-}
-.needsdrawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(24rem, 92vw);
-  z-index: 51;
-  display: flex;
-  flex-direction: column;
-  background: var(--color-ink-900);
-  border-left: 1px solid var(--color-ink-700);
-  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
-}
+.s-drawer.needsdrawer .s-drawer-body { padding: 0; }
 
 /* A group header — Decisions opens by default; the rest fold. */
 .needgroup {
@@ -2581,23 +2563,6 @@ button.refchip:hover {
    inside the rounded corners. */
 .chatdock textarea {
   scrollbar-gutter: stable;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .needsdrawer {
-    animation: drawer-in .22s cubic-bezier(.2, .8, .2, 1) both;
-  }
-  .needsscrim {
-    animation: scrim-in .18s ease both;
-  }
-}
-@keyframes drawer-in {
-  from { transform: translateX(2.5rem); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
-@keyframes scrim-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
 }
 
 /* Home: a quiet conversation desk with a separate team journal. */

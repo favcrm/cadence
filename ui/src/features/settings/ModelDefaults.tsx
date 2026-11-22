@@ -5,6 +5,7 @@ import { READ_ONLY_REASON } from "../auth/gate";
 import { WriteGate } from "../auth/WriteGate";
 import { api, ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useTranslate } from "../../lib/locale";
 import { canonicalJson } from "./modelDefaultsCompare";
 import "./agentsSettings.css";
@@ -392,45 +393,6 @@ export default function ModelDefaults() {
   const [preview, setPreview] = useState<AgentPreviewResult | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const drawerRef = useRef<HTMLElement>(null);
-  const drawerOpen = drawer !== null;
-
-  useEffect(() => {
-    if (!drawerOpen) return;
-    const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusableControls = () => Array.from(drawerRef.current?.querySelectorAll<HTMLElement>(
-      "input:not([disabled]), textarea:not([disabled]), select:not([disabled]), button:not([disabled]), a[href], [tabindex='0']",
-    ) ?? []);
-    focusableControls()[0]?.focus();
-    const keepFocus = (event: FocusEvent) => {
-      if (event.target instanceof Node && !drawerRef.current?.contains(event.target)) focusableControls()[0]?.focus();
-    };
-    const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.defaultPrevented) return;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeDrawer();
-      } else if (event.key === "Tab") {
-        const items = focusableControls();
-        const first = items[0];
-        const last = items[items.length - 1];
-        if (event.shiftKey && document.activeElement === first && last) {
-          event.preventDefault();
-          last.focus();
-        } else if (!event.shiftKey && document.activeElement === last && first) {
-          event.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener("focusin", keepFocus);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("focusin", keepFocus);
-      document.removeEventListener("keydown", onKey);
-      if (origin?.isConnected) origin.focus();
-    };
-  }, [drawerOpen]);
 
   function applySnapshot(next: AgentSettingsSnapshot) {
     setSaved(next);
@@ -1102,16 +1064,28 @@ export default function ModelDefaults() {
     }
 
     return (
-      <>
-        <div className="scrim" onClick={closeDrawer} />
-        <aside ref={drawerRef} className="drawer" role="dialog" aria-modal="true" aria-label={title || "editor"}>
-          <div className="dhead">
-            <div><div className="slabel">{kicker}</div><h2>{title}</h2></div>
-            <Button size="sm" variant="ghost" onClick={closeDrawer}>Close</Button>
+      <DrawerShell
+        kind={`agent-settings-${drawer.kind}`}
+        scrim="board"
+        modal
+        trapFocus
+        size="md"
+        label={title || "editor"}
+        kicker={kicker}
+        title={title}
+        onClose={closeDrawer}
+        foot={
+          <div className="s-drawer-actions crm-drawer-actions">
+            <Button size="sm" variant="ghost" onClick={closeDrawer}>
+              {t("Close")}
+            </Button>
           </div>
+        }
+      >
+        <div className="agents-settings agents-settings-drawer">
           <div className="dbody">{body}</div>
-        </aside>
-      </>
+        </div>
+      </DrawerShell>
     );
   }
 

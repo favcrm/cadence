@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import Button from "../../ui/Button";
 import Select, { type SelectOption } from "../../ui/Select";
-import { WorkspaceDialog } from "./WorkspaceDialog";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type CapabilityQuote } from "./workspaceApps";
 import { useTranslate } from "../../lib/locale";
@@ -67,29 +67,42 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
     setValidation(invalid);
     if (!invalid && !busy && quote) onCreate({ profileHandle: handle, ownerPm, writer });
   };
-  return <WorkspaceDialog title={t("Find Instagram source")} onClose={onClose}>
-    <form className="wa-stack" onSubmit={submit}>
-      <p className="wa-muted">{host
-        ? t("Read recent public posts through this app’s Instagram source connection. This click starts the read — no team and no separate plan approval.")
-        : t("Read recent public posts through this app’s Instagram source connection. You approve the frozen plan before a worker starts.")}</p>
-      {quote ? <p className="wa-alert">{host ? t("The source connection is ready.") : t("The source connection is ready — the plan needs your approval before the read starts.")}</p> : !quoteError && <p className="wa-muted" role="status">{t("Checking the source connection…")}</p>}
-      {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError === CONNECTION_CHANGED ? t(CONNECTION_CHANGED) : quoteError}</p>}
-      {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || t(validation ?? "")}</p>}
-      <div className="wa-field">
-        <label htmlFor="wa-profile-handle">{t("Public Instagram handle")}</label>
-        <input id="wa-profile-handle" className="wa-input" value={profileHandle} onChange={event => setProfileHandle(event.target.value)} placeholder="juicysuite_crm" maxLength={31} required disabled={busy} />
-      </div>
-      {!host && <div className="wa-fields">
+  return (
+    <DrawerShell
+      kind="source-import"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={busy}
+      label={t("Find Instagram source")}
+      title={t("Find Instagram source")}
+      closeLabel={t("Close {title}").replace("{title}", () => t("Find Instagram source"))}
+      onClose={onClose}
+    >
+      <form className="wa-stack" onSubmit={submit}>
+        <p className="wa-muted">{host
+          ? t("Read recent public posts through this app’s Instagram source connection. This click starts the read — no team and no separate plan approval.")
+          : t("Read recent public posts through this app’s Instagram source connection. You approve the frozen plan before a worker starts.")}</p>
+        {quote ? <p className="wa-alert">{host ? t("The source connection is ready.") : t("The source connection is ready — the plan needs your approval before the read starts.")}</p> : !quoteError && <p className="wa-muted" role="status">{t("Checking the source connection…")}</p>}
+        {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError === CONNECTION_CHANGED ? t(CONNECTION_CHANGED) : quoteError}</p>}
+        {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || t(validation ?? "")}</p>}
         <div className="wa-field">
-          <label htmlFor="wa-source-owner">{t("Responsible PM")}</label>
-          <Select id="wa-source-owner" value={ownerPm} onChange={value => { setOwnerPm(value); setWriter(""); }} options={managers} placeholder={t("Choose PM")} disabled={busy} full />
+          <label htmlFor="wa-profile-handle">{t("Public Instagram handle")}</label>
+          <input id="wa-profile-handle" className="wa-input" value={profileHandle} onChange={event => setProfileHandle(event.target.value)} placeholder="juicysuite_crm" maxLength={31} required disabled={busy} />
         </div>
-        <div className="wa-field">
-          <label htmlFor="wa-source-reader">{t("Reader")}</label>
-          <Select id="wa-source-reader" value={writer} onChange={setWriter} options={eligibleWorkers} placeholder={ownerPm ? t("Choose reader") : t("Choose a PM first")} disabled={busy || !ownerPm} full />
-        </div>
-      </div>}
-      <Button type="submit" variant="primary" disabled={!quote} loading={busy}>{t("Create source plan")}</Button>
-    </form>
-  </WorkspaceDialog>;
+        {!host && <div className="wa-fields">
+          <div className="wa-field">
+            <label htmlFor="wa-source-owner">{t("Responsible PM")}</label>
+            <Select id="wa-source-owner" value={ownerPm} onChange={value => { setOwnerPm(value); setWriter(""); }} options={managers} placeholder={t("Choose PM")} disabled={busy} full />
+          </div>
+          <div className="wa-field">
+            <label htmlFor="wa-source-reader">{t("Reader")}</label>
+            <Select id="wa-source-reader" value={writer} onChange={setWriter} options={eligibleWorkers} placeholder={ownerPm ? t("Choose reader") : t("Choose a PM first")} disabled={busy || !ownerPm} full />
+          </div>
+        </div>}
+        <Button type="submit" variant="primary" disabled={!quote} loading={busy}>{t("Create source plan")}</Button>
+      </form>
+    </DrawerShell>
+  );
 }

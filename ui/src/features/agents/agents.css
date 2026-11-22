@@ -55,7 +55,7 @@
 .agents-filter:focus-visible,
 .agent-name:focus-visible,
 .agents-page .lnk:focus-visible,
-.agents-drawer .lnk:focus-visible {
+.agents-drawer-body .lnk:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
   border-radius: 0.2rem;
@@ -297,54 +297,30 @@
   border: 1px solid color-mix(in srgb, var(--color-warn) 25%, transparent);
   color: var(--color-warn);
 }
-.agents-drawer {
-  position: fixed;
-  inset: 0 0 0 auto;
-  margin: 0;
-  padding: 0;
-  width: min(36rem, 100%);
-  max-width: 100%;
-  height: 100dvh;
-  max-height: 100dvh;
-  display: none;
-  flex-direction: column;
-  overflow-wrap: anywhere;
-}
-.agents-drawer[open] {
-  display: flex;
-}
-.agents-drawer::backdrop {
-  background: var(--color-scrim);
-}
-.agents-close {
-  width: 2.75rem;
-  min-height: 2.75rem;
-  flex-shrink: 0;
-}
 .agents-command,
-.agents-drawer pre,
-.agents-profile {
+.agents-drawer-body pre,
+.agents-drawer-body .agents-profile {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.agents-drawer .agents-profile {
+.agents-drawer-body .agents-profile {
   white-space: normal;
 }
-.agents-drawer .truncate {
+.agents-drawer-body .truncate {
   white-space: normal;
   overflow: visible;
 }
-.agents-drawer .chip {
+.agents-drawer-body .chip {
   max-width: 100%;
   white-space: normal;
 }
-.agents-drawer li {
+.agents-drawer-body li {
   flex-wrap: wrap;
 }
-.agents-drawer li > .num {
+.agents-drawer-body li > .num {
   min-width: 0;
 }
-.agents-drawer dd {
+.agents-drawer-body dd {
   overflow-wrap: anywhere;
 }
 @media (max-width: 639px) {
@@ -359,11 +335,11 @@
   .agents-filter,
 .agent-name,
 .agents-page .lnk,
-.agents-drawer .lnk {
+.agents-drawer-body .lnk {
     min-height: 2.75rem;
   }
   .agents-page .lnk,
-.agents-drawer .lnk {
+.agents-drawer-body .lnk {
     display: inline-flex;
     align-items: center;
   }

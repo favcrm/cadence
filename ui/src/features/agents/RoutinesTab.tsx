@@ -644,16 +644,27 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
       {creating && (
         <DrawerShell
           kind="routine-new"
+          scrim="board"
+          modal
+          trapFocus
+          size="md"
+          preventClose={busy}
           label={t("New routine")}
           title={t("New routine")}
           subtitle={`${t("Agent")}: ${c.alias}`}
           onClose={() => setCreating(false)}
-          tabs={[
-            {
-              id: "setup",
-              label: t("Setup"),
-              panel: (
-                <div className="rtn-drawer-form">
+          secondary={
+            <Button size="sm" variant="ghost" onClick={() => setCreating(false)} disabled={busy}>
+              {t("Cancel")}
+            </Button>
+          }
+          primary={
+            <Button size="sm" variant="primary" onClick={() => void submitCreate()} loading={busy}>
+              {t("Create routine")}
+            </Button>
+          }
+        >
+          <div className="rtn-drawer-form">
                   <div className="rtn-field">
                     <label htmlFor="rtn-name">{t("Name")}</label>
                     <input
@@ -880,26 +891,18 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     </p>
                   )}
                 </div>
-              ),
-            },
-          ]}
-          secondary={
-            <Button size="sm" variant="ghost" onClick={() => setCreating(false)} disabled={busy}>
-              {t("Cancel")}
-            </Button>
-          }
-          primary={
-            <Button size="sm" variant="primary" onClick={() => void submitCreate()} loading={busy}>
-              {t("Create routine")}
-            </Button>
-          }
-        />
+        </DrawerShell>
       )}
 
       {activeRoutine && (
         <DrawerShell
           key={activeRoutine.id}
           kind="routine"
+          scrim="board"
+          modal
+          trapFocus
+          size="md"
+          preventClose={busy}
           label={activeRoutine.name}
           title={activeRoutine.name}
           subtitle={`${scheduleSummary(activeRoutine, t, viewerZone)} · ${targetSummary(activeRoutine, t)}`}

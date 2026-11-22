@@ -254,11 +254,12 @@ function useConfirmEscape(active: boolean, cancel: () => void): void {
     if (!active) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      event.preventDefault();
       event.stopPropagation();
       cancel();
     };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [active, cancel]);
 }
 
@@ -794,13 +795,19 @@ function MemberDrawer({
   return (
     <DrawerShell
       kind="member"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={busy}
       label={name}
       title={name}
       avatar={initials(member.name, member.email)}
-      tabs={[{ id: "details", label: name, panel: body }]}
       foot={foot}
       onClose={onClose}
-    />
+    >
+      {body}
+    </DrawerShell>
   );
 }
 
@@ -933,12 +940,18 @@ function InviteDrawer({
   return (
     <DrawerShell
       kind="invite"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={busy}
       label={invite.email}
       title={invite.email}
-      tabs={[{ id: "details", label: invite.email, panel: body }]}
       foot={foot}
       onClose={onClose}
-    />
+    >
+      {body}
+    </DrawerShell>
   );
 }
 
@@ -959,11 +972,6 @@ function NewInviteDrawer({
   const [role, setRole] = useState<Role>("member");
   const [fieldError, setFieldError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => emailRef.current?.focus(), 0);
-    return () => window.clearTimeout(timer);
-  }, []);
 
   const send = async () => {
     if (busy) return;
@@ -1065,9 +1073,14 @@ function NewInviteDrawer({
   return (
     <DrawerShell
       kind="invite-new"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={busy}
+      initialFocus={emailRef}
       label={t("Invite member")}
       title={t("Invite member")}
-      tabs={[{ id: "details", label: t("Invite member"), panel: body }]}
       foot={
         <div className="members-foot-actions">
           <Button variant="primary" size="sm" loading={busy} onClick={() => void send()}>
@@ -1076,6 +1089,8 @@ function NewInviteDrawer({
         </div>
       }
       onClose={onClose}
-    />
+    >
+      {body}
+    </DrawerShell>
   );
 }

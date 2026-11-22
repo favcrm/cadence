@@ -72,7 +72,20 @@ export default function General({ documentPolicy }: { documentPolicy?: { hosted:
           </div>
         )}
       </section>
-      {documentPolicy && policyOpen && <DrawerShell kind="document-policy" label={t("Document policy")} title={t("Manage document types")} scrim="board" modal trapFocus tabs={[{ id: "types", label: t("Document types"), panel: <DocumentTypes {...documentPolicy} modalDrawer /> }]} onClose={() => setPolicyOpen(false)} />}
+      {documentPolicy && policyOpen && (
+        <DrawerShell
+          kind="document-policy"
+          label={t("Document policy")}
+          title={t("Manage document types")}
+          scrim="board"
+          modal
+          trapFocus
+          size="lg"
+          onClose={() => setPolicyOpen(false)}
+        >
+          <DocumentTypes {...documentPolicy} modalDrawer />
+        </DrawerShell>
+      )}
     </main>
   );
 }

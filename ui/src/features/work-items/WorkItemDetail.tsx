@@ -140,6 +140,9 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
     <DrawerShell
       kind={origin === "home" ? "review" : "work-item"}
       scrim="board"
+      modal
+      trapFocus
+      size="md"
       label={t("Work item")}
       kicker={t(workItemOriginLabel(origin))}
       title={title}

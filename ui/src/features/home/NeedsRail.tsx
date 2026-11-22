@@ -17,6 +17,7 @@ import { resources } from "../../lib/resources";
 import { routinesApi } from "../agents/routinesApi";
 import type { HostedTemplateRail } from "../templates/HostedTemplateReview";
 import Button from "../../ui/Button";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
@@ -165,28 +166,21 @@ export default function NeedsRail({
   const todo = useMemo(() => withStaged(split.todo, stagedCards), [split.todo, stagedCards]);
   // The staged detail: the ids that were waiting when it opened, and where in them it is.
   const [review, setReview] = useState<{ queue: string[]; at: number } | null>(null);
-  const [drawer, setDrawer] = useState(false);
+  const [drawerToken, setDrawerToken] = useState<number | null>(null);
+  const drawerSeq = useRef(0);
+  const drawer = drawerToken !== null;
+  const openDrawer = () => {
+    drawerSeq.current += 1;
+    setDrawerToken(drawerSeq.current);
+  };
+  const closeDrawerImmediate = () => setDrawerToken(null);
   const local = useTodoLocal();
   // A new visit to Home: earlier decided and sent marks stop applying.
   useLayoutEffect(() => { if (!privateHome) beginTodoVisit(); }, [privateHome]);
   // The floating button that owns the slide-over's focus on the way out.
   const needBtn = useRef<HTMLButtonElement | null>(null);
-  const drawerEl = useRef<HTMLElement | null>(null);
   const wasOpen = useRef(false);
   const reviewOpening = useRef(false);
-  // The <1100px drawer is a dialog: it lands focus on itself, Escape
-  // closes it, and closing hands focus back to the button that opened
-  // it. An Ask hand-off is unaffected — the composer's own focus lands
-  // after this one (child effects run before this parent's).
-  useEffect(() => {
-    if (!drawer) return;
-    drawerEl.current?.focus();
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") setDrawer(false);
-    };
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
-  }, [drawer]);
   useEffect(() => {
     // Opening a review closes the slide-over on purpose: the button behind
     // the scrim is not where focus belongs then.
@@ -197,7 +191,7 @@ export default function NeedsRail({
   // An issue opened from the slide-over leaves Home — drop the drawer so
   // a stale overlay never hangs over the navigation.
   const openIssue = (id: string) => {
-    setDrawer(false);
+    closeDrawerImmediate();
     onOpenIssue?.(id);
   };
   const [showDecided, setShowDecided] = useState(false);
@@ -246,7 +240,7 @@ export default function NeedsRail({
   const readers = cards.filter((n) => kindSpec(n).place === "drawer" && n.action.type !== "staged");
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
   const ask = (need: HomeNeed, lead?: string) => {
-    setDrawer(false);
+    closeDrawerImmediate();
     onAsk?.(need, lead);
   };
   /** One reading item, with the queue as it stood when the detail opened:
@@ -269,7 +263,7 @@ export default function NeedsRail({
     stagedOpener.current = opener;
     homeDecisions.clearNotice();
     reviewOpening.current = true;
-    setDrawer(false);
+    closeDrawerImmediate();
     setReview({ queue, at });
   };
   // CAD-2364: a chip in the thread opens the same review card, over what is waiting now.
@@ -300,7 +294,7 @@ export default function NeedsRail({
       {templateRail?.(() => {
         if (!drawer) return;
         reviewOpening.current = true;
-        setDrawer(false);
+        closeDrawerImmediate();
       })}
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {staged.notice && review === null && (
@@ -338,7 +332,7 @@ export default function NeedsRail({
           <button type="button" className="lnk" onClick={() => void resources.overview.refresh()}>{t("Retry")}</button>
         </p>
       )}
-      {pendingDocuments.length > 0 && <DocumentFollowUpRows rows={pendingDocuments} onOpen={() => setDrawer(false)} />}
+      {pendingDocuments.length > 0 && <DocumentFollowUpRows rows={pendingDocuments} onOpen={closeDrawerImmediate} />}
       {routineActionErr && (
         <p className="px-3 py-2 text-micro text-fail break-words" role="alert">
           {routineActionErr}
@@ -390,7 +384,7 @@ export default function NeedsRail({
                   {href && <Link
                     href={href}
                     className="btn btn-sm btn-secondary"
-                    onClick={() => setDrawer(false)}
+                    onClick={closeDrawerImmediate}
                   >
                     {t("Review")}
                   </Link>}
@@ -435,7 +429,7 @@ export default function NeedsRail({
                   {href && <Link
                     href={href}
                     className="btn btn-sm btn-secondary"
-                    onClick={() => setDrawer(false)}
+                    onClick={closeDrawerImmediate}
                   >
                     {t("Review")}
                   </Link>}
@@ -462,7 +456,7 @@ export default function NeedsRail({
                 {href && <Link
                   href={href}
                   className="btn btn-sm btn-secondary shrink-0"
-                  onClick={() => setDrawer(false)}
+                  onClick={closeDrawerImmediate}
                 >
                   {t("Review")}
                 </Link>}
@@ -486,7 +480,7 @@ export default function NeedsRail({
             onHide={hideTodo}
             onDone={doneTodo}
             onSent={() => {
-              setDrawer(false);
+              closeDrawerImmediate();
               onSent?.();
             }}
           />
@@ -513,7 +507,7 @@ export default function NeedsRail({
                   </li>
                 ))}
               </ul>
-              {permissionsHref && <Link href={permissionsHref} className="lnk text-label" onClick={() => setDrawer(false)}>
+              {permissionsHref && <Link href={permissionsHref} className="lnk text-label" onClick={closeDrawerImmediate}>
                 {t("Standing rules are in Settings")}
               </Link>}
             </>
@@ -525,7 +519,7 @@ export default function NeedsRail({
 
   const updatesBody = (
     <>
-      {recentDocuments.length > 0 && <DocumentFollowUpRows rows={recentDocuments} onOpen={() => setDrawer(false)} recent />}
+      {recentDocuments.length > 0 && <DocumentFollowUpRows rows={recentDocuments} onOpen={closeDrawerImmediate} recent />}
       {privateHome && recentDocuments.length === 0 && (
         <p className="px-3 py-2.5 text-label text-ink-400">{t(documentFollowUps?.status === "loading" ? "Reading document follow-ups…" : documentFollowUps?.status === "unavailable" ? "Document follow-ups could not be loaded." : "No recent document activity.")}</p>
       )}
@@ -558,7 +552,7 @@ export default function NeedsRail({
       )}
       {onAskAgent && <AgentUpdates
         onAsk={(agent, update) => {
-          setDrawer(false);
+          closeDrawerImmediate();
           onAskAgent(agent, update);
         }}
         onOpenIssue={openIssue}
@@ -566,7 +560,7 @@ export default function NeedsRail({
     </>
   );
 
-  const tabs = (drawerMode: boolean) => (
+  const tabs = (
     <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
       <button aria-pressed={tab === "todo"} onClick={() => showTab("todo")}>
         {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{countKnown ? count : "…"}</span>
@@ -577,11 +571,6 @@ export default function NeedsRail({
           <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
         )}
       </button>
-      {drawerMode && (
-        <button type="button" className="lnk text-label todo-close" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
-          ✕
-        </button>
-      )}
     </div>
   );
 
@@ -592,7 +581,7 @@ export default function NeedsRail({
       {/* The desktop column scrolls independently of the conversation. */}
       <div className="hidden rail:block h-full min-h-0">
         <section className="card needsrail overflow-hidden" aria-label={t("to do")}>
-          {tabs(false)}
+          {tabs}
           <div className="rail-scroll min-h-0">{panelBody}</div>
         </section>
       </div>
@@ -602,7 +591,7 @@ export default function NeedsRail({
         type="button"
         className="needbtn rail:hidden"
         ref={needBtn}
-        onClick={() => setDrawer(true)}
+        onClick={openDrawer}
         aria-label={t("to do — {count} waiting; open the list").replace("{count}", String(count))}
       >
         {t("To do")}
@@ -621,21 +610,42 @@ export default function NeedsRail({
           onClose={closeStaged}
         />
       )}
-      {drawer && (
-        <>
-          <div className="needsscrim rail:hidden" onClick={() => setDrawer(false)} />
-          <section
-            className="needsdrawer rail:hidden"
-            role="dialog"
-            aria-label={t("to do")}
-            aria-modal="true"
-            tabIndex={-1}
-            ref={drawerEl}
-          >
-            {tabs(true)}
-            <div className="rail-scroll min-h-0 flex-1">{panelBody}</div>
-          </section>
-        </>
+      {drawerToken !== null && (
+        <DrawerShell
+          key={drawerToken}
+          kind="needs"
+          scrim="board"
+          modal
+          trapFocus
+          size="sm"
+          className="needsdrawer rail:hidden"
+          scrimClassName="rail:hidden"
+          closeLabel={t("close the rail")}
+          label={t("to do")}
+          title={t("To do")}
+          tab={tab}
+          onTab={(next) => showTab(next as "todo" | "updates")}
+          tabs={[
+            {
+              id: "todo",
+              label: `${t("To do")} ${countKnown ? count : "…"}`,
+              panel: <div className="rail-scroll min-h-0 flex-1">{todoBody}</div>,
+            },
+            {
+              id: "updates",
+              label: t("Updates"),
+              badge:
+                staged.failedUnseen && tab !== "updates" ? (
+                  <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
+                ) : undefined,
+              panel: <div className="rail-scroll min-h-0 flex-1">{updatesBody}</div>,
+            },
+          ]}
+          onClose={() => {
+            const closingToken = drawerToken;
+            setDrawerToken((cur) => (cur === closingToken ? null : cur));
+          }}
+        />
       )}
 
     </>

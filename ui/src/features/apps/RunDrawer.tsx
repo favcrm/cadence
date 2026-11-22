@@ -1,7 +1,6 @@
-import { useEffect } from "react";
 import type { AppDetail as AppDetailRow, AppRun } from "../../lib/types";
-import { IconClose } from "../../ui/icons";
 import { useTranslate } from "../../lib/locale";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import RunForm from "../projects/RunForm";
 import type { Viewer } from "../projects/work";
 import {
@@ -36,13 +35,6 @@ export default function RunDrawer({
   onOpenIssue: (id: string) => void;
   onHome: () => void;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
   const t = useTranslate();
   const row = (app.workflows ?? []).find((w) => w.name === wf);
   if (!row) return null;
@@ -56,51 +48,38 @@ export default function RunDrawer({
   // never the engine's "new run" (CAD-571).
   const title = row.label?.trim() || "New run";
   return (
-    <>
-      <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
-      <aside
-        className="drawer fixed top-0 right-0 h-full w-full sm:w-[42rem] bg-ink-875 border-l border-ink-700 z-30 flex flex-col"
-        aria-label={t("new run of {name}").replace("{name}", () => row.name)}
-      >
-        <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
-          <div className="min-w-0 flex-1">
-            <div className="text-label text-ink-500">{t("in")} {project} · {title}</div>
-            <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
-              {title}
-            </h2>
-          </div>
-          <button
-            aria-label={t("Close")}
-            onClick={onClose}
-            className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
-          >
-            <IconClose style={{ pointerEvents: "none" }} />
-          </button>
-        </header>
-        <div className="overflow-y-auto min-w-0">
-          <RunForm
-            row={appWorkflowRow(project, app, row)}
-            viewer={viewer}
-            onOpenIssue={onOpenIssue}
-            onHome={onHome}
-            app={{
-              primary,
-              prefill: team,
-              slugInput,
-              title,
-              start: startLabel(title),
-              // The rules in plain words: the plan waits for the
-              // operator, and nothing goes out without them.
-              note: t("It waits for your approval before anything runs. Nothing is published without your OK."),
-              // Live checks: the folder name's shape, and a team that
-              // breaks the workflow's kept-apart rule (shown only then).
-              validate: (values) =>
-                (slugInput ? slugProblem(values[slugInput] ?? "") : null) ??
-                distinctProblem(row, values),
-            }}
-          />
-        </div>
-      </aside>
-    </>
+    <DrawerShell
+      kind="app-run"
+      scrim="board"
+      modal
+      trapFocus
+      size="lg"
+      label={t("new run of {name}").replace("{name}", () => row.name)}
+      kicker={`${t("in")} ${project} · ${title}`}
+      title={title}
+      onClose={onClose}
+    >
+      <RunForm
+        row={appWorkflowRow(project, app, row)}
+        viewer={viewer}
+        onOpenIssue={onOpenIssue}
+        onHome={onHome}
+        app={{
+          primary,
+          prefill: team,
+          slugInput,
+          title,
+          start: startLabel(title),
+          // The rules in plain words: the plan waits for the
+          // operator, and nothing goes out without them.
+          note: t("It waits for your approval before anything runs. Nothing is published without your OK."),
+          // Live checks: the folder name's shape, and a team that
+          // breaks the workflow's kept-apart rule (shown only then).
+          validate: (values) =>
+            (slugInput ? slugProblem(values[slugInput] ?? "") : null) ??
+            distinctProblem(row, values),
+        }}
+      />
+    </DrawerShell>
   );
 }

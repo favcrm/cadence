@@ -61,8 +61,8 @@ export function useDrawerClose(onClose: () => void): {
     if (closing || done.current) return;
     setClosing(true);
     // Safety net: if no transition runs (reduced-motion, no CSS), the
-    // close still lands on the next tick — never a stuck-open drawer.
-    timer.current = window.setTimeout(finish, 320);
+    // close still lands promptly — never a stuck-open drawer.
+    timer.current = window.setTimeout(finish, 260);
   }, [closing, finish]);
 
   const onTransitionEnd = useCallback(

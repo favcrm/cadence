@@ -68,20 +68,10 @@
 .rc-badge { display: inline-flex; align-items: center; border: 1px solid var(--color-ink-700); border-radius: 999px; padding: 0.1rem 0.5rem; font-size: var(--text-micro); color: var(--color-ink-400); }
 .rc-empty { border: 1px solid var(--color-ink-700); border-radius: 0.5rem; padding: 1.5rem; text-align: center; color: var(--color-ink-500); font-size: var(--text-label); background: var(--color-ink-850); }
 
-/* hire sheet: a right drawer, a bottom sheet on phones */
-.rc-sheet { position: fixed; inset: 0 0 0 auto; margin: 0; padding: 0; width: min(460px, 100%); max-width: 100%; height: 100dvh; max-height: 100dvh; display: none; flex-direction: column; overflow-wrap: anywhere; box-shadow: -18px 0 60px rgb(0 0 0 / 0.35); }
-.rc-sheet[open] { display: flex; }
-.rc-sheet::backdrop { background: var(--color-scrim); }
-@media (max-width: 700px) {
-  .rc-sheet { inset: auto 0 0 0; width: 100%; height: 92dvh; max-height: 92dvh; border-radius: 14px 14px 0 0; border-left: 0; border-top: 1px solid var(--color-ink-700); box-shadow: none; }
-}
-.rc-sheet-h { display: flex; gap: 0.75rem; align-items: center; padding: 1rem 1.1rem; border-bottom: 1px solid var(--color-ink-700); flex: none; }
-.rc-sheet-h .t { color: var(--color-ink-100); font-size: var(--text-section); font-weight: 600; }
-.rc-sheet-h .s { color: var(--color-ink-500); font-size: var(--text-label); }
-.rc-sheet-h .x { margin-left: auto; }
+/* Body spacing for profile & hire detail sections */
 .rc-sheet-b { flex: 1; overflow: auto; padding: 1rem 1.1rem 1.25rem; display: grid; gap: 1.1rem; align-content: start; }
-.rc-sheet-f { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; padding: 0.75rem 1.1rem; border-top: 1px solid var(--color-ink-700); flex: none; }
-.rc-sheet-f .why { color: var(--color-ink-500); font-size: var(--text-label); margin-right: auto; }
+.s-drawer .rc-sheet-b { flex: initial; overflow: visible; padding: 0; }
+[data-drawer="hire"] .rc-connect { margin-top: 0; }
 .rc-blk h4 { margin: 0 0 0.5rem; color: var(--color-ink-400); font-size: var(--text-label); font-weight: 500; }
 .rc-does { margin: 0; padding-left: 1.1rem; list-style: disc; color: var(--color-ink-300); font-size: var(--text-secondary); line-height: 1.6; }
 .rc-fld { display: grid; gap: 0.4rem; }
@@ -283,8 +273,7 @@ textarea.ap-doc-text { min-height: max(24rem, 55vh); font-family: var(--font-mon
 .sk-switch { display: flex; align-items: center; gap: 0.5rem; flex: none; color: var(--color-ink-300); font-size: var(--text-label); white-space: nowrap; }
 .sk-switch[data-state="off"] { color: var(--color-ink-500); }
 .sk-state { color: var(--color-ink-300); font-size: var(--text-label); white-space: nowrap; }
-.crm-drawer.crm-drawer-shell[data-drawer="skill"] { width: min(35rem, 100dvw); }
-.crm-drawer[data-drawer="skill"] .crm-drawer-pills { align-items: center; }
+.s-drawer[data-drawer="skill"] .s-drawer-pills { align-items: center; }
 .sk-rev { color: var(--color-ink-500); font-size: var(--text-label); }
 .sk-assign { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.75rem 0.9rem; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-850); }
 .sk-assign b { color: var(--color-ink-100); font-weight: 500; font-size: var(--text-secondary); }

@@ -6,7 +6,7 @@ import type { Viewer } from "../projects/work";
 import type { Agent, AppContext, InstallTeam, Installation, WorkspaceRun } from "../workspace-apps/workspaceApps";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { retainedRequest, completeRequest } from "../workspace-apps/requests";
-import { WorkspaceDialog } from "../workspace-apps/WorkspaceDialog";
+import DrawerShell from "./shared/DrawerShell";
 import { TeamSettings } from "../workspace-apps/TeamSettings";
 import "../workspace-apps/workspace-apps.css";
 
@@ -235,7 +235,17 @@ export default function RunLauncher({
   };
 
   return (
-    <WorkspaceDialog title={title} onClose={close}>
+    <DrawerShell
+      kind="run-launcher"
+      scrim="board"
+      modal
+      trapFocus
+      size="lg"
+      preventClose={busy}
+      label={title}
+      title={title}
+      onClose={close}
+    >
       {error !== null && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
       {showTeamSettings ? (
         <div className="wa-stack">
@@ -374,6 +384,6 @@ export default function RunLauncher({
           </Button>
         </form>
       )}
-    </WorkspaceDialog>
+    </DrawerShell>
   );
 }

@@ -261,13 +261,13 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
   for (const [kind, names] of drawerControls) {
     await click(labelled(card(kind), "Review"));
     await settle(() => {
-      const d = host.querySelector('[data-drawer="review"]');
+      const d = document.querySelector('[data-drawer="review"]');
       assert(d && names.every((n) => labelled(d, n)), `${kind} drawer controls render`);
     });
-    const drawer = host.querySelector('[data-drawer="review"]')!;
+    const drawer = document.querySelector('[data-drawer="review"]')!;
     for (const name of names) assert(isDisabled(labelled(drawer, name)!), `read-only disables "${name}" in the ${kind} drawer`);
     await click(labelled(drawer, "Not now"));
-    await settle(() => assert(!host.querySelector('[data-drawer="review"]'), "Not now closes the drawer"));
+    await settle(() => assert(!document.querySelector('[data-drawer="review"]'), "Not now closes the drawer"));
   }
   assert(posts.length === 0, "a read-only board sends nothing");
   await done();
@@ -277,8 +277,8 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
 async function publish() {
   const view = await render([rows.merge], false);
   await click(labelled(view.card("merge_decision"), "Review"));
-  await settle(() => assert(labelled(view.host.querySelector('[data-drawer="review"]')!, "Publish"), "merge drawer renders"));
-  const drawer = view.host.querySelector('[data-drawer="review"]')!;
+  await settle(() => assert(labelled(document.querySelector('[data-drawer="review"]')!, "Publish"), "merge drawer renders"));
+  const drawer = document.querySelector('[data-drawer="review"]')!;
   await settle(() => assert(!isDisabled(labelled(drawer, "Publish")!), "Publish is offered for a row that names its head"));
   await click(labelled(drawer, "Publish"));
   return { ...view, drawer };
@@ -308,12 +308,12 @@ async function publish() {
 // ---- a refused plan decision shows plain words in the drawer, never the server's text ----
 {
   replies = { "/api/plans/D-1/approve": { status: 409, body: { error: "plan already decided: run cadence plan approve D-1 (pid 55)" } } };
-  const { host, card, done } = await render([rows.plan], false);
+  const { card, done } = await render([rows.plan], false);
   await click(labelled(card("plan"), "Review"));
-  await settle(() => assert(!isDisabled(labelled(host.querySelector('[data-drawer="review"]')!, "Approve plan") ?? ({ disabled: true } as HTMLButtonElement)), "plan drawer ready"));
-  await click(labelled(host.querySelector('[data-drawer="review"]')!, "Approve plan"));
-  await settle(() => assert(host.querySelector('[data-drawer="review"] .rv-error'), "a refused decision shows an error"));
-  const text = host.querySelector('[data-drawer="review"] .rv-error')!.textContent ?? "";
+  await settle(() => assert(!isDisabled(labelled(document.querySelector('[data-drawer="review"]')!, "Approve plan") ?? ({ disabled: true } as HTMLButtonElement)), "plan drawer ready"));
+  await click(labelled(document.querySelector('[data-drawer="review"]')!, "Approve plan"));
+  await settle(() => assert(document.querySelector('[data-drawer="review"] .rv-error'), "a refused decision shows an error"));
+  const text = document.querySelector('[data-drawer="review"] .rv-error')!.textContent ?? "";
   assert(!/cadence|pid/.test(text), `no server text or command in the drawer, got ${JSON.stringify(text)}`);
   await done();
 }
@@ -372,8 +372,8 @@ const stoppedW1 = { ...rows.stopped, subject: { kind: "agent", id: "w1" } };
   replies = { "/api/plans/D-1/approve": { status: 200, body: { state: "approved" } } };
   const v = await render([rows.plan], false);
   await click(labelled(v.card("plan"), "Review"));
-  await settle(() => assert(!isDisabled(labelled(v.host.querySelector('[data-drawer="review"]')!, "Approve plan") ?? ({ disabled: true } as HTMLButtonElement)), "plan drawer ready"));
-  await click(labelled(v.host.querySelector('[data-drawer="review"]')!, "Approve plan"));
+  await settle(() => assert(!isDisabled(labelled(document.querySelector('[data-drawer="review"]')!, "Approve plan") ?? ({ disabled: true } as HTMLButtonElement)), "plan drawer ready"));
+  await click(labelled(document.querySelector('[data-drawer="review"]')!, "Approve plan"));
   await settle(() => assert(/Plan approved/.test(v.card("plan").textContent ?? ""), "the approved card says so"));
   const ready = { ...rows.blocked, kind: "blocked_ready", subject: { kind: "issue", id: "D-1" } };
   await v.update([ready], false);
@@ -467,7 +467,7 @@ for (const row of [
   // within one visit, closing and reopening the narrow slide-over keeps the card sent
   const v = await render([rows.blocked], false);
   await click(v.host.querySelector(".needbtn"));
-  const slide = () => v.host.querySelector(".needsdrawer") as HTMLElement | null;
+  const slide = () => document.querySelector(".needsdrawer") as HTMLElement | null;
   await click(labelled(slide()!.querySelector('[data-need="blocked"]')!, "Fix it"));
   await settle(() => assert(!slide() || /Sent to Master/.test(slide()!.textContent ?? ""), "sent"));
   if (slide()) await click(slide()!.querySelector('[aria-label="close the rail"]'));
@@ -503,7 +503,7 @@ for (const row of [
   approval = { state: "in-force", approval_id: "a1", board_revocable: true };
   const v = await render([rows.merge], false);
   await click(labelled(v.card("merge_decision"), "Review"));
-  const drawer = () => v.host.querySelector('[data-drawer="review"]')!;
+  const drawer = () => document.querySelector('[data-drawer="review"]')!;
   await settle(() => assert(labelled(drawer(), "Take my approval back"), "an approval on record can be taken back"));
   assert(!isDisabled(labelled(drawer(), "Take my approval back")!), "writable: take-back is enabled");
   await v.update([rows.merge], true);
@@ -539,7 +539,7 @@ for (const row of [
   approval = { state: "missing", verdicts: boardVerdicts };
   const ro = await render([rows.merge], true, { hosted: true });
   await click(labelled(ro.card("merge_decision"), "Review"));
-  const drawer = () => ro.host.querySelector('[data-drawer="review"]')!;
+  const drawer = () => document.querySelector('[data-drawer="review"]')!;
   await settle(() => assert(labelled(drawer(), "Approve this version"), "hosted merge renders primary Approve this version"));
   assert(!labelled(drawer(), "Publish"), "hosted merge hides local Publish button");
   assert(labelled(drawer(), "Ask for changes…"), "hosted merge renders Ask for changes…");
@@ -550,7 +550,7 @@ for (const row of [
   const rw = await render([rows.merge], false, { hosted: true });
   approvalStateUrls.length = 0;
   await click(labelled(rw.card("merge_decision"), "Review"));
-  const d = () => rw.host.querySelector('[data-drawer="review"]')!;
+  const d = () => document.querySelector('[data-drawer="review"]')!;
   await settle(() => assert(!isDisabled(labelled(d(), "Approve this version")!), "writable hosted approval enabled"));
   assert(
     approvalStateUrls.some((u) => u.includes("issue=D-2") && u.includes("project=demo")),
@@ -608,18 +608,18 @@ for (const row of [
   };
   const localView = await render([noIssueRow], false, { hosted: false });
   await click(labelled(localView.card("merge_decision"), "Review"));
-  await settle(() => assert(localView.host.querySelector('[data-review-verb="Publish change"]'), "non-hosted merge uses Publish change verb"));
+  await settle(() => assert(document.querySelector('[data-review-verb="Publish change"]'), "non-hosted merge uses Publish change verb"));
   assert(
-    (localView.host.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Publish a change"),
+    (document.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Publish a change"),
     "non-hosted merge falls back to Publish a change title",
   );
   await localView.done();
 
   const hostedFallback = await render([noIssueRow], false, { hosted: true });
   await click(labelled(hostedFallback.card("merge_decision"), "Review"));
-  await settle(() => assert(hostedFallback.host.querySelector('[data-review-verb="Approve change"]'), "hosted merge uses Approve change verb"));
+  await settle(() => assert(document.querySelector('[data-review-verb="Approve change"]'), "hosted merge uses Approve change verb"));
   assert(
-    (hostedFallback.host.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Approve a change"),
+    (document.querySelector('[data-drawer="review"]')?.textContent ?? "").includes("Approve a change"),
     "hosted merge falls back to Approve a change title",
   );
   await hostedFallback.done();
@@ -636,7 +636,7 @@ for (const row of [
   };
   const staleView = await render([rows.merge], false, { hosted: true });
   await click(labelled(staleView.card("merge_decision"), "Review"));
-  const staleDrawer = () => staleView.host.querySelector('[data-drawer="review"]')!;
+  const staleDrawer = () => document.querySelector('[data-drawer="review"]')!;
   await settle(() => assert(labelled(staleDrawer(), "Local enqueue command"), "40-hex head exposes Local enqueue command"));
   const verdictText = staleDrawer().querySelector(".rv-verdicts")?.textContent ?? "";
   assert(verdictText.includes(`${oldSha.slice(0, 12)} · older version`), `mismatched verdict SHA renders older version badge (${verdictText})`);
@@ -648,16 +648,16 @@ for (const row of [
   approval = { state: "in-force", approval_id: "a-64", board_revocable: false, verdicts: [] };
   const view64 = await render([sha64Row], false, { hosted: true });
   await click(labelled(view64.card("merge_decision"), "Review"));
-  await settle(() => assert(labelled(view64.host.querySelector('[data-drawer="review"]')!, "Local enqueue command"), "64-hex head exposes Local enqueue command"));
+  await settle(() => assert(labelled(document.querySelector('[data-drawer="review"]')!, "Local enqueue command"), "64-hex head exposes Local enqueue command"));
   await view64.done();
 
   const midLenRow = { ...rows.merge, merge: { ...rows.merge.merge, sha: "a".repeat(45) } };
   approval = { state: "in-force", approval_id: "a-mid", board_revocable: false, verdicts: [] };
   const midView = await render([midLenRow], false, { hosted: true });
   await click(labelled(midView.card("merge_decision"), "Review"));
-  await settle(() => assert(labelled(midView.host.querySelector('[data-drawer="review"]')!, "Done"), "approved hosted drawer renders with 45-char head"));
+  await settle(() => assert(labelled(document.querySelector('[data-drawer="review"]')!, "Done"), "approved hosted drawer renders with 45-char head"));
   assert(
-    !labelled(midView.host.querySelector('[data-drawer="review"]')!, "Local enqueue command"),
+    !labelled(document.querySelector('[data-drawer="review"]')!, "Local enqueue command"),
     "45-char non-SHA hex head must not expose Local enqueue command",
   );
   approval = { state: "missing" };

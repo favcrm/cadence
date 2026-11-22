@@ -47,38 +47,38 @@ async function click(element: Element | null | undefined) {
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function choose(id: string, label: string) {
-  await click(host.querySelector(`#${id}`));
+  await click(document.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
-  assert(option?.closest("dialog") === host.querySelector("dialog"), "Options stay inside the active dialog");
+  assert(option && !option.closest("[inert]"), "Options stay reachable and not inside an inert ancestor");
   await click(option);
 }
 async function fill(selector: string, value: string) {
-  const element = host.querySelector(selector) as HTMLInputElement;
+  const element = document.querySelector(selector) as HTMLInputElement;
   assert(element, "Field exists");
   await React.act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(element, value); element.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 async function fillPrompt(selector: string, value: string) {
-  const element = host.querySelector(selector) as HTMLTextAreaElement;
+  const element = document.querySelector(selector) as HTMLTextAreaElement;
   assert(element, "Prompt field exists");
   await React.act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(element, value); element.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 async function main() {
   await React.act(async () => root.render(React.createElement(NewPost, props))); await flush();
-  assert(reads === 1 && host.textContent?.includes("image option is ready"), "Operator sees the image option resolve before choosing a plan");
+  assert(reads === 1 && document.body.textContent?.includes("image option is ready"), "Operator sees the image option resolve before choosing a plan");
   // CAD-1129: no cost or price text anywhere in the board.
-  assert(!host.textContent?.includes("USD") && !host.textContent?.includes("price") && !host.textContent?.includes("billed"), "the board shows no price or cost text");
+  assert(!document.body.textContent?.includes("USD") && !document.body.textContent?.includes("price") && !document.body.textContent?.includes("billed"), "the board shows no price or cost text");
   await fill("#wa-post-title", "Customer follow-up");
   await choose("wa-workflow", "Instagram caption and image");
-  assert((host.querySelector("#wa-post-source") as HTMLTextAreaElement).readOnly, "Selected source facts stay immutable");
-  assert((host.querySelector("#wa-content-prompt") as HTMLTextAreaElement).value === "Fav Limited content", "Saved content prompt is prefilled");
-  assert((host.querySelector("#wa-image-prompt") as HTMLTextAreaElement).value === "Fav Limited image", "Saved image prompt is prefilled");
+  assert((document.querySelector("#wa-post-source") as HTMLTextAreaElement).readOnly, "Selected source facts stay immutable");
+  assert((document.querySelector("#wa-content-prompt") as HTMLTextAreaElement).value === "Fav Limited content", "Saved content prompt is prefilled");
+  assert((document.querySelector("#wa-image-prompt") as HTMLTextAreaElement).value === "Fav Limited image", "Saved image prompt is prefilled");
   await fillPrompt("#wa-content-prompt", "One post content override");
   await fillPrompt("#wa-image-prompt", "One post image override");
-  assert(host.textContent?.includes("this post’s override"), "Effective prompt preview identifies overrides before creation");
+  assert(document.body.textContent?.includes("this post’s override"), "Effective prompt preview identifies overrides before creation");
   await fillPrompt("#wa-image-prompt", "");
-  assert(host.textContent?.includes("Fav Limited image"), "Clearing the image prompt restores its saved default in the preview");
+  assert(document.body.textContent?.includes("Fav Limited image"), "Clearing the image prompt restores its saved default in the preview");
   await choose("wa-owner", "pm-a"); await choose("wa-writer", "writer-a"); await choose("wa-reviewer", "reviewer-a");
-  await click(Array.from(host.querySelectorAll("button")).find(value => value.textContent?.trim() === "Create plan"));
+  await click(Array.from(document.querySelectorAll("button")).find(value => value.textContent?.trim() === "Create plan"));
   assert(created.length === 1 && created[0].workflow === "image-instagram" && created[0].sourceReceiptId === "source-receipt" && created[0].selectedPostId === "post-a", "Image plan pins the retained source and selected post");
   assert(created[0].contentPrompt === "One post content override" && created[0].imagePrompt === undefined, "Only nonempty per-post overrides are submitted");
   await React.act(async () => root.unmount());
@@ -87,16 +87,16 @@ async function main() {
   await fill("#wa-post-title", "Manual facts post");
   await fillPrompt("#wa-post-source", "Fav Limited helps teams manage customer relationships.");
   await choose("wa-workflow", "Caption and image from pasted facts");
-  assert(!(host.querySelector("#wa-image-prompt") as HTMLTextAreaElement).disabled, "Manual facts can use the quoted image workflow");
+  assert(!(document.querySelector("#wa-image-prompt") as HTMLTextAreaElement).disabled, "Manual facts can use the quoted image workflow");
   await choose("wa-owner", "pm-a"); await choose("wa-writer", "writer-a"); await choose("wa-reviewer", "reviewer-a");
-  await click(Array.from(host.querySelectorAll("button")).find(value => value.textContent?.trim() === "Create plan"));
+  await click(Array.from(document.querySelectorAll("button")).find(value => value.textContent?.trim() === "Create plan"));
   assert(created[1]?.workflow === "image-manual" && !created[1].sourceReceiptId, "Manual image run uses pasted facts without inventing a retained source receipt");
   await React.act(async () => manualRoot.unmount());
   const badHost = document.createElement("div"); document.body.append(badHost);
   currentQuote = { ...quote, binding_digest: "stale-binding" };
   const badRoot = createRoot(badHost);
   await React.act(async () => badRoot.render(React.createElement(NewPost, props))); await flush();
-  assert(badHost.textContent?.includes("image connection changed or is unavailable"), "Stale binding quote is explained");
+  assert(document.body.textContent?.includes("image connection changed or is unavailable"), "Stale binding quote is explained");
   await React.act(async () => badRoot.unmount());
   console.log("social image priced plan flow passed");
 }

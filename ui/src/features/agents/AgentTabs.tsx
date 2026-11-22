@@ -161,11 +161,16 @@ function ItemDrawer({ title, onClose, children }: { title: string; onClose: () =
   return (
     <DrawerShell
       kind="agent-item"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
       label={title}
       title={title}
-      tabs={[{ id: "details", label: title, panel: <div className="ap-body">{children}</div> }]}
       onClose={onClose}
-    />
+    >
+      <div className="ap-body">{children}</div>
+    </DrawerShell>
   );
 }
 
@@ -1265,6 +1270,10 @@ function SkillDrawer({
     <>
       <DrawerShell
         kind="skill"
+        scrim="board"
+        modal
+        trapFocus
+        size="md"
         label={name}
         title={name}
         subtitle={ready?.revision.description}
@@ -1637,7 +1646,7 @@ function KnowledgeSection({ c }: { c: TabContext }) {
 }
 
 /** The gear: everything about the agent that isn't one of its sections. */
-export function SettingsDrawer({ c, onClose }: { c: TabContext; onClose: () => void }) {
+export function AgentSettingsDrawer({ c, onClose }: { c: TabContext; onClose: () => void }) {
   const t = useTranslate();
   const body = (
     <div className="ap-body">
@@ -1655,12 +1664,17 @@ export function SettingsDrawer({ c, onClose }: { c: TabContext; onClose: () => v
   return (
     <DrawerShell
       kind="agent-settings"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
       label={t("Agent settings")}
       title={t("Settings")}
       subtitle={c.alias}
-      tabs={[{ id: "settings", label: t("Settings"), panel: body }]}
       onClose={onClose}
-    />
+    >
+      {body}
+    </DrawerShell>
   );
 }
 
