@@ -1037,8 +1037,7 @@ pub fn redact_secrets(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::net::TcpListener;
+    use crate::private_app_update::test_helpers;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1115,20 +1114,7 @@ mod tests {
         review_id: String,
         profile_tools: Option<Vec<String>>,
     ) -> (String, RecordedRequests, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let mut hasher = Sha256::new();
-        hasher.update(&zip_bytes);
-        let computed_hex = {
-            use std::fmt::Write as _;
-            let mut s = String::with_capacity(64);
-            for b in hasher.finalize() {
-                let _ = write!(&mut s, "{b:02x}");
-            }
-            s
-        };
-        let digest_hex = override_digest.unwrap_or(computed_hex);
+        let digest_hex = override_digest.unwrap_or_else(|| test_helpers::sha256_hex(&zip_bytes));
         let zip_sha256 = format!("sha256:{digest_hex}");
         let pkg_digest = format!("sha256:{}", "d".repeat(64));
         let recorded = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
@@ -1137,160 +1123,60 @@ mod tests {
         let total = zip_bytes.len();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&zip_bytes);
 
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(64) {
-                let Ok(mut stream) = stream else { break };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let mut header_end = None;
-                while header_end.is_none() {
-                    let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+        let (endpoint, handle) = test_helpers::spawn_platform_loopback(
+            64,
+            art_id,
+            digest_hex.clone(),
+            move |path, req| match path {
+                "/__platform/wiki/call" => {
+                    let action = req["action"].as_str().unwrap_or("").to_string();
+                    recorded_srv
+                        .lock()
+                        .unwrap()
+                        .push((action, req["arguments"].clone()));
+                    (200, json!({"entries": []}))
                 }
-                let Some(hend) = header_end else { continue };
-                let headers = String::from_utf8_lossy(&buf[..hend]).to_string();
-                let path = headers
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-                let content_len = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (k, v) = line.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                while buf.len() < hend + content_len {
-                    let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                let body_bytes = &buf[hend..hend + content_len];
-                let (status, resp_json): (u16, Value) = match path.as_str() {
-                    "/__platform/cli/authorize" => (
-                        200,
-                        json!({"version": "hosted-cadence-cli.v1", "envelope": "hdr.pay.sig"}),
-                    ),
-                    "/__platform/wiki/authorize" => (
-                        200,
-                        json!({"version": "hosted-cadence-wiki.v1", "envelope": "hdr.pay.sig"}),
-                    ),
-                    "/__platform/wiki/call" => {
-                        let req: Value = serde_json::from_slice(body_bytes).unwrap_or(json!({}));
-                        let action = req["action"].as_str().unwrap_or("").to_string();
-                        recorded_srv
-                            .lock()
-                            .unwrap()
-                            .push((action, req["arguments"].clone()));
-                        (200, json!({"entries": []}))
-                    }
-                    "/__platform/artifacts/upload" => (
-                        200,
-                        json!({"file": {"id": art_id, "version": 1, "digest": digest_hex}}),
-                    ),
-                    "/__platform/cli/call" => {
-                        let req: Value = serde_json::from_slice(body_bytes).unwrap_or(json!({}));
-                        let verb = req["verb"].as_str().unwrap_or("").to_string();
-                        let args = req["arguments"].clone();
-                        recorded_srv
-                            .lock()
-                            .unwrap()
-                            .push((verb.clone(), args.clone()));
-                        match verb.as_str() {
-                            "issue_show" => (200, issue_payload.clone()),
-                            "issue_history" => (200, json!({"comments": []})),
-                            "agent_profile_show" => match &profile_tools {
-                                Some(tools) => (
-                                    200,
-                                    json!({
-                                        "profile": {
-                                            "id": args["id"],
-                                            "enabled_tools": tools,
-                                        }
-                                    }),
-                                ),
-                                None => (404, json!({"ok": false, "code": "not_found"})),
-                            },
-                            "artifact_show" => (
+                "/__platform/cli/call" => {
+                    let verb = req["verb"].as_str().unwrap_or("").to_string();
+                    let args = req["arguments"].clone();
+                    recorded_srv
+                        .lock()
+                        .unwrap()
+                        .push((verb.clone(), args.clone()));
+                    match verb.as_str() {
+                        "issue_show" => (200, issue_payload.clone()),
+                        "issue_history" => (200, json!({"comments": []})),
+                        "agent_profile_show" => match &profile_tools {
+                            Some(tools) => (
                                 200,
-                                json!({
-                                    "versions": [{
-                                        "id": args["id"],
-                                        "version": 1,
-                                        "kind": "private-app-zip",
-                                        "title": "app-update.zip",
-                                        "bytes": total,
-                                        "digest": digest_hex,
-                                    }]
-                                }),
+                                json!({"profile": {"id": args["id"], "enabled_tools": tools}}),
                             ),
-                            "artifact_read" => (
+                            None => (404, json!({"ok": false, "code": "not_found"})),
+                        },
+                        "artifact_show" => (
+                            200,
+                            json!({"versions": [{"id": args["id"], "version": 1, "kind": "private-app-zip", "title": "app-update.zip", "bytes": total, "digest": digest_hex}]}),
+                        ),
+                        "artifact_read" => (
+                            200,
+                            json!({
+                                "file": {"id": args["id"], "version": 1, "kind": "private-app-zip", "title": "app-update.zip", "bytes": total, "digest": digest_hex},
+                                "offset": 0, "total": total, "content_base64": b64,
+                            }),
+                        ),
+                        "platform_call" => {
+                            let tool = args["tool"].as_str().unwrap_or("");
+                            (
                                 200,
-                                json!({
-                                    "file": {
-                                        "id": args["id"],
-                                        "version": 1,
-                                        "kind": "private-app-zip",
-                                        "title": "app-update.zip",
-                                        "bytes": total,
-                                        "digest": digest_hex,
-                                    },
-                                    "offset": 0,
-                                    "total": total,
-                                    "content_base64": b64,
-                                }),
-                            ),
-                            "platform_call" => {
-                                let tool = args["tool"].as_str().unwrap_or("");
-                                let data = match tool {
-                                    "private_app_review_request" => json!({
-                                        "id": review_id,
-                                        "state": "pending",
-                                        "outcome": "awaiting_approval",
-                                        "digest": pkg_digest,
-                                        "zip_sha256": zip_sha256,
-                                    }),
-                                    "private_app_review_status" => json!({
-                                        "id": review_id,
-                                        "state": "pending",
-                                        "outcome": "authorized",
-                                    }),
-                                    "private_app_review_apply" | "private_app_review_reconcile" => {
-                                        json!({
-                                            "id": review_id,
-                                            "state": "installed",
-                                            "outcome": "applied",
-                                        })
-                                    }
-                                    _ => json!({}),
-                                };
-                                (200, json!({"ok": true, "data": data}))
-                            }
-                            _ => (404, json!({"ok": false, "code": "not_found"})),
+                                json!({"ok": true, "data": test_helpers::review_tool_data(tool, &review_id, &pkg_digest, &zip_sha256)}),
+                            )
                         }
+                        _ => (404, json!({"ok": false, "code": "not_found"})),
                     }
-                    _ => (404, json!({"ok": false, "code": "not_found"})),
-                };
-                let body_str = resp_json.to_string();
-                let response = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
-                    body_str.len()
-                );
-                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
-            }
-        });
+                }
+                _ => (404, json!({"ok": false, "code": "not_found"})),
+            },
+        );
         (endpoint, recorded, handle)
     }
 
@@ -1320,14 +1206,7 @@ mod tests {
                     }
                 }
             },
-            "artifacts": [
-                {
-                    "id": art_id,
-                    "kind": "private-app-zip",
-                    "version": 1,
-                    "name": "my-app.zip"
-                }
-            ]
+            "artifacts": [{"id": art_id, "kind": "private-app-zip", "version": 1, "name": "my-app.zip"}]
         });
 
         let (endpoint, recorded, handle) = spawn_mock_board(
@@ -1339,30 +1218,16 @@ mod tests {
         );
         // Dispatcher login deliberately lacks cli.write: readiness must come from the updater profile's cadence_writes.
         let auth_dir = write_login(&root, &endpoint, &["cli.read", "wiki.read"]);
-        let target = RemoteTarget {
-            org: "acme".into(),
-            endpoint: endpoint.clone(),
-            org_id: "org_1".into(),
-            identity: Some(remote_cli::CliIdentityPin {
-                subject_id: "sub_12345".into(),
-                issuer: "https://auth.example".into(),
-            }),
-        };
+        let target = test_helpers::remote_target(&endpoint);
         let message_id = "msg-delivery-e2e";
-        let kickoff = Kickoff {
-            alias: "updater-codex",
-            issue_id: "CAD-2584",
-            assignment_id: "hla_test1",
-            worktree: "/tmp/wt-e2e",
+        let kickoff = test_helpers::kickoff(
+            "updater-codex",
+            "CAD-2584",
+            "/tmp/wt-e2e",
             message_id,
-            claim_id: "hlc_test1",
-            generation: 1,
-            organization_id: "org_1",
-            audience: &endpoint,
-            subject_id: Some("sub_12345"),
-            issuer: Some("https://auth.example"),
-            profile_id: Some("ap_updater"),
-        };
+            &endpoint,
+            Some("ap_updater"),
+        );
 
         let delivered_text = Arc::new(Mutex::new(String::new()));
         let delivered_text_cb = Arc::clone(&delivered_text);
@@ -1384,14 +1249,12 @@ mod tests {
         assert!(text.contains(&format!("Private app package_ref: {art_id}")));
         assert!(text.contains("agents/ap_updater"));
         let zip_path =
-            crate::local_assignment::reporting::private_app_package_path(&state_dir, message_id)
-                .unwrap();
+            super::super::reporting::private_app_package_path(&state_dir, message_id).unwrap();
         assert!(zip_path.exists());
         assert!(!text.contains(&zip_path.display().to_string()));
-        let binding =
-            crate::local_assignment::reporting::hosted_binding_target(&state_dir, message_id)
-                .unwrap()
-                .unwrap();
+        let binding = super::super::reporting::hosted_binding_target(&state_dir, message_id)
+            .unwrap()
+            .unwrap();
         let pkg = binding.private_app_package.expect("package custody bound");
         assert_eq!(pkg.artifact_ref, art_id);
         assert_eq!(pkg.file_name, "app-update.zip");
@@ -1401,105 +1264,41 @@ mod tests {
         assert_eq!(note_json["private_app_package"]["package_ref"], art_id);
 
         // Now run Codex MCP lifecycle (prepare -> status -> apply -> reconcile) using bound custody.
-        let cred_path =
-            crate::local_assignment::reporting::agent_credential_path(&state_dir, message_id)
-                .unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let slot = test_helpers::write_agent_slot(&state_dir, message_id, &target);
+        let invoke = |tool, args: Value| -> Value {
+            serde_json::from_str(
+                &crate::mcp_agent::invoke_private_app_tool_with(
+                    &auth_dir, &state_dir, message_id, &target, &slot, tool, &args, 10,
+                )
+                .unwrap(),
+            )
             .unwrap()
-            .as_secs();
-        fs::write(
-            &cred_path,
-            json!({
-                "version": "cadence-agent-credential.v1",
-                "assignment_id": "hla_test1",
-                "claim_id": "hlc_test1",
-                "generation": 1,
-                "organization_id": "org_1",
-                "audience": endpoint,
-                "capabilities": ["cli.read", "cli.write"],
-                "access_token": format!("hct_{}", "a".repeat(43)),
-                "expires_at": now + 600,
-            })
-            .to_string(),
-        )
-        .unwrap();
-        fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let slot = remote_cli::AgentSlot::new(
-            cred_path,
-            &target,
-            "hla_test1".into(),
-            "hlc_test1".into(),
-            1,
+        };
+        assert_eq!(
+            invoke(
+                "private_app_prepare",
+                json!({"package_ref": pkg.artifact_ref})
+            )["data"]["id"],
+            review_id
+        );
+        assert_eq!(
+            invoke("private_app_status", json!({"id": review_id}))["data"]["outcome"],
+            "authorized"
+        );
+        assert_eq!(
+            invoke(
+                "private_app_apply",
+                json!({"id": review_id, "digest": pkg_digest, "zip_sha256": pkg.zip_sha256})
+            )["data"]["state"],
+            "installed"
+        );
+        assert_eq!(
+            invoke("private_app_reconcile", json!({"id": review_id}))["data"]["outcome"],
+            "applied"
         );
 
-        let prepared: Value = serde_json::from_str(
-            &crate::mcp_agent::invoke_private_app_tool_with(
-                &auth_dir,
-                &state_dir,
-                message_id,
-                &target,
-                &slot,
-                "private_app_prepare",
-                &json!({"package_ref": pkg.artifact_ref}),
-                10,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(prepared["data"]["id"], review_id);
-
-        let status: Value = serde_json::from_str(
-            &crate::mcp_agent::invoke_private_app_tool_with(
-                &auth_dir,
-                &state_dir,
-                message_id,
-                &target,
-                &slot,
-                "private_app_status",
-                &json!({"id": review_id}),
-                10,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(status["data"]["outcome"], "authorized");
-
-        let applied: Value = serde_json::from_str(
-            &crate::mcp_agent::invoke_private_app_tool_with(
-                &auth_dir,
-                &state_dir,
-                message_id,
-                &target,
-                &slot,
-                "private_app_apply",
-                &json!({"id": review_id, "digest": pkg_digest, "zip_sha256": pkg.zip_sha256}),
-                10,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(applied["data"]["state"], "installed");
-
-        let reconciled: Value = serde_json::from_str(
-            &crate::mcp_agent::invoke_private_app_tool_with(
-                &auth_dir,
-                &state_dir,
-                message_id,
-                &target,
-                &slot,
-                "private_app_reconcile",
-                &json!({"id": review_id}),
-                10,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reconciled["data"]["outcome"], "applied");
-
         // Settle binding and confirm custody ZIP is deleted.
-        crate::local_assignment::reporting::settle_binding_for_test(&state_dir, message_id)
-            .unwrap();
+        super::super::reporting::settle_binding_for_test(&state_dir, message_id).unwrap();
         assert!(!zip_path.exists());
 
         let log = recorded.lock().unwrap();
@@ -1518,304 +1317,173 @@ mod tests {
         let art_id = format!("art-{}", "2".repeat(32));
         let zip_bytes = b"PK\x03\x04\x14\x00\x00\x00\x00\x00negative-test".to_vec();
         let review_id = format!("par_{}", "a".repeat(32));
-
-        let base_issue = |fm: Value, artifacts: Value| {
-            json!({
-                "issue": {
-                    "id": "CAD-2584",
-                    "title": "Update App",
-                    "frontmatter": { "private_app_update": fm }
-                },
-                "artifacts": artifacts,
-            })
-        };
         let one_art =
             json!([{"id": art_id, "kind": "private-app-zip", "version": 1, "name": "app.zip"}]);
-
-        struct NegCase<'a> {
-            label: &'a str,
-            issue_payload: Value,
-            adapter_val: Option<&'a str>,
-            caps: &'a [&'a str],
-            profile_tools: Option<Vec<&'a str>>,
-            bad_digest: Option<&'a str>,
-            profile_id: Option<&'a str>,
-            expected_substr: &'a str,
-        }
-
-        let cases = vec![
-            NegCase {
-                label: "personal_assistant",
-                issue_payload: base_issue(
-                    json!({"updater_agent": "service/pa_1"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "personal_assistant_excluded",
-            },
-            NegCase {
-                label: "chat_default_only",
-                issue_payload: base_issue(
-                    json!({"default_app_agent": "agents/ap_chat"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "chat_default_not_updater",
-            },
-            NegCase {
-                label: "chat_default_claimed_as_profile",
-                issue_payload: base_issue(json!({"default_app_agent": "ap_chat"}), one_art.clone()),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_chat"),
-                expected_substr: "chat_default_not_updater",
-            },
-            NegCase {
-                label: "explicit_chat_default_only_flag",
-                issue_payload: base_issue(
-                    json!({"updater_agent": "agents/ap_chat", "is_chat_default_only": true}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_chat"),
-                expected_substr: "chat_default_not_updater",
-            },
-            NegCase {
-                label: "missing_write_scope",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_upd"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                // Dispatcher login has cli.write, but updater profile lacks cadence_writes.
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["read_only"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "missing_write_scope",
-            },
-            NegCase {
-                label: "unsupported_adapter",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_upd"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("claude/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "adapter_upload_unsupported",
-            },
-            NegCase {
-                label: "server_unknown_not_ready",
-                issue_payload: base_issue(
-                    json!({
-                        "dedicated_updater": "agents/ap_upd",
-                        "server_readiness": { "ready": false, "actor": "agents/ap_upd", "reasons": ["policy_locked"] }
-                    }),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "server_not_ready",
-            },
-            NegCase {
-                label: "server_actor_service_override",
-                issue_payload: base_issue(
-                    json!({
-                        "dedicated_updater": "agents/ap_upd",
-                        "server_readiness": { "ready": true, "actor": "service/pa_1", "reasons": [] }
-                    }),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "personal_assistant_excluded",
-            },
-            NegCase {
-                label: "claimed_profile_mismatch",
-                issue_payload: base_issue(
-                    json!({"updater_agent": "agents/ap_other"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_claimed"),
-                expected_substr: "actor_mismatch",
-            },
-            NegCase {
-                label: "corrupt_digest",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_upd"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: Some(
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                ),
-                profile_id: Some("ap_upd"),
-                expected_substr: "digest",
-            },
-            NegCase {
-                label: "ambiguous_multiple_artifacts",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_upd"}),
-                    json!([
-                        {"id": art_id, "kind": "private-app-zip", "version": 1, "name": "a.zip"},
-                        {"id": format!("art-{}", "3".repeat(32)), "kind": "private-app-zip", "version": 1, "name": "b.zip"},
-                    ]),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_upd"),
-                expected_substr: "multiple private-app-zip",
-            },
-            NegCase {
-                label: "absent_claimed_profile",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_upd"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: None,
-                expected_substr: "actor_mismatch",
-            },
-            NegCase {
-                label: "chat_default_as_dedicated_updater",
-                issue_payload: base_issue(
-                    json!({"dedicated_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_chat"),
-                expected_substr: "chat_default_not_updater",
-            },
-            NegCase {
-                label: "chat_default_as_workspace_default_updater",
-                issue_payload: base_issue(
-                    json!({"workspace_default_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
-                    one_art.clone(),
-                ),
-                adapter_val: Some("codex/managed"),
-                caps: &["cli.read", "cli.write", "wiki.read"],
-                profile_tools: Some(vec!["cadence_writes"]),
-                bad_digest: None,
-                profile_id: Some("ap_chat"),
-                expected_substr: "chat_default_not_updater",
-            },
-        ];
-
-        for (idx, case) in cases.into_iter().enumerate() {
-            let NegCase {
-                label,
-                issue_payload,
-                adapter_val,
-                caps,
-                profile_tools,
-                bad_digest,
-                profile_id,
-                expected_substr,
-            } = case;
+        let mut idx = 0usize;
+        let mut run = |lbl: &str,
+                       fm: Value,
+                       ad: &str,
+                       tool: &str,
+                       bd: Option<&str>,
+                       pid: Option<&str>,
+                       arts: Option<Value>,
+                       exp: &str| {
+            let issue_payload = json!({
+                "issue": { "id": "CAD-2584", "title": "Update App", "frontmatter": { "private_app_update": fm } },
+                "artifacts": arts.unwrap_or_else(|| one_art.clone()),
+            });
             let state_dir = root.join(format!("state-{idx}"));
+            idx += 1;
             fs::create_dir_all(&state_dir).unwrap();
-            let (endpoint, _rec, handle) = spawn_mock_board(
+            let (ep, _r, h) = spawn_mock_board(
                 issue_payload,
                 zip_bytes.clone(),
-                bad_digest.map(str::to_string),
+                bd.map(str::to_string),
                 review_id.clone(),
-                profile_tools.map(|v| v.into_iter().map(str::to_string).collect()),
+                Some(vec![tool.to_string()]),
             );
-            write_login(&root, &endpoint, caps);
-            let target = RemoteTarget {
-                org: "acme".into(),
-                endpoint: endpoint.clone(),
-                org_id: "org_1".into(),
-                identity: Some(remote_cli::CliIdentityPin {
-                    subject_id: "sub_12345".into(),
-                    issuer: "https://auth.example".into(),
-                }),
-            };
+            write_login(&root, &ep, &["cli.read", "cli.write", "wiki.read"]);
+            let tgt = test_helpers::remote_target(&ep);
             let msg_id = format!("msg-neg-{idx}");
-            let kickoff = Kickoff {
-                alias: "updater",
-                issue_id: "CAD-2584",
-                assignment_id: "hla_test1",
-                worktree: "/tmp/wt-neg",
-                message_id: &msg_id,
-                claim_id: "hlc_test1",
-                generation: 1,
-                organization_id: "org_1",
-                audience: &endpoint,
-                subject_id: Some("sub_12345"),
-                issuer: Some("https://auth.example"),
-                profile_id,
-            };
-            let send_called = Arc::new(AtomicBool::new(false));
-            let send_called_cb = Arc::clone(&send_called);
-            let adapter_owned = adapter_val.map(str::to_string);
+            let ko = test_helpers::kickoff("updater", "CAD-2584", "/tmp/wt-neg", &msg_id, &ep, pid);
+            let sent = Arc::new(AtomicBool::new(false));
+            let sent_cb = Arc::clone(&sent);
+            let ad_opt = Some(ad.to_string());
             let err = deliver_kickoff_with_adapter(
-                &target,
+                &tgt,
                 &state_dir,
-                &kickoff,
+                &ko,
                 10,
-                &|| adapter_owned.clone(),
+                &|| ad_opt.clone(),
                 &|_| {
-                    send_called_cb.store(true, Ordering::SeqCst);
+                    sent_cb.store(true, Ordering::SeqCst);
                     Ok(json!({}))
                 },
             )
             .unwrap_err();
-            assert!(!send_called.load(Ordering::SeqCst), "{label} called send");
+            assert!(!sent.load(Ordering::SeqCst), "{lbl} called send");
+            assert!(err.to_string().contains(exp), "{lbl}: {err}");
             assert!(
-                err.to_string().contains(expected_substr),
-                "{label}: unexpected error {err}"
-            );
-            assert!(
-                crate::local_assignment::reporting::hosted_binding_target(&state_dir, &msg_id)
+                super::super::reporting::hosted_binding_target(&state_dir, &msg_id)
                     .unwrap()
                     .is_none(),
-                "{label} wrote .bind"
+                "{lbl} wrote .bind"
             );
             assert!(
-                !crate::local_assignment::reporting::private_app_package_path(&state_dir, &msg_id)
+                !super::super::reporting::private_app_package_path(&state_dir, &msg_id)
                     .unwrap()
                     .exists(),
-                "{label} wrote .zip"
+                "{lbl} wrote .zip"
             );
-            drop(handle);
-        }
+            drop(h);
+        };
+        let kv = |k: &str, v: &str| json!({k: v});
+        let mut n = |l, fm, p, e| run(l, fm, "codex/managed", "cadence_writes", None, p, None, e);
+
+        n(
+            "personal_assistant",
+            kv("updater_agent", "service/pa_1"),
+            None,
+            "personal_assistant_excluded",
+        );
+        n(
+            "chat_default_only",
+            kv("default_app_agent", "agents/ap_chat"),
+            None,
+            "chat_default_not_updater",
+        );
+        n(
+            "chat_default_claimed_as_profile",
+            kv("default_app_agent", "ap_chat"),
+            Some("ap_chat"),
+            "chat_default_not_updater",
+        );
+        n(
+            "explicit_chat_default_only_flag",
+            json!({"updater_agent": "agents/ap_chat", "is_chat_default_only": true}),
+            Some("ap_chat"),
+            "chat_default_not_updater",
+        );
+        n(
+            "server_unknown_not_ready",
+            json!({"dedicated_updater": "agents/ap_upd", "server_readiness": {"ready": false, "actor": "agents/ap_upd", "reasons": ["policy_locked"]}}),
+            None,
+            "server_not_ready",
+        );
+        n(
+            "server_actor_service_override",
+            json!({"dedicated_updater": "agents/ap_upd", "server_readiness": {"ready": true, "actor": "service/pa_1", "reasons": []}}),
+            None,
+            "personal_assistant_excluded",
+        );
+        n(
+            "claimed_profile_mismatch",
+            kv("updater_agent", "agents/ap_other"),
+            Some("ap_claimed"),
+            "actor_mismatch",
+        );
+        n(
+            "absent_claimed_profile",
+            kv("dedicated_updater", "agents/ap_upd"),
+            None,
+            "actor_mismatch",
+        );
+        n(
+            "chat_default_as_dedicated_updater",
+            json!({"dedicated_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
+            Some("ap_chat"),
+            "chat_default_not_updater",
+        );
+        n(
+            "chat_default_as_workspace_default_updater",
+            json!({"workspace_default_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
+            Some("ap_chat"),
+            "chat_default_not_updater",
+        );
+
+        let ded = kv("dedicated_updater", "agents/ap_upd");
+        run(
+            "missing_write_scope",
+            ded.clone(),
+            "codex/managed",
+            "read_only",
+            None,
+            None,
+            None,
+            "missing_write_scope",
+        );
+        run(
+            "unsupported_adapter",
+            ded.clone(),
+            "claude/managed",
+            "cadence_writes",
+            None,
+            None,
+            None,
+            "adapter_upload_unsupported",
+        );
+        run(
+            "corrupt_digest",
+            ded.clone(),
+            "codex/managed",
+            "cadence_writes",
+            Some(&"0".repeat(64)),
+            Some("ap_upd"),
+            None,
+            "digest",
+        );
+        run(
+            "ambiguous_multiple_artifacts",
+            ded,
+            "codex/managed",
+            "cadence_writes",
+            None,
+            Some("ap_upd"),
+            Some(
+                json!([{"id": art_id, "kind": "private-app-zip", "version": 1, "name": "a.zip"}, {"id": format!("art-{}", "3".repeat(32)), "kind": "private-app-zip", "version": 1, "name": "b.zip"}]),
+            ),
+            "multiple private-app-zip",
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1839,29 +1507,15 @@ mod tests {
             None,
         );
         write_login(&root, &endpoint, &["cli.read", "cli.write", "wiki.read"]);
-        let target = RemoteTarget {
-            org: "acme".into(),
-            endpoint: endpoint.clone(),
-            org_id: "org_1".into(),
-            identity: Some(remote_cli::CliIdentityPin {
-                subject_id: "sub_12345".into(),
-                issuer: "https://auth.example".into(),
-            }),
-        };
-        let kickoff = Kickoff {
-            alias: "worker",
-            issue_id: "CAD-9999",
-            assignment_id: "hla_test9",
-            worktree: "/tmp/wt-9",
-            message_id: "msg-noop-9",
-            claim_id: "hlc_test9",
-            generation: 1,
-            organization_id: "org_1",
-            audience: &endpoint,
-            subject_id: Some("sub_12345"),
-            issuer: Some("https://auth.example"),
-            profile_id: None,
-        };
+        let target = test_helpers::remote_target(&endpoint);
+        let kickoff = test_helpers::kickoff(
+            "worker",
+            "CAD-9999",
+            "/tmp/wt-9",
+            "msg-noop-9",
+            &endpoint,
+            None,
+        );
         let adapter_calls = AtomicUsize::new(0);
         let out = deliver_kickoff_with_adapter(
             &target,
