@@ -80,7 +80,7 @@ import {
   type OperationEnvelope,
   type OperationScopeSql,
 } from "./operation-scope.ts";
-import { runtimeProfile } from "./profile.ts";
+import { runtimeProfile, skillFreeRuntimeProfile } from "./profile.ts";
 import { runtimeSkillSources } from "./workspace-skills.ts";
 import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
@@ -230,7 +230,8 @@ export class HostedSession<
     this.registry.install(intentGuard(options.toolRefusal));
     // Install after intentGuard so policy and authority refusals always take precedence.
     this.registry.install(loopGuardExtension(this.loopGuard));
-    this.registry.install(runtimeProfile);
+    const skillsEnabled = options.builtInSkills !== false;
+    this.registry.install(skillsEnabled ? runtimeProfile : skillFreeRuntimeProfile);
     // Pi's token-based cut may fall inside the current operation, including
     // an artifact read. Decline rather than silently summarize that input.
     this.registry.install({
@@ -324,14 +325,14 @@ export class HostedSession<
           this.ctx.storage.sql as unknown as TaskSql,
           options.captureOperationReplies === true,
         );
-        // The bundled skills are engine-owned, so they are wrapped here with
-        // the same refusal and live authorization an application tool gets.
-        // CAD-2395: a workspace's approved skills come last, so a bundled
-        // skill of the same name always wins.
-        const sources = await runtimeSkillSources(
-          options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills!(),
-        );
-        this.registry.install(authorizeExtension(await skills(sources), authority));
+        if (skillsEnabled) {
+          // The bundled skills are engine-owned and get the same live
+          // authorization as application tools. Workspace skills come last.
+          const sources = await runtimeSkillSources(
+            options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills!(),
+          );
+          this.registry.install(authorizeExtension(await skills(sources), authority));
+        }
         return Harness.open(
           storage,
           {

@@ -614,17 +614,23 @@ export function readOperationReply(
       conversationId, JSON.stringify(operationId)).toArray();
     if (bodies.length !== 1 || bodies[0]?.id !== row.id) return unconfirmed;
     const submission = parseRecord(row.record);
-    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
-      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
-    if (!receipt || submission === null || submission.type !== "input" ||
+    if (submission === null || submission.type !== "input" ||
         submission.id !== row.id || submission.conversationId !== conversationId ||
-        submission.requestId !== operationId || submission.status !== row.status ||
-        receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) ||
-        receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) ||
-        receipt.answer_id !== (submission.answer ?? null)) return unconfirmed;
+        submission.requestId !== operationId || submission.status !== row.status) return unconfirmed;
     if (submission.entry !== undefined &&
         (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
       return unconfirmed;
+    if (submission.status === "queued" || submission.status === "placed") {
+      if ((submission.status === "placed") !== (submission.entry !== undefined) ||
+          submission.answer !== undefined || submission.reason !== undefined ||
+          submission.detail !== undefined) return unconfirmed;
+      return { state: "pending", operationId };
+    }
+    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
+      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
+    if (!receipt || receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) ||
+        receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) ||
+        receipt.answer_id !== (submission.answer ?? null)) return unconfirmed;
     if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
       return { state: "unanswered", operationId };
     const answerId = submission.answer;

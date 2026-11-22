@@ -30,6 +30,7 @@ import { BrowserCard } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
 import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
+import AppConsultation from "./AppConsultation";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -764,6 +765,7 @@ export default function Home({
   viewerSub = null,
   viewerIsMember = false,
   sessionId = null,
+  consultationSession = null,
   overview,
   documentFollowUps,
   onOpenIssue,
@@ -800,6 +802,7 @@ export default function Home({
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
   sessionId?: string | null;
+  consultationSession?: string | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
@@ -868,6 +871,7 @@ export default function Home({
       <MasterHome
         readOnly={readOnly}
         hosted={hosted}
+        consultationSession={consultationSession}
         overview={overview}
         documentFollowUps={documentFollowUps}
         onOpenIssue={onOpenIssue}
@@ -892,6 +896,7 @@ export default function Home({
 function MasterHome({
   readOnly,
   hosted = null,
+  consultationSession,
   overview,
   documentFollowUps,
   onOpenIssue,
@@ -908,6 +913,7 @@ function MasterHome({
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  consultationSession: string | null;
   credentialRequestsEnabled?: boolean;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
@@ -1685,6 +1691,12 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {!effectiveReadOnly && consultationSession && (
+                <AppConsultation key={consultationSession} session={consultationSession} onCompose={(text) => {
+                  fillComposer(text);
+                  window.requestAnimationFrame(focusHomeComposer);
+                }} />
+              )}
               {compactHome && latestLabel && (
                 <button
                   type="button"
