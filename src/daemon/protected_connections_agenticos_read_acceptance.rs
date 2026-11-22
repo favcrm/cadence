@@ -1349,6 +1349,7 @@ fn cad2508_native_membership_mode_enforces_workspace_and_rejects_deployment() {
     }
 }
 
+#[cfg(feature = "test-seam")]
 fn call_credential_entry_rpc(shared: &Arc<Shared>, method: &str, params: &Value) -> Result<Value> {
     crate::daemon::credential_entry_rpc::rpc_credential_entry(
         shared,
@@ -1359,6 +1360,7 @@ fn call_credential_entry_rpc(shared: &Arc<Shared>, method: &str, params: &Value)
     )
 }
 
+#[cfg(feature = "test-seam")]
 fn mint_entry_proof_and_nonce(
     shared: &Arc<Shared>,
     entry_origin: &str,
@@ -1411,6 +1413,7 @@ fn mint_entry_proof_and_nonce(
     (proof, nonce)
 }
 
+#[cfg(feature = "test-seam")]
 fn vault_record_count(vault_dir: &std::path::Path) -> i64 {
     let conn = rusqlite::Connection::open_with_flags(
         vault_dir.join("custody.sqlite3"),
@@ -1421,6 +1424,7 @@ fn vault_record_count(vault_dir: &std::path::Path) -> i64 {
         .expect("count vault records")
 }
 
+#[cfg(feature = "test-seam")]
 fn credential_record_count(shared: &Shared) -> i64 {
     shared
         .store
@@ -1433,6 +1437,7 @@ fn credential_record_count(shared: &Shared) -> i64 {
         .unwrap()
 }
 
+#[cfg(feature = "test-seam")]
 #[test]
 fn cad2508_real_enroll_rpc_enforces_shape_and_scope_before_vault_write() {
     let dir = TempDir::new().expect("tempdir");
