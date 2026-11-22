@@ -94,15 +94,33 @@ async function main() {
   const tick = (ms = 20) => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
 
   try {
-    // ---- 1. Mobile drawer CSS rules in styles.css ----
+    // ---- 1. Mobile drawer CSS & .rail-card .rc-head rules sit outside @layer components ----
     const css = fs.readFileSync(path.join(processMod.cwd(), "src/styles.css"), "utf8");
+    const layerStart = css.indexOf("@layer components {", css.indexOf("/* ---- CAD-574:"));
+    assert(layerStart > 0, "located CAD-574 @layer components block in styles.css");
+    let depth = 0;
+    let layerClose = -1;
+    for (let i = css.indexOf("{", layerStart); i < css.length; i++) {
+      if (css[i] === "{") depth += 1;
+      else if (css[i] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          layerClose = i + 1;
+          break;
+        }
+      }
+    }
+    assert(layerClose > layerStart, "located closing brace of CAD-574 @layer components block");
+    const layeredCss = css.slice(layerStart, layerClose);
+    const unlayeredCss = css.slice(layerClose);
     assert(
-      /\.s-drawer\.needsdrawer\s*\.s-drawer-body[\s\S]*padding-inline:\s*0;[\s\S]*scrollbar-gutter:\s*auto;/m.test(css),
-      "styles.css zeroes horizontal padding and scrollbar-gutter on .s-drawer.needsdrawer .s-drawer-body",
+      !layeredCss.includes(".s-drawer.needsdrawer .s-drawer-body") &&
+        /\.s-drawer\.needsdrawer\s*\.s-drawer-body[\s\S]*padding-inline:\s*0;[\s\S]*scrollbar-gutter:\s*auto;/m.test(unlayeredCss),
+      "styles.css zeroes horizontal padding and scrollbar-gutter on .s-drawer.needsdrawer .s-drawer-body outside @layer components",
     );
     assert(
-      /@media\s*\(max-width:\s*860px\)\s*\{[\s\S]*\.s-drawer\.needsdrawer\[data-scrim="board"\]\s*\.s-drawer-body\s*\{[\s\S]*padding-inline:\s*0;/m.test(css),
-      "styles.css overrides drawer.css mobile horizontal padding on .s-drawer.needsdrawer",
+      /@media\s*\(max-width:\s*860px\)\s*\{[\s\S]*\.s-drawer\.needsdrawer\[data-scrim="board"\]\s*\.s-drawer-body\s*\{[\s\S]*padding-inline:\s*0;/m.test(unlayeredCss),
+      "styles.css overrides drawer.css mobile horizontal padding on .s-drawer.needsdrawer outside @layer components",
     );
     assert(
       css.includes(".s-drawer.needsdrawer .seg-pill"),
@@ -114,8 +132,9 @@ async function main() {
       "styles.css collapses adjacent visible .rail-cards boundaries without collapsing after [hidden]",
     );
     assert(
-      /\.rail-card\s+\.rc-head\s*\{[\s\S]*flex-wrap:\s*nowrap;[\s\S]*margin:\s*0;/m.test(css),
-      "styles.css scopes .rail-card .rc-head with margin: 0 and flex-wrap: nowrap",
+      !layeredCss.includes(".rail-card .rc-head") &&
+        /\.rail-card\s+\.rc-head\s*\{[\s\S]*flex-wrap:\s*nowrap;[\s\S]*margin:\s*0;/m.test(unlayeredCss),
+      "styles.css scopes .rail-card .rc-head with margin: 0 and flex-wrap: nowrap outside @layer components",
     );
     assert(
       !/^\.rc-head\s*\{/m.test(css),

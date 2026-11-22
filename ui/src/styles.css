@@ -2087,16 +2087,6 @@ textarea.agentform-input { height: auto; width: 100%; }
   border-color: var(--color-edge-hover);
   transform: translateY(-1px);
 }
-.s-drawer.needsdrawer .s-drawer-body,
-.s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
-  padding: 0;
-  padding-inline: 0;
-  scrollbar-gutter: auto;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  background: var(--color-ink-875);
-}
 .s-drawer.needsdrawer .rail-subhead {
   padding: .4375rem .5rem;
 }
@@ -2106,14 +2096,6 @@ textarea.agentform-input { height: auto; width: 100%; }
 .s-drawer.needsdrawer .seg-pill {
   padding: .1875rem .45rem;
   font-size: var(--text-micro);
-}
-@media (max-width: 860px) {
-  .s-drawer.needsdrawer .s-drawer-body,
-  .s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
-    padding: 0;
-    padding-inline: 0;
-    scrollbar-gutter: auto;
-  }
 }
 
 /* A group header — Decisions opens by default; the rest fold. */
@@ -2389,18 +2371,6 @@ textarea.agentform-input { height: auto; width: 100%; }
 .todo-card:hover {
   border-color: var(--color-ink-600);
   background: var(--color-ink-800);
-}
-.rail-card .rc-head {
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: nowrap;
-  gap: .5rem;
-  min-width: 0;
-  margin: 0;
-  font-size: var(--text-micro);
-  color: var(--color-ink-400);
 }
 .rc-head-left {
   display: flex;
@@ -2772,6 +2742,40 @@ button.refchip:hover {
   border-color: var(--color-fail);
   color: var(--color-fail);
 }
+}
+
+/* Unlayered overrides for components whose base sheets (`drawer.css`, `recruit.css`)
+   are unlayered: selector specificity beats them regardless of bundle order while
+   keeping `.needbtn` / `.needsdrawer` inside `@layer components` for `rail:hidden`. */
+.s-drawer.needsdrawer .s-drawer-body,
+.s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
+  padding: 0;
+  padding-inline: 0;
+  scrollbar-gutter: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--color-ink-875);
+}
+@media (max-width: 860px) {
+  .s-drawer.needsdrawer .s-drawer-body,
+  .s-drawer.needsdrawer[data-scrim="board"] .s-drawer-body {
+    padding: 0;
+    padding-inline: 0;
+    scrollbar-gutter: auto;
+  }
+}
+.rail-card .rc-head {
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: .5rem;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
 }
 
 /* ---- CAD-600: the full-height chat panel and its floating dock ----
