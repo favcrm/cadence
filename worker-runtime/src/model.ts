@@ -91,6 +91,31 @@ function withSummaryBudget(input: Record<string, unknown>): Record<string, unkno
 }
 
 /**
+ * CAD-2658: tools change with every deploy, so a summarized tool failure must
+ * not steer later turns. Appended to the system prompt of the attested
+ * summarization request only; a turn request never carries it.
+ */
+export const SUMMARY_INSTRUCTION =
+  "Keep the user's goals, decisions, preferences, facts about their business and open tasks. " +
+  "Do not record tool errors, refusals, retries or \"X doesn't work\" as lasting facts or as instructions; " +
+  "at most say that an earlier attempt to do X failed and to try again normally. " +
+  "Do not copy tool-call argument shapes into the summary.";
+
+function withSummaryInstruction(input: Record<string, unknown>): Record<string, unknown> {
+  const source = summarySource(input);
+  if (source === null) return input;
+  const system = source.system as Record<string, unknown>;
+  const content = system.content;
+  const extra = "\n\n" + SUMMARY_INSTRUCTION;
+  const next =
+    typeof content === "string" ? content + extra
+    : Array.isArray(content) ? [...content, { type: "text", text: extra.trimStart() }]
+    : null;
+  if (next === null) return input;
+  return { ...input, messages: [{ ...system, content: next }, (input.messages as unknown[])[1]] };
+}
+
+/**
  * Models stored in sessions created before the alias landed. The engine
  * resolves a durable session by `(provider, id)` through the provider
  * catalog, so an old session whose stored id is one of these otherwise
@@ -748,7 +773,7 @@ export function meteredBinding(
         );
       }
       const compacting = isCompaction?.(options?.signal) === true;
-      const summary = compacting ? withSummaryBudget(splitSummaryMessages(input)) : input;
+      const summary = compacting ? withSummaryBudget(splitSummaryMessages(withSummaryInstruction(input))) : input;
       const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
       const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {

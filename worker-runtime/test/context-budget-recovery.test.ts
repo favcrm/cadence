@@ -5,7 +5,7 @@ import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-work
 import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { BOARD_MESSAGE_KIND, compactionFailureText, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
-import { BYTE_COMPACTION_THRESHOLD, CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel, HOSTED_COMPACTION_POLICY, SUMMARY_MAX_OUTPUT_TOKENS } from "../src/model.ts";
+import { BYTE_COMPACTION_THRESHOLD, CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel, HOSTED_COMPACTION_POLICY, SUMMARY_INSTRUCTION, SUMMARY_MAX_OUTPUT_TOKENS } from "../src/model.ts";
 import type { ModelTaskContext } from "../src/model-task-context.ts";
 
 // The Workers module is absent in Bun; install its lifecycle stub before
@@ -578,6 +578,21 @@ describe("gateway byte-budget recovery", () => {
     const thread = await run.hosted.transcript(false);
     expect(failed(thread)).toHaveLength(0);
     expect(JSON.stringify(thread)).not.toContain("private summary failure");
+  });
+
+  // CAD-2658: a summarized tool failure must not steer later turns.
+  it("adds the no-tool-errors instruction to the summary request only", async () => {
+    const run = await session(
+      (requests) => (requests.length === 2 ? answer("Summary.") : answer("Answer.")),
+      { keepRecentTokens: 1, reserveTokens: 1_000_000 },
+    );
+    await (await run.submit("Earlier work.")).wait(BACKGROUND_CONTEXT);
+    await (await run.submit("Continue.")).wait(BACKGROUND_CONTEXT);
+    expect(run.requests.map((request) => isSummary(request.input))).toEqual([false, true, false]);
+    const system = (run.requests[1]!.input.messages as Array<{ content: unknown }>)[0]!.content;
+    expect(JSON.stringify(system)).toContain(JSON.stringify(SUMMARY_INSTRUCTION).slice(1, -1));
+    for (const turn of [0, 2])
+      expect(JSON.stringify(run.requests[turn]!.input)).not.toContain(SUMMARY_INSTRUCTION.slice(0, 40));
   });
 
   // CAD-2430: demo-company's long Home conversation failed its first blocking
