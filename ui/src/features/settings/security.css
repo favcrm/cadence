@@ -1,0 +1,211 @@
+/* Settings -> Security (CAD-2578). Reuses Controls + Preferences section
+   dividers; keeps the QR frame high-contrast white in both themes and grids
+   recovery codes cleanly across desktop and narrow viewports. */
+
+.security-section {
+  border-top: 1px solid var(--color-ink-700);
+  padding-block: 1.25rem;
+}
+
+.security-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem 1.25rem;
+}
+
+.security-row-meta {
+  min-inline-size: 0;
+  flex: 1 1 16rem;
+}
+
+.security-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-block-start: 0.25rem;
+}
+
+.security-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.25rem;
+  font-size: var(--text-micro);
+  font-weight: 500;
+  background: var(--color-ink-800);
+  color: var(--color-ink-300);
+}
+
+.security-chip-ok {
+  background: color-mix(in srgb, var(--color-ok) 15%, transparent);
+  color: var(--color-ok);
+}
+
+.security-panel {
+  margin-block-start: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-875);
+  display: grid;
+  gap: 0.875rem;
+  max-inline-size: 32rem;
+}
+
+.security-field {
+  display: grid;
+  gap: 0.35rem;
+  min-inline-size: 0;
+}
+
+.security-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.security-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.security-input-wrap .field {
+  padding-inline-end: 4rem;
+}
+
+.security-toggle-pw {
+  position: absolute;
+  inset-inline-end: 0.5rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 0.25rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+
+.security-toggle-pw:hover {
+  color: var(--color-ink-100);
+  background: var(--color-ink-800);
+}
+
+.security-link-btn {
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.security-link-btn:hover:not(:disabled) {
+  color: var(--color-ink-100);
+}
+
+.security-link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.security-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.security-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.security-qr-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+/* Always keep crisp black modules on pure white even in dark theme so
+   authenticator cameras reliably scan the QR code and quiet zone. */
+.security-qr-frame {
+  flex: none;
+  display: inline-flex;
+  padding: 0.5rem;
+  border-radius: 0.5rem;
+  background: #ffffff;
+  border: 1px solid var(--color-ink-700);
+}
+
+.security-secret-box {
+  display: grid;
+  gap: 0.5rem;
+  min-inline-size: 0;
+  flex: 1 1 12rem;
+}
+
+.security-secret-code {
+  display: block;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+  color: var(--color-ink-100);
+  font-family: var(--font-mono);
+  font-size: var(--text-label);
+  word-break: break-all;
+}
+
+.security-backup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem 0.75rem;
+  padding: 0.75rem;
+  margin: 0;
+  list-style: none;
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+  font-family: var(--font-mono);
+  font-size: var(--text-label);
+  color: var(--color-ink-100);
+}
+
+.security-banner {
+  margin-block-start: 1rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  font-size: var(--text-secondary);
+  color: var(--color-ink-200);
+}
+
+.security-banner-warn {
+  border-color: color-mix(in srgb, var(--color-warn) 45%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-warn) 8%, var(--color-ink-875));
+}
+
+.security-error {
+  margin: 0;
+  color: var(--color-fail);
+  font-size: var(--text-label);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.security-status-msg {
+  margin: 0;
+  color: var(--color-ok);
+  font-size: var(--text-label);
+  line-height: 1.45;
+}
+
+@media (max-width: 480px) {
+  .security-backup-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

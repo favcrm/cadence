@@ -66,3 +66,24 @@ equal(settingsRedirect("documents", OWNER), "members", "an unlisted documents se
 equal(settingsRedirect("documents", {}), "models", "a native board does not expose hosted documents");
 equal(settingsRedirect("documents", { settings_sections: ["preferences"] }), "preferences", "a board without the capability refuses the direct link");
 equal(settingsLabel("documents"), "Documents", "the crumb names the section");
+
+// CAD-2578: Settings → You → Security is hosted only, offered below Preferences when listed.
+const SECURITY = { settings_sections: ["preferences", "security", "general", "members", "connections", "email", "status"] };
+const MEMBER_SECURITY = { settings_sections: ["preferences", "security", "members"] };
+equal(
+  settingsNavGroups(SECURITY).find((g) => g.label === "You")?.items.map((i) => i.label),
+  ["Preferences", "Security"],
+  "security sits under You immediately below Preferences when listed",
+);
+equal(
+  flat(MEMBER_SECURITY),
+  ["Preferences", "Security", "Members"],
+  "a hosted member sees Security when advertised",
+);
+equal(flat(OWNER).includes("Security"), false, "a board that does not name security hides it");
+equal(flat(null).includes("Security"), false, "a native board has no Security section");
+equal(settingsRedirect("security", SECURITY), null, "a listed security section stays");
+equal(settingsRedirect("security", OWNER), "members", "an unlisted security section moves away");
+equal(settingsRedirect("security", {}), "models", "a native board does not expose hosted security");
+equal(settingsRedirect("security", { settings_sections: ["preferences"] }), "preferences", "a board without security refuses the direct link");
+equal(settingsLabel("security"), "Security", "the crumb names Security");
