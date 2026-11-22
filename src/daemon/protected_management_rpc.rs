@@ -366,9 +366,11 @@ pub(super) fn execute(
                 }
                 cadence_core::connection_dispatch::dto::validate_agenticos_read_policy_v1(&policy)
                     .map_err(|e| Error::invalid(e.code.as_str(), e.message))?;
-                if !policy.allowed_destinations.iter().any(|dest| {
-                    dest.as_str() == crate::platform::agenticos_provider::READ_ENDPOINT_URL
-                }) {
+                if policy.allowed_destinations.is_empty()
+                    || !policy.allowed_destinations.iter().all(|dest| {
+                        dest.as_str() == crate::platform::agenticos_provider::READ_ENDPOINT_URL
+                    })
+                {
                     return Err(Error::invalid(
                         "destination_refused",
                         "the destination is not approved",

@@ -143,15 +143,24 @@ pub struct AgenticosProviderAdapter {
     http: ureq::Agent,
 }
 
+fn is_loopback_host(uri: &ureq::http::Uri) -> bool {
+    uri.host()
+        .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "[::1]"))
+}
+
 impl AgenticosProviderAdapter {
+    /// Construct an adapter bound exclusively to `PRODUCTION_ORIGIN` for protected
+    /// dedicated reads (never reading `CADENCE_AGENTICOS_PROVIDER_URL`).
+    pub fn for_dedicated_read() -> Result<Self> {
+        Self::new(PRODUCTION_ORIGIN)
+    }
+
     pub fn new(base: &str) -> Result<Self> {
         let uri: ureq::http::Uri = base
             .trim_end_matches('/')
             .parse()
             .map_err(|_| Error::rejected("AgenticOS provider origin is invalid"))?;
-        let loopback = uri
-            .host()
-            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "[::1]"));
+        let loopback = is_loopback_host(&uri);
         if !matches!(uri.scheme_str(), Some("https"))
             && !(uri.scheme_str() == Some("http") && loopback)
         {
@@ -330,6 +339,46 @@ impl AgenticosProviderAdapter {
         })
     }
 
+    fn approved_dedicated_endpoint(
+        &self,
+        path: &str,
+    ) -> std::result::Result<String, AppCapabilityError> {
+        #[cfg(not(any(test, feature = "test-seam")))]
+        {
+            if self.base != PRODUCTION_ORIGIN {
+                return Err(AppCapabilityError::Refused(
+                    "dedicated reads allow only the approved production origin".into(),
+                ));
+            }
+            if path == READ_PATH {
+                return Ok(READ_ENDPOINT_URL.to_string());
+            }
+            Ok(format!("{PRODUCTION_ORIGIN}{path}"))
+        }
+        #[cfg(any(test, feature = "test-seam"))]
+        {
+            if self.base == PRODUCTION_ORIGIN {
+                return Ok(if path == READ_PATH {
+                    READ_ENDPOINT_URL.to_string()
+                } else {
+                    format!("{PRODUCTION_ORIGIN}{path}")
+                });
+            }
+            if !self
+                .base
+                .parse::<ureq::http::Uri>()
+                .ok()
+                .as_ref()
+                .is_some_and(is_loopback_host)
+            {
+                return Err(AppCapabilityError::Refused(
+                    "dedicated reads allow only READ_ENDPOINT_URL or a local test seam".into(),
+                ));
+            }
+            Ok(format!("{}{path}", self.base))
+        }
+    }
+
     /// One protected dedicated read with frozen request bytes (never `max_charge_minor`),
     /// idempotency key, price parsing, and bearer-leak screening.
     pub fn execute_dedicated_read(
@@ -372,7 +421,7 @@ impl AgenticosProviderAdapter {
                 "dedicated reads do not accept max_charge_minor".into(),
             ));
         }
-        let url = format!("{}{READ_PATH}", self.base);
+        let url = self.approved_dedicated_endpoint(READ_PATH)?;
         let mut response = self
             .http
             .post(&url)
@@ -507,10 +556,8 @@ impl AgenticosProviderAdapter {
                 "a dedicated read lookup needs a valid tool slug".into(),
             ));
         }
-        let url = format!(
-            "{}{LOOKUP_PATH}?key={idempotency_key}&slug={slug}",
-            self.base
-        );
+        let endpoint = self.approved_dedicated_endpoint(LOOKUP_PATH)?;
+        let url = format!("{endpoint}?key={idempotency_key}&slug={slug}");
         let mut response = self
             .http
             .get(&url)
@@ -1074,6 +1121,43 @@ mod tests {
         assert_eq!(
             descriptor.capabilities[0].tools,
             vec![SLUG_SEARCH_CONSOLE_REPORT.to_string()]
+        );
+    }
+
+    #[test]
+    fn dedicated_read_and_lookup_refuse_unapproved_non_loopback_origin() {
+        let prod = AgenticosProviderAdapter::for_dedicated_read().unwrap();
+        assert_eq!(prod.base, PRODUCTION_ORIGIN);
+        assert_eq!(
+            prod.approved_dedicated_endpoint(READ_PATH).unwrap(),
+            READ_ENDPOINT_URL
+        );
+
+        let evil = AgenticosProviderAdapter::new("https://evil.example").unwrap();
+        let frozen_body = serde_json::to_vec(&json!({
+            "slug": "search_console_report",
+            "connection_id": "con_alpha",
+            "input": input(),
+        }))
+        .unwrap();
+        let read_err = evil
+            .execute_dedicated_read(b"tok_supersecret_abc123", &frozen_body, "req-evil-read")
+            .unwrap_err();
+        assert!(
+            matches!(read_err, AppCapabilityError::Refused(_)),
+            "{read_err}"
+        );
+
+        let lookup_err = evil
+            .lookup_dedicated_read(
+                b"tok_supersecret_abc123",
+                "req-evil-lookup",
+                SLUG_SEARCH_CONSOLE_REPORT,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(lookup_err, AppCapabilityError::Refused(_)),
+            "{lookup_err}"
         );
     }
 }

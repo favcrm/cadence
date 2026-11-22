@@ -2765,20 +2765,17 @@ fn agenticos_read_destination() -> Result<ResolvedDestinationV1> {
 fn agenticos_provider_adapter(
     shared: &Shared,
 ) -> Result<crate::platform::agenticos_provider::AgenticosProviderAdapter> {
-    let origin = shared
-        .agenticos_provider_fixture_origin
-        .as_deref()
-        .unwrap_or(crate::platform::agenticos_provider::PRODUCTION_ORIGIN);
-    crate::platform::agenticos_provider::AgenticosProviderAdapter::new(origin)
+    match shared.agenticos_provider_fixture_origin.as_deref() {
+        Some(origin) => crate::platform::agenticos_provider::AgenticosProviderAdapter::new(origin),
+        None => crate::platform::agenticos_provider::AgenticosProviderAdapter::for_dedicated_read(),
+    }
 }
 
 #[cfg(not(any(test, feature = "test-seam")))]
 fn agenticos_provider_adapter(
     _shared: &Shared,
 ) -> Result<crate::platform::agenticos_provider::AgenticosProviderAdapter> {
-    crate::platform::agenticos_provider::AgenticosProviderAdapter::new(
-        crate::platform::agenticos_provider::PRODUCTION_ORIGIN,
-    )
+    crate::platform::agenticos_provider::AgenticosProviderAdapter::for_dedicated_read()
 }
 
 fn require_agenticos_membership(
