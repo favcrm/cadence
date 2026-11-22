@@ -9,13 +9,11 @@ use super::reporting::{
 use super::Kickoff;
 use crate::error::Error;
 use crate::mcp_agent::{invoke_private_app_tool_with, static_tool_names};
-use crate::remote_cli::{
-    call_verb, unbind_managed_session, AgentSlot, CliIdentityPin, RemoteTarget,
-};
+use crate::remote_cli::{call_verb, AgentSlot, CliIdentityPin, RemoteTarget};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -35,9 +33,18 @@ const ASSIGNMENT_ID: &str = "hla_1111111111111111";
 const CLAIM_ID: &str = "hlc_1111111111111111";
 const MESSAGE_ID: &str = "msg-cad2584-01";
 const ALIAS: &str = "agent-updater";
-const ARTIFACT_ID: &str = "art-0123456789abcdef";
+const ARTIFACT_ID: &str = "art-0123456789abcdef0123456789abcdef";
+const REVIEW_ID: &str = "par_0123456789abcdef0123456789abcdef";
 const ACCESS_TOKEN: &str = "hct_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 const JWS_ENVELOPE: &str = "eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiJ1c3JfdGVzdF8xIn0.c2ln";
+
+#[cfg(any(debug_assertions, feature = "test-seam"))]
+fn reset_managed_session() {
+    crate::remote_cli::unbind_managed_session();
+}
+
+#[cfg(not(any(debug_assertions, feature = "test-seam")))]
+fn reset_managed_session() {}
 
 fn minimal_zip_bytes(tag: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(64 + tag.len());
@@ -97,7 +104,7 @@ impl IsolatedEnv {
         let lock = crate::home::CAD1922_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unbind_managed_session();
+        reset_managed_session();
         let tmp = tempfile::tempdir().expect("tempdir");
         let names = [
             "HOME",
@@ -177,7 +184,7 @@ impl IsolatedEnv {
 
 impl Drop for IsolatedEnv {
     fn drop(&mut self) {
-        unbind_managed_session();
+        reset_managed_session();
         crate::home::note_state_dir_flag(None);
         for (name, value) in &self.saved {
             match value {
@@ -235,49 +242,89 @@ fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) {
 }
 
 #[derive(Clone)]
-struct BoardFixtureConfig {
+enum CliCallReply {
+    Json(u16, Value),
+    DropEof,
+}
+
+struct LoopbackConfig {
     frontmatter_private_app: Value,
     profile_enabled_tools: HashMap<String, Vec<String>>,
     zip_bytes: Vec<u8>,
+    queued_cli_calls: Mutex<VecDeque<CliCallReply>>,
 }
 
-struct MockBoardStats {
-    total_connections: AtomicUsize,
-    artifact_read_hits: AtomicUsize,
-    artifact_upload_hits: AtomicUsize,
-    platform_call_hits: AtomicUsize,
-    profile_show_ids: Mutex<Vec<String>>,
-    cli_verbs: Mutex<Vec<String>>,
-}
-
-impl MockBoardStats {
-    fn new() -> Self {
+impl LoopbackConfig {
+    fn for_board(
+        frontmatter_private_app: Value,
+        profile_enabled_tools: HashMap<String, Vec<String>>,
+        zip_bytes: Vec<u8>,
+    ) -> Self {
         Self {
-            total_connections: AtomicUsize::new(0),
-            artifact_read_hits: AtomicUsize::new(0),
-            artifact_upload_hits: AtomicUsize::new(0),
-            platform_call_hits: AtomicUsize::new(0),
-            profile_show_ids: Mutex::new(Vec::new()),
-            cli_verbs: Mutex::new(Vec::new()),
+            frontmatter_private_app,
+            profile_enabled_tools,
+            zip_bytes,
+            queued_cli_calls: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn with_queued_calls(zip_bytes: Vec<u8>, replies: Vec<CliCallReply>) -> Self {
+        Self {
+            frontmatter_private_app: json!({}),
+            profile_enabled_tools: HashMap::new(),
+            zip_bytes,
+            queued_cli_calls: Mutex::new(replies.into()),
         }
     }
 }
 
-struct MockBoardServer {
+struct LoopbackStats {
+    total_connections: AtomicUsize,
+    authorize_hits: AtomicUsize,
+    artifact_read_hits: AtomicUsize,
+    artifact_upload_hits: AtomicUsize,
+    platform_call_hits: AtomicUsize,
+    profile_show_ids: Mutex<Vec<String>>,
+    recorded_cli_calls: Mutex<Vec<Value>>,
+}
+
+impl LoopbackStats {
+    fn new() -> Self {
+        Self {
+            total_connections: AtomicUsize::new(0),
+            authorize_hits: AtomicUsize::new(0),
+            artifact_read_hits: AtomicUsize::new(0),
+            artifact_upload_hits: AtomicUsize::new(0),
+            platform_call_hits: AtomicUsize::new(0),
+            profile_show_ids: Mutex::new(Vec::new()),
+            recorded_cli_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_cli_calls(&self) -> Vec<Value> {
+        let mut guard = self
+            .recorded_cli_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+}
+
+struct LoopbackServer {
     endpoint: String,
     addr: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
-    stats: Arc<MockBoardStats>,
+    stats: Arc<LoopbackStats>,
     handle: Option<JoinHandle<()>>,
 }
 
-impl MockBoardServer {
-    fn start(config: BoardFixtureConfig) -> Self {
+impl LoopbackServer {
+    fn start(config: LoopbackConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let endpoint = format!("http://{addr}");
         let stop = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(MockBoardStats::new());
+        let stats = Arc::new(LoopbackStats::new());
 
         let stop_bg = Arc::clone(&stop);
         let stats_bg = Arc::clone(&stats);
@@ -298,6 +345,7 @@ impl MockBoardServer {
                 };
                 match req.path.as_str() {
                     "/__platform/cli/authorize" => {
+                        stats_bg.authorize_hits.fetch_add(1, Ordering::SeqCst);
                         write_json_response(
                             &mut stream,
                             200,
@@ -359,14 +407,34 @@ impl MockBoardServer {
                     "/__platform/cli/call" => {
                         let body: Value =
                             serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
-                        let verb = body["verb"].as_str().unwrap_or_default().to_string();
                         stats_bg
-                            .cli_verbs
+                            .recorded_cli_calls
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push(verb.clone());
+                            .push(body.clone());
+                        let verb = body["verb"].as_str().unwrap_or_default();
+                        if verb == "platform_call" {
+                            stats_bg.platform_call_hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let queued = config
+                            .queued_cli_calls
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pop_front();
+                        if let Some(reply) = queued {
+                            match reply {
+                                CliCallReply::Json(status, payload) => {
+                                    write_json_response(&mut stream, status, &payload);
+                                }
+                                CliCallReply::DropEof => {
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                    drop(stream);
+                                }
+                            }
+                            continue;
+                        }
                         let arguments = &body["arguments"];
-                        match verb.as_str() {
+                        match verb {
                             "issue_show" => {
                                 write_json_response(
                                     &mut stream,
@@ -437,7 +505,6 @@ impl MockBoardServer {
                                 );
                             }
                             "platform_call" => {
-                                stats_bg.platform_call_hits.fetch_add(1, Ordering::SeqCst);
                                 write_json_response(
                                     &mut stream,
                                     200,
@@ -470,101 +537,7 @@ impl MockBoardServer {
     }
 }
 
-impl Drop for MockBoardServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-struct MockEofServer {
-    endpoint: String,
-    addr: std::net::SocketAddr,
-    stop: Arc<AtomicBool>,
-    call_requests: Arc<Mutex<Vec<Value>>>,
-    authorize_hits: Arc<AtomicUsize>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl MockEofServer {
-    fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind eof loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let endpoint = format!("http://{addr}");
-        let stop = Arc::new(AtomicBool::new(false));
-        let call_requests = Arc::new(Mutex::new(Vec::new()));
-        let authorize_hits = Arc::new(AtomicUsize::new(0));
-
-        let stop_bg = Arc::clone(&stop);
-        let calls_bg = Arc::clone(&call_requests);
-        let auth_bg = Arc::clone(&authorize_hits);
-        let handle = std::thread::spawn(move || {
-            for incoming in listener.incoming() {
-                if stop_bg.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Ok(mut stream) = incoming else {
-                    break;
-                };
-                if stop_bg.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Some(req) = read_http_request(&mut stream) else {
-                    continue;
-                };
-                match req.path.as_str() {
-                    "/__platform/cli/authorize" => {
-                        auth_bg.fetch_add(1, Ordering::SeqCst);
-                        write_json_response(
-                            &mut stream,
-                            200,
-                            &json!({
-                                "version": "hosted-cadence-cli.v1",
-                                "envelope": JWS_ENVELOPE,
-                            }),
-                        );
-                    }
-                    "/__platform/cli/call" => {
-                        let body: Value =
-                            serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
-                        calls_bg
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(body);
-                        // Request could have reached the server; close immediately without any HTTP reply.
-                        let _ = stream.shutdown(Shutdown::Both);
-                        drop(stream);
-                    }
-                    _ => {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        drop(stream);
-                    }
-                }
-            }
-        });
-
-        Self {
-            endpoint,
-            addr,
-            stop,
-            call_requests,
-            authorize_hits,
-            handle: Some(handle),
-        }
-    }
-
-    fn take_call_count(&self) -> usize {
-        let mut guard = self.call_requests.lock().unwrap_or_else(|e| e.into_inner());
-        let len = guard.len();
-        guard.clear();
-        len
-    }
-}
-
-impl Drop for MockEofServer {
+impl Drop for LoopbackServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
@@ -603,7 +576,7 @@ fn make_kickoff<'a>(worktree: &'a str, profile_id: Option<&'a str>) -> Kickoff<'
     }
 }
 
-fn assert_no_custody_and_no_send(state_dir: &Path, server: &MockBoardServer, send_hits: usize) {
+fn assert_no_custody_and_no_send(state_dir: &Path, server: &LoopbackServer, send_hits: usize) {
     let bind_path = state_dir
         .join("hosted-assignments")
         .join(format!("{MESSAGE_ID}.bind"));
@@ -631,14 +604,14 @@ fn run_kickoff_case(
     profile_enabled_tools: HashMap<String, Vec<String>>,
     adapter_name: Option<&str>,
     claimed_profile_id: Option<&str>,
-) -> (Result<Value, Error>, usize, MockBoardServer, IsolatedEnv) {
+) -> (Result<Value, Error>, usize, LoopbackServer, IsolatedEnv) {
     let env = IsolatedEnv::new();
-    let config = BoardFixtureConfig {
+    let config = LoopbackConfig::for_board(
         frontmatter_private_app,
         profile_enabled_tools,
-        zip_bytes: minimal_zip_bytes(b"good"),
-    };
-    let server = MockBoardServer::start(config);
+        minimal_zip_bytes(b"good"),
+    );
+    let server = LoopbackServer::start(config);
     env.write_cli_login(&server.endpoint, &["cli.read", "cli.write", "wiki.read"]);
 
     let target = remote_target(&server.endpoint);
@@ -880,6 +853,61 @@ fn cad2584_unsupported_adapter_claude_managed_refuses_before_download_and_send()
 }
 
 #[test]
+fn cad2584_workspace_mcp_unpaired_refuses_and_paired_succeeds() {
+    for paired in [Some(false), None] {
+        let mut tools = HashMap::new();
+        tools.insert("ap_updater".to_string(), vec!["cadence_writes".to_string()]);
+        let mut fm = json!({
+            "artifact_id": ARTIFACT_ID,
+            "updater_agent": "agents/ap_updater",
+            "server_readiness": {
+                "ready": true,
+                "actor": "agents/ap_updater",
+                "reasons": []
+            }
+        });
+        if let Some(p) = paired {
+            fm["workspace_mcp_paired"] = json!(p);
+        }
+        let (outcome, send_hits, server, env) =
+            run_kickoff_case(fm, tools, Some("workspace_mcp/hosted"), Some("ap_updater"));
+        let err = outcome.expect_err("unpaired WorkspaceMcp must refuse pre-dispatch");
+        assert_eq!(err.code(), Some("private_app_readiness_refused"));
+        assert!(
+            err.to_string().contains("unpaired_workspace_mcp"),
+            "expected unpaired_workspace_mcp for paired={paired:?}, got: {err}"
+        );
+        assert_no_custody_and_no_send(&env.state_dir, &server, send_hits);
+    }
+
+    let mut tools = HashMap::new();
+    tools.insert("ap_updater".to_string(), vec!["cadence_writes".to_string()]);
+    let fm = json!({
+        "artifact_id": ARTIFACT_ID,
+        "updater_agent": "agents/ap_updater",
+        "workspace_mcp_paired": true,
+        "server_readiness": {
+            "ready": true,
+            "actor": "agents/ap_updater",
+            "reasons": []
+        }
+    });
+    let (outcome, send_hits, server, env) =
+        run_kickoff_case(fm, tools, Some("workspace_mcp/hosted"), Some("ap_updater"));
+    let sent = outcome.expect("paired WorkspaceMcp updater must succeed");
+    assert_eq!(send_hits, 1);
+    assert_eq!(server.stats.artifact_read_hits.load(Ordering::SeqCst), 1);
+    assert!(sent.get("note").is_some());
+    assert!(hosted_binding_target(&env.state_dir, MESSAGE_ID)
+        .expect("read binding")
+        .and_then(|b| b.private_app_package)
+        .is_some());
+    assert!(private_app_package_path(&env.state_dir, MESSAGE_ID)
+        .expect("zip path")
+        .is_file());
+}
+
+#[test]
 fn cad2584_ready_updater_positive_control_stages_bind_zip_and_sends() {
     let mut tools = HashMap::new();
     tools.insert("ap_updater".to_string(), vec!["cadence_writes".to_string()]);
@@ -953,6 +981,9 @@ fn setup_mcp_custody_fixture(
     env: &IsolatedEnv,
     endpoint: &str,
     zip_bytes: &[u8],
+    install_id: Option<&str>,
+    expected_digest: Option<&str>,
+    expected_generation: Option<&str>,
 ) -> (RemoteTarget, AgentSlot) {
     env.write_cli_login(endpoint, &["cli.read", "cli.write"]);
     env.write_cached_agent_credential(endpoint);
@@ -973,9 +1004,9 @@ fn setup_mcp_custody_fixture(
         ARTIFACT_ID,
         "app.zip",
         zip_bytes,
-        None,
-        None,
-        None,
+        install_id,
+        expected_digest,
+        expected_generation,
     )
     .expect("store private app package");
     let cred_path =
@@ -994,12 +1025,10 @@ fn setup_mcp_custody_fixture(
 fn cad2584_private_app_prepare_rejects_model_supplied_path_org_alias_before_rpc() {
     let env = IsolatedEnv::new();
     let zip_bytes = minimal_zip_bytes(b"good");
-    let server = MockBoardServer::start(BoardFixtureConfig {
-        frontmatter_private_app: json!({}),
-        profile_enabled_tools: HashMap::new(),
-        zip_bytes: zip_bytes.clone(),
-    });
-    let (target, slot) = setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes);
+    let server =
+        LoopbackServer::start(LoopbackConfig::with_queued_calls(zip_bytes.clone(), vec![]));
+    let (target, slot) =
+        setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes, None, None, None);
 
     for (tool, args) in [
         (
@@ -1020,12 +1049,12 @@ fn cad2584_private_app_prepare_rejects_model_supplied_path_org_alias_before_rpc(
         ),
         (
             "private_app_status",
-            json!({ "id": "par_1", "org": "other-org" }),
+            json!({ "id": REVIEW_ID, "org": "other-org" }),
         ),
         (
             "private_app_apply",
             json!({
-                "id": "par_1",
+                "id": REVIEW_ID,
                 "digest": format!("sha256:{}", sha256_hex(&zip_bytes)),
                 "zip_sha256": format!("sha256:{}", sha256_hex(&zip_bytes)),
                 "alias": "other-alias"
@@ -1033,7 +1062,7 @@ fn cad2584_private_app_prepare_rejects_model_supplied_path_org_alias_before_rpc(
         ),
         (
             "private_app_reconcile",
-            json!({ "id": "par_1", "actor": "service/personal_assistant" }),
+            json!({ "id": REVIEW_ID, "actor": "service/personal_assistant" }),
         ),
     ] {
         let err = invoke_private_app_tool_with(
@@ -1064,12 +1093,10 @@ fn cad2584_private_app_prepare_fails_closed_on_mismatched_ref_and_tampered_zip_b
 ) {
     let env = IsolatedEnv::new();
     let zip_bytes = minimal_zip_bytes(b"good");
-    let server = MockBoardServer::start(BoardFixtureConfig {
-        frontmatter_private_app: json!({}),
-        profile_enabled_tools: HashMap::new(),
-        zip_bytes: zip_bytes.clone(),
-    });
-    let (target, slot) = setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes);
+    let server =
+        LoopbackServer::start(LoopbackConfig::with_queued_calls(zip_bytes.clone(), vec![]));
+    let (target, slot) =
+        setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes, None, None, None);
 
     // 1. Mismatched package_ref (not matching bound custody ARTIFACT_ID)
     let mismatched = invoke_private_app_tool_with(
@@ -1079,7 +1106,7 @@ fn cad2584_private_app_prepare_fails_closed_on_mismatched_ref_and_tampered_zip_b
         &target,
         &slot,
         "private_app_prepare",
-        &json!({ "package_ref": "art-9999999999999999" }),
+        &json!({ "package_ref": "art-99999999999999999999999999999999" }),
         5,
     );
     assert!(
@@ -1130,9 +1157,317 @@ fn cad2584_private_app_prepare_fails_closed_on_mismatched_ref_and_tampered_zip_b
 }
 
 #[test]
+fn cad2584_private_app_apply_missing_owner_consent_refuses_without_replay() {
+    let env = IsolatedEnv::new();
+    let zip_bytes = minimal_zip_bytes(b"good");
+    let sha = format!("sha256:{}", sha256_hex(&zip_bytes));
+    let server = LoopbackServer::start(LoopbackConfig::with_queued_calls(
+        zip_bytes.clone(),
+        vec![CliCallReply::Json(
+            409,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "owner_consent_required",
+                    "message": "owner consent required"
+                }
+            }),
+        )],
+    ));
+    let (target, slot) =
+        setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes, None, None, None);
+
+    let err = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_apply",
+        &json!({
+            "id": REVIEW_ID,
+            "digest": sha,
+            "zip_sha256": sha
+        }),
+        5,
+    )
+    .expect_err("missing owner consent HTTP 409 must fail closed");
+    assert_eq!(err.kind(), "rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("owner_consent_required"),
+        "expected owner_consent_required in refusal: {msg}"
+    );
+    assert!(
+        !msg.contains("installed"),
+        "refusal must not report installed: {msg}"
+    );
+    let calls = server.stats.take_cli_calls();
+    assert_eq!(calls.len(), 1, "must send exactly one apply POST");
+    assert_eq!(
+        calls[0].pointer("/arguments/tool").and_then(Value::as_str),
+        Some("private_app_review_apply")
+    );
+}
+
+#[test]
+fn cad2584_private_app_prepare_and_apply_stale_installation_refuses_without_replay() {
+    let env = IsolatedEnv::new();
+    let zip_bytes = minimal_zip_bytes(b"good");
+    let sha = format!("sha256:{}", sha256_hex(&zip_bytes));
+    let stale_body = json!({
+        "ok": false,
+        "error": {
+            "code": "installation_stale",
+            "message": "installed digest or generation changed"
+        }
+    });
+    let server = LoopbackServer::start(LoopbackConfig::with_queued_calls(
+        zip_bytes.clone(),
+        vec![
+            CliCallReply::Json(409, stale_body.clone()),
+            CliCallReply::Json(409, stale_body),
+        ],
+    ));
+    let (target, slot) = setup_mcp_custody_fixture(
+        &env,
+        &server.endpoint,
+        &zip_bytes,
+        Some("install_app_1"),
+        Some(&sha),
+        Some("gen_1"),
+    );
+
+    let prep_err = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_prepare",
+        &json!({ "package_ref": ARTIFACT_ID }),
+        5,
+    )
+    .expect_err("stale installation on prepare must fail closed");
+    assert_eq!(prep_err.kind(), "rejected");
+    assert!(
+        prep_err.to_string().contains("installation_stale"),
+        "expected installation_stale in prepare refusal: {prep_err}"
+    );
+
+    let apply_err = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_apply",
+        &json!({
+            "id": REVIEW_ID,
+            "digest": sha,
+            "zip_sha256": sha
+        }),
+        5,
+    )
+    .expect_err("stale installation on apply must fail closed");
+    assert_eq!(apply_err.kind(), "rejected");
+    assert!(
+        apply_err.to_string().contains("installation_stale"),
+        "expected installation_stale in apply refusal: {apply_err}"
+    );
+
+    let calls = server.stats.take_cli_calls();
+    assert_eq!(calls.len(), 2, "each stale 409 must send only 1 POST");
+    assert_eq!(
+        calls[0].pointer("/arguments/tool").and_then(Value::as_str),
+        Some("private_app_review_request")
+    );
+    assert_eq!(
+        calls[1].pointer("/arguments/tool").and_then(Value::as_str),
+        Some("private_app_review_apply")
+    );
+}
+
+#[test]
+fn cad2584_private_app_prepare_eof_returns_outcome_unknown_and_retry_reuses_same_request_id() {
+    let env = IsolatedEnv::new();
+    let zip_bytes = minimal_zip_bytes(b"good");
+    let server = LoopbackServer::start(LoopbackConfig::with_queued_calls(
+        zip_bytes.clone(),
+        vec![
+            CliCallReply::DropEof,
+            CliCallReply::Json(
+                200,
+                json!({
+                    "ok": true,
+                    "data": {
+                        "id": REVIEW_ID,
+                        "state": "pending_owner_review"
+                    }
+                }),
+            ),
+        ],
+    ));
+    let (target, slot) =
+        setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes, None, None, None);
+
+    let err = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_prepare",
+        &json!({ "package_ref": ARTIFACT_ID }),
+        5,
+    )
+    .expect_err("EOF on private_app_prepare must return OutcomeUnknown");
+    assert!(
+        matches!(err, Error::OutcomeUnknown(_)),
+        "expected OutcomeUnknown on prepare EOF, got: {err:?}"
+    );
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("parq_"),
+        "OutcomeUnknown prepare message must name deterministic parq_ request_id: {err_msg}"
+    );
+    let first_calls = server.stats.take_cli_calls();
+    assert_eq!(
+        first_calls.len(),
+        1,
+        "timed-out prepare must send at most 1 POST"
+    );
+    let first_req_id = first_calls[0]
+        .pointer("/arguments/body/request_id")
+        .and_then(Value::as_str)
+        .expect("request_id in first prepare call")
+        .to_string();
+    assert!(first_req_id.starts_with("parq_"));
+    assert!(
+        err_msg.contains(&first_req_id),
+        "error message '{err_msg}' must cite exact request_id '{first_req_id}'"
+    );
+
+    // Retrying with the exact same bound package_ref must reuse the identical request_id.
+    let ok_json = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_prepare",
+        &json!({ "package_ref": ARTIFACT_ID }),
+        5,
+    )
+    .expect("prepare retry with same package_ref must succeed");
+    assert!(ok_json.contains(REVIEW_ID));
+
+    let retry_calls = server.stats.take_cli_calls();
+    assert_eq!(retry_calls.len(), 1);
+    let retry_req_id = retry_calls[0]
+        .pointer("/arguments/body/request_id")
+        .and_then(Value::as_str)
+        .expect("request_id in retry prepare call");
+    assert_eq!(
+        retry_req_id, first_req_id,
+        "retrying prepare on the same package_ref must reuse the exact deterministic request_id"
+    );
+}
+
+#[test]
+fn cad2584_private_app_apply_eof_returns_outcome_unknown_then_reconcile_succeeds_without_replay() {
+    let env = IsolatedEnv::new();
+    let zip_bytes = minimal_zip_bytes(b"good");
+    let sha = format!("sha256:{}", sha256_hex(&zip_bytes));
+    let server = LoopbackServer::start(LoopbackConfig::with_queued_calls(
+        zip_bytes.clone(),
+        vec![
+            CliCallReply::DropEof,
+            CliCallReply::Json(
+                200,
+                json!({
+                    "ok": true,
+                    "data": {
+                        "id": REVIEW_ID,
+                        "state": "installed",
+                        "applied_install_id": "install_42"
+                    }
+                }),
+            ),
+        ],
+    ));
+    let (target, slot) =
+        setup_mcp_custody_fixture(&env, &server.endpoint, &zip_bytes, None, None, None);
+
+    let err = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_apply",
+        &json!({
+            "id": REVIEW_ID,
+            "digest": sha,
+            "zip_sha256": sha
+        }),
+        5,
+    )
+    .expect_err("EOF on private_app_apply must return OutcomeUnknown");
+    assert!(
+        matches!(err, Error::OutcomeUnknown(_)),
+        "expected OutcomeUnknown on apply EOF, got: {err:?}"
+    );
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("private_app_reconcile") && err_msg.contains(REVIEW_ID),
+        "apply OutcomeUnknown must direct private_app_reconcile on {REVIEW_ID}: {err_msg}"
+    );
+    let apply_calls = server.stats.take_cli_calls();
+    assert_eq!(apply_calls.len(), 1, "apply must send at most 1 POST");
+    assert_eq!(
+        apply_calls[0]
+            .pointer("/arguments/tool")
+            .and_then(Value::as_str),
+        Some("private_app_review_apply")
+    );
+
+    let reconciled = invoke_private_app_tool_with(
+        &env.auth_dir,
+        &env.state_dir,
+        MESSAGE_ID,
+        &target,
+        &slot,
+        "private_app_reconcile",
+        &json!({ "id": REVIEW_ID }),
+        5,
+    )
+    .expect("private_app_reconcile after uncertain apply must succeed");
+    assert!(reconciled.contains("installed"));
+    assert!(reconciled.contains("install_42"));
+
+    let reconcile_calls = server.stats.take_cli_calls();
+    assert_eq!(reconcile_calls.len(), 1);
+    assert_eq!(
+        reconcile_calls[0]
+            .pointer("/arguments/tool")
+            .and_then(Value::as_str),
+        Some("private_app_review_reconcile")
+    );
+}
+
+#[test]
 fn cad2584_remote_cli_private_app_read_vs_mutation_eof_classification() {
     let env = IsolatedEnv::new();
-    let server = MockEofServer::start();
+    let server = LoopbackServer::start(LoopbackConfig::with_queued_calls(
+        minimal_zip_bytes(b"bundle"),
+        vec![
+            CliCallReply::DropEof,
+            CliCallReply::DropEof,
+            CliCallReply::DropEof,
+            CliCallReply::DropEof,
+        ],
+    ));
     env.write_cli_login(&server.endpoint, &["cli.read", "cli.write"]);
     let target = remote_target(&server.endpoint);
     let fake_sha = format!("sha256:{}", sha256_hex(b"bundle"));
@@ -1160,7 +1495,7 @@ fn cad2584_remote_cli_private_app_read_vs_mutation_eof_classification() {
             "{tool} must not return kind 'unknown': {err:?}"
         );
         assert_eq!(
-            server.take_call_count(),
+            server.stats.take_cli_calls().len(),
             1,
             "{tool} must send exactly one /__platform/cli/call"
         );
@@ -1203,14 +1538,14 @@ fn cad2584_remote_cli_private_app_read_vs_mutation_eof_classification() {
             "{tool} error kind must be 'unknown', got: {err:?}"
         );
         assert_eq!(
-            server.take_call_count(),
+            server.stats.take_cli_calls().len(),
             1,
             "{tool} must make at most one POST to /__platform/cli/call (no blind retries)"
         );
     }
 
     assert!(
-        server.authorize_hits.load(Ordering::SeqCst) >= 4,
+        server.stats.authorize_hits.load(Ordering::SeqCst) >= 4,
         "expected /__platform/cli/authorize to be exercised for all 4 calls"
     );
 }
