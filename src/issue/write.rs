@@ -49,8 +49,8 @@ pub(crate) use projects::{
     check_tags, checked_project_dirs, issue_dir, load_front, save_front, split_tags,
 };
 pub use projects::{
-    private_available, project_add, set_acceptance, set_project_policy, set_project_remote,
-    PRIVATE_UNAVAILABLE,
+    private_available, project_add, read_project_policy, set_acceptance, set_project_policy,
+    set_project_remote, PRIVATE_UNAVAILABLE,
 };
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
@@ -182,6 +182,51 @@ mod tests {
         );
         assert!(clean(&pm), "a refused policy write left something behind");
         std::fs::remove_file(hook).unwrap();
+    }
+
+    #[test]
+    fn reading_a_policy_returns_recorded_state_without_mutating() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let yaml_path = pm.dir.join(key).join("project.yaml");
+
+        set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+            "",
+        )
+        .unwrap();
+        let before = std::fs::read(&yaml_path).unwrap();
+        let read = read_project_policy(&pm, key).unwrap();
+        assert_eq!(read["state"], "ok");
+        assert_eq!(read["project"], key);
+        assert_eq!(read["visibility"], "workspace-visible");
+        assert_eq!(read["grants"], json!(["users/mia"]));
+        assert!(read["version"].as_u64().is_some());
+        assert_eq!(
+            std::fs::read(&yaml_path).unwrap(),
+            before,
+            "policy read must leave project.yaml untouched"
+        );
+        assert!(clean(&pm));
+
+        let mut loaded = project::load(&yaml_path).unwrap();
+        loaded.policy = None;
+        let yaml = serde_yaml::to_string(&loaded).unwrap();
+        std::fs::write(&yaml_path, yaml).unwrap();
+        let empty = read_project_policy(&pm, key).unwrap();
+        assert_eq!(
+            empty,
+            json!({
+                "state": "not_stored",
+                "project": key,
+                "visibility": null,
+                "grants": [],
+                "version": null,
+            })
+        );
     }
 
     /// CAD-908: a created file is whole, a collision renames, and no

@@ -753,18 +753,33 @@ fn verb_for(
                             key,
                             visibility,
                             grants,
+                            clear_grants,
                         },
                 },
         } => {
-            // Exact shared arguments. Visibility is the canonical spelling
-            // (`workspace-visible` | `private`), never the serde rename of
-            // the tracker enum; `wire()` is that one spelling, shared with the
-            // daemon's parser. Grants replace the recorded list; an empty
-            // list is sent as `[]`, not omitted. No role, actor, or org.
-            args.insert("project".into(), json!(key));
-            args.insert("visibility".into(), json!(visibility.wire()));
-            args.insert("grants".into(), json!(grants));
-            "project_policy"
+            match cadence_agent::issue::cli::resolve_project_policy_request(
+                *visibility,
+                grants,
+                *clear_grants,
+            )
+            .map_err(|err| Error::usage(format!("{err}; nothing was sent")))?
+            {
+                None => {
+                    args.insert("project".into(), json!(key));
+                    "project_policy_read"
+                }
+                Some(visibility) => {
+                    // Exact shared arguments. Visibility is the canonical spelling
+                    // (`workspace-visible` | `private`), never the serde rename of
+                    // the tracker enum; `wire()` is that one spelling, shared with the
+                    // daemon's parser. Grants replace the recorded list; an empty
+                    // list is sent as `[]`, not omitted. No role, actor, or org.
+                    args.insert("project".into(), json!(key));
+                    args.insert("visibility".into(), json!(visibility.wire()));
+                    args.insert("grants".into(), json!(grants));
+                    "project_policy"
+                }
+            }
         }
         // CAD-1999: `cadence project new` on a hosted org registers an
         // empty project — its key, its human-readable name and an optional
@@ -5412,6 +5427,93 @@ mod read_contract_tests {
         assert!(
             set_remote.contains("not available on a remote org"),
             "{set_remote}"
+        );
+
+        let policy = |visibility, grants: Vec<String>, clear_grants| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Project {
+                    action: ProjectAction::Policy {
+                        key: "atlas".into(),
+                        visibility,
+                        grants,
+                        clear_grants,
+                    },
+                },
+            })
+        };
+        assert_eq!(
+            policy(None, Vec::new(), false).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        let err = policy(None, vec!["users/alex".into()], false).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(None, Vec::new(), true).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+            Vec::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--clear-grants") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+            vec!["operator".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot be combined") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                Vec::new(),
+                true,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "private", "grants": []}),
+            )
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                vec!["agents/ap_11111111-1111-4111-8111-111111111111".into()],
+                false,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({
+                    "project": "atlas",
+                    "visibility": "private",
+                    "grants": ["agents/ap_11111111-1111-4111-8111-111111111111"],
+                }),
+            )
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                Vec::new(),
+                false,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "workspace-visible", "grants": []}),
+            )
         );
     }
 

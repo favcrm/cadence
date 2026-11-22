@@ -907,21 +907,26 @@ pub enum ProjectAction {
         #[arg(long)]
         to: String,
     },
-    /// Record a project's access policy: visibility and the callers it
-    /// admits. `--grant` is the full member list and replaces whatever
-    /// was recorded; omitting it clears grants. It does not merge.
-    /// Private is unavailable until the isolation gate passes;
-    /// workspace-visible is the only visibility this build can write.
+    /// Read or update a project's access policy: visibility and the callers
+    /// it admits.
+    ///
+    /// Running without `--visibility` reads the current recorded policy without
+    /// modifying anything. Passing `--visibility` replaces the recorded policy
+    /// (`--grant` is the full member list and replaces whatever was recorded;
+    /// omitting `--grant` with `--visibility private` requires `--clear-grants`).
     Policy {
         /// Project key.
         key: String,
-        /// Visibility to record.
-        #[arg(long, value_enum, default_value = "workspace-visible")]
-        visibility: PolicyVisibility,
-        /// Grant a caller access (`users/<handle>` or `operator`);
-        /// repeatable.
+        /// Visibility to record; omit to read the current policy without mutating.
+        #[arg(long, value_enum)]
+        visibility: Option<PolicyVisibility>,
+        /// Grant a caller access (`users/<handle>`, `agents/<profile_id>`, or `operator`);
+        /// repeatable (replaces recorded grants when `--visibility` is given).
         #[arg(long = "grant")]
         grants: Vec<String>,
+        /// Confirm clearing all grants when setting `--visibility private` with no `--grant`.
+        #[arg(long = "clear-grants")]
+        clear_grants: bool,
     },
     /// Record a hosted org's delivery inputs for a project (CAD-1946): its
     /// GitHub repos and, optionally, its `delivery:` policy section. A
@@ -1003,6 +1008,44 @@ impl PolicyVisibility {
             "workspace-visible" => Some(Self::WorkspaceVisible),
             "private" => Some(Self::Private),
             _ => None,
+        }
+    }
+}
+
+/// Validate `issue project policy` flags cleanly before either local execution
+/// or remote RPC encoding (CAD-2650).
+///
+/// Returns `Ok(None)` when bare `issue project policy <KEY>` should perform a
+/// read-only lookup, `Ok(Some(visibility))` for a guarded write, and
+/// `Err(Error::usage(...))` for partial or ambiguous write flags.
+pub fn resolve_project_policy_request(
+    visibility: Option<PolicyVisibility>,
+    grants: &[String],
+    clear_grants: bool,
+) -> Result<Option<PolicyVisibility>> {
+    match visibility {
+        None => {
+            if !grants.is_empty() || clear_grants {
+                return Err(Error::usage(
+                    "modifying a project's policy requires `--visibility <workspace-visible|private>`; \
+                     bare `cadence issue project policy <KEY>` is read-only",
+                ));
+            }
+            Ok(None)
+        }
+        Some(vis) => {
+            if !grants.is_empty() && clear_grants {
+                return Err(Error::usage(
+                    "`--grant` and `--clear-grants` cannot be combined",
+                ));
+            }
+            if vis == PolicyVisibility::Private && grants.is_empty() && !clear_grants {
+                return Err(Error::usage(
+                    "setting `--visibility private` with no `--grant` clears all existing grants; \
+                     pass `--grant <caller>` or confirm with `--clear-grants`",
+                ));
+            }
+            Ok(Some(vis))
         }
     }
 }
@@ -1091,5 +1134,42 @@ mod tests {
         for raw in ["", "workspace_visible", "Private", "public", "secret"] {
             assert_eq!(PolicyVisibility::from_wire(raw), None, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn project_policy_request_defaults_to_read_and_guards_writes() {
+        assert_eq!(
+            resolve_project_policy_request(None, &[], false).unwrap(),
+            None
+        );
+        assert!(resolve_project_policy_request(None, &["users/alex".into()], false).is_err());
+        assert!(resolve_project_policy_request(None, &[], true).is_err());
+        assert!(
+            resolve_project_policy_request(Some(PolicyVisibility::Private), &[], false).is_err()
+        );
+        assert!(resolve_project_policy_request(
+            Some(PolicyVisibility::Private),
+            &["operator".into()],
+            true
+        )
+        .is_err());
+        assert_eq!(
+            resolve_project_policy_request(Some(PolicyVisibility::Private), &[], true).unwrap(),
+            Some(PolicyVisibility::Private)
+        );
+        assert_eq!(
+            resolve_project_policy_request(
+                Some(PolicyVisibility::Private),
+                &["agents/ap_11111111-1111-4111-8111-111111111111".into()],
+                false
+            )
+            .unwrap(),
+            Some(PolicyVisibility::Private)
+        );
+        assert_eq!(
+            resolve_project_policy_request(Some(PolicyVisibility::WorkspaceVisible), &[], false)
+                .unwrap(),
+            Some(PolicyVisibility::WorkspaceVisible)
+        );
     }
 }

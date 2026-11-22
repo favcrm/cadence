@@ -161,6 +161,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-2240: one project's timeline (ticket changes, comments, messages,
     // reviews), newest first. A read.
     "project_timeline",
+    // CAD-2650: read one project's recorded access policy (`cli.read`).
+    "project_policy_read",
     // cli.write
     "issue_new",
     "issue_comment",
@@ -303,6 +305,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_roles"
         | "project_ls"
         | "project_timeline"
+        | "project_policy_read"
         | "document_types"
         | "template_list"
         | "template_show"
@@ -501,6 +504,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_digest_project"
         | "project_ls"
         | "project_timeline"
+        | "project_policy_read"
         | "template_list"
         | "template_show"
         | "template_blob_read"

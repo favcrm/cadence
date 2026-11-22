@@ -319,6 +319,39 @@ pub fn private_available() -> bool {
     false
 }
 
+/// Read a project's recorded access policy without locking or mutating
+/// `project.yaml` (CAD-2650).
+pub fn read_project_policy(pm: &Pm, key: &str) -> Result<Value> {
+    let key = crate::issue::model::check_key(key)?;
+    let dir = project_dir(pm, &key)?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let project = project::load(&yaml_path)?;
+    match project.policy {
+        None => Ok(json!({
+            "state": "not_stored",
+            "project": key,
+            "visibility": null,
+            "grants": [],
+            "version": null,
+        })),
+        Some(policy) => Ok(json!({
+            "state": "ok",
+            "project": key,
+            "visibility": match policy.visibility {
+                project::Visibility::WorkspaceVisible => "workspace-visible",
+                project::Visibility::Private => "private",
+            },
+            "grants": policy.members,
+            "version": policy.version,
+        })),
+    }
+}
+
 /// Replace a project's recorded access policy (AOS-274).
 ///
 /// Takes the tracker lock, re-reads the project, keeps its identity, bumps
