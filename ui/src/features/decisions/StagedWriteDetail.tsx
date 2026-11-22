@@ -76,17 +76,17 @@ export function noticeText(n: DecisionNotice, t: Say): string {
     case "denied":
       return `${t("Denied")} · ${iso(n.title)} · ${t("nothing ran")}`;
     case "failed":
-      return t("{title} was approved but did not apply: {reason}. See Updates.")
+      return t("{title} was approved but did not apply: {reason}. See Feed.")
         .replace("{title}", iso(n.title))
         .replace("{reason}", reasonText(n.reason ?? "the reason is not recognised", t));
     case "unconfirmed":
-      if (n.effect !== undefined) return t("{title}: the result is unconfirmed. The provider may have acted, so do not assume it did not. See Updates.").replace("{title}", iso(n.title));
-      return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
+      if (n.effect !== undefined) return t("{title}: the result is unconfirmed. The provider may have acted, so do not assume it did not. See Feed.").replace("{title}", iso(n.title));
+      return t("{title}: the result could not be confirmed. See Feed.").replace("{title}", iso(n.title));
     case "still-waiting":
       if (n.effect !== undefined && n.reason !== undefined) return t("It is still waiting. The last attempt did not finish ({reason}), so check before approving again.").replace("{reason}", reasonText(n.reason, t));
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
     default:
-      return t("Already decided elsewhere. See Updates.");
+      return t("Already decided elsewhere. See Feed.");
   }
 }
 
@@ -628,7 +628,7 @@ export default function StagedWriteDetail({
             ? t("Only the workspace owner can decide this request.")
             : uncertain
               ? t("We could not confirm the result. It may already have gone through, so do not approve again; check first.")
-              : t("Already decided elsewhere. See Updates.")}
+              : t("Already decided elsewhere. See Feed.")}
         </p>
       </DrawerShell>
     );

@@ -172,7 +172,7 @@ async function render() {
   await settle(() => assert(v.cards().length === 1, "only the renderable cadence_cli row is a card"));
   assert(text(v.cards()[0].querySelector(".todo-title")) === "Cadence: issue new", "the verb is the title");
   assert(/Home assistant/.test(text(v.cards()[0].querySelector(".todo-meta"))), "the asker is on the card");
-  await click(labelled(v.cards()[0], "Review"));
+  await click(v.cards()[0].querySelector(".todo-hit"));
   await settle(() => assert(drawerEl(), "the drawer opens"));
   const d = drawerEl()!;
   const body = text(d);
@@ -194,7 +194,7 @@ async function render() {
   actions = [cliRow("c1", { changes: [change("title", `pay${RLO}evil${ZWSP}x`)] })];
   const v = await render();
   await settle(() => assert(v.cards().length === 1, "a card"));
-  await click(labelled(v.cards()[0], "Review"));
+  await click(v.cards()[0].querySelector(".todo-hit"));
   await settle(() => assert(drawerEl(), "the drawer opens"));
   const rows = Array.from(drawerEl()!.querySelectorAll(".dx-row")).map((r) => text(r.querySelector("dd")));
   assert(rows[0] === "pay[U+202E]evil[U+200B]x", `shown as text (${rows[0]})`);
@@ -207,7 +207,7 @@ async function render() {
   actions = [cliRow("c1", { changes: [change("set", "a=b"), change("set", "a=b")], origin: { via: `ho${RLO}me`, kind: "agent", label: "A" } })];
   const v = await render();
   await settle(() => assert(v.cards().length === 1, "a card"));
-  await click(labelled(v.cards()[0], "Review"));
+  await click(v.cards()[0].querySelector(".todo-hit"));
   await settle(() => assert(drawerEl(), "the drawer opens"));
   const d = drawerEl()!;
   assert(d.querySelectorAll(".dx-row").length === 2, "both identical entries render");
@@ -215,7 +215,7 @@ async function render() {
   await v.done();
   actions = [cliRow("c2", { status: "approved", decidedAt: Date.now(), result: { ok: false, code: `bad${RLO}code` } })];
   const w = await render();
-  await click(labelled(w.host, "Updates"));
+  await click(labelled(w.host, "Feed"));
   assert(text(w.host).includes("refused (bad[U+202E]code)") && !w.host.textContent!.includes(RLO), "result.code is visible");
   await w.done();
 }
@@ -225,7 +225,7 @@ async function render() {
   actions = [cliRow("c1", { changes_complete: false })];
   const v = await render();
   await settle(() => assert(v.cards().length === 1, "a card"));
-  await click(labelled(v.cards()[0], "Review"));
+  await click(v.cards()[0].querySelector(".todo-hit"));
   await settle(() => assert(drawerEl(), "the drawer opens"));
   const d = drawerEl()!;
   assert(text(d).includes("cannot be reviewed here"), "a clear note");

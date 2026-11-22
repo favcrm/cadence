@@ -63,7 +63,7 @@ import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
-import { useHostedTemplateReview, type HostedTemplateRail } from "../templates/HostedTemplateReview";
+import { useHostedTemplateReview, type HostedTemplateList, type HostedTemplateRail } from "../templates/HostedTemplateReview";
 import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
 import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
 import { useSendHandoff } from "./sendHandoff";
@@ -857,6 +857,7 @@ export default function Home({
           documentFollowUps={documentFollowUps}
           templateRail={review.rail}
           templateCount={review.pendingCount}
+          templateList={review.templateList}
         />
         {review.drawer}
       </>
@@ -879,6 +880,7 @@ export default function Home({
         credentialRequestsEnabled={credentialRequestsEnabled}
         templateRail={review.rail}
         templateCount={review.pendingCount}
+        templateList={review.templateList}
       />
       {review.drawer}
     </>
@@ -902,12 +904,14 @@ function MasterHome({
   credentialRequestsEnabled = true,
   templateRail,
   templateCount,
+  templateList,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
+  templateList?: HostedTemplateList;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
@@ -1633,6 +1637,8 @@ function MasterHome({
           documentFollowUps={documentFollowUps}
           templateRail={templateRail}
           templateCount={templateCount}
+          templateList={templateList}
+          hasLiveAgents={(agents.data?.agents ?? []).some((a) => a.running > 0)}
           readOnly={readOnly}
           scopedHost={hosted !== false}
           hostedRoster={hosted === false ? undefined : agents.data ?? null}
