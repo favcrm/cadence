@@ -89,8 +89,11 @@ pub enum WikiAction {
     Rm { path: String },
     /// Ranked full-text search over wiki text pages and extracted sources.
     Search {
-        /// The query.
-        q: String,
+        /// The query: one or more words, no quotes needed. Separate words
+        /// are joined with spaces, so `wiki search acme invoice` is the
+        /// same search as `wiki search "acme invoice"` (CAD-1524).
+        #[arg(required = true, num_args = 1..)]
+        q: Vec<String>,
         /// Limit to a subtree (default: the whole wiki).
         #[arg(long)]
         path: Option<String>,
@@ -349,7 +352,7 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             let out = rpc(
                 state_dir,
                 "wiki_search",
-                json!({"q": q, "path": path.clone().unwrap_or_default()}),
+                json!({"q": q.join(" "), "path": path.clone().unwrap_or_default()}),
             )?;
             if *json {
                 crate::issue::cli::print_json(&out);
