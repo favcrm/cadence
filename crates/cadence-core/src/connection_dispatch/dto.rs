@@ -308,6 +308,18 @@ pub enum SmtpVerifiedKindV1 {
     SmtpVerified,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AgenticosSearchConsoleReportKindV1 {
+    #[serde(rename = "agenticos.search_console_report@1")]
+    AgenticosSearchConsoleReport,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AgenticosReadResultKindV1 {
+    #[serde(rename = "agenticos.read@1")]
+    AgenticosRead,
+}
+
 /// The typed operations a protected Connection dispatch may name.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
@@ -322,6 +334,8 @@ pub enum OperationKindV1 {
     SmtpTestSend,
     #[serde(rename = "smtp.verify@1")]
     SmtpVerify,
+    #[serde(rename = "agenticos.search_console_report@1")]
+    AgenticosSearchConsoleReport,
 }
 
 impl OperationKindV1 {
@@ -331,6 +345,7 @@ impl OperationKindV1 {
             OperationKindV1::SmtpSend => "smtp.send@1",
             OperationKindV1::SmtpTestSend => "smtp.test_send@1",
             OperationKindV1::SmtpVerify => "smtp.verify@1",
+            OperationKindV1::AgenticosSearchConsoleReport => "agenticos.search_console_report@1",
         }
     }
     /// Operations a human may invoke; never obtainable from an agent grant.
@@ -395,6 +410,48 @@ pub struct HumanSmtpVerifyV1 {
 }
 
 /// The agent-invokable union: three tags, `smtp.verify@1` impossible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum SearchConsoleDimensionV1 {
+    #[serde(rename = "query")]
+    Query,
+    #[serde(rename = "page")]
+    Page,
+    #[serde(rename = "country")]
+    Country,
+    #[serde(rename = "device")]
+    Device,
+    #[serde(rename = "date")]
+    Date,
+    #[serde(rename = "searchAppearance")]
+    SearchAppearance,
+}
+
+impl SearchConsoleDimensionV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchConsoleDimensionV1::Query => "query",
+            SearchConsoleDimensionV1::Page => "page",
+            SearchConsoleDimensionV1::Country => "country",
+            SearchConsoleDimensionV1::Device => "device",
+            SearchConsoleDimensionV1::Date => "date",
+            SearchConsoleDimensionV1::SearchAppearance => "searchAppearance",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticosSearchConsoleReportV1 {
+    pub kind: AgenticosSearchConsoleReportKindV1,
+    pub site_url: String,
+    pub start_date: String,
+    pub end_date: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<SearchConsoleDimensionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit: Option<u16>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -402,6 +459,7 @@ pub enum AgentOperationV1 {
     TextGenerate(TextGenerateV1),
     SmtpSend(SmtpSendV1),
     SmtpTestSend(NativeSmtpTestV1),
+    AgenticosSearchConsoleReport(AgenticosSearchConsoleReportV1),
 }
 
 impl AgentOperationV1 {
@@ -410,6 +468,9 @@ impl AgentOperationV1 {
             AgentOperationV1::TextGenerate(_) => OperationKindV1::TextGenerate,
             AgentOperationV1::SmtpSend(_) => OperationKindV1::SmtpSend,
             AgentOperationV1::SmtpTestSend(_) => OperationKindV1::SmtpTestSend,
+            AgentOperationV1::AgenticosSearchConsoleReport(_) => {
+                OperationKindV1::AgenticosSearchConsoleReport
+            }
         }
     }
 }
@@ -491,6 +552,46 @@ impl AdmissionRequestV1 {
     }
 }
 
+fn is_valid_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes[0..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        value[0..4].parse::<u16>(),
+        value[5..7].parse::<u8>(),
+        value[8..10].parse::<u8>(),
+    ) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=max_day).contains(&day)
+}
+
+fn valid_search_console_site_url(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= crate::connection_dispatch::primitives::MAX_HTTPS_URL_BYTES
+        && !value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
 pub fn validate_connection_invoke_v1(invoke: &ConnectionInvokeV1) -> Result<(), DispatchError> {
     require_v(invoke.v)?;
     match &invoke.operation {
@@ -509,6 +610,21 @@ pub fn validate_connection_invoke_v1(invoke: &ConnectionInvokeV1) -> Result<(), 
             }
         }
         AgentOperationV1::SmtpSend(_) | AgentOperationV1::SmtpTestSend(_) => {}
+        AgentOperationV1::AgenticosSearchConsoleReport(operation) => {
+            if !valid_search_console_site_url(&operation.site_url)
+                || !is_valid_calendar_date(&operation.start_date)
+                || !is_valid_calendar_date(&operation.end_date)
+                || operation.start_date > operation.end_date
+                || operation.dimensions.len() > 1
+            {
+                return Err(validation_error(ErrorCodeV1::InvalidRequest));
+            }
+            if let Some(limit) = operation.row_limit {
+                if !(1..=1000).contains(&limit) {
+                    return Err(validation_error(ErrorCodeV1::InvalidRequest));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -768,6 +884,8 @@ pub fn validate_loaded_receipt_v1(
 pub enum ProviderKindV1 {
     Smtp,
     Openrouter,
+    #[serde(rename = "agenticos-provider")]
+    AgenticosProvider,
 }
 
 impl ProviderKindV1 {
@@ -775,6 +893,7 @@ impl ProviderKindV1 {
         match self {
             ProviderKindV1::Smtp => "smtp",
             ProviderKindV1::Openrouter => "openrouter",
+            ProviderKindV1::AgenticosProvider => "agenticos-provider",
         }
     }
 }
@@ -952,6 +1071,39 @@ pub struct DataScopeV1 {
     pub content_digest: Option<Digest>,
 }
 
+pub const AGENTICOS_PROVIDER_MANIFEST_PIN: &str = "cadence-provider-tools@1";
+pub const AGENTICOS_SEARCH_CONSOLE_SLUG: &str = "search_console_report";
+pub const AGENTICOS_PROVIDER_READ_PATH: &str = "/v1/runtime/tools/read";
+pub const MAX_AGENTICOS_READ_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticosReadPolicyV1 {
+    pub adapter_manifest_pin: Ident,
+    pub slug: Ident,
+    pub upstream_connection_id: Ident,
+    pub site_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Ident>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<Ident>,
+}
+
+pub fn validate_agenticos_read_policy_v1(policy: &OperationPolicyV1) -> Result<(), DispatchError> {
+    let Some(read) = &policy.agenticos_read else {
+        return Err(validation_error(ErrorCodeV1::OperationNotGranted));
+    };
+    if read.adapter_manifest_pin.as_str() != AGENTICOS_PROVIDER_MANIFEST_PIN
+        || read.slug.as_str() != AGENTICOS_SEARCH_CONSOLE_SLUG
+    {
+        return Err(validation_error(ErrorCodeV1::CapabilityUnavailable));
+    }
+    if !valid_search_console_site_url(&read.site_url) {
+        return Err(validation_error(ErrorCodeV1::DataPolicyRefused));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OperationPolicyV1 {
@@ -964,6 +1116,8 @@ pub struct OperationPolicyV1 {
     pub provider_profile: Ident,
     pub data_scopes: Vec<DataScopeV1>,
     pub approved_document_digest: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agenticos_read: Option<AgenticosReadPolicyV1>,
 }
 
 impl OperationPolicyV1 {
@@ -1816,6 +1970,40 @@ pub enum SmtpVerificationClaimV1 {
     AuthenticationOnly,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticosReadPriceV1 {
+    pub amount: String,
+    pub currency: CurrencyV1,
+    pub scale: u8,
+}
+
+fn valid_agenticos_read_price(price: &AgenticosReadPriceV1) -> bool {
+    if price.currency != CurrencyV1::Usd || price.scale != 6 {
+        return false;
+    }
+    let Some((whole, fraction)) = price.amount.split_once('.') else {
+        return false;
+    };
+    !whole.is_empty()
+        && whole.len() <= 10
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && (whole == "0" || !whole.starts_with('0'))
+        && fraction.len() == 6
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticosReadResultV1 {
+    pub kind: AgenticosReadResultKindV1,
+    pub slug: Ident,
+    pub repeated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<AgenticosReadPriceV1>,
+    pub result_json: String,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -1823,6 +2011,7 @@ pub enum ReceiptResultV1 {
     TextGenerated(TextGeneratedV1),
     SmtpAccepted(SmtpAcceptedV1),
     SmtpVerified(SmtpVerifiedV1),
+    AgenticosRead(AgenticosReadResultV1),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1881,6 +2070,20 @@ impl DispatchReceiptV1 {
                             return Err(validation_error(ErrorCodeV1::InvalidRequest));
                         }
                     }
+                    Some(ReceiptResultV1::AgenticosRead(result)) => {
+                        if result.result_json.len() > MAX_AGENTICOS_READ_BYTES {
+                            return Err(validation_error(ErrorCodeV1::PayloadTooLarge));
+                        }
+                        if self.usage.is_some()
+                            || result.kind != AgenticosReadResultKindV1::AgenticosRead
+                            || result.slug.as_str() != AGENTICOS_SEARCH_CONSOLE_SLUG
+                            || result.result_json.is_empty()
+                            || (!result.repeated && result.price.is_none())
+                            || !result.price.as_ref().is_none_or(valid_agenticos_read_price)
+                        {
+                            return Err(validation_error(ErrorCodeV1::InvalidRequest));
+                        }
+                    }
                     None => return Err(validation_error(ErrorCodeV1::InvalidRequest)),
                 }
             }
@@ -1910,10 +2113,12 @@ impl DispatchReceiptV1 {
                 }
             }
         }
-        // Receipt metadata is bounded to 8 KiB; the model text may add 1 MiB.
+        // Receipt metadata is bounded to 8 KiB; the model text or read payload may add 1 MiB.
         let mut metadata = self.clone();
-        if let Some(ReceiptResultV1::TextGenerated(result)) = metadata.result.as_mut() {
-            result.text.clear();
+        match metadata.result.as_mut() {
+            Some(ReceiptResultV1::TextGenerated(result)) => result.text.clear(),
+            Some(ReceiptResultV1::AgenticosRead(result)) => result.result_json.clear(),
+            _ => {}
         }
         let bytes = serde_json::to_vec(&metadata)
             .map_err(|_| validation_error(ErrorCodeV1::PayloadTooLarge))?;
@@ -1958,6 +2163,17 @@ pub struct SmtpVerifiedOutcomeV1 {
     pub verified: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticosReadOutcomeV1 {
+    pub kind: AgenticosReadResultKindV1,
+    pub slug: Ident,
+    pub repeated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<AgenticosReadPriceV1>,
+    pub result_json: String,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -1965,6 +2181,7 @@ pub enum OutcomeResultV1 {
     TextGenerated(TextOutcomeV1),
     SmtpAccepted(SmtpAcceptedOutcomeV1),
     SmtpVerified(SmtpVerifiedOutcomeV1),
+    AgenticosRead(AgenticosReadOutcomeV1),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2001,6 +2218,20 @@ impl ValidatedOutcomeV1 {
                     }
                     Some(OutcomeResultV1::SmtpVerified(result)) => {
                         if self.usage.is_some() || !result.verified {
+                            return Err(validation_error(ErrorCodeV1::InvalidRequest));
+                        }
+                    }
+                    Some(OutcomeResultV1::AgenticosRead(result)) => {
+                        if result.result_json.len() > MAX_AGENTICOS_READ_BYTES {
+                            return Err(validation_error(ErrorCodeV1::PayloadTooLarge));
+                        }
+                        if self.usage.is_some()
+                            || result.kind != AgenticosReadResultKindV1::AgenticosRead
+                            || result.slug.as_str() != AGENTICOS_SEARCH_CONSOLE_SLUG
+                            || result.result_json.is_empty()
+                            || (!result.repeated && result.price.is_none())
+                            || !result.price.as_ref().is_none_or(valid_agenticos_read_price)
+                        {
                             return Err(validation_error(ErrorCodeV1::InvalidRequest));
                         }
                     }

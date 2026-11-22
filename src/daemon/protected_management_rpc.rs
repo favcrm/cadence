@@ -336,6 +336,45 @@ fn execute(
                     "the policy digest does not match the approved document",
                 ));
             }
+            if policy.allowed_operations.contains(
+                &cadence_core::connection_dispatch::dto::OperationKindV1::AgenticosSearchConsoleReport,
+            ) || policy.agenticos_read.is_some()
+            {
+                let connection = shared
+                    .store
+                    .protected_connection_row(&connection_id)?
+                    .ok_or_else(|| Error::invalid("not_found", "the selector is unavailable"))?;
+                if connection.platform != crate::platform::agenticos_provider::PLATFORM
+                    || connection.scopes
+                        != [crate::platform::agenticos_provider::SCOPE_DEDICATED_READ]
+                {
+                    return Err(Error::invalid(
+                        "operation_not_granted",
+                        "the Connection does not grant this operation",
+                    ));
+                }
+                if policy.allowed_operations
+                    != [cadence_core::connection_dispatch::dto::OperationKindV1::AgenticosSearchConsoleReport]
+                    || !policy.allowed_human_operations.is_empty()
+                {
+                    return Err(Error::invalid(
+                        "invalid_request",
+                        "agenticos-provider policy allows only agenticos.search_console_report@1",
+                    ));
+                }
+                cadence_core::connection_dispatch::dto::validate_agenticos_read_policy_v1(&policy)
+                    .map_err(|e| Error::invalid(e.code.as_str(), e.message))?;
+                if !policy
+                    .allowed_destinations
+                    .iter()
+                    .any(|dest| dest.as_str() == "https://api-v2.agenticos.hk/v1/runtime/tools/read")
+                {
+                    return Err(Error::invalid(
+                        "destination_refused",
+                        "the destination is not approved",
+                    ));
+                }
+            }
             shared.store.protected_management_commit(
                 &workspace,
                 eligibility.owner_epoch,

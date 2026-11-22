@@ -29,15 +29,17 @@ use std::sync::{Arc, Weak};
 
 use cadence_core::connection_dispatch::canonical::{exact_byte_digest, material_digest_value};
 use cadence_core::connection_dispatch::dto::{
-    AdmissionRequestV1, AgentOperationV1, ConnectionInvokeV1, CredentialRequestArgsV1, CurrencyV1,
-    DispatchCommitV1, DispatchReceiptV1, DispatchStateV1, FallbackPolicyV1, FenceStateV1,
-    HumanSmtpVerifyAdmissionV1, HumanVerbV1, LoadedReceiptV1, ModelQuoteV1, OperationKindV1,
-    OutcomeKindV1, OutcomeResultV1, ParameterPolicyV1, QuoteArgsV1, QuotePriceV1,
-    ReasoningBillingV1, ReceiptResultV1, ResolvedDestinationV1, ResolvedMaterialV1, ResultArgsV1,
-    RuntimeProfileV1, SendApprovalV1, SettlementV1, SmtpAcceptedKindV1, SmtpAcceptedOutcomeV1,
-    SmtpVerifiedKindV1, SmtpVerifiedOutcomeV1, SnapshotArgsV1, SnapshotV1, StageSendArgsV1,
-    TextGenerateV1, TextGeneratedKindV1, TextOutcomeV1, UsageV1, ValidatedOutcomeV1,
-    SNAPSHOT_LIFETIME_MS,
+    validate_agenticos_read_policy_v1, validate_resolved_destination_v1, AdmissionRequestV1,
+    AgentOperationV1, AgenticosReadOutcomeV1, AgenticosReadPolicyV1, AgenticosReadPriceV1,
+    AgenticosReadResultKindV1, AgenticosSearchConsoleReportV1, ConnectionInvokeV1,
+    CredentialRequestArgsV1, CurrencyV1, DestinationKindV1, DispatchCommitV1, DispatchReceiptV1,
+    DispatchStateV1, FallbackPolicyV1, FenceStateV1, HumanSmtpVerifyAdmissionV1, HumanVerbV1,
+    LoadedReceiptV1, ModelQuoteV1, OperationKindV1, OutcomeKindV1, OutcomeResultV1,
+    ParameterPolicyV1, QuoteArgsV1, QuotePriceV1, ReasoningBillingV1, ReceiptResultV1,
+    ResolvedDestinationV1, ResolvedMaterialV1, ResultArgsV1, RuntimeProfileV1, SendApprovalV1,
+    SettlementV1, SmtpAcceptedKindV1, SmtpAcceptedOutcomeV1, SmtpVerifiedKindV1,
+    SmtpVerifiedOutcomeV1, SnapshotArgsV1, SnapshotV1, StageSendArgsV1, TextGenerateV1,
+    TextGeneratedKindV1, TextOutcomeV1, UsageV1, ValidatedOutcomeV1, SNAPSHOT_LIFETIME_MS,
 };
 use cadence_core::connection_dispatch::primitives::{
     parse_usd_decimal_to_pico, AgentUid, Counter, Digest, EpochMs, HttpsUrl, Ident, PicoUsd,
@@ -1206,6 +1208,36 @@ impl ProtectedConnections {
                     "this profile has no reviewed human test-send record",
                 ))
             }
+            AgentOperationV1::AgenticosSearchConsoleReport(operation) => {
+                if connection.platform != crate::platform::agenticos_provider::PLATFORM
+                    || connection.scopes
+                        != [crate::platform::agenticos_provider::SCOPE_DEDICATED_READ]
+                {
+                    return Err(operation_not_granted());
+                }
+                validate_agenticos_read_policy_v1(&policy_row.policy)
+                    .map_err(|e| Error::invalid(e.code.as_str(), e.message))?;
+                let read_policy = policy_row
+                    .policy
+                    .agenticos_read
+                    .as_ref()
+                    .ok_or_else(operation_not_granted)?;
+                require_agenticos_membership(&shared, read_policy, &eligibility.workspace_id)?;
+                if operation.site_url != read_policy.site_url {
+                    return Err(Error::invalid(
+                        "data_policy_refused",
+                        "the requested site_url does not match the approved policy",
+                    ));
+                }
+                ProviderMaterial {
+                    destination: agenticos_read_destination()?,
+                    body: agenticos_read_request_body(read_policy, operation)?,
+                    recipient: None,
+                    approval_id: None,
+                    key_id: key_id.clone(),
+                    smtp_test_ca: None,
+                }
+            }
         };
         Ok(invoke_response(
             self.dispatch(principal, invoke, loaded, material)?,
@@ -1240,12 +1272,37 @@ impl ProtectedConnections {
             Some(caller.agent_uid()),
             row.commit.connection_id.as_str(),
         )?;
-        Ok(json!({
+        let mut response = json!({
             "dispatch_id": row.commit.dispatch_id,
             "request_id": row.commit.request_id,
             "state": row.state,
             "receipt": row.receipt,
-        }))
+        });
+        if row.state == DispatchStateV1::Unknown
+            && row.commit.operation_kind == OperationKindV1::AgenticosSearchConsoleReport
+        {
+            let platform_lookup = match (
+                load_openrouter_key(&shared, &row.commit),
+                agenticos_provider_adapter(&shared),
+            ) {
+                (Ok(token), Ok(adapter)) => match adapter.lookup_dedicated_read(
+                    token.as_bytes(),
+                    row.commit.idempotency_key.as_str(),
+                    crate::platform::agenticos_provider::SLUG_SEARCH_CONSOLE_REPORT,
+                ) {
+                    Ok(lookup) => json!({
+                        "outcome": lookup.outcome,
+                        "recorded": lookup.recorded,
+                        "status": lookup.status,
+                        "billing": lookup.billing,
+                    }),
+                    Err(_) => json!({"outcome": "unknown", "recorded": false}),
+                },
+                _ => json!({"outcome": "unknown", "recorded": false}),
+            };
+            response["platform_lookup"] = platform_lookup;
+        }
+        Ok(response)
     }
 
     fn op_request(&self, caller: &RuntimeCaller, args: &Value) -> Result<Value> {
@@ -1663,6 +1720,9 @@ impl ExecutionPermit {
             AgentOperationV1::SmtpSend(_) | AgentOperationV1::SmtpTestSend(_) => {
                 execute_smtp_send(shared, &self.commit, &self.material)
             }
+            AgentOperationV1::AgenticosSearchConsoleReport(_) => {
+                execute_agenticos_read(shared, &self.commit, &self.material)
+            }
         }
     }
 
@@ -1681,6 +1741,60 @@ impl ExecutionPermit {
             return refused_outcome(ErrorCodeV1::DigestMismatch);
         }
         execute_smtp_verify(shared, &self.commit, &self.material)
+    }
+}
+
+fn execute_agenticos_read(
+    shared: &Shared,
+    commit: &DispatchCommitV1,
+    material: &ProviderMaterial,
+) -> ValidatedOutcomeV1 {
+    if material.destination.https_endpoint().as_deref()
+        != Some("https://api-v2.agenticos.hk/v1/runtime/tools/read")
+    {
+        return refused_outcome(ErrorCodeV1::DestinationRefused);
+    }
+    let token = match load_openrouter_key(shared, commit) {
+        Ok(token) => token,
+        Err(_) => return refused_outcome(ErrorCodeV1::CustodyLocked),
+    };
+    let adapter = match agenticos_provider_adapter(shared) {
+        Ok(adapter) => adapter,
+        Err(_) => return refused_outcome(ErrorCodeV1::DestinationRefused),
+    };
+    let slug = match Ident::try_from(
+        crate::platform::agenticos_provider::SLUG_SEARCH_CONSOLE_REPORT.to_string(),
+    ) {
+        Ok(slug) => slug,
+        Err(_) => return refused_outcome(ErrorCodeV1::InvalidRequest),
+    };
+    match adapter.execute_dedicated_read(
+        token.as_bytes(),
+        &material.body,
+        commit.idempotency_key.as_str(),
+    ) {
+        Ok(reply) => ValidatedOutcomeV1 {
+            v: 1,
+            kind: OutcomeKindV1::Done,
+            usage: None,
+            result: Some(OutcomeResultV1::AgenticosRead(AgenticosReadOutcomeV1 {
+                kind: AgenticosReadResultKindV1::AgenticosRead,
+                slug,
+                repeated: reply.repeated,
+                price: reply.price.map(|p| AgenticosReadPriceV1 {
+                    amount: p.amount,
+                    currency: CurrencyV1::Usd,
+                    scale: p.scale,
+                }),
+                result_json: reply.result_json,
+            })),
+            refused_code: None,
+        },
+        Err(crate::platform::adapter::AppCapabilityError::Refused(_))
+        | Err(crate::platform::adapter::AppCapabilityError::InsufficientFunds(_)) => {
+            refused_outcome(ErrorCodeV1::ProviderRefused)
+        }
+        Err(crate::platform::adapter::AppCapabilityError::Uncertain(_)) => unknown_outcome(),
     }
 }
 
@@ -2166,6 +2280,14 @@ impl ProtectedConnections {
                 ))
             }
         };
+        if base.platform == crate::platform::agenticos_provider::PLATFORM
+            && input.kind() != SecretKind::OpenRouterApiKey
+        {
+            return Err(Error::invalid(
+                "invalid_request",
+                "agenticos-provider credentials require the token shape",
+            ));
+        }
         let workspace_id = shared.store.connection_workspace_id()?;
         // The secret is screened against every piece of metadata that will be
         // persisted BEFORE any of it lands.
@@ -2192,6 +2314,14 @@ impl ProtectedConnections {
         } else {
             attempt.scopes().to_vec()
         };
+        if base.platform == crate::platform::agenticos_provider::PLATFORM
+            && scopes != [crate::platform::agenticos_provider::SCOPE_DEDICATED_READ]
+        {
+            return Err(Error::invalid(
+                "invalid_request",
+                "agenticos-provider credentials require the provider.read.dedicated scope",
+            ));
+        }
         let record = crate::store::CredentialRecord {
             connection_id: base.connection_id,
             credential_revision: revision,
@@ -2335,6 +2465,9 @@ fn smtp_enrollment_metadata(enrollment: &crate::platform::smtp::SmtpEnrollment) 
 fn default_scopes(provider: &str) -> Vec<String> {
     match provider {
         "smtp" => vec![crate::platform::smtp::SCOPE_EMAIL_SEND.to_string()],
+        crate::platform::agenticos_provider::PLATFORM => {
+            vec![crate::platform::agenticos_provider::SCOPE_DEDICATED_READ.to_string()]
+        }
         _ => Vec::new(),
     }
 }
@@ -2613,6 +2746,105 @@ fn https_destination(endpoint: &str) -> Result<ResolvedDestinationV1> {
     Ok(destination)
 }
 
+fn agenticos_read_destination() -> Result<ResolvedDestinationV1> {
+    let destination = ResolvedDestinationV1 {
+        kind: DestinationKindV1::Https,
+        host: ident("api-v2.agenticos.hk")?,
+        port: None,
+        path: Some("v1/runtime/tools/read".to_string()),
+    };
+    validate_resolved_destination_v1(&destination).map_err(|_| destination_refused())?;
+    Ok(destination)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn agenticos_provider_adapter(
+    shared: &Shared,
+) -> Result<crate::platform::agenticos_provider::AgenticosProviderAdapter> {
+    let origin = shared
+        .agenticos_provider_fixture_origin
+        .as_deref()
+        .unwrap_or(crate::platform::agenticos_provider::PRODUCTION_ORIGIN);
+    crate::platform::agenticos_provider::AgenticosProviderAdapter::new(origin)
+}
+
+#[cfg(not(any(test, feature = "test-seam")))]
+fn agenticos_provider_adapter(
+    _shared: &Shared,
+) -> Result<crate::platform::agenticos_provider::AgenticosProviderAdapter> {
+    crate::platform::agenticos_provider::AgenticosProviderAdapter::new(
+        crate::platform::agenticos_provider::PRODUCTION_ORIGIN,
+    )
+}
+
+fn require_agenticos_membership(
+    shared: &Shared,
+    read_policy: &AgenticosReadPolicyV1,
+    authority_workspace: &str,
+) -> Result<()> {
+    let expected_workspace = read_policy
+        .workspace
+        .as_ref()
+        .map(Ident::as_str)
+        .unwrap_or(authority_workspace);
+    match &shared.membership_mode {
+        crate::daemon::public_membership::MembershipMode::Dedicated(ctx) => {
+            if ctx.realm.company != expected_workspace
+                || read_policy
+                    .deployment
+                    .as_ref()
+                    .is_none_or(|deployment| deployment.as_str() != ctx.deployment.as_str())
+            {
+                return Err(operation_not_granted());
+            }
+            Ok(())
+        }
+        crate::daemon::public_membership::MembershipMode::Native(ctx) => {
+            if ctx.company != expected_workspace
+                || ctx.realm.company != expected_workspace
+                || read_policy.deployment.is_some()
+            {
+                return Err(operation_not_granted());
+            }
+            Ok(())
+        }
+        crate::daemon::public_membership::MembershipMode::Standalone
+        | crate::daemon::public_membership::MembershipMode::RequiredUnavailable => {
+            Err(Error::invalid(
+                "capability_unavailable",
+                "dedicated provider reads require a native or dedicated board workspace",
+            ))
+        }
+    }
+}
+
+fn agenticos_read_request_body(
+    read_policy: &AgenticosReadPolicyV1,
+    operation: &AgenticosSearchConsoleReportV1,
+) -> Result<Vec<u8>> {
+    let mut input = serde_json::Map::new();
+    input.insert("site_url".to_string(), json!(operation.site_url));
+    input.insert("start_date".to_string(), json!(operation.start_date));
+    input.insert("end_date".to_string(), json!(operation.end_date));
+    if !operation.dimensions.is_empty() {
+        let dimensions: Vec<&'static str> = operation
+            .dimensions
+            .iter()
+            .map(|dim| dim.as_str())
+            .collect();
+        input.insert("dimensions".to_string(), json!(dimensions));
+    }
+    if let Some(limit) = operation.row_limit {
+        input.insert("row_limit".to_string(), json!(limit));
+    }
+    serde_json::to_vec(&json!({
+        "slug": read_policy.slug.as_str(),
+        "connection_id": read_policy.upstream_connection_id.as_str(),
+        "input": Value::Object(input),
+    }))
+    .map_err(|_| invalid_request())
+}
+
 fn invoke_response(outcome: InvokeOutcome) -> Value {
     match outcome {
         InvokeOutcome::Settled(settlement) => json!({
@@ -2794,3 +3026,7 @@ fn done_verified() -> ValidatedOutcomeV1 {
 #[cfg(test)]
 #[path = "protected_connections_epoch_acceptance_20261027.rs"]
 mod protected_connections_epoch_acceptance_20261027;
+
+#[cfg(test)]
+#[path = "protected_connections_agenticos_read_acceptance.rs"]
+mod protected_connections_agenticos_read_acceptance;
