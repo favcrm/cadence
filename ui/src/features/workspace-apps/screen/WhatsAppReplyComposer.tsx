@@ -62,9 +62,9 @@ const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
 const EFFECT = /^wae_[0-9a-f]{32}$/;
 const provider = "linked";
-const AUTO_POLL_DELAYS_MS = [600, 1_400] as const;
+const AUTO_POLL_DELAYS_MS = [500, 1_000, 1_800, 2_700] as const;
 const SENT_BANNER_DISMISS_MS = 3_000;
-type StatusTone = "confirming" | "sent" | "accepted" | "uncertain" | "failed";
+type StatusTone = "sending" | "confirming" | "sent" | "accepted" | "uncertain" | "failed";
 // Keep the uncertain attempt and latest unconfirmed acceptance separately,
 // so a later failed send can't erase an earlier delivery check.
 const replyRecovery = new Map<string, { pending: string | null; accepted: string | null }>();
@@ -113,7 +113,10 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const [verification, setVerification] = useState<RecipientCheck>();
   const [retry, setRetry] = useState<{ bound?: Recipient }>();
   const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [pendingOp, setPendingOp] = useState<"send" | "check" | null>(null);
+  const busy = pendingOp !== null;
+  const sending = pendingOp === "send";
+  const checking = pendingOp === "check";
   const [staleRecipient, setStaleRecipient] = useState(false);
   const [attempt, setAttempt] = useState<{ effectId: string | null; outcome: Outcome } | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -363,7 +366,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
-    setBusy(true);
+    setPendingOp("send");
     setAttempt(null);
     setAttachError(null);
     const activeAttachment = attachment;
@@ -448,7 +451,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         } else if (outcome === "sent") {
           scheduleSentDismiss(effectId);
         }
-        setBusy(false);
+        setPendingOp(null);
         selection.announce(!mayHaveSent && (!!text || (!!attachment && !staleAttachmentHandled)), submitted);
       }
     }
@@ -460,26 +463,32 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
-    setBusy(true);
+    setPendingOp("check");
     const { effectId } = attempt;
-    const result = await selection.services.call("whatsapp.reply.status", { provider, effect_id: effectId });
-    running.current = false;
-    if (!selection.current()) return;
-    const recorded = recordedState(result.ok && object(result.data) ? result.data.state : null);
-    // An inconclusive delivery check cannot un-confirm a known acceptance.
-    const outcome = recorded === "uncertain" && attempt.outcome === "accepted" ? "accepted" : recorded;
-    settleReceipt(receiptKey(selection, recipient), effectId, outcome, group);
-    setAttempt({ effectId, outcome });
-    if (outcome === "sent") scheduleSentDismiss(effectId);
-    setBusy(false);
-    selection.announce(!!text || !!attachment, true);
+    try {
+      const result = await selection.services.call("whatsapp.reply.status", { provider, effect_id: effectId });
+      if (!selection.current()) return;
+      const recorded = recordedState(result.ok && object(result.data) ? result.data.state : null);
+      // An inconclusive delivery check cannot un-confirm a known acceptance.
+      const outcome = recorded === "uncertain" && attempt.outcome === "accepted" ? "accepted" : recorded;
+      settleReceipt(receiptKey(selection, recipient), effectId, outcome, group);
+      setAttempt({ effectId, outcome });
+      if (outcome === "sent") scheduleSentDismiss(effectId);
+      selection.announce(!!text || !!attachment, true);
+    } finally {
+      running.current = false;
+      if (selection.current()) setPendingOp(null);
+    }
   }
 
   const audioNote = audioHasCaption
     ? (zh ? "音訊回覆不可包含說明文字。請清除文字或移除音訊。" : "Audio replies can’t include a caption. Clear the text or remove the audio.")
     : null;
+  const sendingNote = sending
+    ? (attachment ? (zh ? "正在傳送附件…" : "Sending attachment…") : (zh ? "正在傳送回覆…" : "Sending reply…"))
+    : null;
   const note = staleRecipient ? (zh ? "未有傳送。請清除草稿並重新開啟對話，以再次核對收件人。" : "Nothing sent. Clear the draft and reopen the conversation to verify the recipient again.")
-    : attachError ?? audioNote
+    : attachError ?? audioNote ?? sendingNote
     ?? (resolvingConfirm ? (zh ? "正在向 WhatsApp 確認傳送狀態…" : "Confirming send…")
     : attempt?.outcome === "sent" ? (group ? (zh ? "WhatsApp 已接收群組訊息。" : "WhatsApp accepted the group message.") : (zh ? "已確認送達。" : "Delivery confirmed."))
     : attempt?.outcome === "accepted" ? (zh ? "WhatsApp 已接收，等待送達確認。" : "Sent to WhatsApp · Delivery pending.")
@@ -487,16 +496,22 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null);
   const statusTone: StatusTone | undefined = staleRecipient || !!attachError || audioHasCaption
     ? "failed"
+    : sending ? "sending"
     : resolvingConfirm ? "confirming"
     : attempt?.outcome === "sent" ? "sent"
     : attempt?.outcome === "accepted" ? "accepted"
     : attempt?.outcome === "uncertain" ? "uncertain"
     : attempt ? "failed" : undefined;
-  const statusAlert = staleRecipient || !!attachError || audioHasCaption || (!resolvingConfirm && (attempt?.outcome === "uncertain" || attempt?.outcome === "failed"));
-  const canCheckAction = !attachError && !audioHasCaption && !resolvingConfirm && (locked || (attempt?.outcome === "accepted" && !group));
+  const statusAlert = staleRecipient || !!attachError || audioHasCaption || (!sending && !resolvingConfirm && (attempt?.outcome === "uncertain" || attempt?.outcome === "failed"));
+  const canCheckAction = !attachError && !audioHasCaption && !sending && !resolvingConfirm && (locked || (attempt?.outcome === "accepted" && !group));
+  const showStatusSpinner = statusTone === "sending" || statusTone === "confirming";
+  const sendSpinning = sending || resolvingConfirm;
   const status = note && <div className="wa-reply-status" data-tone={statusTone}>
-    <p role={statusAlert ? "alert" : "status"}>{note}</p>
-    {canCheckAction && <Button size="sm" variant={attempt?.outcome === "accepted" ? "ghost" : undefined} disabled={busy} onClick={() => { void check(); }}>
+    <p role={statusAlert ? "alert" : "status"}>
+      {showStatusSpinner && <span className="wa-reply-spinner" aria-hidden="true" />}
+      <span>{note}</span>
+    </p>
+    {canCheckAction && <Button size="sm" variant={attempt?.outcome === "accepted" ? "ghost" : undefined} loading={checking} disabled={busy} onClick={() => { void check(); }}>
       {attempt?.outcome === "accepted" ? (zh ? "重新檢查" : "Recheck") : (zh ? "檢查狀態" : "Check status")}
     </Button>}
   </div>;
@@ -519,7 +534,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
           : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
-          : availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…")
+          : availability === "checking" ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在核對收件人…" : "Verifying recipient…"}</span>
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
       </p>}
       {attachment && <div className="wa-reply-attachment">
@@ -549,16 +564,24 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         onChange={e => { void pickFile(e.target.files?.[0]); }} />
       <div className="app-chat-composer-tools wa-reply-tools">
         <button type="button" className="wa-reply-attach" aria-label={zh ? "附加檔案" : "Attach file"}
+          data-loading={staging ? "true" : undefined} aria-busy={staging || undefined}
           disabled={readOnly || staging || !!attachment}
           onClick={() => fileInput.current?.click()}>
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+          {staging
+            ? <span className="wa-reply-spinner" aria-hidden="true" />
+            : <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>}
         </button>
         {(text || attachment) && !busy && !resolvingConfirm && !locked && !staging && <Button size="sm" variant="ghost" onClick={() => { setText(""); clearAttachment(true); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
         <span className="wa-reply-hint" aria-live="polite">
-          {staging ? (zh ? "正在上傳附件…" : "Uploading attachment…") : busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
+          {staging ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在上傳附件…" : "Uploading attachment…"}</span>
+            : checking ? (zh ? "正在檢查狀態…" : "Checking status…")
+            : sending || resolvingConfirm ? null
+            : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
         </span>
-        <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"} disabled={disabled}
+        <button type="submit" className="wa-reply-send" aria-label={zh ? "傳送" : "Send"}
+          data-loading={sendSpinning ? "true" : undefined} aria-busy={sendSpinning || undefined}
+          disabled={disabled}
           onPointerDown={e => { pointer.current = e.nativeEvent.isTrusted && e.button === 0; }} onPointerCancel={() => { pointer.current = false; }}
           onClick={e => {
             e.preventDefault();
@@ -566,7 +589,9 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
             pointer.current = false;
             if (deliberate) void send();
           }}>
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
+          {sendSpinning
+            ? <span className="wa-reply-spinner" aria-hidden="true" />
+            : <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>}
         </button>
       </div>
     </form>
