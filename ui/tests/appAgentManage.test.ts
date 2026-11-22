@@ -63,10 +63,20 @@ let acknowledgeConsultation = true;
 let consultationRead: "failure" | "missing" | "unconfirmed" | "answer" = "failure";
 let consultationReply = "  \n ";
 let heldAgentRead: Promise<Response> | null = null;
+let removePreviewCalls = 0;
+let removeCalls = 0;
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), win.location.href).pathname;
+  if (url === `${path}/remove-preview`) {
+    removePreviewCalls += 1;
+    return json({ install_id: installId, title: "Accounting", generation: "a", digest: digestA });
+  }
+  if (url === `${path}/remove`) {
+    removeCalls += 1;
+    return json({ ok: true });
+  }
   if (url.startsWith(`${path}/agent/consultations/`)) {
     const id = url.split("/").pop()!;
     if (init?.method === "POST") {
@@ -123,11 +133,11 @@ const save = () => selector()?.querySelector<HTMLButtonElement>('button[type="su
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
-async function render(session: string | null, operator = true) {
+async function render(session: string | null, operator = true, hosted = false) {
   await React.act(async () => {
     root.render(React.createElement(LocaleProvider, null,
       React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ManageApp, {
-        installId, viewer: { operator, readOnly: !operator }, automaticUpdatesEnabled: false, appAgentSession: session,
+        installId, viewer: { operator, readOnly: !operator }, automaticUpdatesEnabled: false, appAgentSession: session, hosted,
       }) })));
   });
 }
@@ -154,6 +164,12 @@ async function main() {
   try {
     await render("owner-a");
     assert(selector()?.textContent?.includes("Current agent: Bookkeeper"), "Screen-only Accounting exposes the current role in Manage");
+    assert(Boolean(updateButton("Remove app…")), "Native Manage shows Remove app button");
+    await render("owner-a", true, true);
+    assert(!updateButton("Remove app…"), "Hosted Manage hides the unsupported Remove app button");
+    assert(host.textContent?.includes("Removing installed apps from a hosted workspace is not available yet. You can revoke tool access above."), "Hosted Manage explains removal is unavailable and points to revoking access above");
+    assert(removePreviewCalls === 0 && removeCalls === 0, "Hosted Manage never calls remove-preview or remove");
+    await render("owner-a", true, false);
     assert(!choice()?.querySelector('option[value="retired"]'), "Archived profiles are not offered");
     await change(choice(), "reviewer");
     await change(host.querySelector<HTMLInputElement>(".update-source"), "https://example.test/accounting");
