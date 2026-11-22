@@ -300,7 +300,9 @@
 .artcard:hover .artopen { background: var(--color-ink-800); }
 
 /* ---- CAD-2471: an app view (an installed app's screen, read-only) ---- */
-.cv-title > .cv-appview-sub { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; white-space: normal; overflow-wrap: anywhere; min-width: 0; }
+/* CAD-2634: the app name line is one line with an ellipsis; the params wrap to at most two, then an ellipsis. Full text is in each title. */
+.cv-title > .cv-appview-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cv-title > .cv-appview-params { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; white-space: normal; overflow-wrap: anywhere; min-width: 0; }
 .cv-appview-open { flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cv-appview-body { padding: 0; position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .cv-appview-note { display: grid; gap: 8px; justify-items: start; margin: 0; padding: 12px; min-width: 0; overflow-wrap: anywhere; color: var(--color-ink-300); font-size: var(--text-label); }

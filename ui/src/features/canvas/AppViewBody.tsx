@@ -93,7 +93,7 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
   const onOpenedView = app.route.section === openedSection && (app.route.record_id ?? "") === openedRecord;
   const where = (onOpenedView ? app.viewLabel : undefined) ?? (app.route.record_id ? `${app.route.section} / ${app.route.record_id}` : app.route.section);
   const params = paramsLine(app.route.params, locale);
-  const place = params === "" ? where : `${where} · ${params}`;
+  const sub = `${appName} · ${where} · ${t("read-only")}`;
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>
     state.kind === "refused" && isNoAccess(state.status) ? <FrameDenied onDenied={() => setFrameDenied(true)}>{denied}</FrameDenied> : (
@@ -114,11 +114,12 @@ export default function AppViewBody({ tab, app, sheet, expanded, canExpand, onEx
         ) : null}
         <span className="cv-title">
           <b title={tab.title}>{tab.title}</b>
-          <span className="cv-appview-sub" title={`${appName} · ${place} · ${t("read-only")}`}>{appName} · {place} · {t("read-only")}</span>
+          <span className="cv-appview-sub" title={sub}>{sub}</span>
+          {params === "" ? null : <span className="cv-appview-params" data-view-params title={params}>{params}</span>}
         </span>
         {noAccess || href === null ? null : (
           // Navigating away leaves the tab behind: close it on the desktop too (the sheet closes the drawer).
-          <Link className="btn btn-ghost cv-appview-open" href={href} onClick={sheet ? onClose : () => closeTab(tab.id)}>
+          <Link className="btn btn-ghost cv-appview-open" href={href} title={t("Open in {app}").replace("{app}", appName)} onClick={sheet ? onClose : () => closeTab(tab.id)}>
             {t("Open in {app}").replace("{app}", appName)} ↗
           </Link>
         )}
