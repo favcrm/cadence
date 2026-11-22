@@ -11,41 +11,6 @@
   color: var(--color-accent);
   text-decoration-color: currentColor;
 }
-.issue-peek {
-  position: fixed;
-  inset: 0 0 0 auto;
-  margin: 0;
-  padding: 1rem;
-  width: min(25rem, 100%);
-  max-width: 100%;
-  height: 100dvh;
-  max-height: 100dvh;
-  display: none;
-  flex-direction: column;
-  gap: 0.875rem;
-  overflow: hidden;
-  overflow-wrap: anywhere;
-}
-.issue-peek[open] { display: flex; }
-.issue-peek::backdrop { background: var(--color-scrim); }
-.issue-peek-close { min-width: 2.75rem; min-height: 2.75rem; }
-/* Pinned header/footer with a scrolling body; the peek is a snapshot, so
-   disclosures use native <details> carets and the write row stays compact.
-   Shown only when the caller passes the opt-in My work context. */
-.issue-peek-body {
-  display: flex;
-  flex-direction: column;
-  gap: 0.875rem;
-  min-height: 0;
-  flex: 1;
-  overflow-y: auto;
-  padding-right: 0.15rem;
-}
-.issue-peek-foot {
-  flex: none;
-  padding-top: 0.9rem;
-  border-top: 1px solid var(--color-ink-700);
-}
 .issue-peek-sec { display: grid; gap: 0.45rem; }
 .issue-peek-sec > summary {
   display: list-item;
@@ -70,9 +35,6 @@
   font-size: var(--text-secondary);
   color: var(--color-ink-300);
 }
-.issue-peek-check { display: flex; gap: 0.45rem; align-items: baseline; list-style: none; }
-.issue-peek-check svg { position: relative; top: 1px; color: var(--color-ink-500); }
-.issue-peek-check.done svg { color: var(--color-ok); }
 .issue-peek-act {
   display: grid;
   gap: 0.1rem;
@@ -107,10 +69,7 @@
 @media (max-width: 639px) {
   .issues-board .board-issue-title { display: flex; align-items: center; min-height: 2.75rem; }
   .issues-board .board-preview-link { min-height: 2.75rem; display: inline-flex; align-items: center; }
-  .issues-board .btn,
-  .issue-peek .btn,
-  .issue-peek .field,
-  .issue-peek .select-trigger { min-height: 2.75rem; }
+  .issues-board .btn { min-height: 2.75rem; }
   .issues-board .board-new-issue .field,
   .issues-board .board-new-issue .select-trigger { min-height: 2.75rem; }
 }

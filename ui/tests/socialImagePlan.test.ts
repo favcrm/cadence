@@ -49,7 +49,7 @@ async function click(element: Element | null | undefined) {
 async function choose(id: string, label: string) {
   await click(host.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
-  assert(option?.closest("dialog") === host.querySelector("dialog"), "Options stay inside the active dialog");
+  assert(option && !option.closest("[inert]"), "Options stay reachable and not inside an inert ancestor");
   await click(option);
 }
 async function fill(selector: string, value: string) {

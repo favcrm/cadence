@@ -24,7 +24,7 @@ p.sfield-hint { margin: 0; font-size: var(--text-label); line-height: 1.5; color
 .s-field .field,
 .crm-field .field { width: 100%; max-width: 100%; }
 .s-confirm-wrap,
-.crm-confirm-wrap { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 1rem; }
+.crm-confirm-wrap { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; padding: 1rem; }
 .s-confirm-scrim,
 .crm-confirm-scrim { position: absolute; inset: 0; background: var(--color-scrim); }
 .s-confirm,

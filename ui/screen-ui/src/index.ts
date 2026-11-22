@@ -17,7 +17,7 @@ export type { FieldProps, FieldControlProps } from "../../src/features/app-shell
 export { default as Detail } from "../../src/features/app-shell/shared/Detail";
 export type { DetailItem } from "../../src/features/app-shell/shared/Detail";
 export { default as DrawerShell } from "../../src/features/app-shell/shared/DrawerShell";
-export type { DrawerShellProps, DrawerTab, DrawerMenuItem, DrawerEdit } from "../../src/features/app-shell/shared/DrawerShell";
+export type { DrawerShellProps, DrawerTab, DrawerSize, DrawerMenuItem, DrawerEdit } from "../../src/features/app-shell/shared/DrawerShell";
 export { Loading, ErrorNotice, Notice, EmptyState } from "../../src/features/app-shell/shared/States";
 export { default as ConfirmDialog } from "../../src/features/app-shell/shared/ConfirmDialog";
 export { Button } from "../../src/ui/Button";

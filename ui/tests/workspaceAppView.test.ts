@@ -143,6 +143,18 @@ async function click(element: Element | undefined | null) {
   assert(element, "Click target exists");
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
+async function closeDrawer(ariaLabel: string) {
+  await click(host.querySelector(`button[aria-label="${ariaLabel}"]`));
+  const closing = host.querySelector("[data-drawer][data-closing]");
+  if (closing) {
+    await React.act(async () => { closing.dispatchEvent(new Event("transitionend", { bubbles: true })); });
+    await flush();
+  }
+  if (host.querySelector("[data-drawer][data-closing]")) {
+    await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    await flush();
+  }
+}
 async function render(operator = true, readOnly = false) {
   await React.act(async () => root.render(mountApp({ operator, readOnly }))); await flush();
 }
@@ -161,7 +173,7 @@ async function fill(selector: string, value: string) {
 async function choose(id: string, label: string) {
   await click(host.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
-  assert(option?.closest("dialog") === host.querySelector("dialog"), "Modal combobox options stay inside the active dialog instead of inert page body");
+  assert(option && !option.closest("[inert]"), "Modal combobox options stay reachable and not inside an inert ancestor");
   await click(option);
 }
 async function choosePage(label: string, optionLabel: string) {
@@ -211,18 +223,18 @@ async function main() {
   assert(Number(writes.length) === 3 && button("Start writer and reviewer"), "Approval alone never dispatches workers");
   await click(button("Start writer and reviewer"));
   assert(Number(writes.length) === 4 && !text().includes("Reviewer accepted"), "Dispatch waits for actual run evidence instead of fixture review");
-  await click(host.querySelector('button[aria-label="Close Synthetic caption"]'));
+  await closeDrawer("Close Synthetic caption");
   await click(button("New post"));
   await fill("#wa-post-title", "Synthetic caption"); await fill("#wa-post-source", "Synthetic source facts");
   await choose("wa-workflow", "Instagram caption"); await choose("wa-owner", "pm-a"); await choose("wa-writer", "writer-a"); await choose("wa-reviewer", "reviewer-a");
   await click(button("Create plan"));
   assert(Number(writes.length) === 5 && writes[4].body.request_id !== firstCreateId, "A later deliberately created identical post gets a new intent after confirmed creation");
-  await click(host.querySelector('button[aria-label="Close Synthetic caption"]'));
+  await closeDrawer("Close Synthetic caption");
   writes.length = 0;
   rows = [acceptedRun()]; await click(button("Refresh")); await click(button("Library"));
   assert(host.querySelector(".wa-post-card")?.textContent?.includes("Reviewed text"), "Library card previews the accepted stored caption rather than source facts");
   const card = host.querySelector(".wa-post-card"); await click(card);
-  assert(host.querySelector("dialog")?.open, "Post inspection uses an opened native dialog");
+  assert(host.querySelector('[data-drawer="post-run"][role="dialog"][aria-modal="true"]'), "Post inspection opens in the shared modal drawer");
   assert(text().includes("Reviewer accepted") && text().includes("Reviewed text"), "Library opens real persisted review and immutable artifact");
   assert(text().includes("Synthetic source facts"), "Frozen review shows source facts from the package's actual source input");
   assert(writes.length === 0, "Artifact inspection does not stage or release automatically");
@@ -243,7 +255,7 @@ async function main() {
   releaseError = false; await click(button("Release this text to Local"));
   assert(text().includes("Actual Local item") && text().includes("Persisted item and retained verification"), "Release shows matching durable Local item and honest verification boundary");
   assert(reads.includes("/api/outbox?effect_id=effect-a"), "Receipt is fetched using exact effect identity");
-  await click(host.querySelector('button[aria-label="Close Synthetic caption"]'));
+  await closeDrawer("Close Synthetic caption");
   await fresh(); await click(button("Library")); await click(host.querySelector(".wa-post-card")); await click(button("Prepare Local release"));
   assert(writes[0].body.request_id === firstStageId, "Remount retains stage request ID and cannot duplicate logical release preparation");
   effects = [{ ...waitingEffect(), state: "reconcile", record: { ...waitingEffect().record, outcome: { kind: "uncertain", verified: true } } }];

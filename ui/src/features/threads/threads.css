@@ -558,7 +558,7 @@
 }
 .threads-create-sheet::backdrop,
 .threads-context-sheet::backdrop {
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--color-scrim);
 }
 .threads-context-sheet-head {
   display: flex;

@@ -316,13 +316,20 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
   ) : undefined;
 
   const drawer = enabled && target ? <DrawerShell
-    kind="template-review" label={t("Template review")} kicker={t("Template review")} scrim="board" modal trapFocus
+    kind="template-review" label={t("Template review")} kicker={t("Template review")} scrim="board" modal trapFocus size="lg" preventClose={busy}
     title={`${target.name} · v${target.version}`}
     pills={view && <span className="s-status-pill" data-tone={view.template.status === "approved" ? "ok" : "warn"}>
       {t(view.template.status === "approved" ? "Approved for reuse" : "Draft awaiting review")}
     </span>}
     onClose={close}
-    tabs={[{ id: "review", label: t("Review"), panel: <div className="space-y-5">
+    secondary={view && onCompose && <Button variant="ghost" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("revise")}>{t("Ask agent to revise")}</Button>}
+    primary={needsApproval && view
+      ? <Button variant="primary" className="max-sm:min-h-11" loading={busy} disabled={!source.trim() || !view.spec.calculation.confirmed} onClick={() => void approve()}>{t("Approve")} v{target.version} {t("for reuse")}</Button>
+      : view?.template.status === "approved" && onCompose
+        ? <Button variant="primary" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("use")}>{t("Use template")}</Button>
+        : undefined}
+  >
+    <div className="space-y-5">
       {loading && <p role="status">{t("Loading the exact template version…")}</p>}
       {error && <p role="alert" className="text-fail break-words">{t(error)} {detail}</p>}
       {error && !view && !busy && !loading && <Button size="sm" variant="secondary" onClick={() => open(target, openerRef.current)}>{t("Reload exact version")}</Button>}
@@ -388,14 +395,8 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
           {(control) => <input {...control} className="field w-full max-sm:min-h-11" name="template-approval-source" value={source} onChange={(event) => setSource(event.target.value)} />}
         </Field>}
       </>}
-    </div> }]}
-    secondary={view && onCompose && <Button variant="ghost" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("revise")}>{t("Ask agent to revise")}</Button>}
-    primary={needsApproval && view
-      ? <Button variant="primary" className="max-sm:min-h-11" loading={busy} disabled={!source.trim() || !view.spec.calculation.confirmed} onClick={() => void approve()}>{t("Approve")} v{target.version} {t("for reuse")}</Button>
-      : view?.template.status === "approved" && onCompose
-        ? <Button variant="primary" className="max-sm:min-h-11" disabled={busy} onClick={() => compose("use")}>{t("Use template")}</Button>
-        : undefined}
-  /> : null;
+    </div>
+  </DrawerShell> : null;
 
   return { rail, drawer, pendingCount: directory === null ? undefined : pendingCount, open, refresh };
 }

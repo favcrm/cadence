@@ -16,7 +16,7 @@ import {
   IconLock,
 } from "../../ui/icons";
 import { HorizontalStrip } from "./HorizontalStrip";
-import { WorkspaceDialog } from "./WorkspaceDialog";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { NewPost, type NewPostValues, type SelectedSource } from "./NewPost";
 import { SourceImport, type SourceImportValues } from "./SourceImport";
 import { SourcesPanel } from "./SourcesPanel";
@@ -1799,8 +1799,22 @@ export default function WorkspaceApp({
           onCreate={createSource}
         />
       )}
-      {run && isSourceRun(run) && (
-        <WorkspaceDialog title={t("Read @{handle}").replace("{handle}", () => run.snapshot.inputs.profile_handle)} onClose={() => { if (!busy) setSelectedRun(null); }}>
+      {run && isSourceRun(run) && (() => {
+        const sourceTitle = t("Read @{handle}").replace("{handle}", () => run.snapshot.inputs.profile_handle);
+        return (
+          <DrawerShell
+            key={run.id}
+            kind="source-run"
+            scrim="board"
+            modal
+            trapFocus
+            size="lg"
+            preventClose={busy}
+            label={sourceTitle}
+            title={sourceTitle}
+            closeLabel={t("Close {title}").replace("{title}", () => sourceTitle)}
+            onClose={() => { if (!busy) setSelectedRun(null); }}
+          >
           <div className="wa-stack">
             {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
             <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
@@ -1816,15 +1830,27 @@ export default function WorkspaceApp({
             {run.state === "failed" && <p className="wa-alert" data-tone="fail">{t("The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.")}</p>}
             {run.state === "succeeded" && <p className="wa-muted">{t("The provider receipt is available in Sources. Choose one post there to start a caption.")}</p>}
           </div>
-        </WorkspaceDialog>
-      )}
-      {run && !isSourceRun(run) && (
-        <WorkspaceDialog
-          title={plainTitle(run.snapshot.inputs, run.snapshot.workflow.title)}
-          onClose={() => {
-            if (!busy) setSelectedRun(null);
-          }}
-        >
+          </DrawerShell>
+        );
+      })()}
+      {run && !isSourceRun(run) && (() => {
+        const postTitle = plainTitle(run.snapshot.inputs, run.snapshot.workflow.title);
+        return (
+          <DrawerShell
+            key={run.id}
+            kind="post-run"
+            scrim="board"
+            modal
+            trapFocus
+            size="lg"
+            preventClose={busy}
+            label={postTitle}
+            title={postTitle}
+            closeLabel={t("Close {title}").replace("{title}", () => postTitle)}
+            onClose={() => {
+              if (!busy) setSelectedRun(null);
+            }}
+          >
           <div className="wa-stack">
             {actionError && (
               <p className="wa-alert" data-tone="fail" role="alert">
@@ -2145,8 +2171,9 @@ export default function WorkspaceApp({
               </section>
             )}
           </div>
-        </WorkspaceDialog>
-      )}
+          </DrawerShell>
+        );
+      })()}
     </main>
   );
 }

@@ -376,7 +376,7 @@ async function main() {
   await click("Open agent Developer");
   await render();
   assert(open === "Developer", "a profile opens on the same agent route as any agent");
-  assert(!host.querySelector("dialog.rc-sheet"), "the drawer is gone");
+  assert(!host.querySelector('[data-drawer="hire"]'), "the drawer is gone");
   const gate = host.querySelector(".ag-chat-gate");
   assert(gate?.textContent?.includes("can’t reply here yet"), "the page says why nothing can answer");
   assert(gate?.textContent?.includes("cadence agent context ap_1"), "the reason sits with the connect commands");

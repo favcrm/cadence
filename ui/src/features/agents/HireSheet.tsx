@@ -1,8 +1,9 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { HireBlock } from "../auth/WriteGate";
 import type { HiredProfile, AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
@@ -44,7 +45,6 @@ export default function HireSheet({
 }) {
   const t = useTranslate();
   const hireBlock = useContext(HireBlock);
-  const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState(suggested);
   const [job, setJob] = useState(startJob ?? role.instructions);
   const [saving, setSaving] = useState(false);
@@ -64,19 +64,6 @@ export default function HireSheet({
       .catch(() => undefined);
     return () => {
       live = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    const trigger = document.activeElement;
-    const overflow = document.body.style.overflow;
-    dialog?.showModal();
-    document.body.style.overflow = "hidden";
-    return () => {
-      dialog?.close();
-      document.body.style.overflow = overflow;
-      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
     };
   }, []);
 
@@ -103,38 +90,45 @@ export default function HireSheet({
 
   const why = hireBlock !== null ? t("Only the operator can hire.") : t("Nothing runs until a runtime connects.");
   return (
-    <dialog
-      ref={dialogRef}
-      className="rc-sheet bg-ink-875 border-l border-ink-700 text-ink-200"
-      aria-labelledby="hire-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+    <DrawerShell
+      kind="hire"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={saving}
+      label={role.title}
+      avatar={<AgentAvatar slug="custom" look={role.look} size={44} active />}
+      title={<span id="hire-title">{role.title}</span>}
+      subtitle={`${t(categoryLabel(payload, role.category))} · ${t("built-in role")}`}
+      onClose={onClose}
+      foot={
+        <>
+          <div className="s-drawer-actions crm-drawer-actions">
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={saving}>
+              {t("Cancel")}
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={blocked || saving}
+              loading={saving}
+              title={hireBlock ?? undefined}
+              onClick={() => void hire()}
+            >
+              {saving ? t("Adding…") : t("Add {name}").replace("{name}", () => alias.trim())}
+            </Button>
+          </div>
+          {err ? (
+            <span className="s-drawer-note crm-drawer-note text-fail" role="alert">
+              {err}
+            </span>
+          ) : (
+            <span className="s-drawer-note crm-drawer-note">{why}</span>
+          )}
+        </>
+      }
     >
-      <div className="rc-sheet-h">
-        <AgentAvatar slug="custom" look={role.look} size={52} active />
-        <div>
-          <div className="t" id="hire-title">
-            {role.title}
-          </div>
-          <div className="s">
-            {t(categoryLabel(payload, role.category))} · {t("built-in role")}
-          </div>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="x"
-          aria-label={t("Close")}
-          onClick={onClose}
-        >
-          ✕
-        </Button>
-      </div>
       <div className="rc-sheet-b">
         <HireGate reason={hireBlock} />
         <div className="rc-blk">
@@ -231,26 +225,6 @@ export default function HireSheet({
           </dl>
         </details>
       </div>
-      <div className="rc-sheet-f">
-        {err ? (
-          <span className="why text-fail" role="alert">
-            {err}
-          </span>
-        ) : (
-          <span className="why">{why}</span>
-        )}
-        <Button variant="ghost" size="sm" onClick={onClose}>
-          {t("Cancel")}
-        </Button>
-        <Button
-          variant="primary"
-          disabled={blocked || saving}
-          title={hireBlock ?? undefined}
-          onClick={() => void hire()}
-        >
-          {saving ? t("Adding…") : t("Add {name}").replace("{name}", () => alias.trim())}
-        </Button>
-      </div>
-    </dialog>
+    </DrawerShell>
   );
 }

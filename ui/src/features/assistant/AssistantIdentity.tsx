@@ -23,7 +23,6 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { createPortal } from "react-dom";
 import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { sessionKey } from "../../lib/sessionKey";
@@ -33,7 +32,8 @@ import { useQuery } from "../../lib/useResource";
 import type { MasterState } from "../../lib/types";
 import type { ResourceState } from "../../lib/cache";
 import Button from "../../ui/Button";
-import { IconClose, IconInfo } from "../../ui/icons";
+import DrawerShell from "../app-shell/shared/DrawerShell";
+import { IconInfo } from "../../ui/icons";
 import AgentAvatar from "../agents/AgentAvatar";
 import {
   AVATAR_LOOKS,
@@ -358,15 +358,6 @@ export function AssistantAboutButton({ className = "", profileHref }: { classNam
   );
 }
 
-function focusables(root: HTMLElement | null): HTMLElement[] {
-  if (root === null) return [];
-  return Array.from(
-    root.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-    ),
-  ).filter((el) => !el.matches(":disabled") && el.getAttribute("aria-hidden") !== "true");
-}
-
 function AssistantAboutDialog({
   actor,
   profileHref,
@@ -378,81 +369,29 @@ function AssistantAboutDialog({
 }) {
   const model = actor.model;
   const t = useTranslate();
-  const titleId = useId();
-  const panelRef = useRef<HTMLElement | null>(null);
-  const openerRef = useRef<HTMLElement | null>(null);
   const read = actor.read;
   const identity = read.state === "ready" ? read.identity : null;
   const title = actor.scope === null ? t("About the assistant") : actor.scope === "workspace" ? t("About the workspace assistant") : t("About your assistant");
 
-  useEffect(() => {
-    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    panelRef.current?.focus();
-    return () => {
-      const opener = openerRef.current;
-      if (opener?.isConnected) opener.focus();
-    };
-  }, []);
-
-  // Saving can disable the focused submit button and leave focus on body.
-  // The open dialog still owns Escape and Tab in that state.
-  useEffect(() => {
-    const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const items = focusables(panelRef.current);
-      if (items.length === 0) {
-        event.preventDefault();
-        panelRef.current?.focus();
-        return;
-      }
-      const first = items[0];
-      const last = items[items.length - 1];
-      const active = document.activeElement;
-      if (!panelRef.current?.contains(active)) {
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      } else if (event.shiftKey) {
-        if (active === first || active === panelRef.current) {
-          event.preventDefault();
-          last.focus();
-        }
-      } else if (active === last || active === panelRef.current) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [onClose]);
-
-  return createPortal(
-    <div className="assistant-about-wrap">
-      <div className="assistant-about-scrim" onClick={onClose} />
-      <aside
-        ref={panelRef}
-        className="assistant-about card"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        tabIndex={-1}
-        data-assistant-identity={actor.scope}
-        data-identity-state={read.state}
-      >
-        <header className="assistant-about-head">
-          <h2 id={titleId} className="text-cardtitle font-medium text-ink-100">
-            {title}
-          </h2>
-          <button type="button" className="assistant-about-trigger" aria-label={t("Close assistant details")} title={t("Close assistant details")} onClick={onClose}>
-            <IconClose size={13} />
-          </button>
-        </header>
-
+  return (
+    <DrawerShell
+      kind="assistant-about"
+      scrim="board"
+      modal
+      trapFocus
+      size="sm"
+      portal
+      className="assistant-about"
+      closeLabel={t("Close assistant details")}
+      dataAttributes={{
+        "data-assistant-identity": actor.scope ?? undefined,
+        "data-identity-state": read.state,
+      }}
+      label={title}
+      title={title}
+      onClose={onClose}
+    >
+      <div className="assistant-about-body">
         <div className="assistant-about-who">
           <AssistantFace size={44} />
           <div className="min-w-0">
@@ -497,9 +436,8 @@ function AssistantAboutDialog({
         ) : actor.scope === "workspace" ? (
           <WorkspaceIdentityDetails actor={actor} identity={identity} />
         ) : null}
-      </aside>
-    </div>,
-    document.body,
+      </div>
+    </DrawerShell>
   );
 }
 

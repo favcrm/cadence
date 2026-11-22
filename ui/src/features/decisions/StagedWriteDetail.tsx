@@ -484,8 +484,6 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
 /** How long a newly shown item ignores Approve and Deny. */
 const ARM_MS = 800;
 
-const TABBABLE = 'button:not([disabled]):not([tabindex="-1"]), a[href]:not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), pre[tabindex="0"], [tabindex]:not([tabindex="-1"])';
-
 /**
  * CAD-2186: one staged write in the shared DrawerShell, with the queue of
  * what is waiting. The shell is mounted once per opening: deciding advances
@@ -553,31 +551,6 @@ export default function StagedWriteDetail({
     document.querySelector<HTMLElement>('.crm-drawer[data-drawer="staged"] .crm-drawer-title')?.focus();
   }, [id]);
 
-  // Focus stays in the drawer until it closes (the shell is non-modal by default).
-  useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== "Tab") return;
-      const root = document.querySelector<HTMLElement>('.crm-drawer[data-drawer="staged"]');
-      if (root === null) return;
-      const items = Array.from(root.querySelectorAll<HTMLElement>(TABBABLE));
-      if (items.length === 0) return;
-      const active = document.activeElement;
-      const onTitle = active instanceof HTMLElement && active.classList.contains("crm-drawer-title");
-      if (!(active instanceof Node) || !root.contains(active)) {
-        e.preventDefault();
-        items[e.shiftKey ? items.length - 1 : 0].focus();
-      } else if (e.shiftKey && (active === items[0] || onTitle)) {
-        e.preventDefault();
-        items[items.length - 1].focus();
-      } else if (!e.shiftKey && active === items[items.length - 1]) {
-        e.preventDefault();
-        items[0].focus();
-      }
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, []);
-
   /** The next item that is still waiting, else close. Nothing is decided by moving on. */
   const advance = () => {
     const s = store.currentDecisions();
@@ -636,24 +609,11 @@ export default function StagedWriteDetail({
       <DrawerShell
         kind="staged"
         modal
+        trapFocus
         scrim="board"
+        size="md"
         label={label}
         title={t("This request is no longer waiting")}
-        tabs={[
-          {
-            id: "detail",
-            label,
-            panel: (
-              <p className="issue-peek-note warn m-0" role="alert">
-                {lost
-                  ? t("Only the workspace owner can decide this request.")
-                  : uncertain
-                    ? t("We could not confirm the result. It may already have gone through, so do not approve again; check first.")
-                    : t("Already decided elsewhere. See Updates.")}
-              </p>
-            ),
-          },
-        ]}
         foot={
           <div className="crm-drawer-actions">
             <button type="button" className="btn btn-sm btn-primary" onClick={lost ? onClose : uncertain ? check : advance}>
@@ -662,7 +622,15 @@ export default function StagedWriteDetail({
           </div>
         }
         onClose={onClose}
-      />
+      >
+        <p className="issue-peek-note warn m-0" role="alert">
+          {lost
+            ? t("Only the workspace owner can decide this request.")
+            : uncertain
+              ? t("We could not confirm the result. It may already have gone through, so do not approve again; check first.")
+              : t("Already decided elsewhere. See Updates.")}
+        </p>
+      </DrawerShell>
     );
   }
 
@@ -695,7 +663,10 @@ export default function StagedWriteDetail({
     <DrawerShell
       kind="staged"
       modal
+      trapFocus
       scrim="board"
+      size="md"
+      preventClose={busy !== undefined}
       label={label}
       title={<B>{titleOf(write, t)}</B>}
       subtitle={

@@ -90,6 +90,18 @@ async function click(element: Element | undefined | null) {
   assert(element, "Click target exists");
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
+async function closeDrawer(ariaLabel: string) {
+  await click(host.querySelector(`button[aria-label="${ariaLabel}"]`));
+  const closing = host.querySelector("[data-drawer][data-closing]");
+  if (closing) {
+    await React.act(async () => { closing.dispatchEvent(new Event("transitionend", { bubbles: true })); });
+    await flush();
+  }
+  if (host.querySelector("[data-drawer][data-closing]")) {
+    await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    await flush();
+  }
+}
 async function fill(selector: string, value: string) {
   const element = host.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
   assert(element, "Field exists");
@@ -99,7 +111,7 @@ async function fill(selector: string, value: string) {
 async function choose(id: string, label: string) {
   await click(host.querySelector(`#${id}`));
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
-  assert(option?.closest("dialog") === host.querySelector("dialog"), "Options stay inside the active dialog");
+  assert(option && !option.closest("[inert]"), "Options stay reachable and not inside an inert ancestor");
   await click(option);
 }
 async function main() {
@@ -109,7 +121,7 @@ async function main() {
   assert(host.querySelector("#wa-content-prompt") && host.querySelector("#wa-image-prompt"), "New post exposes both Cadence-owned per-post prompts");
   await click(host.querySelector("#wa-workflow"));
   assert(Array.from(document.querySelectorAll('[role="option"]')).some(value => value.textContent?.includes("Caption and image from pasted facts")), "v0.5 offers the manual-facts image workflow");
-  await click(host.querySelector('button[aria-label="Close New post"]'));
+  await closeDrawer("Close New post");
   await click(button("Settings"));
   assert(host.querySelector("#wa-default-content-prompt") && host.querySelector("#wa-default-image-prompt"), "Settings exposes both saved prompt defaults for v0.5");
   await click(button("Sources"));
@@ -120,7 +132,7 @@ async function main() {
   assert(host.textContent?.includes("source connection is ready"), "Operator sees the source connection resolve before planning a read");
   // CAD-1129: the source dialog shows no provider charge — WorkspaceApp's
   // approval copy is the CAD-1123 lane's own removal, not this dialog's.
-  const dlg = host.querySelector("dialog");
+  const dlg = host.querySelector('[data-drawer="source-import"][role="dialog"]');
   assert(dlg && !dlg.textContent?.includes("USD") && !dlg.textContent?.includes("price") && !dlg.textContent?.includes("charge"), "the source dialog shows no price or charge text");
   await fill("#wa-profile-handle", "@juicysuite_crm"); await choose("wa-source-owner", "pm-a"); await choose("wa-source-reader", "writer-a");
   await click(button("Create source plan"));
@@ -129,7 +141,7 @@ async function main() {
   assert(!reads.includes("/api/app-runs/source-run/capability-results"), "No provider receipt exists before dispatch and success");
   await click(button("Approve source plan")); await click(button("Start source reader"));
   assert(!reads.includes("/api/app-runs/source-run/capability-results"), "Dispatch is not a fabricated provider result");
-  await click(host.querySelector('button[aria-label="Close Read @juicysuite_crm"]'));
+  await closeDrawer("Close Read @juicysuite_crm");
   rows = [sourceRun("succeeded")]; await click(button("Refresh")); await flush();
   assert(reads.includes("/api/app-runs/source-run/capability-results") && host.textContent?.includes("Original line one"), "Only the stored broker receipt populates source posts");
   const readsBeforeFailure = reads.filter(path => path === "/api/app-runs/source-run/capability-results").length;

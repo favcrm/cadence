@@ -883,13 +883,16 @@ function TypeDrawer({
   return (
     <DrawerShell
       kind="document-type"
+      scrim="board"
+      size="md"
       label={title}
       title={title}
       modal={modal}
       trapFocus={modal}
-      tabs={[{ id: "details", label: title, panel: body }]}
       foot={foot}
       onClose={onClose}
-    />
+    >
+      {body}
+    </DrawerShell>
   );
 }

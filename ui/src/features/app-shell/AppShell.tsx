@@ -4,7 +4,7 @@ import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
-import { IconMore, IconThreads } from "../../ui/icons";
+import { IconClose, IconMore, IconThreads } from "../../ui/icons";
 import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
 import { dropWorkspaceAppSnapshot, readAppScopeFresh, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
@@ -1463,7 +1463,7 @@ export default function AppShell({
              aria-label={`${title} ${t("Details")}`}>
           <div className="app-shell-screen-drawer-bar">
             <span className="truncate text-label text-ink-300">{t("Details")}</span>
-            <Button size="sm" variant="ghost" onClick={closeIndependentDrawer} aria-label={t("Close")}>×</Button>
+            <Button size="sm" variant="ghost" icon={<IconClose size={15} />} onClick={closeIndependentDrawer} aria-label={t("Close")} />
           </div>
           <div ref={attachDrawerTarget} className="app-shell-screen-drawer-body" />
         </div>

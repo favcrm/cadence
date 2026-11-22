@@ -14,10 +14,15 @@ export default function SettingsDrawer({
   return (
     <DrawerShell
       kind="settings-item"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
       label={title}
       title={title}
-      tabs={[{ id: "details", label: title, panel: <div className="grid gap-3 min-w-0">{children}</div> }]}
       onClose={onClose}
-    />
+    >
+      <div className="grid gap-3 min-w-0">{children}</div>
+    </DrawerShell>
   );
 }

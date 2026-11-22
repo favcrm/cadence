@@ -14,7 +14,7 @@ import { RecoveryBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
 import { useInstructionsDoc } from "./useInstructionsDoc";
 import { instructionsKind } from "./instructionsDoc";
-import AgentTabBody, { SettingsDrawer, Work, type TabContext } from "./AgentTabs";
+import AgentTabBody, { AgentSettingsDrawer, Work, type TabContext } from "./AgentTabs";
 import {
   categoryLabel,
   durationText,
@@ -582,7 +582,7 @@ export default function AgentPage({
             )}
           </div>
           {(gear || tab === "settings") && (
-            <SettingsDrawer
+            <AgentSettingsDrawer
               c={ctx}
               onClose={() => {
                 setGear(false);

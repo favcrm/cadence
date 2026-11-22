@@ -122,7 +122,7 @@ async function main() {
   const strays = Array.from(host.querySelectorAll(".crm-drawer-body button")).length;
   assert(strays === 0, "body holds no action buttons");
   const topButtons = Array.from(q(".crm-drawer-top")!.querySelectorAll("button")).filter((b) => b.getAttribute("role") !== "tab");
-  assert(topButtons.length === 1 && topButtons[0].textContent === "✕", "header holds only the icon close");
+  assert(topButtons.length === 1 && topButtons[0].getAttribute("aria-label") === "Close customer details", "header holds only the icon close");
 
   // Overflow menu: opens, destructive item last and red, Escape closes the menu only.
   const menuBtn = q('button[aria-label="More actions"]')!;
@@ -160,6 +160,97 @@ async function main() {
   await React.act(async () => { await sleep(420); });
   assert(closedCount() === 1, "onClose fires once");
   assert(document.activeElement === heading, "deep-linked drawer returns focus to the outlet heading, not body");
+  await React.act(async () => { root.unmount(); });
+
+  // Unified DrawerShell features: single-view children + size + canonical classes + preventClose + nested LIFO stack.
+  const host2 = document.createElement("div");
+  document.body.append(host2);
+  const root2 = createRoot(host2);
+  const stackEvents = { parentClosed: 0, childClosed: 0 };
+  const parentClosed = (): number => stackEvents.parentClosed;
+  const childClosed = (): number => stackEvents.childClosed;
+  function StackHarness() {
+    const [showParent, setShowParent] = React.useState(true);
+    const [showChild, setShowChild] = React.useState(true);
+    const [guarded, setGuarded] = React.useState(true);
+    return h(
+      React.Fragment,
+      null,
+      showParent &&
+        h(
+          DrawerShell,
+          {
+            kind: "parent-doc",
+            label: "Parent drawer",
+            title: "Parent",
+            scrim: "board",
+            size: "sm",
+            modal: true,
+            trapFocus: true,
+            onClose: () => {
+              stackEvents.parentClosed += 1;
+              setShowParent(false);
+            },
+          },
+          h("p", null, "single-view body"),
+        ),
+      showChild &&
+        h(
+          DrawerShell,
+          {
+            kind: "child-doc",
+            label: "Child drawer",
+            title: "Child",
+            scrim: "board",
+            size: "lg",
+            modal: true,
+            trapFocus: true,
+            preventClose: guarded,
+            preventCloseNote: "Saving...",
+            primary: h(
+              "button",
+              { type: "button", className: "btn btn-sm btn-primary", onClick: () => setGuarded(false) },
+              "Unlock",
+            ),
+            onClose: () => {
+              stackEvents.childClosed += 1;
+              setShowChild(false);
+            },
+          },
+          h("p", null, "nested child body"),
+        ),
+    );
+  }
+  await React.act(async () => { root2.render(h(StackHarness)); });
+  await flush();
+
+  const parentPanel = host2.querySelector('[data-drawer="parent-doc"]') as HTMLElement | null;
+  const childPanel = host2.querySelector('[data-drawer="child-doc"]') as HTMLElement | null;
+  assert(parentPanel && childPanel, "nested drawers render together");
+  assert(parentPanel.classList.contains("s-drawer") && host2.querySelector(".s-drawer-scrim"), "canonical .s-drawer classes are present");
+  assert(parentPanel.getAttribute("data-size") === "sm" && childPanel.getAttribute("data-size") === "lg", "size attributes apply");
+  assert(host2.textContent?.includes("single-view body"), "children single-view renders without tabs");
+  assert(parentPanel.getAttribute("data-receded") === "true" && parentPanel.hasAttribute("inert"), "parent recedes while child is open");
+  assert(parentPanel.getAttribute("data-depth") === null && childPanel.getAttribute("data-depth") === "1", "child takes depth 1");
+
+  // Guarded top drawer refuses Escape/scrim, marks data-nudged, and surfaces preventCloseNote.
+  await key("Escape");
+  assert(childClosed() === 0 && parentClosed() === 0, "preventClose blocks Escape");
+  assert(childPanel.getAttribute("data-nudged") === "true", "preventClose triggers nudge feedback");
+  assert(childPanel.querySelector(".s-drawer-note")?.textContent === "Saving...", "preventCloseNote surfaces in footer");
+
+  // Unlock top drawer: Escape closes only child first (LIFO), un-recedes parent, then second Escape closes parent.
+  await click(Array.from(childPanel.querySelectorAll("button")).find((b) => b.textContent === "Unlock"));
+  await key("Escape");
+  assert(childPanel.hasAttribute("data-closing") && !parentPanel.hasAttribute("data-closing"), "Escape closes only top child drawer");
+  await React.act(async () => { await sleep(320); });
+  assert(childClosed() === 1 && parentClosed() === 0, "only child unmounted on first Escape");
+  assert(!parentPanel.hasAttribute("data-receded") && !parentPanel.hasAttribute("inert"), "parent clears receded and inert after child closes");
+  await key("Escape");
+  await React.act(async () => { await sleep(320); });
+  assert(parentClosed() === 1, "second Escape closes parent drawer");
+  await React.act(async () => { root2.unmount(); });
+  host2.remove();
 
   // Reduced motion and layout fixes are in the sheet.
   const nativeCss = fs.readFileSync(require("path").join(process.cwd(), "src/features/app-shell/shared/drawer.css"), "utf8");
@@ -170,7 +261,6 @@ async function main() {
   assert(/\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css) || /\.crm-field \.select,\s*\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css), "selects shrink to their column");
   assert(/\.crm-field-row \{\s*align-items: end;/.test(css), "hinted fields align with their row");
 
-  await React.act(async () => { root.unmount(); });
   console.log("crm drawer shell checks passed");
 }
 

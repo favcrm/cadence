@@ -135,35 +135,32 @@ export default function InstructionsEditor({
       {context && (
         <DrawerShell
           kind="agent-item"
+          scrim="board"
+          modal
+          trapFocus
+          size="md"
           label={t("Context")}
           title={t("Context")}
-          tabs={[
-            {
-              id: "context",
-              label: t("Context"),
-              panel: (
-                <div className="ap-body">
-                  <section>
-                    <h4 className="ap-doc-h">{t(contextHeading)}</h4>
-                    <ul className="ap-doc-lines">
-                      {contextLines.map((line) => (
-                        <li key={line.name}>
-                          <span>{t(line.name)}</span>
-                          <span className="ap-doc-muted">{t(line.size).replace("{n}", () => (line.count ?? 0).toLocaleString("en"))}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
-                  <section>
-                    <h4 className="ap-doc-h">{t("Loaded when needed")}</h4>
-                    {contextNote}
-                  </section>
-                </div>
-              ),
-            },
-          ]}
           onClose={() => setContext(false)}
-        />
+        >
+          <div className="ap-body">
+            <section>
+              <h4 className="ap-doc-h">{t(contextHeading)}</h4>
+              <ul className="ap-doc-lines">
+                {contextLines.map((line) => (
+                  <li key={line.name}>
+                    <span>{t(line.name)}</span>
+                    <span className="ap-doc-muted">{t(line.size).replace("{n}", () => (line.count ?? 0).toLocaleString("en"))}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+            <section>
+              <h4 className="ap-doc-h">{t("Loaded when needed")}</h4>
+              {contextNote}
+            </section>
+          </div>
+        </DrawerShell>
       )}
     </div>
   );
