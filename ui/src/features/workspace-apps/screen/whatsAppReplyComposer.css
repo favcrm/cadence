@@ -37,11 +37,11 @@
   overflow: auto;
   overscroll-behavior: contain;
   gap: 0.2rem;
-  padding: 0.5625rem 0.75rem 0.5rem 0.875rem;
-  border: 1px solid color-mix(in srgb, var(--color-ink-400) 26%, transparent);
+  padding: 0.625rem 0.75rem 0.5rem 0.875rem;
+  border: 1px solid color-mix(in srgb, var(--color-ink-400) 24%, transparent);
   border-radius: 1rem;
   background-color: var(--color-ink-850);
-  box-shadow: var(--board-composer-shadow);
+  box-shadow: none;
 }
 .wa-reply-dock[data-overlay] .app-chat-composer.wa-reply-card[data-locked="true"] {
   border-color: color-mix(in srgb, var(--color-warn) 44%, transparent);

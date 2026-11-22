@@ -823,8 +823,10 @@ async function testComposerInteractions(): Promise<void> {
     assert(
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
         container.textContent?.includes("Confirming send") &&
-        !container.textContent?.includes("Send not confirmed"),
-      "initial uncertain starts confirming state without showing scary alert immediately",
+        !container.textContent?.includes("Send not confirmed") &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
+        apSend.disabled,
+      "initial uncertain starts confirming state without locking card or showing alert immediately",
     );
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 700));
@@ -858,6 +860,12 @@ async function testComposerInteractions(): Promise<void> {
       trustedClick(esSend);
       await flush();
     });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
+        esSend.disabled,
+      "escalate scenario keeps data-locked off while disabling duplicate send during Confirming send",
+    );
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 2_200));
       await flush();

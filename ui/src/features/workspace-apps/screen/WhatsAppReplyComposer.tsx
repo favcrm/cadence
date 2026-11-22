@@ -135,22 +135,15 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const latestSelection = useRef(selection);
   latestSelection.current = selection;
 
-  function clearPollTimer() {
-    if (pollTimerRef.current !== null) {
-      clearTimeout(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-  }
-
-  function clearDismissTimer() {
-    if (dismissTimerRef.current !== null) {
-      clearTimeout(dismissTimerRef.current);
-      dismissTimerRef.current = null;
+  function clearTimer(ref: { current: ReturnType<typeof setTimeout> | null }) {
+    if (ref.current !== null) {
+      clearTimeout(ref.current);
+      ref.current = null;
     }
   }
 
   function scheduleSentDismiss(effectId: string | null) {
-    clearDismissTimer();
+    clearTimer(dismissTimerRef);
     dismissTimerRef.current = setTimeout(() => {
       dismissTimerRef.current = null;
       if (!mountedRef.current || !latestSelection.current.current()) return;
@@ -186,8 +179,9 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const group = selection.conversationId.endsWith("@g.us");
   const recipient = verification?.recipient;
   const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
-  const locked = attempt?.outcome === "uncertain";
-  const readOnly = busy || locked || availability !== "verified";
+  const resolvingConfirm = confirming && attempt?.outcome === "uncertain";
+  const locked = attempt?.outcome === "uncertain" && !resolvingConfirm;
+  const readOnly = busy || resolvingConfirm || locked || availability !== "verified";
   const isAudio = attachment?.kind === "audio";
   const audioHasCaption = isAudio && text !== "";
   const textareaReadOnly = readOnly || (isAudio && text === "");
@@ -217,8 +211,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      clearPollTimer();
-      clearDismissTimer();
+      clearTimer(pollTimerRef);
+      clearTimer(dismissTimerRef);
       if (previewUrlRef.current && typeof URL.revokeObjectURL === "function") {
         URL.revokeObjectURL(previewUrlRef.current);
       }
@@ -322,7 +316,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   }
 
   function scheduleAutoStatusCheck(verifiedKey: string, effectId: string, step: number) {
-    clearPollTimer();
+    clearTimer(pollTimerRef);
     const delay = AUTO_POLL_DELAYS_MS[step];
     if (delay === undefined) {
       setConfirming(false);
@@ -365,8 +359,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     const key = receiptKey(selection, recipient);
     const pending = replyRecovery.get(key)?.pending;
     if (pending) { setAttempt({ effectId: pending, outcome: "uncertain" }); return; }
-    clearPollTimer();
-    clearDismissTimer();
+    clearTimer(pollTimerRef);
+    clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
     setBusy(true);
@@ -462,8 +456,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
 
   async function check() {
     if (!attempt?.effectId || !recipient || running.current || !selection.current()) return;
-    clearPollTimer();
-    clearDismissTimer();
+    clearTimer(pollTimerRef);
+    clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
     setBusy(true);
@@ -484,7 +478,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const audioNote = audioHasCaption
     ? (zh ? "音訊回覆不可包含說明文字。請清除文字或移除音訊。" : "Audio replies can’t include a caption. Clear the text or remove the audio.")
     : null;
-  const resolvingConfirm = confirming && attempt?.outcome === "uncertain";
   const note = staleRecipient ? (zh ? "未有傳送。請清除草稿並重新開啟對話，以再次核對收件人。" : "Nothing sent. Clear the draft and reopen the conversation to verify the recipient again.")
     : attachError ?? audioNote
     ?? (resolvingConfirm ? (zh ? "正在向 WhatsApp 確認傳送狀態…" : "Confirming send…")
@@ -537,7 +530,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           <span className="wa-reply-att-name">{attachment.file_name ?? (zh ? attachment.kind : attachment.kind)}</span>
           <span className="wa-reply-att-size">{formatMediaBytes(attachment.byte_length)}</span>
         </span>
-        {!busy && !locked && <button type="button" className="wa-reply-att-remove" aria-label={zh ? "移除附件" : "Remove attachment"}
+        {!busy && !resolvingConfirm && !locked && <button type="button" className="wa-reply-att-remove" aria-label={zh ? "移除附件" : "Remove attachment"}
           onClick={() => clearAttachment(true)}>×</button>}
       </div>}
       <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"}
@@ -560,7 +553,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           onClick={() => fileInput.current?.click()}>
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
         </button>
-        {(text || attachment) && !busy && !locked && !staging && <Button size="sm" variant="ghost" onClick={() => { setText(""); clearAttachment(true); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
+        {(text || attachment) && !busy && !resolvingConfirm && !locked && !staging && <Button size="sm" variant="ghost" onClick={() => { setText(""); clearAttachment(true); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
         <span className="wa-reply-hint" aria-live="polite">
           {staging ? (zh ? "正在上傳附件…" : "Uploading attachment…") : busy ? (zh ? "處理中…" : "Working…") : !readOnly && <span className="wa-reply-shortcut">{zh ? "Enter 傳送 · Shift+Enter 換行" : "Enter to send · Shift+Enter for a new line"}</span>}
