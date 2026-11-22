@@ -69,6 +69,7 @@ export interface ScreenActions {
   onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
   onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
   onWhatsAppMediaDownload?(conversationId: string, messageId: string, signal: AbortSignal): Promise<WhatsAppMediaDownloadResult>;
+  onWhatsAppMediaSave?(bytes: ArrayBuffer, mimeType: string, fileName: string): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -354,6 +355,32 @@ export function admitsWhatsAppComposer(receipt: MountReceipt): boolean {
 export function admitsWhatsAppMediaDownload(receipt: MountReceipt): boolean {
   return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
     !!receipt.operations?.includes("whatsapp.messages");
+}
+
+const WHATSAPP_MEDIA_FALLBACK_FILENAMES: Readonly<Record<string, string>> = {
+  "image/jpeg": "whatsapp-image.jpg",
+  "image/png": "whatsapp-image.png",
+  "image/webp": "whatsapp-image.webp",
+  "video/mp4": "whatsapp-video.mp4",
+  "video/webm": "whatsapp-video.webm",
+  "video/3gpp": "whatsapp-video.3gp",
+  "video/quicktime": "whatsapp-video.mov",
+  "audio/mpeg": "whatsapp-audio.mp3",
+  "audio/ogg": "whatsapp-audio.ogg",
+  "audio/mp4": "whatsapp-audio.m4a",
+  "audio/aac": "whatsapp-audio.aac",
+  "audio/wav": "whatsapp-audio.wav",
+  "audio/webm": "whatsapp-audio.webm",
+  "application/pdf": "whatsapp-document.pdf",
+  "text/plain": "whatsapp-document.txt",
+  "text/csv": "whatsapp-document.csv",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "whatsapp-document.docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "whatsapp-document.xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "whatsapp-document.pptx",
+};
+
+function fallbackWhatsAppMediaFileName(mimeType: string): string {
+  return WHATSAPP_MEDIA_FALLBACK_FILENAMES[mimeType] ?? "whatsapp-media.bin";
 }
 
 export class ScreenChannel extends FrameChannel {
@@ -653,6 +680,18 @@ export class ScreenChannel extends FrameChannel {
     const reply = (message: WhatsAppMediaReply, transfer: Transferable[] = []) => {
       if (!this.closed) this.port?.postMessage(message, transfer);
     };
+    const isSave = request.disposition === "download";
+    const save = this.actions?.onWhatsAppMediaSave;
+    if (isSave && !save) {
+      reply({
+        v: 2,
+        op: "whatsapp-media-reply",
+        id: request.id,
+        ok: false,
+        refusal: { code: "unavailable", text: "Downloads are unavailable on this screen." },
+      });
+      return;
+    }
     if (this.whatsappMediaRetire.size >= 4) {
       reply({
         v: 2,
@@ -672,6 +711,21 @@ export class ScreenChannel extends FrameChannel {
         if (this.closed) return;
         if (!result.ok) {
           reply({ v: 2, op: "whatsapp-media-reply", id: request.id, ok: false, refusal: result.refusal });
+          return;
+        }
+        if (isSave && save) {
+          const fileName = result.fileName ?? fallbackWhatsAppMediaFileName(result.mimeType);
+          save(result.bytes, result.mimeType, fileName);
+          reply({
+            v: 2,
+            op: "whatsapp-media-reply",
+            id: request.id,
+            ok: true,
+            saved: true,
+            mime_type: result.mimeType,
+            file_name: fileName,
+            sha256: result.sha256,
+          });
           return;
         }
         reply(

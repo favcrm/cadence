@@ -247,12 +247,14 @@ const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.u
 export const SCREEN_WHATSAPP_MEDIA_V1 = "screen-whatsapp-media.v1";
 export const LINKED_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 export const LINKED_MEDIA_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export type WhatsAppMediaDisposition = "inline" | "download";
 export interface WhatsAppMediaRequest {
   v: 2;
   op: "whatsapp-media";
   id: string;
   conversation_id: string;
   message_id: string;
+  disposition?: WhatsAppMediaDisposition;
 }
 export type WhatsAppMediaReply =
   | {
@@ -263,6 +265,16 @@ export type WhatsAppMediaReply =
       bytes: ArrayBuffer;
       mime_type: string;
       file_name: string | null;
+      sha256: string;
+    }
+  | {
+      v: 2;
+      op: "whatsapp-media-reply";
+      id: string;
+      ok: true;
+      saved: true;
+      mime_type: string;
+      file_name: string;
       sha256: string;
     }
   | { v: 2; op: "whatsapp-media-reply"; id: string; ok: false; refusal: ActionRefusal };
@@ -1048,7 +1060,9 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   if (
     d.v === 2 &&
     d.op === "whatsapp-media" &&
-    Object.keys(d).sort().join() === "conversation_id,id,message_id,op,v" &&
+    (Object.keys(d).sort().join() === "conversation_id,id,message_id,op,v" ||
+      (Object.keys(d).sort().join() === "conversation_id,disposition,id,message_id,op,v" &&
+        (d.disposition === "inline" || d.disposition === "download"))) &&
     typeof d.id === "string" &&
     ACTION_ID.test(d.id) &&
     validLinkedMediaId(d.conversation_id) &&
@@ -1060,6 +1074,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       id: d.id,
       conversation_id: d.conversation_id,
       message_id: d.message_id,
+      ...(d.disposition !== undefined ? { disposition: d.disposition as WhatsAppMediaDisposition } : {}),
     };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&

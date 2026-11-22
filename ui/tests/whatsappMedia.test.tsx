@@ -119,10 +119,23 @@ async function testProtocolAndChannel(): Promise<void> {
 
   const parsedReq = parseChild({ v: 2, op: "whatsapp-media", id: "req1", conversation_id: "15550001111@s.whatsapp.net", message_id: "m1" });
   assert(parsedReq && parsedReq.op === "whatsapp-media" && parsedReq.message_id === "m1", "valid whatsapp-media request parses");
+  const parsedInline = parseChild({ v: 2, op: "whatsapp-media", id: "req2", conversation_id: "15550001111@s.whatsapp.net", message_id: "m1", disposition: "inline" });
+  assert(parsedInline && parsedInline.op === "whatsapp-media" && parsedInline.disposition === "inline", "inline whatsapp-media request parses");
+  const parsedDownload = parseChild({ v: 2, op: "whatsapp-media", id: "req3", conversation_id: "15550001111@s.whatsapp.net", message_id: "m1", disposition: "download" });
+  assert(parsedDownload && parsedDownload.op === "whatsapp-media" && parsedDownload.disposition === "download", "download whatsapp-media request parses");
+  assert(parseChild({ v: 2, op: "whatsapp-media", id: "req4", conversation_id: "1555@s.whatsapp.net", message_id: "m1", disposition: "evil" }) === null, "invalid disposition refused");
   assert(parseChild({ v: 2, op: "whatsapp-media", id: "req1", conversation_id: "bad\nid", message_id: "m1" }) === null, "control char id refused");
   assert(parseChild({ v: 2, op: "whatsapp-media", id: "req1", conversation_id: "1555@s.whatsapp.net", message_id: "m1", extra: 1 }) === null, "extra key refused");
 
-  const mountFrame = (opts: { app?: string; ops?: string[]; accepts?: string[]; abortedSignals?: AbortSignal[]; resolvers?: ((v: any) => void)[] }) => {
+  const mountFrame = (opts: {
+    app?: string;
+    ops?: string[];
+    accepts?: string[];
+    abortedSignals?: AbortSignal[];
+    resolvers?: ((v: any) => void)[];
+    downloadResult?: { mimeType: string; fileName: string | null };
+    onSave?: (bytes: ArrayBuffer, mimeType: string, fileName: string) => void;
+  }) => {
     const nonce = "a".repeat(64);
     const digest = `sha256:${"c".repeat(64)}`;
     const receipt: MountReceipt = {
@@ -183,11 +196,12 @@ async function testProtocolAndChannel(): Promise<void> {
         return {
           ok: true,
           bytes: sampleBytes.slice(0),
-          mimeType: "image/png",
-          fileName: "shot.png",
+          mimeType: opts.downloadResult?.mimeType ?? "image/png",
+          fileName: opts.downloadResult ? opts.downloadResult.fileName : "shot.png",
           sha256: "1".repeat(64),
         };
       },
+      ...(opts.onSave ? { onWhatsAppMediaSave: opts.onSave } : {}),
     };
     const source = {} as Window;
     const channel = new ScreenChannel(source, receipt, projection, () => {}, () => { failed += 1; }, () => { ready += 1; }, undefined, actions);
@@ -217,6 +231,55 @@ async function testProtocolAndChannel(): Promise<void> {
     assert(reply && reply.ok === true && reply.bytes instanceof ArrayBuffer && new TextDecoder().decode(reply.bytes) === "PNG-DATA" && reply.mime_type === "image/png" && reply.file_name === "shot.png", "ArrayBuffer transfers via whatsapp-media-reply");
   } finally {
     member.close();
+  }
+
+  // Host-mediated save disposition: missing save handler refuses in-place; present handler saves explicit and fallback filenames
+  const noSave = mountFrame({ ops: ["whatsapp.messages"] });
+  try {
+    await flush();
+    noSave.port.postMessage({ v: 2, op: "whatsapp-media", id: "sv0", conversation_id: "1555@s.whatsapp.net", message_id: "m1", disposition: "download" });
+    await flush();
+    const noSaveReply = noSave.replies.find((m) => m.op === "whatsapp-media-reply" && m.id === "sv0");
+    assert(noSaveReply && noSaveReply.ok === false && (noSaveReply.refusal as { code: string }).code === "unavailable" && noSave.state().failed === 0, "missing onWhatsAppMediaSave refuses in place");
+  } finally {
+    noSave.close();
+  }
+
+  const savedCalls: { bytes: ArrayBuffer; mimeType: string; fileName: string }[] = [];
+  const withSave = mountFrame({
+    ops: ["whatsapp.messages"],
+    downloadResult: { mimeType: "application/pdf", fileName: "invoice.pdf" },
+    onSave: (bytes, mimeType, fileName) => savedCalls.push({ bytes, mimeType, fileName }),
+  });
+  try {
+    await flush();
+    withSave.port.postMessage({ v: 2, op: "whatsapp-media", id: "sv1", conversation_id: "1555@s.whatsapp.net", message_id: "m1", disposition: "download" });
+    await flush();
+    const saveReply = withSave.replies.find((m) => m.op === "whatsapp-media-reply" && m.id === "sv1");
+    assert(
+      saveReply && saveReply.ok === true && saveReply.saved === true && !("bytes" in saveReply) &&
+        saveReply.file_name === "invoice.pdf" && saveReply.mime_type === "application/pdf" &&
+        savedCalls.length === 1 && savedCalls[0]!.fileName === "invoice.pdf" && savedCalls[0]!.mimeType === "application/pdf",
+      "download disposition triggers host save with explicit filename and returns saved metadata",
+    );
+  } finally {
+    withSave.close();
+  }
+
+  const fallbackSaveCalls: { fileName: string }[] = [];
+  const fallbackSave = mountFrame({
+    ops: ["whatsapp.messages"],
+    downloadResult: { mimeType: "audio/ogg", fileName: null },
+    onSave: (_bytes, _mimeType, fileName) => fallbackSaveCalls.push({ fileName }),
+  });
+  try {
+    await flush();
+    fallbackSave.port.postMessage({ v: 2, op: "whatsapp-media", id: "sv2", conversation_id: "1555@s.whatsapp.net", message_id: "m2", disposition: "download" });
+    await flush();
+    const fbReply = fallbackSave.replies.find((m) => m.op === "whatsapp-media-reply" && m.id === "sv2");
+    assert(fbReply && fbReply.ok === true && fbReply.saved === true && fbReply.file_name === "whatsapp-audio.ogg" && fallbackSaveCalls[0]?.fileName === "whatsapp-audio.ogg", "download disposition derives fallback filename when header filename is null");
+  } finally {
+    fallbackSave.close();
   }
 
   // Unnegotiated, non-WABA, and missing whatsapp.messages frames are refused / closed
